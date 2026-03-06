@@ -85,7 +85,7 @@ Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep)
 
 | Model | Tasks | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|
-| Sonnet 4.5 | 26 (78 runs) | $0.26 | $0.17 | **-34%** | 96% | 100% |
+| Sonnet 4.6 | 26 (78 runs) | $0.26 | $0.17 | **-34%** | 96% | 100% |
 | Opus 4.6 | 26 (52 runs) | $0.20 | $0.16 | **-19%** | 96% | 96% |
 | Haiku 4.5 | 22 (65 runs†) | $0.17 | $0.11 | **-38%** | 58% | 87% |
 | **Average** | **195 runs** | **$0.21** | **$0.15** | **-31%** | **83%** | **95%** |

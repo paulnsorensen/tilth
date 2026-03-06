@@ -38,7 +38,8 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::Cpp => tree_sitter_cpp::LANGUAGE,
         Lang::Ruby => tree_sitter_ruby::LANGUAGE,
         // Languages without shipped grammars — fall back
-        Lang::Swift | Lang::Kotlin | Lang::CSharp | Lang::Dockerfile | Lang::Make => {
+        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
+        Lang::Swift | Lang::Kotlin | Lang::Dockerfile | Lang::Make => {
             return None;
         }
     };
@@ -80,7 +81,8 @@ fn node_to_entry(
         | "function_definition"
         | "function_item"
         | "method_definition"
-        | "method_declaration" => {
+        | "method_declaration"
+        | "constructor_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
@@ -144,8 +146,16 @@ fn node_to_entry(
             (OutlineKind::Variable, name, None)
         }
 
+        // C# properties
+        "property_declaration" => {
+            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<property>".into());
+            let sig = extract_signature(node, lines);
+            (OutlineKind::Function, name, Some(sig))
+        }
+
         // Imports — collect as a group
-        "import_statement" | "import_declaration" | "use_declaration" | "use_item" => {
+        "import_statement" | "import_declaration" | "use_declaration" | "use_item"
+        | "using_directive" => {
             let text = node_text(node, lines);
             (OutlineKind::Import, text, None)
         }
@@ -157,7 +167,7 @@ fn node_to_entry(
         }
 
         // Module declarations
-        "mod_item" | "module" => {
+        "mod_item" | "module" | "namespace_declaration" | "file_scoped_namespace_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
             (OutlineKind::Module, name, None)
         }
@@ -166,12 +176,19 @@ fn node_to_entry(
     };
 
     // Collect children for classes, impls, modules, traits/interfaces
+    let is_namespace = matches!(
+        kind_str,
+        "namespace_declaration" | "file_scoped_namespace_declaration"
+    );
     let children = if matches!(
         kind,
         OutlineKind::Class | OutlineKind::Struct | OutlineKind::Module | OutlineKind::Interface
     ) && depth < 1
     {
-        collect_children(node, lines, lang, depth + 1)
+        // Namespaces are transparent wrappers — don't consume a depth level,
+        // so classes inside namespaces still collect their methods.
+        let child_depth = if is_namespace { depth } else { depth + 1 };
+        collect_children(node, lines, lang, child_depth)
     } else {
         Vec::new()
     };
@@ -200,10 +217,11 @@ fn collect_children(
     let mut children = Vec::new();
     let mut cursor = node.walk();
 
-    // Look for a body node first
-    let body = node
-        .children(&mut cursor)
-        .find(|c| c.kind().contains("body") || c.kind().contains("block"));
+    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
+    let body = node.children(&mut cursor).find(|c| {
+        let k = c.kind();
+        k.contains("body") || k.contains("block") || k == "declaration_list"
+    });
 
     let parent = body.unwrap_or(node);
     let mut cursor2 = parent.walk();
@@ -348,13 +366,30 @@ fn format_entries(
             }
         }
 
-        out.push(format_entry(entry, 0, lang));
-
-        for child in &entry.children {
-            if out.len() >= max_lines {
-                break;
+        // Flatten namespace modules — hoist their children to top level
+        // so classes inside namespaces show their methods at indent 1.
+        if entry.kind == OutlineKind::Module && !entry.children.is_empty() {
+            out.push(format_entry(entry, 0, lang));
+            for child in &entry.children {
+                if out.len() >= max_lines {
+                    break;
+                }
+                out.push(format_entry(child, 1, lang));
+                for grandchild in &child.children {
+                    if out.len() >= max_lines {
+                        break;
+                    }
+                    out.push(format_entry(grandchild, 2, lang));
+                }
             }
-            out.push(format_entry(child, 1, lang));
+        } else {
+            out.push(format_entry(entry, 0, lang));
+            for child in &entry.children {
+                if out.len() >= max_lines {
+                    break;
+                }
+                out.push(format_entry(child, 1, lang));
+            }
         }
     }
 
