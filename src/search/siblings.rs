@@ -45,6 +45,9 @@ fn sibling_query_str(lang: Lang) -> Option<&'static str> {
             "(member_access_expression expression: (this_expression) name: (identifier) @ref)\n",
             "(invocation_expression function: (member_access_expression expression: (this_expression) name: (identifier) @ref))\n",
         )),
+        Lang::Swift => Some(
+            "(navigation_expression target: (self_expression) suffix: (navigation_suffix suffix: (simple_identifier) @ref))\n",
+        ),
         _ => None,
     }
 }
