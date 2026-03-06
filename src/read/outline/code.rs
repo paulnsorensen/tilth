@@ -167,8 +167,7 @@ fn node_to_entry(
         }
 
         // Module declarations
-        "mod_item" | "module" | "namespace_declaration"
-        | "file_scoped_namespace_declaration" => {
+        "mod_item" | "module" | "namespace_declaration" | "file_scoped_namespace_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
             (OutlineKind::Module, name, None)
         }
@@ -219,12 +218,10 @@ fn collect_children(
     let mut cursor = node.walk();
 
     // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
-    let body = node
-        .children(&mut cursor)
-        .find(|c| {
-            let k = c.kind();
-            k.contains("body") || k.contains("block") || k == "declaration_list"
-        });
+    let body = node.children(&mut cursor).find(|c| {
+        let k = c.kind();
+        k.contains("body") || k.contains("block") || k == "declaration_list"
+    });
 
     let parent = body.unwrap_or(node);
     let mut cursor2 = parent.walk();
