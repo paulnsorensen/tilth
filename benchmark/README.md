@@ -6,7 +6,7 @@ Automated evaluation of tilth's impact on AI agent code navigation.
 
 | Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|---|
-| Sonnet 4.5 | 26 | 78 | $0.26 | $0.17 | **-34%** | 96% | 100% |
+| Sonnet 4.6 | 26 | 78 | $0.26 | $0.17 | **-34%** | 96% | 100% |
 | Opus 4.6 | 26 | 52 | $0.20 | $0.16 | **-19%** | 96% | 96% |
 | Haiku 4.5 | 22† | 65 | $0.17 | $0.11 | **-38%** | 58% | 87% |
 | **Average** | | **195** | **$0.21** | **$0.15** | **-30%** | **83%** | **95%** |
@@ -25,7 +25,7 @@ expected_cost = cost_per_attempt × (1 / accuracy)
 
 **Cost per correct answer** (`total_spend / correct_answers`) computes this exactly. It's mathematically equivalent to `avg_cost / accuracy_rate` — not an arbitrary penalty, but the expected cost under retry.
 
-## Sonnet 4.5 (78 runs)
+## Sonnet 4.6 (78 runs)
 
 26 tasks across 4 repos. 26 baseline + 52 tilth runs (2 reps). 91% tilth tool adoption.
 
@@ -168,7 +168,7 @@ Haiku tilth adoption improved from 42% (v0.4.1) to 78% — but still not 100%. U
 | Model | tilth_search/run | tilth_read/run | tilth_files/run | Host tools/run | Adoption rate |
 |---|---|---|---|---|---|
 | Haiku 4.5 | 0.9 | 4.5 | 0.8 | 3.9 | 62% |
-| Sonnet 4.5 | 2.0 | 3.3 | 0.9 | 0.6 | 91% |
+| Sonnet 4.6 | 2.0 | 3.3 | 0.9 | 0.6 | 91% |
 | Opus 4.6 | 2.0 | 3.0 | 0.4 | 0.2 | 96% |
 
 Adoption scales with model capability: Haiku 62%, Sonnet 91%, Opus 96%. Haiku tilth adoption nearly doubled from 42% (v0.4.1) to 62% but still falls short — forced mode (`--disallowedTools`) remains recommended for smaller models.
