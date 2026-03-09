@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 //   claude-desktop: ~/Library/Application Support/Claude/...  (global)
 //   opencode:       ~/.opencode.json                          (user scope)
 //   gemini:         ~/.gemini/settings.json                   (user scope)
+//   codex:          ~/.codex/config.toml                      (user scope, TOML)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
@@ -21,50 +22,45 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "claude-desktop",
     "opencode",
     "gemini",
+    "codex",
 ];
 
-/// The tilth server entry injected into each host config.
-///
-/// Detects how tilth was installed and picks the right command:
-/// - npm/npx install: `"command": "npx"` with `["tilth", "--mcp"]` args
-///   (bare `tilth` may not be in PATH; npx temp dirs are ephemeral)
-/// - cargo install: absolute exe path (doesn't depend on PATH)
+/// The tilth server entry as JSON, for hosts that use JSON config.
 fn tilth_server_entry(edit: bool) -> Value {
-    let mut mcp_args: Vec<String> = vec!["--mcp".into()];
-    if edit {
-        mcp_args.push("--edit".into());
-    }
-
-    // Detect npm/npx install by checking if our exe lives inside node_modules.
-    let via_npm = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.contains("node_modules")))
-        .unwrap_or(false);
-
-    if via_npm {
-        let mut args = vec!["tilth".to_string()];
-        args.extend(mcp_args);
-        json!({
-            "command": "npx",
-            "args": args
-        })
-    } else {
-        // Use absolute path — more robust than bare "tilth" which depends on PATH.
-        let command = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| "tilth".into());
-        json!({
-            "command": command,
-            "args": mcp_args
-        })
-    }
+    let (command, args) = tilth_command_and_args(edit);
+    json!({
+        "command": command,
+        "args": args
+    })
 }
 
 /// Write MCP config for the given host, preserving existing config.
 pub fn run(host: &str, edit: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
 
+    if let Some(parent) = host_info.path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+
+    if host == "codex" {
+        write_codex_toml(&host_info, edit)?;
+    } else {
+        write_json_config(&host_info, edit)?;
+    }
+
+    if edit {
+        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
+    } else {
+        eprintln!("✓ tilth added to {}", host_info.path.display());
+    }
+    if let Some(note) = host_info.note {
+        eprintln!("  {note}");
+    }
+    Ok(())
+}
+
+fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let mut config: Value = if host_info.path.exists() {
         let raw = fs::read_to_string(&host_info.path)
             .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?;
@@ -74,7 +70,6 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
         json!({})
     };
 
-    // VS Code uses "servers" key; all others use "mcpServers"
     let servers_key = host_info.servers_key;
 
     config
@@ -86,25 +81,79 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
         .ok_or_else(|| format!("{servers_key} is not a JSON object"))?
         .insert("tilth".into(), tilth_server_entry(edit));
 
-    if let Some(parent) = host_info.path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
-
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
     fs::write(&host_info.path, &out)
         .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
-
-    if edit {
-        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
-    } else {
-        eprintln!("✓ tilth added to {}", host_info.path.display());
-    }
-    if let Some(note) = host_info.note {
-        eprintln!("  {note}");
-    }
     Ok(())
+}
+
+/// Codex CLI uses TOML config at ~/.codex/config.toml.
+/// Appends/replaces the `[mcp_servers.tilth]` section.
+fn write_codex_toml(host_info: &HostInfo, edit: bool) -> Result<(), String> {
+    let (command, args) = tilth_command_and_args(edit);
+
+    // Build the TOML section
+    let args_toml: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+    let section = format!(
+        "[mcp_servers.tilth]\ncommand = \"{}\"\nargs = [{}]\n",
+        command,
+        args_toml.join(", ")
+    );
+
+    let existing = if host_info.path.exists() {
+        fs::read_to_string(&host_info.path)
+            .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?
+    } else {
+        String::new()
+    };
+
+    // Remove existing [mcp_servers.tilth] section if present
+    let output = if let Some(start) = existing.find("[mcp_servers.tilth]") {
+        // Find end of section: next [header] or EOF
+        let rest = &existing[start..];
+        let end = rest[1..] // skip the opening '['
+            .find("\n[")
+            .map_or(existing.len(), |i| start + 1 + i + 1);
+        format!("{}{}{}", &existing[..start], section, &existing[end..])
+    } else {
+        // Append with a blank line separator
+        let sep = if existing.is_empty() || existing.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        format!("{existing}{sep}\n{section}")
+    };
+
+    fs::write(&host_info.path, &output)
+        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    Ok(())
+}
+
+/// Returns (command, args) for the tilth MCP server entry.
+fn tilth_command_and_args(edit: bool) -> (String, Vec<String>) {
+    let mut mcp_args: Vec<String> = vec!["--mcp".into()];
+    if edit {
+        mcp_args.push("--edit".into());
+    }
+
+    let via_npm = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.contains("node_modules")))
+        .unwrap_or(false);
+
+    if via_npm {
+        let mut args = vec!["tilth".to_string()];
+        args.extend(mcp_args);
+        ("npx".into(), args)
+    } else {
+        let command = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "tilth".into());
+        (command, mcp_args)
+    }
 }
 
 struct HostInfo {
@@ -166,6 +215,13 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         "gemini" => Ok(HostInfo {
             path: home.join(".gemini/settings.json"),
             servers_key: "mcpServers",
+            note: Some("User scope — available in all projects."),
+        }),
+
+        // Codex CLI user scope: ~/.codex/config.toml → [mcp_servers.tilth] (TOML)
+        "codex" => Ok(HostInfo {
+            path: home.join(".codex/config.toml"),
+            servers_key: "mcp_servers",
             note: Some("User scope — available in all projects."),
         }),
 
