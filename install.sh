@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO="flysikring/tilth"
+REPO="jahala/tilth"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
