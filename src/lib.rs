@@ -77,6 +77,8 @@ fn run_inner(
 
         QueryType::Content(text) => search::search_content(&text, scope, cache)?,
 
+        QueryType::Regex(pattern) => search::search_regex(&pattern, scope, cache)?,
+
         QueryType::Fallthrough(text) => {
             // Path-like query that didn't resolve. Try symbol, then content.
             // Use structured total_found check, not string matching.

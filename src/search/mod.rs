@@ -242,6 +242,16 @@ pub fn search_content(
     format_search_result(&result, cache, None, &bloom, 0)
 }
 
+pub fn search_regex(
+    pattern: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    let result = content::search(pattern, scope, true, None)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result(&result, cache, None, &bloom, 0)
+}
+
 pub fn search_content_expanded(
     query: &str,
     scope: &Path,

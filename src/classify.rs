@@ -5,6 +5,17 @@ use crate::types::QueryType;
 /// Classify a query string into a `QueryType` by byte-pattern matching.
 /// No regex engine — `matches!` compiles to a jump table.
 pub fn classify(query: &str, scope: &Path) -> QueryType {
+    // 0. Slash-wrapped regex — /pattern/ → regex content search.
+    //    Must come before glob check: regex metacharacters ([, {, *) overlap with glob syntax.
+    //    Only if the inner pattern contains regex metacharacters — otherwise /src/ would be
+    //    misclassified as regex instead of a path.
+    if query.len() >= 3 && query.starts_with('/') && query.ends_with('/') {
+        let pattern = &query[1..query.len() - 1];
+        if !pattern.is_empty() && has_regex_metachar(pattern) {
+            return QueryType::Regex(pattern.into());
+        }
+    }
+
     // 1. Glob — check first because globs can contain path separators.
     //    But only if no spaces: real globs don't have spaces, content like "import { X }" does.
     if !query.contains(' ')
@@ -91,6 +102,28 @@ fn looks_like_filename(query: &str) -> bool {
     )
 }
 
+/// Does the pattern contain regex metacharacters?
+/// Used to distinguish `/pattern/` regex from `/path/` paths.
+fn has_regex_metachar(s: &str) -> bool {
+    s.bytes().any(|b| {
+        matches!(
+            b,
+            b'(' | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'*'
+                | b'+'
+                | b'?'
+                | b'|'
+                | b'\\'
+                | b'^'
+                | b'$'
+        )
+    })
+}
+
 /// Identifier check without regex: first byte is [a-zA-Z_$@],
 /// rest are [a-zA-Z0-9_$\.\-]. Tight loop over bytes.
 fn is_identifier(s: &str) -> bool {
@@ -115,6 +148,35 @@ fn is_identifier(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn regex_patterns() {
+        let scope = PathBuf::from(".");
+        assert!(matches!(
+            classify("/render(Call|Result)/", &scope),
+            QueryType::Regex(_)
+        ));
+        assert!(matches!(
+            classify("/renderC[a-z]+/", &scope),
+            QueryType::Regex(_)
+        ));
+        assert!(matches!(
+            classify("/renderC[a-z]{3}/", &scope),
+            QueryType::Regex(_)
+        ));
+        assert!(matches!(
+            classify("/renderC.*/", &scope),
+            QueryType::Regex(_)
+        ));
+        // Single slash or empty pattern should not be regex
+        assert!(!matches!(classify("//", &scope), QueryType::Regex(_)));
+        // Inner slashes = path, not regex
+        assert!(!matches!(
+            classify("/src/lib.rs/", &scope),
+            QueryType::Regex(_)
+        ));
+        assert!(!matches!(classify("/src/", &scope), QueryType::Regex(_)));
+    }
 
     #[test]
     fn glob_patterns() {

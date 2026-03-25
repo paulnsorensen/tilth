@@ -8,6 +8,8 @@ pub enum QueryType {
     Glob(String),
     Symbol(String),
     Content(String),
+    /// Slash-wrapped regex: `/pattern/` → regex content search.
+    Regex(String),
     /// Path-like query that didn't resolve — try symbol, then content.
     Fallthrough(String),
 }
