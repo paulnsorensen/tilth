@@ -87,6 +87,7 @@ fn score(
 
     s += basename_boost(&m.path, query);
     s += exported_api_boost(m);
+    s += non_code_penalty(&m.path);
 
     if is_test_file(&m.path) && !looks_like_test_query(query) {
         s -= 120;
@@ -112,19 +113,32 @@ fn basename_boost(path: &Path, query: &str) -> i32 {
     let query_lower = query.to_ascii_lowercase();
 
     if stem_lower == query_lower {
-        return 300;
+        return 500;
     }
     if stem_lower.starts_with(&query_lower)
         && stem_lower
             .as_bytes()
             .get(query_lower.len())
-            .is_some_and(|&b| b == b'_' || b == b'.')
+            .is_some_and(|&b| b == b'_' || b == b'.' || b == b'-')
     {
-        return 150;
+        return 350;
+    }
+    if stem_lower.ends_with(&query_lower) {
+        return 250;
     }
     if stem_lower.contains(&query_lower) {
-        return 100;
+        return 180;
     }
+
+    let parent_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if parent_name.eq_ignore_ascii_case(query) {
+        return 200;
+    }
+
     0
 }
 
@@ -264,6 +278,36 @@ fn fixture_penalty(m: &Match) -> i32 {
         }
     }
     score
+}
+
+fn non_code_penalty(path: &Path) -> i32 {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let path_str = path.to_string_lossy();
+
+    let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst"
+        || path_str.contains("docs/") || path_str.contains("doc/");
+
+    let is_config_example = (path_str.contains("example") || path_str.contains("sample")
+        || path_str.contains("template"))
+        && (ext == "md" || ext == "txt" || ext == "rst");
+
+    let is_generated = path_str.contains("generated") || path_str.contains("dist/")
+        || path_str.contains("build/");
+
+    let mut penalty = 0;
+    if is_docs {
+        penalty -= 250;
+    }
+    if is_config_example {
+        penalty -= 80;
+    }
+    if is_generated {
+        penalty -= 150;
+    }
+    penalty
 }
 
 fn looks_like_test_query(query: &str) -> bool {
@@ -438,5 +482,59 @@ mod tests {
         sort(&mut matches, "handleAuth", &scope, None);
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
+    }
+
+    #[test]
+    fn prefers_thinking_logic_over_schema_for_concept_query() {
+        let scope = PathBuf::from("/repo/src");
+        let mut matches = vec![
+            make_match(
+                "/repo/src/internal/interfaces/client_models.go",
+                "ThinkingConfig *GenerationConfigThinkingConfig `json:\"thinkingConfig,omitempty\"`",
+                false,
+                None,
+            ),
+            make_match(
+                "/repo/src/internal/util/thinking.go",
+                "func NormalizeThinkingBudget(model string, requested int) int {",
+                true,
+                Some("NormalizeThinkingBudget"),
+            ),
+        ];
+
+        sort(&mut matches, "thinking", &scope, None);
+
+        assert!(
+            matches[0].path.to_string_lossy().contains("thinking.go"),
+            "expected thinking.go first, got {:?}",
+            matches[0].path,
+        );
+    }
+
+    #[test]
+    fn prefers_model_mapping_logic_over_docs_for_alias_query() {
+        let scope = PathBuf::from("/repo/src");
+        let mut matches = vec![
+            make_match(
+                "/repo/src/docs/FORCE_HANDLER_GUIDE.md",
+                "Alias routing example",
+                false,
+                None,
+            ),
+            make_match(
+                "/repo/src/internal/api/modules/amp/model_mapping.go",
+                "func (m *DefaultModelMapper) MapModel(requestedModel string) string {",
+                true,
+                Some("MapModel"),
+            ),
+        ];
+
+        sort(&mut matches, "alias", &scope, None);
+
+        assert!(
+            matches[0].path.to_string_lossy().contains("model_mapping"),
+            "expected model_mapping.go first, got {:?}",
+            matches[0].path,
+        );
     }
 }
