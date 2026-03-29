@@ -359,7 +359,7 @@ fn tool_search(
             session.record_search(query);
             let result = crate::search::content::search(query, &scope, true, context)
                 .map_err(|e| e.to_string())?;
-            crate::search::format_content_result(&result, cache)
+            crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
             session.record_search(query);

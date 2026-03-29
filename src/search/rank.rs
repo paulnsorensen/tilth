@@ -228,8 +228,8 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
     let looks_fn = query.chars().next().is_some_and(char::is_lowercase);
     let text = m.text.trim_start();
 
-    if looks_type {
-        if text.starts_with("struct ")
+    if looks_type
+        && (text.starts_with("struct ")
             || text.starts_with("pub struct ")
             || text.starts_with("enum ")
             || text.starts_with("pub enum ")
@@ -241,10 +241,9 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
             || text.starts_with("export type ")
             || text.starts_with("class ")
             || text.starts_with("export class ")
-            || text.starts_with("impl ")
-        {
-            return 90;
-        }
+            || text.starts_with("impl "))
+    {
+        return 90;
     }
 
     if looks_fn
@@ -306,14 +305,18 @@ fn incidental_text_penalty(m: &Match, query: &str) -> i32 {
 
     // Only use unambiguous comment prefixes — avoid '#' (Python/C preprocessor/Rust attrs)
     // and '*' (could be pointer deref, multiplication, glob, etc.)
-    let is_comment = text.starts_with("//")
+    // Exempt /// doc comments — they're often the most useful context for a symbol.
+    let is_comment = (text.starts_with("//") && !text.starts_with("///"))
         || text.starts_with("/*")
         || text.starts_with("<!--");
 
     // For '#' lines: only treat as comment in languages where # is always a comment
     let is_hash_comment = text.starts_with('#') && {
         let ext = m.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        matches!(ext, "py" | "rb" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "pl" | "r" | "R")
+        matches!(
+            ext,
+            "py" | "rb" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "pl" | "r" | "R"
+        )
     };
 
     if is_comment || is_hash_comment {
@@ -348,7 +351,7 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
 
     let path_lower = m.path.to_string_lossy().to_ascii_lowercase();
     let text_lower = m.text.to_ascii_lowercase();
-    let haystack = format!("{} {}", path_lower, text_lower);
+    let haystack = format!("{path_lower} {text_lower}");
 
     let matched = words
         .iter()
@@ -366,18 +369,22 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
 
 /// Penalize non-code files: docs, config examples, generated output.
 /// Returns positive value (subtracted from score by caller).
-/// Note: dist/, build/ are NOT penalized here — they are already covered by VENDOR_DIRS.
+/// Note: `dist/`, `build/` are NOT penalized here — they are already covered by `VENDOR_DIRS`.
 fn non_code_penalty(path: &Path) -> i32 {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    // Match on path components to avoid false positives (redoc/, javadoc/, pydoc/)
+    let has_docs_component = path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s == "docs" || s == "doc")
+    });
+
+    let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst" || has_docs_component;
+
     let path_str = path.to_string_lossy();
-
-    let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst"
-        || path_str.contains("docs/") || path_str.contains("doc/");
-
-    let is_config_example = (path_str.contains("example") || path_str.contains("sample")
+    let is_config_example = (path_str.contains("example")
+        || path_str.contains("sample")
         || path_str.contains("template"))
         && (ext == "md" || ext == "txt" || ext == "rst");
 
@@ -671,20 +678,33 @@ mod tests {
             None,
         );
         let penalty = super::fixture_penalty(&m);
-        assert!(penalty <= 200, "fixture_penalty was {penalty}, expected <= 200");
+        assert!(
+            penalty <= 200,
+            "fixture_penalty was {penalty}, expected <= 200"
+        );
         assert!(penalty > 0);
     }
 
     #[test]
     fn fixture_penalty_zero_for_normal_code() {
-        let m = make_match("/repo/src/auth.ts", "export function handleAuth() {", true, Some("handleAuth"));
+        let m = make_match(
+            "/repo/src/auth.ts",
+            "export function handleAuth() {",
+            true,
+            Some("handleAuth"),
+        );
         assert_eq!(super::fixture_penalty(&m), 0);
     }
 
     #[test]
     fn incidental_text_penalty_comment_line() {
         // Lines starting with // should be penalized
-        let m = make_match("/repo/src/lib.rs", "// handleAuth is deprecated", false, None);
+        let m = make_match(
+            "/repo/src/lib.rs",
+            "// handleAuth is deprecated",
+            false,
+            None,
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 150);
     }
 
@@ -698,7 +718,12 @@ mod tests {
     #[test]
     fn incidental_text_penalty_hash_comment_in_python() {
         // # in .py files IS a comment — should be penalized
-        let m = make_match("/repo/src/main.py", "# handle_auth is deprecated", false, None);
+        let m = make_match(
+            "/repo/src/main.py",
+            "# handle_auth is deprecated",
+            false,
+            None,
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handle_auth"), 150);
     }
 
@@ -712,29 +737,61 @@ mod tests {
     #[test]
     fn incidental_text_penalty_no_string_literal_heuristic() {
         // String literals should NOT be penalized (fragile heuristic removed)
-        let m = make_match("/repo/src/lib.rs", r#"let msg = "handleAuth error";"#, false, None);
+        let m = make_match(
+            "/repo/src/lib.rs",
+            r#"let msg = "handleAuth error";"#,
+            false,
+            None,
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 0);
     }
 
     #[test]
     fn incidental_text_penalty_trailing_comment() {
         // Query only in trailing comment should be penalized
-        let m = make_match("/repo/src/lib.rs", "let x = 1; // handleAuth workaround", false, None);
+        let m = make_match(
+            "/repo/src/lib.rs",
+            "let x = 1; // handleAuth workaround",
+            false,
+            None,
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 100);
     }
 
     #[test]
     fn incidental_text_penalty_url_not_comment() {
         // :// is a URL scheme — should NOT be treated as trailing comment
-        let m = make_match("/repo/src/lib.rs", r#"let url = "https://handleAuth.example.com";"#, false, None);
+        let m = make_match(
+            "/repo/src/lib.rs",
+            r#"let url = "https://handleAuth.example.com";"#,
+            false,
+            None,
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 0);
     }
 
     #[test]
     fn incidental_text_penalty_skip_definitions() {
         // Definitions should never be penalized
-        let m = make_match("/repo/src/lib.rs", "// handleAuth docs", true, Some("handleAuth"));
+        let m = make_match(
+            "/repo/src/lib.rs",
+            "// handleAuth docs",
+            true,
+            Some("handleAuth"),
+        );
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 0);
+    }
+
+    #[test]
+    fn incidental_text_penalty_doc_comment_exempt() {
+        // /// doc comments should NOT be penalized — they provide useful symbol context
+        let m = make_match(
+            "/repo/src/lib.rs",
+            "/// Handles auth validation for incoming requests",
+            false,
+            None,
+        );
+        assert_eq!(super::incidental_text_penalty(&m, "auth"), 0);
     }
 
     #[test]
@@ -753,8 +810,12 @@ mod tests {
     #[test]
     fn vendor_path_detects_dist_and_build() {
         // dist/ and build/ are in VENDOR_DIRS — this is where the penalty comes from
-        assert!(super::is_vendor_path(&PathBuf::from("/repo/dist/bundle.js")));
-        assert!(super::is_vendor_path(&PathBuf::from("/repo/build/output.js")));
+        assert!(super::is_vendor_path(&PathBuf::from(
+            "/repo/dist/bundle.js"
+        )));
+        assert!(super::is_vendor_path(&PathBuf::from(
+            "/repo/build/output.js"
+        )));
         assert!(!super::is_vendor_path(&PathBuf::from("/repo/src/auth.rs")));
     }
 }

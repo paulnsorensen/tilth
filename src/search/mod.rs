@@ -282,17 +282,8 @@ pub fn search_regex_raw(pattern: &str, scope: &Path) -> Result<SearchResult, Til
     content::search(pattern, scope, true, None)
 }
 
-/// Format a symbol search result (public for Fallthrough path in lib.rs).
-pub fn format_symbol_result(
-    result: &SearchResult,
-    cache: &OutlineCache,
-) -> Result<String, TilthError> {
-    let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(result, cache, None, &bloom, 0)
-}
-
-/// Format a content search result (public for Fallthrough path in lib.rs).
-pub fn format_content_result(
+/// Format a raw search result (symbol or content — both use the same pipeline).
+pub fn format_raw_result(
     result: &SearchResult,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
@@ -693,9 +684,8 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
     let mut best_priority: u8 = 0;
 
     for m in matches {
-        let stem = match m.path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
+        let Some(stem) = m.path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
         };
         if stem.to_ascii_lowercase() != query_lower {
             continue;
@@ -753,9 +743,8 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         if !path.is_file() {
             continue;
         }
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
         };
         if stem.to_ascii_lowercase() != *query_lower {
             continue;
@@ -774,8 +763,8 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 /// return a compact outline of that file. Helps concept queries like `cli`
 /// surface the file `cli.ts` with structural context instead of scattered text matches.
 ///
-/// Uses the already-collected search results to find basename matches,
-/// avoiding an expensive directory walk in the formatting path.
+/// Scans the already-collected search results first (fast path), falls back to
+/// a lightweight directory walk when the basename file didn't survive truncation.
 fn basename_file_outline(
     query: &str,
     matches: &[Match],
@@ -791,7 +780,6 @@ fn basename_file_outline(
 
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
-        // Fallback: lightweight directory scan when basename file didn't survive truncation
         .or_else(|| find_basename_fallback(scope, &query_lower))?;
 
     // Read file and generate outline

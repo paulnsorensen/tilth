@@ -76,65 +76,14 @@ fn run_inner(
         QueryType::Symbol(name) => search::search_symbol(&name, scope, cache)?,
 
         QueryType::Concept(text) => {
-            // Concept query: route differently based on word count.
             let is_multi_word = text.contains(' ');
 
             if is_multi_word {
-                // Multi-word concepts: exact phrase first, then relaxed word proximity
-                let mut content_result = search::search_content_raw(&text, scope)?;
-                content_result.query = text.clone();
-                if content_result.total_found > 0 {
-                    search::format_content_result(&content_result, cache)?
-                } else {
-                    // Relaxed: match all words in any order (word1.*word2|word2.*word1)
-                    let words: Vec<&str> = text.split_whitespace().collect();
-                    let relaxed = if words.len() == 2 {
-                        format!(
-                            "{}.*{}|{}.*{}",
-                            regex_syntax::escape(words[0]),
-                            regex_syntax::escape(words[1]),
-                            regex_syntax::escape(words[1]),
-                            regex_syntax::escape(words[0]),
-                        )
-                    } else {
-                        // 3+ words: match any word (OR), rely on multi_word_boost in ranking
-                        words
-                            .iter()
-                            .map(|w| regex_syntax::escape(w))
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    };
-                    let mut relaxed_result = search::search_regex_raw(&relaxed, scope)?;
-                    relaxed_result.query = text.clone();
-                    if relaxed_result.total_found > 0 {
-                        search::format_content_result(&relaxed_result, cache)?
-                    } else {
-                        let first_word = words.first().copied().unwrap_or(&text);
-                        return Err(TilthError::NotFound {
-                            path: scope.join(&text),
-                            suggestion: read::suggest_similar_file(scope, first_word),
-                        });
-                    }
-                }
+                multi_word_concept_search(&text, scope, cache)?
             } else {
-                // Single-word concept: try symbol first (may match a definition),
-                // fall back to content.
-                let sym_result = search::search_symbol_raw(&text, scope)?;
-                if sym_result.definitions > 0 {
-                    search::format_symbol_result(&sym_result, cache)?
-                } else {
-                    let content_result = search::search_content_raw(&text, scope)?;
-                    if content_result.total_found > 0 {
-                        search::format_content_result(&content_result, cache)?
-                    } else if sym_result.total_found > 0 {
-                        search::format_symbol_result(&sym_result, cache)?
-                    } else {
-                        return Err(TilthError::NotFound {
-                            path: scope.join(&text),
-                            suggestion: read::suggest_similar_file(scope, &text),
-                        });
-                    }
-                }
+                // Single-word concept: prefer definitions, then content, then any match.
+                // Differs from Fallthrough which accepts any match immediately.
+                single_query_search(&text, scope, cache, true)?
             }
         }
 
@@ -142,29 +91,94 @@ fn run_inner(
 
         QueryType::Regex(pattern) => search::search_regex(&pattern, scope, cache)?,
 
-        QueryType::Fallthrough(text) => {
-            // Path-like query that didn't resolve. Try symbol, then content.
-            // Use structured total_found check, not string matching.
-            let sym_result = search::search_symbol_raw(&text, scope)?;
-            if sym_result.total_found > 0 {
-                search::format_symbol_result(&sym_result, cache)?
-            } else {
-                let content_result = search::search_content_raw(&text, scope)?;
-                if content_result.total_found > 0 {
-                    search::format_content_result(&content_result, cache)?
-                } else {
-                    let resolved = scope.join(&text);
-                    return Err(TilthError::NotFound {
-                        path: resolved,
-                        suggestion: read::suggest_similar_file(scope, &text),
-                    });
-                }
-            }
-        }
+        QueryType::Fallthrough(text) => single_query_search(&text, scope, cache, false)?,
     };
 
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
     }
+}
+
+/// Shared cascade for single-word queries: symbol → content → not found.
+///
+/// When `prefer_definitions` is true (Concept path), only accept symbol results
+/// that contain actual definitions; fall back to content otherwise.
+/// When false (Fallthrough path), accept any symbol match immediately.
+fn single_query_search(
+    text: &str,
+    scope: &Path,
+    cache: &cache::OutlineCache,
+    prefer_definitions: bool,
+) -> Result<String, error::TilthError> {
+    let sym_result = search::search_symbol_raw(text, scope)?;
+    let accept_sym = if prefer_definitions {
+        sym_result.definitions > 0
+    } else {
+        sym_result.total_found > 0
+    };
+
+    if accept_sym {
+        return search::format_raw_result(&sym_result, cache);
+    }
+
+    let content_result = search::search_content_raw(text, scope)?;
+    if content_result.total_found > 0 {
+        return search::format_raw_result(&content_result, cache);
+    }
+
+    // For concept queries: if symbol had usages but no definitions, show those
+    if prefer_definitions && sym_result.total_found > 0 {
+        return search::format_raw_result(&sym_result, cache);
+    }
+
+    Err(error::TilthError::NotFound {
+        path: scope.join(text),
+        suggestion: read::suggest_similar_file(scope, text),
+    })
+}
+
+/// Multi-word concept search: exact phrase first, then relaxed word proximity.
+fn multi_word_concept_search(
+    text: &str,
+    scope: &Path,
+    cache: &cache::OutlineCache,
+) -> Result<String, error::TilthError> {
+    // Try exact phrase match first
+    let mut content_result = search::search_content_raw(text, scope)?;
+    content_result.query.clone_from(&text.to_string());
+    if content_result.total_found > 0 {
+        return search::format_raw_result(&content_result, cache);
+    }
+
+    // Relaxed: match all words in any order
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let relaxed = if words.len() == 2 {
+        format!(
+            "{}.*{}|{}.*{}",
+            regex_syntax::escape(words[0]),
+            regex_syntax::escape(words[1]),
+            regex_syntax::escape(words[1]),
+            regex_syntax::escape(words[0]),
+        )
+    } else {
+        // 3+ words: match any word (OR), rely on multi_word_boost in ranking
+        words
+            .iter()
+            .map(|w| regex_syntax::escape(w))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+
+    let mut relaxed_result = search::search_regex_raw(&relaxed, scope)?;
+    relaxed_result.query.clone_from(&text.to_string());
+    if relaxed_result.total_found > 0 {
+        return search::format_raw_result(&relaxed_result, cache);
+    }
+
+    let first_word = words.first().copied().unwrap_or(text);
+    Err(error::TilthError::NotFound {
+        path: scope.join(text),
+        suggestion: read::suggest_similar_file(scope, first_word),
+    })
 }

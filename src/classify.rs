@@ -89,9 +89,9 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
 /// Does this single-token query look like an exact symbol name?
 ///
 /// Heuristics (all generic, no domain knowledge):
-/// - PascalCase (starts uppercase): `SearchResult`, `MapModel`, `AuthService`
+/// - `PascalCase` (starts uppercase): `SearchResult`, `MapModel`, `AuthService`
 /// - Contains `::` or `.`: `std::path`, `Auth.validate`
-/// - snake_case with underscore: `handle_auth`, `is_test_file`
+/// - `snake_case` with underscore: `handle_auth`, `is_test_file`
 /// - Has mixed case after first char: `handleAuth`, `getElementById`
 /// - Starts with `$` or `@`: `$ref`, `@decorator`
 fn looks_like_exact_symbol(query: &str) -> bool {
@@ -126,7 +126,7 @@ fn looks_like_exact_symbol(query: &str) -> bool {
     }
 
     // camelCase: starts lowercase but has uppercase later → likely function/method name
-    if bytes[0].is_ascii_lowercase() && bytes[1..].iter().any(|b| b.is_ascii_uppercase()) {
+    if bytes[0].is_ascii_lowercase() && bytes[1..].iter().any(u8::is_ascii_uppercase) {
         return true;
     }
 
@@ -296,7 +296,10 @@ mod tests {
     fn concept_queries() {
         let scope = PathBuf::from(".");
         // Single lowercase words → concept, not symbol
-        assert!(matches!(classify("thinking", &scope), QueryType::Concept(_)));
+        assert!(matches!(
+            classify("thinking", &scope),
+            QueryType::Concept(_)
+        ));
         assert!(matches!(classify("alias", &scope), QueryType::Concept(_)));
         assert!(matches!(classify("cli", &scope), QueryType::Concept(_)));
         assert!(matches!(classify("mode", &scope), QueryType::Concept(_)));
@@ -325,10 +328,7 @@ mod tests {
             classify("SearchResult", &scope),
             QueryType::Symbol(_)
         ));
-        assert!(matches!(
-            classify("MapModel", &scope),
-            QueryType::Symbol(_)
-        ));
+        assert!(matches!(classify("MapModel", &scope), QueryType::Symbol(_)));
         // camelCase → symbol
         assert!(matches!(
             classify("handleAuth", &scope),
