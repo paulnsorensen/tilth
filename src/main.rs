@@ -44,6 +44,18 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
+    /// Expand top N search matches with inline source (default: 2 when flag present).
+    #[arg(long, num_args = 0..=1, default_missing_value = "2")]
+    expand: Option<usize>,
+
+    /// Find all callers of a symbol.
+    #[arg(long)]
+    callers: bool,
+
+    /// Analyze blast-radius dependencies of a file.
+    #[arg(long)]
+    deps: bool,
+
     /// Generate a structural codebase map.
     #[arg(long)]
     map: bool,
@@ -123,8 +135,32 @@ fn main() {
 
     // When piped (not a TTY), force full output — scripts expect raw content
     let full = cli.full || !is_tty;
+    let expand = cli.expand.unwrap_or(0);
 
-    let result = if full {
+    // Callers mode
+    if cli.callers {
+        let result = tilth::run_callers(&query, &scope, expand, cli.budget, &cache);
+        match result {
+            Ok(output) => emit_output(&output, is_tty),
+            Err(e) => { eprintln!("{e}"); process::exit(e.exit_code()); }
+        }
+        return;
+    }
+
+    // Deps mode
+    if cli.deps {
+        let path = scope.join(&query);
+        let result = tilth::run_deps(&path, &scope, cli.budget, &cache);
+        match result {
+            Ok(output) => emit_output(&output, is_tty),
+            Err(e) => { eprintln!("{e}"); process::exit(e.exit_code()); }
+        }
+        return;
+    }
+
+    let result = if expand > 0 {
+        tilth::run_expanded(&query, &scope, cli.section.as_deref(), cli.budget, full, expand, &cache)
+    } else if full {
         tilth::run_full(&query, &scope, cli.section.as_deref(), cli.budget, &cache)
     } else {
         tilth::run(&query, &scope, cli.section.as_deref(), cli.budget, &cache)
