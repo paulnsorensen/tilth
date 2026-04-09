@@ -241,7 +241,10 @@ new file mode 100644
         assert_eq!(diffs.len(), 1);
         let f = &diffs[0];
         assert_eq!(f.status, FileStatus::Added);
-        assert!(f.hunks[0].lines.iter().all(|l| l.kind == DiffLineKind::Added));
+        assert!(f.hunks[0]
+            .lines
+            .iter()
+            .all(|l| l.kind == DiffLineKind::Added));
     }
 
     // ── 3. Deleted file ───────────────────────────────────────────────────────
@@ -260,7 +263,10 @@ deleted file mode 100644
         assert_eq!(diffs.len(), 1);
         let f = &diffs[0];
         assert_eq!(f.status, FileStatus::Deleted);
-        assert!(f.hunks[0].lines.iter().all(|l| l.kind == DiffLineKind::Removed));
+        assert!(f.hunks[0]
+            .lines
+            .iter()
+            .all(|l| l.kind == DiffLineKind::Removed));
     }
 
     // ── 4. Renamed file ───────────────────────────────────────────────────────

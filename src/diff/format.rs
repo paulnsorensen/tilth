@@ -223,10 +223,7 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
 
 /// Format detailed view of a single named function within a file's diff.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
-    let change = overlay
-        .symbol_changes
-        .iter()
-        .find(|c| c.name == fn_name);
+    let change = overlay.symbol_changes.iter().find(|c| c.name == fn_name);
 
     let Some(change) = change else {
         return format!(
@@ -316,11 +313,7 @@ pub(crate) fn format_conflicts(conflicts: &[Conflict], path: &Path) -> String {
 /// ## abc1234 — "message" (2h ago, @author)
 ///   path:  [~:sig] name, [+] name
 /// ```
-pub(crate) fn format_log(
-    summaries: &[CommitSummary],
-    scope: &str,
-    budget: Option<u64>,
-) -> String {
+pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Option<u64>) -> String {
     let path_scope = Path::new(".");
 
     let total_files: usize = summaries.iter().map(|s| s.overlays.len()).sum();
@@ -671,7 +664,10 @@ mod tests {
         let meta: Vec<(&Path, bool, bool)> = vec![(&path, true, false)];
         let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
         assert!(out.contains("generated"), "missing 'generated':\n{out}");
-        assert!(out.contains("lines changed"), "missing 'lines changed':\n{out}");
+        assert!(
+            out.contains("lines changed"),
+            "missing 'lines changed':\n{out}"
+        );
         assert!(
             out.contains("2 lines changed"),
             "expected 2 changed lines:\n{out}"
@@ -724,16 +720,14 @@ mod tests {
     // 8. Multiple files — correct file count, both paths present
     #[test]
     fn test_overview_multiple_files() {
-        let overlay_a =
-            make_overlay("src/a.rs", vec![make_change("fn_a", ChangeType::Added)]);
-        let overlay_b =
-            make_overlay("src/b.rs", vec![make_change("fn_b", ChangeType::BodyChanged)]);
+        let overlay_a = make_overlay("src/a.rs", vec![make_change("fn_a", ChangeType::Added)]);
+        let overlay_b = make_overlay(
+            "src/b.rs",
+            vec![make_change("fn_b", ChangeType::BodyChanged)],
+        );
         let path_a = overlay_a.path.clone();
         let path_b = overlay_b.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![
-            (&path_a, false, false),
-            (&path_b, false, false),
-        ];
+        let meta: Vec<(&Path, bool, bool)> = vec![(&path_a, false, false), (&path_b, false, false)];
         let out = format_overview(&[overlay_a, overlay_b], &meta, &[], "HEAD", None);
         assert!(out.contains("2 files"), "wrong file count:\n{out}");
         assert!(out.contains("src/a.rs"), "missing a.rs:\n{out}");
@@ -763,8 +757,10 @@ mod tests {
     // 10. File detail header — symbol count and +N/-N
     #[test]
     fn test_file_detail_header() {
-        let mut overlay =
-            make_overlay("src/lib.rs", vec![make_change("foo", ChangeType::BodyChanged)]);
+        let mut overlay = make_overlay(
+            "src/lib.rs",
+            vec![make_change("foo", ChangeType::BodyChanged)],
+        );
         overlay.attributed_hunks = vec![(
             "foo".to_string(),
             vec![
@@ -783,10 +779,7 @@ mod tests {
             ],
         )];
         let out = format_file_detail(&overlay, None);
-        assert!(
-            out.starts_with("# Diff: src/lib.rs"),
-            "bad header:\n{out}"
-        );
+        assert!(out.starts_with("# Diff: src/lib.rs"), "bad header:\n{out}");
         assert!(out.contains("+2"), "missing insertions:\n{out}");
         assert!(out.contains('1'), "missing deletions:\n{out}");
     }
@@ -794,8 +787,10 @@ mod tests {
     // 11. File detail — +/-/space prefixes with line numbers
     #[test]
     fn test_file_detail_diff_lines() {
-        let mut overlay =
-            make_overlay("src/lib.rs", vec![make_change("foo", ChangeType::BodyChanged)]);
+        let mut overlay = make_overlay(
+            "src/lib.rs",
+            vec![make_change("foo", ChangeType::BodyChanged)],
+        );
         overlay.attributed_hunks = vec![(
             "foo".to_string(),
             vec![
@@ -854,8 +849,10 @@ mod tests {
     // 14. Function detail — correct name and content
     #[test]
     fn test_function_detail_found() {
-        let mut overlay =
-            make_overlay("src/lib.rs", vec![make_change("my_fn", ChangeType::BodyChanged)]);
+        let mut overlay = make_overlay(
+            "src/lib.rs",
+            vec![make_change("my_fn", ChangeType::BodyChanged)],
+        );
         overlay.attributed_hunks = vec![(
             "my_fn".to_string(),
             vec![DiffLine {
