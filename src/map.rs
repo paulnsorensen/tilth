@@ -76,11 +76,21 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
             _ => None,
         };
 
-        tree.entry(parent).or_default().push(FileEntry {
+        tree.entry(parent.clone()).or_default().push(FileEntry {
             name,
             symbols,
             tokens,
         });
+
+        // Ensure all ancestor directories exist in the tree so format_tree can find them.
+        let mut ancestor = parent.parent();
+        while let Some(a) = ancestor {
+            tree.entry(a.to_path_buf()).or_default();
+            if a == Path::new("") {
+                break;
+            }
+            ancestor = a.parent();
+        }
     }
 
     let mut out = format!("# Map: {} (depth {})\n", scope.display(), depth);
