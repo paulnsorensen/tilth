@@ -310,6 +310,12 @@ fn walk_definitions(
                 symbols.push((Arc::from(iface.as_str()), line, true));
             }
         }
+    } else if crate::lang::treesitter::is_elixir_definition(node, lines) {
+        // Elixir: all definitions are `call` nodes — handle separately
+        if let Some(name) = crate::lang::treesitter::extract_elixir_definition_name(node, lines) {
+            let line = node.start_position().row as u32 + 1;
+            symbols.push((Arc::from(name.as_str()), line, true));
+        }
     }
 
     // Recurse into children for nested definitions (impl blocks, class bodies, modules)

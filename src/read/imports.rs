@@ -59,6 +59,12 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
         Lang::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
         Lang::Go | Lang::Java | Lang::Scala | Lang::Kotlin => trimmed.starts_with("import "),
         Lang::C | Lang::Cpp => trimmed.starts_with("#include"),
+        Lang::Elixir => {
+            trimmed.starts_with("alias ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("require ")
+        }
         _ => false,
     }
 }

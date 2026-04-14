@@ -442,9 +442,16 @@ fn find_enclosing_function(
     while let Some(n) = current {
         let kind = n.kind();
 
-        if DEFINITION_KINDS.contains(&kind) {
-            let name =
-                extract_definition_name(n, lines).unwrap_or_else(|| "<anonymous>".to_string());
+        // Check standard definition kinds, or Elixir call-node definitions
+        let def_name = if DEFINITION_KINDS.contains(&kind) {
+            extract_definition_name(n, lines)
+        } else if crate::lang::treesitter::is_elixir_definition(n, lines) {
+            crate::lang::treesitter::extract_elixir_definition_name(n, lines)
+        } else {
+            None
+        };
+
+        if let Some(name) = def_name {
             let range = Some((
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
@@ -455,6 +462,14 @@ fn find_enclosing_function(
             while let Some(p) = parent {
                 if TYPE_KINDS.contains(&p.kind()) {
                     if let Some(type_name) = extract_definition_name(p, lines) {
+                        return (format!("{type_name}.{name}"), range);
+                    }
+                }
+                // Elixir: defmodule is a call node acting as a type container
+                if crate::lang::treesitter::is_elixir_definition(p, lines) {
+                    if let Some(type_name) =
+                        crate::lang::treesitter::extract_elixir_definition_name(p, lines)
+                    {
                         return (format!("{type_name}.{name}"), range);
                     }
                 }

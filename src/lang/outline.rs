@@ -19,6 +19,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
         Lang::Swift => tree_sitter_swift::LANGUAGE,
         Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
+        Lang::Elixir => tree_sitter_elixir::LANGUAGE,
         Lang::Dockerfile | Lang::Make => {
             return None;
         }
@@ -180,6 +181,16 @@ fn node_to_entry(
             (OutlineKind::Module, name, None)
         }
 
+        // Elixir: all definitions are `call` nodes distinguished by target identifier
+        "call" if lang == Lang::Elixir => {
+            return elixir_call_to_entry(node, lines, lang, depth);
+        }
+
+        // Elixir: @type, @typep, @opaque are unary_operator nodes
+        "unary_operator" if lang == Lang::Elixir => {
+            return elixir_attr_to_entry(node, lines);
+        }
+
         _ => return None,
     };
 
@@ -257,6 +268,16 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
             if let Some(pos) = line.rfind(':') {
                 return line[..pos].trim().to_string();
             }
+        }
+        // Elixir — truncate at ` do` (block form) or `, do:` (keyword form)
+        if let Some(pos) = line.rfind(" do") {
+            let after = &line[pos + 3..];
+            if after.is_empty() || after.starts_with('\n') {
+                return line[..pos].trim().to_string();
+            }
+        }
+        if let Some(pos) = line.find(", do:") {
+            return line[..pos].trim().to_string();
         }
         // Full first line, truncated
         if line.len() > 120 {
@@ -350,6 +371,292 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Elixir-specific outline helpers
+// ---------------------------------------------------------------------------
+
+/// Elixir definition keywords that correspond to outline entries.
+const ELIXIR_DEF_KEYWORDS: &[&str] = &[
+    "def",
+    "defp",
+    "defmacro",
+    "defmacrop",
+    "defguard",
+    "defguardp",
+    "defdelegate",
+];
+
+/// Convert an Elixir `call` node to an outline entry.
+///
+/// In the Elixir tree-sitter grammar, `defmodule`, `def`, `defp`, `defstruct`,
+/// etc. are all `call` nodes whose `target` field is an identifier like `"def"`.
+fn elixir_call_to_entry(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+) -> Option<OutlineEntry> {
+    let target = node.child_by_field_name("target")?;
+    let keyword = node_text(target, lines);
+    let start_line = node.start_position().row as u32 + 1;
+    let end_line = node.end_position().row as u32 + 1;
+
+    let (kind, name, signature) = match keyword.as_str() {
+        "defmodule" => {
+            let name = elixir_first_arg_text(node, lines)?;
+            (OutlineKind::Module, name, None)
+        }
+        kw if ELIXIR_DEF_KEYWORDS.contains(&kw) => {
+            let name = elixir_func_name(node, lines)?;
+            let sig = extract_signature(node, lines);
+            (OutlineKind::Function, name, Some(sig))
+        }
+        "defstruct" | "defexception" => (OutlineKind::Struct, keyword.clone(), None),
+        "defprotocol" => {
+            let name = elixir_first_arg_text(node, lines)?;
+            (OutlineKind::Interface, name, None)
+        }
+        "defimpl" => {
+            let name = elixir_first_arg_text(node, lines)?;
+            (OutlineKind::Module, format!("impl {name}"), None)
+        }
+        "use" | "import" | "alias" | "require" => {
+            let text = node_text(node, lines);
+            (OutlineKind::Import, text, None)
+        }
+        _ => return None,
+    };
+
+    // Collect children for modules, protocols, impls
+    let children = if matches!(kind, OutlineKind::Module | OutlineKind::Interface) && depth < 1 {
+        elixir_collect_children(node, lines, lang, depth + 1)
+    } else {
+        Vec::new()
+    };
+
+    // Extract @doc / @moduledoc from previous sibling
+    let doc = elixir_extract_doc(node, lines);
+
+    Some(OutlineEntry {
+        kind,
+        name,
+        start_line,
+        end_line,
+        signature,
+        children,
+        doc,
+    })
+}
+
+/// Convert an Elixir `unary_operator` node (`@type`, `@typep`, `@opaque`) to an outline entry.
+fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<OutlineEntry> {
+    let operand = node.child_by_field_name("operand")?;
+    if operand.kind() != "call" {
+        return None;
+    }
+    let target = operand.child_by_field_name("target")?;
+    let attr_name = node_text(target, lines);
+    let start_line = node.start_position().row as u32 + 1;
+    let end_line = node.end_position().row as u32 + 1;
+    match attr_name.as_str() {
+        "type" | "typep" | "opaque" => {
+            let name = elixir_type_name(operand, lines)?;
+            let sig = node_text(node, lines);
+            Some(OutlineEntry {
+                kind: OutlineKind::TypeAlias,
+                name,
+                start_line,
+                end_line,
+                signature: Some(sig),
+                children: Vec::new(),
+                doc: None,
+            })
+        }
+        "callback" | "macrocallback" => {
+            let name = elixir_callback_name(operand, lines)?;
+            let sig = node_text(node, lines);
+            Some(OutlineEntry {
+                kind: OutlineKind::Function,
+                name,
+                start_line,
+                end_line,
+                signature: Some(sig),
+                children: Vec::new(),
+                doc: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extract the first argument text from an Elixir call node.
+/// For `defmodule Foo.Bar do ... end`, returns `"Foo.Bar"`.
+fn elixir_first_arg_text(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let args = super::treesitter::elixir_arguments(node)?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if child.is_named() {
+            return Some(node_text(child, lines));
+        }
+    }
+    None
+}
+
+/// Extract function name from an Elixir `def`/`defp` call node.
+///
+/// For `def greet(name) do ... end`, the AST is:
+///   call[target=def] → arguments → call[target=greet] → arguments → ...
+/// For `def greet(name), do: ...` (keyword form), same structure.
+fn elixir_func_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let args = super::treesitter::elixir_arguments(node)?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        return elixir_func_head_name(child, lines);
+    }
+    None
+}
+
+/// Extract function name from a function head node.
+///
+/// Handles three shapes:
+/// - `call`: `greet(name)` → target is `greet`
+/// - `identifier`: `bar` (no-arg, no-parens)
+/// - `binary_operator[when]`: `foo(x) when x > 0` → unwrap left, recurse
+fn elixir_func_head_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    match node.kind() {
+        "call" => {
+            if let Some(target) = node.child_by_field_name("target") {
+                return Some(node_text(target, lines));
+            }
+            None
+        }
+        "identifier" => Some(node_text(node, lines)),
+        "binary_operator" => {
+            let left = node.child_by_field_name("left")?;
+            elixir_func_head_name(left, lines)
+        }
+        _ => None,
+    }
+}
+
+/// Extract type name from an Elixir `@type` call.
+/// For `@type t :: %{...}`, the call operand is `type t :: %{...}`,
+/// and we extract `t` from the first argument.
+fn elixir_type_name(call: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let args = super::treesitter::elixir_arguments(call)?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        // `type t :: ...` → binary_operator with left=identifier
+        if child.kind() == "binary_operator" {
+            if let Some(left) = child.child_by_field_name("left") {
+                // left may be a call like `t()` or an identifier `t`
+                if left.kind() == "call" {
+                    if let Some(target) = left.child_by_field_name("target") {
+                        return Some(node_text(target, lines));
+                    }
+                }
+                return Some(node_text(left, lines));
+            }
+        }
+        // Bare identifier
+        if child.kind() == "identifier" {
+            return Some(node_text(child, lines));
+        }
+    }
+    None
+}
+
+/// Extract callback name from an Elixir `@callback` call.
+/// For `@callback handle_event(event :: term()) :: :ok`, the call operand is
+/// `callback handle_event(...) :: :ok`. The arguments contain a `binary_operator`
+/// with `::`, whose left side is a `call` with target = the callback name.
+fn elixir_callback_name(call: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let args = super::treesitter::elixir_arguments(call)?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        if child.kind() == "binary_operator" {
+            // `handle_event(...) :: return_type` → left is the function head
+            if let Some(left) = child.child_by_field_name("left") {
+                return elixir_func_head_name(left, lines);
+            }
+        }
+        // Bare callback without return type spec (unlikely but handle it)
+        return elixir_func_head_name(child, lines);
+    }
+    None
+}
+
+/// Collect child entries from an Elixir module/protocol/impl `do_block`.
+fn elixir_collect_children(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+) -> Vec<OutlineEntry> {
+    let mut children = Vec::new();
+    let mut cursor = node.walk();
+
+    // Find the do_block child
+    let Some(do_block) = node.children(&mut cursor).find(|c| c.kind() == "do_block") else {
+        return children;
+    };
+
+    let mut cursor2 = do_block.walk();
+    for child in do_block.children(&mut cursor2) {
+        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
+            children.push(entry);
+        }
+    }
+
+    children
+}
+
+/// Extract @doc or @moduledoc text from the previous sibling of an Elixir definition.
+///
+/// In Elixir, `@doc "text"` is a `unary_operator` node. We check if the
+/// previous sibling is such a node and extract the string content.
+fn elixir_extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let prev = node.prev_sibling()?;
+    if prev.kind() != "unary_operator" {
+        return None;
+    }
+    let operand = prev.child_by_field_name("operand")?;
+    if operand.kind() != "call" {
+        return None;
+    }
+    let target = operand.child_by_field_name("target")?;
+    let attr = node_text(target, lines);
+    if attr != "doc" && attr != "moduledoc" {
+        return None;
+    }
+    // Get the string argument
+    let args = super::treesitter::elixir_arguments(operand)?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if child.is_named() {
+            let text = node_text(child, lines);
+            let trimmed = text
+                .trim_matches('"')
+                .trim_start_matches("~S\"\"\"")
+                .trim_end_matches("\"\"\"")
+                .trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Extract the source module name from an import statement text.
 /// Handles: `use std::fs;` → `std::fs`, `import X from "react"` → `react`,
 /// `from collections import X` → `collections`
@@ -395,6 +702,13 @@ pub(crate) fn extract_import_source(text: &str) -> String {
     // C/C++: #include "file.h" or #include <header>
     if let Some(rest) = trimmed.strip_prefix("#include") {
         return rest.trim().to_string(); // preserves quotes/angles for external detection
+    }
+
+    // Elixir: `alias Foo.Bar`, `use GenServer`, `require Logger`
+    for prefix in &["alias ", "require "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.split(',').next().unwrap_or(rest).trim().to_string();
+        }
     }
 
     // Go: `import "source"` — already handled above via "import"

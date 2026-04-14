@@ -250,6 +250,7 @@ fn lang_display_name(lang: Lang) -> &'static str {
         Lang::Swift => "Swift",
         Lang::Kotlin => "Kotlin",
         Lang::CSharp => "C#",
+        Lang::Elixir => "Elixir",
         Lang::Dockerfile => "Docker",
         Lang::Make => "Make",
     }
