@@ -135,6 +135,11 @@ pub(crate) fn extract_implemented_interfaces(
 // ---------------------------------------------------------------------------
 
 /// Elixir call-node target identifiers that define named symbols.
+/// This is the complete set used for definition detection in symbol search/index.
+/// See also `ELIXIR_DEF_KEYWORDS` in `outline.rs` which is the subset of
+/// function-like keywords (excludes container keywords like `defmodule`,
+/// `defprotocol`, `defimpl`, `defstruct`, `defexception` that have their own
+/// outline handling).
 const ELIXIR_DEFINITION_TARGETS: &[&str] = &[
     "defmodule",
     "def",
@@ -155,6 +160,7 @@ const ELIXIR_DEFINITION_TARGETS: &[&str] = &[
 /// so `child_by_field_name("arguments")` doesn't work.
 pub(crate) fn elixir_arguments(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     let mut cursor = node.walk();
+    // Node is Copy (arena index) — the returned node survives cursor drop.
     let result = node.children(&mut cursor).find(|c| c.kind() == "arguments");
     result
 }
@@ -211,6 +217,10 @@ pub(crate) fn extract_elixir_definition_name(
             }
             None
         }
+        // In Elixir, a struct IS its enclosing module (`%MyModule{}`), and only
+        // one struct per module is allowed. There's no standalone struct name to
+        // extract, so we index the keyword itself. Search for the struct by its
+        // module name instead.
         "defstruct" | "defexception" => Some(kw.clone()),
         _ => None,
     }

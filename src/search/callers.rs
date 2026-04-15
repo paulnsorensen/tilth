@@ -470,7 +470,8 @@ fn find_enclosing_function(
                         return (format!("{type_name}.{name}"), range);
                     }
                 }
-                // Elixir: defmodule is a call node acting as a type container
+                // Elixir: `defmodule` is a `call` node, not in TYPE_KINDS, so it
+                // needs a separate check to qualify function names as Module.func.
                 if lang == crate::types::Lang::Elixir
                     && crate::lang::treesitter::is_elixir_definition(p, lines)
                 {

@@ -225,6 +225,7 @@ fn walk_for_definitions(
     }
 
     let kind = node.kind();
+
     if DEFINITION_KINDS.contains(&kind) {
         // Check if this node defines the queried symbol
         if let Some(name) = extract_definition_name(node, lines) {
