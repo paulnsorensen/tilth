@@ -222,7 +222,10 @@ pub(crate) fn extract_elixir_definition_name(
 /// - `call` node: `def greet(name)` → target is `greet`
 /// - `identifier` node: `def bar, do: :ok` → text is `bar`
 /// - `binary_operator` with `when`: `def foo(x) when x > 0` → unwrap left, then recurse
-fn elixir_extract_func_head_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+pub(crate) fn elixir_extract_func_head_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+) -> Option<String> {
     match node.kind() {
         "call" => node
             .child_by_field_name("target")

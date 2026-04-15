@@ -514,32 +514,9 @@ fn elixir_func_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
         if !child.is_named() {
             continue;
         }
-        return elixir_func_head_name(child, lines);
+        return super::treesitter::elixir_extract_func_head_name(child, lines);
     }
     None
-}
-
-/// Extract function name from a function head node.
-///
-/// Handles three shapes:
-/// - `call`: `greet(name)` → target is `greet`
-/// - `identifier`: `bar` (no-arg, no-parens)
-/// - `binary_operator[when]`: `foo(x) when x > 0` → unwrap left, recurse
-fn elixir_func_head_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    match node.kind() {
-        "call" => {
-            if let Some(target) = node.child_by_field_name("target") {
-                return Some(node_text(target, lines));
-            }
-            None
-        }
-        "identifier" => Some(node_text(node, lines)),
-        "binary_operator" => {
-            let left = node.child_by_field_name("left")?;
-            elixir_func_head_name(left, lines)
-        }
-        _ => None,
-    }
 }
 
 /// Extract type name from an Elixir `@type` call.
@@ -586,11 +563,11 @@ fn elixir_callback_name(call: tree_sitter::Node, lines: &[&str]) -> Option<Strin
         if child.kind() == "binary_operator" {
             // `handle_event(...) :: return_type` → left is the function head
             if let Some(left) = child.child_by_field_name("left") {
-                return elixir_func_head_name(left, lines);
+                return super::treesitter::elixir_extract_func_head_name(left, lines);
             }
         }
         // Bare callback without return type spec (unlikely but handle it)
-        return elixir_func_head_name(child, lines);
+        return super::treesitter::elixir_extract_func_head_name(child, lines);
     }
     None
 }
