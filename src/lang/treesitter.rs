@@ -194,7 +194,10 @@ pub(crate) fn extract_elixir_definition_name(
 
     match kw.as_str() {
         "defmodule" | "defprotocol" | "defimpl" => {
-            // First named child of arguments is the module/protocol alias
+            // First named child of arguments is the module/protocol alias.
+            // For `defimpl Printable, for: User`, this returns "Printable" (the
+            // protocol name), not "User" (the implementing type). Searching for
+            // the protocol name will find both the protocol and all its impls.
             let mut cursor = args.walk();
             for child in args.children(&mut cursor) {
                 if child.is_named() {

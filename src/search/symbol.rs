@@ -697,16 +697,12 @@ defmodule MyError do
   defexception [:message, :code]
 end
 "#;
-        // Protocol
+        // Protocol + defimpl: both indexed under the protocol name "Printable"
+        let defs = elixir_find(code, "Printable");
         assert!(
-            !elixir_find(code, "Printable").is_empty(),
-            "should find 'Printable' protocol"
-        );
-
-        // defimpl
-        assert!(
-            !elixir_find(code, "Printable").is_empty(),
-            "should find defimpl for 'Printable'"
+            defs.len() >= 2,
+            "should find both defprotocol and defimpl for 'Printable', got {}",
+            defs.len()
         );
 
         // defexception
