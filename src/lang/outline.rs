@@ -269,7 +269,9 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
                 return line[..pos].trim().to_string();
             }
         }
-        // Elixir — truncate at ` do` (block form) or `, do:` (keyword form)
+        // Elixir — truncate at ` do` (block form) or `, do:` (keyword form).
+        // Safe for other languages: C/Java/Go/Rust hit the `{` branch above,
+        // Python hits the `:` branch. Only Elixir uses ` do` as a block delimiter.
         if let Some(pos) = line.rfind(" do") {
             let after = &line[pos + 3..];
             if after.is_empty() || after.starts_with('\n') {
