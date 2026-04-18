@@ -401,8 +401,7 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    // Multi-file batch read (capped at 20 to bound I/O). Files are read in
-    // parallel via the rayon global pool; order of results matches input order.
+    // Multi-file batch read (capped at 20 to bound I/O).
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
         if paths_arr.len() > 20 {
             return Err(format!(
@@ -411,7 +410,6 @@ fn tool_read(
             ));
         }
 
-        // Pre-validate all paths before spawning rayon work — fail fast.
         let paths: Vec<PathBuf> = paths_arr
             .iter()
             .map(|p| {
@@ -760,35 +758,63 @@ fn handle_tool_call(
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
+    let timeout = request_timeout();
 
-    // Clone values needed by the worker thread
+    // Hard cap: refuse new work when too many prior threads are still running
+    // after timeout, to bound thread accumulation on stuck ops.
+    let result: Result<String, String> =
+        if ABANDONED_THREADS.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS {
+            Err(
+                "server busy: too many prior operations still running after timeout. \
+             Wait for them to complete before retrying."
+                    .into(),
+            )
+        } else {
+            run_tool_with_timeout(
+                tool_name, args, cache, session, index, bloom, edit_mode, timeout,
+            )
+        };
+
+    build_response(req.id.as_ref(), result)
+}
+
+fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpcResponse {
+    let (text, is_error) = match result {
+        Ok(output) => (output, false),
+        Err(e) => (e, true),
+    };
+    let mut payload = serde_json::json!({
+        "content": [{ "type": "text", "text": text }]
+    });
+    if is_error {
+        payload["isError"] = Value::Bool(true);
+    }
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: id.cloned(),
+        result: Some(payload),
+        error: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tool_with_timeout(
+    tool_name: &str,
+    args: &Value,
+    cache: &Arc<OutlineCache>,
+    session: &Arc<Session>,
+    index: &Arc<SymbolIndex>,
+    bloom: &Arc<BloomFilterCache>,
+    edit_mode: bool,
+    timeout: Duration,
+) -> Result<String, String> {
+    let (tx, rx) = mpsc::channel();
     let tool_name_owned = tool_name.to_string();
     let args_owned = args.clone();
     let cache_clone = Arc::clone(cache);
     let session_clone = Arc::clone(session);
     let index_clone = Arc::clone(index);
     let bloom_clone = Arc::clone(bloom);
-
-    // Hard cap: refuse new work when too many prior threads are still running
-    // after timeout. This prevents unbounded thread accumulation on stuck ops.
-    if ABANDONED_THREADS.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS {
-        return JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": "server busy: too many prior operations still running after timeout. \
-                             Wait or set TILTH_TIMEOUT=<seconds> higher."
-                }],
-                "isError": true
-            })),
-            error: None,
-        };
-    }
-
-    let (tx, rx) = mpsc::channel();
-    let timeout = request_timeout();
 
     let handle = std::thread::spawn(move || {
         let result = dispatch_tool(
@@ -807,7 +833,7 @@ fn handle_tool_call(
         }
     });
 
-    let result = match rx.recv_timeout(timeout) {
+    match rx.recv_timeout(timeout) {
         Ok(result) => {
             // Thread finished in time — join it to reclaim resources
             let _ = handle.join();
@@ -838,32 +864,6 @@ fn handle_tool_call(
             // Thread panicked — the channel was dropped without sending
             Err("tool panicked during execution".into())
         }
-    };
-
-    match result {
-        Ok(output) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": output
-                }]
-            })),
-            error: None,
-        },
-        Err(e) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": e
-                }],
-                "isError": true
-            })),
-            error: None,
-        },
     }
 }
 
@@ -1314,26 +1314,31 @@ mod tests {
         assert_eq!(root_canon, expected_canon);
     }
 
-    // -- abandoned thread counter ---------------------------------------------
-
     // Serializes tests that mutate global ABANDONED_THREADS to avoid races.
+    // Recover from poisoning so a panicking sibling test doesn't cascade.
     static COUNTER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_counter() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-    /// Verify that the abandoned-thread counter decrements when a worker's send
-    /// fails (i.e., the receiver was dropped by a timeout before the thread
-    /// finished). We test via the observable atomic directly.
     #[test]
     fn test_abandoned_counter_decrements_on_abandon() {
-        let _guard = COUNTER_MUTEX.lock().unwrap();
+        let _guard = lock_counter();
         ABANDONED_THREADS.store(0, Ordering::SeqCst);
 
-        // Simulate timeout path: increment the counter as handle_tool_call does.
-        let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-        assert_eq!(abandoned, 1);
+        // Drive the real send-failure path: spawn a thread that mirrors the
+        // worker closure, drop the receiver before the thread sends, and
+        // observe the counter round-trip back to zero.
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+        ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed);
+        drop(rx);
 
-        // Simulate worker finishing after receiver is gone: channel send fails,
-        // so the worker decrements the counter.
-        ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
+        let handle = std::thread::spawn(move || {
+            if tx.send(Ok("late".into())).is_err() {
+                ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+        handle.join().unwrap();
 
         assert_eq!(
             ABANDONED_THREADS.load(Ordering::SeqCst),
@@ -1342,11 +1347,9 @@ mod tests {
         );
     }
 
-    /// When ABANDONED_THREADS is at MAX_ABANDONED_THREADS, handle_tool_call must
-    /// return a server-busy error without spawning a new thread.
     #[test]
     fn test_abandoned_hard_cap_returns_server_busy() {
-        let _guard = COUNTER_MUTEX.lock().unwrap();
+        let _guard = lock_counter();
         ABANDONED_THREADS.store(MAX_ABANDONED_THREADS, Ordering::SeqCst);
 
         let req = JsonRpcRequest {
