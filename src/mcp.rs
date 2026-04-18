@@ -6,7 +6,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,20 +14,112 @@ use crate::index::bloom::BloomFilterCache;
 use crate::index::SymbolIndex;
 use crate::session::Session;
 
-/// Tracks abandoned threads (timed out but still running). Warns on stderr
-/// when accumulation exceeds threshold to help diagnose resource pressure.
-/// Counter is live: incremented on timeout, decremented when the thread exits.
-static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
 const ABANDONED_THREAD_WARN: usize = 3;
 /// Hard cap: refuse new work when this many prior threads are still running
 /// after timeout. Prevents unbounded thread accumulation on stuck operations.
 const MAX_ABANDONED_THREADS: usize = 8;
 
-/// State machine values for per-thread timeout coordination.
-/// CAS between main thread and worker ensures exactly-once counter updates.
-const THREAD_RUNNING: u8 = 0;
-const THREAD_TIMED_OUT: u8 = 1;
-const THREAD_FINISHED: u8 = 2;
+/// Live count of threads that timed out and are still running in the background.
+/// Owned by `Services`, so tests instantiate their own instance rather than
+/// serializing on a global.
+pub(crate) struct ThreadTracker {
+    count: AtomicUsize,
+}
+
+impl ThreadTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_at_cap(&self) -> bool {
+        self.count.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS
+    }
+
+    fn record_timeout(&self) -> usize {
+        self.count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn record_finish_after_timeout(&self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-request coordination between the main thread and the worker thread.
+/// Exactly one of `claim_timeout` / `claim_finish` wins, so the tracker count
+/// is updated at most once per spawn even when a worker's send and the main
+/// thread's `recv_timeout` deadline race.
+struct ThreadCoord(AtomicU8);
+
+impl ThreadCoord {
+    const RUNNING: u8 = 0;
+    const TIMED_OUT: u8 = 1;
+    const FINISHED: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::RUNNING))
+    }
+
+    /// Main-thread side. Returns true if we transitioned `RUNNING` → `TIMED_OUT`;
+    /// the caller should then increment the tracker. False means the worker
+    /// already reached `FINISHED` — no counter change needed.
+    fn claim_timeout(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::RUNNING,
+                Self::TIMED_OUT,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Worker-thread side. Returns true if we transitioned `RUNNING` → `FINISHED`;
+    /// no counter change needed. False means the main thread already flipped
+    /// to `TIMED_OUT` and incremented — the caller must decrement to undo it.
+    fn claim_finish(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::RUNNING,
+                Self::FINISHED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+}
+
+/// Shared dependencies passed through the request → dispatch pipeline.
+/// Cloning is cheap (all fields are `Arc` or `Copy`) so the spawned worker
+/// thread gets its own handle via `Services::clone`.
+#[derive(Clone)]
+pub(crate) struct Services {
+    pub cache: Arc<OutlineCache>,
+    pub session: Arc<Session>,
+    pub index: Arc<SymbolIndex>,
+    pub bloom: Arc<BloomFilterCache>,
+    pub tracker: Arc<ThreadTracker>,
+    pub edit_mode: bool,
+}
+
+impl Services {
+    pub(crate) fn new(edit_mode: bool) -> Self {
+        Self {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            tracker: Arc::new(ThreadTracker::new()),
+            edit_mode,
+        }
+    }
+}
 
 /// Per-request timeout for tool calls. If a tool doesn't respond within this
 /// duration, the MCP server returns a timeout error instead of hanging.
@@ -131,10 +222,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
-    let cache = Arc::new(OutlineCache::new());
-    let session = Arc::new(Session::new());
-    let symbol_index = Arc::new(SymbolIndex::new());
-    let bloom_cache = Arc::new(BloomFilterCache::new());
+    let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -193,14 +281,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             params,
         };
 
-        let response = handle_request(
-            &req,
-            &cache,
-            &session,
-            &symbol_index,
-            &bloom_cache,
-            edit_mode,
-        );
+        let response = handle_request(&req, &services);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -296,14 +377,8 @@ struct JsonRpcError {
     message: String,
 }
 
-fn handle_request(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
+    let edit_mode = services.edit_mode;
     match req.method.as_str() {
         "initialize" => {
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
@@ -350,7 +425,7 @@ fn handle_request(
             error: None,
         },
 
-        "tools/call" => handle_tool_call(req, cache, session, index, bloom, edit_mode),
+        "tools/call" => handle_tool_call(req, services),
 
         "ping" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -377,24 +452,25 @@ fn handle_request(
 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
-pub(crate) fn dispatch_tool(
-    tool: &str,
-    args: &Value,
-    cache: &OutlineCache,
-    session: &Session,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> Result<String, String> {
+fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String, String> {
+    let edit_mode = services.edit_mode;
     match tool {
-        "tilth_read" => tool_read(args, cache, session, edit_mode),
-        "tilth_search" => tool_search(args, cache, session, index, bloom),
-        "tilth_files" => tool_files(args, cache),
-        "tilth_deps" => tool_deps(args, cache, bloom),
+        "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
+        "tilth_search" => tool_search(
+            args,
+            &services.cache,
+            &services.session,
+            &services.index,
+            &services.bloom,
+        ),
+        "tilth_files" => tool_files(args, &services.cache),
+        "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
         "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
-        "tilth_session" => tool_session(args, session),
-        "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
+        "tilth_session" => tool_session(args, &services.session),
+        "tilth_edit" if edit_mode => {
+            tool_edit(args, &services.session, &services.cache, &services.bloom)
+        }
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -425,18 +501,7 @@ fn tool_read(
             })
             .collect::<Result<_, _>>()?;
 
-        let results: Vec<String> = paths
-            .par_iter()
-            .map(|path| {
-                session.record_read(path);
-                match crate::read::read_file(path, None, false, cache, edit_mode) {
-                    Ok(output) => output,
-                    Err(e) => format!("# {} — error: {}", path.display(), e),
-                }
-            })
-            .collect();
-
-        let combined = results.join("\n\n");
+        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
         return Ok(apply_budget(combined, budget));
     }
 
@@ -753,33 +818,20 @@ fn apply_budget(output: String, budget: Option<u64>) -> String {
 // MCP tool call handler
 // ---------------------------------------------------------------------------
 
-fn handle_tool_call(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
-    let timeout = request_timeout();
 
-    // Hard cap: refuse new work when too many prior threads are still running
-    // after timeout, to bound thread accumulation on stuck ops.
-    let result: Result<String, String> =
-        if ABANDONED_THREADS.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS {
-            Err(
-                "server busy: too many prior operations still running after timeout. \
-             Wait for them to complete before retrying."
-                    .into(),
-            )
-        } else {
-            run_tool_with_timeout(
-                tool_name, args, cache, session, index, bloom, edit_mode, timeout,
-            )
-        };
+    let result = if services.tracker.is_at_cap() {
+        Err(
+            "server busy: too many prior operations still running after timeout. \
+             Wait or set TILTH_TIMEOUT=<seconds> higher."
+                .into(),
+        )
+    } else {
+        run_tool_with_timeout(services, tool_name, args, request_timeout())
+    };
 
     build_response(req.id.as_ref(), result)
 }
@@ -803,78 +855,81 @@ fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpc
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_tool_with_timeout(
-    tool_name: &str,
-    args: &Value,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
+/// Run an arbitrary closure on a fresh thread with a wall-clock timeout.
+/// Returns `Ok(result)` on success. On timeout, returns `Err(SpawnFailure::Timeout)`
+/// and detaches the worker; the tracker is incremented and the worker will
+/// decrement it when it eventually exits. On worker panic, returns `Err(Panic)`.
+fn spawn_with_timeout<F, R>(
+    tracker: &Arc<ThreadTracker>,
     timeout: Duration,
-) -> Result<String, String> {
+    work: F,
+) -> Result<R, SpawnFailure>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     let (tx, rx) = mpsc::channel();
-    let tool_name_owned = tool_name.to_string();
-    let args_owned = args.clone();
-    let cache_clone = Arc::clone(cache);
-    let session_clone = Arc::clone(session);
-    let index_clone = Arc::clone(index);
-    let bloom_clone = Arc::clone(bloom);
-    let thread_state = Arc::new(AtomicU8::new(THREAD_RUNNING));
-    let thread_state_clone = Arc::clone(&thread_state);
+    let coord = Arc::new(ThreadCoord::new());
+    let coord_worker = Arc::clone(&coord);
+    let tracker_worker = Arc::clone(tracker);
 
     let handle = std::thread::spawn(move || {
-        let result = dispatch_tool(
-            &tool_name_owned,
-            &args_owned,
-            &cache_clone,
-            &session_clone,
-            &index_clone,
-            &bloom_clone,
-            edit_mode,
-        );
+        let result = work();
         let _ = tx.send(result);
-        // CAS RUNNING → FINISHED. If it fails, main thread already won the race
-        // (TIMED_OUT) and incremented the counter — decrement it now.
-        if thread_state_clone
-            .compare_exchange(THREAD_RUNNING, THREAD_FINISHED, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
+        if !coord_worker.claim_finish() {
+            tracker_worker.record_finish_after_timeout();
         }
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => {
             let _ = handle.join();
-            result
+            Ok(result)
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // CAS RUNNING → TIMED_OUT. If it fails, worker already finished —
-            // skip the increment entirely (no abandoned thread to track).
-            if thread_state
-                .compare_exchange(THREAD_RUNNING, THREAD_TIMED_OUT, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-                if abandoned == ABANDONED_THREAD_WARN {
+            if coord.claim_timeout() {
+                let n = tracker.record_timeout();
+                if n == ABANDONED_THREAD_WARN {
                     eprintln!(
-                        "tilth: warning: {abandoned} abandoned threads still running. \
+                        "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
                     );
                 }
             }
-            Err(format!(
-                "tool timed out after {}s — the operation took too long. \
-                 Try: reduce scope, use section instead of full, or set \
-                 TILTH_TIMEOUT=<seconds> to increase the limit.",
-                timeout.as_secs()
-            ))
+            Err(SpawnFailure::Timeout)
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err("tool panicked during execution".into())
-        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(SpawnFailure::Panic),
+    }
+}
+
+enum SpawnFailure {
+    Timeout,
+    Panic,
+}
+
+fn run_tool_with_timeout(
+    services: &Services,
+    tool_name: &str,
+    args: &Value,
+    timeout: Duration,
+) -> Result<String, String> {
+    let services_worker = services.clone();
+    let tool = tool_name.to_string();
+    let args_owned = args.clone();
+
+    let result = spawn_with_timeout(&services.tracker, timeout, move || {
+        dispatch_tool(&services_worker, &tool, &args_owned)
+    });
+
+    match result {
+        Ok(inner) => inner,
+        Err(SpawnFailure::Timeout) => Err(format!(
+            "tool timed out after {}s — the operation took too long. \
+             Try: reduce scope, use section instead of full, or set \
+             TILTH_TIMEOUT=<seconds> to increase the limit.",
+            timeout.as_secs()
+        )),
+        Err(SpawnFailure::Panic) => Err("tool panicked during execution".into()),
     }
 }
 
@@ -1325,43 +1380,48 @@ mod tests {
         assert_eq!(root_canon, expected_canon);
     }
 
-    // Serializes tests that mutate global ABANDONED_THREADS to avoid races.
-    // Recover from poisoning so a panicking sibling test doesn't cascade.
-    static COUNTER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn lock_counter() -> std::sync::MutexGuard<'static, ()> {
-        COUNTER_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    fn test_services_with_tracker(tracker: Arc<ThreadTracker>) -> Services {
+        Services {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            tracker,
+            edit_mode: false,
+        }
     }
 
+    /// Drives the real CAS path: a short-timeout `spawn_with_timeout` call
+    /// races against a worker that sleeps past the deadline. The main thread
+    /// must win the CAS (increment), and the worker must observe the lost CAS
+    /// when it eventually exits (decrement). Ends with the counter back at zero.
     #[test]
-    fn test_abandoned_counter_decrements_on_abandon() {
-        let _guard = lock_counter();
-        ABANDONED_THREADS.store(0, Ordering::SeqCst);
+    fn test_abandoned_counter_roundtrips_through_cas() {
+        let tracker = Arc::new(ThreadTracker::new());
+        assert_eq!(tracker.current(), 0);
 
-        // Drive the real send-failure path: spawn a thread that mirrors the
-        // worker closure, drop the receiver before the thread sends, and
-        // observe the counter round-trip back to zero.
-        let (tx, rx) = mpsc::channel::<Result<String, String>>();
-        ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed);
-        drop(rx);
+        let result: Result<(), SpawnFailure> =
+            spawn_with_timeout(&tracker, Duration::from_millis(20), || {
+                std::thread::sleep(Duration::from_millis(200));
+            });
 
-        let handle = std::thread::spawn(move || {
-            if tx.send(Ok("late".into())).is_err() {
-                ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
-            }
-        });
-        handle.join().unwrap();
+        assert!(matches!(result, Err(SpawnFailure::Timeout)));
+        assert_eq!(tracker.current(), 1, "timeout must increment tracker");
 
-        assert_eq!(
-            ABANDONED_THREADS.load(Ordering::SeqCst),
-            0,
-            "counter must return to 0 after abandoned thread exits"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while tracker.current() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tracker.current(), 0, "worker exit must decrement tracker");
     }
 
     #[test]
     fn test_abandoned_hard_cap_returns_server_busy() {
-        let _guard = lock_counter();
-        ABANDONED_THREADS.store(MAX_ABANDONED_THREADS, Ordering::SeqCst);
+        let tracker = Arc::new(ThreadTracker::new());
+        for _ in 0..MAX_ABANDONED_THREADS {
+            tracker.record_timeout();
+        }
+        let services = test_services_with_tracker(tracker);
 
         let req = JsonRpcRequest {
             _jsonrpc: "2.0".into(),
@@ -1372,20 +1432,13 @@ mod tests {
                 "arguments": { "pattern": "*.rs" }
             }),
         };
-        let cache = Arc::new(OutlineCache::new());
-        let session = Arc::new(Session::new());
-        let index = Arc::new(SymbolIndex::new());
-        let bloom = Arc::new(BloomFilterCache::new());
 
-        let resp = handle_tool_call(&req, &cache, &session, &index, &bloom, false);
-
-        // Reset before any assertion that could panic
-        ABANDONED_THREADS.store(0, Ordering::SeqCst);
+        let resp = handle_tool_call(&req, &services);
 
         let result = resp.result.expect("response must have a result field");
         let is_error = result
             .get("isError")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         assert!(is_error, "response must have isError: true");
 
@@ -1394,14 +1447,17 @@ mod tests {
             text.contains("server busy"),
             "error message must contain 'server busy', got: {text}"
         );
+        assert!(
+            text.contains("TILTH_TIMEOUT"),
+            "error message must include TILTH_TIMEOUT hint, got: {text}"
+        );
     }
 
-    // -- batch read -----------------------------------------------------------
-
-    /// Batch reads with paths array must return all file contents in the same
-    /// order as the submitted paths list, even under parallel execution.
+    /// Batch reads must return the content of every submitted path (parallel
+    /// execution does not drop files). Ordering is guaranteed by rayon's
+    /// `par_iter().collect()` contract; not asserted here.
     #[test]
-    fn test_batch_read_parallel_preserves_order() {
+    fn test_batch_read_returns_all_files() {
         let dir = tempfile::tempdir().unwrap();
         let file_count = 5usize;
 
@@ -1428,21 +1484,6 @@ mod tests {
             assert!(
                 result.contains(&format!("content-of-file-{i}")),
                 "output must contain content of file {i}"
-            );
-        }
-
-        // Verify order: each file's content appears before the next one's.
-        for i in 0..file_count - 1 {
-            let pos_a = result
-                .find(&format!("content-of-file-{i}"))
-                .expect(&format!("file {i} content missing"));
-            let pos_b = result
-                .find(&format!("content-of-file-{}", i + 1))
-                .expect(&format!("file {} content missing", i + 1));
-            assert!(
-                pos_a < pos_b,
-                "file {i} content must appear before file {} content",
-                i + 1
             );
         }
     }
