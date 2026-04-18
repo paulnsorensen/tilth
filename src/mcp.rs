@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +23,12 @@ const ABANDONED_THREAD_WARN: usize = 3;
 /// Hard cap: refuse new work when this many prior threads are still running
 /// after timeout. Prevents unbounded thread accumulation on stuck operations.
 const MAX_ABANDONED_THREADS: usize = 8;
+
+/// State machine values for per-thread timeout coordination.
+/// CAS between main thread and worker ensures exactly-once counter updates.
+const THREAD_RUNNING: u8 = 0;
+const THREAD_TIMED_OUT: u8 = 1;
+const THREAD_FINISHED: u8 = 2;
 
 /// Per-request timeout for tool calls. If a tool doesn't respond within this
 /// duration, the MCP server returns a timeout error instead of hanging.
@@ -815,6 +821,8 @@ fn run_tool_with_timeout(
     let session_clone = Arc::clone(session);
     let index_clone = Arc::clone(index);
     let bloom_clone = Arc::clone(bloom);
+    let thread_state = Arc::new(AtomicU8::new(THREAD_RUNNING));
+    let thread_state_clone = Arc::clone(&thread_state);
 
     let handle = std::thread::spawn(move || {
         let result = dispatch_tool(
@@ -826,32 +834,36 @@ fn run_tool_with_timeout(
             &bloom_clone,
             edit_mode,
         );
-        if tx.send(result).is_err() {
-            // Receiver dropped — we were abandoned by a timeout. Decrement to
-            // reflect live count (paired with fetch_add on the timeout path).
+        let _ = tx.send(result);
+        // CAS RUNNING → FINISHED. If it fails, main thread already won the race
+        // (TIMED_OUT) and incremented the counter — decrement it now.
+        if thread_state_clone
+            .compare_exchange(THREAD_RUNNING, THREAD_FINISHED, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
         }
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => {
-            // Thread finished in time — join it to reclaim resources
             let _ = handle.join();
             result
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Thread is still running — we can't safely kill it, but we return
-            // an error to the client immediately. The thread will finish in the
-            // background and its result will be dropped.
-            //
-            // Note: we intentionally do NOT join here to avoid blocking the
-            // main loop. The thread will complete and exit on its own.
-            let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-            if abandoned == ABANDONED_THREAD_WARN {
-                eprintln!(
-                    "tilth: warning: {abandoned} abandoned threads still running. \
-                     Consider reducing scope or increasing TILTH_TIMEOUT."
-                );
+            // CAS RUNNING → TIMED_OUT. If it fails, worker already finished —
+            // skip the increment entirely (no abandoned thread to track).
+            if thread_state
+                .compare_exchange(THREAD_RUNNING, THREAD_TIMED_OUT, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
+                if abandoned == ABANDONED_THREAD_WARN {
+                    eprintln!(
+                        "tilth: warning: {abandoned} abandoned threads still running. \
+                         Consider reducing scope or increasing TILTH_TIMEOUT."
+                    );
+                }
             }
             Err(format!(
                 "tool timed out after {}s — the operation took too long. \
@@ -861,7 +873,6 @@ fn run_tool_with_timeout(
             ))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Thread panicked — the channel was dropped without sending
             Err("tool panicked during execution".into())
         }
     }
@@ -1424,10 +1435,10 @@ mod tests {
         for i in 0..file_count - 1 {
             let pos_a = result
                 .find(&format!("content-of-file-{i}"))
-                .expect("file {i} content missing");
+                .expect(&format!("file {i} content missing"));
             let pos_b = result
                 .find(&format!("content-of-file-{}", i + 1))
-                .expect("file {} content missing");
+                .expect(&format!("file {} content missing", i + 1));
             assert!(
                 pos_a < pos_b,
                 "file {i} content must appear before file {} content",
