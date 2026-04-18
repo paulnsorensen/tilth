@@ -35,6 +35,8 @@ fn request_timeout() -> Duration {
 const SERVER_INSTRUCTIONS: &str = "\
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.\n\
 \n\
+ALWAYS BATCH. When you have 2+ files to read, call tilth_read once with paths: [...]. When you have edits to multiple files, call tilth_edit once with files: [...]. Never make N serial calls when one will do — each tool call is a turn.\n\
+\n\
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.\n\
 Usage: tilth_search(query: \"handleRequest\").\n\
 tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.\n\
@@ -57,10 +59,11 @@ tilth_search: Search code — finds definitions, usages, and text. Replaces grep
       <name>  <path>:<start>-<end>  <signature>\n\
   Re-expanding a previously shown definition returns [shown earlier].\n\
 \n\
-tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
+tilth_read: Read one or more files with smart outlining. Replaces cat/head/tail.\n\
+  paths: [\"a.rs\", \"b.rs\"] reads many in one call (max 20). PREFER this over serial single-file reads.\n\
+  path: \"a.rs\" for a single file.\n\
   Small files → full content. Large files → structural outline.\n\
   section: \"<start>-<end>\" or \"<heading text>\"\n\
-  paths: read multiple files in one call.\n\
   Output:\n\
     <line_number> │ <content>                  ← full/section mode\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
@@ -86,15 +89,20 @@ DO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
-tilth_edit: Edit files using hash-anchored lines. Replaces the host Edit tool.\n\
+tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.\n\
+  ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.\n\
   tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
   tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
-  Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
-  Range: {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
-  Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
-  Hash mismatch → file changed, re-read and retry.\n\
+  Shape: {\"files\": [{\"path\": \"a.rs\", \"edits\": [...]}, {\"path\": \"b.rs\", \"edits\": [...]}]}\n\
+  Single file: {\"files\": [{\"path\": \"a.rs\", \"edits\": [{\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}]}]}\n\
+  Edit forms inside `edits`:\n\
+    Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
+    Range:       {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
+    Delete:      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
+  Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.\n\
+  Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).\n\
   Large files: tilth_read shows outline — use section to get hashlined content.\n\
-  Pass diff: true to see a compact before/after diff in the response.\n\
+  Pass diff: true to see a compact before/after diff per file.\n\
   After editing a function signature, tilth_edit shows callers that may need updating.\n\
 DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 
@@ -634,44 +642,63 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
-fn tool_edit(
-    args: &Value,
-    session: &Session,
-    _cache: &OutlineCache,
-    bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path")?;
-    let path = PathBuf::from(path_str);
+// deferred parse error — surfaces per-file without aborting siblings
+enum FileEditTask {
+    Ready {
+        path: PathBuf,
+        edits: Vec<crate::edit::Edit>,
+    },
+    ParseError {
+        label: String,
+        msg: String,
+    },
+}
 
-    let edits_val = args
-        .get("edits")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: edits")?;
+fn parse_file_edit(index: usize, val: &Value) -> FileEditTask {
+    let Some(path_str) = val.get("path").and_then(|v| v.as_str()) else {
+        return FileEditTask::ParseError {
+            label: format!("files[{index}]"),
+            msg: "missing 'path'".into(),
+        };
+    };
+    let Some(edits_val) = val.get("edits").and_then(|v| v.as_array()) else {
+        return FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg: "missing 'edits' array".into(),
+        };
+    };
 
     let mut edits = Vec::with_capacity(edits_val.len());
     for (i, e) in edits_val.iter().enumerate() {
-        let start_str = e
-            .get("start")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("edit[{i}]: missing 'start'"))?;
-        let (start_line, start_hash) = crate::format::parse_anchor(start_str)
-            .ok_or_else(|| format!("edit[{i}]: invalid start anchor '{start_str}'"))?;
-
+        let Some(start_str) = e.get("start").and_then(|v| v.as_str()) else {
+            return FileEditTask::ParseError {
+                label: path_str.to_string(),
+                msg: format!("edit[{i}]: missing 'start'"),
+            };
+        };
+        let Some((start_line, start_hash)) = crate::format::parse_anchor(start_str) else {
+            return FileEditTask::ParseError {
+                label: path_str.to_string(),
+                msg: format!("edit[{i}]: invalid start anchor '{start_str}'"),
+            };
+        };
         let (end_line, end_hash) = if let Some(end_str) = e.get("end").and_then(|v| v.as_str()) {
-            crate::format::parse_anchor(end_str)
-                .ok_or_else(|| format!("edit[{i}]: invalid end anchor '{end_str}'"))?
+            let Some(parsed) = crate::format::parse_anchor(end_str) else {
+                return FileEditTask::ParseError {
+                    label: path_str.to_string(),
+                    msg: format!("edit[{i}]: invalid end anchor '{end_str}'"),
+                };
+            };
+            parsed
         } else {
             (start_line, start_hash)
         };
-
-        let content = e
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("edit[{i}]: missing 'content'"))?;
-
+        let Some(content) = e.get("content").and_then(|v| v.as_str()) else {
+            return FileEditTask::ParseError {
+                label: path_str.to_string(),
+                msg: format!("edit[{i}]: missing 'content'"),
+            };
+        };
         edits.push(crate::edit::Edit {
             start_line,
             start_hash,
@@ -681,43 +708,131 @@ fn tool_edit(
         });
     }
 
-    let show_diff = args
-        .get("diff")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    FileEditTask::Ready {
+        path: PathBuf::from(path_str),
+        edits,
+    }
+}
 
-    session.record_read(&path);
-
-    match crate::edit::apply_edits(&path, &edits).map_err(|e| e.to_string())? {
+fn apply_one_file_edit(
+    path: &Path,
+    edits: &[crate::edit::Edit],
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> Result<String, String> {
+    match crate::edit::apply_edits(path, edits).map_err(|e| e.to_string())? {
         crate::edit::EditResult::Applied { diff, context } => {
             let mut output = String::new();
-
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
                 if !context.is_empty() {
                     output.push_str("\n\n");
                 }
             }
-
             if !context.is_empty() {
                 output.push_str(&context);
             }
-
-            let abs_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
                 || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 std::path::Path::to_path_buf,
             );
-
-            if let Some(blast) = crate::search::blast::blast_radius(&path, &edits, &scope, bloom) {
+            if let Some(blast) = crate::search::blast::blast_radius(path, edits, &scope, bloom) {
                 output.push_str(&blast);
             }
-
             Ok(output)
         }
         crate::edit::EditResult::HashMismatch(msg) => Err(format!(
             "hash mismatch — file changed since last read:\n\n{msg}"
         )),
+    }
+}
+
+fn tool_edit(
+    args: &Value,
+    session: &Session,
+    _cache: &OutlineCache,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
+    let files_val = args
+        .get("files")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: files (array of {path, edits})")?;
+
+    if files_val.is_empty() {
+        return Err("files array is empty".into());
+    }
+    if files_val.len() > 20 {
+        return Err(format!(
+            "batch edit limited to 20 files (got {})",
+            files_val.len()
+        ));
+    }
+
+    let show_diff = args
+        .get("diff")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+
+    let tasks: Vec<FileEditTask> = files_val
+        .iter()
+        .enumerate()
+        .map(|(i, v)| parse_file_edit(i, v))
+        .collect();
+
+    let total = tasks.len();
+    let mut sections: Vec<String> = Vec::with_capacity(total);
+    let mut success_count = 0usize;
+    let mut deadline_hit_at = None;
+
+    for (i, task) in tasks.into_iter().enumerate() {
+        if std::time::Instant::now() > deadline {
+            deadline_hit_at = Some(i);
+            break;
+        }
+        match task {
+            FileEditTask::ParseError { label, msg } => {
+                sections.push(format!("## {label}\nerror: {msg}"));
+            }
+            FileEditTask::Ready { path, edits } => {
+                session.record_read(&path);
+                let header = format!("## {}", path.display());
+                match apply_one_file_edit(&path, &edits, bloom, show_diff) {
+                    Ok(body) => {
+                        success_count += 1;
+                        if body.is_empty() {
+                            sections.push(header);
+                        } else {
+                            sections.push(format!("{header}\n{body}"));
+                        }
+                    }
+                    Err(msg) => {
+                        sections.push(format!("{header}\n{msg}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(stopped_at) = deadline_hit_at {
+        sections.push(format!(
+            "# batch edit stopped — deadline exceeded after {stopped_at}/{total} files. \
+             Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>."
+        ));
+    }
+
+    let combined = sections.join("\n\n---\n\n");
+
+    if success_count == 0 {
+        Err(combined)
+    } else {
+        Ok(combined)
     }
 }
 
@@ -854,18 +969,18 @@ fn handle_tool_call(
 
 fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+        "Read one or more files with smart outlining. Replaces cat/head/tail and the host Read tool. \
+         ALWAYS use `paths: [...]` when you need 2+ files — saves turns. Single file uses `path`. \
+         Output uses hashline format (line:hash|content) — the line:hash anchors are required by tilth_edit. \
+         Small files return full hashlined content. Large files return a structural outline (no hashlines); \
+         use `section` to get hashlined content for the lines you want to edit. \
+         Use `full` to force complete content."
     } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read specific line ranges. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+        "Read one or more files with smart outlining. Replaces cat/head/tail and the host Read tool. \
+         ALWAYS use `paths: [...]` when you need 2+ files — saves turns. Single file uses `path`. \
+         Small files return full content. Large files return a structural outline (functions, classes, \
+         imports) so you see the shape without consuming your context window. \
+         Use `section` to read specific line ranges. Use `full` to force complete content."
     };
     let mut tools = vec![
         serde_json::json!({
@@ -922,7 +1037,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
+                        "description": "Multiple file paths to read in one call (max 20). PREFER this over multiple single-file calls when you have 2+ files — one call instead of N saves turns and latency."
                     },
                     "section": {
                         "type": "string",
@@ -1046,33 +1161,43 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_edit",
-            "description": "Apply edits to a file using hashline anchors from tilth_read. Each edit targets a line range by line:hash anchors. Edits are verified against content hashes and rejected if the file has changed since the last read.",
+            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "edits"],
+                "required": ["files"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to edit."
-                    },
-                    "edits": {
+                    "files": {
                         "type": "array",
-                        "description": "Array of edit operations, applied atomically.",
+                        "description": "One entry per file. Use a single-element array for a single-file edit.",
                         "items": {
                             "type": "object",
-                            "required": ["start", "content"],
+                            "required": ["path", "edits"],
                             "properties": {
-                                "start": {
+                                "path": {
                                     "type": "string",
-                                    "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                    "description": "Absolute or relative file path to edit."
                                 },
-                                "end": {
-                                    "type": "string",
-                                    "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                "edits": {
+                                    "type": "array",
+                                    "description": "Edit operations for this file, applied atomically per file.",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["start", "content"],
+                                        "properties": {
+                                            "start": {
+                                                "type": "string",
+                                                "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                            },
+                                            "end": {
+                                                "type": "string",
+                                                "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
+                                            },
+                                            "content": {
+                                                "type": "string",
+                                                "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1080,7 +1205,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Set true to include a compact diff of changes in the response. Useful for batch edits or verifying unexpected results."
+                        "description": "Set true to include a compact diff of changes in the response per file."
                     }
                 }
             }
@@ -1293,5 +1418,198 @@ mod tests {
         let root_canon = root.unwrap().canonicalize().unwrap();
         let expected_canon = project_path.canonicalize().unwrap();
         assert_eq!(root_canon, expected_canon);
+    }
+
+    // -- batch tool_edit / tool_read ------------------------------------------
+
+    fn dispatch_ctx() -> (
+        OutlineCache,
+        Session,
+        Arc<SymbolIndex>,
+        Arc<BloomFilterCache>,
+    ) {
+        (
+            OutlineCache::new(),
+            Session::new(),
+            Arc::new(SymbolIndex::new()),
+            Arc::new(BloomFilterCache::new()),
+        )
+    }
+
+    fn anchor(content: &str, line: usize) -> String {
+        let lines: Vec<_> = content.lines().collect();
+        let h = crate::format::line_hash(lines[line - 1].as_bytes());
+        format!("{line}:{h:03x}")
+    }
+
+    #[test]
+    fn tool_edit_batch_two_files_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_content = "alpha\nbravo\ncharlie\n";
+        let b_content = "uno\ndos\ntres\n";
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, a_content).unwrap();
+        std::fs::write(&b, b_content).unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": a.to_str().unwrap(),
+                    "edits": [{ "start": anchor(a_content, 2), "content": "BRAVO" }]
+                },
+                {
+                    "path": b.to_str().unwrap(),
+                    "edits": [{ "start": anchor(b_content, 1), "content": "UNO" }]
+                }
+            ]
+        });
+
+        let (cache, session, index, bloom) = dispatch_ctx();
+        let out = dispatch_tool("tilth_edit", &args, &cache, &session, &index, &bloom, true)
+            .expect("batch should succeed");
+
+        assert!(
+            out.contains(a.to_str().unwrap()),
+            "output should mention file a: {out}"
+        );
+        assert!(
+            out.contains(b.to_str().unwrap()),
+            "output should mention file b: {out}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "alpha\nBRAVO\ncharlie\n"
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "UNO\ndos\ntres\n");
+    }
+
+    #[test]
+    fn tool_edit_batch_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_content = "first\nsecond\nthird\n";
+        let b_content = "one\ntwo\nthree\n";
+        let a = dir.path().join("first.txt");
+        let b = dir.path().join("second.txt");
+        std::fs::write(&a, a_content).unwrap();
+        std::fs::write(&b, b_content).unwrap();
+
+        // Second file uses a wrong hash on purpose.
+        let bad_anchor = "1:000";
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": a.to_str().unwrap(),
+                    "edits": [{ "start": anchor(a_content, 2), "content": "SECOND" }]
+                },
+                {
+                    "path": b.to_str().unwrap(),
+                    "edits": [{ "start": bad_anchor, "content": "ONE" }]
+                }
+            ]
+        });
+
+        let (cache, session, index, bloom) = dispatch_ctx();
+        let out = dispatch_tool("tilth_edit", &args, &cache, &session, &index, &bloom, true)
+            .expect("batch should be Ok because one file succeeded");
+
+        // First file applied.
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "first\nSECOND\nthird\n"
+        );
+        // Second file untouched.
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), b_content);
+
+        assert!(
+            out.contains("hash mismatch"),
+            "should report hash mismatch for second file: {out}"
+        );
+        assert!(
+            out.contains(b.to_str().unwrap()),
+            "should mention second file path: {out}"
+        );
+        assert!(
+            out.contains("---"),
+            "should include section separator between files: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_edit_batch_over_limit_rejected() {
+        let mut files = Vec::with_capacity(21);
+        for i in 0..21 {
+            files.push(serde_json::json!({
+                "path": format!("/tmp/nonexistent_{i}.txt"),
+                "edits": [{ "start": "1:000", "content": "x" }]
+            }));
+        }
+        let args = serde_json::json!({ "files": files });
+
+        let (cache, session, index, bloom) = dispatch_ctx();
+        let err = dispatch_tool("tilth_edit", &args, &cache, &session, &index, &bloom, true)
+            .expect_err("should reject 21 files");
+        assert!(
+            err.contains("limited to 20"),
+            "error should mention limit: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_edit_batch_all_failed_returns_err() {
+        // Every file in the batch fails → tool_edit returns Err so the MCP
+        // response gets isError: true.
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": "/tmp/tilth_does_not_exist_xyz_1.txt",
+                    "edits": [{ "start": "1:000", "content": "x" }]
+                },
+                {
+                    "path": "/tmp/tilth_does_not_exist_xyz_2.txt",
+                    "edits": [{ "start": "1:000", "content": "x" }]
+                }
+            ]
+        });
+
+        let (cache, session, index, bloom) = dispatch_ctx();
+        let err = dispatch_tool("tilth_edit", &args, &cache, &session, &index, &bloom, true)
+            .expect_err("all files failed → Err");
+        assert!(
+            err.contains("tilth_does_not_exist_xyz_1"),
+            "should include first file section: {err}"
+        );
+        assert!(
+            err.contains("tilth_does_not_exist_xyz_2"),
+            "should include second file section: {err}"
+        );
+        assert!(err.contains("---"), "should separate sections: {err}");
+    }
+
+    #[test]
+    fn tool_read_paths_batch_returns_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("read_a.txt");
+        let b = dir.path().join("read_b.txt");
+        std::fs::write(&a, "ALPHA_TOKEN\n").unwrap();
+        std::fs::write(&b, "BRAVO_TOKEN\n").unwrap();
+
+        let args = serde_json::json!({
+            "paths": [a.to_str().unwrap(), b.to_str().unwrap()]
+        });
+
+        let (cache, session, index, bloom) = dispatch_ctx();
+        let out = dispatch_tool("tilth_read", &args, &cache, &session, &index, &bloom, false)
+            .expect("batch read should succeed");
+
+        assert!(
+            out.contains("ALPHA_TOKEN"),
+            "missing first file content: {out}"
+        );
+        assert!(
+            out.contains("BRAVO_TOKEN"),
+            "missing second file content: {out}"
+        );
     }
 }
