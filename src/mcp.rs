@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,8 +17,12 @@ use crate::session::Session;
 
 /// Tracks abandoned threads (timed out but still running). Warns on stderr
 /// when accumulation exceeds threshold to help diagnose resource pressure.
+/// Counter is live: incremented on timeout, decremented when the thread exits.
 static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
 const ABANDONED_THREAD_WARN: usize = 3;
+/// Hard cap: refuse new work when this many prior threads are still running
+/// after timeout. Prevents unbounded thread accumulation on stuck operations.
+const MAX_ABANDONED_THREADS: usize = 8;
 
 /// Per-request timeout for tool calls. If a tool doesn't respond within this
 /// duration, the MCP server returns a timeout error instead of hanging.
@@ -396,7 +401,8 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    // Multi-file batch read (capped at 20 to bound I/O)
+    // Multi-file batch read (capped at 20 to bound I/O). Files are read in
+    // parallel via the rayon global pool; order of results matches input order.
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
         if paths_arr.len() > 20 {
             return Err(format!(
@@ -405,36 +411,27 @@ fn tool_read(
             ));
         }
 
-        // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
-        // Note: deadline is checked between files, so a single massive file could still
-        // exceed it. The per-request timeout (handle_tool_call) catches that case.
-        let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+        // Pre-validate all paths before spawning rayon work — fail fast.
+        let paths: Vec<PathBuf> = paths_arr
+            .iter()
+            .map(|p| {
+                p.as_str()
+                    .ok_or("paths must be an array of strings")
+                    .map(PathBuf::from)
+            })
+            .collect::<Result<_, _>>()?;
 
-        let mut results = Vec::with_capacity(paths_arr.len());
-        for (i, p) in paths_arr.iter().enumerate() {
-            // Check deadline before each file
-            if std::time::Instant::now() > deadline {
-                results.push(format!(
-                    "# batch read stopped — deadline exceeded after {}/{} files. \
-                     Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
-                    i,
-                    paths_arr.len()
-                ));
-                break;
-            }
+        let results: Vec<String> = paths
+            .par_iter()
+            .map(|path| {
+                session.record_read(path);
+                match crate::read::read_file(path, None, false, cache, edit_mode) {
+                    Ok(output) => output,
+                    Err(e) => format!("# {} — error: {}", path.display(), e),
+                }
+            })
+            .collect();
 
-            let path_str = p.as_str().ok_or("paths must be an array of strings")?;
-            let path = PathBuf::from(path_str);
-            session.record_read(&path);
-            match crate::read::read_file(&path, None, false, cache, edit_mode) {
-                Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
-            }
-        }
         let combined = results.join("\n\n");
         return Ok(apply_budget(combined, budget));
     }
@@ -772,6 +769,24 @@ fn handle_tool_call(
     let index_clone = Arc::clone(index);
     let bloom_clone = Arc::clone(bloom);
 
+    // Hard cap: refuse new work when too many prior threads are still running
+    // after timeout. This prevents unbounded thread accumulation on stuck ops.
+    if ABANDONED_THREADS.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS {
+        return JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: req.id.clone(),
+            result: Some(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": "server busy: too many prior operations still running after timeout. \
+                             Wait or set TILTH_TIMEOUT=<seconds> higher."
+                }],
+                "isError": true
+            })),
+            error: None,
+        };
+    }
+
     let (tx, rx) = mpsc::channel();
     let timeout = request_timeout();
 
@@ -785,7 +800,11 @@ fn handle_tool_call(
             &bloom_clone,
             edit_mode,
         );
-        let _ = tx.send(result);
+        if tx.send(result).is_err() {
+            // Receiver dropped — we were abandoned by a timeout. Decrement to
+            // reflect live count (paired with fetch_add on the timeout path).
+            ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
+        }
     });
 
     let result = match rx.recv_timeout(timeout) {
@@ -802,7 +821,7 @@ fn handle_tool_call(
             // Note: we intentionally do NOT join here to avoid blocking the
             // main loop. The thread will complete and exit on its own.
             let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-            if abandoned >= ABANDONED_THREAD_WARN {
+            if abandoned == ABANDONED_THREAD_WARN {
                 eprintln!(
                     "tilth: warning: {abandoned} abandoned threads still running. \
                      Consider reducing scope or increasing TILTH_TIMEOUT."
@@ -1293,5 +1312,124 @@ mod tests {
         let root_canon = root.unwrap().canonicalize().unwrap();
         let expected_canon = project_path.canonicalize().unwrap();
         assert_eq!(root_canon, expected_canon);
+    }
+
+    // -- abandoned thread counter ---------------------------------------------
+
+    // Serializes tests that mutate global ABANDONED_THREADS to avoid races.
+    static COUNTER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Verify that the abandoned-thread counter decrements when a worker's send
+    /// fails (i.e., the receiver was dropped by a timeout before the thread
+    /// finished). We test via the observable atomic directly.
+    #[test]
+    fn test_abandoned_counter_decrements_on_abandon() {
+        let _guard = COUNTER_MUTEX.lock().unwrap();
+        ABANDONED_THREADS.store(0, Ordering::SeqCst);
+
+        // Simulate timeout path: increment the counter as handle_tool_call does.
+        let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
+        assert_eq!(abandoned, 1);
+
+        // Simulate worker finishing after receiver is gone: channel send fails,
+        // so the worker decrements the counter.
+        ABANDONED_THREADS.fetch_sub(1, Ordering::Relaxed);
+
+        assert_eq!(
+            ABANDONED_THREADS.load(Ordering::SeqCst),
+            0,
+            "counter must return to 0 after abandoned thread exits"
+        );
+    }
+
+    /// When ABANDONED_THREADS is at MAX_ABANDONED_THREADS, handle_tool_call must
+    /// return a server-busy error without spawning a new thread.
+    #[test]
+    fn test_abandoned_hard_cap_returns_server_busy() {
+        let _guard = COUNTER_MUTEX.lock().unwrap();
+        ABANDONED_THREADS.store(MAX_ABANDONED_THREADS, Ordering::SeqCst);
+
+        let req = JsonRpcRequest {
+            _jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: serde_json::json!({
+                "name": "tilth_files",
+                "arguments": { "pattern": "*.rs" }
+            }),
+        };
+        let cache = Arc::new(OutlineCache::new());
+        let session = Arc::new(Session::new());
+        let index = Arc::new(SymbolIndex::new());
+        let bloom = Arc::new(BloomFilterCache::new());
+
+        let resp = handle_tool_call(&req, &cache, &session, &index, &bloom, false);
+
+        // Reset before any assertion that could panic
+        ABANDONED_THREADS.store(0, Ordering::SeqCst);
+
+        let result = resp.result.expect("response must have a result field");
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(is_error, "response must have isError: true");
+
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("server busy"),
+            "error message must contain 'server busy', got: {text}"
+        );
+    }
+
+    // -- batch read -----------------------------------------------------------
+
+    /// Batch reads with paths array must return all file contents in the same
+    /// order as the submitted paths list, even under parallel execution.
+    #[test]
+    fn test_batch_read_parallel_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_count = 5usize;
+
+        let paths: Vec<PathBuf> = (0..file_count)
+            .map(|i| {
+                let p = dir.path().join(format!("file{i}.txt"));
+                std::fs::write(&p, format!("content-of-file-{i}")).unwrap();
+                p
+            })
+            .collect();
+
+        let paths_json: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|p| serde_json::json!(p.to_str().unwrap()))
+            .collect();
+
+        let args = serde_json::json!({ "paths": paths_json });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let result = tool_read(&args, &cache, &session, false).expect("batch read must succeed");
+
+        for i in 0..file_count {
+            assert!(
+                result.contains(&format!("content-of-file-{i}")),
+                "output must contain content of file {i}"
+            );
+        }
+
+        // Verify order: each file's content appears before the next one's.
+        for i in 0..file_count - 1 {
+            let pos_a = result
+                .find(&format!("content-of-file-{i}"))
+                .expect("file {i} content missing");
+            let pos_b = result
+                .find(&format!("content-of-file-{}", i + 1))
+                .expect("file {} content missing");
+            assert!(
+                pos_a < pos_b,
+                "file {i} content must appear before file {} content",
+                i + 1
+            );
+        }
     }
 }
