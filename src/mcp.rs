@@ -1037,6 +1037,8 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 20,
                         "description": "Multiple file paths to read in one call (max 20). PREFER this over multiple single-file calls when you have 2+ files — one call instead of N saves turns and latency."
                     },
                     "section": {
@@ -1538,10 +1540,11 @@ mod tests {
 
     #[test]
     fn tool_edit_batch_over_limit_rejected() {
+        let tmp = std::env::temp_dir();
         let mut files = Vec::with_capacity(21);
         for i in 0..21 {
             files.push(serde_json::json!({
-                "path": format!("/tmp/nonexistent_{i}.txt"),
+                "path": tmp.join(format!("tilth_nonexistent_{i}.txt")).to_str().unwrap(),
                 "edits": [{ "start": "1:000", "content": "x" }]
             }));
         }
@@ -1560,14 +1563,17 @@ mod tests {
     fn tool_edit_batch_all_failed_returns_err() {
         // Every file in the batch fails → tool_edit returns Err so the MCP
         // response gets isError: true.
+        let tmp = std::env::temp_dir();
+        let p1 = tmp.join("tilth_does_not_exist_xyz_1.txt");
+        let p2 = tmp.join("tilth_does_not_exist_xyz_2.txt");
         let args = serde_json::json!({
             "files": [
                 {
-                    "path": "/tmp/tilth_does_not_exist_xyz_1.txt",
+                    "path": p1.to_str().unwrap(),
                     "edits": [{ "start": "1:000", "content": "x" }]
                 },
                 {
-                    "path": "/tmp/tilth_does_not_exist_xyz_2.txt",
+                    "path": p2.to_str().unwrap(),
                     "edits": [{ "start": "1:000", "content": "x" }]
                 }
             ]
