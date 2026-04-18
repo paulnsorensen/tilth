@@ -30,7 +30,9 @@ fn full_read_size_cap() -> u64 {
 
 /// Read many files in parallel. Each file's output follows the same smart-view
 /// rules as [`read_file`]; errors are inlined as `# <path> — error: <msg>` so
-/// one bad path never aborts the batch. Ordering matches the input `paths`.
+/// one bad path never aborts the batch. Output ordering matches the input
+/// `paths` — rayon's `par_iter().collect()` preserves index order even though
+/// execution order is not deterministic.
 pub fn read_batch(
     paths: &[std::path::PathBuf],
     cache: &OutlineCache,

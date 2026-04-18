@@ -1,8 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,87 +11,7 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::index::SymbolIndex;
 use crate::session::Session;
-
-const ABANDONED_THREAD_WARN: usize = 3;
-/// Hard cap: refuse new work when this many prior threads are still running
-/// after timeout. Prevents unbounded thread accumulation on stuck operations.
-const MAX_ABANDONED_THREADS: usize = 8;
-
-/// Live count of threads that timed out and are still running in the background.
-/// Owned by `Services`, so tests instantiate their own instance rather than
-/// serializing on a global.
-pub(crate) struct ThreadTracker {
-    count: AtomicUsize,
-}
-
-impl ThreadTracker {
-    pub(crate) fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-        }
-    }
-
-    fn is_at_cap(&self) -> bool {
-        self.count.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS
-    }
-
-    fn record_timeout(&self) -> usize {
-        self.count.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    fn record_finish_after_timeout(&self) {
-        self.count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn current(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-}
-
-/// Per-request coordination between the main thread and the worker thread.
-/// Exactly one of `claim_timeout` / `claim_finish` wins, so the tracker count
-/// is updated at most once per spawn even when a worker's send and the main
-/// thread's `recv_timeout` deadline race.
-struct ThreadCoord(AtomicU8);
-
-impl ThreadCoord {
-    const RUNNING: u8 = 0;
-    const TIMED_OUT: u8 = 1;
-    const FINISHED: u8 = 2;
-
-    fn new() -> Self {
-        Self(AtomicU8::new(Self::RUNNING))
-    }
-
-    /// Main-thread side. Returns true if we transitioned `RUNNING` → `TIMED_OUT`;
-    /// the caller should then increment the tracker. False means the worker
-    /// already reached `FINISHED` — no counter change needed.
-    fn claim_timeout(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::RUNNING,
-                Self::TIMED_OUT,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-
-    /// Worker-thread side. Returns true if we transitioned `RUNNING` → `FINISHED`;
-    /// no counter change needed. False means the main thread already flipped
-    /// to `TIMED_OUT` and incremented — the caller must decrement to undo it.
-    fn claim_finish(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::RUNNING,
-                Self::FINISHED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-}
+use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 /// Cloning is cheap (all fields are `Arc` or `Copy`) so the spawned worker
@@ -119,17 +37,6 @@ impl Services {
             edit_mode,
         }
     }
-}
-
-/// Per-request timeout for tool calls. If a tool doesn't respond within this
-/// duration, the MCP server returns a timeout error instead of hanging.
-/// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-fn request_timeout() -> Duration {
-    let secs = std::env::var("TILTH_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90);
-    Duration::from_secs(secs)
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
@@ -830,7 +737,7 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
                 .into(),
         )
     } else {
-        run_tool_with_timeout(services, tool_name, args, request_timeout())
+        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
     };
 
     build_response(req.id.as_ref(), result)
@@ -853,58 +760,6 @@ fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpc
         result: Some(payload),
         error: None,
     }
-}
-
-/// Run an arbitrary closure on a fresh thread with a wall-clock timeout.
-/// Returns `Ok(result)` on success. On timeout, returns `Err(SpawnFailure::Timeout)`
-/// and detaches the worker; the tracker is incremented and the worker will
-/// decrement it when it eventually exits. On worker panic, returns `Err(Panic)`.
-fn spawn_with_timeout<F, R>(
-    tracker: &Arc<ThreadTracker>,
-    timeout: Duration,
-    work: F,
-) -> Result<R, SpawnFailure>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    let coord = Arc::new(ThreadCoord::new());
-    let coord_worker = Arc::clone(&coord);
-    let tracker_worker = Arc::clone(tracker);
-
-    let handle = std::thread::spawn(move || {
-        let result = work();
-        let _ = tx.send(result);
-        if !coord_worker.claim_finish() {
-            tracker_worker.record_finish_after_timeout();
-        }
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            let _ = handle.join();
-            Ok(result)
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            if coord.claim_timeout() {
-                let n = tracker.record_timeout();
-                if n == ABANDONED_THREAD_WARN {
-                    eprintln!(
-                        "tilth: warning: {n} abandoned threads still running. \
-                         Consider reducing scope or increasing TILTH_TIMEOUT."
-                    );
-                }
-            }
-            Err(SpawnFailure::Timeout)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(SpawnFailure::Panic),
-    }
-}
-
-enum SpawnFailure {
-    Timeout,
-    Panic,
 }
 
 fn run_tool_with_timeout(
@@ -1391,36 +1246,10 @@ mod tests {
         }
     }
 
-    /// Drives the real CAS path: a short-timeout `spawn_with_timeout` call
-    /// races against a worker that sleeps past the deadline. The main thread
-    /// must win the CAS (increment), and the worker must observe the lost CAS
-    /// when it eventually exits (decrement). Ends with the counter back at zero.
-    #[test]
-    fn test_abandoned_counter_roundtrips_through_cas() {
-        let tracker = Arc::new(ThreadTracker::new());
-        assert_eq!(tracker.current(), 0);
-
-        let result: Result<(), SpawnFailure> =
-            spawn_with_timeout(&tracker, Duration::from_millis(20), || {
-                std::thread::sleep(Duration::from_millis(200));
-            });
-
-        assert!(matches!(result, Err(SpawnFailure::Timeout)));
-        assert_eq!(tracker.current(), 1, "timeout must increment tracker");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while tracker.current() > 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(tracker.current(), 0, "worker exit must decrement tracker");
-    }
-
     #[test]
     fn test_abandoned_hard_cap_returns_server_busy() {
         let tracker = Arc::new(ThreadTracker::new());
-        for _ in 0..MAX_ABANDONED_THREADS {
-            tracker.record_timeout();
-        }
+        tracker.saturate();
         let services = test_services_with_tracker(tracker);
 
         let req = JsonRpcRequest {
@@ -1453,9 +1282,8 @@ mod tests {
         );
     }
 
-    /// Batch reads must return the content of every submitted path (parallel
-    /// execution does not drop files). Ordering is guaranteed by rayon's
-    /// `par_iter().collect()` contract; not asserted here.
+    /// Batch reads must return the content of every submitted path — no file
+    /// is dropped or reordered on the way through the tool handler.
     #[test]
     fn test_batch_read_returns_all_files() {
         let dir = tempfile::tempdir().unwrap();
