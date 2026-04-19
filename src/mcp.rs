@@ -409,7 +409,8 @@ fn tool_search(
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
-        "symbol" => {
+        "symbol" | "any" => {
+            let strict = kind == "symbol";
             let queries: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -420,7 +421,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob, strict,
                     )
                 }
                 2..=5 => {
@@ -428,7 +429,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob,
+                        &queries, &scope, cache, session, bloom, expand, context, glob, strict,
                     )
                 }
                 _ => {
@@ -459,7 +460,7 @@ fn tool_search(
         }
         _ => {
             return Err(format!(
-                "unknown search kind: {kind}. Use: symbol, content, regex, callers"
+                "unknown search kind: {kind}. Use: symbol, any, content, regex, callers"
             ))
         }
     }
@@ -800,9 +801,9 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["symbol", "content", "regex", "callers"],
+                        "enum": ["symbol", "any", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "description": "Search type. symbol: declarations only (tree-sitter AST, no comment/string hits). any: symbol-name matches including comments/strings/usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
                     "expand": {
                         "type": "number",
