@@ -1,5 +1,6 @@
 pub mod imports;
 pub mod outline;
+pub mod sections;
 
 use std::fs;
 use std::path::Path;
