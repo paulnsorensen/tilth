@@ -145,8 +145,13 @@ where
     let tracker_worker = Arc::clone(tracker);
 
     let handle = std::thread::spawn(move || {
-        let result = work();
-        let _ = tx.send(result);
+        // catch_unwind ensures claim_finish / record_finish_after_timeout run
+        // even if work() panics after the main thread has already timed out.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        if let Ok(val) = result {
+            let _ = tx.send(val);
+        }
+        // tx is dropped here on panic, so main thread gets RecvError.
         if !coord_worker.claim_finish() {
             tracker_worker.record_finish_after_timeout();
         }
@@ -161,14 +166,19 @@ where
             Err(RecvError) => Err(SpawnFailure::Panic),
         },
         default(timeout) => {
+            // Increment before the CAS so the worker can never observe TIMED_OUT
+            // and call fetch_sub before the fetch_add, which would underflow.
+            // If the worker already claimed FINISHED, roll back the increment.
+            let n = tracker.record_timeout();
             if coord.claim_timeout() {
-                let n = tracker.record_timeout();
                 if n >= ABANDONED_THREAD_WARN {
                     eprintln!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
                     );
                 }
+            } else {
+                tracker.record_finish_after_timeout();
             }
             Err(SpawnFailure::Timeout)
         }

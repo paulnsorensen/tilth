@@ -33,7 +33,7 @@ fn full_read_size_cap() -> u64 {
 /// one bad path never aborts the batch. Output ordering matches the input
 /// `paths` — rayon's `par_iter().collect()` preserves index order even though
 /// execution order is not deterministic.
-pub fn read_batch(
+pub(crate) fn read_batch(
     paths: &[std::path::PathBuf],
     cache: &OutlineCache,
     session: &Session,
