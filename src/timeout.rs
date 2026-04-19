@@ -188,6 +188,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-var tests so parallel `cargo test` execution doesn't
+    /// race on process-global `TILTH_TIMEOUT`. Any test that mutates this
+    /// env var must take this lock for its duration.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Drives the real CAS path: a short-timeout `spawn_with_timeout` call
     /// races against a worker that sleeps past the deadline. The main thread
@@ -223,6 +229,7 @@ mod tests {
 
     #[test]
     fn request_timeout_reads_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TILTH_TIMEOUT", "7");
         assert_eq!(request_timeout(), Duration::from_secs(7));
         std::env::remove_var("TILTH_TIMEOUT");
