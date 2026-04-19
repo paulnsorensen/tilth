@@ -288,7 +288,27 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
 /// Read a specific line range from a file.
 /// Uses memchr to find the Nth newline offset and slice the mmap buffer directly
 /// instead of collecting all lines into a Vec.
+/// Read a section's formatted body (without the file header).
+/// Used by multi-section read to avoid duplicating the file header per section.
+pub(crate) fn read_section_body(
+    path: &Path,
+    range: &str,
+    edit_mode: bool,
+) -> Result<String, TilthError> {
+    let (_, body) = read_section_parts(path, range, edit_mode)?;
+    Ok(body)
+}
+
 fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, TilthError> {
+    let (header, body) = read_section_parts(path, range, edit_mode)?;
+    Ok(format!("{header}\n\n{body}"))
+}
+
+fn read_section_parts(
+    path: &Path,
+    range: &str,
+    edit_mode: bool,
+) -> Result<(String, String), TilthError> {
     let file = fs::File::open(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
@@ -345,24 +365,7 @@ fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, Til
     } else {
         format::number_lines(&selected, start as u32)
     };
-    Ok(format!("{header}\n\n{formatted}"))
-}
-
-/// Read multiple sections from a single file.
-/// Returns sections separated by dividers, with per-section headers.
-pub(crate) fn read_sections(
-    path: &Path,
-    ranges: &[String],
-    edit_mode: bool,
-) -> Result<String, TilthError> {
-    let mut results = Vec::new();
-    for range in ranges {
-        match read_section(path, range, edit_mode) {
-            Ok(content) => results.push(content),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(results.join("\n\n"))
+    Ok((header, formatted))
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
