@@ -378,10 +378,16 @@ fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String
         "tilth_files" => tool_files(args, &services.cache),
         "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
         "tilth_diff" => tool_diff(args),
-        "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
+        "tilth_map" | "structural_map" => Err(format!(
+            "{tool} is not an exposed MCP tool. \
+             Use tilth_files to list files/directories or tilth_search to find symbols and content."
+        )),
         "tilth_session" => tool_session(args, &services.session),
         "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
-        _ => Err(format!("unknown tool: {tool}")),
+        _ => {
+            eprintln!("[tilth] unknown tool requested: {tool}");
+            Err(format!("unknown tool: {tool}"))
+        }
     }
 }
 
@@ -1349,6 +1355,95 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+    }
+
+    // -- JSON round-trip regression tests --------------------------------------
+
+    fn make_services() -> Services {
+        Services {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            tracker: Arc::new(ThreadTracker::new()),
+            edit_mode: false,
+        }
+    }
+
+    fn round_trip_req(tool: &str, args: &Value) -> JsonRpcResponse {
+        let services = make_services();
+        let req = JsonRpcRequest {
+            _jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(99)),
+            method: "tools/call".into(),
+            params: serde_json::json!({ "name": tool, "arguments": args }),
+        };
+        handle_tool_call(&req, &services)
+    }
+
+    fn assert_valid_json_response(resp: &JsonRpcResponse) {
+        let s = serde_json::to_string(&resp).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            reparsed["result"]["content"][0]["text"].is_string(),
+            "content[0].text must be a string: {s}"
+        );
+        // Verify re-serializing the parsed value produces valid JSON (stable values,
+        // not necessarily identical key ordering).
+        let s2 = serde_json::to_string(&reparsed).unwrap();
+        let reparsed2: serde_json::Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(
+            reparsed, reparsed2,
+            "double round-trip must produce identical values"
+        );
+    }
+
+    #[test]
+    fn all_tool_responses_are_valid_json() {
+        let tool_args: &[(&str, Value)] = &[
+            (
+                "tilth_search",
+                serde_json::json!({ "query": "__tilth_nonexistent__" }),
+            ),
+            (
+                "tilth_read",
+                serde_json::json!({ "path": "/nonexistent/path/tilth_test.rs" }),
+            ),
+            ("tilth_files", serde_json::json!({ "pattern": "*.rs" })),
+            (
+                "tilth_deps",
+                serde_json::json!({ "path": "/nonexistent/tilth_test.rs" }),
+            ),
+            ("tilth_diff", serde_json::json!({})),
+            ("tilth_session", serde_json::json!({})),
+        ];
+
+        for (tool, args) in tool_args {
+            let resp = round_trip_req(tool, args);
+            assert_valid_json_response(&resp);
+        }
+    }
+
+    #[test]
+    fn structural_map_returns_valid_json_error() {
+        let resp = round_trip_req("structural_map", &serde_json::json!({}));
+
+        let s = serde_json::to_string(&resp).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        assert!(
+            reparsed["result"]["content"][0]["text"].is_string(),
+            "content[0].text must be a string: {s}"
+        );
+
+        let text = reparsed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("tilth_files") || text.contains("tilth_search"),
+            "error must suggest alternatives, got: {text}"
+        );
+
+        let is_error = reparsed["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(is_error, "response must have isError: true, got: {s}");
     }
 
     // -- batch tool_edit --------------------------------------------------------
