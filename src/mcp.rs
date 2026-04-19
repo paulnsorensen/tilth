@@ -446,10 +446,38 @@ fn tool_read(
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = PathBuf::from(path_str);
     let section = args.get("section").and_then(|v| v.as_str());
+    let sections = args.get("sections").and_then(|v| v.as_array());
     let full = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+
+    // Multi-section read (mutually exclusive with section parameter).
+    if let Some(sections_arr) = sections {
+        if section.is_some() {
+            return Err("section and sections are mutually exclusive".into());
+        }
+        if sections_arr.len() > 20 {
+            return Err(format!(
+                "sections read limited to 20 sections (got {})",
+                sections_arr.len()
+            ));
+        }
+
+        let ranges: Vec<String> = sections_arr
+            .iter()
+            .map(|s| {
+                s.as_str()
+                    .ok_or("sections must be an array of strings")
+                    .map(std::string::ToString::to_string)
+            })
+            .collect::<Result<_, _>>()?;
+
+        session.record_read(&path);
+        let output =
+            crate::read::read_sections(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
+        return Ok(apply_budget(output, budget));
+    }
 
     session.record_read(&path);
     let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
