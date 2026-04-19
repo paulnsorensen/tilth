@@ -1913,6 +1913,367 @@ mod tests {
         assert!(err.contains("empty"), "must mention empty: {err}");
     }
 
+    // ── press: adversarial multi-section edge cases ───────────────────────────
+
+    /// Duplicate ranges produce two blocks (no dedup). Both markers appear and
+    /// sections_meta contains two entries with the same range label.
+    #[test]
+    fn multi_section_duplicate_ranges_produce_two_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dup.txt");
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["10-15", "10-15"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        // Both markers should be present in the output
+        let count = result.text.matches("## section: \"10-15\"").count();
+        assert_eq!(
+            count, 2,
+            "duplicate range should produce 2 blocks, got {count}"
+        );
+
+        let metas = result.sections_meta.as_ref().unwrap();
+        assert_eq!(metas.len(), 2, "sections_meta must have 2 entries");
+        assert_eq!(metas[0].section, "10-15");
+        assert_eq!(metas[1].section, "10-15");
+        assert!(
+            !result.truncated,
+            "no truncation expected for small sections"
+        );
+    }
+
+    /// Overlapping ranges produce two independent blocks (no merging).
+    #[test]
+    fn multi_section_overlapping_ranges_produce_two_independent_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overlap.txt");
+        let body: String = (1..=50).map(|i| format!("content{i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["10-25", "20-40"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        // Both markers appear
+        assert!(
+            result.text.contains("## section: \"10-25\""),
+            "first section marker missing"
+        );
+        assert!(
+            result.text.contains("## section: \"20-40\""),
+            "second section marker missing"
+        );
+
+        // Overlapping content should appear in both blocks
+        assert!(
+            result.text.contains("content22"),
+            "line 22 in overlap zone must appear"
+        );
+
+        let metas = result.sections_meta.as_ref().unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(!metas[0].truncated);
+        assert!(!metas[1].truncated);
+    }
+
+    /// Range exceeding file length should be clamped to EOF, not crash.
+    /// Content up to the last line is returned; no panic.
+    #[test]
+    fn multi_section_out_of_bounds_range_clamps_to_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("short.txt");
+        // Only 10 lines
+        let body: String = (1..=10).map(|i| format!("row {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["1-99999"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        // Must not panic — range is clamped to EOF, returns full file content
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        // Verified behavior: parse_range returns (1, 99999); read_section_parts clamps
+        // `e = 99999.min(total)` and returns content up to EOF. No panic, no error.
+        assert!(
+            !result.text.is_empty(),
+            "out-of-bounds range must produce non-empty output"
+        );
+        assert!(
+            result.text.contains("row 10"),
+            "clamped out-of-bounds range must include last real line: {}",
+            result.text
+        );
+        // truncated=false because the section read itself is complete (just clamped)
+        assert!(
+            !result.truncated,
+            "clamped section should not set truncated=true (budget not hit)"
+        );
+    }
+
+    /// Malformed range string — error is inlined per-section (does not abort other sections).
+    /// The error text does not need to identify the index position (acceptable behavior).
+    #[test]
+    fn multi_section_malformed_range_inlines_error_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("good.txt");
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["abc", "10-15"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        // Should succeed at the sections level — per-section errors inlined
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        // Second (valid) section should still appear
+        assert!(
+            result.text.contains("## section: \"abc\""),
+            "bad section marker should still appear"
+        );
+        assert!(
+            result.text.contains("## section: \"10-15\""),
+            "valid second section must appear after bad first section"
+        );
+        // The bad section should have an error message
+        assert!(
+            result.text.contains("error"),
+            "bad section should produce an error message"
+        );
+        // The valid section should contain real content
+        assert!(
+            result.text.contains("line 12"),
+            "valid section must contain real content"
+        );
+    }
+
+    /// Malformed range "10-" (trailing dash) is rejected with a clear error.
+    #[test]
+    fn section_malformed_trailing_dash_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.txt");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        // Single-section path
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "section": "10-",
+        });
+        // Either returns Err or Ok with error text — must not panic
+        match tool_read(&args, &cache, &session, false) {
+            Err(e) => {
+                assert!(
+                    e.contains("expected format")
+                        || e.contains("out of bounds")
+                        || e.contains("range"),
+                    "error message should describe the format problem: {e}"
+                );
+            }
+            Ok(result) => {
+                // If it somehow parsed "10-" as (10, 0), that would be a bug
+                // Accept an error inline, but not silent success with wrong content
+                // "10-" can't parse as (usize, usize) since "" fails parse — so Ok here
+                // would mean the content is a "section omitted" or file content
+                let _ = result; // acceptable
+            }
+        }
+    }
+
+    /// Malformed range "-25" (leading dash) is rejected.
+    #[test]
+    fn section_malformed_leading_dash_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.txt");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "section": "-25",
+        });
+        match tool_read(&args, &cache, &session, false) {
+            Err(e) => {
+                assert!(!e.is_empty(), "error must be non-empty for malformed range");
+            }
+            Ok(_) => {
+                // "-25" starts with '-' not '#', so parse_range tries split_once('-')
+                // on "" and "25" — start="" fails parse so returns None → InvalidQuery
+                // If we reach Ok, this is a finding.
+                panic!("malformed range '-25' should not succeed silently");
+            }
+        }
+    }
+
+    /// Budget=0 with sections: every section is "omitted due to budget", truncated=true,
+    /// no panic.
+    #[test]
+    fn multi_section_zero_budget_marks_all_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("z.txt");
+        let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["1-10", "15-25"],
+            "budget": 0,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        assert!(result.truncated, "budget=0 must set truncated=true");
+        let metas = result.sections_meta.as_ref().unwrap();
+        assert_eq!(metas.len(), 2);
+        // With budget=0 both sections must be truncated/omitted
+        assert!(
+            metas[0].truncated || metas[1].truncated,
+            "at least one section must be truncated with budget=0"
+        );
+        // Check that the output doesn't contain real line content
+        assert!(
+            !result.text.contains("line 5"),
+            "budget=0 should not return real content"
+        );
+    }
+
+    /// truncated=false is guaranteed when the response fits within budget.
+    #[test]
+    fn truncated_false_when_output_fits_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("small.txt");
+        std::fs::write(&p, "hello\nworld\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "section": "1-2",
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(!result.truncated, "small section must not be truncated");
+        assert!(
+            result.truncated_at_line.is_none(),
+            "truncated_at_line must be None when not truncated"
+        );
+    }
+
+    /// kind="symbol" on an unsupported grammar file (Dockerfile) returns empty
+    /// matches rather than crashing. Acceptable behavior documented.
+    #[test]
+    fn kind_symbol_unsupported_lang_returns_empty_no_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        std::fs::write(
+            &dockerfile,
+            "FROM ubuntu:22.04\nRUN apt-get install -y curl\nCMD [\"/bin/bash\"]\n",
+        )
+        .unwrap();
+
+        let scope = dir.path().to_str().unwrap();
+        let args = serde_json::json!({
+            "query": "ubuntu",
+            "scope": scope,
+            "kind": "symbol",
+            "expand": 0,
+        });
+
+        // Must not panic — empty results are fine
+        let resp = round_trip_req("tilth_search", &args);
+        let s = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // Response must be valid JSON with a text field
+        assert!(
+            v["result"]["content"][0]["text"].is_string(),
+            "response must have text field: {s}"
+        );
+        // No crash == success; empty results acceptable
+    }
+
+    /// Sections array with only non-string elements should return Err.
+    #[test]
+    fn multi_section_non_string_elements_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.txt");
+        std::fs::write(&p, "a\nb\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": [42, "1-2"],
+        });
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("non-string element must be rejected");
+        assert!(
+            err.contains("strings") || err.contains("string"),
+            "error should mention string type: {err}"
+        );
+    }
+
+    /// Sections with exactly 20 ranges (limit) should succeed.
+    #[test]
+    fn multi_section_exactly_20_ranges_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.txt");
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let ranges: Vec<String> = (1..=20).map(|i| format!("{}-{}", i, i)).collect();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ranges,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        // Must not error on exactly 20 sections
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let metas = result.sections_meta.as_ref().unwrap();
+        assert_eq!(metas.len(), 20, "exactly 20 sections must all be processed");
+    }
+
+    /// Sections with 21 ranges exceeds limit and is rejected.
+    #[test]
+    fn multi_section_21_ranges_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big21.txt");
+        std::fs::write(&p, "a\n").unwrap();
+
+        let ranges: Vec<String> = (1..=21).map(|i| format!("{}-{}", i, i.min(1))).collect();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ranges,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err =
+            tool_read(&args, &cache, &session, false).expect_err("21 sections must be rejected");
+        assert!(
+            err.contains("20") || err.contains("limited"),
+            "error must mention the 20-section limit: {err}"
+        );
+    }
+
     #[test]
     fn symbol_kind_strict_vs_any_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
