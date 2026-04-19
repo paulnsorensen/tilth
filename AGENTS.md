@@ -46,6 +46,9 @@ search: filter to lines matching a term. blast: true to show callers of changed 
 Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
 
+Note: tilth_map is a CLI-only tool and is NOT exposed over MCP. Consumers wanting
+file-tree structure should use tilth_files (glob patterns) or tilth_search (symbol/content).
+
 To search code, use tilth_search instead of Grep or Bash(grep/rg).
 To read files, use tilth_read instead of Read or Bash(cat).
 To find files, use tilth_files instead of Glob or Bash(find/ls).
