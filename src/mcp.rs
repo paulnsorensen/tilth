@@ -37,12 +37,22 @@ impl Services {
     }
 }
 
+/// Per-section metadata for multi-section `tilth_read` responses.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SectionMeta {
+    pub(crate) section: String,
+    pub(crate) truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) truncated_at_line: Option<u32>,
+}
+
 /// Output from a tool, with optional truncation metadata.
 #[derive(Debug)]
 pub(crate) struct ToolOutcome {
     pub(crate) text: String,
     pub(crate) truncated: bool,
     pub(crate) truncated_at_line: Option<u32>,
+    pub(crate) sections_meta: Option<Vec<SectionMeta>>,
 }
 
 impl From<String> for ToolOutcome {
@@ -51,6 +61,7 @@ impl From<String> for ToolOutcome {
             text,
             truncated: false,
             truncated_at_line: None,
+            sections_meta: None,
         }
     }
 }
@@ -89,6 +100,8 @@ tilth_read: Read one or more files with smart outlining. Replaces cat/head/tail.
   path: \"a.rs\" for a single file.\n\
   Small files → full content. Large files → structural outline.\n\
   section: \"<start>-<end>\" or \"<heading text>\"\n\
+  sections: [\"10-25\", \"47-60\"] reads multiple ranges from ONE file (max 20). Mutually exclusive with section.\n\
+  When budget is hit, response _meta.truncated=true + _meta.truncated_at_line. Multi-section _meta.sections[] has per-section truncated flags; later sections truncated first.\n\
   Output:\n\
     <line_number> │ <content>                  ← full/section mode\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
@@ -457,6 +470,9 @@ fn tool_read(
         if section.is_some() {
             return Err("section and sections are mutually exclusive".into());
         }
+        if sections_arr.is_empty() {
+            return Err("sections must contain at least one range".into());
+        }
         if sections_arr.len() > 20 {
             return Err(format!(
                 "sections read limited to 20 sections (got {})",
@@ -474,9 +490,7 @@ fn tool_read(
             .collect::<Result<_, _>>()?;
 
         session.record_read(&path);
-        let output =
-            crate::read::read_sections(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
-        return Ok(apply_budget(output, budget));
+        return Ok(read_sections_with_budget(&path, &ranges, edit_mode, budget));
     }
 
     session.record_read(&path);
@@ -790,6 +804,68 @@ fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     (resolved, None)
 }
 
+/// Read multiple sections from one file, enforcing a shared token budget.
+/// Later sections are truncated (or omitted) first when budget is exhausted.
+fn read_sections_with_budget(
+    path: &Path,
+    ranges: &[String],
+    edit_mode: bool,
+    budget: Option<u64>,
+) -> ToolOutcome {
+    let mut blocks: Vec<String> = Vec::with_capacity(ranges.len());
+    let mut metas: Vec<SectionMeta> = Vec::with_capacity(ranges.len());
+    let mut remaining: u64 = budget.unwrap_or(u64::MAX);
+    let mut any_truncated = false;
+    let mut first_truncated_at: Option<u32> = None;
+
+    for range in ranges {
+        let raw_body = match crate::read::read_section_body(path, range, edit_mode) {
+            Ok(s) => s,
+            Err(e) => format!("error reading section: {e}"),
+        };
+        let header = format!("## section: {range:?}");
+        let block_full = format!("{header}\n\n{raw_body}");
+        let tokens = crate::types::estimate_tokens(block_full.len() as u64);
+
+        let (emitted, section_truncated, at_line) = if remaining == u64::MAX || tokens <= remaining
+        {
+            remaining = remaining.saturating_sub(tokens);
+            (block_full, false, None)
+        } else if remaining == 0 {
+            (
+                format!("{header}\n\n... section omitted due to budget"),
+                true,
+                None,
+            )
+        } else {
+            let (truncated_text, info) = crate::budget::apply_with_info(&block_full, remaining);
+            remaining = 0;
+            (truncated_text, true, info.map(|i| i.at_line))
+        };
+
+        if section_truncated {
+            any_truncated = true;
+            if first_truncated_at.is_none() {
+                first_truncated_at = at_line;
+            }
+        }
+
+        blocks.push(emitted);
+        metas.push(SectionMeta {
+            section: range.clone(),
+            truncated: section_truncated,
+            truncated_at_line: at_line,
+        });
+    }
+
+    ToolOutcome {
+        text: blocks.join("\n\n"),
+        truncated: any_truncated,
+        truncated_at_line: first_truncated_at,
+        sections_meta: Some(metas),
+    }
+}
+
 fn apply_budget(output: String, budget: Option<u64>) -> ToolOutcome {
     match budget {
         Some(b) => {
@@ -798,12 +874,14 @@ fn apply_budget(output: String, budget: Option<u64>) -> ToolOutcome {
                 text,
                 truncated: info.is_some(),
                 truncated_at_line: info.map(|i| i.at_line),
+                sections_meta: None,
             }
         }
         None => ToolOutcome {
             text: output,
             truncated: false,
             truncated_at_line: None,
+            sections_meta: None,
         },
     }
 }
@@ -831,14 +909,23 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
 }
 
 fn build_response(id: Option<&Value>, result: Result<ToolOutcome, String>) -> JsonRpcResponse {
-    let (text, is_error, truncated, truncated_at_line) = match result {
-        Ok(outcome) => (
-            outcome.text,
-            false,
-            outcome.truncated,
-            outcome.truncated_at_line,
-        ),
-        Err(e) => (e, true, false, None),
+    let (text, is_error, outcome_meta) = match result {
+        Ok(outcome) => {
+            let meta = if outcome.truncated || outcome.sections_meta.is_some() {
+                let mut m = serde_json::json!({ "truncated": outcome.truncated });
+                if let Some(line) = outcome.truncated_at_line {
+                    m["truncated_at_line"] = serde_json::json!(line);
+                }
+                if let Some(sections) = outcome.sections_meta {
+                    m["sections"] = serde_json::to_value(sections).unwrap_or(Value::Null);
+                }
+                Some(m)
+            } else {
+                Some(serde_json::json!({ "truncated": false }))
+            };
+            (outcome.text, false, meta)
+        }
+        Err(e) => (e, true, None),
     };
     let mut payload = serde_json::json!({
         "content": [{ "type": "text", "text": text }]
@@ -846,17 +933,8 @@ fn build_response(id: Option<&Value>, result: Result<ToolOutcome, String>) -> Js
     if is_error {
         payload["isError"] = Value::Bool(true);
     }
-    // Add _meta with truncation info when truncation occurred
-    if truncated {
-        payload["_meta"] = serde_json::json!({
-            "truncated": true,
-            "truncated_at_line": truncated_at_line
-        });
-    } else if !is_error {
-        // Include _meta even without truncation to indicate completeness
-        payload["_meta"] = serde_json::json!({
-            "truncated": false
-        });
+    if let Some(m) = outcome_meta {
+        payload["_meta"] = m;
     }
     JsonRpcResponse {
         jsonrpc: "2.0",
@@ -973,6 +1051,13 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "section": {
                         "type": "string",
                         "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view."
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Multiple ranges/headings from ONE file e.g. ['10-25', '47-60']. Returned in input order with '## section: \"X-Y\"' markers. Shared budget across all sections; later sections truncated first. Mutually exclusive with 'section'."
                     },
                     "full": {
                         "type": "boolean",
@@ -1433,6 +1518,126 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+    }
+
+    #[test]
+    fn multi_section_returns_ordered_blocks_with_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("multi.txt");
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["10-15", "40-45", "80-85"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        assert!(result.text.contains("## section: \"10-15\""));
+        assert!(result.text.contains("## section: \"40-45\""));
+        assert!(result.text.contains("## section: \"80-85\""));
+
+        let idx_a = result.text.find("## section: \"10-15\"").unwrap();
+        let idx_b = result.text.find("## section: \"40-45\"").unwrap();
+        let idx_c = result.text.find("## section: \"80-85\"").unwrap();
+        assert!(
+            idx_a < idx_b && idx_b < idx_c,
+            "sections must be in input order"
+        );
+
+        assert!(result.text.contains("line 12"));
+        assert!(result.text.contains("line 42"));
+        assert!(result.text.contains("line 82"));
+
+        let metas = result
+            .sections_meta
+            .as_ref()
+            .expect("sections_meta required");
+        assert_eq!(metas.len(), 3);
+        assert_eq!(metas[0].section, "10-15");
+        assert_eq!(metas[1].section, "40-45");
+        assert_eq!(metas[2].section, "80-85");
+        assert!(!metas[0].truncated);
+        assert!(!metas[1].truncated);
+        assert!(!metas[2].truncated);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn multi_section_truncates_later_sections_first_on_tight_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("long.txt");
+        // Wide lines so each section's token weight is predictable and non-trivial.
+        let body: String = (1..=200)
+            .map(|i| format!("line {i} with extra padding to widen the token footprint\n"))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+
+        // Section 1-20 alone is ~250 tokens. Pick a budget that fits section one
+        // comfortably but cannot accommodate the 50-100 or 150-200 blocks.
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["1-20", "50-100", "150-200"],
+            "budget": 350,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+
+        assert!(
+            result.truncated,
+            "top-level truncated must be true under tight budget"
+        );
+        let metas = result.sections_meta.as_ref().unwrap();
+        assert_eq!(metas.len(), 3);
+        assert!(!metas[0].truncated, "earliest section must survive intact");
+        assert!(
+            metas[2].truncated,
+            "latest section must be truncated or omitted"
+        );
+    }
+
+    #[test]
+    fn multi_section_rejects_both_section_and_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "section": "1-2",
+            "sections": ["1-2"],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn multi_section_meta_surfaces_in_mcp_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("m.txt");
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+
+        let args = serde_json::json!({
+            "path": p.to_str().unwrap(),
+            "sections": ["5-10", "20-25"],
+        });
+        let resp = round_trip_req("tilth_read", &args);
+        let s = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let meta = &v["result"]["_meta"];
+        assert_eq!(meta["truncated"], serde_json::json!(false));
+        let sections = meta["sections"].as_array().expect("_meta.sections[]");
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0]["section"], serde_json::json!("5-10"));
+        assert_eq!(sections[0]["truncated"], serde_json::json!(false));
+        assert_eq!(sections[1]["section"], serde_json::json!("20-25"));
     }
 
     // -- JSON round-trip regression tests --------------------------------------
