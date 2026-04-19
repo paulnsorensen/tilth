@@ -1,9 +1,14 @@
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::error::TilthError;
 use crate::format;
+use crate::index::bloom::BloomFilterCache;
+use crate::session::Session;
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -13,6 +18,14 @@ pub struct Edit {
     pub end_line: usize,
     pub end_hash: u16,
     pub content: String,
+}
+
+/// One file's worth of work for a batch `tilth_edit`. Parse errors are deferred
+/// onto the task so a malformed entry surfaces as a per-file failure instead
+/// of aborting the whole batch.
+pub enum FileEditTask {
+    Ready { path: PathBuf, edits: Vec<Edit> },
+    ParseError { label: String, msg: String },
 }
 
 /// Per-edit diff: old lines removed vs new lines added.
@@ -294,6 +307,84 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
     }
 
     out
+}
+
+/// Apply a batch of file edits in parallel.
+///
+/// Each task is processed independently — a hash mismatch, parse error, or
+/// I/O failure on one file does not block siblings. Output is a series of
+/// `## <path>` sections joined with `---`. Returns `Err` only when every
+/// file failed (so the MCP response sets `isError: true`). Output ordering
+/// matches the input `tasks` — rayon's `par_iter().collect()` preserves
+/// index order even though execution order is not deterministic.
+pub fn apply_batch(
+    tasks: Vec<FileEditTask>,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> Result<String, String> {
+    let outcomes: Vec<(String, bool)> = tasks
+        .into_par_iter()
+        .map(|task| match task {
+            FileEditTask::ParseError { label, msg } => (format!("## {label}\nerror: {msg}"), false),
+            FileEditTask::Ready { path, edits } => {
+                session.record_read(&path);
+                let header = format!("## {}", path.display());
+                match apply_one(&path, &edits, bloom, show_diff) {
+                    Ok(body) if body.is_empty() => (header, true),
+                    Ok(body) => (format!("{header}\n{body}"), true),
+                    Err(msg) => (format!("{header}\n{msg}"), false),
+                }
+            }
+        })
+        .collect();
+
+    let success_count = outcomes.iter().filter(|(_, ok)| *ok).count();
+    let combined = outcomes
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    if success_count == 0 {
+        Err(combined)
+    } else {
+        Ok(combined)
+    }
+}
+
+fn apply_one(
+    path: &Path,
+    edits: &[Edit],
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> Result<String, String> {
+    match apply_edits(path, edits).map_err(|e| e.to_string())? {
+        EditResult::Applied { diff, context } => {
+            let mut output = String::new();
+            if show_diff && !diff.is_empty() {
+                output.push_str(&diff);
+                if !context.is_empty() {
+                    output.push_str("\n\n");
+                }
+            }
+            if !context.is_empty() {
+                output.push_str(&context);
+            }
+            let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let scope = crate::lang::package_root(&abs_path).map_or_else(
+                || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                Path::to_path_buf,
+            );
+            if let Some(blast) = crate::search::blast::blast_radius(path, edits, &scope, bloom) {
+                output.push_str(&blast);
+            }
+            Ok(output)
+        }
+        EditResult::HashMismatch(msg) => Err(format!(
+            "hash mismatch — file changed since last read:\n\n{msg}"
+        )),
+    }
 }
 
 #[cfg(test)]

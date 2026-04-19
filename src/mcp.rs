@@ -612,21 +612,12 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
-/// One file's worth of work for a batch `tilth_edit`. Parse errors are deferred
-/// onto the task so a malformed entry surfaces as a per-file failure instead
-/// of aborting the whole batch.
-enum FileEditTask {
-    Ready {
-        path: PathBuf,
-        edits: Vec<crate::edit::Edit>,
-    },
-    ParseError {
-        label: String,
-        msg: String,
-    },
-}
+/// Parse one `files[]` entry into a [`crate::edit::FileEditTask`]. Parse errors
+/// are deferred onto the task so a malformed entry surfaces as a per-file
+/// failure instead of aborting the whole batch.
+fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
+    use crate::edit::FileEditTask;
 
-fn parse_file_edit(index: usize, val: &Value) -> FileEditTask {
     let Some(path_str) = val.get("path").and_then(|v| v.as_str()) else {
         return FileEditTask::ParseError {
             label: format!("files[{index}]"),
@@ -686,44 +677,8 @@ fn parse_file_edit(index: usize, val: &Value) -> FileEditTask {
     }
 }
 
-fn apply_one_file_edit(
-    path: &Path,
-    edits: &[crate::edit::Edit],
-    bloom: &Arc<BloomFilterCache>,
-    show_diff: bool,
-) -> Result<String, String> {
-    match crate::edit::apply_edits(path, edits).map_err(|e| e.to_string())? {
-        crate::edit::EditResult::Applied { diff, context } => {
-            let mut output = String::new();
-            if show_diff && !diff.is_empty() {
-                output.push_str(&diff);
-                if !context.is_empty() {
-                    output.push_str("\n\n");
-                }
-            }
-            if !context.is_empty() {
-                output.push_str(&context);
-            }
-            let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            let scope = crate::lang::package_root(&abs_path).map_or_else(
-                || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                std::path::Path::to_path_buf,
-            );
-            if let Some(blast) = crate::search::blast::blast_radius(path, edits, &scope, bloom) {
-                output.push_str(&blast);
-            }
-            Ok(output)
-        }
-        crate::edit::EditResult::HashMismatch(msg) => Err(format!(
-            "hash mismatch — file changed since last read:\n\n{msg}"
-        )),
-    }
-}
-
-/// Batch `tilth_edit`. Each file in `files` is processed independently — a
-/// hash mismatch or parse error on one file does not block siblings. Returns
-/// `Ok` if at least one file succeeded; `Err` only when every file failed
-/// (so the MCP response gets `isError: true`).
+/// Batch `tilth_edit`. Parses the `files` array, enforces the 20-file cap,
+/// then delegates to [`crate::edit::apply_batch`] for parallel application.
 fn tool_edit(
     args: &Value,
     session: &Session,
@@ -750,47 +705,13 @@ fn tool_edit(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let tasks: Vec<FileEditTask> = files_val
+    let tasks: Vec<crate::edit::FileEditTask> = files_val
         .iter()
         .enumerate()
         .map(|(i, v)| parse_file_edit(i, v))
         .collect();
 
-    let mut sections: Vec<String> = Vec::with_capacity(tasks.len());
-    let mut success_count = 0usize;
-
-    for task in tasks {
-        match task {
-            FileEditTask::ParseError { label, msg } => {
-                sections.push(format!("## {label}\nerror: {msg}"));
-            }
-            FileEditTask::Ready { path, edits } => {
-                session.record_read(&path);
-                let header = format!("## {}", path.display());
-                match apply_one_file_edit(&path, &edits, bloom, show_diff) {
-                    Ok(body) => {
-                        success_count += 1;
-                        if body.is_empty() {
-                            sections.push(header);
-                        } else {
-                            sections.push(format!("{header}\n{body}"));
-                        }
-                    }
-                    Err(msg) => {
-                        sections.push(format!("{header}\n{msg}"));
-                    }
-                }
-            }
-        }
-    }
-
-    let combined = sections.join("\n\n---\n\n");
-
-    if success_count == 0 {
-        Err(combined)
-    } else {
-        Ok(combined)
-    }
+    crate::edit::apply_batch(tasks, session, bloom, show_diff)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
