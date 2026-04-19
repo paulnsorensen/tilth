@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, select, RecvError};
 
-pub(crate) const ABANDONED_THREAD_WARN: usize = 3;
+const ABANDONED_THREAD_WARN: usize = 3;
 /// Hard cap: refuse new work when this many prior threads are still running
 /// after timeout. Prevents unbounded thread accumulation on stuck operations.
-pub(crate) const MAX_ABANDONED_THREADS: usize = 8;
+const MAX_ABANDONED_THREADS: usize = 8;
 
 /// Live count of threads that timed out and are still running in the background.
 /// Owned by `Services`, so tests instantiate their own instance rather than
@@ -109,6 +109,7 @@ impl ThreadCoord {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum SpawnFailure {
     Timeout,
     Panic,
@@ -162,7 +163,7 @@ where
         default(timeout) => {
             if coord.claim_timeout() {
                 let n = tracker.record_timeout();
-                if n == ABANDONED_THREAD_WARN {
+                if n >= ABANDONED_THREAD_WARN {
                     eprintln!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
@@ -192,7 +193,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
             });
 
-        assert!(matches!(result, Err(SpawnFailure::Timeout)));
+        assert_eq!(result, Err(SpawnFailure::Timeout));
         assert_eq!(tracker.current(), 1, "timeout must increment tracker");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -202,19 +203,14 @@ mod tests {
         assert_eq!(tracker.current(), 0, "worker exit must decrement tracker");
     }
 
-    /// Fast-completing work must not trip the timeout path — counter stays
-    /// at zero, `Ok` is returned, and the handle joins cleanly.
     #[test]
     fn fast_work_returns_ok_without_counter_change() {
         let tracker = Arc::new(ThreadTracker::new());
         let result = spawn_with_timeout(&tracker, Duration::from_secs(5), || 42_i32);
-        assert_eq!(result.ok(), Some(42));
+        assert_eq!(result.expect("fast work should not timeout"), 42);
         assert_eq!(tracker.current(), 0);
     }
 
-    /// `request_timeout` honors `TILTH_TIMEOUT` override and falls back to 90s.
-    /// Uses a distinct env var name per test to avoid cross-test interference,
-    /// since `std::env::set_var` is process-global.
     #[test]
     fn request_timeout_reads_env() {
         std::env::set_var("TILTH_TIMEOUT", "7");

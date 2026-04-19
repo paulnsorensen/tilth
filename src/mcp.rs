@@ -14,16 +14,14 @@ use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
-/// Cloning is cheap (all fields are `Arc` or `Copy`) so the spawned worker
-/// thread gets its own handle via `Services::clone`.
 #[derive(Clone)]
 pub(crate) struct Services {
-    pub cache: Arc<OutlineCache>,
-    pub session: Arc<Session>,
-    pub index: Arc<SymbolIndex>,
-    pub bloom: Arc<BloomFilterCache>,
-    pub tracker: Arc<ThreadTracker>,
-    pub edit_mode: bool,
+    pub(crate) cache: Arc<OutlineCache>,
+    pub(crate) session: Arc<Session>,
+    pub(crate) index: Arc<SymbolIndex>,
+    pub(crate) bloom: Arc<BloomFilterCache>,
+    pub(crate) tracker: Arc<ThreadTracker>,
+    pub(crate) edit_mode: bool,
 }
 
 impl Services {
@@ -357,7 +355,6 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-/// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String, String> {
     let edit_mode = services.edit_mode;
@@ -1235,7 +1232,7 @@ mod tests {
         assert_eq!(root_canon, expected_canon);
     }
 
-    fn test_services_with_tracker(tracker: Arc<ThreadTracker>) -> Services {
+    fn services_with_tracker(tracker: Arc<ThreadTracker>) -> Services {
         Services {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
@@ -1247,10 +1244,10 @@ mod tests {
     }
 
     #[test]
-    fn test_abandoned_hard_cap_returns_server_busy() {
+    fn abandoned_hard_cap_returns_server_busy() {
         let tracker = Arc::new(ThreadTracker::new());
         tracker.saturate();
-        let services = test_services_with_tracker(tracker);
+        let services = services_with_tracker(tracker);
 
         let req = JsonRpcRequest {
             _jsonrpc: "2.0".into(),
@@ -1285,7 +1282,7 @@ mod tests {
     /// Batch reads must return the content of every submitted path — no file
     /// is dropped or reordered on the way through the tool handler.
     #[test]
-    fn test_batch_read_returns_all_files() {
+    fn batch_read_returns_all_files() {
         let dir = tempfile::tempdir().unwrap();
         let file_count = 5usize;
 
