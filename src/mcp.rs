@@ -37,6 +37,24 @@ impl Services {
     }
 }
 
+/// Output from a tool, with optional truncation metadata.
+#[derive(Debug)]
+pub(crate) struct ToolOutcome {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+    pub(crate) truncated_at_line: Option<u32>,
+}
+
+impl From<String> for ToolOutcome {
+    fn from(text: String) -> Self {
+        ToolOutcome {
+            text,
+            truncated: false,
+            truncated_at_line: None,
+        }
+    }
+}
+
 // Sent to the LLM via the MCP `instructions` field during initialization.
 // Keeps the strategic guidance from AGENTS.md available to any host.
 const SERVER_INSTRUCTIONS: &str = "\
@@ -364,7 +382,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 // ---------------------------------------------------------------------------
 
 /// No classifier involved — the caller specifies the tool explicitly.
-fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String, String> {
+fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<ToolOutcome, String> {
     let edit_mode = services.edit_mode;
     match tool {
         "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
@@ -390,7 +408,7 @@ fn tool_read(
     cache: &OutlineCache,
     session: &Session,
     edit_mode: bool,
-) -> Result<String, String> {
+) -> Result<ToolOutcome, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     // Multi-file batch read (capped at 20 to bound I/O).
@@ -454,7 +472,7 @@ fn tool_search(
     session: &Session,
     index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
+) -> Result<ToolOutcome, String> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -533,12 +551,14 @@ fn tool_search(
     }
     .map_err(|e| e.to_string())?;
 
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
-    Ok(result)
+    let mut outcome = apply_budget(output, budget);
+    if let Some(warning) = scope_warning {
+        outcome.text = format!("{}{}", warning, outcome.text);
+    }
+    Ok(outcome)
 }
 
-fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
+fn tool_files(args: &Value, cache: &OutlineCache) -> Result<ToolOutcome, String> {
     let pattern = args
         .get("pattern")
         .and_then(|v| v.as_str())
@@ -548,16 +568,18 @@ fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
 
     let output = crate::search::search_glob(pattern, &scope, cache).map_err(|e| e.to_string())?;
 
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
-    Ok(result)
+    let mut outcome = apply_budget(output, budget);
+    if let Some(warning) = scope_warning {
+        outcome.text = format!("{}{}", warning, outcome.text);
+    }
+    Ok(outcome)
 }
 
 fn tool_deps(
     args: &Value,
     cache: &OutlineCache,
     bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
+) -> Result<ToolOutcome, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -577,10 +599,10 @@ fn tool_deps(
         &scope,
         budget,
     ));
-    Ok(output)
+    Ok(output.into())
 }
 
-fn tool_diff(args: &Value) -> Result<String, String> {
+fn tool_diff(args: &Value) -> Result<ToolOutcome, String> {
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());
@@ -593,10 +615,10 @@ fn tool_diff(args: &Value) -> Result<String, String> {
     let budget = args.get("budget").and_then(Value::as_u64);
 
     let diff_source = crate::diff::resolve_source(source, a, b, patch, log)?;
-    crate::diff::diff(&diff_source, scope, search, blast, expand, budget)
+    crate::diff::diff(&diff_source, scope, search, blast, expand, budget).map(Into::into)
 }
 
-fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
+fn tool_session(args: &Value, session: &Session) -> Result<ToolOutcome, String> {
     let action = args
         .get("action")
         .and_then(|v| v.as_str())
@@ -604,9 +626,9 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     match action {
         "reset" => {
             session.reset();
-            Ok("Session reset.".to_string())
+            Ok("Session reset.".to_string().into())
         }
-        _ => Ok(session.summary()),
+        _ => Ok(session.summary().into()),
     }
 }
 
@@ -678,7 +700,7 @@ fn tool_edit(
     args: &Value,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
+) -> Result<ToolOutcome, String> {
     let files_val = args
         .get("files")
         .and_then(|v| v.as_array())
@@ -711,7 +733,7 @@ fn tool_edit(
         }
     }
 
-    crate::edit::apply_batch(tasks, bloom, show_diff)
+    crate::edit::apply_batch(tasks, bloom, show_diff).map(Into::into)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -734,10 +756,21 @@ fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     (resolved, None)
 }
 
-fn apply_budget(output: String, budget: Option<u64>) -> String {
+fn apply_budget(output: String, budget: Option<u64>) -> ToolOutcome {
     match budget {
-        Some(b) => crate::budget::apply(&output, b),
-        None => output,
+        Some(b) => {
+            let (text, info) = crate::budget::apply_with_info(&output, b);
+            ToolOutcome {
+                text,
+                truncated: info.is_some(),
+                truncated_at_line: info.map(|i| i.at_line),
+            }
+        }
+        None => ToolOutcome {
+            text: output,
+            truncated: false,
+            truncated_at_line: None,
+        },
     }
 }
 
@@ -750,7 +783,7 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    let result = if services.tracker.is_at_cap() {
+    let result: Result<ToolOutcome, String> = if services.tracker.is_at_cap() {
         Err(
             "server busy: too many prior operations still running after timeout. \
              Wait or set TILTH_TIMEOUT=<seconds> higher."
@@ -763,16 +796,33 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
     build_response(req.id.as_ref(), result)
 }
 
-fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpcResponse {
-    let (text, is_error) = match result {
-        Ok(output) => (output, false),
-        Err(e) => (e, true),
+fn build_response(id: Option<&Value>, result: Result<ToolOutcome, String>) -> JsonRpcResponse {
+    let (text, is_error, truncated, truncated_at_line) = match result {
+        Ok(outcome) => (
+            outcome.text,
+            false,
+            outcome.truncated,
+            outcome.truncated_at_line,
+        ),
+        Err(e) => (e, true, false, None),
     };
     let mut payload = serde_json::json!({
         "content": [{ "type": "text", "text": text }]
     });
     if is_error {
         payload["isError"] = Value::Bool(true);
+    }
+    // Add _meta with truncation info when truncation occurred
+    if truncated {
+        payload["_meta"] = serde_json::json!({
+            "truncated": true,
+            "truncated_at_line": truncated_at_line
+        });
+    } else if !is_error {
+        // Include _meta even without truncation to indicate completeness
+        payload["_meta"] = serde_json::json!({
+            "truncated": false
+        });
     }
     JsonRpcResponse {
         jsonrpc: "2.0",
@@ -787,7 +837,7 @@ fn run_tool_with_timeout(
     tool_name: &str,
     args: &Value,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<ToolOutcome, String> {
     let services_worker = services.clone();
     let tool = tool_name.to_string();
     let args_owned = args.clone();
@@ -1345,7 +1395,7 @@ mod tests {
 
         for i in 0..file_count {
             assert!(
-                result.contains(&format!("content-of-file-{i}")),
+                result.text.contains(&format!("content-of-file-{i}")),
                 "output must contain content of file {i}"
             );
         }
@@ -1390,16 +1440,19 @@ mod tests {
         let out = tool_edit(&args, &session, &bloom).expect("batch should succeed");
 
         assert!(
-            out.contains(a.to_str().unwrap()),
-            "must mention file a: {out}"
+            out.text.contains(a.to_str().unwrap()),
+            "must mention file a: {}",
+            out.text
         );
         assert!(
-            out.contains(b.to_str().unwrap()),
-            "must mention file b: {out}"
+            out.text.contains(b.to_str().unwrap()),
+            "must mention file b: {}",
+            out.text
         );
         assert!(
-            !out.contains("error:") && !out.contains("hash mismatch"),
-            "successful batch must not contain error markers: {out}"
+            !out.text.contains("error:") && !out.text.contains("hash mismatch"),
+            "successful batch must not contain error markers: {}",
+            out.text
         );
         assert_eq!(
             std::fs::read_to_string(&a).expect("file a should be readable"),
@@ -1451,17 +1504,20 @@ mod tests {
             "second file must remain untouched"
         );
         assert!(
-            out.contains("---"),
-            "must separate per-file sections: {out}"
+            out.text.contains("---"),
+            "must separate per-file sections: {}",
+            out.text
         );
-        let (a_section, b_section) = out.split_once("\n\n---\n\n").expect("two sections");
+        let (a_section, b_section) = out.text.split_once("\n\n---\n\n").expect("two sections");
         assert!(
             !a_section.contains("hash mismatch"),
-            "file a's section must not report hash mismatch: {a_section}"
+            "file a's section must not report hash mismatch: {}",
+            a_section
         );
         assert!(
             b_section.contains("hash mismatch"),
-            "file b's section must report hash mismatch: {b_section}"
+            "file b's section must report hash mismatch: {}",
+            b_section
         );
     }
 

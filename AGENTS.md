@@ -29,6 +29,13 @@ paths: ["a.rs", "b.rs"] reads many in one call (max 20). PREFER this over serial
 path: "a.rs" for a single file.
 Small files → full content. Large files → structural outline.
 section: "<start>-<end>" or "<heading text>"
+sections: ["10-25", "47-60"] reads multiple ranges in one call (max 20). Mutually exclusive with section.
+  Shared budget; later sections truncated first when budget is exhausted.
+  Returns each as a ## section: "<range>" block.
+Response _meta (always present on path/paths/section reads):
+  {truncated: bool, truncated_at_line?: number}
+Multi-section _meta:
+  {truncated: bool, sections: [{section, truncated, truncated_at_line?}, ...]}
 Output:
 <line_number> │ <content>                  ← full/section mode
 [<start>-<end>]  <symbol name>             ← outline mode
