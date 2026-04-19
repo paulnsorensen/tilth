@@ -81,7 +81,7 @@ DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep),
 \n\
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
   For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
-  kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
+  kind: \"symbol\" (default, declarations only) | \"any\" (symbol-name matches incl. comments/strings) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
   expand (default 2): inline full source for top matches.\n\
   context: path to file being edited — boosts nearby results.\n\
   glob: file pattern filter — \"*.rs\" (whitelist), \"!*.test.ts\" (exclude).\n\
@@ -543,7 +543,8 @@ fn tool_search(
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
-        "symbol" => {
+        "symbol" | "any" => {
+            let strict = kind == "symbol";
             let queries: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -555,6 +556,7 @@ fn tool_search(
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, index, bloom, expand, context, glob,
+                        strict,
                     )
                 }
                 2..=5 => {
@@ -563,6 +565,7 @@ fn tool_search(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &queries, &scope, cache, session, index, bloom, expand, context, glob,
+                        strict,
                     )
                 }
                 _ => {
@@ -593,7 +596,7 @@ fn tool_search(
         }
         _ => {
             return Err(format!(
-                "unknown search kind: {kind}. Use: symbol, content, regex, callers"
+                "unknown search kind: {kind}. Use: symbol, any, content, regex, callers"
             ))
         }
     }
@@ -1007,9 +1010,9 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["symbol", "content", "regex", "callers"],
+                        "enum": ["symbol", "any", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "description": "Search type. symbol: declarations only (tree-sitter AST, no comment/string hits). any: symbol-name matches including comments/strings/usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
                     "expand": {
                         "type": "number",
@@ -1908,5 +1911,53 @@ mod tests {
         let err =
             tool_edit(&args, &session, &bloom).expect_err("empty files array must be rejected");
         assert!(err.contains("empty"), "must mention empty: {err}");
+    }
+
+    #[test]
+    fn symbol_kind_strict_vs_any_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py_path = tmp.path().join("foo.py");
+        // Comment hit, real definition, variable usage
+        std::fs::write(
+            &py_path,
+            "# class Foo\nclass Foo:\n    pass\n\nfoo = Foo()\n",
+        )
+        .unwrap();
+
+        let scope = tmp.path().to_str().unwrap();
+
+        // kind="symbol" (strict): only the class definition should come back
+        let strict_args = serde_json::json!({
+            "query": "Foo",
+            "scope": scope,
+            "kind": "symbol",
+            "expand": 0,
+        });
+        let strict_resp = round_trip_req("tilth_search", &strict_args);
+        let strict_s = serde_json::to_string(&strict_resp).unwrap();
+        let strict_v: serde_json::Value = serde_json::from_str(&strict_s).unwrap();
+        let strict_text = strict_v["result"]["content"][0]["text"].as_str().unwrap();
+        // Should report 1 definition, not more
+        assert!(
+            strict_text.contains("1 match") || strict_text.contains("definitions: 1"),
+            "kind=symbol should report 1 definition match, got: {strict_text}"
+        );
+
+        // kind="any": should find comment + definition + usage (>1 match)
+        let any_args = serde_json::json!({
+            "query": "Foo",
+            "scope": scope,
+            "kind": "any",
+            "expand": 0,
+        });
+        let any_resp = round_trip_req("tilth_search", &any_args);
+        let any_s = serde_json::to_string(&any_resp).unwrap();
+        let any_v: serde_json::Value = serde_json::from_str(&any_s).unwrap();
+        let any_text = any_v["result"]["content"][0]["text"].as_str().unwrap();
+        // Any mode should show more than 1 match
+        assert!(
+            !any_text.contains("1 match"),
+            "kind=any should return more than 1 match, got: {any_text}"
+        );
     }
 }
