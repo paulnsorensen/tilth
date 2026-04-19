@@ -348,6 +348,23 @@ fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, Til
     Ok(format!("{header}\n\n{formatted}"))
 }
 
+/// Read multiple sections from a single file.
+/// Returns sections separated by dividers, with per-section headers.
+pub(crate) fn read_sections(
+    path: &Path,
+    ranges: &[String],
+    edit_mode: bool,
+) -> Result<String, TilthError> {
+    let mut results = Vec::new();
+    for range in ranges {
+        match read_section(path, range, edit_mode) {
+            Ok(content) => results.push(content),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(results.join("\n\n"))
+}
+
 /// Parse "45-89" into (45, 89). 1-indexed.
 fn parse_range(s: &str) -> Option<(usize, usize)> {
     let (a, b) = s.split_once('-')?;
