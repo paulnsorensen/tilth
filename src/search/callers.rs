@@ -12,6 +12,7 @@ use crate::lang::treesitter::{
     node_text_simple, DEFINITION_KINDS,
 };
 
+use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
