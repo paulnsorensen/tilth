@@ -132,10 +132,14 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 
 /// Compact human token count for directory rollups.
 /// Uses the same scale as `tilth_files` output (`12.3k`, `1.2M`).
+///
+/// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
+/// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
+/// the M tier (`"1.0M"`) instead of producing four-digit k labels.
 fn fmt_tokens(n: u64) -> String {
     #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
     let f = n as f64;
-    if n >= 1_000_000 {
+    if f >= 999_950.0 {
         format!("{:.1}M", f / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}k", f / 1_000.0)
@@ -247,7 +251,7 @@ fn format_tree(
     for subdir in subdirs {
         let dir_name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let total = totals.get(subdir).copied().unwrap_or(0);
-        let _ = writeln!(out, "{prefix}{dir_name}/  (~{} tokens)", fmt_tokens(total));
+        let _ = writeln!(out, "{prefix}{dir_name}/ (~{} tokens)", fmt_tokens(total));
         format_tree(tree, totals, subdir, indent + 1, out);
     }
 }
@@ -305,6 +309,19 @@ mod tests {
         assert_eq!(fmt_tokens(2_500_000), "2.5M");
     }
 
+    /// Boundary: values that would round to "1000.0k" under `{:.1}`
+    /// formatting must roll over to the M tier instead of producing a
+    /// four-digit k label.
+    #[test]
+    fn fmt_tokens_rolls_over_at_999_950() {
+        // Just below the rollover boundary — still formats as k.
+        assert_eq!(fmt_tokens(999_949), "999.9k");
+        // At and above the boundary — formats as M, not "1000.0k".
+        assert_eq!(fmt_tokens(999_950), "1.0M");
+        assert_eq!(fmt_tokens(999_999), "1.0M");
+        assert_eq!(fmt_tokens(1_499_999), "1.5M");
+    }
+
     #[test]
     fn format_tree_renders_dir_rollups_alongside_files() {
         let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
@@ -316,10 +333,11 @@ mod tests {
         format_tree(&tree, &totals, Path::new(""), 0, &mut out);
 
         assert!(out.contains("README.md (~800 tokens)"));
-        // Subdir line carries its rollup
+        // Subdir line: only main.rs lives under src/, so the rollup must
+        // be exactly 4.2k. The previous OR-form hid the dead branch.
         assert!(
-            out.contains("src/  (~5.0k tokens)") || out.contains("src/  (~4.2k tokens)"),
-            "expected src/ rollup, got: {out}"
+            out.contains("src/ (~4.2k tokens)"),
+            "expected exact 'src/ (~4.2k tokens)' rollup, got: {out}"
         );
     }
 }
