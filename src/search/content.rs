@@ -60,10 +60,32 @@ pub fn search(
 
             let path = entry.path();
 
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
             // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > MAX_SEARCH_FILE_SIZE {
-                    return ignore::WalkState::Continue;
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
+
+            // Catch unmarked minified bundles in the 100KB–500KB range.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if crate::lang::detection::is_minified_by_content(&bytes) {
+                        return ignore::WalkState::Continue;
+                    }
                 }
             }
 
