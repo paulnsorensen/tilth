@@ -465,14 +465,18 @@ fn find_usages(
                 Err(_) => 0,
             };
 
+            // Read once and dispatch via `search_slice` so the minified
+            // heuristic and the search share a single kernel read.
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
             // Catch unmarked minified bundles between 100KB and 500KB — they
             // were not skipped by the filename check or the size cap above.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if crate::lang::detection::is_minified_by_content(&bytes) {
-                        return ignore::WalkState::Continue;
-                    }
-                }
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
             }
 
             let (file_lines, mtime) = file_metadata(path);
@@ -480,9 +484,9 @@ fn find_usages(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_path(
+            let _ = searcher.search_slice(
                 matcher,
-                path,
+                &bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

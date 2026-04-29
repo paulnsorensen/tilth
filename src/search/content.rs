@@ -80,13 +80,19 @@ pub fn search(
                 Err(_) => 0,
             };
 
+            // Read the file once. Use `search_slice` instead of `search_path`
+            // so the minified-check (when triggered) and the actual search
+            // share a single kernel read — no double I/O, no TOCTOU window
+            // between the heuristic and the search.
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
             // Catch unmarked minified bundles in the 100KB–500KB range.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if crate::lang::detection::is_minified_by_content(&bytes) {
-                        return ignore::WalkState::Continue;
-                    }
-                }
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
             }
 
             let (file_lines, mtime) = file_metadata(path);
@@ -94,9 +100,9 @@ pub fn search(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_path(
+            let _ = searcher.search_slice(
                 matcher,
-                path,
+                &bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

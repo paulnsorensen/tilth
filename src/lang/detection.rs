@@ -56,15 +56,17 @@ pub fn is_minified_by_name(name: &str) -> bool {
         return false;
     };
     let stem = &name[..stem_end];
-    // `.min.<ext>` — stem itself ends in `.min`
+    // `.min.<ext>` — stem itself ends in `.min`. The `secondary > 0` guard
+    // skips hidden-file forms like `.min.config` where the leading dot is
+    // a POSIX hidden-file marker, not an extension separator.
     if let Some(secondary) = stem.rfind('.') {
-        if stem[secondary + 1..].eq_ignore_ascii_case("min") {
+        if secondary > 0 && stem[secondary + 1..].eq_ignore_ascii_case("min") {
             return true;
         }
     }
-    // `-min.<ext>` (e.g. `bundle-min.js`)
-    let lower = stem.to_ascii_lowercase();
-    lower.ends_with("-min")
+    // `-min.<ext>` (e.g. `bundle-min.js`). Compare in place to avoid the
+    // per-call lowercase allocation.
+    stem.len() >= 4 && stem[stem.len() - 4..].eq_ignore_ascii_case("-min")
 }
 
 /// Heuristic: does this content look minified? Samples first 2KB and counts
@@ -73,11 +75,14 @@ pub fn is_minified_by_name(name: &str) -> bool {
 ///
 /// Only call this on files >= [`MINIFIED_CHECK_THRESHOLD`] — for small files
 /// the cost of parsing is bounded regardless and false positives are noisier
-/// than just letting them through.
+/// than just letting them through. Threshold of `< 2` newlines (i.e., 0 or 1)
+/// in 2KB is a strong signal: real source has line breaks every ~80 bytes,
+/// while minified bundles routinely have zero. A threshold of `< 4` would
+/// flag legitimate single-block license headers and compact one-line JSON.
 pub fn is_minified_by_content(buf: &[u8]) -> bool {
     let sample = &buf[..buf.len().min(2048)];
     let newlines = memchr::memchr_iter(b'\n', sample).count();
-    newlines < 4
+    newlines < 2
 }
 
 #[cfg(test)]
@@ -105,6 +110,15 @@ mod tests {
         assert!(!is_minified_by_name("admin.js"));
         assert!(!is_minified_by_name("README.md"));
         assert!(!is_minified_by_name("noext"));
+    }
+
+    /// A leading dot is a hidden-file marker, not an extension separator —
+    /// `.min.config` is a config file named `min`, not a minified file.
+    #[test]
+    fn minified_filename_hidden_files_not_flagged() {
+        assert!(!is_minified_by_name(".min.config"));
+        assert!(!is_minified_by_name(".min.env"));
+        assert!(!is_minified_by_name(".min.json"));
     }
 
     #[test]
