@@ -103,20 +103,6 @@ pub fn read_file(
         ));
     }
 
-    // Minified — filename convention or, for big files, newline-density heuristic.
-    if crate::lang::detection::is_minified_by_name(name)
-        || (byte_len >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-            && crate::lang::detection::is_minified_by_content(buf))
-    {
-        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
-        return Ok(format::file_header(
-            path,
-            byte_len,
-            line_count,
-            ViewMode::Minified,
-        ));
-    }
-
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
     let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
