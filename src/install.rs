@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 //   windsurf:       ~/.codeium/windsurf/mcp_config.json       (global)
 //   vscode:         .vscode/mcp.json                          (project scope)
 //   claude-desktop: ~/Library/Application Support/Claude/...  (global)
-//   opencode:       ~/.opencode.json                          (user scope)
+//   opencode:       ~/.config/opencode/opencode.json          (user scope)
 //   gemini:         ~/.gemini/settings.json                   (user scope)
 //   codex:          ~/.codex/config.toml                      (user scope, TOML)
 //   amp:            ~/.config/amp/settings.json                (user scope)
@@ -271,10 +271,11 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             note: None,
         }),
 
-        // OpenCode user scope: ~/.opencode.json → mcp (NOT mcpServers)
+        // OpenCode user scope: ~/.config/opencode/opencode.json → mcp (NOT mcpServers)
         // Uses "type": "local" and "command" as array format.
+        // Verified from opencode docs: global config at ~/.config/opencode/opencode.json
         "opencode" => Ok(HostInfo {
-            path: home.join(".opencode.json"),
+            path: home.join(".config/opencode/opencode.json"),
             format: ConfigFormat::Json { servers_key: "mcp" },
             entry_style: EntryStyle::Local,
             note: Some("User scope — available in all projects."),
@@ -921,8 +922,8 @@ mod tests {
     fn opencode_resolve_host() {
         let info = resolve_host("opencode").expect("opencode should resolve");
         assert!(
-            info.path.ends_with(".opencode.json"),
-            "path should end with .opencode.json, got: {}",
+            info.path.ends_with(".config/opencode/opencode.json"),
+            "path should end with .config/opencode/opencode.json, got: {}",
             info.path.display()
         );
         match info.format {
