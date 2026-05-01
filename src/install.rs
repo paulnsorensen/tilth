@@ -53,13 +53,28 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "pi",
 ];
 
-/// The tilth server entry as JSON, for hosts that use JSON config.
-fn tilth_server_entry(edit: bool) -> Value {
+#[derive(Debug, Clone, Copy)]
+enum EntryStyle {
+    Standard,
+    Local,
+}
+
+fn tilth_server_entry(edit: bool, entry_style: &EntryStyle) -> Value {
     let (command, args) = tilth_command_and_args(edit);
-    json!({
-        "command": command,
-        "args": args
-    })
+    match entry_style {
+        EntryStyle::Standard => json!({
+            "command": command,
+            "args": args
+        }),
+        EntryStyle::Local => {
+            let mut command_arr = vec![command];
+            command_arr.extend(args);
+            json!({
+                "type": "local",
+                "command": command_arr
+            })
+        }
+    }
 }
 
 /// Write MCP config for the given host, preserving existing config.
@@ -102,7 +117,11 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         json!({})
     };
 
-    upsert_json_server(&mut config, servers_key, tilth_server_entry(edit))?;
+    upsert_json_server(
+        &mut config,
+        servers_key,
+        tilth_server_entry(edit, &host_info.entry_style),
+    )?;
 
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
@@ -183,7 +202,7 @@ fn tilth_command_and_args(edit: bool) -> (String, Vec<String>) {
 
 #[derive(Debug)]
 enum ConfigFormat {
-    /// JSON with a configurable servers key ("mcpServers" or "servers").
+    /// JSON with a configurable servers key ("mcpServers", "servers", "mcp", etc.).
     Json { servers_key: &'static str },
     /// TOML with `[mcp_servers.<name>]` sections.
     Toml,
@@ -192,6 +211,8 @@ enum ConfigFormat {
 struct HostInfo {
     path: PathBuf,
     format: ConfigFormat,
+    /// How to shape the server entry JSON (Standard: command+args, Local: type+command array).
+    entry_style: EntryStyle,
     /// Optional note printed after success.
     note: Option<&'static str>,
 }
@@ -207,6 +228,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -216,6 +238,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
@@ -225,6 +248,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
@@ -234,6 +258,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "servers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("Project scope — run from your project root."),
         }),
 
@@ -242,16 +267,16 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
-        // OpenCode user scope: ~/.opencode.json → mcpServers
-        // Verified from opencode source: internal/config/config.go (viper config name ".opencode")
+        // OpenCode user scope: ~/.opencode.json → mcp (NOT mcpServers)
+        // Uses "type": "local" and "command" as array format.
         "opencode" => Ok(HostInfo {
             path: home.join(".opencode.json"),
-            format: ConfigFormat::Json {
-                servers_key: "mcpServers",
-            },
+            format: ConfigFormat::Json { servers_key: "mcp" },
+            entry_style: EntryStyle::Local,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -261,6 +286,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -268,6 +294,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         "codex" => Ok(HostInfo {
             path: home.join(".codex/config.toml"),
             format: ConfigFormat::Toml,
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -278,6 +305,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "amp.mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -288,6 +316,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -298,6 +327,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -308,6 +338,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "context_servers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -318,6 +349,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -328,6 +360,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -338,6 +371,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -348,6 +382,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
@@ -358,6 +393,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
@@ -368,6 +404,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: None,
         }),
 
@@ -378,6 +415,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("Project scope — run from your project root."),
         }),
 
@@ -388,6 +426,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -396,6 +435,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         "crush" => Ok(HostInfo {
             path: home.join(".config/crush/crush.json"),
             format: ConfigFormat::Json { servers_key: "mcp" },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -406,6 +446,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            entry_style: EntryStyle::Standard,
             note: Some("User scope — available in all projects."),
         }),
 
@@ -509,7 +550,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "amp.mcpServers");
             }
             ConfigFormat::Toml => panic!("amp should use JSON format, not TOML"),
@@ -585,7 +626,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("droid should use JSON format, not TOML"),
@@ -626,7 +667,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("antigravity should use JSON format, not TOML"),
@@ -667,7 +708,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "context_servers");
             }
             ConfigFormat::Toml => panic!("zed should use JSON format, not TOML"),
@@ -697,7 +738,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("copilot-cli should use JSON format, not TOML"),
@@ -713,7 +754,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("augment should use JSON format, not TOML"),
@@ -729,7 +770,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("kiro should use JSON format, not TOML"),
@@ -745,7 +786,7 @@ mod tests {
             "path should contain kilocode.kilo-code and mcp_settings.json, got: {path_str}",
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("kilo-code should use JSON format, not TOML"),
@@ -762,7 +803,7 @@ mod tests {
             "path should contain saoudrizwan.claude-dev and cline_mcp_settings.json, got: {path_str}",
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("cline should use JSON format, not TOML"),
@@ -779,7 +820,7 @@ mod tests {
             "path should contain rooveterinaryinc.roo-cline and mcp_settings.json, got: {path_str}",
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("roo-code should use JSON format, not TOML"),
@@ -795,7 +836,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("trae should use JSON format, not TOML"),
@@ -815,7 +856,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("qwen-code should use JSON format, not TOML"),
@@ -831,7 +872,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcp");
             }
             ConfigFormat::Toml => panic!("crush should use JSON format, not TOML"),
@@ -858,7 +899,7 @@ mod tests {
             info.path.display()
         );
         match info.format {
-            ConfigFormat::Json { servers_key } => {
+            ConfigFormat::Json { servers_key, .. } => {
                 assert_eq!(servers_key, "mcpServers");
             }
             ConfigFormat::Toml => panic!("pi should use JSON format, not TOML"),
@@ -874,5 +915,59 @@ mod tests {
             err.contains("amp"),
             "error should list amp in supported hosts, got: {err}"
         );
+    }
+
+    #[test]
+    fn opencode_resolve_host() {
+        let info = resolve_host("opencode").expect("opencode should resolve");
+        assert!(
+            info.path.ends_with(".opencode.json"),
+            "path should end with .opencode.json, got: {}",
+            info.path.display()
+        );
+        match info.format {
+            ConfigFormat::Json { servers_key } => {
+                assert_eq!(servers_key, "mcp");
+            }
+            ConfigFormat::Toml => panic!("opencode should use JSON format, not TOML"),
+        }
+        assert!(matches!(info.entry_style, EntryStyle::Local));
+    }
+
+    #[test]
+    fn opencode_local_entry_format() {
+        let entry = tilth_server_entry(false, &EntryStyle::Local);
+        assert_eq!(entry["type"], json!("local"));
+        assert!(entry["command"].is_array());
+        assert!(entry.get("args").is_none());
+    }
+
+    #[test]
+    fn opencode_local_entry_with_edit() {
+        let entry = tilth_server_entry(true, &EntryStyle::Local);
+        assert_eq!(entry["type"], json!("local"));
+        let cmd = entry["command"].as_array().unwrap();
+        assert!(cmd.iter().any(|v| v == "--edit"));
+        assert!(cmd.iter().any(|v| v == "--mcp"));
+    }
+
+    #[test]
+    fn standard_entry_format() {
+        let entry = tilth_server_entry(false, &EntryStyle::Standard);
+        assert!(entry.get("type").is_none());
+        assert!(entry["command"].is_string());
+        assert!(entry["args"].is_array());
+    }
+
+    #[test]
+    fn opencode_upserts_under_mcp_key() {
+        let mut config = json!({});
+        let entry = tilth_server_entry(false, &EntryStyle::Local);
+        upsert_json_server(&mut config, "mcp", entry).unwrap();
+
+        assert!(config.get("mcp").is_some());
+        assert!(config.get("mcpServers").is_none());
+        assert_eq!(config["mcp"]["tilth"]["type"], json!("local"));
+        assert!(config["mcp"]["tilth"]["command"].is_array());
     }
 }
