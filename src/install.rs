@@ -53,7 +53,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "pi",
 ];
 
-/// The tilth server entry as JSON. Format depends on the host's ConfigFormat variant.
+/// The tilth server entry as JSON. Format depends on the host's [`ConfigFormat`] variant.
 fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
     let (command, args) = tilth_command_and_args(edit);
     match format {
@@ -69,10 +69,7 @@ fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
                 "command": command_arr
             })
         }
-        ConfigFormat::Toml => json!({
-            "command": command,
-            "args": args
-        }),
+        ConfigFormat::Toml => unreachable!("tilth_server_entry called for TOML host"),
     }
 }
 
@@ -87,7 +84,7 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 
     match host_info.format {
         ConfigFormat::Json { .. } | ConfigFormat::JsonLocal { .. } => {
-            write_json_config(&host_info, edit)?
+            write_json_config(&host_info, edit)?;
         }
         ConfigFormat::Toml => write_toml_config(&host_info, edit)?,
     }
@@ -105,8 +102,7 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
-        ConfigFormat::Json { servers_key } => servers_key,
-        ConfigFormat::JsonLocal { servers_key } => servers_key,
+        ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
         ConfigFormat::Toml => unreachable!("write_json_config called for TOML host"),
     };
 
@@ -270,9 +266,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         // OpenCode user scope: ~/.config/opencode/opencode.json → mcp (local entry shape)
         "opencode" => Ok(HostInfo {
             path: home.join(".config/opencode/opencode.json"),
-            format: ConfigFormat::JsonLocal {
-                servers_key: "mcp",
-            },
+            format: ConfigFormat::JsonLocal { servers_key: "mcp" },
             note: Some("User scope — available in all projects."),
         }),
 
@@ -293,6 +287,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Amp user scope: ~/.config/amp/settings.json → amp.mcpServers
+        // Verified from official docs: https://ampcode.com/manual
         "amp" => Ok(HostInfo {
             path: home.join(".config/amp/settings.json"),
             format: ConfigFormat::Json {
@@ -302,6 +297,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Google Antigravity user scope: ~/.gemini/antigravity/mcp_config.json → mcpServers
+        // Verified from official docs: https://antigravity.google/docs/mcp
         "antigravity" => Ok(HostInfo {
             path: home.join(".gemini/antigravity/mcp_config.json"),
             format: ConfigFormat::Json {
@@ -311,6 +307,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Factory Droid user scope: ~/.factory/mcp.json → mcpServers
+        // Verified from official docs: https://docs.factory.ai/cli/configuration/mcp
         "droid" => Ok(HostInfo {
             path: home.join(".factory/mcp.json"),
             format: ConfigFormat::Json {
@@ -320,6 +317,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Zed user scope: ~/.config/zed/settings.json → context_servers (NOT mcpServers)
+        // Verified from official docs: https://zed.dev/docs/ai/mcp
         "zed" => Ok(HostInfo {
             path: home.join(".config/zed/settings.json"),
             format: ConfigFormat::Json {
@@ -329,6 +327,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // GitHub Copilot CLI user scope: ~/.copilot/mcp-config.json → mcpServers
+        // Verified from official docs: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers
         "copilot-cli" => Ok(HostInfo {
             path: home.join(".copilot/mcp-config.json"),
             format: ConfigFormat::Json {
@@ -338,6 +337,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // AugmentCode user scope: ~/.augment/settings.json → mcpServers
+        // Verified from official docs: https://docs.augmentcode.com/cli/integrations
         "augment" => Ok(HostInfo {
             path: home.join(".augment/settings.json"),
             format: ConfigFormat::Json {
@@ -347,6 +347,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Kiro user scope: ~/.kiro/settings/mcp.json → mcpServers
+        // Verified from official docs: https://kiro.dev/docs/mcp/configuration/
         "kiro" => Ok(HostInfo {
             path: home.join(".kiro/settings/mcp.json"),
             format: ConfigFormat::Json {
@@ -356,6 +357,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Kilo Code (VS Code extension): globalStorage → mcpServers
+        // Verified from official docs: https://kilo.ai/docs/automate/mcp/using-in-kilo-code
         "kilo-code" => Ok(HostInfo {
             path: vscode_global_storage_path("kilocode.kilo-code", "mcp_settings.json")?,
             format: ConfigFormat::Json {
@@ -365,6 +367,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Cline (VS Code extension): globalStorage → mcpServers
+        // Verified from official docs: https://docs.cline.bot/mcp-servers/configuring-mcp-servers
         "cline" => Ok(HostInfo {
             path: vscode_global_storage_path("saoudrizwan.claude-dev", "cline_mcp_settings.json")?,
             format: ConfigFormat::Json {
@@ -374,6 +377,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Roo Code (VS Code extension): globalStorage → mcpServers
+        // Verified from official docs: https://docs.roocode.com/features/mcp/using-mcp-in-roo
         "roo-code" => Ok(HostInfo {
             path: vscode_global_storage_path("rooveterinaryinc.roo-cline", "mcp_settings.json")?,
             format: ConfigFormat::Json {
@@ -383,6 +387,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Trae project scope: .trae/mcp.json → mcpServers
+        // Verified from official docs: https://docs.trae.ai/ide/add-mcp-servers
         "trae" => Ok(HostInfo {
             path: PathBuf::from(".trae/mcp.json"),
             format: ConfigFormat::Json {
@@ -392,6 +397,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Qwen Code user scope: ~/.qwen/settings.json → mcpServers
+        // Verified from official docs: https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
         "qwen-code" => Ok(HostInfo {
             path: home.join(".qwen/settings.json"),
             format: ConfigFormat::Json {
@@ -401,15 +407,15 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         }),
 
         // Crush user scope: ~/.config/crush/crush.json → mcp (NOT mcpServers)
+        // Verified from official docs: https://github.com/charmbracelet/crush
         "crush" => Ok(HostInfo {
             path: home.join(".config/crush/crush.json"),
-            format: ConfigFormat::Json {
-                servers_key: "mcp",
-            },
+            format: ConfigFormat::Json { servers_key: "mcp" },
             note: Some("User scope — available in all projects."),
         }),
 
         // Pi coding agent user scope: ~/.pi/agent/mcp.json → mcpServers
+        // Verified from: https://github.com/badlogic/pi-mono/issues/563
         "pi" => Ok(HostInfo {
             path: home.join(".pi/agent/mcp.json"),
             format: ConfigFormat::Json {
@@ -640,7 +646,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("antigravity should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("antigravity should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("antigravity should use JSON format, not TOML"),
         }
     }
@@ -713,7 +721,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("copilot-cli should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("copilot-cli should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("copilot-cli should use JSON format, not TOML"),
         }
     }
@@ -730,7 +740,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("augment should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("augment should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("augment should use JSON format, not TOML"),
         }
     }
@@ -764,7 +776,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("kilo-code should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("kilo-code should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("kilo-code should use JSON format, not TOML"),
         }
     }
@@ -800,7 +814,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("roo-code should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("roo-code should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("roo-code should use JSON format, not TOML"),
         }
     }
@@ -838,7 +854,9 @@ mod tests {
             ConfigFormat::Json { servers_key } => {
                 assert_eq!(servers_key, "mcpServers");
             }
-            ConfigFormat::JsonLocal { .. } => panic!("qwen-code should use Json format, not JsonLocal"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("qwen-code should use Json format, not JsonLocal")
+            }
             ConfigFormat::Toml => panic!("qwen-code should use JSON format, not TOML"),
         }
     }
@@ -935,9 +953,12 @@ mod tests {
 
     #[test]
     fn standard_entry_format() {
-        let entry = tilth_server_entry(false, &ConfigFormat::Json {
-            servers_key: "mcpServers",
-        });
+        let entry = tilth_server_entry(
+            false,
+            &ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+        );
         assert!(entry.get("type").is_none());
         assert!(entry["command"].is_string());
         assert!(entry["args"].is_array());
