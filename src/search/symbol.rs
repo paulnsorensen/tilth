@@ -26,6 +26,19 @@ const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 /// Stop walking once we have this many raw usage matches.
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
+/// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
+/// as a stable sort key after `rank::sort` so the MAX_MATCHES cap can't drop
+/// real code defs in favor of markdown-heading defs of the same query.
+fn stratum_for_display(m: &Match) -> u8 {
+    if !m.is_definition {
+        2
+    } else if m.def_weight >= 60 {
+        0
+    } else {
+        1
+    }
+}
+
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
 pub fn search(
@@ -67,6 +80,15 @@ pub fn search(
     let usage_count = total - def_count;
 
     rank::sort(&mut merged, query, scope, context);
+
+    // Stratify so the cap can't drop a real code definition in favor of a
+    // markdown-heading "definition" of the same query. Stable within each
+    // stratum, so the relevance ordering from rank::sort is preserved. Code
+    // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
+    // second, usages last. Display-side only — pre-cap totals (Phase 5) and
+    // the underlying ranking semantics for `--json` callers are unchanged.
+    merged.sort_by_key(stratum_for_display);
+
     merged.truncate(MAX_MATCHES);
 
     Ok(SearchResult {
@@ -703,6 +725,7 @@ fn is_definition_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::SystemTime;
 
     #[test]
@@ -1163,5 +1186,48 @@ Body to end.
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].line, 1);
         assert_eq!(defs[0].def_range, Some((1, 1)));
+    }
+
+    #[test]
+    fn stratify_for_display_keeps_code_defs_above_doc_defs() {
+        // When the cap drops matches, real code defs must keep their slots
+        // and doc-heading defs slide below them. Rank order within each
+        // stratum is preserved by the stable sort.
+        let mk = |line: u32, weight: u16, is_definition: bool| Match {
+            path: PathBuf::from("test.rs"),
+            line,
+            text: String::new(),
+            is_definition,
+            exact: false,
+            file_lines: 100,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: weight,
+            impl_target: None,
+        };
+
+        // Pre-cap order (after rank::sort): doc def, code def, doc def, code def, usage.
+        let mut matches = vec![
+            mk(1, 30, true),  // doc def — high relevance
+            mk(2, 70, true),  // code def
+            mk(3, 30, true),  // doc def
+            mk(4, 70, true),  // code def
+            mk(5, 0, false),  // usage
+        ];
+        matches.sort_by_key(stratum_for_display);
+
+        // Code defs first (stable order: line 2 before line 4),
+        // then doc defs (line 1 before line 3), then the usage.
+        let lines: Vec<u32> = matches.iter().map(|m| m.line).collect();
+        assert_eq!(lines, vec![2, 4, 1, 3, 5]);
+
+        // Truncate-to-2 should keep both code defs, drop both doc defs.
+        matches.truncate(2);
+        assert!(
+            matches.iter().all(|m| m.def_weight >= 60),
+            "displayed slice after cap must be all code defs, got {:?}",
+            matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
+        );
     }
 }
