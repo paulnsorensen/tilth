@@ -10,6 +10,7 @@ use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
 use crate::lang::detect_file_type;
+use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
@@ -180,97 +181,103 @@ pub fn would_outline(path: &Path) -> bool {
 /// Resolve a heading address to a line range in a markdown file.
 /// Returns `(start_line, end_line)` as 1-indexed inclusive range.
 /// Returns `None` if heading not found.
+///
+/// Walks the `tree-sitter-md` `section` tree: each ATX heading owns a
+/// `section` node spanning from the heading line through the line before
+/// the next same-or-higher-level heading (sub-headings nest as child
+/// sections and don't terminate the parent). Headings inside fenced /
+/// indented code blocks aren't emitted as `atx_heading` nodes, so the
+/// fence-state tracking the previous hand-rolled scanner needed is now
+/// the parser's responsibility.
 fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     let heading_trimmed = heading.trim_end();
-    let heading_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
-
-    if heading_level == 0 {
+    let query_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
+    if query_level == 0 || query_level > 6 {
+        return None;
+    }
+    // Normalise the query the same way `heading_text` normalises an
+    // `atx_heading` node — strip leading `#`s, surrounding whitespace,
+    // and any ATX-close `#`s — so `## Foo`, `## Foo ##`, and `##  Foo`
+    // all match the same node.
+    let query_text = heading_trimmed[query_level..]
+        .trim()
+        .trim_end_matches('#')
+        .trim();
+    if query_text.is_empty() {
         return None;
     }
 
-    // Build line offsets
-    let mut line_offsets: Vec<usize> = vec![0];
-    for pos in memchr::memchr_iter(b'\n', buf) {
-        line_offsets.push(pos + 1);
-    }
-    // Exclude phantom empty line after trailing newline (match outline's count)
-    let total_lines = if buf.last() == Some(&b'\n') {
-        line_offsets.len() - 1
-    } else {
-        line_offsets.len()
-    };
+    let content = std::str::from_utf8(buf).ok()?;
+    let tree = parse_markdown(content)?;
+    let lines: Vec<&str> = content.lines().collect();
 
-    let mut in_code_block = false;
-    let mut found_line: Option<usize> = None;
+    #[allow(clippy::cast_possible_truncation)]
+    let level = query_level as u8;
+    find_section(tree.root_node(), &lines, level, query_text)
+}
 
-    // Scan for the target heading
-    for (line_idx, &offset) in line_offsets.iter().enumerate() {
-        let line_end = if line_idx + 1 < line_offsets.len() {
-            line_offsets[line_idx + 1] - 1 // exclude newline
-        } else {
-            buf.len()
-        };
-
-        if let Ok(line_str) = std::str::from_utf8(&buf[offset..line_end]) {
-            let trimmed = line_str.trim_end();
-
-            // Track code blocks
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                continue;
+/// Recursive section-tree walk for `resolve_heading`. Returns the first
+/// section whose `atx_heading` matches `(level, text)`.
+fn find_section(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    target_level: u8,
+    target_text: &str,
+) -> Option<(usize, usize)> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "section" => {
+                if let Some(hit) = match_section(child, lines, target_level, target_text) {
+                    return Some(hit);
+                }
+                if let Some(hit) = find_section(child, lines, target_level, target_text) {
+                    return Some(hit);
+                }
             }
-
-            // Skip headings inside code blocks
-            if in_code_block {
-                continue;
-            }
-
-            // Check if this line matches the heading
-            if trimmed == heading_trimmed {
-                found_line = Some(line_idx + 1); // 1-indexed
-                break;
-            }
-        }
-    }
-
-    let start_line = found_line?;
-
-    // Find the next heading of same or higher level
-    in_code_block = false;
-    let start_idx = start_line - 1; // convert back to 0-indexed for iteration
-
-    for (line_idx, &offset) in line_offsets.iter().enumerate().skip(start_idx + 1) {
-        let line_end = if line_idx + 1 < line_offsets.len() {
-            line_offsets[line_idx + 1] - 1
-        } else {
-            buf.len()
-        };
-
-        if let Ok(line_str) = std::str::from_utf8(&buf[offset..line_end]) {
-            let trimmed = line_str.trim_end();
-
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                continue;
-            }
-
-            // Check if this is a heading
-            if trimmed.starts_with('#') {
-                let level = trimmed.chars().take_while(|&c| c == '#').count();
-                if level <= heading_level {
-                    // 0-based line_idx of next heading = 1-indexed line before it
-                    return Some((start_line, line_idx));
+            // The parser owns these — no headings hide inside.
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => {
+                if let Some(hit) = find_section(child, lines, target_level, target_text) {
+                    return Some(hit);
                 }
             }
         }
     }
+    None
+}
 
-    // No next heading found — section goes to end of file
-    Some((start_line, total_lines))
+fn match_section(
+    section: tree_sitter::Node,
+    lines: &[&str],
+    target_level: u8,
+    target_text: &str,
+) -> Option<(usize, usize)> {
+    let mut cursor = section.walk();
+    let heading = section
+        .children(&mut cursor)
+        .find(|c| c.kind() == "atx_heading")?;
+    if heading_level(heading) != Some(target_level) {
+        return None;
+    }
+    if heading_text(heading, lines) != target_text {
+        return None;
+    }
+    let start_line = heading.start_position().row + 1;
+    let end_line = section_end_line(section);
+    Some((start_line, end_line))
+}
+
+/// 1-indexed inclusive last line of a tree-sitter `section` node.
+/// `end_position` is exclusive; col 0 means we landed on the next line's
+/// row, so the section's last line is `end.row` itself.
+fn section_end_line(section: tree_sitter::Node) -> usize {
+    let end = section.end_position();
+    if end.column == 0 {
+        end.row
+    } else {
+        end.row + 1
+    }
 }
 
 /// Return up to `top_n` markdown headings ranked by edit distance to `query`.
@@ -279,10 +286,13 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
 /// renamed since they last read. Returning the closest matches lets them
 /// retry with the right anchor without re-reading the whole file.
 ///
-/// Recognizes `ATX` headings (`CommonMark` §4.6: 1–6 leading `#`s followed
-/// by a space). Skips headings inside fenced code blocks delimited by either
-/// triple backticks or triple tildes. `Setext` headings (`Title\n===`) are
-/// not recognized — they are rare in practice and would require lookback.
+/// Walks `atx_heading` nodes from `tree-sitter-md`, which by construction
+/// covers `CommonMark` §4.6 (1–6 `#`s followed by space/EOL) and excludes
+/// headings inside fenced or indented code blocks. `Setext` headings
+/// (`Title\n===`) are silently ignored — see `find_defs_markdown_buf` for
+/// the same trade-off; the block grammar puts them at document scope so
+/// span computation doesn't apply.
+///
 /// Caveat on ranking: Levenshtein favours candidates of similar length to
 /// the query, so very short queries against long headings can rank tighter
 /// matches first; this is acceptable for a hint and aligned with the rest
@@ -294,49 +304,54 @@ fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
     }
     let q_lower = q_text.to_ascii_lowercase();
 
-    let mut in_code_block = false;
-    let mut scored: Vec<(usize, String)> = Vec::new();
-    for line in buf.split(|&b| b == b'\n') {
-        let Ok(s) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let trimmed = s.trim_end();
-        // CommonMark allows both ``` and ~~~ as fence delimiters.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if in_code_block || !trimmed.starts_with('#') {
-            continue;
-        }
-        // CommonMark §4.6.1: ATX headings have 1–6 `#`s followed by a space
-        // (or end-of-line). Reject longer hash runs and hash-prefixes that
-        // aren't followed by whitespace (`##foo` is not a heading).
-        let hash_count = trimmed.bytes().take_while(|&b| b == b'#').count();
-        if !(1..=6).contains(&hash_count) {
-            continue;
-        }
-        let after_hashes = trimmed.as_bytes().get(hash_count).copied();
-        if !matches!(after_hashes, None | Some(b' ' | b'\t')) {
-            continue;
-        }
-        let h_text = trimmed[hash_count..].trim();
-        if h_text.is_empty() {
-            continue;
-        }
-        // Strip kramdown attr blocks and ATX-close `#`s from comparison text.
-        let h_clean = h_text
-            .split('{')
-            .next()
-            .unwrap_or(h_text)
-            .trim_end_matches('#')
-            .trim();
-        let dist = edit_distance(&q_lower, &h_clean.to_ascii_lowercase());
-        scored.push((dist, trimmed.to_string()));
-    }
+    let Ok(content) = std::str::from_utf8(buf) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_markdown(content) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
 
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    collect_atx_headings(tree.root_node(), &lines, &q_lower, &mut scored);
     scored.sort_by_key(|(d, _)| *d);
     scored.into_iter().take(top_n).map(|(_, h)| h).collect()
+}
+
+/// Recursively collect `atx_heading` nodes scored by edit distance to
+/// `q_lower`. Code blocks are skipped — the grammar already guarantees
+/// no `atx_heading` nests inside them, but we elide the recursion to
+/// avoid walking large fenced bodies.
+fn collect_atx_headings(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    q_lower: &str,
+    out: &mut Vec<(usize, String)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "atx_heading" => {
+                let h_text = heading_text(child, lines);
+                // Strip kramdown attr blocks before scoring (e.g. `## Foo {#id}`).
+                let h_clean = h_text.split('{').next().unwrap_or(&h_text).trim();
+                if h_clean.is_empty() {
+                    continue;
+                }
+                let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
+                let row = child.start_position().row;
+                let line_text = lines
+                    .get(row)
+                    .copied()
+                    .unwrap_or("")
+                    .trim_end()
+                    .to_string();
+                out.push((dist, line_text));
+            }
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => collect_atx_headings(child, lines, q_lower, out),
+        }
+    }
 }
 
 /// Read a specific line range from a file.
