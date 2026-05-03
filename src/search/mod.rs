@@ -322,6 +322,19 @@ fn count_label(shown: usize, total: usize) -> String {
     }
 }
 
+/// Emit a per-facet hidden-count tail line after a truncated facet's entries.
+/// Wording mirrors the linear-path global tail so a reader sees a single
+/// consistent shape — only the noun changes per facet kind.
+fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
+    if shown < total {
+        let hidden = total - shown;
+        let _ = write!(
+            out,
+            "\n\n... and {hidden} more {kind}. Narrow with scope."
+        );
+    }
+}
+
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
@@ -877,7 +890,11 @@ fn format_search_result(
         let faceted = facets::facet_matches(result.matches.clone(), &result.scope);
         let totals = &result.facet_totals;
 
-        // Format each non-empty facet with section headers
+        // Format each non-empty facet with section headers. After a truncated
+        // facet's entries, emit a per-facet hidden-count line (`write_hidden_tail`)
+        // so the reader sees which facet got cut. The global tail used to live
+        // at the end of `format_search_result`; on the facet path we suppress
+        // it to avoid double-counting hidden matches across two surfaces.
         if !faceted.definitions.is_empty() {
             let _ = write!(
                 out,
@@ -893,6 +910,12 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+            );
+            write_hidden_tail(
+                &mut out,
+                faceted.definitions.len(),
+                totals.definitions,
+                "definitions",
             );
         }
 
@@ -912,6 +935,12 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
             );
+            write_hidden_tail(
+                &mut out,
+                faceted.implementations.len(),
+                totals.implementations,
+                "implementations",
+            );
         }
 
         if !faceted.tests.is_empty() {
@@ -930,6 +959,7 @@ fn format_search_result(
                     m.text.trim()
                 );
             }
+            write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
         }
 
         if !faceted.usages_local.is_empty() {
@@ -947,6 +977,12 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+            );
+            write_hidden_tail(
+                &mut out,
+                faceted.usages_local.len(),
+                totals.usages_local,
+                "usages",
             );
         }
 
@@ -966,6 +1002,12 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
             );
+            write_hidden_tail(
+                &mut out,
+                faceted.usages_cross.len(),
+                totals.usages_cross,
+                "usages",
+            );
         }
     } else {
         // Linear display for ≤5 matches
@@ -979,14 +1021,17 @@ fn format_search_result(
             &mut expanded_files,
             &mut out,
         );
-    }
 
-    if result.total_found > result.matches.len() {
-        let omitted = result.total_found - result.matches.len();
-        let _ = write!(
-            out,
-            "\n\n... and {omitted} more matches. Narrow with scope."
-        );
+        // Global hidden-tail only on the linear path. The faceted path emits
+        // a per-facet line for each truncated facet above; printing both
+        // would double-count the same hidden matches.
+        if result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(
+                out,
+                "\n\n... and {omitted} more matches. Narrow with scope."
+            );
+        }
     }
 
     let tokens = estimate_tokens(out.len() as u64);
@@ -1718,6 +1763,30 @@ mod tests {
         assert!(
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
+        );
+    }
+
+    #[test]
+    fn write_hidden_tail_emits_only_when_truncated() {
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 3, "definitions");
+        assert!(
+            out.is_empty(),
+            "no truncation → no tail line, got {out:?}"
+        );
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 10, 14, "definitions");
+        assert_eq!(
+            out,
+            "\n\n... and 4 more definitions. Narrow with scope."
+        );
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 27, "usages");
+        assert_eq!(
+            out,
+            "\n\n... and 24 more usages. Narrow with scope."
         );
     }
 
