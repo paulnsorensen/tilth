@@ -2,7 +2,7 @@
 
 This document walks a reader unfamiliar with the source through tilth's
 subsystems, data flow, key types, and extension points. It is written
-against the `choongng/tilth@dev` fork at commit `fd3de77` (17 commits
+against the `choongng/tilth@dev` fork at commit `c592109` (23 commits
 ahead of `origin/main`, which itself tracks upstream `jahala/tilth` at
 v0.7.0). Where the fork has diverged from upstream architecturally, that
 is called out inline; the [Fork delta](#fork-delta) section tabulates
@@ -12,7 +12,7 @@ Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. The whole project is ~22.5k lines of
+analysis, and codebase mapping. The whole project is ~22.8k lines of
 Rust across 48 files in `src/` (about half of which is in-source
 `#[cfg(test)]` modules), plus a Cargo workspace, an `install.rs` that
 writes MCP-host configs, and a benchmark harness.
@@ -95,7 +95,7 @@ src/
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
-│       ├── markdown.rs  ATX-heading outline with fence tracking
+│       ├── markdown.rs  Tree-sitter-md outline: walks `section` nodes
 │       ├── structured.rs JSON/YAML/TOML "keys" view
 │       ├── tabular.rs   CSV/TSV head/tail + column count
 │       ├── test_file.rs Test-suite outline (describe/it grouping)
@@ -106,7 +106,9 @@ src/
 │   ├── detection.rs     Binary / generated / minified detection
 │   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
-│                        node_to_entry walker (~800 lines)
+│                        node_to_entry walker (~800 lines);
+│                        parse_markdown / heading_level / heading_text
+│                        helpers shared by markdown outline + search defs
 │
 ├── index/           Pre-computed indexes (currently allocated, not all
 │                    used in the active code path)
@@ -374,8 +376,11 @@ The biggest file in the subsystem (~1280 lines). Three layers stacked:
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
-     `def_weight = 30` definitions, with fence-state tracking
-     (fork commit `8882d72`) to skip ```` ``` ```` and `~~~` blocks.
+     `def_weight = 30` definitions by walking `section` nodes from the
+     tree-sitter-md block grammar (no manual fence pre-pass needed —
+     the grammar owns the fenced/indented-code-block distinction).
+     Section span (`def_range`) comes from the section node's end
+     position; trailing blank lines are trimmed.
 3. **Usage matching** (`find_usages`) — line-level identifier
    matching, with word-boundary checks to avoid substring false hits.
    Each usage is annotated with its enclosing definition (fork commit
@@ -384,12 +389,13 @@ The biggest file in the subsystem (~1280 lines). Three layers stacked:
    real code defs (weight ≥60) ahead of doc-heading defs (weight 30)
    when the display cap is binding.
 
-The markdown branch deserves a callout because it interacts with two
-seemingly-similar things in different files. `read/outline/markdown.rs`
-also tracks fence state for outlines; `find_defs_markdown_buf` does
-the same job for the search path. The two implementations share the
-`parse_atx_heading` parser but maintain their own pre-pass loops. See
-[Open threads](#open-architectural-threads).
+Both markdown paths (`read/outline/markdown.rs` for outlines and
+`find_defs_markdown_buf` for search defs) share the same parser and
+heading helpers via `lang/outline.rs::{parse_markdown, heading_level,
+heading_text}`. Each walks `section` nodes from the same tree, so the
+fence-state tracking that used to live in two places now lives at the
+parser level — adding a markdown edge case (lazy continuations, info
+strings, …) means teaching the helpers, not chasing copies.
 
 ### Content / regex search (`content.rs`, regex paths)
 
@@ -518,7 +524,9 @@ The `outline/` submodule dispatches on `FileType`:
 - `code.rs` — calls `lang::outline::walk_top_level` with the parsed
   tree-sitter tree, formats `OutlineEntry` instances as `[start-end]
   symbol_name signature`.
-- `markdown.rs` — ATX headings outline with fence-state tracking.
+- `markdown.rs` — ATX headings outline via tree-sitter-md `section`
+  walk (no manual fence pre-pass; the grammar handles fenced and
+  indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
 - `tabular.rs` — CSV/TSV header + first/last few rows.
@@ -798,8 +806,8 @@ user-facing.
 
 ## Fork delta
 
-The fork (`choongng/tilth@dev`, 17 commits ahead of `origin/main`,
-which is at upstream v0.7.0) groups into five themes. Listed
+The fork (`choongng/tilth@dev`, 23 commits ahead of `origin/main`,
+which is at upstream v0.7.0) groups into six themes. Listed
 oldest-first.
 
 | Commit    | Theme                | Summary |
@@ -821,6 +829,9 @@ oldest-first.
 | `cc1525a` | Search output        | Emit per-facet hidden-count tail; drop global tail on facet path. |
 | `99c4a3d` | Search output        | Inline section body for markdown-heading defs in default preview. |
 | `fd3de77` | Server instructions  | Tighten `SERVER_INSTRUCTIONS` into a pre-flight gate. |
+| `12c7045` | Markdown AST         | Switch markdown outline to tree-sitter-md (`lang/outline.rs::{parse_markdown, heading_level, heading_text}`); delete fence pre-pass in `read/outline/markdown.rs`. |
+| `47c3471` | Markdown AST         | Switch `find_defs_markdown_buf` to walk tree-sitter `section` nodes; delete the second fence pre-pass + the `parse_atx_heading` helper. |
+| `c592109` | Markdown AST         | Switch `markdown_enclosing_scope` to AST so `#`-prefixed lines inside fenced code blocks no longer become enclosing-heading labels. |
 
 The seven "agent usability" patches are the oldest layer and cover
 everything from default ignore behaviour to terminal sizing to output
@@ -828,8 +839,11 @@ trailing-newline polish — they predated the search-output project that
 landed Sessions 51-52. The `feat/usage-enclosing-scope-ast`
 (`7cad3f1`) and `feat/markdown-section-span-expansion` (`02e9a51` →
 `7d76b16` → six search-output follow-ups) trees are the two
-substantial features. `fd3de77` is the latest commit, a small but
-focused MCP-instructions rewrite.
+substantial features. `fd3de77` rewrote `SERVER_INSTRUCTIONS` as a
+pre-flight gate. The newest cluster (`12c7045` → `47c3471` →
+`c592109`) replaces three hand-rolled markdown scanners with
+tree-sitter-md walks — fenced-code-block awareness now lives at the
+parser level instead of in three separate per-line pre-passes.
 
 None of these have an obvious upstream blocker; they are
 fork-divergent because of bandwidth / drift, not architectural
@@ -903,17 +917,18 @@ tracking.
   walk 5k+ files per call today). This is the single largest design
   cleanup available short of a full async rewrite.
 
-- **Fence-tracking duplication.** Two markdown ATX scanners maintain
-  their own pre-pass loops that toggle an `in_fence` flag on
-  ```` ``` ```` / `~~~` delimiters: `read/outline/markdown.rs:10-32`
-  (outline path) and `search/symbol.rs:603-660` (search path). They
-  share the `parse_atx_heading` helper but the fence loops are
-  copy-pasted. The MEMORY.md note says "two copies stay below the
-  abstraction threshold; introduce a shared helper only if a third
-  caller appears." That threshold is roughly correct — the cost of
-  the abstraction is one tiny shared module — but the next time
-  fence-state has to handle a new edge case (indented fences, info
-  strings, lazy continuations) the duplication will bite.
+- **`read/mod.rs::resolve_heading` still scans manually.** Three small
+  hand-rolled fence-aware loops live in the markdown-section-lookup
+  path that backs `tilth_read foo.md section="## Foo"`. They each
+  toggle an `in_code_block` flag on ```` ``` ```` delimiters
+  (`read/mod.rs:203,239,297`). The behaviour is correct on the cases
+  the unit tests cover, but the surface is exactly the kind that
+  surfaced bugs in the search-side scanners (e.g. `~~~` fences are
+  not handled). The sibling refactor (`12c7045` → `c592109`) gave
+  these scanners an AST-based replacement target — `parse_markdown`
+  plus a section-by-heading-text walk would collapse all three loops.
+  Deferred because nothing's broken in practice; worth picking up
+  next time read-path markdown logic needs work.
 
 - **MCP per-request thread model.** Every `tools/call` spawns a fresh
   thread; on timeout the thread is abandoned. This is correct given
