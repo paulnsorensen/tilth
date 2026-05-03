@@ -1,85 +1,107 @@
-/// Markdown outline via memchr line scan — no markdown parser needed.
-/// Find lines starting with `#`, extract heading level and text,
-/// count code blocks per section. Shows line ranges for each heading.
+/// Markdown outline via tree-sitter-md. The block grammar emits `section`
+/// nodes that group each heading with its content (and any nested sections),
+/// so heading hierarchy + section spans drop out of the AST instead of
+/// requiring a hand-rolled fence-aware ATX scan. Fenced code blocks are
+/// `fenced_code_block` nodes and never produce false-positive headings.
+use crate::lang::outline::{heading_level, heading_text, parse_markdown};
+
 pub fn outline(buf: &[u8], max_lines: usize) -> String {
-    // First pass: collect all headings and count total lines
-    let mut headings = Vec::new();
-    let mut pos = 0;
-    let mut line_num = 0u32;
-    let mut code_block_count = 0u32;
-    let mut in_code_block = false;
+    let Ok(content) = std::str::from_utf8(buf) else {
+        return String::new();
+    };
+    let Some(tree) = parse_markdown(content) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
 
-    while pos < buf.len() && headings.len() < max_lines {
-        line_num += 1;
-
-        // Find end of current line
-        let line_end = memchr::memchr(b'\n', &buf[pos..]).map_or(buf.len(), |i| pos + i);
-
-        let line = &buf[pos..line_end];
-
-        // Track code blocks
-        if line.starts_with(b"```") {
-            if in_code_block {
-                in_code_block = false;
-            } else {
-                in_code_block = true;
-                code_block_count += 1;
-            }
-            pos = line_end + 1;
-            continue;
-        }
-
-        if !in_code_block && !line.is_empty() && line[0] == b'#' {
-            // Count heading level
-            let level = line.iter().take_while(|&&b| b == b'#').count();
-            if level <= 6 {
-                let text_start = level + usize::from(line.get(level) == Some(&b' '));
-                if let Ok(text) = std::str::from_utf8(&line[text_start..]) {
-                    headings.push((line_num, level, text.to_string()));
-                }
-            }
-        }
-
-        pos = line_end + 1;
-    }
-
-    let total_lines = line_num;
-
-    // Second pass: compute end lines for each heading and format output
     let mut entries = Vec::new();
-    let num_headings = headings.len();
-
-    for (i, (start_line, level, text)) in headings.iter().enumerate() {
-        // Find next heading with same or higher level (lower level number)
-        let end_line = if i + 1 < num_headings {
-            // Look for next heading with level <= current level
-            headings[i + 1..]
-                .iter()
-                .find(|(_, next_level, _)| next_level <= level)
-                .map_or(total_lines, |(next_start, _, _)| next_start - 1)
-        } else {
-            // Last heading extends to end of file
-            total_lines
-        };
-
-        let indent = "  ".repeat(level.saturating_sub(1));
-        let hashes = "#".repeat(*level);
-        let truncated = if text.len() > 80 {
-            format!("{}...", crate::types::truncate_str(text, 77))
-        } else {
-            text.clone()
-        };
-
-        entries.push(format!(
-            "[{start_line}-{end_line}] {indent}{hashes} {truncated}"
-        ));
-    }
+    let mut code_block_count = 0u32;
+    walk(
+        tree.root_node(),
+        &lines,
+        max_lines,
+        &mut entries,
+        &mut code_block_count,
+    );
 
     if code_block_count > 0 {
         entries.push(format!("\n({code_block_count} code blocks)"));
     }
-
     entries.join("\n")
+}
+
+fn walk(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    max_lines: usize,
+    entries: &mut Vec<String>,
+    code_block_count: &mut u32,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if entries.len() >= max_lines {
+            return;
+        }
+        match child.kind() {
+            "section" => {
+                emit_section_heading(child, lines, entries);
+                walk(child, lines, max_lines, entries, code_block_count);
+            }
+            "fenced_code_block" => {
+                *code_block_count += 1;
+            }
+            _ => walk(child, lines, max_lines, entries, code_block_count),
+        }
+    }
+}
+
+/// If `section` opens with an `atx_heading` or `setext_heading`, append an
+/// entry of the form `[start-end] {indent}{hashes} {text}` to `entries`.
+fn emit_section_heading(
+    section: tree_sitter::Node,
+    lines: &[&str],
+    entries: &mut Vec<String>,
+) {
+    let mut cursor = section.walk();
+    for inner in section.children(&mut cursor) {
+        // Only ATX headings nest as proper sections in the block grammar;
+        // setext headings sit as siblings inside one big document section,
+        // so section-span computation doesn't apply. Preserve the old
+        // hand-rolled scanner's behavior of silently ignoring setext.
+        if inner.kind() != "atx_heading" {
+            continue;
+        }
+        let Some(level) = heading_level(inner) else {
+            return;
+        };
+        let start_line = (inner.start_position().row + 1) as u32;
+        let end_line = section_end_line(section);
+        let text = heading_text(inner, lines);
+        let indent = "  ".repeat((level as usize).saturating_sub(1));
+        let hashes = "#".repeat(level as usize);
+        let display = if text.len() > 80 {
+            format!("{}...", crate::types::truncate_str(&text, 77))
+        } else {
+            text
+        };
+        entries.push(format!(
+            "[{start_line}-{end_line}] {indent}{hashes} {display}"
+        ));
+        return;
+    }
+}
+
+/// Convert a section node's exclusive end position to a 1-indexed inclusive
+/// line. Tree-sitter end positions point one past the last character — when
+/// the section ends with a newline, end.column is 0 on the row after the
+/// content; otherwise end.row is the row containing the last character.
+fn section_end_line(section: tree_sitter::Node) -> u32 {
+    let end = section.end_position();
+    if end.column == 0 {
+        end.row as u32
+    } else {
+        (end.row + 1) as u32
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +171,32 @@ mod tests {
         let input = b"";
         let result = outline(input, 100);
 
+        assert_eq!(result, "");
+    }
+
+    /// AST handles fenced code blocks at the parser level — a `# foo` Python
+    /// comment inside a fenced block is part of the `fenced_code_block` node,
+    /// not an `atx_heading`. The hand-rolled scanner needed a manual fence
+    /// pre-pass to avoid treating it as a heading; the AST gets this for free.
+    #[test]
+    fn hash_inside_fenced_code_does_not_become_heading() {
+        let input = b"# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
+        let result = outline(input, 100);
+        let lines: Vec<&str> = result.lines().collect();
+        let heading_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with('[')).collect();
+        assert_eq!(heading_lines.len(), 2);
+        assert!(heading_lines[0].contains("# Real"));
+        assert!(heading_lines[1].contains("## Also Real"));
+    }
+
+    /// Setext headings (`Top\n====`) are not handled — the block grammar puts
+    /// every setext heading as a sibling inside one document-spanning section
+    /// rather than nesting them, so section-span computation doesn't apply.
+    /// The old hand-rolled scanner only matched ATX too; we preserve that.
+    #[test]
+    fn setext_headings_silently_ignored() {
+        let input = b"Top\n===\n\ncontent\n";
+        let result = outline(input, 100);
         assert_eq!(result, "");
     }
 }
