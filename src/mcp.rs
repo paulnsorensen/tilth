@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
-use crate::index::SymbolIndex;
 use crate::session::Session;
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -19,7 +18,6 @@ use crate::session::Session;
 pub(crate) struct Services {
     cache: Arc<OutlineCache>,
     session: Arc<Session>,
-    index: Arc<SymbolIndex>,
     bloom: Arc<BloomFilterCache>,
     edit_mode: bool,
 }
@@ -29,7 +27,6 @@ impl Services {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
-            index: Arc::new(SymbolIndex::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             edit_mode,
         }
@@ -41,10 +38,6 @@ impl Services {
 
     pub(crate) fn session(&self) -> &Session {
         &self.session
-    }
-
-    pub(crate) fn index(&self) -> &Arc<SymbolIndex> {
-        &self.index
     }
 
     pub(crate) fn bloom(&self) -> &Arc<BloomFilterCache> {
@@ -404,7 +397,6 @@ pub(crate) fn dispatch_tool(
             args,
             services.cache(),
             services.session(),
-            services.index(),
             services.bloom(),
         ),
         "tilth_files" => tool_files(args, services.cache()),
@@ -507,7 +499,6 @@ fn tool_search(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
-    index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
     let query = args
@@ -543,7 +534,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, index, bloom, expand, context, glob,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 2..=5 => {
@@ -551,7 +542,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, index, bloom, expand, context, glob,
+                        &queries, &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 _ => {
