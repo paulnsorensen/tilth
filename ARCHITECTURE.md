@@ -2,7 +2,7 @@
 
 This document walks a reader unfamiliar with the source through tilth's
 subsystems, data flow, key types, and extension points. It is written
-against the `choongng/tilth@dev` fork at commit `5d81660` (27 commits
+against the `choongng/tilth@dev` fork at commit `cb2d875` (30 commits
 ahead of `origin/main`, which itself tracks upstream `jahala/tilth` at
 v0.7.0). Where the fork has diverged from upstream architecturally, that
 is called out inline; the [Fork delta](#fork-delta) section tabulates
@@ -12,8 +12,8 @@ Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. The whole project is ~22.3k lines of
-Rust across 47 files in `src/` (about half of which is in-source
+analysis, and codebase mapping. The whole project is ~22.1k lines of
+Rust across 47 files in `src/` (about a quarter of which is in-source
 `#[cfg(test)]` modules), plus a Cargo workspace, an `install.rs` that
 writes MCP-host configs, and a benchmark harness.
 
@@ -52,7 +52,7 @@ src/
 ├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
 ├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
-├── classify.rs      Query string → QueryType (7-rule precedence ladder)
+├── classify.rs      Query string → QueryType (8-rule precedence ladder)
 ├── types.rs         Shared types: QueryType, Lang, FileType, ViewMode,
 │                    Match, SearchResult, FacetTotals, OutlineEntry
 ├── error.rs         TilthError (NotFound, PermissionDenied,
@@ -106,7 +106,7 @@ src/
 │   ├── detection.rs     Binary / generated / minified detection
 │   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
-│                        node_to_entry walker (~800 lines);
+│                        node_to_entry walker (~945 lines);
 │                        parse_markdown / heading_level / heading_text
 │                        helpers shared by markdown outline + search defs
 │
@@ -327,7 +327,7 @@ checked when the shape suggests a file").
 ## Search subsystem (`src/search/`)
 
 The search subsystem is the largest area of code and the thing most fork
-work has touched. Roughly 7300 lines across 13 files.
+work has touched. Roughly 7900 lines across 13 files.
 
 ### Walker and ignore policy (`mod.rs`)
 
@@ -359,7 +359,9 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 
 ### Symbol search (`symbol.rs`)
 
-The biggest file in the subsystem (~1280 lines). Three layers stacked:
+The biggest production-only file in the subsystem (~1290 lines; only
+`mod.rs` is larger overall, and most of that is in-source tests). Three
+layers stacked:
 
 1. **`search()`** — top-level entry. Walks files via `walker`, parses
    each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
@@ -453,15 +455,18 @@ Java/Kotlin/C#, C/C++).
 These produce derived views from the same walker + tree-sitter
 machinery:
 
-- **Callers** (`callers.rs`, ~1070 lines, the second-largest file in
-  the subsystem). `find_callers` and `search_callers_expanded` resolve
-  call sites of a symbol. Two implementations: a single-symbol
-  tree-sitter path and a batch path that processes multiple symbols in
-  one walk. Each caller is annotated with its `EnclosingScope`
-  (fork commit `7cad3f1`) so the user sees `[usage in function foo]`
-  instead of just a line number. `no_callers_message` produces the
-  helpful "no callers found, here are similar names" output (also a
-  fork-side polish, see Session 51).
+- **Callers** (`callers.rs`, ~900 lines). `find_callers_batch` is the
+  single tree-sitter walk that resolves call sites for any number of
+  target symbols (1 to N) — `search_callers_expanded` calls it with a
+  one-element set, the deps / blast / 2nd-hop paths call it with the
+  full set. Each caller is annotated with its `EnclosingScope` (fork
+  commit `7cad3f1`) so the user sees `[usage in function foo]` instead
+  of just a line number. When the walk returns empty, a small
+  `target_seen_in_scope` helper does an mmap-based literal scan so
+  `no_callers_message` can distinguish typo from "real symbol with no
+  direct callers" (indirect dispatch, dead code, framework
+  registration). The "no callers found, here are similar names" output
+  is fork-side polish (see Session 51).
 - **Callees** (`callees.rs`) — resolve outgoing calls inside a
   definition body. Drives the `── calls ──` footer under each
   expanded match.
@@ -784,16 +789,16 @@ user-facing.
   control. CLI-only — the MCP boundary doesn't expose it (no schema
   in `tools/list`, no dispatch arm).
 - **`install.rs`** — `tilth install <host>` writes tilth's MCP server
-  entry into a host's config file. Supports about 20 hosts:
-  claude-code, cursor, windsurf, vscode, claude-desktop, opencode,
-  gemini, codex, amp, droid, antigravity, zed, copilot-cli, augment,
-  kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi. Each
-  host has its own config-file location and JSON/TOML format quirks;
-  `resolve_host` returns a `HostInfo` that drives the right writer.
+  entry into a host's config file. Supports 22 hosts: claude-code,
+  cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex,
+  amp, droid, antigravity, zed, copilot-cli, augment, kiro, kilo-code,
+  cline, roo-code, trae, qwen-code, crush, pi. Each host has its own
+  config-file location and JSON/TOML format quirks; `resolve_host`
+  returns a `HostInfo` that drives the right writer.
 
 ## Fork delta
 
-The fork (`choongng/tilth@dev`, 27 commits ahead of `origin/main`,
+The fork (`choongng/tilth@dev`, 30 commits ahead of `origin/main`,
 which is at upstream v0.7.0) groups into seven themes. Listed
 oldest-first.
 
@@ -822,6 +827,8 @@ oldest-first.
 | `76dfb7f` | Markdown AST         | Switch `read/mod.rs::{resolve_heading, suggest_headings}` to AST so `tilth_read foo.md section="## Foo"` and the did-you-mean fallback both reuse the same parser; delete the last three hand-rolled fence-aware loops in `src/`. |
 | `8b585f4` | Simplification       | Delete inert `SymbolIndex` plumbing — the type was allocated, threaded through dispatch, and discarded with `let _ = index;` at every search call site. Drop the file, prune `index/mod.rs` to `BloomFilterCache`, strip the unused parameter from `search_*_expanded` / `dispatch_tool` / `tool_search` / `handle_tool_call`. Net −547 / +6. |
 | `5d81660` | Simplification       | Delete dead `tilth_map` MCP dispatch arm + orphaned schema-comment block. Schema was already commented out of `tools/list` (so the dispatch arm was unreachable); CLI keeps `tilth --map`. |
+| `2d5365b` | Simplification       | Collapse the single-symbol caller path into `find_callers_batch`. Replace `find_callers` + `find_callers_treesitter` with a small `target_seen_in_scope` helper that runs only when the batch walk returns empty. Net −162 lines; same caller output for the happy path. |
+| `cb2d875` | Simplification       | Drop unused `_cache` / `_session` parameters from five helpers (`search_callers_expanded`, `search_glob`, `resolve_callees{_transitive}` / `resolve_second_hop`, `analyze_deps`, `tool_edit`); thread the simpler signatures back through every call site. Public API: `tilth::run_callers` and `tilth::run_deps` no longer take a `cache` argument. Net −31 lines. |
 
 The seven "agent usability" patches are the oldest layer and cover
 everything from default ignore behaviour to terminal sizing to output
@@ -835,8 +842,12 @@ pre-flight gate. The Markdown-AST cluster (`12c7045` → `47c3471` →
 with tree-sitter-md walks — fenced-code-block awareness now lives at
 the parser level rather than in four separate per-line pre-passes;
 no in-tree caller still hand-rolls fence state. The Simplification
-pair (`8b585f4` → `5d81660`) follows up by deleting the
-two largest pieces of dead plumbing the architectural review surfaced.
+quartet (`8b585f4` → `5d81660` → `2d5365b` → `cb2d875`) follows up by
+deleting the two largest pieces of dead plumbing the architectural
+review surfaced (`SymbolIndex`, `tilth_map` dispatch arm), then
+collapsing the structural-duplicate single-symbol caller path into the
+batch walk, and finally peeling off the residual `_cache` / `_session`
+parameters left over from earlier shape-only contracts.
 
 None of these have an obvious upstream blocker; they are
 fork-divergent because of bandwidth / drift, not architectural
