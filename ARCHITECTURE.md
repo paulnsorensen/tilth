@@ -12,23 +12,25 @@ Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. The whole project is ~16.5k lines of
-Rust across roughly 40 files in `src/`, plus a Cargo workspace, an
-`install.rs` that writes MCP-host configs, and a benchmark harness.
+analysis, and codebase mapping. The whole project is ~22.5k lines of
+Rust across 48 files in `src/` (about half of which is in-source
+`#[cfg(test)]` modules), plus a Cargo workspace, an `install.rs` that
+writes MCP-host configs, and a benchmark harness.
 
 ## Reading order
 
 Read in this order to learn the codebase from scratch:
 
-1. `src/types.rs` (~190 lines) — the type alphabet. `QueryType`, `Lang`,
+1. `src/types.rs` (~195 lines) — the type alphabet. `QueryType`, `Lang`,
    `FileType`, `ViewMode`, `Match`, `SearchResult`, `FacetTotals`,
    `OutlineEntry`, `OutlineKind`. Every other module speaks in these.
-2. `src/lib.rs` (~360 lines) — the public API. Five entry points
+2. `src/lib.rs` (~400 lines) — the public API. Five entry points
    (`run`, `run_full`, `run_expanded`, `run_callers`, `run_deps`),
    one shared dispatcher (`run_inner`), and the cascade helpers
    `single_query_search` / `multi_word_concept_search`.
-3. `src/classify.rs` (~150 lines) — query string → `QueryType` by
-   byte-pattern matching, in priority order.
+3. `src/classify.rs` (~370 lines, but ~140 of those are tests) —
+   query string → `QueryType` by byte-pattern matching, in priority
+   order.
 4. `src/main.rs` and `src/mcp.rs` — the two surfaces. Read `main.rs`
    first to see the clap shape; `mcp.rs` is the larger one but follows
    the same dispatch logic in JSON-RPC clothing.
@@ -66,7 +68,7 @@ src/
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
 │
-├── search/          Search engine (~7300 lines, 13 files)
+├── search/          Search engine (~8000 lines, 13 files)
 │   ├── mod.rs           Walker, ignore policy, formatter, dispatch
 │   ├── symbol.rs        Tree-sitter definition detection per language;
 │   │                    markdown-heading defs; usage matching
@@ -86,7 +88,7 @@ src/
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
 │   └── blast.rs         Symbol-level blast radius
 │
-├── read/            Read engine (~1800 lines, 8 files)
+├── read/            Read engine (~2000 lines, 9 files)
 │   ├── mod.rs           read_file decision tree, section reader,
 │   │                    heading resolver, suggestion fallback
 │   ├── imports.rs       Resolve "Related: file1, file2" hints
@@ -113,7 +115,7 @@ src/
 │   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
 │                        (BloomFilterCache wraps the per-file filters)
 │
-└── diff/            Structural diff (~3600 lines, 5 files)
+└── diff/            Structural diff (~4000 lines, 5 files)
     ├── mod.rs           DiffSource resolution; diff() pipeline orchestrator
     ├── parse.rs         Parse unified diff text → FileDiff structs
     ├── overlay.rs       FileDiff + on-disk source → structural FileOverlay
@@ -134,14 +136,20 @@ shell with its own concurrency model.
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
 plus flags. The mode is determined by mutually-exclusive flags
 (`--callers`, `--deps`, `--map`, `--mcp`, `--edit`, `--full`,
-`--expand`, `--section`). Subcommands are limited to one entry —
-`Install` — which delegates to `install::run`.
+`--expand`, `--section`). Three subcommands sit alongside the
+free-form path:
 
-The default mode dispatches into `lib::run` (or `run_full`,
-`run_expanded`, `run_callers`, `run_deps`, `map::generate`) based on
-the active flags. The output is printed verbatim to stdout. JSON output
-(`--json`) emits a serde-serialized `SearchResult`; otherwise the
-human-readable formatter wins.
+- `tilth install <host>` — delegates to `install::run`.
+- `tilth diff [<source>]` — bypasses `lib.rs` entirely and goes
+  through `diff::resolve_source` + `diff::diff`.
+- `tilth overview` — prints the project fingerprint that the MCP
+  `initialize` response would inject.
+
+The default (no-subcommand) mode dispatches into `lib::run` (or
+`run_full`, `run_expanded`, `run_callers`, `run_deps`,
+`map::generate`) based on the active flags. The output is printed
+verbatim to stdout. JSON output (`--json`) emits a serde-serialized
+`SearchResult`; otherwise the human-readable formatter wins.
 
 `main.rs` also handles two operational concerns the MCP path doesn't
 touch: it detects terminal height via `TIOCGWINSZ` (fork commit
@@ -162,8 +170,11 @@ working directory, so every later tool call resolves relative paths
 against it. This was added specifically to handle MCP hosts (Codex was
 the documented case) that launch tilth with `cwd=/`.
 
-The request loop (`mcp.rs:139-220`) parses each line as JSON, dispatches
-on `method`, and writes the response. Two methods are special:
+The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
+off to `handle_request`, which switches on `method`. The handler
+recognises `initialize`, `tools/list`, `tools/call`, and `ping`;
+anything else returns a JSON-RPC `method not found` error. The two
+methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
   and an `instructions` string. The instructions are the
@@ -272,7 +283,7 @@ caller knows truncation happened.
 
 ## Classification (`src/classify.rs`)
 
-Tilth's "what kind of query is this" decision is a 7-rule byte-pattern
+Tilth's "what kind of query is this" decision is an 8-rule byte-pattern
 ladder, in priority order:
 
 1. **Slash-wrapped regex** — `/pattern/` with regex metacharacters
@@ -296,12 +307,21 @@ ladder, in priority order:
    splits `Symbol` from `Concept`.
 8. **Multi-word phrase** — 2-4 simple words → `Concept`.
 
-When nothing matches, `Fallthrough` is the catch-all. Classification is
-deliberately syntactic — no regex engine, no fuzzy matching — so adding
-a query type means adding a `QueryType` enum arm and one rule. The
-ordering encodes the precedence policy ("globs before paths," "regex
-first if metachars present," "filesystem only checked when the shape
-suggests a file").
+When nothing else matches, the catch-all is `Content` (the query was
+typed by a user who didn't quote it, but it doesn't look like a path,
+glob, identifier, or short concept phrase, so treat it as a literal
+text search). The narrower `Fallthrough` variant is reserved for
+queries that *did* look path-shaped (rule 3) but failed to resolve on
+disk; downstream callers (`run_query_basic`, `run_query_expanded`)
+hand `Fallthrough` to the same single-symbol cascade as `Concept` but
+with `prefer_definitions: false`, so any symbol or content match is
+accepted.
+
+Classification is deliberately syntactic — no regex engine, no fuzzy
+matching — so adding a query type means adding a `QueryType` enum arm
+and one rule. The ordering encodes the precedence policy ("globs
+before paths," "regex first if metachars present," "filesystem only
+checked when the shape suggests a file").
 
 ## Search subsystem (`src/search/`)
 
@@ -628,7 +648,7 @@ single tool each.
 
 ### Diff (`src/diff/`)
 
-`tilth_diff` (and the `tilth --diff` CLI shape) ends up in
+`tilth_diff` (and the `tilth diff` CLI subcommand) ends up in
 `diff::diff`. The pipeline:
 
 1. **Resolve source** (`resolve_source`) — `DiffSource` is a
@@ -651,8 +671,15 @@ single tool each.
    matching a substring, if `--search` was passed.
 8. **Blast radius** (`compute_blast`) — for each signature-changed
    symbol, list of impacted files, gated on `--blast`.
-9. **`format::format_diff`** — `[+]`/`[-]`/`[~]`/`[~:sig]` line
-   prefixes; budgeted via `budget::apply`.
+9. **Format** — dispatched by scope shape: `format::format_overview`
+   (no scope), `format::format_file_detail` (single file scope), or
+   `format::format_function_detail` (`file:fn` scope). Marker line
+   prefixes are `[+]`/`[-]`/`[~]`/`[~:sig]`; the overview header is
+   budgeted via `budget::apply`.
+10. **Conflict detection** — only on `DiffSource::GitUncommitted`,
+    `overlay::detect_conflicts` scans each affected file for git
+    merge-conflict markers and `format::format_conflicts` appends the
+    findings to the output.
 
 `diff_log(range, scope, budget)` is a separate pipeline for `--log
 HEAD~5..HEAD` summaries — runs `git log --pretty + git show` per commit
@@ -660,22 +687,31 @@ and emits a structural change list per commit.
 
 ### Edit (`src/edit.rs`)
 
-Hash-anchored line edits, ~300 lines. The `Edit` struct carries a
-start anchor (`<line>:<hash>`), an optional end anchor (range edit), and
-a content string (empty = delete). `apply_edits` reads the file, hashes
-each line, validates that supplied anchors match, and rewrites the
-file with the substituted content. The hash mismatch case is the
-primary safety: if the file changed since `tilth_read`, the agent gets
-`Mismatch` back and is forced to re-read.
+Hash-anchored line edits. The implementation is ~300 lines of code
+(plus ~360 lines of tests). The `Edit` struct carries a start line
+and hash (`<line>:<hash>`), an end line and hash (equal to the start
+for single-line edits — the MCP `tool_edit` parser fills these in
+when the JSON payload omits `end`), and a content string (empty =
+delete). `apply_edits` reads the file, hashes each line, validates
+that the supplied anchors match, and rewrites the file with the
+substituted content. The hash mismatch case is the primary safety: if
+the file changed since `tilth_read`, the agent gets a `HashMismatch`
+back with hashlined context around each failing site, and is forced
+to re-read.
 
-`EditResult` is `Ok` / `Mismatch { expected, actual, line }`. The
-formatter (`format_diffs`) produces a compact before/after diff
-summary.
+`EditResult` is the two-armed enum
+`Applied { diff, context } | HashMismatch(String)` — `diff` is a
+compact `-`/`+` rendering of every edit site, `context` is the
+hashlined window around each rewrite. The formatter (`format_diffs`,
+also in `edit.rs`) produces the diff string itself.
 
-The edit tool surfaces a callee-callers warning when a function
-signature changes — `apply_edits` calls into `search::callers` to
-list possibly-affected sites. This is opt-in (`diff: true` arg) but
-designed to make the agent re-check before chaining edits.
+The callee-callers warning lives one layer up. `mcp::tool_edit`, on a
+successful `Applied` result, calls `search::blast::blast_radius` with
+the same `Edit` list and appends its output. The check is
+unconditional in MCP (every successful edit gets the warning); the
+`diff: true` argument controls whether the per-edit `-`/`+` block is
+shown alongside the hashlined context, *not* whether the blast
+radius runs.
 
 ## MCP server (`src/mcp.rs`)
 
