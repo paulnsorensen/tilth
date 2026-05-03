@@ -569,23 +569,46 @@ fn find_defs_markdown_buf(
     mtime: SystemTime,
 ) -> Vec<Match> {
     let mut defs = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
 
-    for (i, line) in content.lines().enumerate() {
-        let Some(heading_text) = extract_atx_heading_text(line) else {
+    for (i, line) in lines.iter().enumerate() {
+        let Some((level, heading_text)) = parse_atx_heading(line) else {
             continue;
         };
         if !contains_identifier(heading_text, query) {
             continue;
         }
+
+        // Section span: heading line through the line before the next ATX
+        // heading at the same or higher level (smaller `level` = higher).
+        // If no such heading follows, the section runs to EOF. Trailing
+        // blank lines are trimmed so the rendered range is tight.
+        let heading_line = (i + 1) as u32;
+        let mut end = lines.len();
+        for (j, peek) in lines.iter().enumerate().skip(i + 1) {
+            if let Some((peek_level, _)) = parse_atx_heading(peek) {
+                if peek_level <= level {
+                    end = j;
+                    break;
+                }
+            }
+        }
+        while end > i + 1 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        let section_end = end as u32;
+
         defs.push(Match {
             path: path.to_path_buf(),
-            line: (i + 1) as u32,
+            line: heading_line,
             text: line.trim_end().to_string(),
             is_definition: true,
             exact: true,
             file_lines,
             mtime,
-            def_range: None,
+            // Populating def_range lets the renderer expand to the section
+            // body — the markdown analogue of a code definition's body.
+            def_range: Some((heading_line, section_end)),
             def_name: Some(query.to_string()),
             // Soft definition — code definitions are 60-80, usages 0. Sits
             // between them so docs headings outrank passing mentions but
@@ -598,10 +621,11 @@ fn find_defs_markdown_buf(
     defs
 }
 
-/// Extract the text of an ATX-style markdown heading, or `None` if the line
-/// is not a heading. Strips leading `#` markers and optional trailing `#`s.
-/// Per CommonMark: 0-3 spaces of indent allowed; 4+ spaces is a code block.
-fn extract_atx_heading_text(line: &str) -> Option<&str> {
+/// Parse an ATX-style markdown heading. Returns `(level, text)` or `None`
+/// if the line is not a heading. Strips leading `#` markers and optional
+/// trailing `#`s. Per CommonMark: 0-3 spaces of indent allowed; 4+ spaces
+/// is a code block.
+fn parse_atx_heading(line: &str) -> Option<(usize, &str)> {
     let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
     if leading_spaces > 3 {
         return None;
@@ -617,7 +641,7 @@ fn extract_atx_heading_text(line: &str) -> Option<&str> {
     }
     let text = after_indent[hashes..].trim();
     // ATX allows optional trailing `#`s: `## Foo ##` — strip them.
-    Some(text.trim_end_matches('#').trim_end())
+    Some((hashes, text.trim_end_matches('#').trim_end()))
 }
 
 /// True if `query` appears in `text` as a whole identifier — flanked by
@@ -1051,5 +1075,93 @@ end
     fn markdown_hashes_without_space_are_not_headings() {
         // `##foo` (no space after `#`s) is not a heading.
         assert!(md_find("##parseCitations\n", "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_next_same_level_heading() {
+        // `## parseCitations` body ends at the next `## ...` (same level).
+        // The blank line on line 4 (between body and next heading) is
+        // trimmed, so the span ends at line 3.
+        let content = "\
+## parseCitations
+
+Body line.
+
+## Other section
+
+Unrelated.
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 3)));
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_higher_level_heading() {
+        // A `## ...` ends a sub-section under `### parseCitations` because
+        // the outer heading is higher level (smaller hash count). The blank
+        // line preceding `## Outer two` is trimmed.
+        let content = "\
+## Outer
+
+### parseCitations
+
+Body.
+
+## Outer two
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 3);
+        assert_eq!(defs[0].def_range, Some((3, 5)));
+    }
+
+    #[test]
+    fn markdown_section_span_skips_deeper_subheadings() {
+        // A `### ...` does NOT end the enclosing `## parseCitations`
+        // section — only same-or-higher-level headings do.
+        let content = "\
+## parseCitations
+
+Lead-in.
+
+### Detail
+
+Subprose.
+
+## Next
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 7)));
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_eof_when_no_following_heading() {
+        let content = "\
+## parseCitations
+
+Body to end.
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        // Three content lines; trailing newline does not produce a 4th.
+        assert_eq!(defs[0].def_range, Some((1, 3)));
+    }
+
+    #[test]
+    fn markdown_section_span_handles_heading_with_no_body() {
+        // Adjacent headings: span is just the heading line itself.
+        let content = "\
+## parseCitations
+## Other
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 1)));
     }
 }
