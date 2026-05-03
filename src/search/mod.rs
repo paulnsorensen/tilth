@@ -503,18 +503,18 @@ fn format_single_match(
         if let Some((start, end)) = m.def_range {
             let _ = write!(
                 out,
-                "\n\n## {}:{}-{} [{kind}]",
+                "\n\n### {}:{}-{} [{kind}]",
                 rel(&m.path, scope),
                 start,
                 end
             );
         } else {
-            let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+            let _ = write!(out, "\n\n### {}:{} [{kind}]", rel(&m.path, scope), m.line);
         }
     } else {
         let _ = write!(
             out,
-            "\n\n## {}:{} [{kind}{scope_suffix}]",
+            "\n\n### {}:{} [{kind}{scope_suffix}]",
             rel(&m.path, scope),
             m.line
         );
@@ -830,7 +830,7 @@ fn basename_file_outline(
     let rel_path = rel(&matched_path, scope);
     let line_count = content.lines().count();
     Some(format!(
-        "### File overview: {rel_path} ({line_count} lines)\n{outline}"
+        "## File overview: {rel_path} ({line_count} lines)\n{outline}"
     ))
 }
 
@@ -866,7 +866,7 @@ fn format_search_result(
 
         // Format each non-empty facet with section headers
         if !faceted.definitions.is_empty() {
-            let _ = write!(out, "\n\n### Definitions ({})", faceted.definitions.len());
+            let _ = write!(out, "\n\n## Definitions ({})", faceted.definitions.len());
             format_matches(
                 &faceted.definitions,
                 &result.scope,
@@ -882,7 +882,7 @@ fn format_search_result(
         if !faceted.implementations.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Implementations ({})",
+                "\n\n## Implementations ({})",
                 faceted.implementations.len()
             );
             format_matches(
@@ -898,7 +898,7 @@ fn format_search_result(
         }
 
         if !faceted.tests.is_empty() {
-            let _ = write!(out, "\n\n### Tests ({})", faceted.tests.len());
+            let _ = write!(out, "\n\n## Tests ({})", faceted.tests.len());
             // Compact test format — one line per match, no expand budget consumed
             for m in &faceted.tests {
                 let _ = write!(
@@ -914,7 +914,7 @@ fn format_search_result(
         if !faceted.usages_local.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Usages — same package ({})",
+                "\n\n## Usages — same package ({})",
                 faceted.usages_local.len()
             );
             format_matches(
@@ -932,7 +932,7 @@ fn format_search_result(
         if !faceted.usages_cross.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Usages — other ({})",
+                "\n\n## Usages — other ({})",
                 faceted.usages_cross.len()
             );
             format_matches(
