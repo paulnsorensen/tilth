@@ -165,7 +165,7 @@ fn fingerprint_inner(root: &Path) -> String {
 
             // Hot files (only for projects with local imports)
             if let Some(hot) = hot_files(root, &walk, primary_lang) {
-                lines.push(format!("  hot: {hot}"));
+                lines.push(format!("  hot (× = importers): {hot}"));
             }
 
             // Git context
@@ -192,7 +192,7 @@ fn fingerprint_inner(root: &Path) -> String {
     } else {
         // No manifest — still show hot, git, tests
         if let Some(hot) = hot_files(root, &walk, primary_lang) {
-            lines.push(format!("  hot: {hot}"));
+            lines.push(format!("  hot (× = importers): {hot}"));
         }
         if let Some(git) = git_context(root) {
             lines.push(format!("  git: {git}"));
