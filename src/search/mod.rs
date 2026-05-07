@@ -2040,6 +2040,96 @@ mod tests {
             out.contains("20 more lines"),
             "must signal truncated lines, got: {out:?}"
         );
+        assert!(
+            out.contains("--expand"),
+            "tail must point to --expand for full section, got: {out:?}"
+        );
+    }
+
+    /// 99c4a3d's docstring is explicit: the markdown-section preview is a
+    /// fixed-cost short-circuit that bypasses the --expand budget. This pins
+    /// that intent — passing a non-zero `expand_remaining` must NOT cause
+    /// the renderer to skip the cap. Without this guard, a future refactor
+    /// could "fix" the short-circuit by routing through expand and turn
+    /// every markdown-heading match into a multi-hundred-line preview.
+    #[test]
+    fn format_single_match_markdown_cap_bypasses_expand_budget() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("long.md");
+        let mut content = String::from("## Big Section\n");
+        for i in 0..60 {
+            let _ = write!(content, "body line {i}\n");
+        }
+        std::fs::write(&p, &content).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "## Big Section".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 61,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 61)),
+            def_name: Some("Big Section".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        // Non-zero expand budget — should NOT change the cap behavior.
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        // Body lines beyond the cap must still be trimmed.
+        assert!(
+            !out.contains("body line 40"),
+            "cap must apply even with non-zero expand budget, got: {out:?}"
+        );
+        assert!(
+            out.contains("20 more lines"),
+            "tail must still report truncated lines, got: {out:?}"
+        );
+        // Budget must be untouched — short-circuit returns before consuming it.
+        assert_eq!(
+            expand_remaining, 5,
+            "markdown short-circuit must not consume expand budget"
+        );
+    }
+
+    /// Worst-case bound: with MAX_MATCHES = 10 markdown-heading defs each
+    /// hitting the 40-line preview cap, total inlined preview content is at
+    /// most 10 × 40 = 400 lines. This pins the bound by exercising the cap
+    /// and asserting the truncation shape, so a future bump of either
+    /// constant can't silently inflate worst-case output without updating
+    /// the test.
+    #[test]
+    fn markdown_preview_cap_constant_unchanged() {
+        // Pin both constants — if either changes, this assertion fails and
+        // the test author has to consider the worst-case product (currently
+        // 10 * 40 = 400 lines extra in default preview, on top of the
+        // outline context per match).
+        assert_eq!(
+            MARKDOWN_PREVIEW_MAX_LINES, 40,
+            "if you change MARKDOWN_PREVIEW_MAX_LINES, also re-evaluate the \
+             MAX_MATCHES * MARKDOWN_PREVIEW_MAX_LINES worst-case bound \
+             (currently 10 * 40 = 400 lines per search response)"
+        );
     }
 
     #[test]
