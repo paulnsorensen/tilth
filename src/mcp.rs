@@ -603,8 +603,8 @@ fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, Stri
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result = crate::search::deps::analyze_deps(&path, &scope, bloom)
-        .map_err(|e| e.to_string())?;
+    let deps_result =
+        crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,

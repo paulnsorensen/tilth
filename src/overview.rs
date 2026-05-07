@@ -460,16 +460,18 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
 
     let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let parsed: CargoToml = toml::from_str(&content).ok()?;
-    let (name, version) = parsed
-        .package
-        .map_or((None, None), |p| (p.name, p.version));
+    let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let mut deps: Vec<String> = parsed
         .dependencies
         .map(|d| d.into_iter().map(|(k, _)| k).collect())
         .unwrap_or_default();
     deps.sort();
     deps.truncate(10);
-    Some(ManifestInfo { name, version, deps })
+    Some(ManifestInfo {
+        name,
+        version,
+        deps,
+    })
 }
 
 fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
