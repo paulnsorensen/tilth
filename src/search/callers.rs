@@ -1,13 +1,10 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
-
-use crate::lang::treesitter::{extract_definition_name, DEFINITION_KINDS};
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
@@ -112,32 +109,18 @@ pub(crate) fn find_callers_batch(
 
             let path = entry.path();
 
-            // Single metadata call: check size and capture mtime together
-            let (file_len, mtime) = match std::fs::metadata(path) {
-                Ok(meta) => (
-                    meta.len(),
-                    meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                ),
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            if file_len > 500_000 {
-                return ignore::WalkState::Continue;
-            }
-
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            // Read + size-gate + bloom prefilter in one shared step.
+            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
+                path,
+                targets,
+                bloom,
+                super::bloom_walk::MAX_FILE_SIZE,
+            ) else {
                 return ignore::WalkState::Continue;
             };
 
-            // Bloom pre-filter: skip if none of the targets are definitely in the file
-            if !targets
-                .iter()
-                .any(|t| bloom.contains(path, mtime, &content, t))
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Fast byte check via memchr::memmem (SIMD) — skip files without any target symbol
+            // Fast byte check via memchr::memmem (SIMD) — cheap second pass that
+            // eliminates bloom false positives before tree-sitter parses.
             if !targets
                 .iter()
                 .any(|t| memchr::memmem::find(content.as_bytes(), t.as_bytes()).is_some())
@@ -185,7 +168,7 @@ fn find_callers_treesitter_batch(
     lang: crate::types::Lang,
 ) -> Vec<(String, CallerMatch)> {
     // Get the query string for this language
-    let Some(query_str) = super::callees::callee_query_str(lang) else {
+    let Some(query_str) = super::callee_query::callee_query_str(lang) else {
         return Vec::new();
     };
 
@@ -204,7 +187,7 @@ fn find_callers_treesitter_batch(
     // One Arc per file — all call sites share the same allocation.
     let shared_content: Arc<String> = Arc::new(content.to_string());
 
-    let Some(callers) = super::callees::with_callee_query(ts_lang, query_str, |query| {
+    let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
             return Vec::new();
         };
@@ -274,82 +257,16 @@ fn find_callers_treesitter_batch(
 }
 
 /// Walk up the AST from a node to find the enclosing function definition.
-/// Returns (`function_name`, `line_range`).
-/// Type-like node kinds that can enclose a function definition.
-const TYPE_KINDS: &[&str] = &[
-    "class_declaration",
-    "class_definition",
-    "struct_item",
-    "impl_item",
-    "interface_declaration",
-    "trait_item",
-    "trait_declaration",
-    "type_declaration",
-    "enum_item",
-    "enum_declaration",
-    "module",
-    "mod_item",
-    "namespace_definition",
-];
-
+/// Returns (`function_name`, `line_range`). Top-level renders as `"<top-level>"`.
 fn find_enclosing_function(
     node: tree_sitter::Node,
     lines: &[&str],
     lang: crate::types::Lang,
 ) -> (String, Option<(u32, u32)>) {
-    // Walk up the tree until we find a definition node
-    let mut current = Some(node);
-
-    while let Some(n) = current {
-        let kind = n.kind();
-
-        // Check standard definition kinds, or Elixir call-node definitions
-        let def_name = if DEFINITION_KINDS.contains(&kind) {
-            extract_definition_name(n, lines)
-        } else if lang == crate::types::Lang::Elixir
-            && crate::lang::treesitter::is_elixir_definition(n, lines)
-        {
-            crate::lang::treesitter::extract_elixir_definition_name(n, lines)
-        } else {
-            None
-        };
-
-        if let Some(name) = def_name {
-            let range = Some((
-                n.start_position().row as u32 + 1,
-                n.end_position().row as u32 + 1,
-            ));
-
-            // Walk further up to find an enclosing type and qualify the name
-            let mut parent = n.parent();
-            while let Some(p) = parent {
-                if TYPE_KINDS.contains(&p.kind()) {
-                    if let Some(type_name) = extract_definition_name(p, lines) {
-                        return (format!("{type_name}.{name}"), range);
-                    }
-                }
-                // Elixir: `defmodule` is a `call` node, not in TYPE_KINDS, so it
-                // needs a separate check to qualify function names as Module.func.
-                if lang == crate::types::Lang::Elixir
-                    && crate::lang::treesitter::is_elixir_definition(p, lines)
-                {
-                    if let Some(type_name) =
-                        crate::lang::treesitter::extract_elixir_definition_name(p, lines)
-                    {
-                        return (format!("{type_name}.{name}"), range);
-                    }
-                }
-                parent = p.parent();
-            }
-
-            return (name, range);
-        }
-
-        current = n.parent();
+    match super::scope::walk_to_enclosing_definition(node, lines, lang) {
+        Some((_, name, range)) => (name, Some(range)),
+        None => ("<top-level>".to_string(), None),
     }
-
-    // No enclosing function found — top-level call
-    ("<top-level>".to_string(), None)
 }
 
 /// Format and rank caller search results with optional expand.
@@ -572,8 +489,7 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 
 #[cfg(test)]
 mod tests {
-    use super::no_callers_message;
-    use std::path::Path;
+    use super::*;
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {

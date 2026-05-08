@@ -1,3 +1,4 @@
+use crate::lang::treesitter::node_text_simple;
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -25,6 +26,74 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         }
     };
     Some(lang.into())
+}
+
+/// Parse markdown content into a tree-sitter block tree.
+///
+/// Returns `None` if the parser fails to set the language (should not happen
+/// in practice). The block grammar is what tilth's outline / definition
+/// scanners need: it emits `atx_heading`, `setext_heading`, `section`, and
+/// `fenced_code_block` nodes. Inline structure (emphasis, links inside the
+/// heading text) is parsed by a separate inline grammar tilth doesn't use —
+/// heading text is read as the raw inline node's text.
+///
+/// Centralised so both `read::outline::markdown` and
+/// `search::symbol::find_defs_markdown_buf` configure the parser the same
+/// way.
+pub fn parse_markdown(content: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_md::LANGUAGE.into()).ok()?;
+    parser.parse(content, None)
+}
+
+/// Map an `atx_heading` or `setext_heading` node to its 1-6 level by
+/// inspecting the marker child. Returns `None` for malformed nodes.
+pub fn heading_level(node: tree_sitter::Node) -> Option<u8> {
+    let kind = node.kind();
+    if kind == "atx_heading" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "atx_h1_marker" => return Some(1),
+                "atx_h2_marker" => return Some(2),
+                "atx_h3_marker" => return Some(3),
+                "atx_h4_marker" => return Some(4),
+                "atx_h5_marker" => return Some(5),
+                "atx_h6_marker" => return Some(6),
+                _ => {}
+            }
+        }
+        None
+    } else if kind == "setext_heading" {
+        // setext H1: `=====`; H2: `-----`. Marker is a child node.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "setext_h1_underline" => return Some(1),
+                "setext_h2_underline" => return Some(2),
+                _ => {}
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
+/// Read the heading text of an `atx_heading` / `setext_heading` node from
+/// pre-split source lines. Returns the inline content with surrounding
+/// whitespace + trailing `#`s (for ATX-closed headings like `## Foo ##`)
+/// trimmed, matching the previous hand-rolled scanner's output.
+pub fn heading_text(node: tree_sitter::Node, lines: &[&str]) -> String {
+    // Both heading kinds expose their inline content as an `inline` child.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "inline" {
+            let text = node_text_simple(child, lines);
+            return text.trim().trim_end_matches('#').trim().to_string();
+        }
+    }
+    String::new()
 }
 
 /// Walk top-level children of the root node, extracting outline entries.
@@ -798,4 +867,79 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 
     let lines: Vec<&str> = content.lines().collect();
     walk_top_level(tree.root_node(), &lines, lang)
+}
+
+#[cfg(test)]
+mod markdown_helper_tests {
+    use super::{heading_level, heading_text, parse_markdown};
+
+    /// Walk the tree and collect every `atx_heading`/`setext_heading` node.
+    fn collect_headings(tree: &tree_sitter::Tree) -> Vec<tree_sitter::Node<'_>> {
+        let mut out = Vec::new();
+        let mut cursor = tree.walk();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "atx_heading" | "setext_heading") {
+                out.push(node);
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out.sort_by_key(|n| n.start_position().row);
+        out
+    }
+
+    #[test]
+    fn parse_returns_block_tree_with_sections() {
+        let src = "# Top\n\ncontent\n\n## Sub\n\nmore\n";
+        let tree = parse_markdown(src).unwrap();
+        let root = tree.root_node();
+        assert_eq!(root.kind(), "document");
+        // The document contains at least one section node.
+        let mut cursor = root.walk();
+        let has_section = root.children(&mut cursor).any(|c| c.kind() == "section");
+        assert!(has_section, "expected document to contain section children");
+    }
+
+    #[test]
+    fn fenced_code_blocks_do_not_emit_headings() {
+        // The whole point: a `# foo` inside a fenced code block must NOT be
+        // parsed as an atx_heading. The hand-rolled scanners had to track
+        // fence state manually; the AST does this for free.
+        let src = "# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
+        let tree = parse_markdown(src).unwrap();
+        let headings = collect_headings(&tree);
+        let lines: Vec<&str> = src.lines().collect();
+        let texts: Vec<String> = headings.iter().map(|n| heading_text(*n, &lines)).collect();
+        assert_eq!(texts, vec!["Real".to_string(), "Also Real".to_string()]);
+    }
+
+    #[test]
+    fn tilde_fences_are_recognised() {
+        let src = "# Real\n\n~~~\n# inside tilde fence\n~~~\n\n## Other\n";
+        let tree = parse_markdown(src).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
+        let headings = collect_headings(&tree);
+        let texts: Vec<String> = headings.iter().map(|n| heading_text(*n, &lines)).collect();
+        assert_eq!(texts, vec!["Real".to_string(), "Other".to_string()]);
+    }
+
+    #[test]
+    fn level_extraction_covers_h1_through_h6() {
+        let src = "# A\n\n## B\n\n### C\n\n#### D\n\n##### E\n\n###### F\n";
+        let tree = parse_markdown(src).unwrap();
+        let headings = collect_headings(&tree);
+        let levels: Vec<u8> = headings.iter().filter_map(|n| heading_level(*n)).collect();
+        assert_eq!(levels, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn trailing_atx_close_hashes_are_stripped() {
+        let src = "## Foo ##\n";
+        let tree = parse_markdown(src).unwrap();
+        let lines: Vec<&str> = src.lines().collect();
+        let headings = collect_headings(&tree);
+        assert_eq!(heading_text(headings[0], &lines), "Foo");
+    }
 }

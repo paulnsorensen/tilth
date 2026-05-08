@@ -28,7 +28,15 @@ struct Cli {
     #[arg(long)]
     budget: Option<u64>,
 
-    /// Force full output (override smart view).
+    /// Force full output (effect depends on query type — see --help).
+    ///
+    /// File path: return the whole file instead of an outline (bypass smart view).
+    ///
+    /// Symbol / text / regex: inline source for every match (equivalent to
+    /// `--expand=<all>`). Explicit `--expand=N` wins. Output stays bounded
+    /// by `--budget`.
+    ///
+    /// Glob: no effect (glob queries already return a flat file list).
     #[arg(long)]
     full: bool,
 
@@ -48,7 +56,12 @@ struct Cli {
     #[arg(long)]
     no_overview: bool,
 
-    /// Expand top N search matches with inline source (default: 2 when flag present).
+    /// Inline source for top N search matches (default 2 when flag bare).
+    ///
+    /// Applies to symbol / text / regex queries. Without the flag the
+    /// result is just the outline summary. `--full` upgrades this to
+    /// expand every match (subject to `--budget`); explicit `--expand=N`
+    /// wins over `--full`. No effect on file-path or glob queries.
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
 
@@ -251,9 +264,23 @@ fn main() {
     let cache = tilth::cache::OutlineCache::new();
     let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
 
-    // When piped (not a TTY), force full output — scripts expect raw content
+    // When piped (not a TTY), force full output — scripts expect raw content.
+    // This promotion exists for FilePath queries (return full file instead of
+    // outline) and is harmless for Glob (which ignores `full`). Search queries
+    // also receive `full=true` here but stay outline-only — they do not auto-
+    // expand on piping. See the `cli.full` guard on the expand override below.
     let full = cli.full || !is_tty;
-    let expand = cli.expand.unwrap_or(0);
+
+    // Explicit `--full` on a search query means expand every match. Guarded on
+    // `cli.full` (NOT the piped-derived `full` above) so that subprocess /
+    // pipeline callers (Claude Code's Bash tool, CI scripts, `tilth foo | rg`)
+    // still receive the concise outline they want. They opt into expand-all by
+    // adding `--full` themselves. Explicit `--expand=N` still wins because it
+    // produces `expand != 0`. We over-apply to all query types — `run_inner`
+    // only forwards `expand` to search dispatches, so the value is silently
+    // ignored for FilePath and Glob.
+    //
+    let expand = compute_expand(cli.expand, cli.full);
 
     // Callers mode
     if cli.callers {
@@ -412,4 +439,74 @@ fn configure_thread_pools() {
         .num_threads(num_threads)
         .build_global()
         .ok();
+}
+
+/// Compute the effective `expand` value for a search query from the raw
+/// CLI flags. Lifted out of `main` so the `--full` / `--expand` precedence
+/// is unit-testable.
+///
+/// Precedence:
+/// - Explicit `--expand=N` always wins (`cli_expand = Some(n)`), even alongside `--full`.
+/// - Bare `--full` with no `--expand` → `FULL_EXPAND_CAP` (50).
+/// - Neither flag → 0 (no expansion).
+///
+/// Critically, `cli_full` is the *parsed* `--full` flag, NOT the piped-derived
+/// `full = cli.full || !is_tty` in `main`. Subprocess / pipeline callers
+/// (Claude Code's Bash tool, CI scripts, `tilth foo | rg`) must keep the
+/// concise outline by default; expand-all is opt-in via explicit `--full`.
+fn compute_expand(cli_expand: Option<usize>, cli_full: bool) -> usize {
+    /// `--budget` already bounds output, but `expand=usize::MAX` makes tilth
+    /// compute the expanded source for every match before truncating —
+    /// wasted parsing + rendering on pathological queries. 50 is well above
+    /// any practical "show me everything that matters" case (MAX_MATCHES is
+    /// 10 for symbol search anyway).
+    const FULL_EXPAND_CAP: usize = 50;
+    match (cli_expand, cli_full) {
+        (Some(n), _) => n,
+        (None, true) => FULL_EXPAND_CAP,
+        (None, false) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin `--expand=N` precedence — explicit value always wins, including
+    /// when combined with `--full`.
+    #[test]
+    fn explicit_expand_wins_over_full() {
+        assert_eq!(compute_expand(Some(2), false), 2);
+        assert_eq!(compute_expand(Some(2), true), 2);
+        assert_eq!(compute_expand(Some(0), false), 0);
+        assert_eq!(compute_expand(Some(0), true), 0);
+        assert_eq!(compute_expand(Some(99), true), 99);
+    }
+
+    /// Pin `--full` → expand=50 when no explicit `--expand`.
+    #[test]
+    fn bare_full_promotes_to_full_expand_cap() {
+        assert_eq!(compute_expand(None, true), 50);
+    }
+
+    /// Pin the default — neither flag means no expansion.
+    #[test]
+    fn neither_flag_means_zero_expand() {
+        assert_eq!(compute_expand(None, false), 0);
+    }
+
+    /// Pin the regression that 16212fc was authored to prevent: a piped
+    /// invocation (where `main` sets `full = !is_tty = true` for FilePath
+    /// queries) must still receive `expand=0` here. `compute_expand` only
+    /// sees the parsed `cli.full`, never the piped-derived bool — so a
+    /// future refactor that conflates the two would have to change this
+    /// function's signature, making the violation visible.
+    #[test]
+    fn piped_invocation_does_not_auto_expand() {
+        // Simulating: user ran `tilth foo` (no --full) but stdout is piped.
+        // `main` will set `full = !is_tty = true` for downstream FilePath
+        // handling, but cli.full stays false. compute_expand must return 0.
+        let cli_full = false; // user did NOT pass --full
+        assert_eq!(compute_expand(None, cli_full), 0);
+    }
 }
