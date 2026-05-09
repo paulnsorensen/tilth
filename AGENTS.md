@@ -4,7 +4,7 @@ tilth — code intelligence MCP server. Use it instead of grep/cat/find/ls.
 
 ## Fast path
 
-1. Search first: use tilth_search for symbols, text, usages, and callers. It often returns enough source to avoid a read.
+1. Search first for unknown locations: use tilth_search for symbols, text, usages, and callers. If exact paths/ranges are known, read them directly.
 2. Batch every independent operation. One tool call is one turn.
 3. Do not re-read source already expanded by search results.
 4. Use host Bash only for builds/tests or commands tilth cannot do.
@@ -29,10 +29,11 @@ tilth_search: AST-aware code search.
 - `glob`: include/exclude files, e.g. `"*.rs"`, `"!*.test.ts"`, `"src/**/*.{ts,tsx}"`.
 
 tilth_read: Smart file reading.
+- Provide exactly one of `path`, `paths`, or `files`.
 - `path`: one file. `section`: one range/heading. `sections`: many ranges/headings from that file.
 - `paths`: up to 20 files with the same smart behavior.
 - `files`: up to 20 per-file specs, each with `path`, optional `section`, `sections`, or `full`.
-- Large files outline first; read only the needed sections afterward.
+- For known ranges, request `section`/`sections` directly. For unknown locations in large files, outline first and then batch all needed sections.
 
 tilth_files: File discovery.
 - `pattern`: one glob. `patterns`: up to 20 globs in one call.
@@ -54,10 +55,12 @@ tilth_edit: Batch editing with hashline anchors from tilth_read.
    - Different files/sections: `tilth_read({ "files": [{ "path": "a.rs", "sections": ["10-40", "90-120"] }, { "path": "b.rs", "section": "5-30" }] })`.
    - One file with disjoint edit sites: use `sections`, not serial reads.
 2. Copy exact `line:hash` anchors from hashline output.
+   - Search output has no edit hashes. Read target lines before editing.
+   - Never invent anchors; re-read when anchors are missing or stale.
 3. Send all independent edits in one tilth_edit call:
    - One file: one `files` entry with many `edits`.
    - Many files: many `files` entries in the same call.
-4. If a file reports a hash mismatch, re-read only that file/section and retry only its failed edits.
+4. If files report hash mismatches, batch re-read only those files/sections and retry only their failed edits.
 
 ## Request shape
 

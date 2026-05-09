@@ -6,10 +6,12 @@ tilth_edit: Batch editing with hashline anchors from tilth_read.
    - Different files/sections: `tilth_read({ "files": [{ "path": "a.rs", "sections": ["10-40", "90-120"] }, { "path": "b.rs", "section": "5-30" }] })`.
    - One file with disjoint edit sites: use `sections`, not serial reads.
 2. Copy exact `line:hash` anchors from hashline output.
+   - Search output has no edit hashes. Read target lines before editing.
+   - Never invent anchors; re-read when anchors are missing or stale.
 3. Send all independent edits in one tilth_edit call:
    - One file: one `files` entry with many `edits`.
    - Many files: many `files` entries in the same call.
-4. If a file reports a hash mismatch, re-read only that file/section and retry only its failed edits.
+4. If files report hash mismatches, batch re-read only those files/sections and retry only their failed edits.
 
 ## Request shape
 

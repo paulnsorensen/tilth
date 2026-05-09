@@ -299,6 +299,13 @@ fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    let read_shape_count = ["path", "paths", "files"]
+        .iter()
+        .filter(|key| args.get(**key).is_some())
+        .count();
+    if read_shape_count > 1 {
+        return Err("provide exactly one of path, paths, or files".into());
+    }
 
     // Rich batch read: each file can request whole-file smart view, full
     // content, one section, or many sections.
@@ -885,25 +892,27 @@ fn run_tool_with_timeout(
 
 fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
-         from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+        "Batch-first file reading. Replaces cat/head/tail and the host Read tool — \
+          use this for all file reading. Output uses hashline format (line:hash|content) — \
+          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
+          Large files return a structural outline (no hashlines); use `section` to get hashlined \
+          content for the lines you want to edit. Use `sections` to grab several disjoint slices \
+          from the same file in one call. Use `full` to force complete content. \
+          Use `paths` for many files with the same behavior, or `files` for mixed per-file sections/full reads. \
+          Provide exactly one of `path`, `paths`, or `files`."
     } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read a specific line range or heading. \
-         Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+        "Batch-first file reading. Replaces cat/head/tail and the host Read tool — \
+          use this for all file reading. Small files return full content. Large files return \
+          a structural outline (functions, classes, imports) so you see the shape without \
+          consuming your context window. Use `section` to read a specific line range or heading. \
+          Use `sections` to grab several disjoint slices from the same file in one call. \
+          Use `full` to force complete content. Use `paths` for many files with the same behavior, \
+          or `files` for mixed per-file sections/full reads. Provide exactly one of `path`, `paths`, or `files`."
     };
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool. Use when locations are unknown; read known paths/ranges directly. Symbol search returns declarations with source inlined for top matches. Use kind=any for usages/comments/strings and kind=callers for call sites. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -1610,6 +1619,29 @@ mod tests {
         assert!(
             result.contains("---"),
             "must separate file sections: {result}"
+        );
+    }
+
+    #[test]
+    fn batch_read_rejects_multiple_read_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": a.to_str().unwrap(),
+            "paths": [b.to_str().unwrap()]
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("ambiguous read shapes should be rejected");
+        assert!(
+            err.contains("exactly one of path, paths, or files"),
+            "must explain valid read shapes: {err}"
         );
     }
 
