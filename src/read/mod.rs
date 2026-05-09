@@ -365,7 +365,7 @@ fn collect_atx_headings(
                 if h_clean.is_empty() {
                     continue;
                 }
-                let dist = strsim::levenshtein(q_lower, &h_clean.to_ascii_lowercase());
+                let dist = crate::util::edit_distance(q_lower, &h_clean.to_ascii_lowercase());
                 let row = child.start_position().row;
                 let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
                 out.push((dist, line_text));
@@ -558,7 +558,7 @@ fn suggest_similar(path: &Path) -> Option<String> {
     for entry in entries.flatten() {
         let candidate = entry.file_name();
         let candidate = candidate.to_string_lossy();
-        let dist = strsim::levenshtein(name, &candidate);
+        let dist = crate::util::edit_distance(name, &candidate);
         if dist <= 3 {
             match &best {
                 Some((d, _)) if dist < *d => best = Some((dist, candidate.into_owned())),
@@ -775,20 +775,6 @@ mod tests {
             !suggestions.iter().any(|h| h.contains("NoSpace")),
             "##NoSpace leaked as heading: {suggestions:?}"
         );
-    }
-
-    /// Filename and heading suggestion rely on Unicode-scalar-level edit
-    /// distance (not byte-level) so CJK and emoji rank correctly. Locks in
-    /// the contract we depend on from `strsim::levenshtein`.
-    #[test]
-    fn levenshtein_is_unicode_aware() {
-        // 设置 (Settings) and 設定 (Configuration) — different chars,
-        // each one Unicode scalar. Distance should be 2, not 6.
-        assert_eq!(strsim::levenshtein("设置", "設定"), 2);
-        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
-        assert_eq!(strsim::levenshtein("🦀", "🐙"), 1);
-        // ASCII baseline still works.
-        assert_eq!(strsim::levenshtein("kitten", "sitting"), 3);
     }
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {

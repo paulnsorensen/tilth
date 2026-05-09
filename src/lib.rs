@@ -31,6 +31,7 @@ pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
+pub(crate) mod util;
 
 use std::path::Path;
 

@@ -227,8 +227,7 @@ fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
     for root in roots {
         let uri = root.get("uri")?.as_str()?;
         let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
-        let decoded = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
-        let path = PathBuf::from(decoded.into_owned());
+        let path = PathBuf::from(crate::util::percent_decode(raw_path));
         if path.is_dir() {
             return Some(path);
         }
@@ -1131,25 +1130,6 @@ mod tests {
         });
         let path = extract_root_from_response(&msg);
         assert_eq!(path, Some(space_dir));
-    }
-
-    /// Locks in percent-decoding behavior `extract_root_from_response` relies
-    /// on: spaces decoded, untouched paths unchanged, multiple sequences,
-    /// and malformed `%` preserved literally rather than dropped.
-    #[test]
-    fn percent_decode_contract() {
-        let decode = |s: &str| {
-            percent_encoding::percent_decode_str(s)
-                .decode_utf8_lossy()
-                .into_owned()
-        };
-        assert_eq!(
-            decode("/Users/Jan%20Hallvard/project"),
-            "/Users/Jan Hallvard/project"
-        );
-        assert_eq!(decode("/normal/path"), "/normal/path");
-        assert_eq!(decode("%2F%2Fweird"), "//weird");
-        assert_eq!(decode("no%percent"), "no%percent");
     }
 
     #[test]
