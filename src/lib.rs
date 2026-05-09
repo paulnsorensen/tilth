@@ -174,7 +174,7 @@ fn run_inner(
                 expand,
                 None,
                 glob,
-                search::symbol::SymbolMode::Any,
+                search::symbol::SymbolMode::Strict,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -238,7 +238,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
-            search::symbol::SymbolMode::Any,
+            search::symbol::SymbolMode::Strict,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -298,7 +298,9 @@ fn run_query_basic(
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob),
+        QueryType::Symbol(name) => {
+            search::search_symbol(name, scope, cache, glob, search::symbol::SymbolMode::Strict)
+        }
         QueryType::Concept(text) if text.contains(' ') => {
             multi_word_concept_search(text, scope, cache, glob)
         }
@@ -331,7 +333,7 @@ fn single_query_search(
     prefer_definitions: bool,
     glob: Option<&str>,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob)?;
+    let sym_result = search::search_symbol_raw(text, scope, glob, search::symbol::SymbolMode::Any)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {

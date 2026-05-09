@@ -50,7 +50,8 @@ pub enum SymbolMode {
 
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
-/// `SymbolMode::Strict` drops usage matches entirely; `SymbolMode::Any` keeps them.
+/// `SymbolMode::Strict` skips the usage scan entirely; `SymbolMode::Any` adds
+/// word-boundary usage matches alongside the definitions.
 pub fn search(
     query: &str,
     scope: &Path,
@@ -58,34 +59,34 @@ pub fn search(
     glob: Option<&str>,
     mode: SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    // Compile regex once, share across both arms
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
-        query: query.to_string(),
-        reason: e.to_string(),
-    })?;
-
-    let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob),
-        || find_usages(query, &matcher, scope, glob),
-    );
-
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, usages) = match mode {
+        SymbolMode::Strict => (find_definitions(query, scope, glob)?, Vec::new()),
+        SymbolMode::Any => {
+            let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
+            let matcher =
+                RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+                    query: query.to_string(),
+                    reason: e.to_string(),
+                })?;
+            let (defs, usages) = rayon::join(
+                || find_definitions(query, scope, glob),
+                || find_usages(query, &matcher, scope, glob),
+            );
+            (defs?, usages?)
+        }
+    };
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
-    if mode == SymbolMode::Any {
-        for m in usages {
-            let dominated = merged[..def_count]
-                .iter()
-                .any(|d| d.path == m.path && d.line == m.line);
-            if !dominated {
-                merged.push(m);
-            }
+    for m in usages {
+        let dominated = merged[..def_count]
+            .iter()
+            .any(|d| d.path == m.path && d.line == m.line);
+        if !dominated {
+            merged.push(m);
         }
     }
 

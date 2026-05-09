@@ -808,7 +808,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["symbol", "any", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: declarations only (tree-sitter AST, no comment/string hits). any: symbol-name matches including comments/strings/usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "description": "Search type. symbol: declarations only — tree-sitter AST where supported, with keyword/heading fallbacks for code without grammars and for markdown. No comment/string hits. any: symbol-name matches including comments/strings/usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
                     "expand": {
                         "type": "number",

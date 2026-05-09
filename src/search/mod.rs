@@ -152,8 +152,9 @@ pub fn search_symbol(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, symbol::SymbolMode::Any)?;
+    let result = symbol::search(query, scope, None, glob, mode)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -284,8 +285,9 @@ pub fn search_symbol_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None, glob, symbol::SymbolMode::Any)
+    symbol::search(query, scope, None, glob, mode)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
