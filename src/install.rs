@@ -216,7 +216,7 @@ struct HostInfo {
 }
 
 fn resolve_host(host: &str) -> Result<HostInfo, String> {
-    let home = crate::util::home_dir()?;
+    let home = home_dir()?;
 
     match host {
         // Claude Code user scope: ~/.claude.json → mcpServers
@@ -431,6 +431,11 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
     }
 }
 
+/// Cross-platform home-directory lookup, with an actionable error message.
+fn home_dir() -> Result<PathBuf, String> {
+    home::home_dir().ok_or_else(|| "home directory not found ($HOME / $USERPROFILE)".into())
+}
+
 /// Merge a tilth server entry into a JSON config under the given servers key.
 /// Extracted for testability — used by `write_json_config` and unit tests.
 fn upsert_json_server(config: &mut Value, servers_key: &str, entry: Value) -> Result<(), String> {
@@ -454,7 +459,7 @@ fn vscode_global_storage_path(extension_id: &str, filename: &str) -> Result<Path
 fn vscode_global_storage_base() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
-        let home = crate::util::home_dir()?;
+        let home = home_dir()?;
         Ok(home.join("Library/Application Support/Code/User/globalStorage"))
     }
 
@@ -466,7 +471,7 @@ fn vscode_global_storage_base() -> Result<PathBuf, String> {
 
     #[cfg(target_os = "linux")]
     {
-        let home = crate::util::home_dir()?;
+        let home = home_dir()?;
         Ok(home.join(".config/Code/User/globalStorage"))
     }
 
@@ -479,7 +484,7 @@ fn vscode_global_storage_base() -> Result<PathBuf, String> {
 fn claude_desktop_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
-        let home = crate::util::home_dir()?;
+        let home = home_dir()?;
         Ok(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
     }
 

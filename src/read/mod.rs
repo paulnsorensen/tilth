@@ -365,7 +365,7 @@ fn collect_atx_headings(
                 if h_clean.is_empty() {
                     continue;
                 }
-                let dist = crate::util::edit_distance(q_lower, &h_clean.to_ascii_lowercase());
+                let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
                 let row = child.start_position().row;
                 let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
                 out.push((dist, line_text));
@@ -558,7 +558,7 @@ fn suggest_similar(path: &Path) -> Option<String> {
     for entry in entries.flatten() {
         let candidate = entry.file_name();
         let candidate = candidate.to_string_lossy();
-        let dist = crate::util::edit_distance(name, &candidate);
+        let dist = edit_distance(name, &candidate);
         if dist <= 3 {
             match &best {
                 Some((d, _)) if dist < *d => best = Some((dist, candidate.into_owned())),
@@ -568,6 +568,16 @@ fn suggest_similar(path: &Path) -> Option<String> {
         }
     }
     best.map(|(_, name)| name)
+}
+
+/// Levenshtein distance over Unicode scalar values.
+///
+/// Wraps `strsim::levenshtein`, which iterates `.chars()` so a single CJK
+/// or emoji glyph counts as one edit unit (not 3-4 bytes). Used by both
+/// filename suggestion (`suggest_similar`) and heading suggestion
+/// (`collect_atx_headings`).
+fn edit_distance(a: &str, b: &str) -> usize {
+    strsim::levenshtein(a, b)
 }
 
 /// Guess MIME type from extension for binary file headers.
@@ -775,6 +785,20 @@ mod tests {
             !suggestions.iter().any(|h| h.contains("NoSpace")),
             "##NoSpace leaked as heading: {suggestions:?}"
         );
+    }
+
+    /// Filename and heading suggestion rely on Unicode-scalar-level edit
+    /// distance, not byte-level — locks in the contract `strsim::levenshtein`
+    /// provides via its char-iterating wrapper.
+    #[test]
+    fn edit_distance_is_unicode_aware() {
+        // 设置 (Settings) and 設定 (Configuration) — different chars,
+        // each one Unicode scalar. Distance should be 2, not 6.
+        assert_eq!(edit_distance("设置", "設定"), 2);
+        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
+        assert_eq!(edit_distance("🦀", "🐙"), 1);
+        // ASCII baseline still works.
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {

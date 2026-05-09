@@ -227,7 +227,12 @@ fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
     for root in roots {
         let uri = root.get("uri")?.as_str()?;
         let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
-        let path = PathBuf::from(crate::util::percent_decode(raw_path));
+        // On invalid UTF-8 in a percent-encoded path, fall back to the
+        // original input rather than substituting U+FFFD replacements.
+        let decoded = percent_encoding::percent_decode_str(raw_path)
+            .decode_utf8()
+            .map_or_else(|_| raw_path.to_string(), std::borrow::Cow::into_owned);
+        let path = PathBuf::from(decoded);
         if path.is_dir() {
             return Some(path);
         }
