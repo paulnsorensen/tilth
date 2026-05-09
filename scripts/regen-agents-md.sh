@@ -14,11 +14,13 @@ if [[ ! -f $base || ! -f $edit ]]; then
   exit 1
 fi
 
+# Use command substitution to strip trailing newlines from each source, then
+# emit an exact `\n\n` separator. This makes regeneration deterministic even
+# if a source file gains or loses trailing blank lines.
 {
   printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n'
-  cat "$base"
-  printf '\n'
-  cat "$edit"
+  printf '%s\n\n' "$(cat "$base")"
+  printf '%s\n' "$(cat "$edit")"
 } > "$out"
 
 # Auto-fix markdown formatting (idempotent)

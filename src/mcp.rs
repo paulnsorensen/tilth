@@ -40,11 +40,12 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../prompts/mcp-edit.md");
 
-/// Compose the `instructions` field for MCP `initialize`. Trims the embedded
-/// markdown so that trailing file newlines don't leak into the wire format,
-/// then reinjects `\n\n` between sections.
+/// Compose the `instructions` field for MCP `initialize`. Strips trailing
+/// whitespace from the embedded markdown so trailing file newlines don't leak
+/// into the wire format, then reinjects `\n\n` between sections. Leading bytes
+/// are preserved verbatim so prompt files remain byte-stable on the wire.
 fn build_instructions(edit_mode: bool, overview: &str) -> String {
-    let base = SERVER_INSTRUCTIONS.trim();
+    let base = SERVER_INSTRUCTIONS.trim_end();
     let mut out = String::with_capacity(SERVER_INSTRUCTIONS.len() + EDIT_MODE_EXTRA.len() + 64);
     if !overview.is_empty() {
         out.push_str(overview);
@@ -53,7 +54,7 @@ fn build_instructions(edit_mode: bool, overview: &str) -> String {
     out.push_str(base);
     if edit_mode {
         out.push_str("\n\n");
-        out.push_str(EDIT_MODE_EXTRA.trim());
+        out.push_str(EDIT_MODE_EXTRA.trim_end());
     }
     out
 }
