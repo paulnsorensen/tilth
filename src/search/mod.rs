@@ -11,6 +11,10 @@ pub mod strip;
 pub mod symbol;
 pub mod truncate;
 
+mod bloom_walk;
+mod callee_query;
+pub mod scope;
+
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
@@ -66,6 +70,11 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 ];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
+
+/// Cap for inlined markdown section bodies in the default preview slot.
+/// Long sections get a tail "… (N more lines — pass --expand to see the full
+/// section)" so the user knows to expand for the rest.
+const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
@@ -154,17 +163,12 @@ pub fn search_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    index: &crate::index::SymbolIndex,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
     strict: bool,
 ) -> Result<String, TilthError> {
-    // Index is available but not yet used for search fast-path.
-    // Build will be triggered when the lookup path is wired in.
-    let _ = index;
-
     let result = symbol::search(query, scope, context, glob, strict)?;
     format_search_result(&result, cache, Some(session), bloom, expand)
 }
@@ -174,15 +178,12 @@ pub fn search_multi_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    index: &crate::index::SymbolIndex,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
     strict: bool,
 ) -> Result<String, TilthError> {
-    let _ = index; // Available but not yet used for search fast-path
-
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
     let mut expand_remaining = if expand == 0 {
@@ -315,13 +316,31 @@ pub fn format_raw_result(
     format_search_result(result, cache, None, &bloom, 0)
 }
 
-pub fn search_glob(
-    pattern: &str,
-    scope: &Path,
-    _cache: &OutlineCache,
-) -> Result<String, TilthError> {
+pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
+}
+
+/// Render the count for a facet section heading. Returns the bare displayed
+/// count when nothing was hidden (`shown == total`), or `displayed/total`
+/// when the cap dropped some entries — so a reader sees at a glance whether
+/// the facet was truncated.
+fn count_label(shown: usize, total: usize) -> String {
+    if shown >= total {
+        format!("{shown}")
+    } else {
+        format!("{shown}/{total}")
+    }
+}
+
+/// Emit a per-facet hidden-count tail line after a truncated facet's entries.
+/// Wording mirrors the linear-path global tail so a reader sees a single
+/// consistent shape — only the noun changes per facet kind.
+fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
+    if shown < total {
+        let hidden = total - shown;
+        let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
+    }
 }
 
 /// Format match entries with optional expansion.
@@ -434,21 +453,11 @@ fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, o
     let lines: Vec<u32> = group.iter().map(|m| m.line).collect();
     let line_str = format_line_list(&lines);
 
-    // Get enclosing function name from outline
-    let fn_name = get_outline_str(&first.path, cache).and_then(|outline_str| {
-        let outline_lines: Vec<&str> = outline_str.lines().collect();
-        let idx = outline_lines.iter().position(|line| {
-            extract_line_range(line).is_some_and(|(s, e)| first.line >= s && first.line <= e)
-        })?;
-        // Extract name: outline lines look like "  [45-79]      fn TestMiddlewareNoRoute"
-        let entry = outline_lines[idx].trim();
-        // Find the name after "fn " or similar keyword
-        entry.split_whitespace().last().map(String::from)
-    });
+    let scope_label = enclosing_scope_label(&first.path, first.line, cache);
 
-    let _ = write!(out, "\n\n## {path_str}:{line_str} [{} usages", group.len());
-    if let Some(ref name) = fn_name {
-        let _ = write!(out, " in {name}");
+    let _ = write!(out, "\n\n### {path_str}:{line_str} [{} usages", group.len());
+    if let Some(ref label) = scope_label {
+        let _ = write!(out, " in {label}");
     }
     out.push(']');
 
@@ -512,21 +521,74 @@ fn format_single_match(
         "usage"
     };
 
+    // For usages, append the enclosing function/section if we can recover one.
+    // Definitions and impls already are the named scope.
+    let scope_suffix = if m.is_definition || m.impl_target.is_some() {
+        String::new()
+    } else {
+        enclosing_scope_label(&m.path, m.line, cache)
+            .map(|s| format!(" in {s}"))
+            .unwrap_or_default()
+    };
+
     // Show line range for definitions with def_range, otherwise just the line
     if m.is_definition {
         if let Some((start, end)) = m.def_range {
             let _ = write!(
                 out,
-                "\n\n## {}:{}-{} [{kind}]",
+                "\n\n### {}:{}-{} [{kind}]",
                 rel(&m.path, scope),
                 start,
                 end
             );
         } else {
-            let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+            let _ = write!(out, "\n\n### {}:{} [{kind}]", rel(&m.path, scope), m.line);
         }
     } else {
-        let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+        let _ = write!(
+            out,
+            "\n\n### {}:{} [{kind}{scope_suffix}]",
+            rel(&m.path, scope),
+            m.line
+        );
+    }
+
+    // Markdown-heading defs (`def_weight == 30`): the heading text alone is
+    // just the query, so the default preview slot would carry no information.
+    // Inline the section body directly. Bypasses the --expand budget — this
+    // is a fixed-cost preview, not the on-demand expand — and short-circuits
+    // the rest of the function (no callees / siblings etc. apply to a
+    // markdown section). On any read failure or empty body, fall through to
+    // the existing outline / single-line preview branches.
+    if m.is_definition && m.def_weight == 30 {
+        if let Some((heading_line_1, section_end_1)) = m.def_range {
+            if let Ok(content) = fs::read_to_string(&m.path) {
+                let lines: Vec<&str> = content.lines().collect();
+                // def_range is `(heading_line, section_end)` in 1-indexed
+                // inclusive form (see `find_defs_markdown_buf`). The body
+                // starts at the line *after* the heading. In 0-indexed
+                // half-open form: `[heading_line_1 .. section_end_1)`.
+                let body_start = heading_line_1 as usize;
+                let body_end = (section_end_1 as usize).min(lines.len());
+                if body_start < body_end {
+                    let total_body_lines = body_end - body_start;
+                    let take_n = total_body_lines.min(MARKDOWN_PREVIEW_MAX_LINES);
+                    out.push('\n');
+                    for line in &lines[body_start..body_start + take_n] {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    if total_body_lines > take_n {
+                        let truncated = total_body_lines - take_n;
+                        let _ = write!(
+                            out,
+                            "… ({truncated} more lines — pass --expand to see the full section)"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     // Skip outline for small files — the expanded code speaks for itself
@@ -601,7 +663,6 @@ fn format_single_match(
                                     &callee_names,
                                     &m.path,
                                     &content,
-                                    cache,
                                     bloom,
                                     2,
                                     15,
@@ -840,7 +901,7 @@ fn basename_file_outline(
     let rel_path = rel(&matched_path, scope);
     let line_count = content.lines().count();
     Some(format!(
-        "### File overview: {rel_path} ({line_count} lines)\n{outline}"
+        "## File overview: {rel_path} ({line_count} lines)\n{outline}"
     ))
 }
 
@@ -873,10 +934,19 @@ fn format_search_result(
     // Apply faceting when there are many matches (>5)
     if result.matches.len() > 5 {
         let faceted = facets::facet_matches(result.matches.clone(), &result.scope);
+        let totals = &result.facet_totals;
 
-        // Format each non-empty facet with section headers
+        // Format each non-empty facet with section headers. After a truncated
+        // facet's entries, emit a per-facet hidden-count line (`write_hidden_tail`)
+        // so the reader sees which facet got cut. The global tail used to live
+        // at the end of `format_search_result`; on the facet path we suppress
+        // it to avoid double-counting hidden matches across two surfaces.
         if !faceted.definitions.is_empty() {
-            let _ = write!(out, "\n\n### Definitions ({})", faceted.definitions.len());
+            let _ = write!(
+                out,
+                "\n\n## Definitions ({})",
+                count_label(faceted.definitions.len(), totals.definitions)
+            );
             format_matches(
                 &faceted.definitions,
                 &result.scope,
@@ -887,13 +957,19 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
             );
+            write_hidden_tail(
+                &mut out,
+                faceted.definitions.len(),
+                totals.definitions,
+                "definitions",
+            );
         }
 
         if !faceted.implementations.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Implementations ({})",
-                faceted.implementations.len()
+                "\n\n## Implementations ({})",
+                count_label(faceted.implementations.len(), totals.implementations)
             );
             format_matches(
                 &faceted.implementations,
@@ -905,10 +981,20 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
             );
+            write_hidden_tail(
+                &mut out,
+                faceted.implementations.len(),
+                totals.implementations,
+                "implementations",
+            );
         }
 
         if !faceted.tests.is_empty() {
-            let _ = write!(out, "\n\n### Tests ({})", faceted.tests.len());
+            let _ = write!(
+                out,
+                "\n\n## Tests ({})",
+                count_label(faceted.tests.len(), totals.tests)
+            );
             // Compact test format — one line per match, no expand budget consumed
             for m in &faceted.tests {
                 let _ = write!(
@@ -919,13 +1005,14 @@ fn format_search_result(
                     m.text.trim()
                 );
             }
+            write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
         }
 
         if !faceted.usages_local.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Usages — same package ({})",
-                faceted.usages_local.len()
+                "\n\n## Usages — same package ({})",
+                count_label(faceted.usages_local.len(), totals.usages_local)
             );
             format_matches(
                 &faceted.usages_local,
@@ -937,13 +1024,19 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
             );
+            write_hidden_tail(
+                &mut out,
+                faceted.usages_local.len(),
+                totals.usages_local,
+                "usages",
+            );
         }
 
         if !faceted.usages_cross.is_empty() {
             let _ = write!(
                 out,
-                "\n\n### Usages — other ({})",
-                faceted.usages_cross.len()
+                "\n\n## Usages — other ({})",
+                count_label(faceted.usages_cross.len(), totals.usages_cross)
             );
             format_matches(
                 &faceted.usages_cross,
@@ -954,6 +1047,12 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+            );
+            write_hidden_tail(
+                &mut out,
+                faceted.usages_cross.len(),
+                totals.usages_cross,
+                "usages",
             );
         }
     } else {
@@ -968,14 +1067,17 @@ fn format_search_result(
             &mut expanded_files,
             &mut out,
         );
-    }
 
-    if result.total_found > result.matches.len() {
-        let omitted = result.total_found - result.matches.len();
-        let _ = write!(
-            out,
-            "\n\n... and {omitted} more matches. Narrow with scope."
-        );
+        // Global hidden-tail only on the linear path. The faceted path emits
+        // a per-facet line for each truncated facet above; printing both
+        // would double-count the same hidden matches.
+        if result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(
+                out,
+                "\n\n... and {omitted} more matches. Narrow with scope."
+            );
+        }
     }
 
     let tokens = estimate_tokens(out.len() as u64);
@@ -1165,6 +1267,90 @@ fn outline_context_for_match(
         }
     }
     Some(context)
+}
+
+/// Annotate a usage match with its enclosing scope: `"function foo"` /
+/// `"class Bar"` for code (via tree-sitter), `"§Heading"` for markdown
+/// (via line walk). Returns `None` for top-level matches and unsupported
+/// file types — the formatter renders those without an `in …` suffix.
+fn enclosing_scope_label(
+    path: &std::path::Path,
+    match_line: u32,
+    cache: &OutlineCache,
+) -> Option<String> {
+    match crate::lang::detect_file_type(path) {
+        FileType::Code(_) => {
+            let s = scope::enclosing_definition_at(path, match_line, cache)?;
+            Some(format!("{} {}", s.kind, s.name))
+        }
+        FileType::Markdown => markdown_enclosing_scope(path, match_line),
+        _ => None,
+    }
+}
+
+/// Find the deepest ATX-heading section that encloses `match_line`. Returns
+/// the heading text prefixed with `§`. A `# foo` line inside a fenced or
+/// indented code block is NOT a heading — the tree-sitter-md block grammar
+/// owns that distinction, so we don't need our own fence pre-pass.
+fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<String> {
+    if match_line == 0 {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let tree = crate::lang::outline::parse_markdown(&content)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let mut best: Option<(tree_sitter::Node, u32)> = None;
+    walk_md_for_enclosing(tree.root_node(), match_line, &mut best);
+    let (heading, _) = best?;
+    let text = crate::lang::outline::heading_text(heading, &lines);
+    if text.is_empty() {
+        return None;
+    }
+    let display: String = if text.chars().count() > 60 {
+        let mut s: String = text.chars().take(57).collect();
+        s.push_str("...");
+        s
+    } else {
+        text
+    };
+    Some(format!("§{display}"))
+}
+
+fn walk_md_for_enclosing<'a>(
+    node: tree_sitter::Node<'a>,
+    match_line: u32,
+    best: &mut Option<(tree_sitter::Node<'a>, u32)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "section" {
+            continue;
+        }
+        let start = (child.start_position().row + 1) as u32;
+        let end_excl = child.end_position();
+        let end = if end_excl.column == 0 {
+            end_excl.row as u32
+        } else {
+            (end_excl.row + 1) as u32
+        };
+        if match_line < start || match_line > end {
+            continue;
+        }
+        // Section contains match_line. Record its heading if it has one,
+        // then recurse to find a deeper section.
+        let mut sec_cursor = child.walk();
+        if let Some(heading) = child
+            .children(&mut sec_cursor)
+            .find(|c| c.kind() == "atx_heading")
+        {
+            // Update best to the *deepest* (largest start_line) match.
+            match best {
+                Some((_, prev_start)) if *prev_start >= start => {}
+                _ => *best = Some((heading, start)),
+            }
+        }
+        walk_md_for_enclosing(child, match_line, best);
+    }
 }
 
 /// Extract (`start_line`, `end_line`) from an outline entry like "[20-115]" or "[16]".
@@ -1427,9 +1613,11 @@ mod tests {
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let rs_callers =
-            callers::find_callers("walker", &scope, &bloom, Some("*.rs")).expect("callers failed");
-        let toml_callers = callers::find_callers("walker", &scope, &bloom, Some("*.toml"))
+        let single: std::collections::HashSet<String> =
+            std::iter::once("walker".to_string()).collect();
+        let rs_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.rs"))
+            .expect("callers failed");
+        let toml_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.toml"))
             .expect("callers toml failed");
 
         assert!(
@@ -1440,7 +1628,7 @@ mod tests {
             toml_callers.is_empty(),
             "*.toml should not find callers of 'walker'"
         );
-        for c in &rs_callers {
+        for (_, c) in &rs_callers {
             assert_eq!(
                 c.path.extension().and_then(|e| e.to_str()),
                 Some("rs"),
@@ -1549,6 +1737,443 @@ mod tests {
             result.total_found >= 2,
             "expected symbol found via both real and symlinked paths, got {}",
             result.total_found
+        );
+    }
+
+    // ── enclosing_scope_label / markdown tests ──
+
+    #[test]
+    fn scope_label_code_combines_kind_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
+        let cache = OutlineCache::new();
+        let label = enclosing_scope_label(&p, 3, &cache).unwrap();
+        assert_eq!(label, "function Foo.bar");
+    }
+
+    #[test]
+    fn scope_label_markdown_returns_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "# Top\n\n## Cost Accounting\n\nsome text\n\nmore text\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let label = enclosing_scope_label(&p, 7, &cache).unwrap();
+        assert_eq!(label, "§Cost Accounting");
+    }
+
+    #[test]
+    fn markdown_scope_truncates_long_headings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        let long = "x".repeat(80);
+        std::fs::write(&p, format!("## {long}\n\nbody\n")).unwrap();
+        let label = markdown_enclosing_scope(&p, 3).unwrap();
+        // 60-char window means 57 chars + "..." (display starts after the "§").
+        assert!(label.starts_with("§"));
+        assert!(label.ends_with("..."));
+        assert_eq!(label.chars().count(), 1 + 57 + 3);
+    }
+
+    #[test]
+    fn markdown_scope_returns_none_before_first_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(&p, "preamble line one\npreamble line two\n").unwrap();
+        assert!(markdown_enclosing_scope(&p, 2).is_none());
+    }
+
+    /// `#`-prefixed lines inside fenced code blocks are NOT headings, so they
+    /// must not become the enclosing scope label of usages on adjacent lines.
+    /// Pre-fix this returned `§...` derived from a Python comment inside the
+    /// fence; post-fix the AST owns the distinction.
+    #[test]
+    fn markdown_scope_skips_hashes_inside_fenced_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "## Outer\n\nbefore fence\n\n```python\n# fake heading\nx = 1\n```\n\nafter fence\n",
+        )
+        .unwrap();
+        // Line 7 (`x = 1`) is inside the fence; the only real heading is `## Outer`.
+        let label = markdown_enclosing_scope(&p, 7).unwrap();
+        assert_eq!(label, "§Outer");
+    }
+
+    /// CommonMark §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
+    /// raw text, not a heading, and must not surface as the enclosing scope.
+    /// Pre-AST migration the regex matched `#######` and produced a bogus
+    /// `§# Fake Heading 7` label.
+    #[test]
+    fn markdown_scope_rejects_seven_hash_atx_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "## Real Heading\n\nbody line\n\n####### Fake Heading 7\n\ntrailing line\n",
+        )
+        .unwrap();
+        // Line 5 is the 7-hash line; line 7 is the line after.
+        // Both should resolve to the only real heading, "Real Heading".
+        assert_eq!(
+            markdown_enclosing_scope(&p, 5),
+            Some("§Real Heading".to_string())
+        );
+        assert_eq!(
+            markdown_enclosing_scope(&p, 7),
+            Some("§Real Heading".to_string())
+        );
+    }
+
+    /// CommonMark §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
+    /// is paragraph text, not a heading. Pre-AST migration the regex accepted
+    /// it and produced `§NoSpace`.
+    #[test]
+    fn markdown_scope_rejects_no_space_atx_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(&p, "## Real Heading\n\n##NoSpace\n\ntrailing line\n").unwrap();
+        // Line 3 is the no-space candidate; both line 3 and line 5 must
+        // resolve to the only real heading.
+        assert_eq!(
+            markdown_enclosing_scope(&p, 3),
+            Some("§Real Heading".to_string())
+        );
+        assert_eq!(
+            markdown_enclosing_scope(&p, 5),
+            Some("§Real Heading".to_string())
+        );
+    }
+
+    #[test]
+    fn format_single_match_renders_usage_scope_suffix() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 3,
+            text: "    const x = 1;".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 5,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        assert!(
+            out.contains("[usage in function Foo.bar]"),
+            "expected scope suffix in output, got: {out}"
+        );
+    }
+
+    #[test]
+    fn write_hidden_tail_emits_only_when_truncated() {
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 3, "definitions");
+        assert!(out.is_empty(), "no truncation → no tail line, got {out:?}");
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 10, 14, "definitions");
+        assert_eq!(out, "\n\n... and 4 more definitions. Narrow with scope.");
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 27, "usages");
+        assert_eq!(out, "\n\n... and 24 more usages. Narrow with scope.");
+    }
+
+    #[test]
+    fn count_label_renders_displayed_over_total_only_when_truncated() {
+        // No truncation — bare count.
+        assert_eq!(count_label(3, 3), "3");
+        // Defensive: shown > total (shouldn't happen in practice) — bare count.
+        assert_eq!(count_label(4, 3), "4");
+        // Truncated — displayed/total form.
+        assert_eq!(count_label(10, 14), "10/14");
+        // Zero / zero — still bare (no header is emitted at zero anyway).
+        assert_eq!(count_label(0, 0), "0");
+    }
+
+    #[test]
+    fn format_single_match_inlines_markdown_section_body() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("notes.md");
+        std::fs::write(
+            &p,
+            "# Top\n\n## Session 50\n\nFirst paragraph.\n\nSecond line.\n\n## Other\n\nUnrelated.\n",
+        )
+        .unwrap();
+
+        // Mimic the `Match` `find_defs_markdown_buf` would produce for a
+        // markdown-heading def: weight 30, def_range covers the section span.
+        let m = Match {
+            path: p.clone(),
+            line: 3, // `## Session 50`
+            text: "## Session 50".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 10,
+            mtime: SystemTime::now(),
+            def_range: Some((3, 7)), // heading line .. section_end (1-indexed inclusive)
+            def_name: Some("Session 50".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        assert!(
+            out.contains("First paragraph."),
+            "section body must be inlined, got: {out:?}"
+        );
+        assert!(
+            out.contains("Second line."),
+            "section body must include later body lines, got: {out:?}"
+        );
+        assert!(
+            !out.contains("Unrelated."),
+            "must stop at section_end, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_single_match_caps_long_markdown_section() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("long.md");
+        // Heading on line 1, then 60 body lines.
+        let mut content = String::from("## Big Section\n");
+        for i in 0..60 {
+            let _ = write!(content, "body line {i}\n");
+        }
+        std::fs::write(&p, &content).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "## Big Section".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 61,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 61)),
+            def_name: Some("Big Section".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        // Cap is 40 lines; expect 60 - 40 = 20 truncated.
+        assert!(
+            out.contains("body line 0"),
+            "first body line must appear, got: {out:?}"
+        );
+        assert!(
+            out.contains("body line 39"),
+            "last kept body line must appear, got: {out:?}"
+        );
+        assert!(
+            !out.contains("body line 40"),
+            "body line beyond cap must be trimmed, got: {out:?}"
+        );
+        assert!(
+            out.contains("20 more lines"),
+            "must signal truncated lines, got: {out:?}"
+        );
+        assert!(
+            out.contains("--expand"),
+            "tail must point to --expand for full section, got: {out:?}"
+        );
+    }
+
+    /// 99c4a3d's docstring is explicit: the markdown-section preview is a
+    /// fixed-cost short-circuit that bypasses the --expand budget. This pins
+    /// that intent — passing a non-zero `expand_remaining` must NOT cause
+    /// the renderer to skip the cap. Without this guard, a future refactor
+    /// could "fix" the short-circuit by routing through expand and turn
+    /// every markdown-heading match into a multi-hundred-line preview.
+    #[test]
+    fn format_single_match_markdown_cap_bypasses_expand_budget() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("long.md");
+        let mut content = String::from("## Big Section\n");
+        for i in 0..60 {
+            let _ = write!(content, "body line {i}\n");
+        }
+        std::fs::write(&p, &content).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "## Big Section".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 61,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 61)),
+            def_name: Some("Big Section".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        // Non-zero expand budget — should NOT change the cap behavior.
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        // Body lines beyond the cap must still be trimmed.
+        assert!(
+            !out.contains("body line 40"),
+            "cap must apply even with non-zero expand budget, got: {out:?}"
+        );
+        assert!(
+            out.contains("20 more lines"),
+            "tail must still report truncated lines, got: {out:?}"
+        );
+        // Budget must be untouched — short-circuit returns before consuming it.
+        assert_eq!(
+            expand_remaining, 5,
+            "markdown short-circuit must not consume expand budget"
+        );
+    }
+
+    /// Worst-case bound: with MAX_MATCHES = 10 markdown-heading defs each
+    /// hitting the 40-line preview cap, total inlined preview content is at
+    /// most 10 × 40 = 400 lines. This pins the bound by exercising the cap
+    /// and asserting the truncation shape, so a future bump of either
+    /// constant can't silently inflate worst-case output without updating
+    /// the test.
+    #[test]
+    fn markdown_preview_cap_constant_unchanged() {
+        // Pin both constants — if either changes, this assertion fails and
+        // the test author has to consider the worst-case product (currently
+        // 10 * 40 = 400 lines extra in default preview, on top of the
+        // outline context per match).
+        assert_eq!(
+            MARKDOWN_PREVIEW_MAX_LINES, 40,
+            "if you change MARKDOWN_PREVIEW_MAX_LINES, also re-evaluate the \
+             MAX_MATCHES * MARKDOWN_PREVIEW_MAX_LINES worst-case bound \
+             (currently 10 * 40 = 400 lines per search response)"
+        );
+    }
+
+    #[test]
+    fn format_grouped_usages_emits_h3_heading() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(
+            &p,
+            "function host() {\n  doThing();\n  doThing();\n  doThing();\n}\n",
+        )
+        .unwrap();
+
+        let mk = |line: u32| Match {
+            path: p.clone(),
+            line,
+            text: "  doThing();".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 5,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let m1 = mk(2);
+        let m2 = mk(3);
+        let m3 = mk(4);
+        let group: Vec<&Match> = vec![&m1, &m2, &m3];
+        let cache = OutlineCache::new();
+        let mut out = String::new();
+        format_grouped_usages(&group, tmp.path(), &cache, &mut out);
+
+        assert!(
+            out.starts_with("\n\n### "),
+            "grouped-usage heading must be H3, got: {out:?}"
+        );
+        assert!(
+            !out.starts_with("\n\n## "),
+            "grouped-usage heading must not be H2, got: {out:?}"
         );
     }
 }

@@ -12,6 +12,7 @@ use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
 use crate::lang::detect_file_type;
+use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
@@ -130,6 +131,20 @@ pub fn read_file(
         ));
     }
 
+    // Minified — filename convention or, for big files, newline-density heuristic.
+    if crate::lang::detection::is_minified_by_name(name)
+        || (byte_len >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+            && crate::lang::detection::is_minified_by_content(buf))
+    {
+        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+        return Ok(format::file_header(
+            path,
+            byte_len,
+            line_count,
+            ViewMode::Minified,
+        ));
+    }
+
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
     let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
@@ -193,102 +208,79 @@ pub fn would_outline(path: &Path) -> bool {
 /// Resolve a heading address to a line range in a markdown file.
 /// Returns `(start_line, end_line)` as 1-indexed inclusive range.
 /// Returns `None` if heading not found.
+///
+/// Walks the `tree-sitter-md` `section` tree: each ATX heading owns a
+/// `section` node spanning from the heading line through the line before
+/// the next same-or-higher-level heading (sub-headings nest as child
+/// sections and don't terminate the parent). Headings inside fenced /
+/// indented code blocks aren't emitted as `atx_heading` nodes, so the
+/// fence-state tracking the previous hand-rolled scanner needed is now
+/// the parser's responsibility.
 fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     let heading_trimmed = heading.trim_end();
-    let heading_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
-
-    if heading_level == 0 {
+    let query_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
+    if query_level == 0 || query_level > 6 {
+        return None;
+    }
+    // Normalise the query the same way `heading_text` normalises an
+    // `atx_heading` node — strip leading `#`s, surrounding whitespace,
+    // and any ATX-close `#`s — so `## Foo`, `## Foo ##`, and `##  Foo`
+    // all match the same node.
+    let query_text = heading_trimmed[query_level..]
+        .trim()
+        .trim_end_matches('#')
+        .trim();
+    if query_text.is_empty() {
         return None;
     }
 
-    // Build line offsets
-    let mut line_offsets: Vec<usize> = vec![0];
-    for pos in memchr::memchr_iter(b'\n', buf) {
-        line_offsets.push(pos + 1);
-    }
-    // Exclude phantom empty line after trailing newline (match outline's count)
-    let total_lines = if buf.last() == Some(&b'\n') {
-        line_offsets.len() - 1
-    } else {
-        line_offsets.len()
-    };
+    let content = std::str::from_utf8(buf).ok()?;
+    let tree = parse_markdown(content)?;
+    let lines: Vec<&str> = content.lines().collect();
 
-    let mut in_code_block = false;
-    let mut found_line: Option<usize> = None;
+    #[allow(clippy::cast_possible_truncation)]
+    let level = query_level as u8;
+    find_section(tree.root_node(), &lines, level, query_text)
+}
 
-    // Scan for the target heading
-    for (line_idx, &offset) in line_offsets.iter().enumerate() {
-        let line_end = if line_idx + 1 < line_offsets.len() {
-            line_offsets[line_idx + 1] - 1 // exclude newline
-        } else {
-            buf.len()
-        };
-
-        if let Ok(line_str) = std::str::from_utf8(&buf[offset..line_end]) {
-            let trimmed = line_str.trim_end();
-
-            // Track code blocks
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                continue;
+/// Recursive section-tree walk for `resolve_heading`. Returns the first
+/// section whose `atx_heading` matches `(level, text)`.
+fn find_section(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    target_level: u8,
+    target_text: &str,
+) -> Option<(usize, usize)> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "section" => {
+                if let Some(hit) = match_section(child, lines, target_level, target_text) {
+                    return Some(hit);
+                }
+                if let Some(hit) = find_section(child, lines, target_level, target_text) {
+                    return Some(hit);
+                }
             }
-
-            // Skip headings inside code blocks
-            if in_code_block {
-                continue;
-            }
-
-            // Check if this line matches the heading
-            if trimmed == heading_trimmed {
-                found_line = Some(line_idx + 1); // 1-indexed
-                break;
-            }
-        }
-    }
-
-    let start_line = found_line?;
-
-    // Find the next heading of same or higher level
-    in_code_block = false;
-    let start_idx = start_line - 1; // convert back to 0-indexed for iteration
-
-    for (line_idx, &offset) in line_offsets.iter().enumerate().skip(start_idx + 1) {
-        let line_end = if line_idx + 1 < line_offsets.len() {
-            line_offsets[line_idx + 1] - 1
-        } else {
-            buf.len()
-        };
-
-        if let Ok(line_str) = std::str::from_utf8(&buf[offset..line_end]) {
-            let trimmed = line_str.trim_end();
-
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
-                continue;
-            }
-
-            if in_code_block {
-                continue;
-            }
-
-            // Check if this is a heading
-            if trimmed.starts_with('#') {
-                let level = trimmed.chars().take_while(|&c| c == '#').count();
-                if level <= heading_level {
-                    // 0-based line_idx of next heading = 1-indexed line before it
-                    return Some((start_line, line_idx));
+            // The parser owns these — no headings hide inside.
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => {
+                if let Some(hit) = find_section(child, lines, target_level, target_text) {
+                    return Some(hit);
                 }
             }
         }
     }
-
-    // No next heading found — section goes to end of file
-    Some((start_line, total_lines))
+    None
 }
 
-/// Read a specific line range from a file.
-/// Uses memchr to find the Nth newline offset and slice the mmap buffer directly
-/// instead of collecting all lines into a Vec.
+////// Read one or more line ranges from a file. Each range is "start-end"
+/// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
+/// markdown files. Mmaps the file once and emits a single `[section]`
+/// header followed by the formatted blocks; when more than one range is
+/// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
+///
+/// Ranges are emitted in the order supplied — overlapping or out-of-order
 /// Read a section's formatted body (without the file header).
 /// Used by multi-section read to avoid duplicating the file header per section.
 pub(crate) fn read_section_body(
@@ -305,6 +297,139 @@ fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, Til
     Ok(format!("{header}\n\n{body}"))
 }
 
+fn match_section(
+    section: tree_sitter::Node,
+    lines: &[&str],
+    target_level: u8,
+    target_text: &str,
+) -> Option<(usize, usize)> {
+    let mut cursor = section.walk();
+    let heading = section
+        .children(&mut cursor)
+        .find(|c| c.kind() == "atx_heading")?;
+    if heading_level(heading) != Some(target_level) {
+        return None;
+    }
+    if heading_text(heading, lines) != target_text {
+        return None;
+    }
+    let start_line = heading.start_position().row + 1;
+    let end_line = section_end_line(section);
+    Some((start_line, end_line))
+}
+
+/// 1-indexed inclusive last line of a tree-sitter `section` node.
+/// `end_position` is exclusive; col 0 means we landed on the next line's
+/// row, so the section's last line is `end.row` itself.
+fn section_end_line(section: tree_sitter::Node) -> usize {
+    let end = section.end_position();
+    if end.column == 0 {
+        end.row
+    } else {
+        end.row + 1
+    }
+}
+
+/// Return up to `top_n` markdown headings ranked by edit distance to `query`.
+///
+/// Used when a heading lookup misses — agents typo'd anchors, or the heading
+/// renamed since they last read. Returning the closest matches lets them
+/// retry with the right anchor without re-reading the whole file.
+///
+/// Walks `atx_heading` nodes from `tree-sitter-md`, which by construction
+/// covers `CommonMark` §4.6 (1–6 `#`s followed by space/EOL) and excludes
+/// headings inside fenced or indented code blocks. `Setext` headings
+/// (`Title\n===`) are silently ignored — see `find_defs_markdown_buf` for
+/// the same trade-off; the block grammar puts them at document scope so
+/// span computation doesn't apply.
+///
+/// Caveat on ranking: Levenshtein favours candidates of similar length to
+/// the query, so very short queries against long headings can rank tighter
+/// matches first; this is acceptable for a hint and aligned with the rest
+/// of the project's `edit_distance` use.
+fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
+    let q_text = query.trim_end().trim_start_matches('#').trim();
+    if q_text.is_empty() {
+        return Vec::new();
+    }
+    let q_lower = q_text.to_ascii_lowercase();
+
+    let Ok(content) = std::str::from_utf8(buf) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_markdown(content) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    collect_atx_headings(tree.root_node(), &lines, &q_lower, &mut scored);
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().take(top_n).map(|(_, h)| h).collect()
+}
+
+/// Recursively collect `atx_heading` nodes scored by edit distance to
+/// `q_lower`. Code blocks are skipped — the grammar already guarantees
+/// no `atx_heading` nests inside them, but we elide the recursion to
+/// avoid walking large fenced bodies.
+fn collect_atx_headings(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    q_lower: &str,
+    out: &mut Vec<(usize, String)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "atx_heading" => {
+                let h_text = heading_text(child, lines);
+                // Strip kramdown attr blocks before scoring (e.g. `## Foo {#id}`).
+                let h_clean = h_text.split('{').next().unwrap_or(&h_text).trim();
+                if h_clean.is_empty() {
+                    continue;
+                }
+                let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
+                let row = child.start_position().row;
+                let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
+                out.push((dist, line_text));
+            }
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => collect_atx_headings(child, lines, q_lower, out),
+        }
+    }
+}
+
+/// Resolve a single range string (line range like "45-89" or heading like
+/// "## Architecture") to a 1-indexed inclusive `(start, end)` pair.
+fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> {
+    if range.starts_with('#') {
+        resolve_heading(buf, range).ok_or_else(|| {
+            let suggestions = suggest_headings(buf, range, 5);
+            let reason = if suggestions.is_empty() {
+                "heading not found in file".to_string()
+            } else {
+                format!(
+                    "heading not found in file. Closest matches:\n  {}",
+                    suggestions.join("\n  ")
+                )
+            };
+            TilthError::InvalidQuery {
+                query: range.to_string(),
+                reason,
+            }
+        })
+    } else {
+        parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
+            query: range.to_string(),
+            reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
+        })
+    }
+}
+
+/// Read a specific line range from a file. Returns the file header and the
+/// formatted body separately so callers can choose to emit them together
+/// (single-section read) or fold the body into a multi-section response with
+/// per-section markers (see `crate::read::sections::read_sections_with_budget`).
 fn read_section_parts(
     path: &Path,
     range: &str,
@@ -320,36 +445,22 @@ fn read_section_parts(
     })?;
     let buf = &mmap[..];
 
-    // Check if this is a heading-based address (markdown)
-    let (start, end) = if range.starts_with('#') {
-        resolve_heading(buf, range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "heading not found in file".into(),
-        })?
-    } else {
-        parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
-        })?
-    };
+    let (start, end) = resolve_range(buf, range)?;
 
-    // Find line offsets using memchr — no full-file Vec<&str> allocation
     let mut line_offsets: Vec<usize> = vec![0];
     for pos in memchr::memchr_iter(b'\n', buf) {
         line_offsets.push(pos + 1);
     }
     let total = line_offsets.len();
 
-    let s = (start.saturating_sub(1)).min(total);
+    let s = start.saturating_sub(1).min(total);
     let e = end.min(total);
-
     if s >= e {
         return Err(TilthError::InvalidQuery {
             query: range.to_string(),
             reason: format!("range out of bounds (file has {total} lines)"),
         });
     }
-
     let start_byte = line_offsets[s];
     let end_byte = if e < line_offsets.len() {
         line_offsets[e]
@@ -444,10 +555,16 @@ fn suggest_similar(path: &Path) -> Option<String> {
     best.map(|(_, name)| name)
 }
 
-/// Simple Levenshtein distance — only used on short file names.
+/// Levenshtein distance over Unicode scalar values.
+///
+/// Operates on `char`s, not bytes — a single CJK or emoji glyph is one
+/// edit unit, not 3-4. Byte-level Levenshtein on UTF-8 inflates distances
+/// for non-ASCII content and breaks ranking for international markdown
+/// or filenames. Used by both filename suggestion (`suggest_similar`) and
+/// heading suggestion (`suggest_headings`).
 fn edit_distance(a: &str, b: &str) -> usize {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut curr = vec![0; b.len() + 1];
 
@@ -583,5 +700,103 @@ mod tests {
 
         std::env::remove_var("TILTH_FULL_SIZE_CAP");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn suggest_headings_returns_close_matches() {
+        let input = b"# Architecture\nfoo\n## Getting Started\nbar\n## Configuration\nbaz\n";
+        let suggestions = suggest_headings(input, "## Get Started", 5);
+        assert!(
+            suggestions.iter().any(|h| h.contains("Getting Started")),
+            "expected 'Getting Started' in suggestions, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_top_n_orders_by_distance() {
+        let input = b"# A\nfoo\n## Configuration\nbar\n## Authentication\nbaz\n## Settings\nqux\n";
+        // Whole-word typo of "Configuration" — Levenshtein favours close-length
+        // candidates here, so "Configuration" must rank ahead of the others.
+        let suggestions = suggest_headings(input, "## Configurashun", 5);
+        assert!(
+            suggestions[0].contains("Configuration"),
+            "expected 'Configuration' first, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_skips_code_blocks() {
+        let input = b"## Real Heading\nfoo\n```md\n## Inside Code\n```\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        // Heading inside code block must NOT appear
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Inside Code")),
+            "fenced heading leaked into suggestions: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|h| h.contains("Real Heading")),
+            "expected real heading in suggestions: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_empty_query_returns_empty() {
+        let input = b"# A\n## B\n";
+        assert!(suggest_headings(input, "", 5).is_empty());
+        assert!(suggest_headings(input, "###", 5).is_empty());
+    }
+
+    /// CommonMark allows `~~~` as a fence delimiter. Headings inside
+    /// must not be treated as suggestable.
+    #[test]
+    fn suggest_headings_skips_tilde_fenced_blocks() {
+        let input = b"## Real Heading\nfoo\n~~~md\n## Inside Tilde Fence\n~~~\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Inside Tilde Fence")),
+            "tilde-fenced heading leaked: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|h| h.contains("Real Heading")),
+            "real heading missing: {suggestions:?}"
+        );
+    }
+
+    /// CommonMark §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
+    /// hashes are not headings, even with a space after.
+    #[test]
+    fn suggest_headings_rejects_seven_or_more_hashes() {
+        let input = b"## Real Heading\nfoo\n####### Not a Heading\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Not a Heading")),
+            "7-hash line leaked as heading: {suggestions:?}"
+        );
+    }
+
+    /// CommonMark §4.6.1: hashes must be followed by a space (or EOL).
+    /// `##foo` (no space) is not a heading.
+    #[test]
+    fn suggest_headings_rejects_hashes_without_space() {
+        let input = b"## Real Heading\nfoo\n##NoSpace\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("NoSpace")),
+            "##NoSpace leaked as heading: {suggestions:?}"
+        );
+    }
+
+    /// edit_distance must operate on `char`s so non-ASCII headings rank
+    /// correctly. Byte-level Levenshtein would inflate distances for
+    /// CJK or emoji because those occupy 3–4 bytes per scalar value.
+    #[test]
+    fn edit_distance_is_unicode_aware() {
+        // 设置 (Settings) and 設定 (Configuration) — different chars,
+        // each one Unicode scalar. Distance should be 2, not 6.
+        assert_eq!(edit_distance("设置", "設定"), 2);
+        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
+        assert_eq!(edit_distance("🦀", "🐙"), 1);
+        // ASCII baseline still works.
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 }

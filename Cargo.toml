@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -36,6 +36,7 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-elixir = "0.3"
+tree-sitter-md = "0.5"
 
 # Search (ripgrep internals)
 grep-regex = "0.1"
@@ -66,8 +67,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
+# Error types
+thiserror = "2"
+
+# Bloom filter (fast SIMD-optimized impl)
+fastbloom = "0.17"
+
+# String similarity (fuzzy symbol-rename detection)
+strsim = "0.11"
+
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
+
+# Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
+terminal_size = "0.4"
 
 
 [dev-dependencies]

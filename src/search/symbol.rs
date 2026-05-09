@@ -13,9 +13,9 @@ use crate::lang::treesitter::{
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
-use crate::lang::outline::outline_language;
+use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
-use crate::types::{FileType, Match, SearchResult};
+use crate::types::{FacetTotals, FileType, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -25,6 +25,17 @@ const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 /// Stop walking once we have this many raw usage matches.
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
+
+/// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
+/// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
+/// real code defs in favor of markdown-heading defs of the same query.
+fn stratum_for_display(m: &Match) -> u8 {
+    if m.is_definition {
+        u8::from(m.def_weight < 60)
+    } else {
+        2
+    }
+}
 
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
@@ -71,6 +82,31 @@ pub fn search(
     let usage_count = total - def_count;
 
     rank::sort(&mut merged, query, scope, context);
+
+    // Stratify so the cap can't drop a real code definition in favor of a
+    // markdown-heading "definition" of the same query. Stable within each
+    // stratum, so the relevance ordering from rank::sort is preserved. Code
+    // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
+    // second, usages last. Display-side only — pre-cap totals below and the
+    // underlying ranking semantics for `--json` callers are unchanged.
+    merged.sort_by_key(stratum_for_display);
+
+    // Compute per-subfacet totals on the *pre-cap* set so the renderer can
+    // print `displayed/total` headings + per-facet hidden-count lines.
+    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
+    // clone is cheap. Faceting is pure / side-effect-free.
+    let totals = {
+        let snapshot = merged.clone();
+        let f = super::facets::facet_matches(snapshot, scope);
+        FacetTotals {
+            definitions: f.definitions.len(),
+            implementations: f.implementations.len(),
+            tests: f.tests.len(),
+            usages_local: f.usages_local.len(),
+            usages_cross: f.usages_cross.len(),
+        }
+    };
+
     merged.truncate(MAX_MATCHES);
 
     Ok(SearchResult {
@@ -80,6 +116,7 @@ pub fn search(
         total_found: total,
         definitions: def_count,
         usages: usage_count,
+        facet_totals: totals,
     })
 }
 
@@ -124,12 +161,25 @@ fn find_definitions(
 
             let path = entry.path();
 
-            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 500_000 {
-                    return ignore::WalkState::Continue;
-                }
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
             }
+
+            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
 
             // Single read: read file once, use buffer for both check and parse
             let Ok(content) = fs::read_to_string(path) else {
@@ -138,6 +188,13 @@ fn find_definitions(
 
             // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
             if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+                return ignore::WalkState::Continue;
+            }
+
+            // Catch unmarked minified bundles that slipped past the filename check.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(content.as_bytes())
+            {
                 return ignore::WalkState::Continue;
             }
 
@@ -159,9 +216,35 @@ fn find_definitions(
                 Vec::new()
             };
 
-            // Fallback: keyword heuristic for files without grammars
+            // Per-file-type fallback dispatch. The semantics of "definition"
+            // differ by file kind, so handle them separately:
+            //
+            // * Code without a tree-sitter grammar: keyword heuristic (looks
+            //   for lines starting with `function`/`const`/`class`/etc.).
+            // * Markdown / RST: heading-as-definition. A heading whose text
+            //   contains the query (`## parseCitations` in a doc) marks that
+            //   section AS being about the symbol — that is the documentation
+            //   analogue of a code definition. Quoted code blocks inside
+            //   docs are NOT treated as definitions; they're usages, because
+            //   the keyword heuristic would false-positive on every snippet
+            //   that quotes the real source. Heading defs carry a lower
+            //   `def_weight` (30) than code definitions (60-80) so the real
+            //   source still ranks first.
+            // * Structured data / tabular / log / other: no fallback.
+            //   Mentions are config values, data, or noise — not definitions.
+            //   (A future patch could treat top-level config keys matching
+            //   the query as soft definitions, but that's ambiguous enough
+            //   to skip for now.)
             if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = find_defs_heuristic_buf(path, query, &content, file_lines, mtime);
+                file_defs = match file_type {
+                    FileType::Code(_) => {
+                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
+                    }
+                    FileType::Markdown => {
+                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
+                    }
+                    _ => Vec::new(),
+                };
             }
 
             if !file_defs.is_empty() {
@@ -429,11 +512,38 @@ fn find_usages(
 
             let path = entry.path();
 
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
             // Skip oversized files
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 500_000 {
-                    return ignore::WalkState::Continue;
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
                 }
+                Err(_) => 0,
+            };
+
+            // Read once and dispatch via `search_slice` so the minified
+            // heuristic and the search share a single kernel read.
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
+            // Catch unmarked minified bundles between 100KB and 500KB — they
+            // were not skipped by the filename check or the size cap above.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
             }
 
             let (file_lines, mtime) = file_metadata(path);
@@ -441,9 +551,9 @@ fn find_usages(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_path(
+            let _ = searcher.search_slice(
                 matcher,
-                path,
+                &bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -477,6 +587,158 @@ fn find_usages(
     Ok(matches
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// Markdown heading definition detector.
+///
+/// An ATX heading (`^#{1,6}\s+<text>`) in a `.md`/`.mdx`/`.rst` file is
+/// treated as a soft definition of the section about <query> when <query>
+/// appears in <text> as a whole identifier (flanked by non-word chars).
+/// Setext headings, indented code blocks, and lines inside fenced code
+/// blocks are filtered out by the tree-sitter-md parser before we see them.
+///
+/// Section span (`def_range`) covers the heading line through the last
+/// non-blank line before the next same-or-higher-level heading, and is
+/// computed from the enclosing `section` node's end position. Sub-headings
+/// nest as child sections of the parent and don't terminate the parent.
+///
+/// Whole-identifier match (not substring-anywhere) prevents false positives
+/// like query `func` matching heading `## refactoring guidelines`.
+fn find_defs_markdown_buf(
+    path: &Path,
+    query: &str,
+    content: &str,
+    file_lines: u32,
+    mtime: SystemTime,
+) -> Vec<Match> {
+    let Some(tree) = parse_markdown(content) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut defs = Vec::new();
+    walk_md_sections(
+        tree.root_node(),
+        &lines,
+        query,
+        path,
+        file_lines,
+        mtime,
+        &mut defs,
+    );
+    defs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_md_sections(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    path: &Path,
+    file_lines: u32,
+    mtime: SystemTime,
+    defs: &mut Vec<Match>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "section" => {
+                emit_md_section_match(child, lines, query, path, file_lines, mtime, defs);
+                walk_md_sections(child, lines, query, path, file_lines, mtime, defs);
+            }
+            // The parser owns these — no headings hide inside.
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => walk_md_sections(child, lines, query, path, file_lines, mtime, defs),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_md_section_match(
+    section: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    path: &Path,
+    file_lines: u32,
+    mtime: SystemTime,
+    defs: &mut Vec<Match>,
+) {
+    let mut cursor = section.walk();
+    let Some(heading) = section
+        .children(&mut cursor)
+        .find(|c| c.kind() == "atx_heading")
+    else {
+        return;
+    };
+    let text = heading_text(heading, lines);
+    if !contains_identifier(&text, query) {
+        return;
+    }
+    let heading_line = (heading.start_position().row + 1) as u32;
+    let raw_end = md_section_end_line(section);
+    let section_end = trim_trailing_blank_lines(lines, heading_line, raw_end);
+    let line_text = lines
+        .get(heading.start_position().row)
+        .copied()
+        .unwrap_or("");
+    defs.push(Match {
+        path: path.to_path_buf(),
+        line: heading_line,
+        text: line_text.trim_end().to_string(),
+        is_definition: true,
+        exact: true,
+        file_lines,
+        mtime,
+        // Populating def_range lets the renderer expand to the section
+        // body — the markdown analogue of a code definition's body.
+        def_range: Some((heading_line, section_end)),
+        def_name: Some(query.to_string()),
+        // Soft definition — code definitions are 60-80, usages 0. Sits
+        // between them so docs headings outrank passing mentions but
+        // never outrank the real source.
+        def_weight: 30,
+        impl_target: None,
+    });
+}
+
+/// 1-indexed inclusive last line of a tree-sitter section node.
+fn md_section_end_line(section: tree_sitter::Node) -> u32 {
+    let end = section.end_position();
+    if end.column == 0 {
+        end.row as u32
+    } else {
+        (end.row + 1) as u32
+    }
+}
+
+fn trim_trailing_blank_lines(lines: &[&str], start: u32, end: u32) -> u32 {
+    let mut e = end;
+    while e > start
+        && lines
+            .get((e - 1) as usize)
+            .is_some_and(|l| l.trim().is_empty())
+    {
+        e -= 1;
+    }
+    e
+}
+
+/// True if `query` appears in `text` as a whole identifier — flanked by
+/// non-word characters (anything outside `[A-Za-z0-9_]`) or string ends.
+fn contains_identifier(text: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    text.match_indices(query).any(|(abs, _)| {
+        let bytes = text.as_bytes();
+        let before_ok = abs == 0 || !is_word_byte(bytes[abs - 1]);
+        let end_pos = abs + query.len();
+        let after_ok = end_pos == bytes.len() || !is_word_byte(bytes[end_pos]);
+        before_ok && after_ok
+    })
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Keyword heuristic fallback — only used when tree-sitter grammar unavailable.
@@ -519,6 +781,7 @@ fn is_definition_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::SystemTime;
 
     #[test]
@@ -574,6 +837,48 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             SystemTime::now(),
         );
         assert!(!defs.is_empty(), "should find 'dispatch_tool' definition");
+    }
+
+    #[test]
+    fn typescript_export_const_detected_as_definition() {
+        let code = r#"export const UNTAGGED_REQUESTS_SQL = `SELECT foo FROM bar`;
+
+export const anotherConst = 42;
+
+const unexported = "hello";
+"#;
+        let ts_lang =
+            crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
+        let lines = code.lines().count() as u32;
+
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.ts"),
+            "UNTAGGED_REQUESTS_SQL",
+            &ts_lang,
+            Some(crate::types::Lang::TypeScript),
+            code,
+            lines,
+            SystemTime::now(),
+        );
+        assert!(
+            !defs.is_empty(),
+            "should find 'UNTAGGED_REQUESTS_SQL' definition"
+        );
+        assert!(defs[0].is_definition);
+        assert!(defs[0].def_range.is_some());
+
+        // Non-exported const also detected
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.ts"),
+            "unexported",
+            &ts_lang,
+            Some(crate::types::Lang::TypeScript),
+            code,
+            lines,
+            SystemTime::now(),
+        );
+        assert!(!defs.is_empty(), "should find 'unexported' definition");
+        assert!(defs[0].is_definition);
     }
 
     /// Helper: search for an Elixir definition by name in a code snippet.
@@ -781,6 +1086,246 @@ end
         assert!(
             !elixir_find(code, "Inner").is_empty(),
             "should find nested 'Inner' module"
+        );
+    }
+
+    fn md_find(content: &str, query: &str) -> Vec<Match> {
+        let lines = content.lines().count() as u32;
+        find_defs_markdown_buf(
+            std::path::Path::new("test.md"),
+            query,
+            content,
+            lines,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn markdown_heading_named_for_query_matches() {
+        let content = "# Intro\n\n## parseCitations\n\nProse.\n";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 3);
+        assert!(defs[0].is_definition);
+        assert_eq!(defs[0].def_weight, 30);
+    }
+
+    #[test]
+    fn markdown_heading_levels_one_through_six() {
+        for level in 1..=6 {
+            let hashes = "#".repeat(level);
+            let content = format!("{hashes} parseCitations\n");
+            assert_eq!(md_find(&content, "parseCitations").len(), 1, "h{level}");
+        }
+        // h7 is not a heading
+        assert!(md_find("####### parseCitations\n", "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_heading_without_query_does_not_match() {
+        let content = "## Other section\n\n## Another heading\n";
+        assert!(md_find(content, "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_substring_inside_word_does_not_match() {
+        // query "func" must not match "function" — that's the maintainer's
+        // word-boundary concern. Same for "factor" inside "refactoring".
+        assert!(md_find("## function pointers\n", "func").is_empty());
+        assert!(md_find("## refactoring guidelines\n", "factor").is_empty());
+        assert!(md_find("## getCitationsBatch\n", "Citations").is_empty());
+    }
+
+    #[test]
+    fn markdown_whole_word_in_phrase_matches() {
+        // Whole-word match anywhere in the heading text is a definition —
+        // a heading like `## How parseCitations works` IS naming the symbol.
+        let defs = md_find("## How parseCitations works\n", "parseCitations");
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn markdown_query_with_hyphen_matches() {
+        // Tracking-doc identifiers like `GUM-1732` must match. The hyphen
+        // is part of the query; word-boundary check applies only at the ends.
+        let defs = md_find("## GUM-1732: Cost attribution\n", "GUM-1732");
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn markdown_code_block_lines_do_not_match() {
+        // Fenced code block — line is not an ATX heading, even though
+        // the text contains `function parseCitations`.
+        let content = "## Real heading\n\n```ts\nfunction parseCitations() {}\n```\n";
+        let defs = md_find(content, "parseCitations");
+        assert!(defs.is_empty(), "fenced-code mention is not a definition");
+
+        // Indented code block (4+ space indent) — a `## ...` line indented
+        // 4 spaces is a code block per CommonMark, not a heading.
+        let content = "Intro.\n\n    ## parseCitations\n";
+        assert!(
+            md_find(content, "parseCitations").is_empty(),
+            "4-space-indented `## foo` is a code block, not a heading"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_with_up_to_three_space_indent_matches() {
+        // 0-3 space indents are valid ATX headings per CommonMark.
+        for indent in 0..=3 {
+            let content = format!("{}## parseCitations\n", " ".repeat(indent));
+            assert_eq!(
+                md_find(&content, "parseCitations").len(),
+                1,
+                "indent {indent} should be a heading"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_heading_with_trailing_hashes_matches() {
+        // ATX allows optional trailing `#`s — strip them before matching.
+        assert_eq!(md_find("## parseCitations ##\n", "parseCitations").len(), 1);
+        assert_eq!(
+            md_find("### parseCitations ###\n", "parseCitations").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn markdown_hashes_without_space_are_not_headings() {
+        // `##foo` (no space after `#`s) is not a heading.
+        assert!(md_find("##parseCitations\n", "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_next_same_level_heading() {
+        // `## parseCitations` body ends at the next `## ...` (same level).
+        // The blank line on line 4 (between body and next heading) is
+        // trimmed, so the span ends at line 3.
+        let content = "\
+## parseCitations
+
+Body line.
+
+## Other section
+
+Unrelated.
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 3)));
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_higher_level_heading() {
+        // A `## ...` ends a sub-section under `### parseCitations` because
+        // the outer heading is higher level (smaller hash count). The blank
+        // line preceding `## Outer two` is trimmed.
+        let content = "\
+## Outer
+
+### parseCitations
+
+Body.
+
+## Outer two
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 3);
+        assert_eq!(defs[0].def_range, Some((3, 5)));
+    }
+
+    #[test]
+    fn markdown_section_span_skips_deeper_subheadings() {
+        // A `### ...` does NOT end the enclosing `## parseCitations`
+        // section — only same-or-higher-level headings do.
+        let content = "\
+## parseCitations
+
+Lead-in.
+
+### Detail
+
+Subprose.
+
+## Next
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 7)));
+    }
+
+    #[test]
+    fn markdown_section_span_runs_to_eof_when_no_following_heading() {
+        let content = "\
+## parseCitations
+
+Body to end.
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        // Three content lines; trailing newline does not produce a 4th.
+        assert_eq!(defs[0].def_range, Some((1, 3)));
+    }
+
+    #[test]
+    fn markdown_section_span_handles_heading_with_no_body() {
+        // Adjacent headings: span is just the heading line itself.
+        let content = "\
+## parseCitations
+## Other
+";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 1);
+        assert_eq!(defs[0].def_range, Some((1, 1)));
+    }
+
+    #[test]
+    fn stratify_for_display_keeps_code_defs_above_doc_defs() {
+        // When the cap drops matches, real code defs must keep their slots
+        // and doc-heading defs slide below them. Rank order within each
+        // stratum is preserved by the stable sort.
+        let mk = |line: u32, weight: u16, is_definition: bool| Match {
+            path: PathBuf::from("test.rs"),
+            line,
+            text: String::new(),
+            is_definition,
+            exact: false,
+            file_lines: 100,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: weight,
+            impl_target: None,
+        };
+
+        // Pre-cap order (after rank::sort): doc def, code def, doc def, code def, usage.
+        let mut matches = vec![
+            mk(1, 30, true), // doc def — high relevance
+            mk(2, 70, true), // code def
+            mk(3, 30, true), // doc def
+            mk(4, 70, true), // code def
+            mk(5, 0, false), // usage
+        ];
+        matches.sort_by_key(stratum_for_display);
+
+        // Code defs first (stable order: line 2 before line 4),
+        // then doc defs (line 1 before line 3), then the usage.
+        let lines: Vec<u32> = matches.iter().map(|m| m.line).collect();
+        assert_eq!(lines, vec![2, 4, 1, 3, 5]);
+
+        // Truncate-to-2 should keep both code defs, drop both doc defs.
+        matches.truncate(2);
+        assert!(
+            matches.iter().all(|m| m.def_weight >= 60),
+            "displayed slice after cap must be all code defs, got {:?}",
+            matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
         );
     }
 }
