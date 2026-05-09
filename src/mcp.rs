@@ -276,17 +276,35 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
+/// What a tool returns to the MCP layer: the text payload plus optional
+/// structured `_meta` that gets attached to the JSON-RPC response.
+/// Most tools only set `text`; only `tilth_read` populates `meta` today.
+#[derive(Debug)]
+struct ToolOutput {
+    text: String,
+    meta: Option<Value>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self { text, meta: None }
+    }
+}
+
 /// No classifier involved — the caller specifies the tool explicitly.
-fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String, String> {
+fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<ToolOutput, String> {
     let edit_mode = services.edit_mode;
     match tool {
         "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
-        "tilth_search" => tool_search(args, &services.cache, &services.session, &services.bloom),
-        "tilth_files" => tool_files(args),
-        "tilth_deps" => tool_deps(args, &services.bloom),
-        "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, &services.session),
-        "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
+        "tilth_search" => tool_search(args, &services.cache, &services.session, &services.bloom)
+            .map(ToolOutput::from),
+        "tilth_files" => tool_files(args).map(ToolOutput::from),
+        "tilth_deps" => tool_deps(args, &services.bloom).map(ToolOutput::from),
+        "tilth_diff" => tool_diff(args).map(ToolOutput::from),
+        "tilth_session" => tool_session(args, &services.session).map(ToolOutput::from),
+        "tilth_edit" if edit_mode => {
+            tool_edit(args, &services.session, &services.bloom).map(ToolOutput::from)
+        }
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -296,7 +314,7 @@ fn tool_read(
     cache: &OutlineCache,
     session: &Session,
     edit_mode: bool,
-) -> Result<String, String> {
+) -> Result<ToolOutput, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let paths_arr = match args.get("paths") {
@@ -350,7 +368,7 @@ fn tool_read(
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
         let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
-        return Ok(apply_budget(combined, budget));
+        return Ok(apply_budget_with_meta(combined, budget));
     }
 
     let path = paths.into_iter().next().expect("paths non-empty");
@@ -372,14 +390,18 @@ fn tool_read(
             ));
         }
         session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
-            }
-        };
-        return Ok(output);
+        if let Some(b) = budget {
+            let detail = crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
+                .map_err(|e| e.to_string())?;
+            let meta = Some(sections_meta(&detail));
+            return Ok(ToolOutput {
+                text: detail.text,
+                meta,
+            });
+        }
+        let text =
+            crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
+        return Ok(text.into());
     }
 
     session.record_read(&path);
@@ -400,7 +422,55 @@ fn tool_read(
         }
     }
 
-    Ok(apply_budget(output, budget))
+    Ok(apply_budget_with_meta(output, budget))
+}
+
+/// Apply a budget and surface truncation flags so callers can detect a
+/// silent clip via `_meta.truncated`. Used by [`tool_read`] for the
+/// single-file and batch-read paths.
+fn apply_budget_with_meta(output: String, budget: Option<u64>) -> ToolOutput {
+    let Some(b) = budget else {
+        return output.into();
+    };
+    let (text, info) = crate::budget::apply_with_info(&output, b);
+    let mut meta = serde_json::json!({
+        "truncated": info.is_some(),
+    });
+    if let Some(i) = info {
+        meta["truncated_at_line"] = serde_json::Value::from(i.at_line);
+    }
+    ToolOutput {
+        text,
+        meta: Some(meta),
+    }
+}
+
+/// Build the `_meta` JSON for a budgeted multi-section read: top-level
+/// `truncated` / `truncated_at_line` plus a `sections[]` array carrying
+/// individual flags.
+fn sections_meta(detail: &crate::read::BudgetedReadResult) -> Value {
+    let sections: Vec<Value> = detail
+        .sections
+        .iter()
+        .map(|s| {
+            let mut obj = serde_json::json!({
+                "section": s.section,
+                "truncated": s.truncated,
+            });
+            if let Some(line) = s.truncated_at_line {
+                obj["truncated_at_line"] = Value::from(line);
+            }
+            obj
+        })
+        .collect();
+    let mut meta = serde_json::json!({
+        "truncated": detail.truncated,
+        "sections": sections,
+    });
+    if let Some(line) = detail.truncated_at_line {
+        meta["truncated_at_line"] = Value::from(line);
+    }
+    meta
 }
 
 fn tool_search(
@@ -750,14 +820,17 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
     build_response(req.id.as_ref(), result)
 }
 
-fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpcResponse {
-    let (text, is_error) = match result {
-        Ok(output) => (output, false),
-        Err(e) => (e, true),
+fn build_response(id: Option<&Value>, result: Result<ToolOutput, String>) -> JsonRpcResponse {
+    let (text, meta, is_error) = match result {
+        Ok(output) => (output.text, output.meta, false),
+        Err(e) => (e, None, true),
     };
     let mut payload = serde_json::json!({
         "content": [{ "type": "text", "text": text }]
     });
+    if let Some(m) = meta {
+        payload["_meta"] = m;
+    }
     if is_error {
         payload["isError"] = Value::Bool(true);
     }
@@ -774,7 +847,7 @@ fn run_tool_with_timeout(
     tool_name: &str,
     args: &Value,
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<ToolOutput, String> {
     let services_worker = services.clone();
     let tool = tool_name.to_string();
     let args_owned = args.clone();
@@ -1474,6 +1547,103 @@ mod tests {
         );
     }
 
+    // -- _meta surface ----------------------------------------------------------
+
+    /// Single-section read clipped by budget must surface
+    /// `_meta.truncated = true` and a `truncated_at_line`. Without a budget
+    /// (or with a roomy one), no `_meta` is attached.
+    #[test]
+    fn tool_read_single_section_meta_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let body: String = (0..400)
+            .map(|i| format!("line-{i}-padding-padding-padding\n"))
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let args = serde_json::json!({
+            "paths": [path.to_str().unwrap()],
+            "section": "1-300",
+            "budget": 200u64,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("must succeed");
+        let meta = out.meta.expect("meta should be set when budget supplied");
+        assert_eq!(meta["truncated"], serde_json::Value::Bool(true));
+        assert!(
+            meta["truncated_at_line"].is_number(),
+            "truncated_at_line must be present when truncation occurs: {meta}"
+        );
+    }
+
+    /// Without a budget, `tool_read` must not attach `_meta` — the wire
+    /// shape must be backwards-compatible for callers that never pass a
+    /// budget.
+    #[test]
+    fn tool_read_no_budget_no_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("must succeed");
+        assert!(out.meta.is_none(), "meta must be None without a budget");
+    }
+
+    /// Multi-section read with a tight budget must surface a per-section
+    /// `_meta.sections[]` array with a `truncated` flag for each input
+    /// range, in user-supplied order.
+    #[test]
+    fn tool_read_multi_section_meta_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        let big_line = "x".repeat(50);
+        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let args = serde_json::json!({
+            "paths": [path.to_str().unwrap()],
+            "sections": ["1-3", "10-12", "20-22"],
+            "budget": 90u64,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("must succeed");
+        let meta = out.meta.expect("multi-section + budget must attach meta");
+        assert_eq!(meta["truncated"], serde_json::Value::Bool(true));
+        let sections = meta["sections"]
+            .as_array()
+            .expect("sections array must be present");
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0]["section"], serde_json::Value::from("1-3"));
+        assert_eq!(sections[0]["truncated"], serde_json::Value::Bool(false));
+        assert_eq!(sections[1]["section"], serde_json::Value::from("10-12"));
+        assert_eq!(sections[1]["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(sections[2]["section"], serde_json::Value::from("20-22"));
+        assert_eq!(sections[2]["truncated"], serde_json::Value::Bool(true));
+    }
+
+    /// `build_response` must serialise `_meta` to a JSON object next to
+    /// `content`, not nest it underneath. This pins the wire shape so
+    /// downstream consumers can rely on `result._meta.truncated` directly.
+    #[test]
+    fn build_response_attaches_meta_at_top_level() {
+        let out = ToolOutput {
+            text: "ok".into(),
+            meta: Some(serde_json::json!({ "truncated": true })),
+        };
+        let response = build_response(None, Ok(out));
+        let result = response.result.expect("result present");
+        let meta = result.get("_meta").expect("_meta must be at top level");
+        assert_eq!(meta["truncated"], serde_json::Value::Bool(true));
+        assert!(
+            result.get("content").is_some(),
+            "content must still be present alongside _meta: {result}"
+        );
+    }
+
     /// Batch reads must return the content of every submitted path — no file
     /// is dropped or reordered on the way through the tool handler.
     #[test]
@@ -1502,7 +1672,7 @@ mod tests {
 
         for i in 0..file_count {
             assert!(
-                result.contains(&format!("content-of-file-{i}")),
+                result.text.contains(&format!("content-of-file-{i}")),
                 "output must contain content of file {i}"
             );
         }

@@ -437,36 +437,87 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     Ok(out)
 }
 
+/// Per-section truncation flag returned by [`read_ranges_with_budget`].
+#[derive(Debug, Clone)]
+pub struct SectionTruncation {
+    /// The original range string the caller passed (e.g. `"45-89"` or
+    /// `"## Architecture"`).
+    pub section: String,
+    /// `true` when this section was either partially clipped or replaced
+    /// with the `... section omitted ...` marker.
+    pub truncated: bool,
+    /// 1-indexed line of the section's body (relative to the file) at which
+    /// the partial cut landed. `None` when the section was emitted in full
+    /// or omitted entirely.
+    pub truncated_at_line: Option<u32>,
+}
+
+/// Result of a budgeted multi-section read, including per-section
+/// truncation flags so the MCP layer can populate `_meta.sections[]`.
+#[derive(Debug, Clone)]
+pub struct BudgetedReadResult {
+    /// Final text payload (same shape as [`read_ranges_with_budget`]).
+    pub text: String,
+    /// `true` when any section was truncated or omitted.
+    pub truncated: bool,
+    /// 1-indexed line (in the rendered output) of the first cut, when one
+    /// occurred. Mirrors the top-level `_meta.truncated_at_line` field.
+    pub truncated_at_line: Option<u32>,
+    /// One entry per input range, in input order.
+    pub sections: Vec<SectionTruncation>,
+}
+
 /// Like [`read_ranges`], but with a strict shared token budget across all
-/// sections.
+/// sections, returning per-section truncation flags so callers (the MCP
+/// layer) can populate `_meta.truncated` / `_meta.sections[]` on
+/// `tilth_read` responses.
 ///
 /// Walks blocks in user order, deducting each from the remaining budget as
 /// it is emitted. When the budget is exhausted, later blocks are replaced
 /// with a single `... section omitted (budget exhausted) ...` line under
 /// their `─── lines X-Y ───` marker so callers can still see which ranges
 /// were dropped — but only while that marker itself fits in the remaining
-/// budget. Once even the marker would overflow, the function stops emitting.
-/// If the very first block alone exceeds the budget, it is truncated by
-/// [`crate::budget::apply`] and all later blocks are omitted.
+/// budget. Once even the marker would overflow, the function stops emitting
+/// (later sections still record a `truncated: true` flag so callers can
+/// detect the omission via `_meta.sections[]`). If the very first block
+/// alone exceeds the budget, it is truncated by
+/// [`crate::budget::apply_with_info`] and all later blocks are omitted.
 ///
-/// The returned string is a hard cap: its token estimate is `<= budget`.
+/// The returned text is a hard cap: its token estimate is `<= budget`.
 pub fn read_ranges_with_budget(
     path: &Path,
     ranges: &[&str],
     edit_mode: bool,
     budget: u64,
-) -> Result<String, TilthError> {
+) -> Result<BudgetedReadResult, TilthError> {
     let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
     let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
+    let range_strs: Vec<String> = ranges.iter().map(|r| (*r).to_string()).collect();
 
     if blocks.len() == 1 {
         let single = format!("{header}\n\n{}", blocks[0].text);
-        return Ok(crate::budget::apply(&single, budget));
+        let (text, info) = crate::budget::apply_with_info(&single, budget);
+        let truncated = info.is_some();
+        let truncated_at_line = info.as_ref().map(|i| i.at_line);
+        let section = SectionTruncation {
+            section: range_strs[0].clone(),
+            truncated,
+            truncated_at_line,
+        };
+        return Ok(BudgetedReadResult {
+            text,
+            truncated,
+            truncated_at_line,
+            sections: vec![section],
+        });
     }
 
     let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
     out.push_str(&header);
     let mut remaining = budget.saturating_sub(estimate_tokens(header.len() as u64));
+    let mut section_metas: Vec<SectionTruncation> = Vec::with_capacity(blocks.len());
+    let mut top_truncated = false;
+    let mut top_truncated_at_line: Option<u32> = None;
 
     for (i, b) in blocks.iter().enumerate() {
         let chunk = format!("\n\n─── lines {}-{} ───\n{}", b.start, b.end, b.text);
@@ -474,6 +525,11 @@ pub fn read_ranges_with_budget(
         if tokens <= remaining {
             out.push_str(&chunk);
             remaining -= tokens;
+            section_metas.push(SectionTruncation {
+                section: range_strs[i].clone(),
+                truncated: false,
+                truncated_at_line: None,
+            });
             continue;
         }
         if i == 0 {
@@ -481,7 +537,24 @@ pub fn read_ranges_with_budget(
             // pair (header + first block) so the cut lands at a clean line
             // boundary, then omit every later block.
             let single = format!("{header}{chunk}");
-            return Ok(crate::budget::apply(&single, budget));
+            let (truncated_text, info) = crate::budget::apply_with_info(&single, budget);
+            out = truncated_text;
+            top_truncated = true;
+            top_truncated_at_line = info.as_ref().map(|i| i.at_line);
+            section_metas.push(SectionTruncation {
+                section: range_strs[i].clone(),
+                truncated: true,
+                truncated_at_line: info.map(|i| i.at_line),
+            });
+            // Every later block is omitted entirely — no marker fits.
+            for later in &range_strs[i + 1..] {
+                section_metas.push(SectionTruncation {
+                    section: later.clone(),
+                    truncated: true,
+                    truncated_at_line: None,
+                });
+            }
+            break;
         }
         let marker = format!(
             "\n\n─── lines {}-{} ───\n... section omitted (budget exhausted) ...",
@@ -490,13 +563,38 @@ pub fn read_ranges_with_budget(
         let marker_tokens = estimate_tokens(marker.len() as u64);
         if marker_tokens > remaining {
             // Even the omission marker would overflow — stop emitting.
-            // Earlier markers (if any) already signal that omission occurred.
+            // Earlier markers (if any) already signal that omission occurred;
+            // record the remaining sections as truncated so callers can still
+            // detect the drop via `_meta.sections[]`.
+            for later in &range_strs[i..] {
+                section_metas.push(SectionTruncation {
+                    section: later.clone(),
+                    truncated: true,
+                    truncated_at_line: None,
+                });
+            }
+            top_truncated = true;
             break;
         }
         out.push_str(&marker);
         remaining -= marker_tokens;
+        top_truncated = true;
+        if top_truncated_at_line.is_none() {
+            top_truncated_at_line = Some((out.bytes().filter(|&c| c == b'\n').count() + 1) as u32);
+        }
+        section_metas.push(SectionTruncation {
+            section: range_strs[i].clone(),
+            truncated: true,
+            truncated_at_line: None,
+        });
     }
-    Ok(out)
+
+    Ok(BudgetedReadResult {
+        text: out,
+        truncated: top_truncated,
+        truncated_at_line: top_truncated_at_line,
+        sections: section_metas,
+    })
 }
 
 /// Shared block-resolver used by both budgeted and unbudgeted multi-section
@@ -1021,14 +1119,19 @@ mod tests {
 
     #[test]
     fn budgeted_passes_through_when_budget_ample() {
-        // Generous budget: emitted output must equal the unbudgeted variant.
+        // Generous budget: emitted text must equal the unbudgeted variant
+        // and report no truncation.
         let path = write_temp(
             "tilth_test_budgeted_passthrough.txt",
             "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
         );
         let plain = read_ranges(&path, &["1-2", "5-6"], false).unwrap();
-        let budgeted = read_ranges_with_budget(&path, &["1-2", "5-6"], false, 100_000).unwrap();
-        assert_eq!(plain, budgeted);
+        let result = read_ranges_with_budget(&path, &["1-2", "5-6"], false, 100_000).unwrap();
+        assert_eq!(plain, result.text);
+        assert!(!result.truncated);
+        assert!(result.truncated_at_line.is_none());
+        assert_eq!(result.sections.len(), 2);
+        assert!(result.sections.iter().all(|s| !s.truncated));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1046,8 +1149,9 @@ mod tests {
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_omit.txt", &body);
         let budget = 240u64;
-        let out =
+        let result =
             read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, budget).unwrap();
+        let out = &result.text;
         // First section emitted in full.
         assert!(out.contains("─── lines 1-3 ───"), "first marker: {out}");
         // Later sections show as omitted.
@@ -1064,19 +1168,28 @@ mod tests {
             "output {} tokens > budget {budget}: {out}",
             estimate_tokens(out.len() as u64)
         );
+        // Per-section flags reflect what was emitted.
+        assert!(result.truncated);
+        assert_eq!(result.sections.len(), 3);
+        assert_eq!(result.sections[0].section, "1-3");
+        assert!(!result.sections[0].truncated);
+        assert!(result.sections[1].truncated);
+        assert!(result.sections[2].truncated);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn budgeted_truncates_first_section_when_too_large() {
-        // Single requested section that alone exceeds the budget falls back to
-        // the standard truncator (`... truncated ...` sentinel).
+        // Single requested section that alone exceeds the budget falls back
+        // to the standard truncator (`... truncated ...` sentinel) and
+        // surfaces a truncated_at_line.
         let body: String = (0..200)
             .map(|i| format!("line-{i}-padding-padding-padding\n"))
             .collect();
         let path = write_temp("tilth_test_budgeted_first_too_large.txt", &body);
         let budget = 100u64;
-        let out = read_ranges_with_budget(&path, &["1-150"], false, budget).unwrap();
+        let result = read_ranges_with_budget(&path, &["1-150"], false, budget).unwrap();
+        let out = &result.text;
         assert!(
             out.contains("... truncated"),
             "expected truncation sentinel: {out}"
@@ -1086,6 +1199,13 @@ mod tests {
             "output {} tokens > budget {budget}: {out}",
             estimate_tokens(out.len() as u64)
         );
+        assert!(result.truncated);
+        assert!(
+            result.truncated_at_line.is_some(),
+            "expected a truncated_at_line for partial cut"
+        );
+        assert_eq!(result.sections.len(), 1);
+        assert!(result.sections[0].truncated);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1099,8 +1219,9 @@ mod tests {
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_order.txt", &body);
         let budget = 240u64;
-        let out =
+        let result =
             read_ranges_with_budget(&path, &["20-22", "1-3", "10-12"], false, budget).unwrap();
+        let out = &result.text;
         let pos_first = out.find("─── lines 20-22 ───").expect("first marker");
         let pos_second = out.find("─── lines 1-3 ───").expect("second marker");
         let pos_third = out.find("─── lines 10-12 ───").expect("third marker");
@@ -1128,13 +1249,17 @@ mod tests {
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_strict_cap.txt", &body);
         let budget = 80u64;
-        let out =
+        let result =
             read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, budget).unwrap();
+        let out = &result.text;
         assert!(
             estimate_tokens(out.len() as u64) <= budget,
             "output {} tokens > budget {budget}: {out}",
             estimate_tokens(out.len() as u64)
         );
+        // Per-section meta preserves user order.
+        let sections: Vec<&str> = result.sections.iter().map(|s| s.section.as_str()).collect();
+        assert_eq!(sections, vec!["1-3", "10-12", "20-22"]);
         let _ = std::fs::remove_file(&path);
     }
 }
