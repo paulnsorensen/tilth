@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
-use crate::index::SymbolIndex;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
@@ -18,7 +17,6 @@ use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 pub(crate) struct Services {
     pub(crate) cache: Arc<OutlineCache>,
     pub(crate) session: Arc<Session>,
-    pub(crate) index: Arc<SymbolIndex>,
     pub(crate) bloom: Arc<BloomFilterCache>,
     pub(crate) tracker: Arc<ThreadTracker>,
     pub(crate) edit_mode: bool,
@@ -29,7 +27,6 @@ impl Services {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
-            index: Arc::new(SymbolIndex::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             tracker: Arc::new(ThreadTracker::new()),
             edit_mode,
@@ -71,12 +68,14 @@ tilth_read: Read one or more files with smart outlining. Replaces cat/head/tail.
   path: \"a.rs\" for a single file.\n\
   Small files → full content. Large files → structural outline.\n\
   section: \"<start>-<end>\" or \"<heading text>\"\n\
+  sections: array of ranges/headings — multiple slices from the same file in one call.\n\
   Output:\n\
     <line_number> │ <content>                  ← full/section mode\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
 \n\
 tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
-  Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
+  patterns: run multiple globs in one call (e.g. patterns: [\"*.rs\", \"*.toml\"]).\n\
+  Output: <path>  (~<token_count> tokens).\n\
 \n\
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
@@ -368,17 +367,10 @@ fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String
     let edit_mode = services.edit_mode;
     match tool {
         "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
-        "tilth_search" => tool_search(
-            args,
-            &services.cache,
-            &services.session,
-            &services.index,
-            &services.bloom,
-        ),
-        "tilth_files" => tool_files(args, &services.cache),
-        "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
+        "tilth_search" => tool_search(args, &services.cache, &services.session, &services.bloom),
+        "tilth_files" => tool_files(args),
+        "tilth_deps" => tool_deps(args, &services.bloom),
         "tilth_diff" => tool_diff(args),
-        "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, &services.session),
         "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
         _ => Err(format!("unknown tool: {tool}")),
@@ -422,10 +414,37 @@ fn tool_read(
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = PathBuf::from(path_str);
     let section = args.get("section").and_then(|v| v.as_str());
+    let sections_arr = args.get("sections").and_then(|v| v.as_array());
     let full = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+
+    if section.is_some() && sections_arr.is_some() {
+        return Err("provide either section (single) or sections (array), not both".into());
+    }
+
+    // Multi-section path: bypass smart view + related-file hints (those only
+    // apply to whole-file reads).
+    if let Some(arr) = sections_arr {
+        let ranges: Vec<&str> = arr
+            .iter()
+            .map(|v| v.as_str().ok_or("sections must be an array of strings"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if ranges.is_empty() {
+            return Err("sections must contain at least one range".into());
+        }
+        if ranges.len() > 20 {
+            return Err(format!(
+                "sections limited to 20 per call (got {})",
+                ranges.len()
+            ));
+        }
+        session.record_read(&path);
+        let output =
+            crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
+        return Ok(apply_budget(output, budget));
+    }
 
     session.record_read(&path);
     let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
@@ -452,7 +471,6 @@ fn tool_search(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
-    index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
     let query = args
@@ -488,7 +506,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, index, bloom, expand, context, glob,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 2..=5 => {
@@ -496,7 +514,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, index, bloom, expand, context, glob,
+                        &queries, &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 _ => {
@@ -522,7 +540,7 @@ fn tool_search(
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, cache, session, bloom, expand, context, glob,
+                query, &scope, bloom, expand, context, glob,
             )
         }
         _ => {
@@ -538,26 +556,47 @@ fn tool_search(
     Ok(result)
 }
 
-fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
-    let pattern = args
-        .get("pattern")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: pattern")?;
+fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let output = crate::search::search_glob(pattern, &scope, cache).map_err(|e| e.to_string())?;
+    let single = args.get("pattern").and_then(|v| v.as_str());
+    let patterns_arr = args.get("patterns").and_then(|v| v.as_array());
+
+    if single.is_some() && patterns_arr.is_some() {
+        return Err("provide either pattern (single) or patterns (array), not both".into());
+    }
+
+    let patterns: Vec<&str> = if let Some(arr) = patterns_arr {
+        if arr.is_empty() {
+            return Err("patterns must contain at least one glob".into());
+        }
+        if arr.len() > 20 {
+            return Err(format!(
+                "patterns limited to 20 per call (got {})",
+                arr.len()
+            ));
+        }
+        arr.iter()
+            .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![single.ok_or("missing required parameter: pattern (or use patterns for batch)")?]
+    };
+
+    let mut blocks = Vec::with_capacity(patterns.len());
+    for p in &patterns {
+        let block = crate::search::search_glob(p, &scope).map_err(|e| e.to_string())?;
+        blocks.push(block);
+    }
+    let combined = blocks.join("\n\n");
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
+    result.push_str(&apply_budget(combined, budget));
     Ok(result)
 }
 
-fn tool_deps(
-    args: &Value,
-    cache: &OutlineCache,
-    bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
+fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -569,8 +608,8 @@ fn tool_deps(
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result = crate::search::deps::analyze_deps(&path, &scope, cache, bloom)
-        .map_err(|e| e.to_string())?;
+    let deps_result =
+        crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,
@@ -818,13 +857,15 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
          use this for all file reading. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `full` to force complete content. \
+         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
+         from the same file in one call. Use `full` to force complete content. \
          Use `paths` to read multiple files in one call."
     } else {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Small files return full content. Large files return \
          a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read specific line ranges. \
+         consuming your context window. Use `section` to read a specific line range or heading. \
+         Use `sections` to grab several disjoint slices from the same file in one call. \
          Use `full` to force complete content. Use `paths` to read multiple files in one call."
     };
     let mut tools = vec![
@@ -888,7 +929,12 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "section": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view."
+                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",
@@ -904,14 +950,18 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
+            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
             "inputSchema": {
                 "type": "object",
-                "required": ["pattern"],
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'"
+                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
                     },
                     "scope": {
                         "type": "string",
@@ -946,12 +996,6 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        // tilth_map disabled — benchmark data shows 62% of losing tasks use map
-        // vs 22% of winners. Re-enable after measuring impact.
-        // serde_json::json!({
-        //     "name": "tilth_map",
-        //     ...
-        // }),
         serde_json::json!({
             "name": "tilth_diff",
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
@@ -1247,6 +1291,73 @@ mod tests {
         std::env::set_current_dir(orig_cwd).unwrap();
     }
 
+    // -- tool_files multi-pattern --------------------------------------------
+
+    /// Build a small scratch project with .rs and .toml files, switch cwd to
+    /// it, and return the tempdir guard so the caller controls cleanup.
+    fn scratch_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        std::fs::write(p.join("Cargo.toml"), "[package]\nname = \"t\"").unwrap();
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(p.join("src/lib.rs"), "pub fn x() {}").unwrap();
+        project
+    }
+
+    #[test]
+    fn tool_files_patterns_emits_one_block_per_pattern() {
+        let project = scratch_project();
+        let args = serde_json::json!({
+            "patterns": ["*.rs", "*.toml"],
+            "scope": project.path().to_str().unwrap(),
+        });
+        let out = tool_files(&args).expect("tool_files should succeed");
+        // Two `# Glob:` headers — one per pattern.
+        let header_count = out.matches("# Glob:").count();
+        assert_eq!(header_count, 2, "expected 2 Glob headers, got: {out}");
+        assert!(out.contains("\"*.rs\""), "missing rs header in: {out}");
+        assert!(out.contains("\"*.toml\""), "missing toml header in: {out}");
+        // Files from both patterns appear in the combined output.
+        assert!(out.contains("main.rs"), "missing main.rs in: {out}");
+        assert!(out.contains("Cargo.toml"), "missing Cargo.toml in: {out}");
+    }
+
+    #[test]
+    fn tool_files_pattern_and_patterns_mutually_exclusive() {
+        let args = serde_json::json!({
+            "pattern": "*.rs",
+            "patterns": ["*.rs"],
+        });
+        let err = tool_files(&args).expect_err("expected mutual-exclusion error");
+        assert!(err.contains("either pattern"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_empty_patterns_errors() {
+        let args = serde_json::json!({ "patterns": [] });
+        let err = tool_files(&args).expect_err("expected empty-patterns error");
+        assert!(err.contains("at least one"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_patterns_capped_at_20() {
+        let twenty_one: Vec<&str> = vec!["*.rs"; 21];
+        let args = serde_json::json!({ "patterns": twenty_one });
+        let err = tool_files(&args).expect_err("expected cap error");
+        assert!(err.contains("limited to 20"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_missing_pattern_and_patterns_errors() {
+        let args = serde_json::json!({});
+        let err = tool_files(&args).expect_err("expected missing-pattern error");
+        assert!(
+            err.contains("missing required parameter"),
+            "unexpected error: {err}"
+        );
+    }
+
     // -- package_root fallback from subdirectory ------------------------------
 
     #[test]
@@ -1274,7 +1385,6 @@ mod tests {
         Services {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
-            index: Arc::new(SymbolIndex::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             tracker,
             edit_mode: false,

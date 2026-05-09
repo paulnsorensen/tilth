@@ -29,6 +29,7 @@ paths: ["a.rs", "b.rs"] reads many in one call (max 20). PREFER this over serial
 path: "a.rs" for a single file.
 Small files → full content. Large files → structural outline.
 section: "<start>-<end>" or "<heading text>"
+sections: array of ranges/headings — multiple slices from the same file in one call.
 Output:
 <line_number> │ <content>                  ← full/section mode
 [<start>-<end>]  <symbol name>             ← outline mode
