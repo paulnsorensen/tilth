@@ -326,9 +326,13 @@ fn tool_read(
             .map(|(i, v)| parse_batch_read_entry(i, v))
             .collect::<Result<_, _>>()?;
 
+        for spec in &specs {
+            session.record_read(&spec.path);
+        }
+
         let results: Vec<String> = specs
             .par_iter()
-            .map(|spec| read_batch_spec(spec, cache, session, edit_mode))
+            .map(|spec| read_batch_spec(spec, cache, edit_mode))
             .collect();
         return Ok(apply_budget(results.join("\n\n---\n\n"), budget));
     }
@@ -435,7 +439,7 @@ fn parse_batch_read_entry(index: usize, val: &Value) -> Result<BatchReadSpec, St
         Some(arr) => {
             if arr.is_empty() {
                 return Err(format!(
-                    "files[{index}]: sections must contain at least one range"
+                    "files[{index}]: sections must contain at least one range or heading"
                 ));
             }
             if arr.len() > 20 {
@@ -473,13 +477,7 @@ fn parse_batch_read_entry(index: usize, val: &Value) -> Result<BatchReadSpec, St
     })
 }
 
-fn read_batch_spec(
-    spec: &BatchReadSpec,
-    cache: &OutlineCache,
-    session: &Session,
-    edit_mode: bool,
-) -> String {
-    session.record_read(&spec.path);
+fn read_batch_spec(spec: &BatchReadSpec, cache: &OutlineCache, edit_mode: bool) -> String {
     let result = if let Some(sections) = &spec.sections {
         let ranges: Vec<&str> = sections.iter().map(String::as_str).collect();
         crate::read::read_ranges(&spec.path, &ranges, edit_mode).map_err(|e| e.to_string())
@@ -956,6 +954,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
+                "description": "Runtime validation requires exactly one read shape: path, paths, or files.",
                 "properties": {
                     "path": {
                         "type": "string",
