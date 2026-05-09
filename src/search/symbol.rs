@@ -39,9 +39,14 @@ fn stratum_for_display(m: &Match) -> u8 {
 
 /// Result shape for `search` — mirrors the MCP `kind` knob.
 ///
-/// `Strict` returns only AST-detected declarations (the `kind="symbol"`
-/// surface). `Any` adds word-boundary usage matches, including comments
-/// and strings (the `kind="any"` surface).
+/// `Strict` returns only declarations (the `kind="symbol"` surface):
+/// tree-sitter AST nodes where supported, with keyword-heuristic and
+/// markdown-heading fallbacks for code without grammars and for docs.
+/// No comment or string hits.
+///
+/// `Any` adds word-boundary usage matches alongside the strict
+/// declarations — usage call-sites plus comment/string mentions
+/// (the `kind="any"` surface).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolMode {
     Strict,
