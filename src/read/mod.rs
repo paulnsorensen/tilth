@@ -463,6 +463,10 @@ pub struct BudgetedReadResult {
     /// 1-indexed line (in the rendered output) of the first cut, when one
     /// occurred. Mirrors the top-level `_meta.truncated_at_line` field.
     pub truncated_at_line: Option<u32>,
+    /// Total line count the response would have had with no budget.
+    /// Populated only when truncation occurred so MCP hosts can render
+    /// "showing 1–N of M lines".
+    pub original_line_count: Option<u32>,
     /// One entry per input range, in input order.
     pub sections: Vec<SectionTruncation>,
 }
@@ -499,6 +503,7 @@ pub fn read_ranges_with_budget(
         let (text, info) = crate::budget::apply_with_info(&single, budget);
         let truncated = info.is_some();
         let truncated_at_line = info.as_ref().map(|i| i.at_line);
+        let original_line_count = info.as_ref().map(|i| i.original_line_count);
         let section = SectionTruncation {
             section: range_strs[0].clone(),
             truncated,
@@ -508,9 +513,16 @@ pub fn read_ranges_with_budget(
             text,
             truncated,
             truncated_at_line,
+            original_line_count,
             sections: vec![section],
         });
     }
+
+    // Pre-compute the line count of the would-have-been unbudgeted output so
+    // the MCP layer can emit `_meta.original_line_count` as the "of M" half
+    // of "showing 1–N of M lines". Mirrors the structure that `read_ranges`
+    // produces verbatim — no behaviour change when the budget is roomy.
+    let unbudgeted_lines = unbudgeted_line_count(&header, &blocks);
 
     let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
     out.push_str(&header);
@@ -589,12 +601,34 @@ pub fn read_ranges_with_budget(
         });
     }
 
+    let original_line_count = if top_truncated {
+        Some(unbudgeted_lines)
+    } else {
+        None
+    };
+
     Ok(BudgetedReadResult {
         text: out,
         truncated: top_truncated,
         truncated_at_line: top_truncated_at_line,
+        original_line_count,
         sections: section_metas,
     })
+}
+
+/// Count of newlines + 1 for the would-have-been unbudgeted multi-section
+/// output. Mirrors the layout `read_ranges` produces (header, then per-block
+/// `\n\n─── lines X-Y ───\n<block.text>`) without materialising the full
+/// string.
+fn unbudgeted_line_count(header: &str, blocks: &[Block]) -> u32 {
+    let header_newlines = header.bytes().filter(|&b| b == b'\n').count() as u64;
+    let mut newlines = header_newlines;
+    for b in blocks {
+        // Per-block prefix `\n\n─── lines X-Y ───\n` contributes 3 newlines.
+        newlines += 3;
+        newlines += b.text.bytes().filter(|&b| b == b'\n').count() as u64;
+    }
+    u32::try_from(newlines + 1).unwrap_or(u32::MAX)
 }
 
 /// Shared block-resolver used by both budgeted and unbudgeted multi-section
@@ -1130,6 +1164,8 @@ mod tests {
         assert_eq!(plain, result.text);
         assert!(!result.truncated);
         assert!(result.truncated_at_line.is_none());
+        // No truncation → no `original_line_count` (host already sees all M).
+        assert!(result.original_line_count.is_none());
         assert_eq!(result.sections.len(), 2);
         assert!(result.sections.iter().all(|s| !s.truncated));
         let _ = std::fs::remove_file(&path);
@@ -1170,6 +1206,19 @@ mod tests {
         );
         // Per-section flags reflect what was emitted.
         assert!(result.truncated);
+        // Truncation occurred → host needs the would-have-been total to render
+        // "showing 1–N of M lines". The unbudgeted output for ranges 1-3,
+        // 10-12, 20-22 is `header + 3 × (3 newlines + 3 content lines)`, so
+        // M must comfortably exceed what we emitted (which is just the first
+        // section + two omission markers).
+        let total = result
+            .original_line_count
+            .expect("truncation must surface original_line_count");
+        let emitted = result.text.bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        assert!(
+            total > emitted,
+            "original_line_count ({total}) must exceed emitted line count ({emitted})"
+        );
         assert_eq!(result.sections.len(), 3);
         assert_eq!(result.sections[0].section, "1-3");
         assert!(!result.sections[0].truncated);
@@ -1203,6 +1252,15 @@ mod tests {
         assert!(
             result.truncated_at_line.is_some(),
             "expected a truncated_at_line for partial cut"
+        );
+        // Single-section truncation still surfaces the pre-cut line count.
+        let total = result
+            .original_line_count
+            .expect("partial cut must surface original_line_count");
+        // Header is one line + blank line + 150 body lines ⇒ M ≥ 150.
+        assert!(
+            total >= 150,
+            "original_line_count ({total}) must cover the requested 150-line section"
         );
         assert_eq!(result.sections.len(), 1);
         assert!(result.sections[0].truncated);

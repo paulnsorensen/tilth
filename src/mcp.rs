@@ -438,6 +438,7 @@ fn apply_budget_with_meta(output: String, budget: Option<u64>) -> ToolOutput {
     });
     if let Some(i) = info {
         meta["truncated_at_line"] = serde_json::Value::from(i.at_line);
+        meta["original_line_count"] = serde_json::Value::from(i.original_line_count);
     }
     ToolOutput {
         text,
@@ -446,8 +447,10 @@ fn apply_budget_with_meta(output: String, budget: Option<u64>) -> ToolOutput {
 }
 
 /// Build the `_meta` JSON for a budgeted multi-section read: top-level
-/// `truncated` / `truncated_at_line` plus a `sections[]` array carrying
-/// individual flags.
+/// `truncated` / `truncated_at_line` / `original_line_count` plus a
+/// `sections[]` array carrying individual flags. `original_line_count` is
+/// emitted only when truncation occurred so MCP hosts can render the
+/// "showing 1–N of M lines" hint without re-reading the file.
 fn sections_meta(detail: &crate::read::BudgetedReadResult) -> Value {
     let sections: Vec<Value> = detail
         .sections
@@ -469,6 +472,9 @@ fn sections_meta(detail: &crate::read::BudgetedReadResult) -> Value {
     });
     if let Some(line) = detail.truncated_at_line {
         meta["truncated_at_line"] = Value::from(line);
+    }
+    if let Some(total) = detail.original_line_count {
+        meta["original_line_count"] = Value::from(total);
     }
     meta
 }
@@ -1550,8 +1556,10 @@ mod tests {
     // -- _meta surface ----------------------------------------------------------
 
     /// Single-section read clipped by budget must surface
-    /// `_meta.truncated = true` and a `truncated_at_line`. Without a budget
-    /// (or with a roomy one), no `_meta` is attached.
+    /// `_meta.truncated = true`, a `truncated_at_line`, and an
+    /// `original_line_count` so MCP hosts can render "showing 1–N of M
+    /// lines". Without a budget (or with a roomy one), no `_meta` is
+    /// attached.
     #[test]
     fn tool_read_single_section_meta_truncated() {
         let dir = tempfile::tempdir().unwrap();
@@ -1571,9 +1579,43 @@ mod tests {
         let out = tool_read(&args, &cache, &session, false).expect("must succeed");
         let meta = out.meta.expect("meta should be set when budget supplied");
         assert_eq!(meta["truncated"], serde_json::Value::Bool(true));
+        let cut_at = meta["truncated_at_line"]
+            .as_u64()
+            .expect("truncated_at_line must be present when truncation occurs");
+        let total = meta["original_line_count"]
+            .as_u64()
+            .expect("original_line_count must accompany a partial cut");
         assert!(
-            meta["truncated_at_line"].is_number(),
-            "truncated_at_line must be present when truncation occurs: {meta}"
+            total > cut_at,
+            "original_line_count ({total}) must exceed truncated_at_line ({cut_at})"
+        );
+    }
+
+    /// A roomy budget that doesn't actually clip must emit
+    /// `_meta.truncated = false` and OMIT `original_line_count` /
+    /// `truncated_at_line` — those fields exist to help hosts render the
+    /// "showing 1–N of M lines" hint and only make sense when M ≠ N.
+    #[test]
+    fn tool_read_roomy_budget_no_original_line_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+        let args = serde_json::json!({
+            "paths": [path.to_str().unwrap()],
+            "budget": 100_000u64,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("must succeed");
+        let meta = out.meta.expect("meta should be set when budget supplied");
+        assert_eq!(meta["truncated"], serde_json::Value::Bool(false));
+        assert!(
+            meta.get("original_line_count").is_none(),
+            "original_line_count must be omitted when no truncation occurred: {meta}"
+        );
+        assert!(
+            meta.get("truncated_at_line").is_none(),
+            "truncated_at_line must be omitted when no truncation occurred: {meta}"
         );
     }
 
@@ -1613,6 +1655,12 @@ mod tests {
         let out = tool_read(&args, &cache, &session, false).expect("must succeed");
         let meta = out.meta.expect("multi-section + budget must attach meta");
         assert_eq!(meta["truncated"], serde_json::Value::Bool(true));
+        // Truncation flips on `_meta.original_line_count` so MCP hosts can
+        // render the "of M" half of "showing 1–N of M lines".
+        assert!(
+            meta["original_line_count"].is_number(),
+            "original_line_count must accompany multi-section truncation: {meta}"
+        );
         let sections = meta["sections"]
             .as_array()
             .expect("sections array must be present");

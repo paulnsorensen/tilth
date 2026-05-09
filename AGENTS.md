@@ -37,6 +37,10 @@ tilth_read: File reading with smart outlining. Replaces cat/head/tail.
   Small files return full content. Large files return structural outline.
   section: "<start>-<end>" or "<heading text>" — only valid with a single-element paths array
   sections: array of ranges/headings for multiple slices — only valid with a single-element paths array
+  budget: <token cap> — when set, response carries_meta with truncation flags.
+    Single-file / batch / single-section: {truncated, truncated_at_line?, original_line_count?}
+    Multi-section: top-level flags plus sections: [{section, truncated, truncated_at_line?}, ...]
+    truncated_at_line + original_line_count are emitted only when the budget actually clipped output.
   Output modes:
     Full/section: <line_number> │ <content>
     Outline: [<start>-<end>]  <symbol name>

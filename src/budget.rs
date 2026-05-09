@@ -1,10 +1,13 @@
 use crate::types::estimate_tokens;
 
 /// Metadata returned alongside a truncated string so callers can surface
-/// "we cut at line N" without re-parsing the output.
+/// "we cut at line N of M" without re-parsing the output.
 pub struct TruncationInfo {
     /// 1-indexed line of the original output where the cut landed.
     pub at_line: u32,
+    /// Total line count of the input before truncation. Lets MCP hosts
+    /// render a "showing 1–N of M lines" hint without re-reading the file.
+    pub original_line_count: u32,
 }
 
 /// Apply token budget to output. Works backwards from the cap:
@@ -56,9 +59,17 @@ pub fn apply_with_info(output: &str, budget: u64) -> (String, Option<TruncationI
     );
 
     // Count newlines in the kept portion so callers can show "truncated at
-    // line N" without scanning the result themselves.
+    // line N" without scanning the result themselves, and on the full input
+    // so they can show "of M".
     let kept = &output[..header_end + cut_point];
     let at_line = (kept.bytes().filter(|&b| b == b'\n').count() + 1) as u32;
+    let original_line_count = (output.bytes().filter(|&b| b == b'\n').count() + 1) as u32;
 
-    (result, Some(TruncationInfo { at_line }))
+    (
+        result,
+        Some(TruncationInfo {
+            at_line,
+            original_line_count,
+        }),
+    )
 }
