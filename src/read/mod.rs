@@ -365,7 +365,7 @@ fn collect_atx_headings(
                 if h_clean.is_empty() {
                     continue;
                 }
-                let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
+                let dist = strsim::levenshtein(q_lower, &h_clean.to_ascii_lowercase());
                 let row = child.start_position().row;
                 let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
                 out.push((dist, line_text));
@@ -558,7 +558,7 @@ fn suggest_similar(path: &Path) -> Option<String> {
     for entry in entries.flatten() {
         let candidate = entry.file_name();
         let candidate = candidate.to_string_lossy();
-        let dist = edit_distance(name, &candidate);
+        let dist = strsim::levenshtein(name, &candidate);
         if dist <= 3 {
             match &best {
                 Some((d, _)) if dist < *d => best = Some((dist, candidate.into_owned())),
@@ -568,30 +568,6 @@ fn suggest_similar(path: &Path) -> Option<String> {
         }
     }
     best.map(|(_, name)| name)
-}
-
-/// Levenshtein distance over Unicode scalar values.
-///
-/// Operates on `char`s, not bytes — a single CJK or emoji glyph is one
-/// edit unit, not 3-4. Byte-level Levenshtein on UTF-8 inflates distances
-/// for non-ASCII content and breaks ranking for international markdown
-/// or filenames. Used by both filename suggestion (`suggest_similar`) and
-/// heading suggestion (`suggest_headings`).
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0; b.len() + 1];
-
-    for (i, &ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
 }
 
 /// Guess MIME type from extension for binary file headers.
@@ -799,20 +775,6 @@ mod tests {
             !suggestions.iter().any(|h| h.contains("NoSpace")),
             "##NoSpace leaked as heading: {suggestions:?}"
         );
-    }
-
-    /// edit_distance must operate on `char`s so non-ASCII headings rank
-    /// correctly. Byte-level Levenshtein would inflate distances for
-    /// CJK or emoji because those occupy 3–4 bytes per scalar value.
-    #[test]
-    fn edit_distance_is_unicode_aware() {
-        // 设置 (Settings) and 設定 (Configuration) — different chars,
-        // each one Unicode scalar. Distance should be 2, not 6.
-        assert_eq!(edit_distance("设置", "設定"), 2);
-        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
-        assert_eq!(edit_distance("🦀", "🐙"), 1);
-        // ASCII baseline still works.
-        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
