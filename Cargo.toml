@@ -65,6 +65,9 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+# String similarity (char-aware Levenshtein for filename / heading suggestions)
+strsim = "0.11"
+
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
