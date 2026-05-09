@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -299,6 +300,32 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
+    // Rich batch read: each file can request whole-file smart view, full
+    // content, one section, or many sections.
+    if let Some(files_arr) = args.get("files").and_then(|v| v.as_array()) {
+        if files_arr.is_empty() {
+            return Err("files array is empty".into());
+        }
+        if files_arr.len() > 20 {
+            return Err(format!(
+                "batch read limited to 20 files (got {})",
+                files_arr.len()
+            ));
+        }
+
+        let specs: Vec<BatchReadSpec> = files_arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| parse_batch_read_entry(i, v))
+            .collect::<Result<_, _>>()?;
+
+        let results: Vec<String> = specs
+            .par_iter()
+            .map(|spec| read_batch_spec(spec, cache, session, edit_mode))
+            .collect();
+        return Ok(apply_budget(results.join("\n\n---\n\n"), budget));
+    }
+
     // Multi-file batch read (capped at 20 to bound I/O).
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
         if paths_arr.len() > 20 {
@@ -379,6 +406,91 @@ fn tool_read(
     }
 
     Ok(apply_budget(output, budget))
+}
+
+struct BatchReadSpec {
+    path: PathBuf,
+    section: Option<String>,
+    sections: Option<Vec<String>>,
+    full: bool,
+}
+
+fn parse_batch_read_entry(index: usize, val: &Value) -> Result<BatchReadSpec, String> {
+    let path = val
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("files[{index}]: missing 'path'"))?;
+    let section = val
+        .get("section")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let sections = match val.get("sections").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            if arr.is_empty() {
+                return Err(format!(
+                    "files[{index}]: sections must contain at least one range"
+                ));
+            }
+            if arr.len() > 20 {
+                return Err(format!(
+                    "files[{index}]: sections limited to 20 per file (got {})",
+                    arr.len()
+                ));
+            }
+            Some(
+                arr.iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| format!("files[{index}]: sections must be strings"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+        None => None,
+    };
+    if section.is_some() && sections.is_some() {
+        return Err(format!(
+            "files[{index}]: provide either section (single) or sections (array), not both"
+        ));
+    }
+    let full = val
+        .get("full")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(BatchReadSpec {
+        path: PathBuf::from(path),
+        section,
+        sections,
+        full,
+    })
+}
+
+fn read_batch_spec(
+    spec: &BatchReadSpec,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+) -> String {
+    session.record_read(&spec.path);
+    let result = if let Some(sections) = &spec.sections {
+        let ranges: Vec<&str> = sections.iter().map(String::as_str).collect();
+        crate::read::read_ranges(&spec.path, &ranges, edit_mode).map_err(|e| e.to_string())
+    } else {
+        crate::read::read_file(
+            &spec.path,
+            spec.section.as_deref(),
+            spec.full,
+            cache,
+            edit_mode,
+        )
+        .map_err(|e| e.to_string())
+    };
+
+    match result {
+        Ok(output) => output,
+        Err(e) => format!("# {} — error: {}", spec.path.display(), e),
+    }
 }
 
 fn tool_search(
@@ -846,6 +958,37 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": 20,
                         "description": "Multiple file paths to read in one call (max 20). Each file gets independent smart handling. PREFER this over serial single-file reads — saves a turn per extra file."
+                    },
+                    "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Rich batch read for mixed whole-file and section reads. Use this instead of serial tilth_read calls when different files need different sections/full settings.",
+                        "items": {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Absolute or relative file path to read."
+                                },
+                                "section": {
+                                    "type": "string",
+                                    "description": "Single line range or heading for this file."
+                                },
+                                "sections": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "maxItems": 20,
+                                    "description": "Multiple line ranges or headings from this file in one call."
+                                },
+                                "full": {
+                                    "type": "boolean",
+                                    "default": false,
+                                    "description": "Force full content for this file."
+                                }
+                            }
+                        }
                     },
                     "section": {
                         "type": "string",
@@ -1420,6 +1563,54 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+    }
+
+    #[test]
+    fn batch_read_files_supports_per_file_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "a1\na2\na3\na4\n").unwrap();
+        std::fs::write(&b, "b1\nb2\nb3\nb4\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": a.to_str().unwrap(),
+                    "sections": ["1-1", "3-3"]
+                },
+                {
+                    "path": b.to_str().unwrap(),
+                    "section": "2-2"
+                }
+            ]
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let result = tool_read(&args, &cache, &session, false)
+            .expect("rich batch read must support per-file sections");
+
+        assert!(
+            result.contains("a1"),
+            "must include first requested section: {result}"
+        );
+        assert!(
+            result.contains("a3"),
+            "must include second requested section: {result}"
+        );
+        assert!(
+            result.contains("b2"),
+            "must include other file section: {result}"
+        );
+        assert!(
+            !result.contains("a2") && !result.contains("b1"),
+            "must not fall back to whole-file reads: {result}"
+        );
+        assert!(
+            result.contains("---"),
+            "must separate file sections: {result}"
+        );
     }
 
     // -- batch tool_edit --------------------------------------------------------

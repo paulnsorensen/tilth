@@ -1,55 +1,45 @@
-tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
+tilth — code intelligence MCP server. Use it instead of grep/cat/find/ls.
 
-## Core Principles
+## Fast path
 
-ALWAYS BATCH: When you have 2+ files to read, call tilth_read with paths: [...]. When you have edits to multiple files, call tilth_edit with files: [...]. Never make N serial calls when one will do — each tool call is a turn.
+1. Search first: use tilth_search for symbols, text, usages, and callers. It often returns enough source to avoid a read.
+2. Batch every independent operation. One tool call is one turn.
+3. Do not re-read source already expanded by search results.
+4. Use host Bash only for builds/tests or commands tilth cannot do.
 
-Search first: To explore code, always call tilth_search before reaching for other tools. It finds definitions, usages, and file locations in one call.
+## Batching patterns
 
-DO NOT use Grep, Read, or Glob. Use tilth_search (grep), tilth_read (read), tilth_files (glob) instead.
-DO NOT use Bash(grep/rg/cat/head/tail/find/ls). Use the tilth tools.
-DO NOT re-read files already shown in expanded search results.
+- Many files, same smart behavior: `tilth_read({ "paths": ["a.rs", "b.rs"] })`.
+- Many sections in one file: `tilth_read({ "path": "a.rs", "sections": ["10-40", "90-130"] })`.
+- Mixed files/sections/full reads: `tilth_read({ "files": [{ "path": "a.rs", "sections": ["10-40"] }, { "path": "b.rs", "full": true }] })`.
+- Many globs: `tilth_files({ "patterns": ["src/**/*.rs", "tests/**/*.rs"] })`.
+- Many symbols: `tilth_search({ "query": "parse_anchor,apply_batch,tool_read" })` (max 5).
+
+Prefer these batched shapes before making a second tilth call.
 
 ## Tools
 
-tilth_search: Code search — finds definitions, usages, and text. Replaces grep/rg.
-  Usage: tilth_search(query: "handleRequest")
-  For multi-symbol lookup, separate with comma: "symbol1,symbol2" (max 5)
-  kind: "symbol" (default, declarations only — no comment/string hits) | "any" (declarations + usages + comment/string mentions) | "content" (literal text in strings/comments) | "regex" (regex pattern over file content) | "callers" (call sites of a symbol)
-  expand: (default 2) inline full source for top matches
-  context: path to file being edited — boosts nearby results
-  glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude)
-  Output per match:
-    ## <path>:<start>-<end> [definition|usage|impl]
-    <outline context>
-    <expanded source block>
-    ── calls ──
-    <name>  <path>:<start>-<end>  <signature>
-    ── siblings ──
-    <name>  <path>:<start>-<end>  <signature>
-  Re-expanding a previously shown definition returns [shown earlier].
+tilth_search: AST-aware code search.
+- `query`: symbol, literal text, regex, or comma-separated symbols (max 5).
+- `kind`: `symbol` declarations (default), `any`, `content`, `regex`, `callers`.
+- `expand`: number of top matches to inline.
+- `context`: path being edited, for ranking nearby results.
+- `glob`: include/exclude files, e.g. `"*.rs"`, `"!*.test.ts"`, `"src/**/*.{ts,tsx}"`.
 
-tilth_read: File reading with smart outlining. Replaces cat/head/tail.
-  Usage: tilth_read(path: "a.rs") or tilth_read(paths: ["a.rs", "b.rs"]) (max 20 files in one call)
-  Small files return full content. Large files return structural outline.
-  section: "<start>-<end>" or "<heading text>" to read a specific slice
-  sections: array of ranges/headings for multiple slices from the same file in one call
-  Output modes:
-    Full/section: <line_number> │ <content>
-    Outline: [<start>-<end>]  <symbol name>
+tilth_read: Smart file reading.
+- `path`: one file. `section`: one range/heading. `sections`: many ranges/headings from that file.
+- `paths`: up to 20 files with the same smart behavior.
+- `files`: up to 20 per-file specs, each with `path`, optional `section`, `sections`, or `full`.
+- Large files outline first; read only the needed sections afterward.
 
-tilth_files: File glob search. Replaces find, ls, pwd.
-  Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — run multiple globs in one call
-  Output: <path>  (~<token_count> tokens)
+tilth_files: File discovery.
+- `pattern`: one glob. `patterns`: up to 20 globs in one call.
+- Use instead of directory listing commands.
 
-tilth_deps: Blast-radius check before signature changes.
-  Shows what imports this file and what it imports.
-  Use ONLY before renaming, removing, or changing an export's signature.
+tilth_deps: Blast-radius check only before renaming/removing exports, changing signatures, or changing behavior callers rely on.
 
-tilth_diff: Structural diff at function level. Replaces Bash(git diff/git log --patch).
-  Usage: tilth_diff(source: "HEAD~1") for last commit, or no args for uncommitted changes
-  scope: "file.rs" or "file.rs:fn_name" to limit to a specific function
-  log: "HEAD~5..HEAD" for per-commit summaries
-  search: filter to lines matching a term
-  blast: true to show callers of changed function signatures
-  Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed
+tilth_diff: Structural diff.
+- No args: uncommitted overview.
+- `scope`: file/directory, `search`: filter, `expand`: changed symbols to show, `blast`: caller warnings.
+- `source`: `uncommitted`, `staged`, a ref/range, or use `a`+`b`, `patch`, or `log`.
+- Output markers: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed

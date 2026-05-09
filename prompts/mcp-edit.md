@@ -1,38 +1,38 @@
-tilth_edit: Batch edit files using hash-anchored lines. Replaces the host Edit tool.
+tilth_edit: Batch editing with hashline anchors from tilth_read.
 
-ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.
+## Edit workflow
 
-Workflow: tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.
-Note: tilth_search does NOT provide hashes — you MUST tilth_read the file or section first to get them.
+1. Read once, in batches, before editing:
+   - Different files/sections: `tilth_read({ "files": [{ "path": "a.rs", "sections": ["10-40", "90-120"] }, { "path": "b.rs", "section": "5-30" }] })`.
+   - One file with disjoint edit sites: use `sections`, not serial reads.
+2. Copy exact `line:hash` anchors from hashline output.
+3. Send all independent edits in one tilth_edit call:
+   - One file: one `files` entry with many `edits`.
+   - Many files: many `files` entries in the same call.
+4. If a file reports a hash mismatch, re-read only that file/section and retry only its failed edits.
 
-Request shape:
+## Request shape
+
 ```json
 {
   "files": [
     {
       "path": "a.rs",
       "edits": [
-        {"start": "<line>:<hash>", "content": "<new code>"},
-        {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."},
-        {"start": "<line>:<hash>", "content": ""}
+        { "start": "10:abc", "content": "replacement line" },
+        { "start": "20:def", "end": "25:123", "content": "multi\nline\nreplacement" },
+        { "start": "40:999", "content": "" }
       ]
-    },
-    {"path": "b.rs", "edits": [...]}
+    }
   ],
   "diff": true
 }
 ```
 
-Edit forms inside `edits`:
-- Single line: {"start": "<line>:<hash>", "content": "<new code>"}
-- Range: {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
-- Delete: {"start": "<line>:<hash>", "content": ""}
-
-Behavior:
-- Each file is processed independently. A hash mismatch on one file does NOT block the others.
-- Hash mismatch means the file changed after you read it. Re-read THAT file and retry (other files in the batch already applied).
-- Large files: tilth_read shows outline — use section to get hashlined content.
-- Pass diff: true to see a compact before/after diff per file.
-- After editing a function signature, tilth_edit shows callers that may need updating.
+- `start`/`end`: anchors from tilth_read hashlines. Omit `end` for a single-line replace.
+- `content`: replacement text. Empty string deletes the line/range.
+- `diff: true`: include compact before/after output.
+- Each file applies independently; one file's failure does not block the others.
+- After signature changes, tilth_edit may append caller blast-radius warnings.
 
 DO NOT use the host Edit tool. Use tilth_edit for all edits.
