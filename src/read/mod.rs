@@ -420,6 +420,82 @@ struct Block {
 /// ranges are honored verbatim, not coalesced or sorted. Any invalid
 /// range fails the whole call.
 pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<String, TilthError> {
+    let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
+    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
+
+    if blocks.len() == 1 {
+        let b = &blocks[0];
+        return Ok(format!("{header}\n\n{}", b.text));
+    }
+
+    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
+    out.push_str(&header);
+    for b in &blocks {
+        let _ = write!(out, "\n\n─── lines {}-{} ───\n", b.start, b.end);
+        out.push_str(&b.text);
+    }
+    Ok(out)
+}
+
+/// Like [`read_ranges`], but with a shared token budget across all sections.
+///
+/// Walks blocks in user order, deducting each from the remaining budget as
+/// it is emitted. When the budget is exhausted, later blocks are replaced
+/// with a single `... section omitted (budget exhausted) ...` line under
+/// their `─── lines X-Y ───` marker so callers can still see which ranges
+/// were dropped. If the very first block alone exceeds the budget, it is
+/// truncated by [`crate::budget::apply`] and all later blocks are omitted.
+pub fn read_ranges_with_budget(
+    path: &Path,
+    ranges: &[&str],
+    edit_mode: bool,
+    budget: u64,
+) -> Result<String, TilthError> {
+    let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
+    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
+
+    if blocks.len() == 1 {
+        let single = format!("{header}\n\n{}", blocks[0].text);
+        return Ok(crate::budget::apply(&single, budget));
+    }
+
+    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
+    out.push_str(&header);
+    let mut remaining = budget.saturating_sub(estimate_tokens(header.len() as u64));
+
+    for (i, b) in blocks.iter().enumerate() {
+        let chunk = format!("\n\n─── lines {}-{} ───\n{}", b.start, b.end, b.text);
+        let tokens = estimate_tokens(chunk.len() as u64);
+        if tokens <= remaining {
+            out.push_str(&chunk);
+            remaining -= tokens;
+        } else if i == 0 {
+            // First block alone won't fit. Use the standard truncator on the
+            // pair (header + first block) so the cut lands at a clean line
+            // boundary, then omit every later block.
+            let single = format!("{header}{chunk}");
+            out = crate::budget::apply(&single, budget);
+            remaining = 0;
+        } else {
+            let _ = write!(
+                out,
+                "\n\n─── lines {}-{} ───\n... section omitted (budget exhausted) ...",
+                b.start, b.end
+            );
+            remaining = 0;
+        }
+    }
+    Ok(out)
+}
+
+/// Shared block-resolver used by both budgeted and unbudgeted multi-section
+/// readers. Returns the blocks in input order plus running totals for the
+/// file header.
+fn collect_blocks(
+    path: &Path,
+    ranges: &[&str],
+    edit_mode: bool,
+) -> Result<(Vec<Block>, u64, u32), TilthError> {
     if ranges.is_empty() {
         return Err(TilthError::InvalidQuery {
             query: String::new(),
@@ -437,7 +513,6 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     })?;
     let buf = &mmap[..];
 
-    // Find line offsets once — shared across all ranges.
     let mut line_offsets: Vec<usize> = vec![0];
     for pos in memchr::memchr_iter(b'\n', buf) {
         line_offsets.push(pos + 1);
@@ -479,20 +554,7 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
         });
     }
 
-    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
-
-    if blocks.len() == 1 {
-        let b = &blocks[0];
-        return Ok(format!("{header}\n\n{}", b.text));
-    }
-
-    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
-    out.push_str(&header);
-    for b in &blocks {
-        let _ = write!(out, "\n\n─── lines {}-{} ───\n", b.start, b.end);
-        out.push_str(&b.text);
-    }
-    Ok(out)
+    Ok((blocks, total_bytes, total_lines))
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
@@ -943,6 +1005,80 @@ mod tests {
             .any(|l| l.starts_with("6:") && l.contains("|zeta"));
         assert!(line_one_match, "expected hashline for line 1: {out}");
         assert!(line_six_match, "expected hashline for line 6: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_passes_through_when_budget_ample() {
+        // Generous budget: emitted output must equal the unbudgeted variant.
+        let path = write_temp(
+            "tilth_test_budgeted_passthrough.txt",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
+        );
+        let plain = read_ranges(&path, &["1-2", "5-6"], false).unwrap();
+        let budgeted = read_ranges_with_budget(&path, &["1-2", "5-6"], false, 100_000).unwrap();
+        assert_eq!(plain, budgeted);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_omits_later_sections_when_exhausted() {
+        // Tight budget: section 1 fits, section 2 omitted, section 3 omitted.
+        // Each section is roughly 250 bytes ≈ 62 tokens. Header reserve plus
+        // one section just fits in 90 tokens; later sections are dropped.
+        let big_line = "x".repeat(50);
+        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let path = write_temp("tilth_test_budgeted_omit.txt", &body);
+        let out = read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, 90).unwrap();
+        // First section emitted in full.
+        assert!(out.contains("─── lines 1-3 ───"), "first marker: {out}");
+        // Later sections show as omitted.
+        assert!(
+            out.contains("─── lines 10-12 ───\n... section omitted (budget exhausted) ..."),
+            "second omitted: {out}"
+        );
+        assert!(
+            out.contains("─── lines 20-22 ───\n... section omitted (budget exhausted) ..."),
+            "third omitted: {out}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_truncates_first_section_when_too_large() {
+        // Single requested section that alone exceeds the budget falls back to
+        // the standard truncator (`... truncated ...` sentinel).
+        let body: String = (0..200)
+            .map(|i| format!("line-{i}-padding-padding-padding\n"))
+            .collect();
+        let path = write_temp("tilth_test_budgeted_first_too_large.txt", &body);
+        let out = read_ranges_with_budget(&path, &["1-150"], false, 100).unwrap();
+        assert!(
+            out.contains("... truncated"),
+            "expected truncation sentinel: {out}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_preserves_user_order_until_exhaustion() {
+        // Ranges out of order: still emitted in user order, with the first
+        // ones consuming budget and later ones omitted in the same order.
+        let big_line = "y".repeat(50);
+        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let path = write_temp("tilth_test_budgeted_order.txt", &body);
+        let out = read_ranges_with_budget(&path, &["20-22", "1-3", "10-12"], false, 90).unwrap();
+        let pos_first = out.find("─── lines 20-22 ───").expect("first marker");
+        let pos_second = out.find("─── lines 1-3 ───").expect("second marker");
+        let pos_third = out.find("─── lines 10-12 ───").expect("third marker");
+        assert!(
+            pos_first < pos_second && pos_second < pos_third,
+            "order: {out}"
+        );
+        assert!(
+            out.contains("─── lines 10-12 ───\n... section omitted (budget exhausted) ..."),
+            "third must be the omitted one: {out}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
