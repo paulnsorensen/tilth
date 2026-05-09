@@ -1066,17 +1066,30 @@ end
         );
         assert!(strict_result.matches[0].is_definition);
 
-        // SymbolMode::Any: comment + definition + usage all returned
+        // SymbolMode::Any: comment (line 1) + definition (line 2) + usage (line 5).
         let any_result =
             super::search("Foo", tmp.path(), None, None, super::SymbolMode::Any).unwrap();
+        let any_lines: Vec<(u32, bool)> = any_result
+            .matches
+            .iter()
+            .map(|m| (m.line, m.is_definition))
+            .collect();
+        assert_eq!(
+            any_result.matches.len(),
+            3,
+            "SymbolMode::Any should return exactly 3 matches (comment + def + usage), got: {any_lines:?}"
+        );
         assert!(
-            any_result.matches.len() > 1,
-            "SymbolMode::Any should return more than 1 match, got: {:?}",
-            any_result
-                .matches
-                .iter()
-                .map(|m| (m.line, &m.text))
-                .collect::<Vec<_>>()
+            any_lines.contains(&(2, true)),
+            "Any should include the class definition at line 2, got: {any_lines:?}"
+        );
+        assert!(
+            any_lines.contains(&(1, false)),
+            "Any should include the comment hit at line 1, got: {any_lines:?}"
+        );
+        assert!(
+            any_lines.contains(&(5, false)),
+            "Any should include the usage at line 5, got: {any_lines:?}"
         );
     }
 

@@ -411,10 +411,10 @@ fn tool_search(
     let output = match kind {
         "symbol" | "any" => {
             use crate::search::symbol::SymbolMode;
-            let mode = match kind {
-                "symbol" => SymbolMode::Strict,
-                "any" => SymbolMode::Any,
-                _ => unreachable!("outer match limits kind to symbol|any"),
+            let mode = if kind == "symbol" {
+                SymbolMode::Strict
+            } else {
+                SymbolMode::Any
             };
             let queries: Vec<&str> = query
                 .split(',')
