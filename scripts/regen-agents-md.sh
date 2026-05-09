@@ -21,4 +21,9 @@ fi
   cat "$edit"
 } > "$out"
 
+# Auto-fix markdown formatting (idempotent)
+if command -v markdownlint-cli2 &>/dev/null; then
+  markdownlint-cli2 --fix --config .markdownlint.json "$out" >/dev/null 2>&1 || true
+fi
+
 echo "wrote $out ($(wc -c < "$out") bytes)"

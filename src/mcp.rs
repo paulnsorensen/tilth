@@ -1079,7 +1079,7 @@ mod tests {
             &s[..60.min(s.len())]
         );
         assert!(
-            s.ends_with("DO NOT re-read files already shown in expanded search results."),
+            s.ends_with("[+] added, [-] deleted, [~] body changed, [~:sig] signature changed"),
             "missing closing anchor"
         );
         assert!(
@@ -1093,7 +1093,7 @@ mod tests {
         let s = build_instructions(true, "");
         assert!(
             s.contains(
-                "DO NOT re-read files already shown in expanded search results.\n\ntilth_edit:"
+                "[+] added, [-] deleted, [~] body changed, [~:sig] signature changed\n\ntilth_edit:"
             ),
             "expected single blank-line separator between base and edit-mode sections"
         );
