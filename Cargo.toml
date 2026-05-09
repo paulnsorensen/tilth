@@ -73,8 +73,14 @@ thiserror = "2"
 # Bloom filter (fast SIMD-optimized impl)
 fastbloom = "0.17"
 
-# String similarity (fuzzy symbol-rename detection)
+# String similarity (fuzzy symbol-rename detection, char-aware Levenshtein)
 strsim = "0.11"
+
+# URI percent-decoding (file:// roots from MCP host)
+percent-encoding = "2.3"
+
+# Cross-platform home directory lookup (cargo-team maintained)
+home = "0.5"
 
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
