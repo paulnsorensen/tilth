@@ -716,6 +716,7 @@ dependencies = [
  "serde",
  "serde_json",
  "streaming-iterator",
+ "strsim",
  "tempfile",
  "terminal_size",
  "toml",
