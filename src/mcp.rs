@@ -410,7 +410,12 @@ fn tool_search(
 
     let output = match kind {
         "symbol" | "any" => {
-            let strict = kind == "symbol";
+            use crate::search::symbol::SymbolMode;
+            let mode = match kind {
+                "symbol" => SymbolMode::Strict,
+                "any" => SymbolMode::Any,
+                _ => unreachable!("outer match limits kind to symbol|any"),
+            };
             let queries: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -421,7 +426,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, strict,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob, mode,
                     )
                 }
                 2..=5 => {
@@ -429,7 +434,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, strict,
+                        &queries, &scope, cache, session, bloom, expand, context, glob, mode,
                     )
                 }
                 _ => {

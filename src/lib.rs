@@ -166,7 +166,15 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob, false,
+                &parts,
+                scope,
+                cache,
+                &session,
+                &bloom,
+                expand,
+                None,
+                glob,
+                search::symbol::SymbolMode::Any,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -230,7 +238,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
-            false,
+            search::symbol::SymbolMode::Any,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -254,7 +262,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
-            false,
+            search::symbol::SymbolMode::Any,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,

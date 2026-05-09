@@ -37,15 +37,26 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
+/// Result shape for `search` — mirrors the MCP `kind` knob.
+///
+/// `Strict` returns only AST-detected declarations (the `kind="symbol"`
+/// surface). `Any` adds word-boundary usage matches, including comments
+/// and strings (the `kind="any"` surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolMode {
+    Strict,
+    Any,
+}
+
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
-/// When `strict` is true, only declaration matches are returned (no comment/string/usage hits).
+/// `SymbolMode::Strict` drops usage matches entirely; `SymbolMode::Any` keeps them.
 pub fn search(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
-    strict: bool,
+    mode: SymbolMode,
 ) -> Result<SearchResult, TilthError> {
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -67,7 +78,7 @@ pub fn search(
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
-    if !strict {
+    if mode == SymbolMode::Any {
         for m in usages {
             let dominated = merged[..def_count]
                 .iter()
@@ -1035,8 +1046,9 @@ end
         let path = tmp.path().join("test_strict.py");
         std::fs::write(&path, py_code).unwrap();
 
-        // strict=true: only the class definition line
-        let strict_result = super::search("Foo", tmp.path(), None, None, true).unwrap();
+        // SymbolMode::Strict: only the class definition line
+        let strict_result =
+            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Strict).unwrap();
         assert_eq!(
             strict_result.matches.len(),
             1,
@@ -1053,11 +1065,12 @@ end
         );
         assert!(strict_result.matches[0].is_definition);
 
-        // strict=false: comment + definition + usage all returned
-        let any_result = super::search("Foo", tmp.path(), None, None, false).unwrap();
+        // SymbolMode::Any: comment + definition + usage all returned
+        let any_result =
+            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Any).unwrap();
         assert!(
             any_result.matches.len() > 1,
-            "non-strict mode should return more than 1 match, got: {:?}",
+            "SymbolMode::Any should return more than 1 match, got: {:?}",
             any_result
                 .matches
                 .iter()
