@@ -777,6 +777,20 @@ mod tests {
         );
     }
 
+    /// Filename and heading suggestion rely on Unicode-scalar-level edit
+    /// distance (not byte-level) so CJK and emoji rank correctly. Locks in
+    /// the contract we depend on from `strsim::levenshtein`.
+    #[test]
+    fn levenshtein_is_unicode_aware() {
+        // 设置 (Settings) and 設定 (Configuration) — different chars,
+        // each one Unicode scalar. Distance should be 2, not 6.
+        assert_eq!(strsim::levenshtein("设置", "設定"), 2);
+        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
+        assert_eq!(strsim::levenshtein("🦀", "🐙"), 1);
+        // ASCII baseline still works.
+        assert_eq!(strsim::levenshtein("kitten", "sitting"), 3);
+    }
+
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
         use std::io::Write;
         let path = std::env::temp_dir().join(name);
