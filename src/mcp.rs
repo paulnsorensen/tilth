@@ -134,7 +134,9 @@ tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the
     Range:       {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
     Delete:      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
   Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.\n\
+  isError is false whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.\n\
   Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).\n\
+  A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.\n\
   Each file path may appear at most once per call — group all edits for a file under its single entry.\n\
   Large files: tilth_read shows outline — use section to get hashlined content.\n\
   Pass diff: true to see a compact before/after diff per file.\n\
@@ -723,6 +725,13 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
         };
     };
 
+    if edits_val.is_empty() {
+        return FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg: "'edits' array is empty — omit this file or add at least one edit".into(),
+        };
+    }
+
     let mut edits = Vec::with_capacity(edits_val.len());
     for (i, e) in edits_val.iter().enumerate() {
         match parse_edit_entry(i, e) {
@@ -769,28 +778,6 @@ fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
     })
 }
 
-/// Return an error if any two `Ready` tasks resolve to the same file.
-/// Canonicalising catches the obvious aliases (`./a.rs` vs `a.rs`) before two
-/// rayon workers can race writes against the same inode and silently lose an
-/// edit. Falls back to the raw path when the file does not yet exist on disk;
-/// either way, distinct keys are required to dispatch.
-fn detect_duplicate_paths(tasks: &[crate::edit::FileEditTask]) -> Option<String> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    for task in tasks {
-        if let crate::edit::FileEditTask::Ready { path, .. } = task {
-            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(key) {
-                return Some(format!(
-                    "duplicate file path in batch: {} — group all edits for a file under one entry",
-                    path.display()
-                ));
-            }
-        }
-    }
-    None
-}
-
 fn tool_edit(
     args: &Value,
     session: &Session,
@@ -822,7 +809,10 @@ fn tool_edit(
         .map(|(i, v)| parse_file_edit(i, v))
         .collect();
 
-    if let Some(msg) = detect_duplicate_paths(&tasks) {
+    // Fast-fail on duplicates before touching session state. apply_batch
+    // re-runs the same check as an encapsulation guarantee for any future
+    // caller that bypasses this wire layer.
+    if let Some(msg) = crate::edit::detect_duplicate_paths(&tasks) {
         return Err(msg);
     }
 
@@ -1147,7 +1137,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Each file path may appear at most once per call. Max 20 files per call.",
+            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -1451,6 +1441,26 @@ mod tests {
             err.contains("missing required parameter"),
             "unexpected error: {err}"
         );
+    }
+
+    // -- parse_file_edit edge cases -------------------------------------------
+
+    #[test]
+    fn parse_file_edit_rejects_empty_edits_array() {
+        // Schema says minItems: 1, but schema validation is advisory — enforce
+        // at runtime so a client that bypasses the schema can't silently get
+        // a no-op success.
+        let val = serde_json::json!({ "path": "noop.txt", "edits": [] });
+        let task = parse_file_edit(0, &val);
+        match task {
+            crate::edit::FileEditTask::ParseError { label, msg } => {
+                assert_eq!(label, "noop.txt");
+                assert!(msg.contains("empty"), "unexpected msg: {msg}");
+            }
+            crate::edit::FileEditTask::Ready { .. } => {
+                panic!("empty edits array should produce a ParseError, not Ready");
+            }
+        }
     }
 
     // -- package_root fallback from subdirectory ------------------------------

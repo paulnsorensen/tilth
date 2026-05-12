@@ -60,7 +60,9 @@ Edit forms inside `edits`:
   Range:       {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
   Delete:      {"start": "<line>:<hash>", "content": ""}
 Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.
+Response is `isError: false` whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.
 Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).
+A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.
 Each file path may appear at most once per call — group all edits for a file under its single entry.
 Large files: tilth_read shows outline — use section to get hashlined content.
 Pass diff: true to see a compact before/after diff per file.
