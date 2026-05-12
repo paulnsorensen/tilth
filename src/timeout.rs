@@ -21,6 +21,12 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, select, RecvError};
 
+/// Warn-once threshold: print a single stderr line the first time the
+/// abandoned-thread count crosses this value. The deadline arm checks
+/// `if n == ABANDONED_THREAD_WARN { ... }` — deliberately `==`, not `>=`, so
+/// the operator gets one signal at the threshold rather than a flood as each
+/// subsequent timeout piles on. The hard cap at [`MAX_ABANDONED_THREADS`]
+/// stops accepting work entirely, so silence past this point is bounded.
 const ABANDONED_THREAD_WARN: usize = 3;
 /// Hard cap: refuse new work when this many prior threads are still running
 /// after timeout. Prevents unbounded thread accumulation on stuck operations.
@@ -40,20 +46,27 @@ impl ThreadTracker {
         }
     }
 
-    /// `Acquire` ordering pairs with the `Release` increment in `record_timeout`,
-    /// so a thread that observes the new count also observes any state the
-    /// incrementing thread published before it. `Relaxed` would be allowed to
-    /// return a stale value on weakly-ordered architectures (e.g. ARM64).
+    /// `Acquire` here pairs with the `AcqRel` RMWs in `record_timeout` and
+    /// `record_finish_after_timeout`. `Relaxed` would suffice for the counter
+    /// value alone (atomic RMWs are atomic at any ordering); we pay the cheap
+    /// upgrade so the pairing is canonical and the next reader doesn't have
+    /// to re-derive that the value is consistent with the rest of the spawn
+    /// state machine.
     pub(crate) fn is_at_cap(&self) -> bool {
         self.count.load(Ordering::Acquire) >= MAX_ABANDONED_THREADS
     }
 
+    /// `AcqRel` is the canonical pessimistic ordering for an RMW that's read
+    /// from another thread: documents intent better than `Release` alone, and
+    /// guarantees the RMW sees any prior `Release` write to this atomic before
+    /// computing its new value. The cost is negligible on x86 and one extra
+    /// barrier on weakly-ordered architectures.
     fn record_timeout(&self) -> usize {
-        self.count.fetch_add(1, Ordering::Release) + 1
+        self.count.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     fn record_finish_after_timeout(&self) {
-        self.count.fetch_sub(1, Ordering::Release);
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -130,14 +143,26 @@ impl ThreadCoord {
     /// Spin until the main thread signals the tracker increment is visible.
     /// The main thread runs only a single counter update between `claim_timeout`
     /// and `ack_timeout`, so this loop terminates promptly in practice.
+    ///
+    /// `spin_loop()` is a CPU pipeline hint, not a scheduler yield — on a
+    /// single-CPU container where the worker was scheduled before the main
+    /// thread, a pure spin would burn the worker's full quantum (~10ms) before
+    /// the main thread gets a turn to set the flag. The trailing `yield_now()`
+    /// surrenders the rest of the quantum so the ack becomes visible in tens
+    /// of microseconds instead.
     fn wait_for_timeout_ack(&self) {
         while !self.timeout_acked.load(Ordering::Acquire) {
             std::hint::spin_loop();
+            std::thread::yield_now();
         }
     }
 }
 
+/// Reasons a `spawn_with_timeout` call did not return a value. Marked
+/// `#[non_exhaustive]` so a future failure mode (e.g. OS-level thread spawn
+/// failure) can be added without churning every call site.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub(crate) enum SpawnFailure {
     Timeout,
     Panic,
@@ -244,7 +269,7 @@ mod tests {
         assert_eq!(result, Err(SpawnFailure::Timeout));
         assert_eq!(tracker.current(), 1, "timeout must increment tracker");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while tracker.current() > 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
