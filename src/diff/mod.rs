@@ -242,7 +242,10 @@ pub fn diff(
         return Ok("No changes.".to_string());
     }
 
-    // 2. Build structural overlays.
+    // 2. Build structural overlays in parallel — each FileDiff is independent
+    // and `compute_overlay` constructs its own tree-sitter parser per call
+    // (see `lang::outline::get_outline_entries`), so no shared mutable state
+    // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
         .map(|fd| overlay::compute_overlay(fd, source))
