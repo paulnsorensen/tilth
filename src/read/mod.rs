@@ -1037,10 +1037,15 @@ mod tests {
         // Tight budget: section 1 fits in full, sections 2 and 3 are replaced
         // with compact omission markers. The budget is wide enough for both
         // markers themselves; the strict cap is verified below.
-        let big_line = "x".repeat(50);
+        //
+        // Lines are 200 chars wide so each chunk is ~160 tokens. Header path
+        // length varies by OS (`/tmp/...` on Linux CI vs `/var/folders/...`
+        // on macOS), which shifts header tokens by ~6; chunks at this size
+        // dwarf that variance so the cliff is OS-independent.
+        let big_line = "x".repeat(200);
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_omit.txt", &body);
-        let budget = 120u64;
+        let budget = 240u64;
         let out =
             read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, budget).unwrap();
         // First section emitted in full.
@@ -1088,10 +1093,12 @@ mod tests {
     fn budgeted_preserves_user_order_until_exhaustion() {
         // Ranges out of order: still emitted in user order, with the first
         // ones consuming budget and later ones omitted in the same order.
-        let big_line = "y".repeat(50);
+        // See `budgeted_omits_later_sections_when_exhausted` for why the
+        // chunk size needs to dominate path-length variance.
+        let big_line = "y".repeat(200);
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_order.txt", &body);
-        let budget = 120u64;
+        let budget = 240u64;
         let out =
             read_ranges_with_budget(&path, &["20-22", "1-3", "10-12"], false, budget).unwrap();
         let pos_first = out.find("─── lines 20-22 ───").expect("first marker");
