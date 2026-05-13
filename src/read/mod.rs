@@ -499,30 +499,28 @@ pub fn read_ranges_with_budget(
     let range_strs: Vec<String> = ranges.iter().map(|r| (*r).to_string()).collect();
 
     if blocks.len() == 1 {
-        let single = format!("{header}\n\n{}", blocks[0].text);
+        let preamble = format!("{header}\n\n");
+        let single = format!("{preamble}{}", blocks[0].text);
         let (text, info) = crate::budget::apply_with_info(&single, budget);
         let truncated = info.is_some();
-        let truncated_at_line = info.as_ref().map(|i| i.at_line);
+        let top_truncated_at_line = info.as_ref().map(|i| i.at_line);
         let original_line_count = info.as_ref().map(|i| i.original_line_count);
+        let section_truncated_at_line = info
+            .as_ref()
+            .map(|i| body_at_line_to_file_line(i.at_line, &preamble, blocks[0].start));
         let section = SectionTruncation {
             section: range_strs[0].clone(),
             truncated,
-            truncated_at_line,
+            truncated_at_line: section_truncated_at_line,
         };
         return Ok(BudgetedReadResult {
             text,
             truncated,
-            truncated_at_line,
+            truncated_at_line: top_truncated_at_line,
             original_line_count,
             sections: vec![section],
         });
     }
-
-    // Pre-compute the line count of the would-have-been unbudgeted output so
-    // the MCP layer can emit `_meta.original_line_count` as the "of M" half
-    // of "showing 1–N of M lines". Mirrors the structure that `read_ranges`
-    // produces verbatim — no behaviour change when the budget is roomy.
-    let unbudgeted_lines = unbudgeted_line_count(&header, &blocks);
 
     let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
     out.push_str(&header);
@@ -548,15 +546,19 @@ pub fn read_ranges_with_budget(
             // First block alone won't fit. Use the standard truncator on the
             // pair (header + first block) so the cut lands at a clean line
             // boundary, then omit every later block.
-            let single = format!("{header}{chunk}");
+            let preamble = format!("{header}\n\n─── lines {}-{} ───\n", b.start, b.end);
+            let single = format!("{preamble}{}", b.text);
             let (truncated_text, info) = crate::budget::apply_with_info(&single, budget);
             out = truncated_text;
             top_truncated = true;
             top_truncated_at_line = info.as_ref().map(|i| i.at_line);
+            let section_at = info
+                .as_ref()
+                .map(|i| body_at_line_to_file_line(i.at_line, &preamble, b.start));
             section_metas.push(SectionTruncation {
                 section: range_strs[i].clone(),
                 truncated: true,
-                truncated_at_line: info.map(|i| i.at_line),
+                truncated_at_line: section_at,
             });
             // Every later block is omitted entirely — no marker fits.
             for later in &range_strs[i + 1..] {
@@ -586,6 +588,13 @@ pub fn read_ranges_with_budget(
                 });
             }
             top_truncated = true;
+            // Wire-shape contract: `truncated=true` should carry a
+            // `truncated_at_line`. If no prior marker iteration set it,
+            // anchor it at the current end of `out`.
+            if top_truncated_at_line.is_none() {
+                top_truncated_at_line =
+                    Some((out.bytes().filter(|&c| c == b'\n').count() + 1) as u32);
+            }
             break;
         }
         out.push_str(&marker);
@@ -601,8 +610,11 @@ pub fn read_ranges_with_budget(
         });
     }
 
+    // Compute `original_line_count` lazily — only when truncation occurred
+    // would the MCP layer emit it, so spare the full-block newline scan
+    // when the budget is roomy.
     let original_line_count = if top_truncated {
-        Some(unbudgeted_lines)
+        Some(unbudgeted_line_count(&header, &blocks))
     } else {
         None
     };
@@ -629,6 +641,20 @@ fn unbudgeted_line_count(header: &str, blocks: &[Block]) -> u32 {
         newlines += b.text.bytes().filter(|&b| b == b'\n').count() as u64;
     }
     u32::try_from(newlines + 1).unwrap_or(u32::MAX)
+}
+
+/// Map a 1-indexed `at_line` in the budget-truncator input (header +
+/// optional delimiter + block body) to a 1-indexed file line. `preamble`
+/// is the prefix that precedes `block.text` in the rendered output;
+/// `block_start` is the block's first file line. When the cut lands in
+/// the preamble itself (degenerate tiny-budget case), the result is
+/// clamped to `block_start`.
+fn body_at_line_to_file_line(at_line: u32, preamble: &str, block_start: usize) -> u32 {
+    let preamble_newlines = preamble.bytes().filter(|&b| b == b'\n').count() as u32;
+    let body_offset = at_line.saturating_sub(preamble_newlines + 1);
+    u32::try_from(block_start)
+        .unwrap_or(u32::MAX)
+        .saturating_add(body_offset)
 }
 
 /// Shared block-resolver used by both budgeted and unbudgeted multi-section
@@ -1318,6 +1344,36 @@ mod tests {
         // Per-section meta preserves user order.
         let sections: Vec<&str> = result.sections.iter().map(|s| s.section.as_str()).collect();
         assert_eq!(sections, vec!["1-3", "10-12", "20-22"]);
+        // Wire-shape contract: truncated=true must carry a truncated_at_line,
+        // even when the omission marker itself couldn't fit. Otherwise hosts
+        // can't render "showing 1–N of M lines".
+        assert!(result.truncated);
+        assert!(
+            result.truncated_at_line.is_some(),
+            "truncated=true must carry truncated_at_line: {result:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_section_truncated_at_line_is_file_relative() {
+        // A range that does not start at line 1 must surface a file-relative
+        // section cut line, not a rendered-output line count. Use 200-char
+        // lines so the section gets clipped well inside the body.
+        let big_line = "q".repeat(200);
+        let body: String = (0..100).map(|_| format!("{big_line}\n")).collect();
+        let path = write_temp("tilth_test_section_file_relative.txt", &body);
+        let budget = 200u64;
+        let result = read_ranges_with_budget(&path, &["40-90"], false, budget).unwrap();
+        assert!(result.truncated);
+        let section = &result.sections[0];
+        let cut = section
+            .truncated_at_line
+            .expect("partial cut must surface section truncated_at_line");
+        assert!(
+            (40..=90).contains(&cut),
+            "section truncated_at_line ({cut}) must be a file line inside the 40-90 range"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
