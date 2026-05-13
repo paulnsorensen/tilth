@@ -587,6 +587,12 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
             msg: "missing 'edits' array".into(),
         };
     };
+    if edits_val.is_empty() {
+        return FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg: "'edits' array is empty".into(),
+        };
+    }
 
     let mut edits = Vec::with_capacity(edits_val.len());
     for (i, e) in edits_val.iter().enumerate() {
@@ -665,8 +671,8 @@ fn tool_edit(
         .collect();
 
     // Record reads only for files whose edits actually committed. Hash
-    // mismatches and parse errors don't put usable file content in front of
-    // the LLM, so they shouldn't inflate the session activity counter.
+    // mismatches, parse errors, and I/O failures didn't change the file, so
+    // they shouldn't inflate the session activity counter.
     let outcome = crate::edit::apply_batch(tasks, bloom, show_diff)?;
     for path in &outcome.applied {
         session.record_read(path);
@@ -1431,6 +1437,16 @@ mod tests {
         format!("{line}:{h:03x}")
     }
 
+    /// Anchor with a hash guaranteed not to match the line's real hash.
+    /// XOR-flipping a bit can't collide with the original — used to force
+    /// hash-mismatch paths without depending on hardcoded sentinel values.
+    fn wrong_anchor_for(content: &str, line: usize) -> String {
+        let lines: Vec<_> = content.lines().collect();
+        let real = crate::format::line_hash(lines[line - 1].as_bytes());
+        let wrong = (real ^ 0x1) & 0xFFF;
+        format!("{line}:{wrong:03x}")
+    }
+
     fn edit_services() -> (Session, Arc<BloomFilterCache>) {
         (Session::new(), Arc::new(BloomFilterCache::new()))
     }
@@ -1598,6 +1614,46 @@ mod tests {
         assert!(err.contains("empty"), "must mention empty: {err}");
     }
 
+    /// Empty `edits` array must be rejected at parse time. Otherwise
+    /// `apply_edits` short-circuits to `Applied` without writing the file,
+    /// and the path would still flow into `BatchOutcome.applied` — inflating
+    /// the session read counter for a file that was never touched.
+    #[test]
+    fn batch_edit_empty_edits_array_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let untouched = dir.path().join("untouched.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        std::fs::write(&untouched, "beta\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": untouched.to_str().unwrap(),
+                    "edits": [],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_edit(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains("'edits' array is empty"),
+            "empty edits must surface as parse error: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "beta\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "empty-edits file must not be counted as read"
+        );
+    }
+
     // -- record_read counter gating -------------------------------------------
 
     /// A batch with one good file and one file with a deliberate hash
@@ -1620,8 +1676,9 @@ mod tests {
                 },
                 {
                     "path": bad.to_str().unwrap(),
-                    // Wrong hash — guaranteed not to match `beta`.
-                    "edits": [{ "start": "1:fff", "content": "BETA" }],
+                    // Derive a guaranteed-wrong hash so the mismatch is
+                    // forced regardless of what `beta` actually hashes to.
+                    "edits": [{ "start": wrong_anchor_for("beta\n", 1), "content": "BETA" }],
                 },
             ]
         });
