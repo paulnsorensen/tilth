@@ -299,10 +299,14 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let paths_arr = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: paths (array of file paths, use single-element array for one file)")?;
+    let paths_arr = match args.get("paths") {
+        Some(v) => v.as_array().ok_or(
+            "paths must be an array of file paths (use single-element array for one file)",
+        )?,
+        None => {
+            return Err("missing required parameter: paths (array of file paths, use single-element array for one file)".into());
+        }
+    };
 
     if paths_arr.is_empty() {
         return Err("paths must contain at least one file".into());
@@ -342,7 +346,8 @@ fn tool_read(
         );
     }
 
-    // Multi-file batch read: bypass smart view + related-file hints.
+    // Multi-file batch: per-file smart view applies, but no related-file hints
+    // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
         let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
         return Ok(apply_budget(combined, budget));
@@ -492,10 +497,14 @@ fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let patterns_arr = args
-        .get("patterns")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: patterns (array of globs, use single-element array for one pattern)")?;
+    let patterns_arr = match args.get("patterns") {
+        Some(v) => v.as_array().ok_or(
+            "patterns must be an array of globs (use single-element array for one pattern)",
+        )?,
+        None => {
+            return Err("missing required parameter: patterns (array of globs, use single-element array for one pattern)".into());
+        }
+    };
 
     if patterns_arr.is_empty() {
         return Err("patterns must contain at least one glob".into());
@@ -1408,6 +1417,39 @@ mod tests {
         assert!(
             err.contains("missing required parameter: paths"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_read_paths_wrong_type_reports_type_error() {
+        // A scalar (or any non-array) value for `paths` should produce a
+        // type-specific error, not the generic "missing" message.
+        let args = serde_json::json!({ "paths": "a.rs" });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("scalar `paths` must be rejected as wrong type");
+        assert!(
+            err.contains("paths must be an array"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("missing required parameter"),
+            "wrong-type error must not claim the param is missing: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_files_patterns_wrong_type_reports_type_error() {
+        let args = serde_json::json!({ "patterns": "*.rs" });
+        let err = tool_files(&args).expect_err("scalar `patterns` must be rejected as wrong type");
+        assert!(
+            err.contains("patterns must be an array"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("missing required parameter"),
+            "wrong-type error must not claim the param is missing: {err}"
         );
     }
 
