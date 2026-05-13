@@ -849,4 +849,61 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn parse_block_per_file_in_batch_independent() {
+        // Verify that in a multi-file batch, one file breaking and another
+        // staying clean each get their own parse block (or lack thereof).
+        // File 1: syntax error introduced (parse block expected).
+        let path1 = std::env::temp_dir().join("tilth_edit_test_batch1.rs");
+        std::fs::write(&path1, "fn a() { 1 }\n").unwrap();
+        let h1 = hash_at("fn a() { 1 }\n", 1);
+
+        // File 2: syntax stays valid (no parse block).
+        let path2 = std::env::temp_dir().join("tilth_edit_test_batch2.rs");
+        std::fs::write(&path2, "fn b() { 2 }\n").unwrap();
+        let h2 = hash_at("fn b() { 2 }\n", 1);
+
+        let edits1 = vec![Edit {
+            start_line: 1,
+            start_hash: h1,
+            end_line: 1,
+            end_hash: h1,
+            content: "fn a() { 1".into(), // breaks
+        }];
+
+        let edits2 = vec![Edit {
+            start_line: 1,
+            start_hash: h2,
+            end_line: 1,
+            end_hash: h2,
+            content: "fn b() { 99 }".into(), // stays clean
+        }];
+
+        let r1 = apply_edits(&path1, &edits1).unwrap();
+        let r2 = apply_edits(&path2, &edits2).unwrap();
+
+        match r1 {
+            EditResult::Applied { parse, .. } => {
+                assert!(
+                    parse.is_some(),
+                    "file 1 should have parse block when broken"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        match r2 {
+            EditResult::Applied { parse, .. } => {
+                assert!(
+                    parse.is_none(),
+                    "file 2 should have no parse block when clean"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+    }
 }

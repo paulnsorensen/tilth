@@ -4,9 +4,11 @@
 //! the language's tree-sitter grammar and surface any *new* `ERROR` / `MISSING`
 //! nodes the edit introduced. Pre-existing errors stay silent.
 //!
-//! Multiset diff by `(is_missing, kind, detail)` — robust to edits that shift
-//! line numbers (a positional key would false-flag pre-existing errors below
-//! the edit site).
+//! Multiset diff by `(ErrorKind, detail)` where `ErrorKind` is the local
+//! `Error`/`Missing` enum (not the tree-sitter node kind) and `detail` is the
+//! trimmed/truncated node text. Deliberately non-positional — robust to edits
+//! that shift line numbers (a positional key would false-flag pre-existing
+//! errors below the edit site).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,7 +31,10 @@ pub enum ErrorKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
+    /// 1-indexed line number, suitable for direct display.
     pub line: usize,
+    /// 0-indexed column from `tree_sitter::Point::column`. Internal sort key
+    /// only — never rendered, so the indexing offset doesn't appear in output.
     pub col: usize,
     pub kind: ErrorKind,
     /// For `ERROR`: trimmed/truncated node text. For `MISSING`: the node `kind()`
@@ -57,14 +62,15 @@ pub fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
     let pre = parse_errors(&grammar, before)?;
     let post = parse_errors(&grammar, after)?;
 
-    let new_errors = multiset_subtract(&pre, post.clone());
+    let total_post = post.len();
+    let new_errors = multiset_subtract(&pre, post);
     if new_errors.is_empty() {
         return None;
     }
 
     Some(ParseReport {
         new_errors,
-        total_post: post.len(),
+        total_post,
     })
 }
 
@@ -127,9 +133,11 @@ fn collect_errors(node: tree_sitter::Node, source: &[u8], out: &mut Vec<ParseErr
     }
 }
 
-/// Multiset subtraction. For each key `(kind, detail)` count occurrences in
-/// `pre`; walk `post` in order, skipping the first `pre_count` instances of
-/// that key (they match pre-existing errors), and collecting the rest as new.
+/// Multiset subtraction. For each key `(ErrorKind, detail)` — i.e.
+/// `(Error|Missing, trimmed node text or expected kind)` — count occurrences
+/// in `pre`; walk `post` in order, skipping the first `pre_count` instances
+/// of that key (they match pre-existing errors), and collecting the rest as
+/// new. Positions are deliberately not part of the key.
 fn multiset_subtract(pre: &[ParseError], post: Vec<ParseError>) -> Vec<ParseError> {
     let mut remaining: HashMap<(ErrorKind, String), usize> = HashMap::new();
     for e in pre {

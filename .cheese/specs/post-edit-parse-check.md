@@ -34,12 +34,12 @@ grammar  = outline_language(lang)        // Option<Language>
 if grammar is None:    return None       // no grammar, skip silently
 pre      = parse(content, grammar)
 post     = parse(output,  grammar)
-new_errs = errors(post) - errors(pre)    // diff by (line, col, kind)
+new_errs = multiset_subtract(pre, post)  // key = (ErrorKind, detail)
 if new_errs is empty:  return None
-return ParseReport { new_errs, total_post: errors(post).len() }
+return ParseReport { new_errs, total_post: post.len() }
 ```
 
-`errors(tree)` walks the tree and collects nodes where `is_error()` or `is_missing()` is true. Identity is `(start_row, start_col, kind)` — node ids are unstable across parses, but row/col/kind is stable enough to subtract sets.
+`errors(tree)` walks the tree and collects nodes where `is_error()` or `is_missing()` is true. The multiset key is `(ErrorKind, detail)` — `ErrorKind` is the local `Error|Missing` enum and `detail` is the trimmed/truncated error-node text (or, for `MISSING`, the expected node kind). Positions are intentionally *not* part of the key: an edit that shifts lines must not surface pre-existing errors below the edit site as "new".
 
 A node is reported as:
 - `ERROR` if `is_error()` is true
@@ -56,10 +56,10 @@ Append to `EditResult::Applied` before the blast radius block:
 ```
 
 Format details:
-- One line per error: `:<line> <ERROR|MISSING> <detail>`.
-- `<detail>` for `ERROR`: the kind of the parent grammar rule plus the literal text of the error node (truncated to 40 chars).
+- One line per error: `:<line> <ERROR|MISSING> <detail>` (or `:<line> <ERROR|MISSING>` when `detail` is empty).
+- `<detail>` for `ERROR`: the trimmed text of the error node, truncated to 40 chars with an ellipsis (`…`).
 - `<detail>` for `MISSING`: the node `kind()` (which is what's expected, e.g. `;`, `)`, `expression`).
-- Cap at **10 errors**. If more, append `... and N more (M total)`.
+- Cap at **10 listed errors**. If more, append `... and N more (X new, Y total)` where `X` is the new-error count and `Y` is the total post-edit error count.
 - Omit the block entirely if no new errors.
 
 ### Failure semantics
@@ -80,7 +80,7 @@ Untouched. Parse check is read-only on the just-written file. `apply_batch` hand
 
 ### New module
 
-`src/edit/parse_check.rs` (promote `edit.rs` to `edit/mod.rs` + child module). Keeps `edit.rs` from growing.
+`src/edit_parse_check.rs` — sibling of `src/edit.rs`, not a child. Keeping `edit.rs` flat (no `edit/mod.rs` promotion) avoided unnecessary churn since the new logic stands alone.
 
 Public surface:
 
@@ -92,6 +92,7 @@ pub struct ParseReport {
 
 pub struct ParseError {
     pub line: usize,        // 1-indexed
+    pub col: usize,         // 0-indexed (internal sort key, never rendered)
     pub kind: ErrorKind,    // Error | Missing
     pub detail: String,     // <= 40 chars
 }
@@ -118,9 +119,12 @@ EditResult::Applied {
 
 ### Diffing errors
 
-Pre-parse error set: `HashSet<(usize, usize, String)>` keyed by `(row, col, kind)`.
-Post-parse error set: same shape.
-`new_errors = post - pre`, then sorted by `(line, col)` for stable output.
+Pre- and post-parse error lists are sorted by `(line, col)` for stable output.
+Diff is a multiset subtraction keyed by `(ErrorKind, detail)` — no positions:
+count occurrences in `pre`, walk `post` in order, skip the first N matches per
+key, and collect the rest as new. This stays robust when an edit shifts line
+numbers; a positional key would false-flag pre-existing errors below the edit
+site.
 
 If pre has errors the edit *fixed* (rare but possible), do not surface them in v1 — keeps output focused on regressions.
 
@@ -129,14 +133,14 @@ If pre has errors the edit *fixed* (rare but possible), do not surface them in v
 1. **Clean edit, clean file** → no `── parse ──` block. (Most common case.)
 2. **Clean edit, pre-broken file** → no `── parse ──` block (pre-existing errors silent).
 3. **Edit introduces syntax error** → `── parse ──` block with the new error, line-anchored.
-4. **Edit introduces 15 syntax errors** → top 10 listed, `... and 5 more (15 total)`.
+4. **Edit introduces 15 syntax errors** → top 10 listed, `... and 5 more (15 new, 15 total)`.
 5. **File in a language without a tree-sitter grammar (Dockerfile, Make)** → no `── parse ──` block, no crash.
 6. **Multi-file batch where one file goes broken, others stay clean** → only the broken file's section shows `── parse ──`.
 7. **Edit that fixes a pre-existing error** → no `── parse ──` block (v1 behavior — we don't report fixes).
 
 ### Test plan
 
-In-source `#[cfg(test)] mod tests` in `src/edit/parse_check.rs`:
+In-source `#[cfg(test)] mod tests` in `src/edit_parse_check.rs`:
 
 - `clean_edit_returns_none` — edit a Rust file, valid before, valid after.
 - `introduced_error_reported` — edit removes a closing brace.
