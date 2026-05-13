@@ -996,7 +996,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group all ready edits into a single tilth_edit call — never call tilth_edit twice in a row when one files array could include everything. Each file is processed independently: a hash mismatch on one file does not block the others. Partial success returns isError: false, so scan every per-file `## <path>` section for failures. A malformed edit fails that whole file before any of its edits apply. Each path may appear at most once per call. Max 20 files per call.",
+            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group all ready edits into a single tilth_edit call — never call tilth_edit twice in a row when one `files` array could include everything. Each file is processed independently: a hash mismatch on one file does not block the others. Partial success returns isError: false, so scan every per-file `## <path>` section for failures. A malformed edit fails that whole file before any of its edits apply. Each path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
