@@ -437,14 +437,19 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     Ok(out)
 }
 
-/// Like [`read_ranges`], but with a shared token budget across all sections.
+/// Like [`read_ranges`], but with a strict shared token budget across all
+/// sections.
 ///
 /// Walks blocks in user order, deducting each from the remaining budget as
 /// it is emitted. When the budget is exhausted, later blocks are replaced
 /// with a single `... section omitted (budget exhausted) ...` line under
 /// their `─── lines X-Y ───` marker so callers can still see which ranges
-/// were dropped. If the very first block alone exceeds the budget, it is
-/// truncated by [`crate::budget::apply`] and all later blocks are omitted.
+/// were dropped — but only while that marker itself fits in the remaining
+/// budget. Once even the marker would overflow, the function stops emitting.
+/// If the very first block alone exceeds the budget, it is truncated by
+/// [`crate::budget::apply`] and all later blocks are omitted.
+///
+/// The returned string is a hard cap: its token estimate is `<= budget`.
 pub fn read_ranges_with_budget(
     path: &Path,
     ranges: &[&str],
@@ -469,21 +474,27 @@ pub fn read_ranges_with_budget(
         if tokens <= remaining {
             out.push_str(&chunk);
             remaining -= tokens;
-        } else if i == 0 {
+            continue;
+        }
+        if i == 0 {
             // First block alone won't fit. Use the standard truncator on the
             // pair (header + first block) so the cut lands at a clean line
             // boundary, then omit every later block.
             let single = format!("{header}{chunk}");
-            out = crate::budget::apply(&single, budget);
-            remaining = 0;
-        } else {
-            let _ = write!(
-                out,
-                "\n\n─── lines {}-{} ───\n... section omitted (budget exhausted) ...",
-                b.start, b.end
-            );
-            remaining = 0;
+            return Ok(crate::budget::apply(&single, budget));
         }
+        let marker = format!(
+            "\n\n─── lines {}-{} ───\n... section omitted (budget exhausted) ...",
+            b.start, b.end
+        );
+        let marker_tokens = estimate_tokens(marker.len() as u64);
+        if marker_tokens > remaining {
+            // Even the omission marker would overflow — stop emitting.
+            // Earlier markers (if any) already signal that omission occurred.
+            break;
+        }
+        out.push_str(&marker);
+        remaining -= marker_tokens;
     }
     Ok(out)
 }
@@ -1023,13 +1034,15 @@ mod tests {
 
     #[test]
     fn budgeted_omits_later_sections_when_exhausted() {
-        // Tight budget: section 1 fits, section 2 omitted, section 3 omitted.
-        // Each section is roughly 250 bytes ≈ 62 tokens. Header reserve plus
-        // one section just fits in 90 tokens; later sections are dropped.
+        // Tight budget: section 1 fits in full, sections 2 and 3 are replaced
+        // with compact omission markers. The budget is wide enough for both
+        // markers themselves; the strict cap is verified below.
         let big_line = "x".repeat(50);
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_omit.txt", &body);
-        let out = read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, 90).unwrap();
+        let budget = 120u64;
+        let out =
+            read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, budget).unwrap();
         // First section emitted in full.
         assert!(out.contains("─── lines 1-3 ───"), "first marker: {out}");
         // Later sections show as omitted.
@@ -1040,6 +1053,11 @@ mod tests {
         assert!(
             out.contains("─── lines 20-22 ───\n... section omitted (budget exhausted) ..."),
             "third omitted: {out}"
+        );
+        assert!(
+            estimate_tokens(out.len() as u64) <= budget,
+            "output {} tokens > budget {budget}: {out}",
+            estimate_tokens(out.len() as u64)
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1052,10 +1070,16 @@ mod tests {
             .map(|i| format!("line-{i}-padding-padding-padding\n"))
             .collect();
         let path = write_temp("tilth_test_budgeted_first_too_large.txt", &body);
-        let out = read_ranges_with_budget(&path, &["1-150"], false, 100).unwrap();
+        let budget = 100u64;
+        let out = read_ranges_with_budget(&path, &["1-150"], false, budget).unwrap();
         assert!(
             out.contains("... truncated"),
             "expected truncation sentinel: {out}"
+        );
+        assert!(
+            estimate_tokens(out.len() as u64) <= budget,
+            "output {} tokens > budget {budget}: {out}",
+            estimate_tokens(out.len() as u64)
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1067,7 +1091,9 @@ mod tests {
         let big_line = "y".repeat(50);
         let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
         let path = write_temp("tilth_test_budgeted_order.txt", &body);
-        let out = read_ranges_with_budget(&path, &["20-22", "1-3", "10-12"], false, 90).unwrap();
+        let budget = 120u64;
+        let out =
+            read_ranges_with_budget(&path, &["20-22", "1-3", "10-12"], false, budget).unwrap();
         let pos_first = out.find("─── lines 20-22 ───").expect("first marker");
         let pos_second = out.find("─── lines 1-3 ───").expect("second marker");
         let pos_third = out.find("─── lines 10-12 ───").expect("third marker");
@@ -1078,6 +1104,29 @@ mod tests {
         assert!(
             out.contains("─── lines 10-12 ───\n... section omitted (budget exhausted) ..."),
             "third must be the omitted one: {out}"
+        );
+        assert!(
+            estimate_tokens(out.len() as u64) <= budget,
+            "output {} tokens > budget {budget}: {out}",
+            estimate_tokens(out.len() as u64)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budgeted_never_exceeds_budget_even_when_markers_dont_fit() {
+        // Pathological case: budget is tight enough that some omission markers
+        // themselves can't fit. The function must still produce a strict cap.
+        let big_line = "z".repeat(50);
+        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let path = write_temp("tilth_test_budgeted_strict_cap.txt", &body);
+        let budget = 80u64;
+        let out =
+            read_ranges_with_budget(&path, &["1-3", "10-12", "20-22"], false, budget).unwrap();
+        assert!(
+            estimate_tokens(out.len() as u64) <= budget,
+            "output {} tokens > budget {budget}: {out}",
+            estimate_tokens(out.len() as u64)
         );
         let _ = std::fs::remove_file(&path);
     }
