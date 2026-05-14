@@ -156,7 +156,7 @@ pub fn search_symbol(
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, None, glob, mode)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, false)
 }
 
 pub fn search_symbol_expanded(
@@ -170,8 +170,47 @@ pub fn search_symbol_expanded(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
+    search_symbol_expanded_mode(
+        query, scope, cache, session, bloom, expand, context, glob, mode, false,
+    )
+}
+
+/// Edit-mode-aware variant: expanded source lines carry `<line>:<hash>` prefixes
+/// when `edit_mode` is true, so the agent can pipe directly into `tilth_write`
+/// hash-mode without a follow-up `tilth_read`.
+#[allow(clippy::too_many_arguments)]
+pub fn search_symbol_expanded_mode(
+    query: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    mode: symbol::SymbolMode,
+    edit_mode: bool,
+) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, context, glob, mode)?;
-    format_search_result(&result, cache, Some(session), bloom, expand)
+    format_search_result(&result, cache, Some(session), bloom, expand, edit_mode)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_multi_symbol_expanded_mode(
+    queries: &[&str],
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    mode: symbol::SymbolMode,
+    edit_mode: bool,
+) -> Result<String, TilthError> {
+    multi_symbol_inner(
+        queries, scope, cache, session, bloom, expand, context, glob, mode, edit_mode,
+    )
 }
 
 pub fn search_multi_symbol_expanded(
@@ -184,6 +223,24 @@ pub fn search_multi_symbol_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     mode: symbol::SymbolMode,
+) -> Result<String, TilthError> {
+    multi_symbol_inner(
+        queries, scope, cache, session, bloom, expand, context, glob, mode, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multi_symbol_inner(
+    queries: &[&str],
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    mode: symbol::SymbolMode,
+    edit_mode: bool,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
@@ -213,6 +270,7 @@ pub fn search_multi_symbol_expanded(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            edit_mode,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -236,7 +294,7 @@ pub fn search_content(
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, None, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, false)
 }
 
 pub fn search_regex(
@@ -247,7 +305,7 @@ pub fn search_regex(
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, None, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, false)
 }
 
 pub fn search_content_expanded(
@@ -259,10 +317,24 @@ pub fn search_content_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
+    search_content_expanded_mode(query, scope, cache, session, expand, context, glob, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_content_expanded_mode(
+    query: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    edit_mode: bool,
+) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, context, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand)
+    format_search_result(&result, cache, Some(session), &bloom, expand, edit_mode)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
@@ -275,9 +347,23 @@ pub fn search_regex_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
+    search_regex_expanded_mode(pattern, scope, cache, session, expand, context, glob, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_regex_expanded_mode(
+    pattern: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    edit_mode: bool,
+) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, context, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand)
+    format_search_result(&result, cache, Some(session), &bloom, expand, edit_mode)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
@@ -315,7 +401,7 @@ pub fn format_raw_result(
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(result, cache, None, &bloom, 0)
+    format_search_result(result, cache, None, &bloom, 0, false)
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
@@ -348,6 +434,7 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
+#[allow(clippy::too_many_arguments)]
 fn format_matches(
     matches: &[Match],
     scope: &Path,
@@ -357,6 +444,7 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
+    edit_mode: bool,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -381,6 +469,7 @@ fn format_matches(
                 expanded_files,
                 multi_file,
                 out,
+                edit_mode,
             );
         } else {
             // Multiple usages collapsed into one entry
@@ -504,6 +593,7 @@ fn format_line_list(lines: &[u32]) -> String {
 }
 
 /// Format a single match entry (unchanged from original behavior).
+#[allow(clippy::too_many_arguments)]
 fn format_single_match(
     m: &Match,
     scope: &Path,
@@ -514,6 +604,7 @@ fn format_single_match(
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
+    edit_mode: bool,
 ) {
     let kind = if m.impl_target.is_some() {
         "impl"
@@ -622,7 +713,7 @@ fn format_single_match(
         } else {
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
-                if let Some((code, content)) = expand_match(m, scope) {
+                if let Some((code, content)) = expand_match(m, scope, edit_mode) {
                     if m.is_definition && m.def_range.is_some() {
                         if let Some(s) = session {
                             s.record_expand(&m.path, m.line);
@@ -913,6 +1004,7 @@ fn format_search_result(
     session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
+    edit_mode: bool,
 ) -> Result<String, TilthError> {
     let header = format::search_header(
         &result.query,
@@ -958,6 +1050,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -982,6 +1075,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1025,6 +1119,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1049,6 +1144,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1068,6 +1164,7 @@ fn format_search_result(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            edit_mode,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1099,7 +1196,7 @@ fn format_search_result(
 ///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
+fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, String)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
@@ -1157,7 +1254,12 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
                 continue;
             }
 
-            let _ = write!(out, "\n{i:>4} │ {line}");
+            if edit_mode {
+                let hash = crate::format::line_hash(line.as_bytes());
+                let _ = write!(out, "\n{i}:{hash:03x}|{line}");
+            } else {
+                let _ = write!(out, "\n{i:>4} │ {line}");
+            }
             prev_blank = is_blank;
         }
     }
@@ -1901,6 +2003,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            false,
         );
 
         assert!(
@@ -1979,6 +2082,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            false,
         );
 
         assert!(
@@ -2037,6 +2141,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            false,
         );
 
         // Cap is 40 lines; expect 60 - 40 = 20 truncated.
@@ -2110,6 +2215,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            false,
         );
 
         // Body lines beyond the cap must still be trimmed.

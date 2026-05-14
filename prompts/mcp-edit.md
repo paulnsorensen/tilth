@@ -1,41 +1,36 @@
-tilth_edit: Batch edit files using hash-anchored lines. Replaces the host Edit tool.
+tilth_write: Hash-anchored / overwrite / append edits. Replaces the host Edit and Write tools.
 
-ALWAYS group edits to all files you are ready to modify into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row when one `files` array could include every file.
+Per-file mode (default "hash"):
+  • hash       — replace lines at hash-anchored positions from tilth_read or tilth_search expanded output
+  • overwrite  — replace whole file contents; creates the file if absent
+  • append     — append bytes to file; creates if absent
 
-Workflow: tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.
-Note: tilth_search does NOT provide hashes — you MUST tilth_read the file or section first to get them.
+ALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
 
 Request shape:
 ```json
 {
   "files": [
-    {
-      "path": "a.rs",
-      "edits": [
-        {"start": "<line>:<hash>", "content": "<new code>"},
-        {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."},
-        {"start": "<line>:<hash>", "content": ""}
-      ]
-    },
-    {"path": "b.rs", "edits": [...]}
+    {"path": "a.rs", "mode": "hash", "edits": [
+      {"start": "<line>:<hash>", "content": "<new code>"},
+      {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."},
+      {"start": "<line>:<hash>", "content": ""}
+    ]},
+    {"path": "new.rs", "mode": "overwrite", "content": "..."},
+    {"path": "log.txt", "mode": "append",    "content": "...\n"}
   ],
   "diff": true
 }
 ```
 
-Edit forms inside `edits`:
-- Single line: {"start": "<line>:<hash>", "content": "<new code>"}
-- Range: {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
-- Delete: {"start": "<line>:<hash>", "content": ""}
-
-Behavior:
+Hash-mode behavior:
 - Each file is processed independently. A hash mismatch on one file does NOT block the others.
-- If at least one file succeeds, the MCP response has `isError: false`; still scan every `## <path>` section for per-file failures.
-- Hash mismatch means the file changed after you read it. Re-read THAT file and retry only that file (other files in the batch already applied).
-- A malformed edit entry fails that whole file before any of its edits apply; fix the entry and retry the file.
-- Each path may appear only once per call. Group all edits for the same file under one `files[]` entry.
-- Large files: tilth_read shows outline — use section to get hashlined content.
-- Pass diff: true to see a compact before/after diff per file.
-- After editing a function signature, tilth_edit shows callers that may need updating.
+- Auto-fix on mismatch: tilth re-reads the file and fingerprints your original anchor range body. If the fingerprint appears at exactly one new location, the edit is applied there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined content of the affected region is returned inline so you can retry in one turn.
+- A malformed edit entry fails that whole file.
+- Each path may appear only once per call.
 
-DO NOT use the host Edit tool. Use tilth_edit for all edits.
+Pass `diff: true` when you need to confirm exactly what changed and don't already have the new content cached.
+
+DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
+
+(Legacy alias: tilth_edit accepts the same hash-mode shape.)

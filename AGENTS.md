@@ -1,103 +1,51 @@
 <!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->
 
-tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
+tilth — AST-aware code intelligence MCP server.
 
-## Core Principles
+Four tools, all batch-capable via array inputs:
+  • tilth_search — find by symbol/content/regex/callers (merged by default)
+  • tilth_read   — load files with smart auto-sizing (full / signature / preview)
+  • tilth_list   — directory layout with token-cost rollups
+  • tilth_write  — hash-anchored / overwrite / append; auto-fixes safe mismatches
 
-ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Batch all known reads, globs, and edits into the first call; each extra call costs a turn. Even for one item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call the same batch-capable tool twice in a row when one call could include all items.
+Each tool's description carries detailed usage, examples, and batching rules.
+DO NOT use host Grep, Read, Glob, Write, or Edit.
 
-Search first: To explore code, always call tilth_search before reaching for other tools. It finds definitions, usages, and file locations in one call.
+Aux tools: tilth_deps (blast-radius before signature changes), tilth_diff (structural diff: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed)
 
-DO NOT use Grep, Read, or Glob. Use tilth_search (grep), tilth_read (read), tilth_files (glob) instead.
-DO NOT use Bash(grep/rg/cat/head/tail/find/ls). Use the tilth tools.
-DO NOT re-read files already shown in expanded search results.
+tilth_write: Hash-anchored / overwrite / append edits. Replaces the host Edit and Write tools.
 
-## Tools
+Per-file mode (default "hash"):
+  • hash       — replace lines at hash-anchored positions from tilth_read or tilth_search expanded output
+  • overwrite  — replace whole file contents; creates the file if absent
+  • append     — append bytes to file; creates if absent
 
-tilth_search: Code search — finds definitions, usages, and text. Replaces grep/rg.
-  Usage: tilth_search(query: "handleRequest")
-  For multi-symbol lookup, separate with comma: "symbol1,symbol2" (max 5)
-  kind: "symbol" (default, declarations only — no comment/string hits) | "any" (declarations + usages + comment/string mentions) | "content" (literal text in strings/comments) | "regex" (regex pattern over file content) | "callers" (call sites of a symbol)
-  expand: (default 2) inline full source for top matches
-  context: path to file being edited — boosts nearby results
-  glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude)
-  Output per match:
-    ## <path>:<start>-<end> [definition|usage|impl]
-    <outline context>
-    <expanded source block>
-    ── calls ──
-    <name>  <path>:<start>-<end>  <signature>
-    ── siblings ──
-    <name>  <path>:<start>-<end>  <signature>
-  Re-expanding a previously shown definition returns [shown earlier].
-
-tilth_read: File reading with smart outlining. Replaces cat/head/tail.
-  Usage: tilth_read(paths: ["a.rs", "b.rs"]) — always an array, max 20 files in one call.
-  Before calling, collect every file you already know you need; include them all.
-  For a single file: tilth_read(paths: ["a.rs"]). The singular `path` form is NOT accepted.
-  Small files return full content. Large files return structural outline.
-  section: "<start>-<end>" or "<heading text>" — only valid with a single-element paths array
-  sections: array of ranges/headings for multiple slices — only valid with a single-element paths array
-  Output modes:
-    Full/section: <line_number> │ <content>
-    Outline: [<start>-<end>]  <symbol name>
-
-tilth_files: File glob search. Replaces find, ls, pwd.
-  Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — always an array, max 20 globs in one call.
-  Before calling, collect every glob you already know you need; include them all.
-  For a single glob: tilth_files(patterns: ["*.rs"]). The singular `pattern` form is NOT accepted.
-  Output: <path>  (~<token_count> tokens)
-
-tilth_deps: Blast-radius check before signature changes.
-  Shows what imports this file and what it imports.
-  Use ONLY before renaming, removing, or changing an export's signature.
-
-tilth_diff: Structural diff at function level. Replaces Bash(git diff/git log --patch).
-  Usage: tilth_diff(source: "HEAD~1") for last commit, or no args for uncommitted changes
-  scope: "file.rs" or "file.rs:fn_name" to limit to a specific function
-  log: "HEAD~5..HEAD" for per-commit summaries
-  search: filter to lines matching a term
-  blast: true to show callers of changed function signatures
-  Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed
-
-tilth_edit: Batch edit files using hash-anchored lines. Replaces the host Edit tool.
-
-ALWAYS group edits to all files you are ready to modify into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row when one `files` array could include every file.
-
-Workflow: tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.
-Note: tilth_search does NOT provide hashes — you MUST tilth_read the file or section first to get them.
+ALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
 
 Request shape:
 ```json
 {
   "files": [
-    {
-      "path": "a.rs",
-      "edits": [
-        {"start": "<line>:<hash>", "content": "<new code>"},
-        {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."},
-        {"start": "<line>:<hash>", "content": ""}
-      ]
-    },
-    {"path": "b.rs", "edits": [...]}
+    {"path": "a.rs", "mode": "hash", "edits": [
+      {"start": "<line>:<hash>", "content": "<new code>"},
+      {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."},
+      {"start": "<line>:<hash>", "content": ""}
+    ]},
+    {"path": "new.rs", "mode": "overwrite", "content": "..."},
+    {"path": "log.txt", "mode": "append",    "content": "...\n"}
   ],
   "diff": true
 }
 ```
 
-Edit forms inside `edits`:
-- Single line: {"start": "<line>:<hash>", "content": "<new code>"}
-- Range: {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
-- Delete: {"start": "<line>:<hash>", "content": ""}
-
-Behavior:
+Hash-mode behavior:
 - Each file is processed independently. A hash mismatch on one file does NOT block the others.
-- If at least one file succeeds, the MCP response has `isError: false`; still scan every `## <path>` section for per-file failures.
-- Hash mismatch means the file changed after you read it. Re-read THAT file and retry only that file (other files in the batch already applied).
-- A malformed edit entry fails that whole file before any of its edits apply; fix the entry and retry the file.
-- Each path may appear only once per call. Group all edits for the same file under one `files[]` entry.
-- Large files: tilth_read shows outline — use section to get hashlined content.
-- Pass diff: true to see a compact before/after diff per file.
-- After editing a function signature, tilth_edit shows callers that may need updating.
+- Auto-fix on mismatch: tilth re-reads the file and fingerprints your original anchor range body. If the fingerprint appears at exactly one new location, the edit is applied there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined content of the affected region is returned inline so you can retry in one turn.
+- A malformed edit entry fails that whole file.
+- Each path may appear only once per call.
 
-DO NOT use the host Edit tool. Use tilth_edit for all edits.
+Pass `diff: true` when you need to confirm exactly what changed and don't already have the new content cached.
+
+DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
+
+(Legacy alias: tilth_edit accepts the same hash-mode shape.)

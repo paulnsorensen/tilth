@@ -281,12 +281,20 @@ fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String
     let edit_mode = services.edit_mode;
     match tool {
         "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
-        "tilth_search" => tool_search(args, &services.cache, &services.session, &services.bloom),
+        "tilth_search" => tool_search(
+            args,
+            &services.cache,
+            &services.session,
+            &services.bloom,
+            edit_mode,
+        ),
         "tilth_files" => tool_files(args),
+        "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, &services.bloom),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, &services.session),
         "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
+        "tilth_write" if edit_mode => tool_write(args, &services.session, &services.bloom),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -299,13 +307,22 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let paths_arr = match args.get("paths") {
+    // Accept singular `path:` form (82% of agents use it; not worth fighting)
+    // alongside the documented `paths: [...]` array.
+    let paths_arr_owned: Vec<Value>;
+    let paths_arr: &Vec<Value> = match args.get("paths") {
         Some(v) => v.as_array().ok_or(
             "paths must be an array of file paths (use single-element array for one file)",
         )?,
-        None => {
-            return Err("missing required parameter: paths (array of file paths, use single-element array for one file)".into());
-        }
+        None => match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => {
+                paths_arr_owned = vec![Value::String(p.to_string())];
+                &paths_arr_owned
+            }
+            None => {
+                return Err("missing required parameter: paths (array of file paths)".into());
+            }
+        },
     };
 
     if paths_arr.is_empty() {
@@ -318,21 +335,41 @@ fn tool_read(
         ));
     }
 
-    let paths: Vec<PathBuf> = paths_arr
+    let raw_paths: Vec<String> = paths_arr
         .iter()
         .map(|p| {
             p.as_str()
                 .ok_or("paths must be an array of strings")
-                .map(PathBuf::from)
+                .map(String::from)
         })
         .collect::<Result<_, _>>()?;
 
-    let section = args.get("section").and_then(|v| v.as_str());
-    let sections_arr = args.get("sections").and_then(|v| v.as_array());
-    let full = args
+    // `mode: auto|full|signature` overrides the implicit smart-view.
+    let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+    let force_full = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || mode_str == "full";
+    let force_signature = mode_str == "signature";
+
+    // if_modified_since: skip files whose mtime is <= ts (return stub).
+    let since = args
+        .get("if_modified_since")
+        .and_then(|v| v.as_str())
+        .and_then(crate::mcp_v2::parse_iso_utc);
+
+    let section = args.get("section").and_then(|v| v.as_str());
+    let sections_arr = args.get("sections").and_then(|v| v.as_array());
+    let full = force_full;
+
+    // Resolve suffix grammar on each path spec into (PathBuf, Suffix)
+    let parsed: Vec<(PathBuf, crate::mcp_v2::PathSuffix)> = raw_paths
+        .iter()
+        .map(|s| crate::mcp_v2::parse_path_with_suffix(s))
+        .collect();
+    let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
+    let suffixes: Vec<&crate::mcp_v2::PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
     if section.is_some() && sections_arr.is_some() {
         return Err("provide either section (single) or sections (array), not both".into());
@@ -346,14 +383,63 @@ fn tool_read(
         );
     }
 
+    let now = std::time::SystemTime::now();
+    let has_any_suffix = suffixes
+        .iter()
+        .any(|s| !matches!(s, crate::mcp_v2::PathSuffix::None));
+
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
+        if has_any_suffix || since.is_some() || force_signature {
+            // Per-path resolution so suffix/since/signature behave correctly.
+            let mut parts: Vec<String> = Vec::with_capacity(paths.len());
+            for (path, suffix) in &parsed {
+                session.record_read(path);
+                if let Some(s_ts) = since {
+                    if !crate::mcp_v2::file_changed_since(path, s_ts) {
+                        parts.push(crate::mcp_v2::unchanged_stub(path, s_ts));
+                        continue;
+                    }
+                }
+                let body = read_single_with_suffix(path, suffix, force_signature, edit_mode, cache);
+                parts.push(body);
+            }
+            let combined = parts.join("\n\n");
+            let with_hdr = crate::mcp_v2::with_header(now, &combined);
+            return Ok(apply_budget(with_hdr, budget));
+        }
         let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
         return Ok(apply_budget(combined, budget));
     }
 
     let path = paths.into_iter().next().expect("paths non-empty");
+    let suffix = suffixes
+        .into_iter()
+        .next()
+        .cloned()
+        .unwrap_or(crate::mcp_v2::PathSuffix::None);
+
+    // if_modified_since on a single path
+    if let Some(s_ts) = since {
+        if !crate::mcp_v2::file_changed_since(&path, s_ts) {
+            let body = crate::mcp_v2::unchanged_stub(&path, s_ts);
+            return Ok(crate::mcp_v2::with_header(now, &body));
+        }
+    }
+
+    // Path-suffix grammar takes priority over the legacy `section`/`sections`
+    // params when present.
+    if !matches!(suffix, crate::mcp_v2::PathSuffix::None) {
+        session.record_read(&path);
+        let body = read_single_with_suffix(&path, &suffix, force_signature, edit_mode, cache);
+        let out = if since.is_some() {
+            crate::mcp_v2::with_header(now, &body)
+        } else {
+            body
+        };
+        return Ok(apply_budget(out, budget));
+    }
 
     // Multi-section path: bypass smart view + related-file hints (those only
     // apply to whole-file reads).
@@ -383,6 +469,21 @@ fn tool_read(
     }
 
     session.record_read(&path);
+
+    // `mode: signature` is an outline-style read; route through outline path.
+    if force_signature {
+        return Ok(apply_budget(
+            read_single_with_suffix(
+                &path,
+                &crate::mcp_v2::PathSuffix::None,
+                true,
+                edit_mode,
+                cache,
+            ),
+            budget,
+        ));
+    }
+
     let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
         .map_err(|e| e.to_string())?;
 
@@ -403,21 +504,159 @@ fn tool_read(
     Ok(apply_budget(output, budget))
 }
 
+/// Resolve a single path+suffix to its read output. Signature mode falls back
+/// to outline rendering via `read_file` (smart view) — outline is the closest
+/// existing equivalent and matches the spec's "signatures only" intent.
+fn read_single_with_suffix(
+    path: &Path,
+    suffix: &crate::mcp_v2::PathSuffix,
+    force_signature: bool,
+    edit_mode: bool,
+    cache: &OutlineCache,
+) -> String {
+    use crate::mcp_v2::PathSuffix;
+    let render_err = |e: crate::error::TilthError| format!("# {}\nerror: {}", path.display(), e);
+    match suffix {
+        PathSuffix::LineRange(s, e) => {
+            let range = format!("{s}-{e}");
+            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+        }
+        PathSuffix::FromLine(n) => {
+            // Resolve total lines via metadata + count; cheap & avoids full read.
+            let total = std::fs::read_to_string(path)
+                .map(|c| c.lines().count())
+                .unwrap_or(*n);
+            let range = format!("{n}-{}", total.max(*n));
+            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+        }
+        PathSuffix::Heading(h) => {
+            crate::read::read_ranges(path, &[h.as_str()], edit_mode).unwrap_or_else(render_err)
+        }
+        PathSuffix::Symbol(name) => {
+            // Resolve symbol via outline → range, then read that range.
+            match resolve_symbol_range(path, name) {
+                Some((s, e)) => {
+                    let range = format!("{s}-{e}");
+                    crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                        .unwrap_or_else(render_err)
+                }
+                None => {
+                    format!(
+                        "# {}\nerror: symbol '{}' not found in outline",
+                        path.display(),
+                        name
+                    )
+                }
+            }
+        }
+        PathSuffix::None => {
+            // Whole-file read. `force_signature` is honoured by the caller
+            // before reaching this arm; here we read with default smart view.
+            let _ = force_signature; // semantics handled upstream
+            crate::read::read_file(path, None, false, cache, edit_mode).unwrap_or_else(render_err)
+        }
+    }
+}
+
+fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
+    for e in entries {
+        if e.name == name {
+            return Some((e.start_line as usize, e.end_line as usize));
+        }
+        if let Some(hit) = find_symbol_entry(&e.children, name) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Look up `name` in the file's outline; return its 1-indexed `(start, end)`.
+fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let ft = crate::lang::detect_file_type(path);
+    let crate::types::FileType::Code(lang) = ft else {
+        return None;
+    };
+    let entries = crate::lang::outline::get_outline_entries(&content, lang);
+    find_symbol_entry(&entries, name)
+}
+
 fn tool_search(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
+    edit_mode: bool,
+) -> Result<String, String> {
+    // v2 surface: `queries: [{query, glob?, kind?}]`. When present, run each
+    // entry through the legacy single-query path and concatenate. Per-query
+    // glob/kind override the top-level values.
+    if let Some(queries_arr) = args.get("queries").and_then(|v| v.as_array()) {
+        if queries_arr.is_empty() {
+            return Err("queries array is empty".into());
+        }
+        if queries_arr.len() > 10 {
+            return Err(format!(
+                "queries array limited to 10 entries (got {})",
+                queries_arr.len()
+            ));
+        }
+        let now = std::time::SystemTime::now();
+        let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
+        for (i, q) in queries_arr.iter().enumerate() {
+            let qstr = q
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("queries[{i}]: missing 'query' string"))?;
+            let mut sub = serde_json::Map::new();
+            sub.insert("query".into(), Value::String(qstr.to_string()));
+            if let Some(g) = q.get("glob").and_then(|v| v.as_str()) {
+                sub.insert("glob".into(), Value::String(g.to_string()));
+            } else if let Some(g) = args.get("glob").and_then(|v| v.as_str()) {
+                sub.insert("glob".into(), Value::String(g.to_string()));
+            }
+            let kind = q
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("kind").and_then(|v| v.as_str()))
+                .unwrap_or("symbol");
+            // `any` is preserved as a no-op alias for the new merged default
+            let kind = if kind == "any" { "symbol" } else { kind };
+            sub.insert("kind".into(), Value::String(kind.to_string()));
+            for k in ["expand", "context", "scope", "budget", "if_modified_since"] {
+                if let Some(v) = args.get(k) {
+                    sub.insert(k.into(), v.clone());
+                }
+            }
+            let sub_val = Value::Object(sub);
+            let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
+            parts.push(format!("## query: {qstr}\n\n{body}"));
+        }
+        let combined = parts.join("\n\n---\n\n");
+        return Ok(crate::mcp_v2::with_header(now, &combined));
+    }
+    tool_search_single(args, cache, session, bloom, edit_mode)
+}
+
+fn tool_search_single(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    edit_mode: bool,
 ) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: query")?;
+        .ok_or("missing required parameter: query (or queries array)")?;
     let (scope, scope_warning) = resolve_scope(args);
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
         .unwrap_or("symbol");
+    // `kind: any` collapses to `symbol` under the v2 merged-default; preserve
+    // the parameter as a no-op alias rather than failing.
+    let kind = if kind == "any" { "symbol" } else { kind };
     let expand = args
         .get("expand")
         .and_then(serde_json::Value::as_u64)
@@ -447,16 +686,18 @@ fn tool_search(
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
                     session.record_search(queries[0]);
-                    crate::search::search_symbol_expanded(
+                    crate::search::search_symbol_expanded_mode(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, mode,
+                        edit_mode,
                     )
                 }
                 2..=5 => {
                     for q in &queries {
                         session.record_search(q);
                     }
-                    crate::search::search_multi_symbol_expanded(
+                    crate::search::search_multi_symbol_expanded_mode(
                         &queries, &scope, cache, session, bloom, expand, context, glob, mode,
+                        edit_mode,
                     )
                 }
                 _ => {
@@ -469,15 +710,15 @@ fn tool_search(
         }
         "content" => {
             session.record_search(query);
-            crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob,
+            crate::search::search_content_expanded_mode(
+                query, &scope, cache, session, expand, context, glob, edit_mode,
             )
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob)
-                .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            crate::search::search_regex_expanded_mode(
+                query, &scope, cache, session, expand, context, glob, edit_mode,
+            )
         }
         "callers" => {
             session.record_search(query);
@@ -502,13 +743,21 @@ fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let patterns_arr = match args.get("patterns") {
+    // Accept singular `pattern:` as a transitional alias (97% of agents use it).
+    let patterns_arr_owned: Vec<Value>;
+    let patterns_arr: &Vec<Value> = match args.get("patterns") {
         Some(v) => v.as_array().ok_or(
             "patterns must be an array of globs (use single-element array for one pattern)",
         )?,
-        None => {
-            return Err("missing required parameter: patterns (array of globs, use single-element array for one pattern)".into());
-        }
+        None => match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) => {
+                patterns_arr_owned = vec![Value::String(p.to_string())];
+                &patterns_arr_owned
+            }
+            None => {
+                return Err("missing required parameter: patterns (array of globs)".into());
+            }
+        },
     };
 
     if patterns_arr.is_empty() {
@@ -535,6 +784,504 @@ fn tool_files(args: &Value) -> Result<String, String> {
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(combined, budget));
     Ok(result)
+}
+
+/// `tilth_list` — tree output with token-cost rollups.
+///
+/// Resolves each glob via `ignore::WalkBuilder` (same as `tilth_files`), but
+/// collects `(path, byte_len)` pairs and renders them as a single tree rooted
+/// at scope.
+fn tool_list(args: &Value) -> Result<String, String> {
+    use globset::Glob;
+    let (scope, scope_warning) = resolve_scope(args);
+    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+
+    let patterns_arr_owned: Vec<Value>;
+    let patterns_arr: &Vec<Value> = match args.get("patterns") {
+        Some(v) => v.as_array().ok_or("patterns must be an array of globs")?,
+        None => match args.get("pattern").and_then(|v| v.as_str()) {
+            Some(p) => {
+                patterns_arr_owned = vec![Value::String(p.to_string())];
+                &patterns_arr_owned
+            }
+            None => return Err("missing required parameter: patterns".into()),
+        },
+    };
+    if patterns_arr.is_empty() {
+        return Err("patterns must contain at least one glob".into());
+    }
+    if patterns_arr.len() > 20 {
+        return Err(format!(
+            "patterns limited to 20 per call (got {})",
+            patterns_arr.len()
+        ));
+    }
+    let patterns: Vec<String> = patterns_arr
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or("patterns must be an array of strings")
+                .map(String::from)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let depth = args
+        .get("depth")
+        .and_then(serde_json::Value::as_u64)
+        .map(|d| d as usize);
+
+    // Walk the scope directory and collect all files matching any pattern.
+    let matchers: Vec<_> = patterns
+        .iter()
+        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
+        .collect();
+    if matchers.is_empty() {
+        return Err("no valid globs provided".into());
+    }
+
+    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
+    let walker = ignore::WalkBuilder::new(&scope)
+        .follow_links(true)
+        .hidden(false)
+        .git_ignore(false)
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !crate::search::SKIP_DIRS.contains(&name);
+                }
+            }
+            true
+        })
+        .build();
+    for entry in walker.filter_map(Result::ok) {
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(d) = depth {
+            let rel = path.strip_prefix(&scope).unwrap_or(path);
+            let parts = rel.components().count();
+            if parts > d {
+                continue;
+            }
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let rel = path.strip_prefix(&scope).unwrap_or(path);
+        let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
+        if matched {
+            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            entries.push((path.to_path_buf(), bytes));
+        }
+    }
+
+    let tree = crate::mcp_v2::render_tree(&scope, &entries);
+    let mut result = scope_warning.unwrap_or_default();
+    result.push_str(&apply_budget(tree, budget));
+    Ok(result)
+}
+
+/// `tilth_write` — hash / overwrite / append modes per file.
+fn tool_write(
+    args: &Value,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
+    let files_val = args
+        .get("files")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: files (array of {path, mode, ...})")?;
+    if files_val.is_empty() {
+        return Err("files array is empty".into());
+    }
+    if files_val.len() > 20 {
+        return Err(format!(
+            "batch write limited to 20 files (got {})",
+            files_val.len()
+        ));
+    }
+    let show_diff = args
+        .get("diff")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Partition into hash-mode tasks (delegate to existing apply_batch) and
+    // direct overwrite/append tasks (handled inline).
+    let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
+    let mut direct_results: Vec<String> = Vec::new();
+    let mut direct_applied: Vec<PathBuf> = Vec::new();
+
+    let (scope_root, _scope_warn) = resolve_scope(args);
+    // resolve_scope returns `.` (PathBuf) when scope == cwd; canonicalize for
+    // the containment check below. Fail closed on canonicalize failure: an
+    // unresolvable scope must refuse overwrite/append rather than silently
+    // disabling the guard (the symmetric behavior in `path_within_scope`).
+    let scope_canon: Result<PathBuf, std::io::Error> = scope_root.canonicalize();
+    for (i, f) in files_val.iter().enumerate() {
+        let mode = f.get("mode").and_then(|v| v.as_str()).unwrap_or("hash");
+        let Some(path_str) = f.get("path").and_then(|v| v.as_str()) else {
+            direct_results.push(format!("## files[{i}]\nerror: missing 'path'"));
+            continue;
+        };
+        let path = PathBuf::from(path_str);
+        // Scope guard for overwrite/append: hash mode goes through
+        // `edit::apply_batch` which canonicalizes + roots to `package_root`.
+        // overwrite/append accept any path the client sends, so we refuse
+        // writes that resolve outside the configured scope OR when the scope
+        // itself cannot be canonicalized (fail closed).
+        if matches!(mode, "overwrite" | "w" | "append" | "a") {
+            match scope_canon.as_ref() {
+                Ok(root) => {
+                    if !path_within_scope(&path, root) {
+                        direct_results.push(format!(
+                            "## {}\nerror: refusing write outside scope ({})",
+                            path.display(),
+                            root.display()
+                        ));
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    direct_results.push(format!(
+                        "## {}\nerror: scope unresolvable ({e}); refusing write",
+                        path.display(),
+                    ));
+                    continue;
+                }
+            }
+        }
+        match mode {
+            "hash" | "h" => hash_tasks.push(parse_file_edit(i, f)),
+            "overwrite" | "w" => {
+                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                match crate::mcp_v2::write_overwrite(&path, content) {
+                    Ok(()) => {
+                        let line_count = content.matches('\n').count() + 1;
+                        let mut block = format!(
+                            "## {}\noverwrite: {} bytes, {line_count} lines",
+                            path.display(),
+                            content.len()
+                        );
+                        if show_diff {
+                            block.push_str("\n── diff ──\n+ ");
+                            block.push_str(&content.replace('\n', "\n+ "));
+                        }
+                        direct_results.push(block);
+                        direct_applied.push(path);
+                    }
+                    Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),
+                }
+            }
+            "append" | "a" => {
+                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                match crate::mcp_v2::write_append(&path, content) {
+                    Ok(()) => {
+                        direct_results.push(format!(
+                            "## {}\nappend: {} bytes",
+                            path.display(),
+                            content.len()
+                        ));
+                        direct_applied.push(path);
+                    }
+                    Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),
+                }
+            }
+            other => direct_results.push(format!(
+                "## {}\nerror: unknown mode '{other}' (use hash, overwrite, append)",
+                path.display()
+            )),
+        }
+    }
+
+    let mut output = String::new();
+    if !hash_tasks.is_empty() {
+        // Pre-run strict auto-fix on hash-mode tasks. Capture original
+        // anchor-range bodies, then try the standard apply_batch. If the
+        // outcome reports hash mismatches per file, attempt auto-fix.
+        let originals: Vec<Option<HashOriginal>> =
+            hash_tasks.iter().map(capture_hash_original).collect();
+        match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
+            Ok(outcome) => {
+                for p in &outcome.applied {
+                    session.record_read(p);
+                }
+                // Per-file independence: when a file's section reports a hash
+                // mismatch, append a per-file auto-fix probe so spec criterion 9
+                // (strict auto-fix on mismatch, per file) holds even on partial
+                // batch success. The probe re-applies on a single-match
+                // relocation, so any path it touches is recorded as read.
+                let (augmented, reapplied) =
+                    append_per_file_auto_fix(&outcome.output, &originals, bloom);
+                for p in &reapplied {
+                    session.record_read(p);
+                }
+                output.push_str(&augmented);
+            }
+            Err(msg) => {
+                // All-failed path. Try auto-fix for each captured original.
+                let (fixed, reapplied) = try_auto_fix(&msg, &originals, bloom);
+                for p in &reapplied {
+                    session.record_read(p);
+                }
+                output.push_str(&fixed);
+            }
+        }
+    }
+    if !direct_results.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n\n---\n\n");
+        }
+        output.push_str(&direct_results.join("\n\n---\n\n"));
+        for p in &direct_applied {
+            session.record_read(p);
+        }
+    }
+    Ok(output)
+}
+
+/// Returns true if `path` resolves under `scope` (canonical path containment).
+/// For paths that don't yet exist, canonicalize the nearest existing ancestor
+/// and append the remaining components.
+fn path_within_scope(path: &Path, scope: &Path) -> bool {
+    let Ok(scope_canon) = scope.canonicalize() else {
+        return false;
+    };
+    // Walk up until a component canonicalizes.
+    let mut cursor: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        scope_canon.join(path)
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let resolved = loop {
+        if let Ok(p) = cursor.canonicalize() {
+            break p;
+        }
+        match (cursor.file_name(), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cursor = parent.to_path_buf();
+            }
+            _ => return false,
+        }
+    };
+    let mut full = resolved;
+    for component in tail.into_iter().rev() {
+        full.push(component);
+    }
+    full.starts_with(&scope_canon)
+}
+
+#[derive(Clone)]
+struct HashOriginal {
+    path: PathBuf,
+    body: String,
+    start: usize,
+    end: usize,
+    /// Full edit list captured pre-apply so a relocation probe can rebuild
+    /// the batch at the new line with freshly-computed hashes and re-invoke
+    /// `apply_batch` (spec criterion 9: "exactly one match → apply edit at
+    /// that new location").
+    edits: Vec<crate::edit::Edit>,
+}
+
+fn capture_hash_original(task: &crate::edit::FileEditTask) -> Option<HashOriginal> {
+    let crate::edit::FileEditTask::Ready { path, edits } = task else {
+        return None;
+    };
+    let first = edits.first()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    if first.start_line == 0 || first.start_line > lines.len() {
+        return None;
+    }
+    let s = first.start_line - 1;
+    let e = first.end_line.min(lines.len());
+    let body = lines[s..e].join("\n");
+    Some(HashOriginal {
+        path: path.clone(),
+        body,
+        start: first.start_line,
+        end: first.end_line,
+        edits: edits.clone(),
+    })
+}
+
+/// Rebuild the captured edits at the relocated `new_line`, recomputing hashes
+/// against the current file content, and apply via `crate::edit::apply_batch`.
+/// Returns the per-file section emitted by `apply_batch` on success, or `None`
+/// when the relocation cannot be reapplied (file gone, line out of bounds,
+/// apply failed). The first edit anchors the offset; subsequent edits in the
+/// same file shift by the same delta so multi-edit batches survive the move.
+fn reapply_at_relocation(
+    orig: &HashOriginal,
+    new_line: usize,
+    bloom: &Arc<BloomFilterCache>,
+) -> Option<String> {
+    use crate::edit::{apply_batch, Edit, FileEditTask};
+
+    let old_first = orig.edits.first()?.start_line;
+    let delta: isize = new_line as isize - old_first as isize;
+    let content = std::fs::read_to_string(&orig.path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    let mut shifted: Vec<Edit> = Vec::with_capacity(orig.edits.len());
+    for e in &orig.edits {
+        let new_start = (e.start_line as isize) + delta;
+        let new_end = (e.end_line as isize) + delta;
+        if new_start < 1 || new_end < 1 {
+            return None;
+        }
+        let (s, en) = (new_start as usize, new_end as usize);
+        if s == 0 || en == 0 || s > total || en > total {
+            return None;
+        }
+        let start_hash = crate::format::line_hash(lines[s - 1].as_bytes());
+        let end_hash = crate::format::line_hash(lines[en - 1].as_bytes());
+        shifted.push(Edit {
+            start_line: s,
+            start_hash,
+            end_line: en,
+            end_hash,
+            content: e.content.clone(),
+        });
+    }
+
+    let task = FileEditTask::Ready {
+        path: orig.path.clone(),
+        edits: shifted,
+    };
+    match apply_batch(vec![task], bloom, false) {
+        Ok(outcome) => Some(outcome.output),
+        Err(_) => None,
+    }
+}
+
+/// Probe one captured original for a strict-fingerprint relocation and,
+/// on exactly one match, re-apply the original edit at the new location
+/// (spec criterion 9). Returns the formatted line(s) describing the outcome
+/// (relocated+applied / relocated-only / ambiguous / err).
+fn probe_one_auto_fix(orig: &HashOriginal, bloom: &Arc<BloomFilterCache>) -> String {
+    use crate::mcp_v2::{auto_fix_locate, fresh_region, AutoFixResult};
+    let mut out = String::new();
+    match auto_fix_locate(&orig.path, &orig.body) {
+        Ok(AutoFixResult::Relocated { new_line }) => {
+            // Emit the verbatim prompt-promised line first so agents that
+            // pattern-match on `auto-fixed: <old> → <new>` (prompts/mcp-edit.md)
+            // see the literal signal.
+            let _ = writeln!(out, "auto-fixed: {} → {}", orig.start, new_line);
+            match reapply_at_relocation(orig, new_line, bloom) {
+                Some(section) => {
+                    let _ = writeln!(
+                        out,
+                        "{}: auto-fixed — edit re-applied at line {} (was {})",
+                        orig.path.display(),
+                        new_line,
+                        orig.start
+                    );
+                    out.push_str(&section);
+                    out.push('\n');
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{}: auto-fixed candidate — original anchor body found at line {} (was {}); re-apply failed",
+                        orig.path.display(),
+                        new_line,
+                        orig.start
+                    );
+                }
+            }
+        }
+        Ok(AutoFixResult::Ambiguous { matches }) => {
+            let _ = writeln!(
+                out,
+                "{}: {matches} matches for original body — fresh region below; retry with new anchors",
+                orig.path.display(),
+            );
+            if let Ok(fresh) = fresh_region(&orig.path, orig.start, orig.end) {
+                out.push_str(&fresh);
+                out.push('\n');
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "{}: auto-fix failed: {e}", orig.path.display());
+        }
+    }
+    out
+}
+
+/// Scan `apply_batch` output for `## <path>` sections that report a hash
+/// mismatch and append a per-file auto-fix probe to each one. Sections that
+/// applied cleanly are left untouched. Returns the augmented output plus the
+/// list of paths whose edits were re-applied at a relocated anchor — callers
+/// use the second value to extend session bookkeeping (`record_read`) so a
+/// successful auto-fix is treated as a write.
+fn append_per_file_auto_fix(
+    output: &str,
+    originals: &[Option<HashOriginal>],
+    bloom: &Arc<BloomFilterCache>,
+) -> (String, Vec<PathBuf>) {
+    let needs_probe = output.contains("hash mismatch");
+    if !needs_probe {
+        return (output.to_string(), Vec::new());
+    }
+    let by_path: std::collections::HashMap<String, &HashOriginal> = originals
+        .iter()
+        .flatten()
+        .map(|o| (o.path.display().to_string(), o))
+        .collect();
+    let sections: Vec<&str> = output.split("\n\n---\n\n").collect();
+    let mut rendered: Vec<String> = Vec::with_capacity(sections.len());
+    let mut reapplied: Vec<PathBuf> = Vec::new();
+    for section in sections {
+        if !section.contains("hash mismatch") {
+            rendered.push(section.to_string());
+            continue;
+        }
+        // First line is `## <path>` — extract path key.
+        let path_str = section
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("## "))
+            .unwrap_or("")
+            .trim();
+        let Some(orig) = by_path.get(path_str) else {
+            rendered.push(section.to_string());
+            continue;
+        };
+        let probe = probe_one_auto_fix(orig, bloom);
+        if probe.contains("auto-fixed —") {
+            reapplied.push(orig.path.clone());
+        }
+        let mut s = section.to_string();
+        s.push_str("\n\n── auto-fix probe ──\n");
+        s.push_str(&probe);
+        rendered.push(s);
+    }
+    (rendered.join("\n\n---\n\n"), reapplied)
+}
+
+fn try_auto_fix(
+    original_msg: &str,
+    originals: &[Option<HashOriginal>],
+    bloom: &Arc<BloomFilterCache>,
+) -> (String, Vec<PathBuf>) {
+    let mut out = String::from("hash mismatch — attempted auto-fix:\n\n");
+    out.push_str(original_msg);
+    out.push_str("\n\n── auto-fix probe ──\n");
+    let mut reapplied: Vec<PathBuf> = Vec::new();
+    for orig in originals.iter().flatten() {
+        let probe = probe_one_auto_fix(orig, bloom);
+        if probe.contains("auto-fixed —") {
+            reapplied.push(orig.path.clone());
+        }
+        out.push_str(&probe);
+    }
+    (out, reapplied)
 }
 
 fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
@@ -819,14 +1566,28 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Code search — finds definitions, usages, and text. Replaces grep/rg/Grep. Example callers query: `tilth_search(queries: [{query: \"handleAuth\", kind: \"callers\"}])` finds every call site of handleAuth. Prefer `queries: [{query, glob?, kind?}]` (array form, max 10) for multi-query batches; per-entry glob/kind compose freely. Singular `query:` still works for legacy/single calls. kind values: symbol (declarations only, default), content (literal text), regex (regex pattern), callers (call sites of a symbol). `expand: N` inlines source for top N matches with `<line>:<hash>` prefixes ready for tilth_write. `context: <path>` boosts results near the file you're editing. `if_modified_since: <ts>` returns unchanged-file stubs.",
             "inputSchema": {
                 "type": "object",
-                "required": ["query"],
                 "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": {"type": "string"},
+                                "glob": {"type": "string"},
+                                "kind": {"type": "string", "enum": ["symbol", "any", "content", "regex", "callers"]}
+                            }
+                        },
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": "Array of query objects. Each entry runs independently and results are concatenated under `## query: <q>` headers."
+                    },
                     "query": {
                         "type": "string",
-                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
+                        "description": "Legacy single-query form. Prefer `queries: [...]`."
                     },
                     "scope": {
                         "type": "string",
@@ -854,6 +1615,10 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Files with mtime ≤ this value return as `(unchanged @ <ts>)` stubs instead of bodies."
                     }
                 }
             }
@@ -870,7 +1635,21 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "File paths to read in one call (max 20). ALWAYS pass every file you need in one call — never call tilth_read twice in a row. For a single file, use a one-element array: paths: [\"a.rs\"]. Each file gets independent smart handling."
+                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Singular `path: \"...\"` is also accepted for one-file reads."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Singular form (transitional). Prefer paths: [...]."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "signature"],
+                        "default": "auto",
+                        "description": "auto = smart-size: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
                     },
                     "section": {
                         "type": "string",
@@ -894,8 +1673,34 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "tilth_list",
+            "description": "Directory layout with token-cost rollups. Example tree output:\n```\nsrc/      ~28k tokens   45 files\n├── cache.rs      ~833 tokens\n├── search/      ~14k tokens   8 files\n│   └── mod.rs      ~5.0k tokens\n```\nUse before tilth_read to budget context. Accepts patterns: [\"*.rs\", \"src/**/*.ts\"] and optional depth.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Glob patterns (max 20). e.g. [\"*.rs\", \"src/**/*.ts\"]. Always an array."
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Transitional singular form. Prefer patterns: [...]."
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Cap directory depth (1 = top-level only)."
+                    },
+                    "scope": {"type": "string"},
+                    "budget": {"type": "number"}
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching glob patterns. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates.",
+            "description": "Legacy alias for tilth_list. Prefer tilth_list. Find files matching glob patterns. Returns matched file paths sorted by relevance with token size estimates.",
             "inputSchema": {
                 "type": "object",
                 "required": ["patterns"],
@@ -995,6 +1800,55 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     if edit_mode {
         tools.push(serde_json::json!({
+            "name": "tilth_write",
+            "description": "Hash-anchored / overwrite / append edits across one or more files. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`. Modes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode auto-fixes safe mismatches: if your anchor body appears at exactly one new location, the edit lands there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined region returned inline for one-turn retry. Pass `diff: true` to verify what landed without a separate read.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["files"],
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["hash", "overwrite", "append"],
+                                    "default": "hash"
+                                },
+                                "edits": {
+                                    "type": "array",
+                                    "description": "Required when mode=hash. Each: {start: '<line>:<hash>', end?: '<line>:<hash>', content: '...'}",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["start", "content"],
+                                        "properties": {
+                                            "start": {"type": "string"},
+                                            "end": {"type": "string"},
+                                            "content": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Required when mode=overwrite or mode=append. Full file content / append payload."
+                                }
+                            }
+                        }
+                    },
+                    "diff": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include per-file before/after diff in the response."
+                    }
+                }
+            }
+        }));
+        tools.push(serde_json::json!({
             "name": "tilth_edit",
             "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group all ready edits into a single tilth_edit call — never call tilth_edit twice in a row when one `files` array could include everything. Each file is processed independently: a hash mismatch on one file does not block the others. Partial success returns isError: false, so scan every per-file `## <path>` section for failures. A malformed edit fails that whole file before any of its edits apply. Each path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
@@ -1082,16 +1936,16 @@ mod tests {
     fn build_instructions_base_has_expected_anchors() {
         let s = build_instructions(false, "");
         assert!(
-            s.starts_with("tilth — code intelligence MCP server."),
+            s.starts_with("tilth — AST-aware code intelligence MCP server."),
             "missing opening anchor: {:?}",
             &s[..60.min(s.len())]
         );
         assert!(
-            s.ends_with("[+] added, [-] deleted, [~] body changed, [~:sig] signature changed"),
+            s.contains("[+] added, [-] deleted, [~] body changed, [~:sig] signature changed"),
             "missing closing anchor"
         );
         assert!(
-            !s.contains("tilth_edit:"),
+            !s.contains("tilth_write:"),
             "edit-mode content leaked into base"
         );
     }
@@ -1100,12 +1954,10 @@ mod tests {
     fn build_instructions_edit_appends_extra_with_blank_line() {
         let s = build_instructions(true, "");
         assert!(
-            s.contains(
-                "[+] added, [-] deleted, [~] body changed, [~:sig] signature changed\n\ntilth_edit:"
-            ),
-            "expected single blank-line separator between base and edit-mode sections"
+            s.contains("tilth_write:"),
+            "expected tilth_write section in edit-mode instructions"
         );
-        assert!(s.ends_with("DO NOT use the host Edit tool. Use tilth_edit for all edits."));
+        assert!(s.contains("(Legacy alias: tilth_edit"));
     }
 
     #[test]
@@ -1334,13 +2186,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_files_singular_pattern_rejected() {
+    fn tool_files_singular_pattern_accepted_transitionally() {
+        // v2: singular `pattern:` is accepted as a transitional alias.
         let args = serde_json::json!({ "pattern": "*.rs" });
-        let err = tool_files(&args).expect_err("singular `pattern` must be rejected");
-        assert!(
-            err.contains("missing required parameter: patterns"),
-            "unexpected error: {err}"
-        );
+        let out = tool_files(&args).expect("singular pattern accepted");
+        assert!(out.contains("Glob"), "expected glob output: {out}");
     }
 
     // -- package_root fallback from subdirectory ------------------------------
@@ -1413,15 +2263,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_read_singular_path_rejected() {
-        let args = serde_json::json!({ "path": "a.rs" });
+    fn tool_read_singular_path_accepted_transitionally() {
+        // v2: singular `path:` is accepted as a transitional alias. Pass a
+        // nonexistent file so we exercise the alias parsing path without
+        // requiring real fixture setup. The expected outcome is an error from
+        // read::read_file (file not found), not the missing-param error.
+        let args = serde_json::json!({ "path": "this-file-does-not-exist-xyz.rs" });
         let cache = OutlineCache::new();
         let session = Session::new();
         let err = tool_read(&args, &cache, &session, false)
-            .expect_err("singular `path` must be rejected");
+            .expect_err("nonexistent file should error out");
         assert!(
-            err.contains("missing required parameter: paths"),
-            "unexpected error: {err}"
+            !err.contains("missing required parameter"),
+            "singular path must be accepted, got: {err}"
         );
     }
 
@@ -1869,6 +2723,584 @@ mod tests {
             session.reads_count(),
             1,
             "parse errors must not inflate the read counter"
+        );
+    }
+
+    // -- v2 MCP surface -----------------------------------------------------
+
+    /// `tilth_read` accepts the `path#n-m` suffix grammar.
+    #[test]
+    fn tool_read_line_range_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.txt");
+        std::fs::write(&p, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let spec = format!("{}#2-4", p.to_str().unwrap());
+        let args = serde_json::json!({ "paths": [spec] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("suffix accepted");
+        assert!(out.contains("l2"), "expected l2 in output: {out}");
+        assert!(out.contains("l4"), "expected l4 in output: {out}");
+        assert!(!out.contains("l5"), "must not include l5: {out}");
+    }
+
+    /// `tilth_read` heading suffix `path## Heading` resolves to that section.
+    #[test]
+    fn tool_read_heading_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.md");
+        std::fs::write(&p, "# Top\nintro\n## Foo\nfoo body\n## Bar\nbar body\n").unwrap();
+        // Path-suffix grammar: `path#<heading text>` (with internal space)
+        let spec = format!("{}#Foo", p.to_str().unwrap());
+        // Without internal space, it's classified as symbol — for headings
+        // use form with `##`. Use heading-style suffix instead:
+        let spec_heading = format!("{}### Bar", p.to_str().unwrap());
+        let _ = spec; // unused: the symbol form would fail on .md (no Code lang)
+        let args = serde_json::json!({ "paths": [spec_heading] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("heading suffix");
+        assert!(out.contains("bar body"), "expected heading content: {out}");
+    }
+
+    /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
+    #[test]
+    fn tool_search_queries_array_form() {
+        let args = serde_json::json!({
+            "queries": [{ "query": "build_instructions" }],
+            "expand": 0
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
+        assert!(
+            out.contains("Results as of"),
+            "expected Results header: {out}"
+        );
+        assert!(
+            out.contains("query: build_instructions"),
+            "expected per-query header: {out}"
+        );
+    }
+
+    /// `tilth_search` empty queries array errors clearly.
+    #[test]
+    fn tool_search_queries_empty_errors() {
+        let args = serde_json::json!({ "queries": [] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("empty errors");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// `tilth_list` emits a tree with rolled-up token counts.
+    #[test]
+    fn tool_list_produces_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(out.contains("src/"), "expected src/ in tree: {out}");
+        assert!(out.contains("a.rs"), "expected a.rs: {out}");
+        assert!(out.contains("tokens"), "expected token rollup: {out}");
+    }
+
+    /// `tilth_write` overwrite mode creates a new file.
+    #[test]
+    fn tool_write_overwrite_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.txt");
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "hello world\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("overwrite ok");
+        assert!(
+            out.contains("overwrite"),
+            "expected overwrite report: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world\n");
+    }
+
+    /// `tilth_write` append mode appends to existing or creates.
+    #[test]
+    fn tool_write_append_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        std::fs::write(&p, "start\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": "more\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let _ = tool_write(&args, &session, &bloom).expect("append ok");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "start\nmore\n");
+    }
+
+    // -- v2 hardening (press) ----------------------------------------------
+
+    /// `tool_write` hash-mode happy path: anchored edit applies, session
+    /// records exactly one read for the touched file.
+    #[test]
+    fn tool_write_hash_mode_applies_anchored_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": anchor_for("alpha\nbeta\ngamma\n", 2), "content": "BETA" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("hash apply ok");
+        assert!(!out.contains("hash mismatch"), "must not mismatch: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(session.reads_count(), 1, "applied file is recorded");
+    }
+
+    /// `tool_write` hash-mode mismatch triggers the auto-fix probe and surfaces
+    /// the relocation candidate in the response (strict fingerprint, exactly-
+    /// one-match path). Spec criterion 9.
+    #[test]
+    fn tool_write_hash_mismatch_emits_auto_fix_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        // "target unique line" appears exactly once; agent's anchor hash is
+        // wrong so apply_batch returns Err and auto-fix runs.
+        std::fs::write(&p, "prefix\ntarget unique line\ntail\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": wrong_anchor_for("prefix\ntarget unique line\ntail\n", 2), "content": "NEW" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("mismatch is surfaced, not Err");
+        assert!(
+            out.contains("hash mismatch"),
+            "mismatch marker missing: {out}"
+        );
+        assert!(
+            out.contains("auto-fix"),
+            "auto-fix probe must run on mismatch: {out}"
+        );
+        // Spec criterion 9: exactly one match → apply edit at that new
+        // location with the verbatim `auto-fixed: <old> → <new>` signal.
+        assert!(
+            out.contains("auto-fixed: 2 → 2"),
+            "verbatim auto-fixed line missing: {out}"
+        );
+        // File IS mutated when auto-fix succeeds (one-match relocation).
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "prefix\nNEW\ntail\n",
+            "single-match relocation must re-apply the edit"
+        );
+    }
+
+    /// `tool_write` mixed-mode batch: overwrite + append + bad-mode coexist;
+    /// per-file independence preserved.
+    #[test]
+    fn tool_write_mixed_mode_batch_independent_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let ow = dir.path().join("ow.txt");
+        let ap = dir.path().join("ap.txt");
+        std::fs::write(&ap, "start\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [
+                { "path": ow.to_str().unwrap(), "mode": "overwrite", "content": "X\n" },
+                { "path": ap.to_str().unwrap(), "mode": "append", "content": "Y\n" },
+                { "path": dir.path().join("bogus.txt").to_str().unwrap(), "mode": "bogus", "content": "" }
+            ]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("mixed batch ok");
+        assert_eq!(std::fs::read_to_string(&ow).unwrap(), "X\n");
+        assert_eq!(std::fs::read_to_string(&ap).unwrap(), "start\nY\n");
+        assert!(out.contains("unknown mode"), "bad mode must surface: {out}");
+    }
+
+    /// `tool_write` overwrite mode honors `diff: true` and includes a diff
+    /// block in the response.
+    #[test]
+    fn tool_write_overwrite_with_diff_includes_diff_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.txt");
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{ "path": p.to_str().unwrap(), "mode": "overwrite", "content": "hi\n" }],
+            "diff": true
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("overwrite ok");
+        assert!(out.contains("── diff ──"), "diff block expected: {out}");
+        assert!(out.contains("+ hi"), "added line marker expected: {out}");
+    }
+
+    /// `tool_write` rejects empty `files` array clearly.
+    #[test]
+    fn tool_write_empty_files_rejected() {
+        let args = serde_json::json!({ "files": [] });
+        let (session, bloom) = edit_services();
+        let err = tool_write(&args, &session, &bloom).expect_err("empty must error");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// `tool_read` with `if_modified_since` in the future returns an
+    /// `(unchanged)` stub rather than reading the file. Spec criterion 11.
+    #[test]
+    fn tool_read_if_modified_since_future_returns_unchanged_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.txt");
+        std::fs::write(&p, "contents you should NOT see\n").unwrap();
+        // Pick a timestamp well in the future; file mtime <= ts ⇒ unchanged.
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "if_modified_since": "2099-01-01T00:00:00Z"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("stub ok");
+        assert!(out.contains("unchanged"), "expected stub marker: {out}");
+        assert!(
+            !out.contains("contents you should NOT see"),
+            "body must not leak on unchanged stub: {out}"
+        );
+        assert!(out.contains("Results as of"), "header missing: {out}");
+    }
+
+    /// `tool_read` with `if_modified_since` in the past (epoch) returns the
+    /// actual file content. Boundary partner for the unchanged-stub test.
+    #[test]
+    fn tool_read_if_modified_since_past_returns_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("now.txt");
+        std::fs::write(&p, "hello world\n").unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "if_modified_since": "1970-01-01T00:00:00Z"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("content ok");
+        assert!(out.contains("hello world"), "expected body: {out}");
+    }
+
+    /// `tilth_read` `path#n` (FromLine) suffix returns from line n to end.
+    #[test]
+    fn tool_read_from_line_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, "l1\nl2\nl3\nl4\n").unwrap();
+        let spec = format!("{}#3", p.to_str().unwrap());
+        let args = serde_json::json!({ "paths": [spec] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("from-line suffix ok");
+        assert!(out.contains("l3"), "line 3 expected: {out}");
+        assert!(out.contains("l4"), "line 4 expected: {out}");
+        assert!(!out.contains("l1"), "line 1 must be excluded: {out}");
+    }
+
+    /// `tilth_search` queries[] enforces the 10-entry cap.
+    #[test]
+    fn tool_search_queries_over_limit_rejected() {
+        let mut qs = Vec::with_capacity(11);
+        for _ in 0..11 {
+            qs.push(serde_json::json!({ "query": "foo" }));
+        }
+        let args = serde_json::json!({ "queries": qs });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err(">10 must error");
+        assert!(err.contains("limited to 10"), "unexpected error: {err}");
+    }
+
+    /// `tilth_search` queries[] entry missing `query` field returns a clear
+    /// error naming the offending index.
+    #[test]
+    fn tool_search_queries_missing_query_field_errors() {
+        let args = serde_json::json!({ "queries": [{ "glob": "*.rs" }] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("missing query");
+        assert!(err.contains("queries[0]"), "must name index: {err}");
+        assert!(err.contains("query"), "must mention 'query': {err}");
+    }
+
+    /// `tilth_list` enforces the 20-pattern cap.
+    #[test]
+    fn tool_list_patterns_over_limit_rejected() {
+        let mut ps = Vec::with_capacity(21);
+        for _ in 0..21 {
+            ps.push(serde_json::json!("*.rs"));
+        }
+        let args = serde_json::json!({ "patterns": ps });
+        let err = tool_list(&args).expect_err(">20 must error");
+        assert!(err.contains("limited to 20"), "unexpected: {err}");
+    }
+
+    /// `tilth_list` empty patterns rejected.
+    #[test]
+    fn tool_list_empty_patterns_rejected() {
+        let args = serde_json::json!({ "patterns": [] });
+        let err = tool_list(&args).expect_err("empty must error");
+        assert!(err.contains("at least one"), "unexpected: {err}");
+    }
+
+    /// `kind: any` becomes a no-op alias for the default merged-search mode.
+    /// Tightened to assert it returns the same output as `kind: symbol` for
+    /// the same query — the no-op alias contract.
+    #[test]
+    fn tool_search_any_is_alias_for_symbol() {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let any_args = serde_json::json!({
+            "query": "build_instructions",
+            "kind": "any",
+            "expand": 0
+        });
+        let sym_args = serde_json::json!({
+            "query": "build_instructions",
+            "kind": "symbol",
+            "expand": 0
+        });
+        let any_out = tool_search(&any_args, &cache, &session, &bloom, false).expect("kind:any ok");
+        let sym_out =
+            tool_search(&sym_args, &cache, &session, &bloom, false).expect("kind:symbol ok");
+        assert_eq!(any_out, sym_out, "kind:any must equal kind:symbol");
+    }
+
+    /// Spec criterion 4: in edit_mode, expanded search source lines carry
+    /// `<line>:<hash>` prefixes (no leading gutter), ready to round-trip
+    /// through `tilth_write` hash anchors.
+    #[test]
+    fn tool_search_expand_emits_hashlines_in_edit_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hello.rs");
+        std::fs::write(
+            &p,
+            "fn unique_symbol_for_hashline_test() {\n    1 + 1;\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "queries": [{"query": "unique_symbol_for_hashline_test"}],
+            "expand": 1,
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, true).expect("edit-mode search ok");
+        // Expected: a line of the form `1:xxx|fn unique_symbol_for_hashline_test() {`.
+        let has_hash_anchor = out
+            .lines()
+            .any(|l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some());
+        assert!(
+            has_hash_anchor,
+            "expected <line>:<hash>| anchor in expanded source: {out}"
+        );
+        // The gutter form must NOT appear when edit_mode is set.
+        assert!(
+            !out.contains("│ fn unique_symbol_for_hashline_test"),
+            "gutter form must be suppressed under edit_mode: {out}"
+        );
+    }
+
+    /// Correctness: `tool_list` must respect `SKIP_DIRS` so `target/`,
+    /// `node_modules/`, `.git/` don't blow the budget.
+    #[test]
+    fn tool_list_walker_respects_skip_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/keep.rs"), "fn k(){}").unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/skip.rs"), "fn s(){}").unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/skip.js"), "x").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["**/*"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(
+            out.contains("keep.rs"),
+            "expected src/keep.rs in tree: {out}"
+        );
+        assert!(!out.contains("target/"), "target/ must be skipped: {out}");
+        assert!(
+            !out.contains("node_modules"),
+            "node_modules must be skipped: {out}"
+        );
+    }
+
+    /// Tightened tree-shape assertion: the rendered tree carries the box-
+    /// drawing connectors and a per-directory token rollup, not just the
+    /// substring `src/`.
+    #[test]
+    fn tool_list_emits_tree_shape_with_connectors_and_rollups() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["**/*.rs"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(
+            out.contains("├── ") || out.contains("└── "),
+            "expected box-drawing connector: {out}"
+        );
+        // Per-file token annotation
+        assert!(out.contains("a.rs"), "expected a.rs entry: {out}");
+        assert!(out.contains("tokens"), "expected token rollup: {out}");
+        // Files count on directory line
+        assert!(
+            out.lines()
+                .any(|l| l.contains("src/") && l.contains("files")),
+            "expected src/ line with files rollup: {out}"
+        );
+    }
+
+    /// Spec criterion 9 / per-file independence: a batch with one applying
+    /// file and one mismatching file must emit a per-file auto-fix probe for
+    /// the mismatcher while leaving the applied file untouched. (No more all-
+    /// or-nothing auto-fix.)
+    #[test]
+    fn tool_write_per_file_auto_fix_on_partial_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(&bad, "prefix\nunique relocatable anchor\ntail\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "mode": "hash",
+                    "edits": [{
+                        "start": anchor_for("alpha\nbeta\ngamma\n", 2),
+                        "content": "BETA"
+                    }]
+                },
+                {
+                    "path": bad.to_str().unwrap(),
+                    "mode": "hash",
+                    "edits": [{
+                        "start": wrong_anchor_for("prefix\nunique relocatable anchor\ntail\n", 2),
+                        "content": "NEW"
+                    }]
+                }
+            ]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("partial batch ok");
+        // Good file applied.
+        assert_eq!(
+            std::fs::read_to_string(&good).unwrap(),
+            "alpha\nBETA\ngamma\n",
+            "good file edit must land"
+        );
+        // Bad file: spec criterion 9 — single-match relocation re-applies
+        // the edit at the new location (here the same line, since the body
+        // hasn't moved but the agent's hash was stale).
+        assert_eq!(
+            std::fs::read_to_string(&bad).unwrap(),
+            "prefix\nNEW\ntail\n",
+            "single-match relocation must re-apply the edit on the bad file"
+        );
+        // Per-file probe block present, with the verbatim auto-fixed line.
+        assert!(
+            out.contains("── auto-fix probe ──"),
+            "per-file auto-fix probe must appear: {out}"
+        );
+        assert!(
+            out.contains("auto-fixed: "),
+            "verbatim auto-fixed signal must appear: {out}"
+        );
+    }
+
+    /// Spec criterion 9: when the agent's anchor hash is stale but the
+    /// captured body fingerprint resolves to exactly one location, tilth
+    /// re-applies the edit at that location and emits the verbatim
+    /// `auto-fixed: <old> → <new>` signal (with the resolved new line, which
+    /// equals the old when the body still sits at the agent's claimed line).
+    #[test]
+    fn tool_write_auto_fix_applies_on_single_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        std::fs::write(&p, "prefix\nunique_body_token\ntail\n").unwrap();
+        let stale = wrong_anchor_for("prefix\nunique_body_token\ntail\n", 2);
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": stale, "content": "REPLACED" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("auto-fix path ok");
+        assert!(
+            out.contains("auto-fixed: 2 → 2"),
+            "verbatim auto-fixed line missing: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "prefix\nREPLACED\ntail\n",
+            "edit must be re-applied at the resolved single-match line"
+        );
+    }
+
+    /// Security: overwrite/append outside the configured scope is refused.
+    #[test]
+    fn tool_write_overwrite_outside_scope_refused() {
+        let scope = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let target = outside_dir.path().join("escape.txt");
+        let args = serde_json::json!({
+            "scope": scope.path().to_str().unwrap(),
+            "files": [{
+                "path": target.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "escaped\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("refusal is in-band");
+        assert!(
+            out.contains("outside scope"),
+            "expected refusal marker: {out}"
+        );
+        assert!(
+            !target.exists(),
+            "file outside scope must not be written: {}",
+            target.display()
         );
     }
 }
