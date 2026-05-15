@@ -75,10 +75,7 @@ pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
 /// Render `"Results as of <RFC3339-ish>"` header for the response.
 pub fn results_header(ts: SystemTime) -> String {
     use std::time::UNIX_EPOCH;
-    let secs = ts
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = ts.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     // Minimal ISO-8601-ish formatter avoids pulling chrono. Format: YYYY-MM-DDTHH:MM:SSZ
     // Approximate via UTC seconds — good enough for ranking/caching.
     let datetime = format_iso_utc(secs);

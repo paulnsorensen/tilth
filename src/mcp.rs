@@ -59,8 +59,8 @@ fn build_instructions(edit_mode: bool, overview: &str) -> String {
     out
 }
 
-/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
-/// switches `tilth_read` to hashline output format.
+/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
+/// switches write-ready reads/search expansions to hashline output format.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
@@ -288,12 +288,10 @@ fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String
             &services.bloom,
             edit_mode,
         ),
-        "tilth_files" => tool_files(args),
         "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, &services.bloom),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, &services.session),
-        "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
         "tilth_write" if edit_mode => tool_write(args, &services.session, &services.bloom),
         _ => Err(format!("unknown tool: {tool}")),
     }
@@ -346,11 +344,12 @@ fn tool_read(
 
     // `mode: auto|full|signature` overrides the implicit smart-view.
     let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
-    let force_full = args
-        .get("full")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || mode_str == "full";
+    if !matches!(mode_str, "auto" | "full" | "signature") {
+        return Err(format!(
+            "unknown read mode: {mode_str}. Use: auto, full, signature"
+        ));
+    }
+    let force_full = mode_str == "full";
     let force_signature = mode_str == "signature";
 
     // if_modified_since: skip files whose mtime is <= ts (return stub).
@@ -358,10 +357,6 @@ fn tool_read(
         .get("if_modified_since")
         .and_then(|v| v.as_str())
         .and_then(crate::mcp_v2::parse_iso_utc);
-
-    let section = args.get("section").and_then(|v| v.as_str());
-    let sections_arr = args.get("sections").and_then(|v| v.as_array());
-    let full = force_full;
 
     // Resolve suffix grammar on each path spec into (PathBuf, Suffix)
     let parsed: Vec<(PathBuf, crate::mcp_v2::PathSuffix)> = raw_paths
@@ -371,18 +366,6 @@ fn tool_read(
     let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
     let suffixes: Vec<&crate::mcp_v2::PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
-    if section.is_some() && sections_arr.is_some() {
-        return Err("provide either section (single) or sections (array), not both".into());
-    }
-
-    // section/sections/full only apply when reading a single file.
-    let has_single_file_args = section.is_some() || sections_arr.is_some() || full;
-    if has_single_file_args && paths.len() > 1 {
-        return Err(
-            "section, sections, and full are only valid with a single-element paths array".into(),
-        );
-    }
-
     let now = std::time::SystemTime::now();
     let has_any_suffix = suffixes
         .iter()
@@ -391,7 +374,8 @@ fn tool_read(
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
-        if has_any_suffix || since.is_some() || force_signature {
+        if has_any_suffix || since.is_some() || force_signature || force_full || mode_str == "auto"
+        {
             // Per-path resolution so suffix/since/signature behave correctly.
             let mut parts: Vec<String> = Vec::with_capacity(paths.len());
             for (path, suffix) in &parsed {
@@ -402,7 +386,17 @@ fn tool_read(
                         continue;
                     }
                 }
-                let body = read_single_with_suffix(path, suffix, force_signature, edit_mode, cache);
+                let signature = force_signature
+                    || (!force_full
+                        && mode_str == "auto"
+                        && matches!(suffix, crate::mcp_v2::PathSuffix::None)
+                        && should_auto_signature(path));
+                let body = if force_full && matches!(suffix, crate::mcp_v2::PathSuffix::None) {
+                    crate::read::read_file(path, None, true, cache, edit_mode)
+                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
+                } else {
+                    read_single_with_suffix(path, suffix, signature, edit_mode, cache)
+                };
                 parts.push(body);
             }
             let combined = parts.join("\n\n");
@@ -428,8 +422,8 @@ fn tool_read(
         }
     }
 
-    // Path-suffix grammar takes priority over the legacy `section`/`sections`
-    // params when present.
+    // Path-suffix grammar drives slicing; standalone `section`/`sections` were
+    // removed per spec AC-5.
     if !matches!(suffix, crate::mcp_v2::PathSuffix::None) {
         session.record_read(&path);
         let body = read_single_with_suffix(&path, &suffix, force_signature, edit_mode, cache);
@@ -441,37 +435,10 @@ fn tool_read(
         return Ok(apply_budget(out, budget));
     }
 
-    // Multi-section path: bypass smart view + related-file hints (those only
-    // apply to whole-file reads).
-    if let Some(arr) = sections_arr {
-        let ranges: Vec<&str> = arr
-            .iter()
-            .map(|v| v.as_str().ok_or("sections must be an array of strings"))
-            .collect::<Result<Vec<_>, _>>()?;
-        if ranges.is_empty() {
-            return Err("sections must contain at least one range".into());
-        }
-        if ranges.len() > 20 {
-            return Err(format!(
-                "sections limited to 20 per call (got {})",
-                ranges.len()
-            ));
-        }
-        session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
-            }
-        };
-        return Ok(output);
-    }
-
     session.record_read(&path);
 
     // `mode: signature` is an outline-style read; route through outline path.
-    if force_signature {
+    if force_signature || (!force_full && mode_str == "auto" && should_auto_signature(&path)) {
         return Ok(apply_budget(
             read_single_with_suffix(
                 &path,
@@ -484,11 +451,11 @@ fn tool_read(
         ));
     }
 
-    let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
+    let mut output = crate::read::read_file(&path, None, force_full, cache, edit_mode)
         .map_err(|e| e.to_string())?;
 
-    // Append related-file hint for outlined code files (not section reads).
-    if section.is_none() && crate::read::would_outline(&path) {
+    // Append related-file hint for outlined code files.
+    if crate::read::would_outline(&path) {
         let related = crate::read::imports::resolve_related_files(&path);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
@@ -504,13 +471,12 @@ fn tool_read(
     Ok(apply_budget(output, budget))
 }
 
-/// Resolve a single path+suffix to its read output. Signature mode falls back
-/// to outline rendering via `read_file` (smart view) — outline is the closest
-/// existing equivalent and matches the spec's "signatures only" intent.
+/// Resolve a single path+suffix to its read output. Signature mode emits
+/// source-backed signature lines in hash-anchor format.
 fn read_single_with_suffix(
     path: &Path,
     suffix: &crate::mcp_v2::PathSuffix,
-    force_signature: bool,
+    signature: bool,
     edit_mode: bool,
     cache: &OutlineCache,
 ) -> String {
@@ -523,9 +489,7 @@ fn read_single_with_suffix(
         }
         PathSuffix::FromLine(n) => {
             // Resolve total lines via metadata + count; cheap & avoids full read.
-            let total = std::fs::read_to_string(path)
-                .map(|c| c.lines().count())
-                .unwrap_or(*n);
+            let total = std::fs::read_to_string(path).map_or(*n, |c| c.lines().count());
             let range = format!("{n}-{}", total.max(*n));
             crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
         }
@@ -550,9 +514,9 @@ fn read_single_with_suffix(
             }
         }
         PathSuffix::None => {
-            // Whole-file read. `force_signature` is honoured by the caller
-            // before reaching this arm; here we read with default smart view.
-            let _ = force_signature; // semantics handled upstream
+            if signature {
+                return read_signature_file(path, cache).unwrap_or_else(render_err);
+            }
             crate::read::read_file(path, None, false, cache, edit_mode).unwrap_or_else(render_err)
         }
     }
@@ -581,6 +545,75 @@ fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
     find_symbol_entry(&entries, name)
 }
 
+fn should_auto_signature(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !matches!(
+        crate::lang::detect_file_type(path),
+        crate::types::FileType::Code(_)
+    ) {
+        return false;
+    }
+    crate::types::estimate_tokens(meta.len()) > crate::read::TOKEN_THRESHOLD
+}
+
+fn read_signature_file(
+    path: &Path,
+    cache: &OutlineCache,
+) -> Result<String, crate::error::TilthError> {
+    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => crate::error::TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: None,
+        },
+        std::io::ErrorKind::PermissionDenied => crate::error::TilthError::PermissionDenied {
+            path: path.to_path_buf(),
+        },
+        _ => crate::error::TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    })?;
+    let meta = std::fs::metadata(path).map_err(|e| crate::error::TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let line_count = content.lines().count() as u32;
+    let header = crate::format::file_header(
+        path,
+        meta.len(),
+        line_count,
+        crate::types::ViewMode::Signature,
+    );
+    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+        return crate::read::read_file(path, None, false, cache, false);
+    };
+    let entries = crate::lang::outline::get_outline_entries(&content, lang);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut body = String::new();
+    render_signature_entries(&entries, &lines, &mut body);
+    if body.is_empty() {
+        body = crate::format::hashlines(&content, 1);
+    }
+    Ok(format!("{header}\n\n{}", body.trim_end()))
+}
+
+fn render_signature_entries(
+    entries: &[crate::types::OutlineEntry],
+    lines: &[&str],
+    out: &mut String,
+) {
+    for entry in entries {
+        let idx = entry.start_line.saturating_sub(1) as usize;
+        if let Some(line) = lines.get(idx) {
+            let hash = crate::format::line_hash(line.as_bytes());
+            let _ = writeln!(out, "{}:{hash:03x}|{line}", entry.start_line);
+        }
+        render_signature_entries(&entry.children, lines, out);
+    }
+}
+
 fn tool_search(
     args: &Value,
     cache: &OutlineCache,
@@ -588,6 +621,12 @@ fn tool_search(
     bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
 ) -> Result<String, String> {
+    let now = std::time::SystemTime::now();
+    let since = args
+        .get("if_modified_since")
+        .and_then(|v| v.as_str())
+        .and_then(crate::mcp_v2::parse_iso_utc);
+
     // v2 surface: `queries: [{query, glob?, kind?}]`. When present, run each
     // entry through the legacy single-query path and concatenate. Per-query
     // glob/kind override the top-level values.
@@ -601,7 +640,6 @@ fn tool_search(
                 queries_arr.len()
             ));
         }
-        let now = std::time::SystemTime::now();
         let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
         for (i, q) in queries_arr.iter().enumerate() {
             let qstr = q
@@ -618,11 +656,10 @@ fn tool_search(
             let kind = q
                 .get("kind")
                 .and_then(|v| v.as_str())
-                .or_else(|| args.get("kind").and_then(|v| v.as_str()))
-                .unwrap_or("symbol");
-            // `any` is preserved as a no-op alias for the new merged default
-            let kind = if kind == "any" { "symbol" } else { kind };
-            sub.insert("kind".into(), Value::String(kind.to_string()));
+                .or_else(|| args.get("kind").and_then(|v| v.as_str()));
+            if let Some(kind) = kind {
+                sub.insert("kind".into(), Value::String(kind.to_string()));
+            }
             for k in ["expand", "context", "scope", "budget", "if_modified_since"] {
                 if let Some(v) = args.get(k) {
                     sub.insert(k.into(), v.clone());
@@ -633,9 +670,18 @@ fn tool_search(
             parts.push(format!("## query: {qstr}\n\n{body}"));
         }
         let combined = parts.join("\n\n---\n\n");
+        let (scope, _) = resolve_scope(args);
+        let combined = since
+            .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
+            .unwrap_or(combined);
         return Ok(crate::mcp_v2::with_header(now, &combined));
     }
-    tool_search_single(args, cache, session, bloom, edit_mode)
+    let body = tool_search_single(args, cache, session, bloom, edit_mode)?;
+    let (scope, _) = resolve_scope(args);
+    let body = since
+        .map(|s| redact_unchanged_search_sections(&body, &scope, s))
+        .unwrap_or(body);
+    Ok(crate::mcp_v2::with_header(now, &body))
 }
 
 fn tool_search_single(
@@ -650,13 +696,7 @@ fn tool_search_single(
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query (or queries array)")?;
     let (scope, scope_warning) = resolve_scope(args);
-    let kind = args
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("symbol");
-    // `kind: any` collapses to `symbol` under the v2 merged-default; preserve
-    // the parameter as a no-op alias rather than failing.
-    let kind = if kind == "any" { "symbol" } else { kind };
+    let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")
         .and_then(serde_json::Value::as_u64)
@@ -670,13 +710,15 @@ fn tool_search_single(
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
-        "symbol" | "any" => {
+        None | Some("any") => {
+            session.record_search(query);
+            search_merged_default(
+                query, &scope, cache, session, bloom, expand, context, glob, edit_mode,
+            )
+        }
+        Some("symbol") => {
             use crate::search::symbol::SymbolMode;
-            let mode = if kind == "symbol" {
-                SymbolMode::Strict
-            } else {
-                SymbolMode::Any
-            };
+            let mode = SymbolMode::Strict;
             let queries: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -708,25 +750,25 @@ fn tool_search_single(
                 }
             }
         }
-        "content" => {
+        Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded_mode(
                 query, &scope, cache, session, expand, context, glob, edit_mode,
             )
         }
-        "regex" => {
+        Some("regex") => {
             session.record_search(query);
             crate::search::search_regex_expanded_mode(
                 query, &scope, cache, session, expand, context, glob, edit_mode,
             )
         }
-        "callers" => {
+        Some("callers") => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
                 query, &scope, bloom, expand, context, glob,
             )
         }
-        _ => {
+        Some(kind) => {
             return Err(format!(
                 "unknown search kind: {kind}. Use: symbol, any, content, regex, callers"
             ))
@@ -739,6 +781,111 @@ fn tool_search_single(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_merged_default(
+    query: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    edit_mode: bool,
+) -> Result<String, crate::error::TilthError> {
+    use crate::search::symbol::SymbolMode;
+
+    let mut sections = Vec::new();
+    sections.push(format!(
+        "## symbol results\n\n{}",
+        crate::search::search_symbol_expanded_mode(
+            query,
+            scope,
+            cache,
+            session,
+            bloom,
+            expand,
+            context,
+            glob,
+            SymbolMode::Strict,
+            edit_mode,
+        )?
+    ));
+    sections.push(format!(
+        "## content results\n\n{}",
+        crate::search::search_content_expanded_mode(
+            query, scope, cache, session, expand, context, glob, edit_mode,
+        )?
+    ));
+    if crate::classify::is_identifier(query) {
+        sections.push(format!(
+            "## caller results\n\n{}",
+            crate::search::callers::search_callers_expanded(
+                query, scope, bloom, expand, context, glob,
+            )?
+        ));
+    }
+    Ok(sections.join("\n\n---\n\n"))
+}
+
+fn redact_unchanged_search_sections(
+    output: &str,
+    scope: &Path,
+    since: std::time::SystemTime,
+) -> String {
+    let mut rendered = Vec::new();
+    let mut current = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+
+    for line in output.lines() {
+        if is_search_section_heading(line) {
+            flush_search_section(&mut rendered, &mut current, current_path.take(), since);
+            current_path = search_result_path(line, scope);
+        }
+        current.push(line.to_string());
+    }
+    flush_search_section(&mut rendered, &mut current, current_path, since);
+    rendered.join("\n")
+}
+
+fn flush_search_section(
+    rendered: &mut Vec<String>,
+    current: &mut Vec<String>,
+    current_path: Option<PathBuf>,
+    since: std::time::SystemTime,
+) {
+    if current.is_empty() {
+        return;
+    }
+    if let Some(path) = current_path {
+        if !crate::mcp_v2::file_changed_since(&path, since) {
+            rendered.push(crate::mcp_v2::unchanged_stub(&path, since));
+            current.clear();
+            return;
+        }
+    }
+    rendered.push(current.join("\n"));
+    current.clear();
+}
+
+fn is_search_section_heading(line: &str) -> bool {
+    line.starts_with("## ") || line.starts_with("### ")
+}
+
+fn search_result_path(line: &str, scope: &Path) -> Option<PathBuf> {
+    let rest = line
+        .strip_prefix("### ")
+        .or_else(|| line.strip_prefix("## "))?;
+    let loc = rest.split_whitespace().next()?;
+    let (path_part, _) = loc.rsplit_once(':')?;
+    if path_part.is_empty() {
+        return None;
+    }
+    let path = scope.join(path_part);
+    path.exists().then_some(path)
+}
+
+#[cfg(test)]
 fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
@@ -872,7 +1019,7 @@ fn tool_list(args: &Value) -> Result<String, String> {
         let rel = path.strip_prefix(&scope).unwrap_or(path);
         let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
         if matched {
-            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let bytes = entry.metadata().map_or(0, |m| m.len());
             entries.push((path.to_path_buf(), bytes));
         }
     }
@@ -956,6 +1103,9 @@ fn tool_write(
             "hash" | "h" => hash_tasks.push(parse_file_edit(i, f)),
             "overwrite" | "w" => {
                 let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let before = show_diff
+                    .then(|| std::fs::read_to_string(&path).ok())
+                    .flatten();
                 match crate::mcp_v2::write_overwrite(&path, content) {
                     Ok(()) => {
                         let line_count = content.matches('\n').count() + 1;
@@ -965,8 +1115,8 @@ fn tool_write(
                             content.len()
                         );
                         if show_diff {
-                            block.push_str("\n── diff ──\n+ ");
-                            block.push_str(&content.replace('\n', "\n+ "));
+                            block.push('\n');
+                            block.push_str(&render_text_diff(before.as_deref(), content));
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
@@ -976,13 +1126,22 @@ fn tool_write(
             }
             "append" | "a" => {
                 let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let before = show_diff
+                    .then(|| std::fs::read_to_string(&path).ok())
+                    .flatten();
                 match crate::mcp_v2::write_append(&path, content) {
                     Ok(()) => {
-                        direct_results.push(format!(
-                            "## {}\nappend: {} bytes",
-                            path.display(),
-                            content.len()
-                        ));
+                        let mut block =
+                            format!("## {}\nappend: {} bytes", path.display(), content.len());
+                        if show_diff {
+                            let after = before.as_deref().map_or_else(
+                                || content.to_string(),
+                                |old| format!("{old}{content}"),
+                            );
+                            block.push('\n');
+                            block.push_str(&render_text_diff(before.as_deref(), &after));
+                        }
+                        direct_results.push(block);
                         direct_applied.push(path);
                     }
                     Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),
@@ -1072,6 +1231,19 @@ fn path_within_scope(path: &Path, scope: &Path) -> bool {
         full.push(component);
     }
     full.starts_with(&scope_canon)
+}
+
+fn render_text_diff(before: Option<&str>, after: &str) -> String {
+    let mut out = String::from("── diff ──\n--- before\n+++ after\n");
+    if let Some(before) = before {
+        for line in before.lines() {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
+    for line in after.lines() {
+        let _ = writeln!(out, "+ {line}");
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1407,6 +1579,7 @@ fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
     })
 }
 
+#[cfg(test)]
 fn tool_edit(
     args: &Value,
     session: &Session,
@@ -1547,26 +1720,11 @@ fn run_tool_with_timeout(
 // ---------------------------------------------------------------------------
 
 fn tool_definitions(edit_mode: bool) -> Vec<Value> {
-    let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
-         from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
-    } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read a specific line range or heading. \
-         Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
-    };
+    let read_desc = "Read files with smart auto-sizing. Example: `tilth_read(paths: [\"src/lib.rs\", \"src/mcp.rs#tool_search\"], mode: \"auto\")` returns full small files, hash-prefixed signatures for large code, and sliced suffix reads when requested. Suffix grammar: `path#n-m`, `path#n`, `path### Heading`, `path#symbol_name`. Use `mode: \"full\"` to force full content and `mode: \"signature\"` for hash-prefixed signature lines.";
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Code search — finds definitions, usages, and text. Replaces grep/rg/Grep. Example callers query: `tilth_search(queries: [{query: \"handleAuth\", kind: \"callers\"}])` finds every call site of handleAuth. Prefer `queries: [{query, glob?, kind?}]` (array form, max 10) for multi-query batches; per-entry glob/kind compose freely. Singular `query:` still works for legacy/single calls. kind values: symbol (declarations only, default), content (literal text), regex (regex pattern), callers (call sites of a symbol). `expand: N` inlines source for top N matches with `<line>:<hash>` prefixes ready for tilth_write. `context: <path>` boosts results near the file you're editing. `if_modified_since: <ts>` returns unchanged-file stubs.",
+            "description": "Code search — finds definitions, content, and callers in one default search. Example callers query: `tilth_search(queries: [{query: \"handleAuth\", kind: \"callers\"}])` finds every call site of handleAuth. Use `queries: [{query, glob?, kind?}]` (array form, max 10); per-entry glob/kind compose freely. Omit kind for merged symbol + content + identifier-shaped callers; kind values filter to symbol, content, regex, or callers. `expand: N` inlines source for top N matches with `<line>:<hash>` prefixes ready for tilth_write. If editing `src/edit.rs`, pass `context: \"src/edit.rs\"` to surface nearby results first. `if_modified_since: <ts>` returns unchanged-file stubs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1578,26 +1736,16 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "properties": {
                                 "query": {"type": "string"},
                                 "glob": {"type": "string"},
-                                "kind": {"type": "string", "enum": ["symbol", "any", "content", "regex", "callers"]}
+                                "kind": {"type": "string", "enum": ["symbol", "content", "regex", "callers"]}
                             }
                         },
                         "minItems": 1,
                         "maxItems": 10,
                         "description": "Array of query objects. Each entry runs independently and results are concatenated under `## query: <q>` headers."
                     },
-                    "query": {
-                        "type": "string",
-                        "description": "Legacy single-query form. Prefer `queries: [...]`."
-                    },
                     "scope": {
                         "type": "string",
                         "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
-                    },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["symbol", "any", "content", "regex", "callers"],
-                        "default": "symbol",
-                        "description": "Search type. symbol: declarations only — tree-sitter AST where supported, with keyword/heading fallbacks for code without grammars and for markdown. No comment/string hits. any: symbol-name matches including comments/strings/usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
                     "expand": {
                         "type": "number",
@@ -1651,20 +1799,6 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
                     },
-                    "section": {
-                        "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Only valid with a single-element paths array. Use `sections` for multiple ranges."
-                    },
-                    "sections": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Only valid with a single-element paths array. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
-                    },
-                    "full": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Force full content output, bypass smart outlining. Only valid with a single-element paths array."
-                    },
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
@@ -1685,41 +1819,12 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "maxItems": 20,
                         "description": "Glob patterns (max 20). e.g. [\"*.rs\", \"src/**/*.ts\"]. Always an array."
                     },
-                    "pattern": {
-                        "type": "string",
-                        "description": "Transitional singular form. Prefer patterns: [...]."
-                    },
                     "depth": {
                         "type": "number",
                         "description": "Cap directory depth (1 = top-level only)."
                     },
                     "scope": {"type": "string"},
                     "budget": {"type": "number"}
-                }
-            }
-        }),
-        serde_json::json!({
-            "name": "tilth_files",
-            "description": "Legacy alias for tilth_list. Prefer tilth_list. Find files matching glob patterns. Returns matched file paths sorted by relevance with token size estimates.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["patterns"],
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Glob patterns to run in one call against the same scope (max 20). ALWAYS pass every glob you need in one call — never call tilth_files twice in a row. For a single glob, use a one-element array: patterns: [\"*.rs\"]. Each pattern emits its own `# Glob: ...` block, separated by a blank line."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max tokens in response."
-                    }
                 }
             }
         }),
@@ -1801,7 +1906,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
-            "description": "Hash-anchored / overwrite / append edits across one or more files. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`. Modes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode auto-fixes safe mismatches: if your anchor body appears at exactly one new location, the edit lands there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined region returned inline for one-turn retry. Pass `diff: true` to verify what landed without a separate read.",
+            "description": "Hash-anchored / overwrite / append edits across one or more files. Replaces the host Edit and Write tools — DO NOT use those.\n\nExample overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.\n\nRequest shape:\n```json\n{\n  \"files\": [\n    {\"path\": \"a.rs\", \"mode\": \"hash\", \"edits\": [\n      {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"},\n      {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"},\n      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n    ]},\n    {\"path\": \"new.rs\", \"mode\": \"overwrite\", \"content\": \"...\"},\n    {\"path\": \"log.txt\", \"mode\": \"append\",    \"content\": \"...\\n\"}\n  ],\n  \"diff\": true\n}\n```\n\nModes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode auto-fixes safe mismatches: if your anchor body appears at exactly one new location, the edit lands there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined region returned inline for one-turn retry. A malformed edit entry fails that whole file but does not block siblings.\n\nALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Each path may appear only once per call. Never call tilth_write twice in a row.\n\nPass `diff: true` to verify what landed without a separate read.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -1844,60 +1949,6 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Include per-file before/after diff in the response."
-                    }
-                }
-            }
-        }));
-        tools.push(serde_json::json!({
-            "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group all ready edits into a single tilth_edit call — never call tilth_edit twice in a row when one `files` array could include everything. Each file is processed independently: a hash mismatch on one file does not block the others. Partial success returns isError: false, so scan every per-file `## <path>` section for failures. A malformed edit fails that whole file before any of its edits apply. Each path may appear at most once per call. Max 20 files per call.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["files"],
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call; group all edits for that path here.",
-                        "items": {
-                            "type": "object",
-                            "required": ["path", "edits"],
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Absolute or relative file path to edit."
-                                },
-                                "edits": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "description": "Edit operations for this file, applied atomically per file.",
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["start", "content"],
-                                        "properties": {
-                                            "start": {
-                                                "type": "string",
-                                                "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
-                                            },
-                                            "end": {
-                                                "type": "string",
-                                                "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
-                                            },
-                                            "content": {
-                                                "type": "string",
-                                                "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "diff": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Set true to include a compact diff of changes in the response per file."
                     }
                 }
             }
@@ -1945,19 +1996,33 @@ mod tests {
             "missing closing anchor"
         );
         assert!(
-            !s.contains("tilth_write:"),
-            "edit-mode content leaked into base"
+            !s.contains("tilth_write is exposed"),
+            "edit-mode pointer leaked into base"
         );
     }
 
     #[test]
-    fn build_instructions_edit_appends_extra_with_blank_line() {
+    fn build_instructions_edit_appends_thin_pointer() {
         let s = build_instructions(true, "");
         assert!(
-            s.contains("tilth_write:"),
-            "expected tilth_write section in edit-mode instructions"
+            s.contains("tilth_write is exposed"),
+            "expected thin tilth_write pointer in edit-mode instructions"
         );
-        assert!(s.contains("(Legacy alias: tilth_edit"));
+        assert!(
+            !s.contains("Legacy alias: tilth_edit"),
+            "tilth_edit must not be advertised"
+        );
+        // Spec AC-12: server-level instructions stay thin. Detailed
+        // request shape, modes, and batching rules live in the tilth_write
+        // tool description, not in the server prompt.
+        assert!(
+            !s.contains("\"files\":"),
+            "request-shape JSON leaked into server prompt: {s}"
+        );
+        assert!(
+            !s.contains("ALWAYS group edits"),
+            "batching rule leaked into server prompt: {s}"
+        );
     }
 
     #[test]
@@ -2237,7 +2302,7 @@ mod tests {
             id: Some(serde_json::json!(1)),
             method: "tools/call".into(),
             params: serde_json::json!({
-                "name": "tilth_files",
+                "name": "tilth_list",
                 "arguments": { "patterns": ["*.rs"] }
             }),
         };
@@ -2299,6 +2364,19 @@ mod tests {
     }
 
     #[test]
+    fn tool_read_unknown_mode_errors() {
+        let args = serde_json::json!({
+            "paths": ["a.rs"],
+            "mode": "banana"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err =
+            tool_read(&args, &cache, &session, false).expect_err("unknown mode must be rejected");
+        assert!(err.contains("unknown read mode"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn tool_files_patterns_wrong_type_reports_type_error() {
         let args = serde_json::json!({ "patterns": "*.rs" });
         let err = tool_files(&args).expect_err("scalar `patterns` must be rejected as wrong type");
@@ -2309,22 +2387,6 @@ mod tests {
         assert!(
             !err.contains("missing required parameter"),
             "wrong-type error must not claim the param is missing: {err}"
-        );
-    }
-
-    #[test]
-    fn tool_read_section_with_multiple_paths_rejected() {
-        let args = serde_json::json!({
-            "paths": ["a.rs", "b.rs"],
-            "section": "1-10",
-        });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let err = tool_read(&args, &cache, &session, false)
-            .expect_err("section + multi-path must be rejected");
-        assert!(
-            err.contains("single-element paths array"),
-            "unexpected error: {err}"
         );
     }
 
@@ -2360,6 +2422,35 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+    }
+
+    #[test]
+    fn batch_read_mode_full_applies_to_all_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.rs");
+        let p2 = dir.path().join("b.rs");
+        let large = format!(
+            "fn only_signature() {{}}\n{}",
+            "// padding padding padding padding\n".repeat(1000)
+        );
+        std::fs::write(&p1, &large).unwrap();
+        std::fs::write(&p2, "fn small() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "paths": [p1.to_str().unwrap(), p2.to_str().unwrap()],
+            "mode": "full"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("batch full read ok");
+        assert!(
+            out.contains("padding padding"),
+            "large body must be included: {out}"
+        );
+        assert!(
+            out.contains("fn small"),
+            "small body must be included: {out}"
+        );
     }
 
     // -- batch tool_edit --------------------------------------------------------
@@ -2728,6 +2819,59 @@ mod tests {
 
     // -- v2 MCP surface -----------------------------------------------------
 
+    #[test]
+    fn tool_definitions_expose_v2_surface_only() {
+        let tools = tool_definitions(true);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(names.contains(&"tilth_search"));
+        assert!(names.contains(&"tilth_read"));
+        assert!(names.contains(&"tilth_list"));
+        assert!(names.contains(&"tilth_write"));
+        assert!(
+            !names.contains(&"tilth_files"),
+            "tilth_files must be hidden"
+        );
+        assert!(!names.contains(&"tilth_edit"), "tilth_edit must be hidden");
+
+        let search = tools
+            .iter()
+            .find(|t| t["name"] == "tilth_search")
+            .expect("search tool");
+        let search_props = &search["inputSchema"]["properties"];
+        assert!(search_props.get("query").is_none(), "singular query hidden");
+        assert!(search_props.get("kind").is_none(), "top-level kind hidden");
+        let query_kind_enum = &search_props["queries"]["items"]["properties"]["kind"]["enum"];
+        assert!(
+            !query_kind_enum
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "any"),
+            "kind:any must not be advertised"
+        );
+
+        let read = tools
+            .iter()
+            .find(|t| t["name"] == "tilth_read")
+            .expect("read tool");
+        let read_props = &read["inputSchema"]["properties"];
+        assert!(read_props.get("section").is_none(), "section hidden");
+        assert!(read_props.get("sections").is_none(), "sections hidden");
+        assert!(read_props.get("full").is_none(), "full hidden");
+
+        let list = tools
+            .iter()
+            .find(|t| t["name"] == "tilth_list")
+            .expect("list tool");
+        assert!(
+            list["inputSchema"]["properties"].get("pattern").is_none(),
+            "singular pattern hidden"
+        );
+    }
+
     /// `tilth_read` accepts the `path#n-m` suffix grammar.
     #[test]
     fn tool_read_line_range_suffix() {
@@ -2946,15 +3090,19 @@ mod tests {
     fn tool_write_overwrite_with_diff_includes_diff_block() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("new.txt");
+        std::fs::write(&p, "old\n").unwrap();
         let args = serde_json::json!({
             "scope": dir.path().to_str().unwrap(),
-            "files": [{ "path": p.to_str().unwrap(), "mode": "overwrite", "content": "hi\n" }],
+            "files": [{ "path": p.to_str().unwrap(), "mode": "overwrite", "content": "new\n" }],
             "diff": true
         });
         let (session, bloom) = edit_services();
         let out = tool_write(&args, &session, &bloom).expect("overwrite ok");
         assert!(out.contains("── diff ──"), "diff block expected: {out}");
-        assert!(out.contains("+ hi"), "added line marker expected: {out}");
+        assert!(out.contains("--- before"), "before marker expected: {out}");
+        assert!(out.contains("+++ after"), "after marker expected: {out}");
+        assert!(out.contains("- old"), "removed line marker expected: {out}");
+        assert!(out.contains("+ new"), "added line marker expected: {out}");
     }
 
     /// `tool_write` rejects empty `files` array clearly.
@@ -3022,6 +3170,176 @@ mod tests {
         assert!(!out.contains("l1"), "line 1 must be excluded: {out}");
     }
 
+    /// `mode: signature` emits hash-prefixed signature lines, not full bodies.
+    #[test]
+    fn tool_read_signature_mode_emits_hash_prefixed_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn signature_target() {\n    let body_marker = 42;\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "signature"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("signature ok");
+        assert!(
+            out.contains("[signature]"),
+            "signature header missing: {out}"
+        );
+        assert!(
+            out.lines().any(
+                |l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()
+                    && l.contains("fn signature_target")
+            ),
+            "hash-prefixed signature line missing: {out}"
+        );
+        assert!(
+            !out.contains("body_marker"),
+            "signature mode must not include function body: {out}"
+        );
+    }
+
+    /// Auto mode uses the same hash-prefixed signature output for large code.
+    #[test]
+    fn tool_read_auto_large_code_emits_hash_prefixed_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("large.rs");
+        let mut src = String::from("fn large_signature_target() {\n    let body_marker = 42;\n}\n");
+        src.push_str(&"// padding padding padding padding\n".repeat(1000));
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto signature ok");
+        assert!(
+            out.contains("[signature]"),
+            "signature header missing: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.contains("large_signature_target")
+                && crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()),
+            "hash-prefixed signature line missing: {out}"
+        );
+        assert!(
+            !out.contains("body_marker"),
+            "auto large-code signature must not include body: {out}"
+        );
+    }
+
+    /// Auto mode on small code returns the full body (header `[full]`),
+    /// covering row 1 / column 1 of the spec heuristic table.
+    #[test]
+    fn tool_read_auto_small_code_returns_full_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("small.rs");
+        std::fs::write(&p, "fn small_target() {\n    let body_marker = 1;\n}\n").unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto small-code ok");
+        assert!(out.contains("[full]"), "expected `[full]` header: {out}");
+        assert!(
+            out.contains("body_marker"),
+            "small code must include the body, not just signatures: {out}"
+        );
+    }
+
+    /// Auto mode on a small markdown file returns the full body (`[full]`),
+    /// covering row 2 / column 1 of the spec heuristic table.
+    #[test]
+    fn tool_read_auto_small_markdown_returns_full_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.md");
+        std::fs::write(&p, "# Title\n\nBody paragraph that must appear verbatim.\n").unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto small-md ok");
+        assert!(out.contains("[full]"), "expected `[full]` header: {out}");
+        assert!(
+            out.contains("Body paragraph that must appear verbatim"),
+            "small markdown must include body: {out}"
+        );
+    }
+
+    /// Auto mode on a large markdown file returns the heading-and-preview
+    /// outline (`[outline]`), covering row 2 / column 2 of the heuristic.
+    #[test]
+    fn tool_read_auto_large_markdown_returns_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("large.md");
+        let mut src = String::from("# Top\n\n## Headline Marker\n\nBody preview line one.\n");
+        src.push_str(&"filler line repeated for size.\n".repeat(2_000));
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto large-md ok");
+        assert!(
+            out.contains("[outline]"),
+            "expected `[outline]` header: {out}"
+        );
+        assert!(
+            out.contains("Headline Marker"),
+            "large markdown outline must surface headings: {out}"
+        );
+        assert!(
+            !out.contains("filler line repeated"),
+            "large markdown outline must not dump filler body: {out}"
+        );
+    }
+
+    /// Auto mode on a large structured (JSON) file returns the keys outline
+    /// (`[keys]`), covering the structured row of the heuristic.
+    #[test]
+    fn tool_read_auto_large_structured_returns_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.json");
+        let mut src = String::from("{\n  \"top_level_marker\": {\n");
+        for i in 0..2_000 {
+            let _ = writeln!(
+                src,
+                "    \"padding_key_{i}\": \"value-value-value-value-value-{i}\","
+            );
+        }
+        src.push_str("    \"trailing_key\": null\n  }\n}\n");
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto structured ok");
+        assert!(out.contains("[keys]"), "expected `[keys]` header: {out}");
+        assert!(
+            out.contains("top_level_marker"),
+            "structured outline must surface top-level keys: {out}"
+        );
+    }
+
+    /// Auto mode on a plain text file falls back to the file_type-specific
+    /// outline branch (`[outline]`) — no signature path applies because
+    /// `should_auto_signature` only fires for code, covering the "other
+    /// text" row of the heuristic.
+    #[test]
+    fn tool_read_auto_other_text_does_not_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        let body: String = "plain prose line that is not code.\n".repeat(2_000);
+        std::fs::write(&p, body).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto other-text ok");
+        assert!(
+            !out.contains("[signature]"),
+            "non-code file must never use signature mode: {out}"
+        );
+    }
+
     /// `tilth_search` queries[] enforces the 10-entry cap.
     #[test]
     fn tool_search_queries_over_limit_rejected() {
@@ -3070,28 +3388,71 @@ mod tests {
         assert!(err.contains("at least one"), "unexpected: {err}");
     }
 
-    /// `kind: any` becomes a no-op alias for the default merged-search mode.
-    /// Tightened to assert it returns the same output as `kind: symbol` for
-    /// the same query — the no-op alias contract.
+    /// Default search merges symbol, content, and identifier-shaped caller
+    /// results when `kind` is omitted.
     #[test]
-    fn tool_search_any_is_alias_for_symbol() {
+    fn tool_search_default_merges_symbol_content_and_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn target_fn() {\n    let _marker = \"content branch\";\n}\n\nfn caller() {\n    target_fn();\n}\n",
+        )
+        .unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
-        let any_args = serde_json::json!({
-            "query": "build_instructions",
-            "kind": "any",
+        let args = serde_json::json!({
+            "queries": [{"query": "target_fn"}],
+            "scope": dir.path().to_str().unwrap(),
             "expand": 0
         });
-        let sym_args = serde_json::json!({
-            "query": "build_instructions",
-            "kind": "symbol",
-            "expand": 0
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("merged search ok");
+        assert!(
+            out.contains("symbol results"),
+            "symbol facet missing: {out}"
+        );
+        assert!(
+            out.contains("content results"),
+            "content facet missing: {out}"
+        );
+        assert!(
+            out.contains("caller results"),
+            "caller facet missing: {out}"
+        );
+        assert!(
+            out.contains("[caller: caller]"),
+            "caller result missing: {out}"
+        );
+    }
+
+    /// `tilth_search` honors `if_modified_since` by stubbing unchanged files
+    /// without leaking expanded source bodies.
+    #[test]
+    fn tool_search_if_modified_since_redacts_unchanged_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn demo() {\n    let needle_unique = \"secret body text\";\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "queries": [{"query": "needle_unique", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1,
+            "if_modified_since": "2099-01-01T00:00:00Z"
         });
-        let any_out = tool_search(&any_args, &cache, &session, &bloom, false).expect("kind:any ok");
-        let sym_out =
-            tool_search(&sym_args, &cache, &session, &bloom, false).expect("kind:symbol ok");
-        assert_eq!(any_out, sym_out, "kind:any must equal kind:symbol");
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("Results as of"), "header missing: {out}");
+        assert!(out.contains("unchanged"), "stub missing: {out}");
+        assert!(
+            !out.contains("secret body text"),
+            "unchanged search body must be redacted: {out}"
+        );
     }
 
     /// Spec criterion 4: in edit_mode, expanded search source lines carry
