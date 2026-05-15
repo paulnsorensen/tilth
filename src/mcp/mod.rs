@@ -42,8 +42,13 @@ const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
 mod iso;
 mod path_suffix;
+mod tools;
 mod tree;
 mod write;
+
+#[cfg(test)]
+use tools::tool_files;
+use tools::{apply_budget, resolve_scope, tool_deps, tool_diff, tool_list, tool_session};
 
 /// Compose the `instructions` field for MCP `initialize`. Strips trailing
 /// whitespace from the embedded markdown so trailing file newlines don't leak
@@ -892,151 +897,6 @@ fn search_result_path(line: &str, scope: &Path) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-#[cfg(test)]
-fn tool_files(args: &Value) -> Result<String, String> {
-    let (scope, scope_warning) = resolve_scope(args);
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
-
-    // Accept singular `pattern:` as a transitional alias (97% of agents use it).
-    let patterns_arr_owned: Vec<Value>;
-    let patterns_arr: &Vec<Value> = match args.get("patterns") {
-        Some(v) => v.as_array().ok_or(
-            "patterns must be an array of globs (use single-element array for one pattern)",
-        )?,
-        None => match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => {
-                patterns_arr_owned = vec![Value::String(p.to_string())];
-                &patterns_arr_owned
-            }
-            None => {
-                return Err("missing required parameter: patterns (array of globs)".into());
-            }
-        },
-    };
-
-    if patterns_arr.is_empty() {
-        return Err("patterns must contain at least one glob".into());
-    }
-    if patterns_arr.len() > 20 {
-        return Err(format!(
-            "patterns limited to 20 per call (got {})",
-            patterns_arr.len()
-        ));
-    }
-    let patterns: Vec<&str> = patterns_arr
-        .iter()
-        .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut blocks = Vec::with_capacity(patterns.len());
-    for p in &patterns {
-        let block = crate::search::search_glob(p, &scope).map_err(|e| e.to_string())?;
-        blocks.push(block);
-    }
-    let combined = blocks.join("\n\n");
-
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(combined, budget));
-    Ok(result)
-}
-
-/// `tilth_list` — tree output with token-cost rollups.
-///
-/// Resolves each glob via `ignore::WalkBuilder` (same as `tilth_files`), but
-/// collects `(path, byte_len)` pairs and renders them as a single tree rooted
-/// at scope.
-fn tool_list(args: &Value) -> Result<String, String> {
-    use globset::Glob;
-    let (scope, scope_warning) = resolve_scope(args);
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
-
-    let patterns_arr_owned: Vec<Value>;
-    let patterns_arr: &Vec<Value> = match args.get("patterns") {
-        Some(v) => v.as_array().ok_or("patterns must be an array of globs")?,
-        None => match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => {
-                patterns_arr_owned = vec![Value::String(p.to_string())];
-                &patterns_arr_owned
-            }
-            None => return Err("missing required parameter: patterns".into()),
-        },
-    };
-    if patterns_arr.is_empty() {
-        return Err("patterns must contain at least one glob".into());
-    }
-    if patterns_arr.len() > 20 {
-        return Err(format!(
-            "patterns limited to 20 per call (got {})",
-            patterns_arr.len()
-        ));
-    }
-    let patterns: Vec<String> = patterns_arr
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .ok_or("patterns must be an array of strings")
-                .map(String::from)
-        })
-        .collect::<Result<_, _>>()?;
-
-    let depth = args
-        .get("depth")
-        .and_then(serde_json::Value::as_u64)
-        .map(|d| d as usize);
-
-    // Walk the scope directory and collect all files matching any pattern.
-    let matchers: Vec<_> = patterns
-        .iter()
-        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
-        .collect();
-    if matchers.is_empty() {
-        return Err("no valid globs provided".into());
-    }
-
-    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
-    let walker = ignore::WalkBuilder::new(&scope)
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(false)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !crate::search::SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        })
-        .build();
-    for entry in walker.filter_map(Result::ok) {
-        let Some(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if let Some(d) = depth {
-            let rel = path.strip_prefix(&scope).unwrap_or(path);
-            let parts = rel.components().count();
-            if parts > d {
-                continue;
-            }
-        }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let rel = path.strip_prefix(&scope).unwrap_or(path);
-        let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
-        if matched {
-            let bytes = entry.metadata().map_or(0, |m| m.len());
-            entries.push((path.to_path_buf(), bytes));
-        }
-    }
-
-    let tree = crate::mcp::tree::render_tree(&scope, &entries);
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(tree, budget));
-    Ok(result)
-}
-
 /// `tilth_write` — hash / overwrite / append modes per file.
 fn tool_write(
     args: &Value,
@@ -1463,59 +1323,6 @@ fn try_auto_fix(
     (out, reapplied)
 }
 
-fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path")?;
-    let path = PathBuf::from(path_str);
-    let (scope, scope_warning) = resolve_scope(args);
-    let budget = args
-        .get("budget")
-        .and_then(serde_json::Value::as_u64)
-        .map(|b| b as usize);
-
-    let deps_result =
-        crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
-    let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::deps::format_deps(
-        &deps_result,
-        &scope,
-        budget,
-    ));
-    Ok(output)
-}
-
-fn tool_diff(args: &Value) -> Result<String, String> {
-    let source = args.get("source").and_then(|v| v.as_str());
-    let scope = args.get("scope").and_then(|v| v.as_str());
-    let a = args.get("a").and_then(|v| v.as_str());
-    let b = args.get("b").and_then(|v| v.as_str());
-    let patch = args.get("patch").and_then(|v| v.as_str());
-    let log = args.get("log").and_then(|v| v.as_str());
-    let search = args.get("search").and_then(|v| v.as_str());
-    let blast = args.get("blast").and_then(Value::as_bool).unwrap_or(false);
-    let expand = args.get("expand").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let budget = args.get("budget").and_then(Value::as_u64);
-
-    let diff_source = crate::diff::resolve_source(source, a, b, patch, log)?;
-    crate::diff::diff(&diff_source, scope, search, blast, expand, budget)
-}
-
-fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("summary");
-    match action {
-        "reset" => {
-            session.reset();
-            Ok("Session reset.".to_string())
-        }
-        _ => Ok(session.summary()),
-    }
-}
-
 /// Parse one `files[]` entry. Parse errors are deferred onto the task so a
 /// malformed entry surfaces as a per-file failure instead of aborting the
 /// whole batch.
@@ -1626,33 +1433,6 @@ fn tool_edit(
         session.record_read(path);
     }
     Ok(outcome.output)
-}
-
-/// Falls back to cwd when scope is invalid, with a warning message.
-fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
-    let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
-    let raw: PathBuf = raw_str.into();
-    let resolved = raw.canonicalize().unwrap_or_else(|_| raw.clone());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    if resolved == cwd {
-        return (".".into(), None);
-    }
-    if !resolved.is_dir() {
-        return (
-            ".".into(),
-            Some(format!(
-                "scope \"{raw_str}\" is not a valid directory, searching current directory instead.\n\n"
-            )),
-        );
-    }
-    (resolved, None)
-}
-
-fn apply_budget(output: String, budget: Option<u64>) -> String {
-    match budget {
-        Some(b) => crate::budget::apply(&output, b),
-        None => output,
-    }
 }
 
 // ---------------------------------------------------------------------------
