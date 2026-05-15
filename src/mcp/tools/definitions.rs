@@ -87,7 +87,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["auto", "full", "signature"],
                         "default": "auto",
-                        "description": "auto = smart-size: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
+                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
                     },
                     "if_modified_since": {
                         "type": "string",
