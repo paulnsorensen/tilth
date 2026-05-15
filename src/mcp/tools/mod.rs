@@ -15,6 +15,7 @@ mod list;
 mod read;
 mod search;
 mod session;
+mod write;
 
 pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;
@@ -24,6 +25,9 @@ pub(super) use list::tool_list;
 pub(super) use read::tool_read;
 pub(super) use search::tool_search;
 pub(super) use session::tool_session;
+#[cfg(test)]
+pub(super) use write::tool_edit;
+pub(super) use write::tool_write;
 
 /// Resolve the `scope` argument to a canonical directory. Falls back to cwd
 /// with a warning message when the argument is missing, invalid, or not a
