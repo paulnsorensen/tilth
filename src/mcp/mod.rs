@@ -37,8 +37,10 @@ impl Services {
 // Sent to the LLM via the MCP `instructions` field during initialization.
 // Source of truth: prompts/mcp-base.md and prompts/mcp-edit.md.
 // AGENTS.md is regenerated from these via scripts/regen-agents-md.sh.
-const SERVER_INSTRUCTIONS: &str = include_str!("../prompts/mcp-base.md");
-const EDIT_MODE_EXTRA: &str = include_str!("../prompts/mcp-edit.md");
+const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
+const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
+
+mod v2;
 
 /// Compose the `instructions` field for MCP `initialize`. Strips trailing
 /// whitespace from the embedded markdown so trailing file newlines don't leak
@@ -356,20 +358,20 @@ fn tool_read(
     let since = args
         .get("if_modified_since")
         .and_then(|v| v.as_str())
-        .and_then(crate::mcp_v2::parse_iso_utc);
+        .and_then(crate::mcp::v2::parse_iso_utc);
 
     // Resolve suffix grammar on each path spec into (PathBuf, Suffix)
-    let parsed: Vec<(PathBuf, crate::mcp_v2::PathSuffix)> = raw_paths
+    let parsed: Vec<(PathBuf, crate::mcp::v2::PathSuffix)> = raw_paths
         .iter()
-        .map(|s| crate::mcp_v2::parse_path_with_suffix(s))
+        .map(|s| crate::mcp::v2::parse_path_with_suffix(s))
         .collect();
     let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
-    let suffixes: Vec<&crate::mcp_v2::PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
+    let suffixes: Vec<&crate::mcp::v2::PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
     let now = std::time::SystemTime::now();
     let has_any_suffix = suffixes
         .iter()
-        .any(|s| !matches!(s, crate::mcp_v2::PathSuffix::None));
+        .any(|s| !matches!(s, crate::mcp::v2::PathSuffix::None));
 
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
@@ -381,17 +383,17 @@ fn tool_read(
             for (path, suffix) in &parsed {
                 session.record_read(path);
                 if let Some(s_ts) = since {
-                    if !crate::mcp_v2::file_changed_since(path, s_ts) {
-                        parts.push(crate::mcp_v2::unchanged_stub(path, s_ts));
+                    if !crate::mcp::v2::file_changed_since(path, s_ts) {
+                        parts.push(crate::mcp::v2::unchanged_stub(path, s_ts));
                         continue;
                     }
                 }
                 let signature = force_signature
                     || (!force_full
                         && mode_str == "auto"
-                        && matches!(suffix, crate::mcp_v2::PathSuffix::None)
+                        && matches!(suffix, crate::mcp::v2::PathSuffix::None)
                         && should_auto_signature(path));
-                let body = if force_full && matches!(suffix, crate::mcp_v2::PathSuffix::None) {
+                let body = if force_full && matches!(suffix, crate::mcp::v2::PathSuffix::None) {
                     crate::read::read_file(path, None, true, cache, edit_mode)
                         .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
                 } else {
@@ -400,7 +402,7 @@ fn tool_read(
                 parts.push(body);
             }
             let combined = parts.join("\n\n");
-            let with_hdr = crate::mcp_v2::with_header(now, &combined);
+            let with_hdr = crate::mcp::v2::with_header(now, &combined);
             return Ok(apply_budget(with_hdr, budget));
         }
         let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
@@ -412,23 +414,23 @@ fn tool_read(
         .into_iter()
         .next()
         .cloned()
-        .unwrap_or(crate::mcp_v2::PathSuffix::None);
+        .unwrap_or(crate::mcp::v2::PathSuffix::None);
 
     // if_modified_since on a single path
     if let Some(s_ts) = since {
-        if !crate::mcp_v2::file_changed_since(&path, s_ts) {
-            let body = crate::mcp_v2::unchanged_stub(&path, s_ts);
-            return Ok(crate::mcp_v2::with_header(now, &body));
+        if !crate::mcp::v2::file_changed_since(&path, s_ts) {
+            let body = crate::mcp::v2::unchanged_stub(&path, s_ts);
+            return Ok(crate::mcp::v2::with_header(now, &body));
         }
     }
 
     // Path-suffix grammar drives slicing; standalone `section`/`sections` were
     // removed per spec AC-5.
-    if !matches!(suffix, crate::mcp_v2::PathSuffix::None) {
+    if !matches!(suffix, crate::mcp::v2::PathSuffix::None) {
         session.record_read(&path);
         let body = read_single_with_suffix(&path, &suffix, force_signature, edit_mode, cache);
         let out = if since.is_some() {
-            crate::mcp_v2::with_header(now, &body)
+            crate::mcp::v2::with_header(now, &body)
         } else {
             body
         };
@@ -442,7 +444,7 @@ fn tool_read(
         return Ok(apply_budget(
             read_single_with_suffix(
                 &path,
-                &crate::mcp_v2::PathSuffix::None,
+                &crate::mcp::v2::PathSuffix::None,
                 true,
                 edit_mode,
                 cache,
@@ -475,12 +477,12 @@ fn tool_read(
 /// source-backed signature lines in hash-anchor format.
 fn read_single_with_suffix(
     path: &Path,
-    suffix: &crate::mcp_v2::PathSuffix,
+    suffix: &crate::mcp::v2::PathSuffix,
     signature: bool,
     edit_mode: bool,
     cache: &OutlineCache,
 ) -> String {
-    use crate::mcp_v2::PathSuffix;
+    use crate::mcp::v2::PathSuffix;
     let render_err = |e: crate::error::TilthError| format!("# {}\nerror: {}", path.display(), e);
     match suffix {
         PathSuffix::LineRange(s, e) => {
@@ -625,7 +627,7 @@ fn tool_search(
     let since = args
         .get("if_modified_since")
         .and_then(|v| v.as_str())
-        .and_then(crate::mcp_v2::parse_iso_utc);
+        .and_then(crate::mcp::v2::parse_iso_utc);
 
     // v2 surface: `queries: [{query, glob?, kind?}]`. When present, run each
     // entry through the legacy single-query path and concatenate. Per-query
@@ -674,14 +676,14 @@ fn tool_search(
         let combined = since
             .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
             .unwrap_or(combined);
-        return Ok(crate::mcp_v2::with_header(now, &combined));
+        return Ok(crate::mcp::v2::with_header(now, &combined));
     }
     let body = tool_search_single(args, cache, session, bloom, edit_mode)?;
     let (scope, _) = resolve_scope(args);
     let body = since
         .map(|s| redact_unchanged_search_sections(&body, &scope, s))
         .unwrap_or(body);
-    Ok(crate::mcp_v2::with_header(now, &body))
+    Ok(crate::mcp::v2::with_header(now, &body))
 }
 
 fn tool_search_single(
@@ -858,8 +860,8 @@ fn flush_search_section(
         return;
     }
     if let Some(path) = current_path {
-        if !crate::mcp_v2::file_changed_since(&path, since) {
-            rendered.push(crate::mcp_v2::unchanged_stub(&path, since));
+        if !crate::mcp::v2::file_changed_since(&path, since) {
+            rendered.push(crate::mcp::v2::unchanged_stub(&path, since));
             current.clear();
             return;
         }
@@ -1024,7 +1026,7 @@ fn tool_list(args: &Value) -> Result<String, String> {
         }
     }
 
-    let tree = crate::mcp_v2::render_tree(&scope, &entries);
+    let tree = crate::mcp::v2::render_tree(&scope, &entries);
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(tree, budget));
     Ok(result)
@@ -1106,7 +1108,7 @@ fn tool_write(
                 let before = show_diff
                     .then(|| std::fs::read_to_string(&path).ok())
                     .flatten();
-                match crate::mcp_v2::write_overwrite(&path, content) {
+                match crate::mcp::v2::write_overwrite(&path, content) {
                     Ok(()) => {
                         let line_count = content.matches('\n').count() + 1;
                         let mut block = format!(
@@ -1129,7 +1131,7 @@ fn tool_write(
                 let before = show_diff
                     .then(|| std::fs::read_to_string(&path).ok())
                     .flatten();
-                match crate::mcp_v2::write_append(&path, content) {
+                match crate::mcp::v2::write_append(&path, content) {
                     Ok(()) => {
                         let mut block =
                             format!("## {}\nappend: {} bytes", path.display(), content.len());
@@ -1337,7 +1339,7 @@ fn reapply_at_relocation(
 /// (spec criterion 9). Returns the formatted line(s) describing the outcome
 /// (relocated+applied / relocated-only / ambiguous / err).
 fn probe_one_auto_fix(orig: &HashOriginal, bloom: &Arc<BloomFilterCache>) -> String {
-    use crate::mcp_v2::{auto_fix_locate, fresh_region, AutoFixResult};
+    use crate::mcp::v2::{auto_fix_locate, fresh_region, AutoFixResult};
     let mut out = String::new();
     match auto_fix_locate(&orig.path, &orig.body) {
         Ok(AutoFixResult::Relocated { new_line }) => {
