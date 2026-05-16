@@ -202,14 +202,21 @@ def run_single(
             env=env,
         )
         assert proc.stdout is not None and proc.stderr is not None
+        stderr_pipe = proc.stderr
         stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
         timed_out = False
+
+        def _drain_stderr() -> None:
+            stderr_chunks.append(stderr_pipe.read())
 
         def _kill_on_timeout() -> None:
             nonlocal timed_out
             timed_out = True
             proc.kill()
 
+        stderr_thread = threading.Thread(target=_drain_stderr)
+        stderr_thread.start()
         timer = threading.Timer(600, _kill_on_timeout)
         timer.start()
         try:
@@ -218,12 +225,12 @@ def run_single(
                     logf.write(line)
                     logf.flush()
                     stdout_chunks.append(line)
-            stderr_text = proc.stderr.read()
             proc.wait()
+            stderr_thread.join()
         finally:
             timer.cancel()
             proc.stdout.close()
-            proc.stderr.close()
+            stderr_pipe.close()
 
         if timed_out:
             raise subprocess.TimeoutExpired(cmd, 600)
@@ -232,7 +239,7 @@ def run_single(
             args=cmd,
             returncode=proc.returncode,
             stdout="".join(stdout_chunks),
-            stderr=stderr_text,
+            stderr="".join(stderr_chunks),
         )
     else:
         result = subprocess.run(
