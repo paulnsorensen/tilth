@@ -385,6 +385,19 @@ fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    let full_flag = args
+        .get("full")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+    if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
+        return Err(format!(
+            "unknown read mode: {mode_str}. Use: auto, full, signature, stripped"
+        ));
+    }
+    let force_full = full_flag || mode_str == "full";
+    let force_signature = mode_str == "signature";
+    let force_stripped = mode_str == "stripped";
 
     // Multi-file batch read (capped at 20 to bound I/O)
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
@@ -420,7 +433,14 @@ fn tool_read(
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = PathBuf::from(path_str);
             session.record_read(&path);
-            match crate::read::read_file(&path, None, false, cache, edit_mode) {
+            let read = if force_signature {
+                read_signature_file(&path, cache).map(|(body, _)| body)
+            } else if force_stripped {
+                read_stripped_file(&path, cache).map(|(body, _, _)| body)
+            } else {
+                crate::read::read_file(&path, None, force_full, cache, edit_mode)
+            };
+            match read {
                 Ok(output) => results.push(output),
                 Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
             }
@@ -437,10 +457,6 @@ fn tool_read(
     let path = PathBuf::from(path_str);
     let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
-    let full = args
-        .get("full")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
 
     if section.is_some() && sections_arr.is_some() {
         return Err("provide either section (single) or sections (array), not both".into());
@@ -463,14 +479,29 @@ fn tool_read(
             ));
         }
         session.record_read(&path);
-        let output =
-            crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
-        return Ok(apply_budget(output, budget));
+        let output = match budget {
+            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
+                .map_err(|e| e.to_string())?,
+            None => {
+                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
+            }
+        };
+        return Ok(output);
     }
 
     session.record_read(&path);
-    let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
-        .map_err(|e| e.to_string())?;
+    let mut output = if section.is_none() && force_signature {
+        read_signature_file(&path, cache)
+            .map(|(body, _)| body)
+            .map_err(|e| e.to_string())?
+    } else if section.is_none() && force_stripped {
+        read_stripped_file(&path, cache)
+            .map(|(body, _, _)| body)
+            .map_err(|e| e.to_string())?
+    } else {
+        crate::read::read_file(&path, section, force_full, cache, edit_mode)
+            .map_err(|e| e.to_string())?
+    };
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
@@ -831,6 +862,126 @@ fn apply_budget(output: String, budget: Option<u64>) -> String {
     }
 }
 
+fn read_signature_file(
+    path: &Path,
+    cache: &OutlineCache,
+) -> Result<(String, u32), crate::error::TilthError> {
+    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => crate::error::TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: None,
+        },
+        std::io::ErrorKind::PermissionDenied => crate::error::TilthError::PermissionDenied {
+            path: path.to_path_buf(),
+        },
+        _ => crate::error::TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    })?;
+    let meta = std::fs::metadata(path).map_err(|e| crate::error::TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+    let header = crate::format::file_header(
+        path,
+        meta.len(),
+        line_count,
+        crate::types::ViewMode::Signature,
+    );
+
+    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+        let body = crate::read::read_file(path, None, false, cache, false)?;
+        return Ok((body, line_count));
+    };
+
+    let entries = crate::lang::outline::get_outline_entries(&content, lang);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut body = String::new();
+    render_signature_entries(&entries, &lines, &mut body);
+    if body.is_empty() {
+        body = crate::format::hashlines(&content, 1);
+    }
+    Ok((format!("{header}\n\n{}", body.trim_end()), line_count))
+}
+
+fn render_signature_entries(
+    entries: &[crate::types::OutlineEntry],
+    lines: &[&str],
+    out: &mut String,
+) {
+    for entry in entries {
+        let idx = entry.start_line.saturating_sub(1) as usize;
+        if let Some(line) = lines.get(idx) {
+            let hash = crate::format::line_hash(line.as_bytes());
+            let _ = writeln!(out, "{}:{hash:03x}|{line}", entry.start_line);
+        }
+        render_signature_entries(&entry.children, lines, out);
+    }
+}
+
+fn read_stripped_file(
+    path: &Path,
+    cache: &OutlineCache,
+) -> Result<(String, u32, u32), crate::error::TilthError> {
+    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => crate::error::TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: None,
+        },
+        std::io::ErrorKind::PermissionDenied => crate::error::TilthError::PermissionDenied {
+            path: path.to_path_buf(),
+        },
+        _ => crate::error::TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    })?;
+    let meta = std::fs::metadata(path).map_err(|e| crate::error::TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+
+    if !matches!(
+        crate::lang::detect_file_type(path),
+        crate::types::FileType::Code(_)
+    ) {
+        let body = crate::read::read_file(path, None, false, cache, false)?;
+        return Ok((body, total_lines, 0));
+    }
+
+    let skip_lines = crate::search::strip::strip_noise(&content, path, Some((1, total_lines)));
+    let width = total_lines.max(1).to_string().len();
+    let mut body = String::with_capacity(content.len());
+    let mut kept: u32 = 0;
+    for (i, line) in content.lines().enumerate() {
+        let line_num = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        if skip_lines.contains(&line_num) {
+            continue;
+        }
+        let _ = writeln!(body, "{line_num:>width$}  {line}");
+        kept += 1;
+    }
+
+    let stripped = total_lines.saturating_sub(kept);
+    let header = crate::format::file_header(
+        path,
+        meta.len(),
+        total_lines,
+        crate::types::ViewMode::Stripped,
+    );
+    let note = format!(
+        "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
+    );
+    Ok((
+        format!("{header}\n{note}\n\n{}", body.trim_end()),
+        total_lines,
+        stripped,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // MCP tool call handler
 // ---------------------------------------------------------------------------
@@ -988,7 +1139,13 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Force full content output, bypass smart outlining."
+                        "description": "Legacy alias for mode='full'. Force full content output, bypass smart outlining."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "signature", "stripped"],
+                        "default": "auto",
+                        "description": "Read view. auto: smart default. full: full content. signature: hash-prefixed declarations only. stripped: whole-file content with plain comments/debug logs/extra blanks removed."
                     },
                     "budget": {
                         "type": "number",
@@ -1414,6 +1571,89 @@ mod tests {
                 panic!("empty edits array should produce a ParseError, not Ready");
             }
         }
+    }
+
+    #[test]
+    fn tool_read_signature_mode_emits_hash_prefixed_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signature.rs");
+        std::fs::write(
+            &path,
+            "fn signature_target() {\n    let body_marker = 42;\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "mode": "signature",
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, false).expect("signature read");
+
+        assert!(
+            out.contains("[signature]"),
+            "signature header missing: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("1:") && l.contains("fn signature_target")),
+            "hash-prefixed signature line missing: {out}"
+        );
+        assert!(
+            !out.contains("body_marker"),
+            "signature mode should omit function body: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_stripped_mode_drops_comments_and_keeps_doc_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stripped.rs");
+        std::fs::write(
+            &path,
+            "/// keep docs\nfn keep() {\n    // drop plain comment\n    dbg!(1);\n    println!(\"keep\");\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "mode": "stripped",
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, true).expect("stripped read");
+
+        assert!(out.contains("[stripped]"), "stripped header missing: {out}");
+        assert!(out.contains("/// keep docs"), "doc comment missing: {out}");
+        assert!(out.contains("println!"), "kept code missing: {out}");
+        assert!(
+            !out.contains("drop plain comment"),
+            "plain comment should be stripped: {out}"
+        );
+        assert!(!out.contains("dbg!"), "debug log should be stripped: {out}");
+        assert!(
+            !out.lines().any(|l| l.contains(":") && l.contains("|")),
+            "stripped output must not expose hash anchors: {out}"
+        );
+    }
+
+    #[test]
+    fn tilth_read_schema_lists_stripped_mode() {
+        let tools = tool_definitions(false);
+        let read = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("tilth_read"))
+            .expect("tilth_read definition");
+        let modes = read
+            .pointer("/inputSchema/properties/mode/enum")
+            .and_then(Value::as_array)
+            .expect("mode enum");
+
+        assert!(
+            modes.iter().any(|v| v.as_str() == Some("stripped")),
+            "mode enum must advertise stripped: {read}"
+        );
     }
 
     #[test]
