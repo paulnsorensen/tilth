@@ -248,3 +248,25 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     tools
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-pins every externalized tool description against its snapshot in
+    /// `src/mcp/tools/snapshots/`. Any change to `prompts/tools/*.md` requires
+    /// running `cargo insta review` and committing the updated `.snap` file,
+    /// making prompt drift visible in PR review.
+    #[test]
+    fn tool_descriptions_are_pinned() {
+        let tools = tool_definitions(true);
+        assert_eq!(tools.len(), 6, "edit mode should advertise all 6 tools");
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("tool has name");
+            let desc = tool["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: description must be a string"));
+            insta::assert_snapshot!(name, desc);
+        }
+    }
+}
