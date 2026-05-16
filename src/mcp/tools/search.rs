@@ -155,9 +155,7 @@ fn tool_search_single(
         }
         Some("callers") => {
             session.record_search(query);
-            crate::search::callers::search_callers_expanded(
-                query, &scope, bloom, expand, None, glob,
-            )
+            crate::search::callers::search_callers_expanded(query, &scope, bloom, expand, glob)
         }
         Some(kind) => {
             return Err(format!(
@@ -209,9 +207,7 @@ fn search_merged_default(
     if crate::classify::is_identifier(query) {
         sections.push(format!(
             "## caller results\n\n{}",
-            crate::search::callers::search_callers_expanded(
-                query, scope, bloom, expand, None, glob
-            )?
+            crate::search::callers::search_callers_expanded(query, scope, bloom, expand, glob)?
         ));
     }
     Ok(sections.join("\n\n---\n\n"))

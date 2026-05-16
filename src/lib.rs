@@ -131,8 +131,7 @@ pub fn run_callers(
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output =
-        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob)?;
+    let output = search::callers::search_callers_expanded(target, scope, &bloom, expand, glob)?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),

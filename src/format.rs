@@ -79,9 +79,8 @@ pub fn search_empty_header(
     } else {
         match kind {
             EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
-            EmptyHint::Content | EmptyHint::Regex => {
-                "regex matched zero content; try kind: symbol or a broader pattern"
-            }
+            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
+            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
             EmptyHint::Callers => {
                 "no callers found — re-check the symbol name; consider kind: symbol to verify it exists"
             }
@@ -207,7 +206,7 @@ mod tests {
     fn empty_header_content_branch() {
         let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Content);
         assert!(
-            out.contains("regex matched zero content; try kind: symbol or a broader pattern"),
+            out.contains("no content matches; try kind: symbol or a broader pattern"),
             "{out}"
         );
     }

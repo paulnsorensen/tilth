@@ -2239,9 +2239,9 @@ mod tests {
             "files searched count missing: {out}"
         );
         assert!(out.contains("Content hits:"), "hits count missing: {out}");
-        // kind=content ⇒ regex hint (Content/Regex share text per spec).
+        // kind=content ⇒ literal-content hint (split from regex per Copilot review).
         assert!(
-            out.contains("regex matched zero content"),
+            out.contains("no content matches"),
             "content-kind hint missing: {out}"
         );
     }
