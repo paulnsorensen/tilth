@@ -1,9 +1,10 @@
 //! JSON-schema definitions for the tools advertised via `tools/list`.
 //! Edit-mode adds `tilth_write` to the catalog.
 //!
-//! Tool descriptions live in `prompts/tools/*.md` and are compiled in via
-//! `include_str!`. Trailing whitespace is stripped at load time so source files
-//! can keep their final newline without affecting wire bytes.
+//! Tool descriptions live in `prompts/tools/*.md` and are embedded at compile
+//! time via `include_str!`. Each call to `tool_definitions()` runs `.trim_end()`
+//! per description, so source files can keep their final newline without
+//! affecting wire bytes.
 
 use serde_json::Value;
 
@@ -250,4 +251,26 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-pins every externalized tool description against its snapshot in
+    /// `src/mcp/tools/snapshots/`. Any change to `prompts/tools/*.md` requires
+    /// running `cargo insta review` and committing the updated `.snap` file —
+    /// making prompt drift (intentional or accidental) visible in PR review.
+    #[test]
+    fn tool_descriptions_are_pinned() {
+        let tools = tool_definitions(true);
+        assert_eq!(tools.len(), 6, "edit mode should advertise all 6 tools");
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("tool has name");
+            let desc = tool["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: description must be a string"));
+            insta::assert_snapshot!(name, desc);
+        }
+    }
 }
