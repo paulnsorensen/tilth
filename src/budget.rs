@@ -48,9 +48,16 @@ pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<Trun
     // Fallback is `safe_max` (= truncated.len()), never `max_bytes`: `max_bytes` may
     // land mid-UTF-8-codepoint and would panic `&body[..cut_point]` on emoji-heavy
     // single-line content with no newline in the truncated region.
+    //
+    // Reject `\n\n` cuts at position 0: body always starts with the structural
+    // header/body separator, and for code-rendered output (every line carries
+    // a `<n>:<hash>|` prefix, so blank source lines are still non-empty) that's
+    // the *only* `\n\n` in the body. Without this filter, every truncated code
+    // file would return zero content lines.
     let cut_point = truncated
         .rfind("\n\n##")
-        .or_else(|| truncated.rfind("\n\n"))
+        .filter(|&p| p > 0)
+        .or_else(|| truncated.rfind("\n\n").filter(|&p| p > 0))
         .or_else(|| truncated.rfind('\n'))
         .unwrap_or(safe_max);
 
@@ -121,6 +128,32 @@ mod tests {
         // Pick a budget so max_bytes lands somewhere mid-crab.
         let (_out, info) = apply_with_info(&input, 100);
         assert!(info.is_some(), "expected truncation on tight budget");
+    }
+
+    #[test]
+    fn apply_with_info_code_format_survives_header_separator() {
+        // Code-rendered output has `<n>:<hash>|<content>\n` on every line, so
+        // the only `\n\n` in the body is the header/body separator at position
+        // 0. Pre-fix, `rfind("\n\n")` returned 0 and `clean_body` was empty —
+        // the response was just `<header>\n\n... truncated` regardless of how
+        // generous the budget was. Verify the cut now lands deep enough that
+        // real content survives.
+        let mut input = String::from("# src/foo.rs (200 lines, ~2k tokens) [full]\n\n");
+        for i in 1..=200 {
+            input.push_str(&format!("{i}:abc|let x_{i} = {i};\n"));
+        }
+        // Tight budget — must truncate, but should leave room for many lines.
+        let (out, info) = apply_with_info(&input, 400);
+        let info = info.expect("must truncate at this budget");
+        assert!(
+            info.at_line > 5,
+            "must cut deep into body, not at header separator: at_line={}",
+            info.at_line
+        );
+        assert!(
+            out.contains("1:abc|let x_1 ="),
+            "first code line must survive truncation: {out}"
+        );
     }
 
     #[test]
