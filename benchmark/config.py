@@ -104,9 +104,9 @@ MODES = {
     ),
     "tilth_forced": ModeConfig(
         name="tilth_forced",
-        tools=["Read", "Edit"],
+        tools=[],
         mcp_config_path=str(TILTH_MCP_CONFIG),
-        description="tilth MCP only (no Bash/Grep/Glob)",
+        description="tilth MCP only (no built-in tools)",
     ),
 }
 

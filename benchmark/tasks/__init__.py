@@ -28,6 +28,7 @@ from .fastapi_edit_tasks import (
     FastAPIEditResponseFilterTask,
     FastAPIEditScopeCacheTask,
 )
+from .fastapi_multi_edit_tasks import FastAPIMultiResponseTask
 from .gin_tasks import (
     GinRadixTreeTask,
     GinClientIPTask,
@@ -40,6 +41,7 @@ from .gin_edit_tasks import (
     GinEditAbortCheckTask,
     GinEditContextResetTask,
 )
+from .gin_multi_edit_tasks import GinMultiContextTask
 from .express_tasks import (
     ExpressJsonSendTask,
     ExpressRenderChainTask,
@@ -75,6 +77,7 @@ TASKS = {
     "rg_edit_line_locate": RipgrepEditLineLocateTask(),
     "rg_edit_preceding": RipgrepEditPrecedingLinesTask(),
     # fastapi (Python)
+    "fastapi_edit_multi_response": FastAPIMultiResponseTask(),
     "fastapi_dependency_resolution": FastAPIDependencyResolutionTask(),
     "fastapi_request_validation": FastAPIRequestValidationTask(),
     "fastapi_depends_internals": FastAPIDependsInternalsTask(),
@@ -92,6 +95,7 @@ TASKS = {
     "gin_edit_middleware_skip": GinEditMiddlewareChainTask(),
     "gin_edit_abort_check": GinEditAbortCheckTask(),
     "gin_edit_context_reset": GinEditContextResetTask(),
+    "gin_edit_multi_context": GinMultiContextTask(),
     # express (JavaScript)
     "express_json_send": ExpressJsonSendTask(),
     "express_render_chain": ExpressRenderChainTask(),
