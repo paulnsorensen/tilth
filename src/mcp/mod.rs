@@ -2178,4 +2178,123 @@ mod tests {
             target.display()
         );
     }
+
+    // ── F1 hardening: the JSON cache-token must stand alone on the first
+    // line so a trivial JSON-line parse pulls the field. The prose-header
+    // baseline was 0 / 2,042 round-trips; the integration regression here
+    // is "response shape changed but the field is no longer parseable."
+    #[test]
+    fn tool_search_first_line_is_parseable_cache_token_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        let first = out.lines().next().expect("response has a first line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first).expect("first line must be valid one-line JSON");
+        let ts = parsed
+            .get("if_modified_since")
+            .and_then(|v| v.as_str())
+            .expect("if_modified_since field present");
+        assert!(
+            crate::mcp::iso::parse_iso_utc(ts).is_some(),
+            "ts must round-trip through parse_iso_utc: {ts}"
+        );
+    }
+
+    // ── F3 hardening: zero-match search emits the new empty header with the
+    // three counts and the per-kind hint, end-to-end through tool_search.
+    // The unit tests in src/format.rs cover the helper in isolation; this
+    // proves the wiring from search.rs → format_search_result actually
+    // routes through the empty path on real walker results.
+    #[test]
+    fn tool_search_zero_matches_emits_empty_header_with_kind_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("only.rs"),
+            "fn unrelated() {}\n", // nothing here will match "zZxQyN_no_such_symbol"
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "zZxQyN_no_such_symbol", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob:"),
+            "files matched count missing: {out}"
+        );
+        assert!(
+            out.contains("Files searched:"),
+            "files searched count missing: {out}"
+        );
+        assert!(out.contains("Content hits:"), "hits count missing: {out}");
+        // kind=content ⇒ regex hint (Content/Regex share text per spec).
+        assert!(
+            out.contains("regex matched zero content"),
+            "content-kind hint missing: {out}"
+        );
+    }
+
+    // ── F3 hardening: glob that excludes every file emits the dedicated
+    // glob-mismatch hint, regardless of the requested kind. This is the
+    // dispatch-table row most likely to silently regress if a future
+    // refactor stops populating files_matched_glob.
+    #[test]
+    fn tool_search_glob_excludes_everything_emits_glob_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn anything() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        // Glob matches nothing in the scope → files_matched_glob == 0.
+        let args = serde_json::json!({
+            "queries": [{"query": "anything", "kind": "symbol", "glob": "*.bogus_ext_does_not_exist"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob: 0"),
+            "glob-mismatch count must be zero: {out}"
+        );
+        assert!(
+            out.contains("glob matched no files"),
+            "glob-zero hint must override the kind hint: {out}"
+        );
+    }
+
+    // ── F5 hardening: a request that still carries the dropped `context`
+    // field must NOT error. Old agents have the parameter cached in their
+    // tool spec; tolerating it silently is the documented contract (the
+    // F5 verifier says "or is silently ignored — implementer's call").
+    #[test]
+    fn tool_search_tolerates_stray_context_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap(),
+            "context": "src/old.rs"
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false)
+            .expect("stray context must not fail the request");
+        assert!(
+            out.contains("handleAuth"),
+            "search must still find the symbol despite the stray field: {out}"
+        );
+    }
 }
