@@ -3,7 +3,7 @@ use crate::types::estimate_tokens;
 /// Metadata returned alongside a truncated string so callers can surface
 /// "we cut at line N of M" without re-parsing the output.
 #[derive(Debug, Clone, Copy)]
-pub struct TruncationInfo {
+pub(crate) struct TruncationInfo {
     /// 1-indexed line of the original output where the cut landed.
     pub at_line: u32,
     /// Total line count of the original output before truncation. Lets
@@ -22,7 +22,7 @@ pub fn apply(output: &str, budget: u64) -> String {
 /// Like [`apply`], but also returns truncation metadata when the budget
 /// actually clips the input. Returns `(text, None)` when the budget is
 /// roomy enough that nothing was cut.
-pub fn apply_with_info(output: &str, budget: u64) -> (String, Option<TruncationInfo>) {
+pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<TruncationInfo>) {
     let current = estimate_tokens(output.len() as u64);
     if current <= budget {
         return (output.to_string(), None);
@@ -44,12 +44,15 @@ pub fn apply_with_info(output: &str, budget: u64) -> (String, Option<TruncationI
     let safe_max = body.floor_char_boundary(max_bytes);
     let truncated = &body[..safe_max];
 
-    // Prefer section boundaries (\n\n##) to avoid cutting mid-match in search results
+    // Prefer section boundaries (\n\n##) to avoid cutting mid-match in search results.
+    // Fallback is `safe_max` (= truncated.len()), never `max_bytes`: `max_bytes` may
+    // land mid-UTF-8-codepoint and would panic `&body[..cut_point]` on emoji-heavy
+    // single-line content with no newline in the truncated region.
     let cut_point = truncated
         .rfind("\n\n##")
         .or_else(|| truncated.rfind("\n\n"))
         .or_else(|| truncated.rfind('\n'))
-        .unwrap_or(max_bytes);
+        .unwrap_or(safe_max);
 
     let clean_body = &body[..cut_point];
 
@@ -107,6 +110,17 @@ mod tests {
             info.original_line_count
         );
         assert!(out.contains("truncated"), "marker line missing: {out}");
+    }
+
+    #[test]
+    fn apply_with_info_emoji_no_newline_does_not_panic() {
+        // Single-line UTF-8 with no \n in the truncated region: `max_bytes` may land
+        // mid-codepoint, so the fallback must clamp to a char boundary.
+        let body: String = "🦀".repeat(500); // 2000 bytes, no newlines
+        let input = format!("# header\n{body}");
+        // Pick a budget so max_bytes lands somewhere mid-crab.
+        let (_out, info) = apply_with_info(&input, 100);
+        assert!(info.is_some(), "expected truncation on tight budget");
     }
 
     #[test]

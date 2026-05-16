@@ -2337,10 +2337,12 @@ mod tests {
 
         let meta = parse_first_line_json(&out).expect("JSON view-meta header expected");
         assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("stripped"));
-        assert_eq!(
-            meta.get("next_view").and_then(|v| v.as_str()),
-            Some("full"),
-            "stripped is non-editable; advertise full as the escalation: {out}"
+        // Explicit `mode=stripped` is a deliberate shape request — like
+        // `mode=signature`, it MUST NOT advertise `next_view`. The agent
+        // already picked this view.
+        assert!(
+            meta.get("next_view").is_none(),
+            "explicit mode=stripped must not emit next_view: {out}"
         );
         let lines_stripped = meta
             .get("lines_stripped")
@@ -2597,6 +2599,40 @@ mod tests {
         assert!(
             at_line >= 2 && at_line < total,
             "N inside (1, M): at_line={at_line}, M={total}: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_budget_truncation_stays_under_requested_budget() {
+        // Regression: `finalize_response` prepends a JSON view-meta header AFTER
+        // budgeting the body. The body budget must subtract the header's tokens
+        // so the rendered response (header + body) fits inside the user's ask.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.rs");
+        let mut src = String::new();
+        for i in 0..400 {
+            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+        }
+        std::fs::write(&p, src).unwrap();
+        let budget = 500u64;
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "budget": budget
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("budget read ok");
+        let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
+        assert_eq!(
+            meta.get("truncated").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "test setup expected truncation: {out}"
+        );
+        let response_tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(
+            response_tokens <= budget,
+            "rendered response must fit in requested budget {budget} (got {response_tokens} tokens, {} bytes)",
+            out.len()
         );
     }
 }

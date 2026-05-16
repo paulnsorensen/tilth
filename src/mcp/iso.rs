@@ -81,7 +81,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// through `serde_json` so the producer never has to think about quote /
 /// backslash / newline escaping inside the timestamp.
 pub fn with_header(now: SystemTime, body: &str) -> String {
-    with_meta_header(Some(now), serde_json::Value::Null, body)
+    with_meta_header(Some(now), serde_json::Map::new(), body)
 }
 
 /// Wrap an output with a leading JSON header line that combines the cache
@@ -94,18 +94,16 @@ pub fn with_header(now: SystemTime, body: &str) -> String {
 /// neither timestamp nor meta provided — the body is returned unchanged
 /// so this function is a safe drop-in for paths that conditionally emit a
 /// header.
-pub fn with_meta_header(now: Option<SystemTime>, meta: serde_json::Value, body: &str) -> String {
-    let mut header = serde_json::Map::new();
+pub fn with_meta_header(
+    now: Option<SystemTime>,
+    mut header: serde_json::Map<String, serde_json::Value>,
+    body: &str,
+) -> String {
     if let Some(ts) = now {
         header.insert(
             "if_modified_since".into(),
             serde_json::Value::String(iso_ts(ts)),
         );
-    }
-    if let serde_json::Value::Object(meta_map) = meta {
-        for (k, v) in meta_map {
-            header.insert(k, v);
-        }
     }
     if header.is_empty() {
         return body.to_string();
@@ -201,7 +199,10 @@ mod tests {
     #[test]
     fn with_meta_header_merges_cache_token_and_meta() {
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let meta = serde_json::json!({"view": "outline", "original_line_count": 1500});
+        let meta = serde_json::json!({"view": "outline", "original_line_count": 1500})
+            .as_object()
+            .unwrap()
+            .clone();
         let out = with_meta_header(Some(now), meta, "body");
         let first_line = out.lines().next().expect("at least one line");
         let parsed: serde_json::Value =
@@ -219,7 +220,10 @@ mod tests {
 
     #[test]
     fn with_meta_header_meta_only_no_timestamp() {
-        let meta = serde_json::json!({"view": "signature", "next_view": "full"});
+        let meta = serde_json::json!({"view": "signature", "next_view": "full"})
+            .as_object()
+            .unwrap()
+            .clone();
         let out = with_meta_header(None, meta, "body");
         let first_line = out.lines().next().expect("at least one line");
         let parsed: serde_json::Value =
@@ -237,15 +241,7 @@ mod tests {
 
     #[test]
     fn with_meta_header_empty_returns_bare_body() {
-        let out = with_meta_header(None, serde_json::Value::Null, "body");
+        let out = with_meta_header(None, serde_json::Map::new(), "body");
         assert_eq!(out, "body", "empty header drops the prefix entirely");
-    }
-
-    #[test]
-    fn with_meta_header_non_object_meta_treated_as_empty() {
-        // Defensive: a caller passing Value::String or similar shouldn't crash
-        // or produce malformed JSON — it just behaves as no meta.
-        let out = with_meta_header(None, serde_json::Value::String("oops".into()), "body");
-        assert_eq!(out, "body");
     }
 }

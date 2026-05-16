@@ -184,28 +184,13 @@ pub(crate) fn tool_read(
 
     // `mode: signature` (explicit or auto-promoted) is an outline-style read.
     if force_signature || auto_signature_promotion {
-        let (body, total_lines) = read_signature_file(&path, cache).map_err(|e| e.to_string())?;
-        let mut meta = serde_json::Map::new();
-        meta.insert("view".into(), Value::String("signature".into()));
-        meta.insert("original_line_count".into(), Value::from(total_lines));
-        // Implicit promotion from `mode=auto` advertises the escalation path.
-        // Explicit `mode=signature` doesn't — the LLM picked this view on purpose.
-        if auto_signature_promotion {
-            meta.insert("next_view".into(), Value::String("full".into()));
-        }
-        return Ok(finalize_response(None, meta, body, budget));
+        return respond_signature(&path, cache, auto_signature_promotion, budget);
     }
 
     // `mode: stripped` is comment/log-stripped; explicit only (no auto path).
+    // Explicit shape request → no `next_view` hint, matching `mode=signature`.
     if force_stripped {
-        let (body, total_lines, lines_stripped) =
-            read_stripped_file(&path, cache).map_err(|e| e.to_string())?;
-        let mut meta = serde_json::Map::new();
-        meta.insert("view".into(), Value::String("stripped".into()));
-        meta.insert("original_line_count".into(), Value::from(total_lines));
-        meta.insert("lines_stripped".into(), Value::from(lines_stripped));
-        meta.insert("next_view".into(), Value::String("full".into()));
-        return Ok(finalize_response(None, meta, body, budget));
+        return respond_stripped(&path, cache, budget);
     }
 
     let mut output = crate::read::read_file(&path, None, force_full, cache, edit_mode)
@@ -260,7 +245,7 @@ pub(crate) fn read_single_with_suffix(
         }
         PathSuffix::FromLine(n) => {
             // Resolve total lines via metadata + count; cheap & avoids full read.
-            let total = std::fs::read_to_string(path).map_or(*n, |c| c.lines().count());
+            let total = count_lines(path).map_or(*n, |t| t as usize);
             let range = format!("{n}-{}", total.max(*n));
             crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
         }
@@ -337,11 +322,21 @@ fn should_auto_signature(path: &Path) -> bool {
 
 /// Cheap line count for view-meta. Returns `None` when the file can't be
 /// read; OS page cache makes the second read effectively free when a helper
-/// already touched the file moments earlier.
+/// already touched the file moments earlier. Byte-level newline scan avoids
+/// allocating a UTF-8 `String` just to count `\n` (and tolerates non-UTF-8
+/// content, which `read_to_string` would reject).
 fn count_lines(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|c| u32::try_from(c.lines().count()).unwrap_or(u32::MAX))
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let nl = memchr::memchr_iter(b'\n', &bytes).count();
+    let total = if bytes.last() == Some(&b'\n') {
+        nl
+    } else {
+        nl + 1
+    };
+    Some(u32::try_from(total).unwrap_or(u32::MAX))
 }
 
 /// Apply budget to `body`, then prepend a single JSON header line that
@@ -351,13 +346,25 @@ fn count_lines(path: &Path) -> Option<u32> {
 /// truncation fields (`truncated`, `truncated_at_line`,
 /// `original_line_count`) are merged into the same meta object before the
 /// header is rendered so the agent only ever parses one line.
+///
+/// Budget accounting has two layers: this function subtracts the JSON
+/// header's estimated tokens (plus a 16-token pad for the truncation
+/// fields that may be added later) from the user-requested budget before
+/// calling `apply_with_info`. `apply_with_info` then reserves an additional
+/// 50 tokens internally for the body's own `# path (...)` header line.
+/// Net: user budget covers the rendered response including both headers.
 fn finalize_response(
     now: Option<SystemTime>,
     mut meta: serde_json::Map<String, Value>,
     body: String,
     budget: Option<u64>,
 ) -> String {
-    let (body_final, info) = match budget {
+    let body_budget = budget.map(|b| {
+        let header_preview = crate::mcp::iso::with_meta_header(now, meta.clone(), "");
+        let header_tokens = crate::types::estimate_tokens(header_preview.len() as u64);
+        b.saturating_sub(header_tokens + 16)
+    });
+    let (body_final, info) = match body_budget {
         Some(b) => crate::budget::apply_with_info(&body, b),
         None => (body, None),
     };
@@ -369,7 +376,44 @@ fn finalize_response(
         meta.entry("original_line_count")
             .or_insert_with(|| Value::from(info.original_line_count));
     }
-    crate::mcp::iso::with_meta_header(now, Value::Object(meta), &body_final)
+    crate::mcp::iso::with_meta_header(now, meta, &body_final)
+}
+
+/// Single-file `mode=signature` (explicit or auto-promoted). Builds the
+/// view-meta object and routes through `finalize_response` so budget +
+/// header accounting stay in one place.
+fn respond_signature(
+    path: &Path,
+    cache: &OutlineCache,
+    auto_promotion: bool,
+    budget: Option<u64>,
+) -> Result<String, String> {
+    let (body, total_lines) = read_signature_file(path, cache).map_err(|e| e.to_string())?;
+    let mut meta = serde_json::Map::new();
+    meta.insert("view".into(), Value::String("signature".into()));
+    meta.insert("original_line_count".into(), Value::from(total_lines));
+    // Implicit promotion from `mode=auto` advertises the escalation path.
+    // Explicit `mode=signature` doesn't — the LLM picked this view on purpose.
+    if auto_promotion {
+        meta.insert("next_view".into(), Value::String("full".into()));
+    }
+    Ok(finalize_response(None, meta, body, budget))
+}
+
+/// Single-file `mode=stripped`. Explicit shape request, so no `next_view`
+/// hint — same contract as explicit `mode=signature`.
+fn respond_stripped(
+    path: &Path,
+    cache: &OutlineCache,
+    budget: Option<u64>,
+) -> Result<String, String> {
+    let (body, total_lines, lines_stripped) =
+        read_stripped_file(path, cache).map_err(|e| e.to_string())?;
+    let mut meta = serde_json::Map::new();
+    meta.insert("view".into(), Value::String("stripped".into()));
+    meta.insert("original_line_count".into(), Value::from(total_lines));
+    meta.insert("lines_stripped".into(), Value::from(lines_stripped));
+    Ok(finalize_response(None, meta, body, budget))
 }
 
 /// Returns `(body, total_lines)` so the dispatcher can build view-meta
