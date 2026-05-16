@@ -76,14 +76,39 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
+/// Upper bound on file size searched by content/regex/symbol walkers. Files
+/// larger than this skip on stat alone — tree-sitter and ripgrep should not
+/// spend cycles on minified bundles or generated lockfiles. Shared so
+/// `content::search` and `count_files_for_empty` stay aligned.
+pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+
+/// Stat-only file filter used before searching: drop files whose names mark
+/// them as minified (`.min.js`, `app-min.css`) or whose size exceeds the
+/// search cap. `content::search` layers a heavier byte-content minified
+/// detector on top once it has the file bytes; this helper is the cheap
+/// shared subset that `count_files_for_empty` can call without reading.
+pub(crate) fn passes_stat_filter(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::lang::detection::is_minified_by_name)
+    {
+        return false;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_SEARCH_FILE_SIZE {
+            return false;
+        }
+    }
+    true
+}
+
 /// Files-matched-glob and files-searched counts for the empty-result header.
 /// Re-walks the scope with the same glob the search used, applying the same
-/// size/minified skip rules as `content::search`. Only runs when matches is
+/// stat-only skip rules as `content::search`. Only runs when matches is
 /// empty, so the extra walk is rare on hot paths.
 fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
     let Ok(walker) = walker(scope, glob) else {
         return (0, 0);
@@ -103,18 +128,8 @@ fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
             }
             files_matched_glob.fetch_add(1, Ordering::Relaxed);
 
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
-            {
+            if !passes_stat_filter(entry.path()) {
                 return ignore::WalkState::Continue;
-            }
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > MAX_SEARCH_FILE_SIZE {
-                    return ignore::WalkState::Continue;
-                }
             }
             files_searched.fetch_add(1, Ordering::Relaxed);
             ignore::WalkState::Continue
@@ -315,11 +330,16 @@ fn multi_symbol_inner(
     };
     let mut expanded_files = HashSet::new();
     let mut sections = Vec::with_capacity(queries.len());
+    // Walker counts for the empty-header path are invariant across queries —
+    // same scope, same glob. Compute lazily on the first zero-match query
+    // and reuse for the rest of the batch.
+    let mut empty_stats: Option<(usize, usize)> = None;
 
     for query in queries {
         let result = symbol::search(query, scope, glob, mode)?;
         if result.matches.is_empty() {
-            let (files_matched_glob, files_searched) = count_files_for_empty(scope, glob);
+            let (files_matched_glob, files_searched) =
+                *empty_stats.get_or_insert_with(|| count_files_for_empty(scope, glob));
             sections.push(format::search_empty_header(
                 &result.query,
                 &result.scope,

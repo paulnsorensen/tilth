@@ -77,10 +77,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Wrap an output with a leading JSON cache-token line. The first line is
 /// a single JSON object so agents can pattern-match on the structured field
-/// without parsing prose; the rest is the payload body.
+/// without parsing prose; the rest is the payload body. Encoding goes
+/// through `serde_json` so the producer never has to think about quote /
+/// backslash / newline escaping inside the timestamp.
 pub fn with_header(now: SystemTime, body: &str) -> String {
-    let ts = iso_ts(now);
-    let mut out = format!("{{\"if_modified_since\": \"{ts}\"}}");
+    let header = serde_json::json!({ "if_modified_since": iso_ts(now) }).to_string();
+    let mut out = header;
     out.push_str("\n\n");
     out.push_str(body);
     out
