@@ -31,4 +31,4 @@ Modes per file: hash (default — replace lines at hash anchors), overwrite (who
 
 ALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Each path may appear only once per call. Never call tilth_write twice in a row.
 
-Pass `diff: true` to verify what landed without a separate read.
+Pass `diff: true` to verify what landed without a separate read. If the diff reveals another needed edit, DO NOT call tilth_write again immediately — collect every visible follow-up, then issue ONE grouped follow-up call (after a read/search verification step if needed).
