@@ -1343,8 +1343,8 @@ mod tests {
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
         assert!(
-            out.contains("Results as of"),
-            "expected Results header: {out}"
+            out.contains("\"if_modified_since\""),
+            "expected JSON cache-token header: {out}"
         );
         assert!(
             out.contains("query: build_instructions"),
@@ -1558,7 +1558,10 @@ mod tests {
             !out.contains("contents you should NOT see"),
             "body must not leak on unchanged stub: {out}"
         );
-        assert!(out.contains("Results as of"), "header missing: {out}");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
     }
 
     /// `tool_read` with `if_modified_since` in the past (epoch) returns the
@@ -1871,7 +1874,10 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        assert!(out.contains("Results as of"), "header missing: {out}");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
         assert!(out.contains("unchanged"), "stub missing: {out}");
         assert!(
             !out.contains("secret body text"),
@@ -2059,6 +2065,90 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "prefix\nREPLACED\ntail\n",
             "edit must be re-applied at the resolved single-match line"
+        );
+    }
+
+    /// Realistic agent-retry: the file has shifted so the anchor body lives
+    /// at a new line, while the agent's claimed line now holds different
+    /// content. `capture_hash_original` reads the body from the CURRENT
+    /// file at the agent's claimed line, so the captured body is whatever
+    /// has shifted INTO that slot — never the body the agent intended. The
+    /// auto-fix can't recover the original body from a 12-bit hash alone,
+    /// so this scenario does not produce `auto-fixed: <old> → <new>`. The
+    /// response instead surfaces a fresh hashlined region so the agent can
+    /// retry in one turn. This test documents the actual contract so a
+    /// future design change (per-session file snapshot, body in the
+    /// request, …) that adds genuine relocation flips a red flag.
+    #[test]
+    fn tool_write_auto_fix_shift_returns_fresh_region_not_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shift.txt");
+
+        use std::fmt::Write as _;
+
+        // C0: TARGET_BODY_TOKEN at line 10.
+        let mut c0 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c0, "orig{i}");
+        }
+        c0.push_str("TARGET_BODY_TOKEN\n");
+        c0.push_str("after\n");
+        std::fs::write(&p, &c0).unwrap();
+
+        // Anchor captured from C0 — line 10 hashes the target line.
+        let anchor = anchor_for(&c0, 10);
+
+        // C1: insert 5 blank lines above the target so it now lives at 15.
+        let mut c1 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c1, "orig{i}");
+        }
+        for _ in 0..5 {
+            c1.push('\n');
+        }
+        c1.push_str("TARGET_BODY_TOKEN\n");
+        c1.push_str("after\n");
+        std::fs::write(&p, &c1).unwrap();
+
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": anchor, "content": "REPLACED" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("response renders");
+
+        // Hash mismatch must surface — agent's hash is stale against C1.
+        assert!(
+            out.contains("hash mismatch"),
+            "shifted file must trip the hash mismatch path: {out}"
+        );
+        // The auto-fix probe must run …
+        assert!(
+            out.contains("── auto-fix probe ──"),
+            "probe block must run even though it can't recover the old body: {out}"
+        );
+        // … but a body-relocation auto-fix is impossible without the
+        // original body, so the verbatim signal must NOT fire.
+        assert!(
+            !out.contains("auto-fixed: 10 → 15"),
+            "auto-fix must not pretend to relocate when the captured body is post-shift: {out}"
+        );
+        // Instead a fresh hashlined region is returned for the agent to
+        // retry in one turn (per the prompt's narrower claim).
+        assert!(
+            out.contains("fresh region"),
+            "shifted-body retry must surface a fresh hashlined region: {out}"
+        );
+        // The file content is left untouched — the edit did NOT silently
+        // land on the wrong line.
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            after, c1,
+            "file must be unchanged when auto-fix cannot recover"
         );
     }
 

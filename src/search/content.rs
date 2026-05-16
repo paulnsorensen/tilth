@@ -20,7 +20,6 @@ pub fn search(
     pattern: &str,
     scope: &Path,
     is_regex: bool,
-    context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     let matcher = if is_regex {
@@ -142,7 +141,7 @@ pub fn search(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort(&mut all_matches, pattern, scope);
     all_matches.truncate(MAX_MATCHES);
 
     Ok(SearchResult {
