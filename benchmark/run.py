@@ -158,9 +158,20 @@ def run_single(
         if bare:
             cmd += ["--bare"]
 
+        # Build the --tools allowlist. In --bare mode, explicitly inject
+        # Grep/Glob for any mode that already allows built-ins, since bare
+        # strips plugin-provided tools and we want baseline/tilth to keep
+        # Grep/Glob for fair comparison. tilth_forced (mode.tools=[]) stays
+        # empty on purpose — that mode is meant to expose only tilth MCP.
+        tools_list = list(mode.tools)
+        if bare and tools_list:
+            for t in ("Grep", "Glob"):
+                if t not in tools_list:
+                    tools_list.append(t)
+
         # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
-        if mode.tools:
-            cmd += ["--tools", ",".join(mode.tools)]
+        if tools_list:
+            cmd += ["--tools", ",".join(tools_list)]
         elif mode.mcp_config_path:
             cmd += ["--tools", ""]
 
