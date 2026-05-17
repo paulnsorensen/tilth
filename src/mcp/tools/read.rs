@@ -104,12 +104,14 @@ pub(crate) fn tool_read(
                 if !path.exists() {
                     return PerPath::NotFound(path.display().to_string());
                 }
-                // A `#symbol` suffix that doesn't resolve is the symbol-equivalent
-                // of a missing file: route it to the `── not found ──` footer
-                // with the qualified `<path>#<symbol>` form so the agent sees
-                // both classes of miss in one place.
+                // A `#symbol` suffix that resolves cleanly to "symbol absent
+                // from outline" is the symbol-equivalent of a missing file:
+                // route it to the `── not found ──` footer with the qualified
+                // `<path>#<symbol>` form. Precondition failures (unreadable
+                // file, non-code file) fall through to the existing inline
+                // error path so we don't misclassify them as "not found".
                 if let PathSuffix::Symbol(name) = suffix {
-                    if resolve_symbol_range(path, name).is_none() {
+                    if matches!(resolve_symbol(path, name), SymbolLookup::Missing) {
                         return PerPath::NotFound(format!("{}#{}", path.display(), name));
                     }
                 }
@@ -326,15 +328,38 @@ fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Opti
     None
 }
 
-/// Look up `name` in the file's outline; return its 1-indexed `(start, end)`.
-fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let ft = crate::lang::detect_file_type(path);
-    let crate::types::FileType::Code(lang) = ft else {
-        return None;
+/// Outcome of looking up `name` in `path`'s outline. Distinguishes a
+/// genuine miss (file parsed cleanly, symbol absent) from precondition
+/// failures (file unreadable, or not a code-with-grammar file). Lets the
+/// multi-file batch route only true misses to the `── not found ──`
+/// footer instead of misclassifying I/O or file-type errors as such.
+enum SymbolLookup {
+    Found(usize, usize),
+    Missing,
+    PreconditionFailed,
+}
+
+fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return SymbolLookup::PreconditionFailed;
+    };
+    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+        return SymbolLookup::PreconditionFailed;
     };
     let entries = crate::lang::outline::get_outline_entries(&content, lang);
-    find_symbol_entry(&entries, name)
+    match find_symbol_entry(&entries, name) {
+        Some((s, e)) => SymbolLookup::Found(s, e),
+        None => SymbolLookup::Missing,
+    }
+}
+
+/// Back-compat shim for `read_single_with_suffix`, which collapses all
+/// non-Found outcomes into a single inline error message.
+fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
+    match resolve_symbol(path, name) {
+        SymbolLookup::Found(s, e) => Some((s, e)),
+        SymbolLookup::Missing | SymbolLookup::PreconditionFailed => None,
+    }
 }
 
 fn should_auto_signature(path: &Path) -> bool {

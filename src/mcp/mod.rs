@@ -1047,6 +1047,39 @@ mod tests {
         );
     }
 
+    /// Precondition-failure boundary: a `#symbol` suffix on a non-code file
+    /// (no tree-sitter grammar) must NOT be routed to `── not found ──` —
+    /// that would misrepresent "wrong file type for symbol grammar" as
+    /// "you typed the wrong symbol name." Falls through to the existing
+    /// inline error path instead.
+    #[test]
+    fn batch_read_symbol_on_non_code_file_falls_through_to_inline_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("real.rs");
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&code, "fn real_fn() {}\n").unwrap();
+        std::fs::write(&txt, "just some prose, no grammar\n").unwrap();
+
+        let target_real = format!("{}#real_fn", code.to_str().unwrap());
+        let target_precondition = format!("{}#anything", txt.to_str().unwrap());
+
+        let args = serde_json::json!({ "paths": [target_real, target_precondition] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false)
+            .expect("batch with non-code symbol target must succeed (Ok)");
+
+        // The non-code path must NOT appear in the not-found footer — if it
+        // does, we're misclassifying "wrong file type" as "missing symbol".
+        if let Some(nf_idx) = out.find("── not found ──") {
+            let nf_section = &out[nf_idx..];
+            assert!(
+                !nf_section.contains(&format!("{}#anything", txt.display())),
+                "non-code file symbol target must not appear in not-found footer: {nf_section}"
+            );
+        }
+    }
+
     // -- batch tool_edit --------------------------------------------------------
 
     fn anchor_for(content: &str, line: usize) -> String {
