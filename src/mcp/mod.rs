@@ -997,6 +997,56 @@ mod tests {
         );
     }
 
+    /// A `#symbol` suffix that doesn't resolve in an otherwise-readable file
+    /// is the symbol-equivalent of a missing path: it must land in the
+    /// `── not found ──` footer using the qualified `<path>#<symbol>` form,
+    /// not as an inline error mixed into the content stream.
+    #[test]
+    fn batch_read_symbol_miss_listed_in_not_found_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("real.rs");
+        let p2 = dir.path().join("other.rs");
+        std::fs::write(&p1, "fn real_fn() {}\n").unwrap();
+        std::fs::write(&p2, "fn other_fn() {}\n").unwrap();
+
+        // Mix: file exists + symbol exists, file exists + symbol missing.
+        let target_real = format!("{}#real_fn", p1.to_str().unwrap());
+        let target_miss = format!("{}#ghost_symbol", p2.to_str().unwrap());
+
+        let args = serde_json::json!({ "paths": [target_real, target_miss] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false)
+            .expect("batch with symbol miss must succeed (Ok)");
+
+        let nf_idx = out
+            .find("── not found ──")
+            .expect("not-found section must be present");
+        let nf_section = &out[nf_idx..];
+
+        // Found symbol's body must appear before the footer, not in it.
+        let body_idx = out
+            .find("fn real_fn")
+            .expect("resolved symbol body present");
+        assert!(
+            body_idx < nf_idx,
+            "resolved symbol body must precede the not-found section: {out}"
+        );
+
+        // Miss must use the qualified `path#symbol` form in the footer.
+        let qualified = format!("{}#ghost_symbol", p2.display());
+        assert!(
+            nf_section.contains(&qualified),
+            "missing symbol must appear as `<path>#<symbol>` in footer: {nf_section}"
+        );
+
+        // The old inline error string must no longer appear anywhere.
+        assert!(
+            !out.contains("error: symbol 'ghost_symbol' not found in outline"),
+            "symbol miss must not surface as an inline error in the content stream: {out}"
+        );
+    }
+
     // -- batch tool_edit --------------------------------------------------------
 
     fn anchor_for(content: &str, line: usize) -> String {

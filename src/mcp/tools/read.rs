@@ -83,74 +83,65 @@ pub(crate) fn tool_read(
     let suffixes: Vec<&PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
     let now = std::time::SystemTime::now();
-    let has_any_suffix = suffixes.iter().any(|s| !matches!(s, PathSuffix::None));
 
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
-        if has_any_suffix
-            || since.is_some()
-            || force_signature
-            || force_stripped
-            || force_full
-            || mode_str == "auto"
-        {
-            // Per-path resolution so suffix/since/signature behave correctly.
-            let mut parts: Vec<String> = Vec::with_capacity(paths.len());
-            let mut not_found: Vec<String> = Vec::new();
-            for (path, suffix) in &parsed {
-                if !path.exists() {
-                    not_found.push(path.display().to_string());
+        let mut parts: Vec<String> = Vec::with_capacity(paths.len());
+        let mut not_found: Vec<String> = Vec::new();
+        for (path, suffix) in &parsed {
+            if !path.exists() {
+                not_found.push(path.display().to_string());
+                continue;
+            }
+            // A `#symbol` suffix that doesn't resolve is the symbol-equivalent
+            // of a missing file: route it to the `── not found ──` footer
+            // with the qualified `<path>#<symbol>` form so the agent sees
+            // both classes of miss in one place.
+            if let PathSuffix::Symbol(name) = suffix {
+                if resolve_symbol_range(path, name).is_none() {
+                    not_found.push(format!("{}#{}", path.display(), name));
                     continue;
                 }
-                session.record_read(path);
-                if let Some(s_ts) = since {
-                    if !crate::mcp::iso::file_changed_since(path, s_ts) {
-                        parts.push(crate::mcp::iso::unchanged_stub(path, s_ts));
-                        continue;
-                    }
-                }
-                let signature = force_signature
-                    || (!force_full
-                        && mode_str == "auto"
-                        && matches!(suffix, PathSuffix::None)
-                        && should_auto_signature(path));
-                let body = if force_full && matches!(suffix, PathSuffix::None) {
-                    crate::read::read_file(path, None, true, cache, edit_mode)
-                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
-                } else {
-                    read_single_with_suffix(
-                        path,
-                        suffix,
-                        signature,
-                        force_stripped,
-                        edit_mode,
-                        cache,
-                    )
-                };
-                parts.push(body);
             }
-            let mut combined = parts.join("\n\n");
-            if !not_found.is_empty() {
-                if !combined.is_empty() {
-                    combined.push_str("\n\n");
-                }
-                combined.push_str("── not found ──");
-                for p in &not_found {
-                    let _ = write!(combined, "\n{p}");
+            session.record_read(path);
+            if let Some(s_ts) = since {
+                if !crate::mcp::iso::file_changed_since(path, s_ts) {
+                    parts.push(crate::mcp::iso::unchanged_stub(path, s_ts));
+                    continue;
                 }
             }
-            // Multi-file responses don't carry per-file view-meta — the agent
-            // can read each per-file `# path (...) [mode]` header inline.
-            return Ok(finalize_response(
-                Some(now),
-                serde_json::Map::new(),
-                combined,
-                budget,
-            ));
+            let signature = force_signature
+                || (!force_full
+                    && mode_str == "auto"
+                    && matches!(suffix, PathSuffix::None)
+                    && should_auto_signature(path));
+            let body = if force_full && matches!(suffix, PathSuffix::None) {
+                crate::read::read_file(path, None, true, cache, edit_mode)
+                    .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
+            } else {
+                read_single_with_suffix(path, suffix, signature, force_stripped, edit_mode, cache)
+            };
+            parts.push(body);
         }
-        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
-        return Ok(super::apply_budget(combined, budget));
+        let mut combined = parts.join("\n\n");
+        if !not_found.is_empty() {
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str("── not found ──");
+            for p in &not_found {
+                let _ = write!(combined, "\n{p}");
+            }
+        }
+        // Multi-file responses don't carry per-file view-meta — the agent
+        // can read each per-file `# path (...) [mode]` header inline.
+        return Ok(finalize_response(
+            Some(now),
+            serde_json::Map::new(),
+            combined,
+            budget,
+        ));
     }
 
     let path = paths.into_iter().next().expect("paths non-empty");

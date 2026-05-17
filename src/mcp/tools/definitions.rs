@@ -204,6 +204,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "files": {
                         "type": "array",
+                        "description": "Required — array of {path, mode, edits|content}. Even single-file edits use this array.",
                         "minItems": 1,
                         "maxItems": 20,
                         "items": {
