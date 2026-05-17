@@ -14,13 +14,25 @@ use grep_searcher::Searcher;
 const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 
+/// Cap when the CLI's `--full` flag is set — the user explicitly asked
+/// for the full picture, so raise both the display cap and the walker
+/// early-quit threshold proportionally.
+const FULL_MAX_MATCHES: usize = 100;
+const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
     scope: &Path,
     is_regex: bool,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let (early_quit, cap) = if full {
+        (FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES)
+    } else {
+        (EARLY_QUIT_THRESHOLD, MAX_MATCHES)
+    };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -44,7 +56,7 @@ pub fn search(
         let total_found = &total_found;
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 return ignore::WalkState::Quit;
             }
 
@@ -121,7 +133,7 @@ pub fn search(
                 all.extend(file_matches);
             }
 
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 ignore::WalkState::Quit
             } else {
                 ignore::WalkState::Continue
@@ -135,7 +147,7 @@ pub fn search(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     rank::sort(&mut all_matches, pattern, scope);
-    all_matches.truncate(MAX_MATCHES);
+    all_matches.truncate(cap);
 
     Ok(SearchResult {
         query: pattern.to_string(),
@@ -146,4 +158,79 @@ pub fn search(
         usages: total,
         facet_totals: FacetTotals::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `--full` raises the content match cap from 10 → 100 and proportionally
+    /// raises the walker early-quit threshold. Seeds 15 files each containing the
+    /// target literal once so all 15 are real matches. With `full=false` the cap
+    /// stays at 10; with `full=true` it lifts above 10. `total_found` is computed
+    /// pre-truncation and matches in both arms.
+    #[test]
+    fn content_full_flag_raises_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..15 {
+            let path = tmp.path().join(format!("file_{i}.rs"));
+            std::fs::write(&path, "// uniqueContentMarkerXYZ\n").unwrap();
+        }
+
+        let default_result =
+            super::search("uniqueContentMarkerXYZ", tmp.path(), false, None, false).unwrap();
+        assert!(
+            default_result.matches.len() <= 10,
+            "default cap should keep matches <= 10, got {}",
+            default_result.matches.len()
+        );
+        assert!(
+            default_result.total_found >= 15,
+            "total_found should reflect pre-truncation count, got {} (expected >= 15)",
+            default_result.total_found
+        );
+        assert!(
+            default_result.total_found > default_result.matches.len(),
+            "total_found must exceed matches.len() in the truncated default case: total={} displayed={}",
+            default_result.total_found,
+            default_result.matches.len()
+        );
+
+        let full_result =
+            super::search("uniqueContentMarkerXYZ", tmp.path(), false, None, true).unwrap();
+        assert!(
+            full_result.matches.len() > 10,
+            "full=true should raise the cap above 10, got {}",
+            full_result.matches.len()
+        );
+        assert_eq!(
+            default_result.total_found, full_result.total_found,
+            "total_found should match pre-truncation across both arms"
+        );
+    }
+
+    /// Regex path shares the same `full` plumbing as literal content search.
+    /// Pin the cap behavior for `is_regex=true` so a future refactor that splits
+    /// the two paths cannot quietly drop the cap raise on the regex side.
+    #[test]
+    fn content_full_flag_raises_match_cap_regex() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..15 {
+            let path = tmp.path().join(format!("file_{i}.rs"));
+            std::fs::write(&path, "// regexMarkerXYZ\n").unwrap();
+        }
+
+        let default_result =
+            super::search("regexMarker..Z", tmp.path(), true, None, false).unwrap();
+        assert!(
+            default_result.matches.len() <= 10,
+            "regex default cap should keep matches <= 10, got {}",
+            default_result.matches.len()
+        );
+
+        let full_result = super::search("regexMarker..Z", tmp.path(), true, None, true).unwrap();
+        assert!(
+            full_result.matches.len() > 10,
+            "regex full=true should raise the cap above 10, got {}",
+            full_result.matches.len()
+        );
+    }
 }

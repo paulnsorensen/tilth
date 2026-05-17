@@ -47,6 +47,11 @@ struct ExpandedCtx {
     session: session::Session,
     bloom: index::bloom::BloomFilterCache,
     expand: usize,
+    /// Forwarded from the CLI's *parsed* `--full` flag (NOT the piped-derived
+    /// `full = cli.full || !is_tty`). When true, expanded search dispatches
+    /// raise the per-mode match cap (10 → 100). Library/MCP callers leave
+    /// this false to preserve current token budgets.
+    full_search: bool,
 }
 
 /// The single public API. Everything flows through here:
@@ -70,6 +75,7 @@ pub fn run(
         glob,
         cache,
         mode,
+        false,
     )
 }
 
@@ -93,10 +99,16 @@ pub fn run_full(
         glob,
         cache,
         mode,
+        false,
     )
 }
 
 /// Run with expanded search — inline source for top N matches.
+///
+/// `cli_full` must be the CLI's *parsed* `--full` flag, NOT the piped-derived
+/// `full = cli.full || !is_tty`. It raises the per-mode search match cap
+/// (10 → 100). Library callers without a `--full` semantic pass `false`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_expanded(
     query: &str,
     scope: &Path,
@@ -107,6 +119,7 @@ pub fn run_expanded(
     glob: Option<&str>,
     cache: &OutlineCache,
     mode: SymbolMode,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -118,20 +131,26 @@ pub fn run_expanded(
         glob,
         cache,
         mode,
+        cli_full,
     )
 }
 
 /// Find all callers of a symbol.
+///
+/// `full` must be the CLI's *parsed* `--full` flag. When true, raises the
+/// callers display cap from 10 → 100. Library callers pass `false`.
 pub fn run_callers(
     target: &str,
     scope: &Path,
     expand: usize,
     budget_tokens: Option<u64>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output = search::callers::search_callers_expanded(target, scope, &bloom, expand, glob)?;
+    let output =
+        search::callers::search_callers_expanded(target, scope, &bloom, expand, glob, full)?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -150,6 +169,7 @@ pub fn run_deps(
     Ok(search::deps::format_deps(&result, scope, budget_usize))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     query: &str,
     scope: &Path,
@@ -160,6 +180,7 @@ fn run_inner(
     glob: Option<&str>,
     cache: &OutlineCache,
     mode: SymbolMode,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
     let query_type = classify(query, scope);
 
@@ -192,7 +213,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, glob, mode,
+                &parts, scope, cache, &session, &bloom, expand, glob, mode, cli_full,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -225,6 +246,7 @@ fn run_inner(
                 session: session::Session::new(),
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
+                full_search: cli_full,
             };
             run_query_expanded(&query_type, scope, cache, &ctx, glob, mode)?
         }
@@ -257,10 +279,17 @@ fn run_query_expanded(
             ctx.expand,
             glob,
             mode,
+            ctx.full_search,
         ),
-        QueryType::Concept(text) if text.contains(' ') => {
-            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, glob)
-        }
+        QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
+            text,
+            scope,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            glob,
+            ctx.full_search,
+        ),
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
         // definitions>0 / content fallback cascade in single_query_search.
@@ -274,13 +303,26 @@ fn run_query_expanded(
             ctx.expand,
             glob,
             search::symbol::SymbolMode::Any,
+            ctx.full_search,
         ),
-        QueryType::Content(text) => {
-            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, glob)
-        }
-        QueryType::Regex(pattern) => {
-            search::search_regex_expanded(pattern, scope, cache, &ctx.session, ctx.expand, glob)
-        }
+        QueryType::Content(text) => search::search_content_expanded(
+            text,
+            scope,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            glob,
+            ctx.full_search,
+        ),
+        QueryType::Regex(pattern) => search::search_regex_expanded(
+            pattern,
+            scope,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            glob,
+            ctx.full_search,
+        ),
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in expanded path")

@@ -19,6 +19,11 @@ const IMPACT_MAX_RESULTS: usize = 15;
 /// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
 pub(crate) const BATCH_EARLY_QUIT: usize = 50;
 
+/// Display cap when the CLI's `--full` flag is set.
+const FULL_MAX_MATCHES: usize = 100;
+/// Early-quit threshold for the batch caller walk when `--full` is set.
+pub(crate) const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
+
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
 pub struct CallerMatch {
@@ -83,6 +88,7 @@ pub(crate) fn find_callers_batch(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<(String, CallerMatch)>, TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
@@ -95,7 +101,7 @@ pub(crate) fn find_callers_batch(
 
         Box::new(move |entry| {
             // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= BATCH_EARLY_QUIT {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -276,9 +282,15 @@ pub fn search_callers_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
+    let (early_quit, cap) = if full {
+        (FULL_BATCH_EARLY_QUIT, FULL_MAX_MATCHES)
+    } else {
+        (BATCH_EARLY_QUIT, MAX_MATCHES)
+    };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob)?;
+    let raw = find_callers_batch(&single, scope, bloom, glob, early_quit)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
@@ -299,7 +311,7 @@ pub fn search_callers_expanded(
         .map(|c| c.calling_function.clone())
         .collect();
 
-    sorted_callers.truncate(MAX_MATCHES);
+    sorted_callers.truncate(cap);
 
     // Format the output
     let mut output = format!(
@@ -357,7 +369,7 @@ pub fn search_callers_expanded(
     // Use all_caller_names (pre-truncation) for the fan-out threshold check,
     // but search for callers of the full set to capture transitive impact.
     if !all_caller_names.is_empty() && all_caller_names.len() <= IMPACT_FANOUT_THRESHOLD {
-        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob) {
+        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob, early_quit) {
             // Filter out hop-1 matches (same file+line = same call site)
             let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
                 .iter()
@@ -520,6 +532,67 @@ mod tests {
         assert!(
             msg.contains("test files"),
             "glob-driven hint should appear when glob is Some: {msg}"
+        );
+    }
+
+    /// `--full` raises the callers display cap from 10 → 100 and proportionally
+    /// raises the walker early-quit threshold (BATCH_EARLY_QUIT vs FULL_BATCH_EARLY_QUIT).
+    /// Seeds 15 files each containing a real call site of `target_fn` so all 15
+    /// are detectable by tree-sitter. With `full=false` the displayed count stays
+    /// at 10; with `full=true` it lifts above 10. The pre-truncation total in the
+    /// header (`\u{2014} N call sites`) must match across both arms.
+    #[test]
+    fn callers_full_flag_raises_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..15 {
+            let path = tmp.path().join(format!("caller_{i}.rs"));
+            std::fs::write(&path, format!("fn caller_{i}() {{\n    target_fn();\n}}\n")).unwrap();
+        }
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let default_output =
+            super::search_callers_expanded("target_fn", tmp.path(), &bloom, 0, None, false)
+                .expect("default callers search");
+        let default_displayed = default_output.matches("\n## ").count();
+        assert!(
+            default_displayed <= 10,
+            "default cap should keep callers displayed <= 10, got {default_displayed}\n{default_output}"
+        );
+
+        let full_output =
+            super::search_callers_expanded("target_fn", tmp.path(), &bloom, 0, None, true)
+                .expect("full callers search");
+        let full_displayed = full_output.matches("\n## ").count();
+        assert!(
+            full_displayed > 10,
+            "full=true should raise callers displayed above 10, got {full_displayed}\n{full_output}"
+        );
+
+        // The pre-truncation total appears in the header — must agree across arms.
+        // Header format: `# Callers of "target_fn" in <scope> \u{2014} N call sites`.
+        let parse_total = |out: &str| -> usize {
+            let line = out.lines().next().unwrap_or("");
+            // Take the token before " call site" and parse.
+            line.rsplit(" call site")
+                .nth(1)
+                .and_then(|prefix| prefix.split_whitespace().last())
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let default_total = parse_total(&default_output);
+        let full_total = parse_total(&full_output);
+        assert!(
+            default_total >= 15,
+            "pre-truncation total should be >= 15 in default arm, got {default_total}\nheader: {}",
+            default_output.lines().next().unwrap_or("")
+        );
+        assert_eq!(
+            default_total, full_total,
+            "pre-truncation total must match across both arms (default={default_total}, full={full_total})"
+        );
+        assert!(
+            default_total > default_displayed,
+            "default arm must show total > displayed (truncation visible): total={default_total} displayed={default_displayed}"
         );
     }
 }
