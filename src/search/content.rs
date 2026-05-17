@@ -11,14 +11,10 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
+use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
+
 const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
-
-/// Cap when the CLI's `--full` flag is set — the user explicitly asked
-/// for the full picture, so raise both the display cap and the walker
-/// early-quit threshold proportionally.
-const FULL_MAX_MATCHES: usize = 100;
-const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(

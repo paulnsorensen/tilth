@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
+use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
@@ -17,12 +18,7 @@ const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
 /// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-pub(crate) const BATCH_EARLY_QUIT: usize = 50;
-
-/// Display cap when the CLI's `--full` flag is set.
-const FULL_MAX_MATCHES: usize = 100;
-/// Early-quit threshold for the batch caller walk when `--full` is set.
-pub(crate) const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
+const BATCH_EARLY_QUIT: usize = 50;
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -79,6 +75,18 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
     });
 
     seen.load(Ordering::Relaxed)
+}
+
+/// Default-threshold variant of `find_callers_batch` — hides `BATCH_EARLY_QUIT`
+/// from callers that don't need to tune the walker. The `--full` cap raise lives
+/// inside `search_callers_expanded`; all other callsites use this wrapper.
+pub(crate) fn find_callers_batch_default(
+    targets: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+) -> Result<Vec<(String, CallerMatch)>, TilthError> {
+    find_callers_batch(targets, scope, bloom, glob, BATCH_EARLY_QUIT)
 }
 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
@@ -285,7 +293,7 @@ pub fn search_callers_expanded(
     full: bool,
 ) -> Result<String, TilthError> {
     let (early_quit, cap) = if full {
-        (FULL_BATCH_EARLY_QUIT, FULL_MAX_MATCHES)
+        (FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES)
     } else {
         (BATCH_EARLY_QUIT, MAX_MATCHES)
     };

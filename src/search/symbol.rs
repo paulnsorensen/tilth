@@ -20,20 +20,13 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
+use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
+
 const MAX_MATCHES: usize = 10;
 /// Stop walking once we have this many raw definition matches.
 const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 /// Stop walking once we have this many raw usage matches.
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
-
-/// Cap when the CLI's `--full` flag is set — the user explicitly asked
-/// for the full picture, so raise both the display cap and the walker
-/// early-quit thresholds proportionally.
-const FULL_MAX_MATCHES: usize = 100;
-/// Early-quit threshold for definitions when `--full` is set.
-const FULL_EARLY_QUIT_DEFINITIONS: usize = 300;
-/// Early-quit threshold for usages when `--full` is set.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -75,8 +68,8 @@ pub fn search(
 ) -> Result<SearchResult, TilthError> {
     let (def_quit, usage_quit, cap) = if full {
         (
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
+            FULL_EARLY_QUIT_THRESHOLD,
+            FULL_EARLY_QUIT_THRESHOLD,
             FULL_MAX_MATCHES,
         )
     } else {

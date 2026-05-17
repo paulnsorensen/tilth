@@ -32,6 +32,15 @@ use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 
 use crate::format::rel;
 
+/// Match-count cap when `--full` is set. Generous but bounded so a
+/// `tilth foo --full` on a huge repo can't blow up output. Shared by the
+/// symbol, content, and callers search arms so they stay in lock-step.
+pub(crate) const FULL_MAX_MATCHES: usize = 100;
+
+/// Walker early-quit threshold when `--full` is set. Proportional to
+/// `FULL_MAX_MATCHES` the same way the default thresholds are.
+pub(crate) const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
 // We skip these explicitly instead of relying on .gitignore so that locally-relevant
 // gitignored files (docs/, configs, generated code) are still searchable.
@@ -1894,22 +1903,11 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.rs"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.toml"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers toml failed");
+        let rs_callers = callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.rs"))
+            .expect("callers failed");
+        let toml_callers =
+            callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.toml"))
+                .expect("callers toml failed");
 
         assert!(
             !rs_callers.is_empty(),
