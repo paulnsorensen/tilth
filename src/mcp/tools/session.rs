@@ -1,5 +1,3 @@
-//! `tilth_session` — session state inspection / reset.
-
 use serde_json::Value;
 
 use crate::session::Session;

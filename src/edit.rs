@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -49,10 +49,6 @@ enum EditResult {
         diff: String,
         /// Hashlined context around edit sites (existing behavior).
         context: String,
-        /// Formatted `── parse ──` block if the edit introduced new tree-sitter
-        /// `ERROR` / `MISSING` nodes. `None` when no new errors or the language
-        /// has no grammar.
-        parse: Option<String>,
     },
     /// One or more hashes didn't match current content.
     HashMismatch(String),
@@ -71,7 +67,6 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         return Ok(EditResult::Applied {
             diff: String::new(),
             context: String::new(),
-            parse: None,
         });
     }
 
@@ -268,15 +263,8 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
-    let parse = crate::edit_parse_check::check(path, &content, &output)
-        .as_ref()
-        .map(crate::edit_parse_check::format_report);
 
-    Ok(EditResult::Applied {
-        diff,
-        context,
-        parse,
-    })
+    Ok(EditResult::Applied { diff, context })
 }
 
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
@@ -322,33 +310,81 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
     out
 }
 
-/// Successful return from [`apply_batch`]. `applied` lists the files whose
-/// edits actually committed so callers can gate session bookkeeping on real
-/// writes instead of on the upstream `Ready`/`ParseError` discriminant.
-#[derive(Debug)]
-pub struct BatchOutcome {
-    pub output: String,
-    pub applied: Vec<PathBuf>,
-}
-
 /// Build a stable dedup key for a path. Canonicalise first (resolves symlinks
-/// and `.`/`..` when the file exists), fall back to `std::path::absolute`
-/// (resolves `.`/`..` and joins relative paths against cwd without touching
-/// the filesystem — catches not-yet-created aliases like `new.rs` vs
-/// `./new.rs`), then to the raw path. On macOS (commonly case-insensitive
-/// APFS) the key is ASCII-lowercased so `Foo.rs` and `FOO.RS` collide;
-/// false-positive collisions on case-sensitive APFS configs are preferred
-/// over false-negatives that race two writers against the same inode.
+/// and `.`/`..` when the file exists), fall back to a lexical normalization
+/// (strips `CurDir` components, walks `ParentDir` against the in-memory
+/// stack — catches not-yet-created aliases like `new.rs` vs `./new.rs`)
+/// then to the raw path. On macOS (commonly case-insensitive APFS) the key
+/// is ASCII-lowercased so `Foo.rs` and `FOO.RS` collide; false-positive
+/// collisions on case-sensitive APFS configs are preferred over
+/// false-negatives that race two writers against the same inode.
+///
+/// **No `current_dir()` calls.** `std::path::absolute(p)` was previously
+/// used here, but it reads `current_dir()` which is process-global mutable
+/// state. Two parallel tests (one of which calls `set_current_dir`) could
+/// race against each other and produce different keys for the same path
+/// — surfacing as a flaky `dedup_catches_nonexistent_alias_spellings`
+/// failure under CI's parallel test runner. Pure-lexical normalization
+/// removes the race.
 pub(crate) fn normalize_path_key(path: &Path) -> String {
-    let resolved = std::fs::canonicalize(path)
-        .or_else(|_| std::path::absolute(path))
-        .unwrap_or_else(|_| path.to_path_buf());
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(target_os = "macos") {
         key.to_ascii_lowercase()
     } else {
         key
     }
+}
+
+/// Lexical-only path normalization: skip `CurDir`, walk `ParentDir`
+/// against the component stack, leave the rest in order. Does not touch
+/// the filesystem or `current_dir()`, so it's deterministic under
+/// parallel tests.
+///
+/// `ParentDir` handling depends on what's already on the stack:
+///   * If the last component is a real (`Normal`) name, pop it —
+///     `a/../b.rs` collapses to `b.rs`.
+///   * If the stack is empty or only contains `..` markers AND the path
+///     is relative, push `..` — `../foo.rs` stays `../foo.rs` (else it
+///     would collapse to `foo.rs`, which is a different file on disk).
+///   * If absolute and at root, `..` is a no-op (Linux semantics:
+///     `/.. == /`).
+///
+/// The result is that two paths produce the same key iff they refer to
+/// the same logical target through the lexical lens — `foo.rs` and
+/// `./foo.rs` collide; `a/../b.rs` and `b.rs` collide; **`../foo.rs`
+/// and `foo.rs` do NOT collide** (different parent dirs).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    let mut is_absolute = false;
+    // Count of `Normal` segments currently on the stack. Lets us decide
+    // in O(1) whether `..` can pop something real (vs. needing to be
+    // preserved as an unresolved `..` in a relative path).
+    let mut normal_count: usize = 0;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                is_absolute = true;
+                out.push(component.as_os_str());
+            }
+            Component::Normal(_) => {
+                out.push(component.as_os_str());
+                normal_count += 1;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normal_count > 0 {
+                    out.pop();
+                    normal_count -= 1;
+                } else if !is_absolute {
+                    // Preserve unresolved `..` in relative paths.
+                    out.push("..");
+                }
+                // Absolute path with `..` at root → no-op.
+            }
+        }
+    }
+    out
 }
 
 /// Return an error if any two `Ready` tasks resolve to the same file. Called
@@ -386,55 +422,45 @@ pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
-) -> Result<BatchOutcome, String> {
+) -> Result<String, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
         return Err(msg);
     }
 
     let bloom: &BloomFilterCache = bloom;
-    let outcomes: Vec<(String, Option<PathBuf>)> = tasks
+    let outcomes: Vec<(String, bool)> = tasks
         .into_par_iter()
         .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let mut applied = Vec::with_capacity(outcomes.len());
-    let mut sections = Vec::with_capacity(outcomes.len());
-    for (section, path) in outcomes {
-        if let Some(p) = path {
-            applied.push(p);
-        }
-        sections.push(section);
-    }
-    let output = sections.join("\n\n---\n\n");
+    let any_success = outcomes.iter().any(|(_, ok)| *ok);
+    let combined = outcomes
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
 
-    if applied.is_empty() {
-        Err(output)
+    if any_success {
+        Ok(combined)
     } else {
-        Ok(BatchOutcome { output, applied })
+        Err(combined)
     }
 }
 
-/// Process one task into a `(section, applied_path)` tuple. The path is
-/// `Some` only when the file's edits committed — callers use that to gate
-/// session bookkeeping (e.g. `record_read`) on actual writes rather than on
-/// the upstream `Ready`/`ParseError` discriminant, which only reflects parse
-/// validation.
-fn apply_one(
-    task: FileEditTask,
-    bloom: &BloomFilterCache,
-    show_diff: bool,
-) -> (String, Option<PathBuf>) {
+/// Process one task into a `(section, success)` tuple. Kept separate so the
+/// parallel closure stays trivial and per-file logic is testable in isolation.
+fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (String, bool) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), None);
+            return (format!("## {label}\nerror: {msg}"), false);
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
     let header = format!("## {}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, Some(path)),
-        Ok(body) => (format!("{header}\n{body}"), Some(path)),
-        Err(msg) => (format!("{header}\n{msg}"), None),
+        Ok(body) if body.is_empty() => (header, true),
+        Ok(body) => (format!("{header}\n{body}"), true),
+        Err(msg) => (format!("{header}\n{msg}"), false),
     }
 }
 
@@ -445,11 +471,7 @@ fn render_applied(
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
-        EditResult::Applied {
-            diff,
-            context,
-            parse,
-        } => {
+        EditResult::Applied { diff, context } => {
             let mut output = String::new();
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
@@ -459,12 +481,6 @@ fn render_applied(
             }
             if !context.is_empty() {
                 output.push_str(&context);
-            }
-            if let Some(parse_block) = parse {
-                if !output.is_empty() {
-                    output.push_str("\n\n");
-                }
-                output.push_str(&parse_block);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
@@ -513,7 +529,7 @@ mod tests {
 
         let result = apply_edits(&path, &edits).unwrap();
         match result {
-            EditResult::Applied { diff, context, .. } => {
+            EditResult::Applied { diff, context } => {
                 assert!(
                     diff.contains("- 2:"),
                     "diff should have removed line: {diff}"
@@ -677,7 +693,7 @@ mod tests {
 
         let result = apply_edits(&path, &[]).unwrap();
         match result {
-            EditResult::Applied { diff, context, .. } => {
+            EditResult::Applied { diff, context } => {
                 assert!(diff.is_empty(), "diff should be empty for no edits");
                 assert!(context.is_empty(), "context should be empty for no edits");
             }
@@ -848,115 +864,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn parse_block_set_when_edit_breaks_syntax() {
-        // Use a .rs extension so detect_file_type picks up the Rust grammar.
-        let path = std::env::temp_dir().join("tilth_edit_test_parse_break.rs");
-        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
-        let h = hash_at("fn a() { 1 }\n", 1);
-
-        // Replace the line with an unbalanced version.
-        let edits = vec![Edit {
-            start_line: 1,
-            start_hash: h,
-            end_line: 1,
-            end_hash: h,
-            content: "fn a() { 1".into(),
-        }];
-
-        let result = apply_edits(&path, &edits).unwrap();
-        match result {
-            EditResult::Applied { parse, .. } => {
-                let block = parse.expect("parse block expected when edit breaks syntax");
-                assert!(
-                    block.starts_with("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
-                    "missing parse header: {block}",
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn parse_block_none_when_edit_keeps_syntax_valid() {
-        let path = std::env::temp_dir().join("tilth_edit_test_parse_clean.rs");
-        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
-        let h = hash_at("fn a() { 1 }\n", 1);
-
-        let edits = vec![Edit {
-            start_line: 1,
-            start_hash: h,
-            end_line: 1,
-            end_hash: h,
-            content: "fn a() { 99 }".into(),
-        }];
-
-        let result = apply_edits(&path, &edits).unwrap();
-        match result {
-            EditResult::Applied { parse, .. } => assert!(parse.is_none()),
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn parse_block_per_file_in_batch_independent() {
-        // Verify that in a multi-file batch, one file breaking and another
-        // staying clean each get their own parse block (or lack thereof).
-        // File 1: syntax error introduced (parse block expected).
-        let path1 = std::env::temp_dir().join("tilth_edit_test_batch1.rs");
-        std::fs::write(&path1, "fn a() { 1 }\n").unwrap();
-        let h1 = hash_at("fn a() { 1 }\n", 1);
-
-        // File 2: syntax stays valid (no parse block).
-        let path2 = std::env::temp_dir().join("tilth_edit_test_batch2.rs");
-        std::fs::write(&path2, "fn b() { 2 }\n").unwrap();
-        let h2 = hash_at("fn b() { 2 }\n", 1);
-
-        let edits1 = vec![Edit {
-            start_line: 1,
-            start_hash: h1,
-            end_line: 1,
-            end_hash: h1,
-            content: "fn a() { 1".into(), // breaks
-        }];
-
-        let edits2 = vec![Edit {
-            start_line: 1,
-            start_hash: h2,
-            end_line: 1,
-            end_hash: h2,
-            content: "fn b() { 99 }".into(), // stays clean
-        }];
-
-        let r1 = apply_edits(&path1, &edits1).unwrap();
-        let r2 = apply_edits(&path2, &edits2).unwrap();
-
-        match r1 {
-            EditResult::Applied { parse, .. } => {
-                assert!(
-                    parse.is_some(),
-                    "file 1 should have parse block when broken"
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-
-        match r2 {
-            EditResult::Applied { parse, .. } => {
-                assert!(
-                    parse.is_none(),
-                    "file 2 should have no parse block when clean"
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-
-        let _ = std::fs::remove_file(&path1);
-        let _ = std::fs::remove_file(&path2);
-    }
-
     // ----------------------------------------------------------------- batch
 
     fn ready_task(path: PathBuf, edits: Vec<Edit>) -> FileEditTask {
@@ -1000,9 +907,7 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("batch should succeed")
-            .output;
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
         assert!(out.contains(&format!("## {}", a.display())));
         assert!(out.contains(&format!("## {}", b.display())));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "AAA\nbbb\n");
@@ -1042,9 +947,7 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("good half succeeded")
-            .output;
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
         assert!(out.contains("hash mismatch"), "bad file reports mismatch");
         assert!(out.contains(&format!("## {}", bad.display())));
         // good file actually got written
@@ -1099,9 +1002,8 @@ mod tests {
             },
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("good half kept the batch alive")
-            .output;
+        let out =
+            apply_batch(tasks, &fresh_bloom(), false).expect("good half kept the batch alive");
         assert!(out.contains("## files[1]"));
         assert!(out.contains("error: missing 'edits' array"));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");
@@ -1133,6 +1035,98 @@ mod tests {
             ready_noop(PathBuf::from("nonexistent_dedup_b.rs")),
         ];
         assert!(detect_duplicate_paths(&tasks).is_none());
+    }
+
+    /// Pin the race fix: `normalize_path_key` MUST NOT depend on
+    /// `current_dir()`. If it did, this test could flake under parallel
+    /// test execution (another test calling `set_current_dir` could
+    /// change the result of the second key computation). The dedup
+    /// must hold even when cwd changes between the two computations,
+    /// which we simulate here by toggling cwd in between.
+    ///
+    /// Regression: pre-fix this used `std::path::absolute()` whose
+    /// behavior depends on `current_dir()`; the test was flaky on
+    /// Linux CI because `mcp::tests::scope_handoff_when_cwd_is_root`
+    /// runs in parallel and calls `set_current_dir("/")`.
+    #[test]
+    fn normalize_path_key_is_cwd_independent() {
+        let key_a = normalize_path_key(Path::new("foo.rs"));
+        let key_b = normalize_path_key(Path::new("./foo.rs"));
+        assert_eq!(
+            key_a, key_b,
+            "foo.rs and ./foo.rs must normalize identically"
+        );
+
+        // `a/../b.rs` should resolve lexically to `b.rs` — same key as `b.rs`.
+        let key_c = normalize_path_key(Path::new("a/../b.rs"));
+        let key_d = normalize_path_key(Path::new("b.rs"));
+        assert_eq!(
+            key_c, key_d,
+            "a/../b.rs and b.rs must normalize identically"
+        );
+    }
+
+    /// Lexical normalization unit tests — these are the predicates the
+    /// `normalize_path_key_is_cwd_independent` test pins as a guarantee.
+    #[test]
+    fn lexical_normalize_strips_curdir() {
+        assert_eq!(
+            lexical_normalize(Path::new("./foo.rs")),
+            PathBuf::from("foo.rs")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("a/./b/./c.rs")),
+            PathBuf::from("a/b/c.rs")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_pops_on_parentdir() {
+        assert_eq!(
+            lexical_normalize(Path::new("a/../b.rs")),
+            PathBuf::from("b.rs")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../../c.rs")),
+            PathBuf::from("c.rs")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_preserves_absolute() {
+        assert_eq!(
+            lexical_normalize(Path::new("/abs/./foo.rs")),
+            PathBuf::from("/abs/foo.rs")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/foo/../bar.rs")),
+            PathBuf::from("/bar.rs")
+        );
+        // `..` at absolute root is a no-op (Linux: /.. == /).
+        assert_eq!(lexical_normalize(Path::new("/..")), PathBuf::from("/"));
+    }
+
+    /// `../foo.rs` and `foo.rs` refer to DIFFERENT files (one in parent
+    /// dir, one in cwd). The dedup must NOT collide them. Tests the
+    /// fix to v1 of `lexical_normalize` which mistakenly popped at empty
+    /// stack and collapsed `../foo.rs` → `foo.rs`.
+    #[test]
+    fn lexical_normalize_preserves_unresolved_parentdir() {
+        assert_eq!(
+            lexical_normalize(Path::new("../foo.rs")),
+            PathBuf::from("../foo.rs")
+        );
+        // Multi-level: foo/bar/../../../baz.rs → ../baz.rs
+        // (foo → +foo, bar → +bar, .. → pop bar, .. → pop foo, .. → push .., baz.rs → +baz.rs)
+        assert_eq!(
+            lexical_normalize(Path::new("foo/bar/../../../baz.rs")),
+            PathBuf::from("../baz.rs")
+        );
+        // ../foo.rs and foo.rs must NOT produce equal keys.
+        assert_ne!(
+            normalize_path_key(Path::new("../foo.rs")),
+            normalize_path_key(Path::new("foo.rs"))
+        );
     }
 
     #[cfg(target_os = "macos")]

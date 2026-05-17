@@ -17,7 +17,12 @@ const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
 /// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-const BATCH_EARLY_QUIT: usize = 50;
+pub(crate) const BATCH_EARLY_QUIT: usize = 50;
+
+/// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
+const FULL_MAX_MATCHES: usize = 100;
+/// Walker early-quit threshold when `--full` is set.
+const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -83,6 +88,7 @@ pub(crate) fn find_callers_batch(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<(String, CallerMatch)>, TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
@@ -95,7 +101,7 @@ pub(crate) fn find_callers_batch(
 
         Box::new(move |entry| {
             // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= BATCH_EARLY_QUIT {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -275,10 +281,17 @@ pub fn search_callers_expanded(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
+    context: Option<&Path>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
+    let (max_matches, batch_quit) = if full {
+        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
+    } else {
+        (MAX_MATCHES, BATCH_EARLY_QUIT)
+    };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob)?;
+    let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
@@ -286,9 +299,9 @@ pub fn search_callers_expanded(
         return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
-    // Sort by path proximity
+    // Sort by relevance (context file first, then by proximity)
     let mut sorted_callers = callers;
-    rank_callers(&mut sorted_callers, scope);
+    rank_callers(&mut sorted_callers, scope, context);
 
     let total = sorted_callers.len();
 
@@ -299,7 +312,7 @@ pub fn search_callers_expanded(
         .map(|c| c.calling_function.clone())
         .collect();
 
-    sorted_callers.truncate(MAX_MATCHES);
+    sorted_callers.truncate(max_matches);
 
     // Format the output
     let mut output = format!(
@@ -357,7 +370,7 @@ pub fn search_callers_expanded(
     // Use all_caller_names (pre-truncation) for the fan-out threshold check,
     // but search for callers of the full set to capture transitive impact.
     if !all_caller_names.is_empty() && all_caller_names.len() <= IMPACT_FANOUT_THRESHOLD {
-        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob) {
+        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob, batch_quit) {
             // Filter out hop-1 matches (same file+line = same call site)
             let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
                 .iter()
@@ -462,9 +475,19 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
     )
 }
 
-/// Rank callers by path proximity to the scope root.
-fn rank_callers(callers: &mut [CallerMatch], scope: &Path) {
+/// Simple ranking: context file first, then by path length (proximity heuristic).
+fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
     callers.sort_by(|a, b| {
+        // Context file wins
+        if let Some(ctx) = context {
+            match (a.path == ctx, b.path == ctx) {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
+        }
+
+        // Shorter paths (more similar to scope) rank higher
         let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
         let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
         a_rel

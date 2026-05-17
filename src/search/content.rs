@@ -13,14 +13,24 @@ use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
+const FULL_MAX_MATCHES: usize = 100;
+const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
     scope: &Path,
     is_regex: bool,
+    context: Option<&Path>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let (max_matches, early_quit) = if full {
+        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
+    } else {
+        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
+    };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -44,7 +54,7 @@ pub fn search(
         let total_found = &total_found;
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 return ignore::WalkState::Quit;
             }
 
@@ -58,14 +68,25 @@ pub fn search(
 
             let path = entry.path();
 
-            // Shared stat-only filter (minified-by-name + size cap). The
-            // empty-header walker calls the same helper so the `Files
-            // searched: N` count reported on zero-result responses always
-            // matches the rule the real search applies.
-            if !super::passes_stat_filter(path) {
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
                 return ignore::WalkState::Continue;
             }
-            let file_size = std::fs::metadata(path).map_or(0, |m| m.len());
+
+            // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
 
             // Read the file once. Use `search_slice` instead of `search_path`
             // so the minified-check (when triggered) and the actual search
@@ -75,12 +96,7 @@ pub fn search(
                 return ignore::WalkState::Continue;
             };
 
-            // Catch unmarked minified bundles in the 100KB–500KB range. This
-            // byte-content check is intentionally NOT part of
-            // `passes_stat_filter`: it requires the file bytes, so the
-            // empty-header walker cannot replicate it without paying the
-            // read cost on every file. A non-empty real search reads the
-            // bytes anyway and pays the extra check once per file.
+            // Catch unmarked minified bundles in the 100KB–500KB range.
             if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                 && crate::lang::detection::is_minified_by_content(&bytes)
             {
@@ -121,7 +137,7 @@ pub fn search(
                 all.extend(file_matches);
             }
 
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 ignore::WalkState::Quit
             } else {
                 ignore::WalkState::Continue
@@ -134,8 +150,8 @@ pub fn search(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope);
-    all_matches.truncate(MAX_MATCHES);
+    rank::sort(&mut all_matches, pattern, scope, context);
+    all_matches.truncate(max_matches);
 
     Ok(SearchResult {
         query: pattern.to_string(),

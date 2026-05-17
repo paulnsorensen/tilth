@@ -1,5 +1,3 @@
-//! `tilth_diff` — structural diff between two refs / patches / sources.
-
 use serde_json::Value;
 
 pub(crate) fn tool_diff(args: &Value) -> Result<String, String> {

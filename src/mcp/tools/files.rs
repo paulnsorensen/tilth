@@ -1,46 +1,34 @@
-//! `tilth_files` — legacy glob-based file finder. Folded into `tilth_search`
-//! at the MCP surface; the function body is kept under `#[cfg(test)]` so the
-//! removal guarantees (tool not advertised, transitional aliases still parse)
-//! remain regression-tested.
-
-#![cfg(test)]
-
 use serde_json::Value;
 
+use super::{apply_budget, resolve_scope};
+
 pub(crate) fn tool_files(args: &Value) -> Result<String, String> {
-    let (scope, scope_warning) = super::resolve_scope(args);
+    let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    // Accept singular `pattern:` as a transitional alias (97% of agents use it).
-    let patterns_arr_owned: Vec<Value>;
-    let patterns_arr: &Vec<Value> = match args.get("patterns") {
-        Some(v) => v.as_array().ok_or(
-            "patterns must be an array of globs (use single-element array for one pattern)",
-        )?,
-        None => match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => {
-                patterns_arr_owned = vec![Value::String(p.to_string())];
-                &patterns_arr_owned
-            }
-            None => {
-                return Err("missing required parameter: patterns (array of globs)".into());
-            }
-        },
-    };
+    let single = args.get("pattern").and_then(|v| v.as_str());
+    let patterns_arr = args.get("patterns").and_then(|v| v.as_array());
 
-    if patterns_arr.is_empty() {
-        return Err("patterns must contain at least one glob".into());
+    if single.is_some() && patterns_arr.is_some() {
+        return Err("provide either pattern (single) or patterns (array), not both".into());
     }
-    if patterns_arr.len() > 20 {
-        return Err(format!(
-            "patterns limited to 20 per call (got {})",
-            patterns_arr.len()
-        ));
-    }
-    let patterns: Vec<&str> = patterns_arr
-        .iter()
-        .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
-        .collect::<Result<Vec<_>, _>>()?;
+
+    let patterns: Vec<&str> = if let Some(arr) = patterns_arr {
+        if arr.is_empty() {
+            return Err("patterns must contain at least one glob".into());
+        }
+        if arr.len() > 20 {
+            return Err(format!(
+                "patterns limited to 20 per call (got {})",
+                arr.len()
+            ));
+        }
+        arr.iter()
+            .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![single.ok_or("missing required parameter: pattern (or use patterns for batch)")?]
+    };
 
     let mut blocks = Vec::with_capacity(patterns.len());
     for p in &patterns {
@@ -50,6 +38,6 @@ pub(crate) fn tool_files(args: &Value) -> Result<String, String> {
     let combined = blocks.join("\n\n");
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&super::apply_budget(combined, budget));
+    result.push_str(&apply_budget(combined, budget));
     Ok(result)
 }
