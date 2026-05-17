@@ -87,42 +87,67 @@ pub(crate) fn tool_read(
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
-        let mut parts: Vec<String> = Vec::with_capacity(paths.len());
+        use rayon::prelude::*;
+
+        // Per-path outcome. Workers are pure (read file, parse outline, format)
+        // except for `session.record_read` (atomic + Mutex internally) and
+        // `cache` access (DashMap). Partitioned after the join to preserve
+        // input order — `par_iter().collect()` is index-stable.
+        enum PerPath {
+            Content(String),
+            NotFound(String),
+        }
+
+        let outcomes: Vec<PerPath> = parsed
+            .par_iter()
+            .map(|(path, suffix)| {
+                if !path.exists() {
+                    return PerPath::NotFound(path.display().to_string());
+                }
+                // A `#symbol` suffix that doesn't resolve is the symbol-equivalent
+                // of a missing file: route it to the `── not found ──` footer
+                // with the qualified `<path>#<symbol>` form so the agent sees
+                // both classes of miss in one place.
+                if let PathSuffix::Symbol(name) = suffix {
+                    if resolve_symbol_range(path, name).is_none() {
+                        return PerPath::NotFound(format!("{}#{}", path.display(), name));
+                    }
+                }
+                session.record_read(path);
+                if let Some(s_ts) = since {
+                    if !crate::mcp::iso::file_changed_since(path, s_ts) {
+                        return PerPath::Content(crate::mcp::iso::unchanged_stub(path, s_ts));
+                    }
+                }
+                let signature = force_signature
+                    || (!force_full
+                        && mode_str == "auto"
+                        && matches!(suffix, PathSuffix::None)
+                        && should_auto_signature(path));
+                let body = if force_full && matches!(suffix, PathSuffix::None) {
+                    crate::read::read_file(path, None, true, cache, edit_mode)
+                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
+                } else {
+                    read_single_with_suffix(
+                        path,
+                        suffix,
+                        signature,
+                        force_stripped,
+                        edit_mode,
+                        cache,
+                    )
+                };
+                PerPath::Content(body)
+            })
+            .collect();
+
+        let mut parts: Vec<String> = Vec::with_capacity(parsed.len());
         let mut not_found: Vec<String> = Vec::new();
-        for (path, suffix) in &parsed {
-            if !path.exists() {
-                not_found.push(path.display().to_string());
-                continue;
+        for outcome in outcomes {
+            match outcome {
+                PerPath::Content(s) => parts.push(s),
+                PerPath::NotFound(s) => not_found.push(s),
             }
-            // A `#symbol` suffix that doesn't resolve is the symbol-equivalent
-            // of a missing file: route it to the `── not found ──` footer
-            // with the qualified `<path>#<symbol>` form so the agent sees
-            // both classes of miss in one place.
-            if let PathSuffix::Symbol(name) = suffix {
-                if resolve_symbol_range(path, name).is_none() {
-                    not_found.push(format!("{}#{}", path.display(), name));
-                    continue;
-                }
-            }
-            session.record_read(path);
-            if let Some(s_ts) = since {
-                if !crate::mcp::iso::file_changed_since(path, s_ts) {
-                    parts.push(crate::mcp::iso::unchanged_stub(path, s_ts));
-                    continue;
-                }
-            }
-            let signature = force_signature
-                || (!force_full
-                    && mode_str == "auto"
-                    && matches!(suffix, PathSuffix::None)
-                    && should_auto_signature(path));
-            let body = if force_full && matches!(suffix, PathSuffix::None) {
-                crate::read::read_file(path, None, true, cache, edit_mode)
-                    .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
-            } else {
-                read_single_with_suffix(path, suffix, signature, force_stripped, edit_mode, cache)
-            };
-            parts.push(body);
         }
         let mut combined = parts.join("\n\n");
         if !not_found.is_empty() {
