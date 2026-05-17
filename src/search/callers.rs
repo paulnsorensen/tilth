@@ -17,7 +17,7 @@ const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
 /// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-const BATCH_EARLY_QUIT: usize = 50;
+pub(crate) const BATCH_EARLY_QUIT: usize = 50;
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
