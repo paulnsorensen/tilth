@@ -877,6 +877,126 @@ mod tests {
         );
     }
 
+    /// Batch reads must surface every requested path: existing files inline,
+    /// missing files in a trailing `── not found ──` section.
+    #[test]
+    fn batch_read_not_found_section_lists_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.py");
+        std::fs::write(&real, "x = 1\ny = 2\n").unwrap();
+        let missing = dir.path().join("test_name_function");
+
+        let args = serde_json::json!({
+            "paths": [real.to_str().unwrap(), missing.to_str().unwrap()],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false)
+            .expect("batch read must succeed with mixed valid/missing");
+
+        assert!(
+            out.contains("x = 1"),
+            "valid file content must be included: {out}"
+        );
+        assert!(
+            out.contains("── not found ──"),
+            "not-found section must appear: {out}"
+        );
+        let nf_idx = out
+            .find("── not found ──")
+            .expect("not-found header present");
+        let nf_section = &out[nf_idx..];
+        assert!(
+            nf_section.contains("test_name_function"),
+            "missing path must be listed in not-found section: {out}"
+        );
+        assert!(
+            !nf_section.contains("real.py"),
+            "valid path must not be in not-found section: {out}"
+        );
+    }
+
+    /// Spec: "Don't error the whole call." An all-missing batch must still
+    /// return Ok with only the `── not found ──` section — no inline file blocks.
+    #[test]
+    fn batch_read_all_missing_returns_section_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let m1 = dir.path().join("ghost_a");
+        let m2 = dir.path().join("ghost_b");
+
+        let args = serde_json::json!({
+            "paths": [m1.to_str().unwrap(), m2.to_str().unwrap()],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false)
+            .expect("all-missing batch must succeed (Ok), not error the whole call");
+
+        assert!(
+            out.contains("── not found ──"),
+            "not-found section must appear: {out}"
+        );
+        assert!(out.contains("ghost_a"), "first missing listed: {out}");
+        assert!(out.contains("ghost_b"), "second missing listed: {out}");
+    }
+
+    /// Locks completeness (every missing path appears) and ordering (input
+    /// order preserved), plus the structural invariant that valid file
+    /// content comes before the not-found section.
+    #[test]
+    fn batch_read_missing_paths_listed_in_order_after_valid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.py");
+        std::fs::write(&real, "x = 1\n").unwrap();
+        let m1 = dir.path().join("aaa_missing");
+        let m2 = dir.path().join("zzz_missing");
+
+        let args = serde_json::json!({
+            "paths": [
+                m1.to_str().unwrap(),
+                real.to_str().unwrap(),
+                m2.to_str().unwrap(),
+            ],
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("mixed batch succeeds");
+
+        let content_idx = out.find("x = 1").expect("real file content present");
+        let nf_idx = out
+            .find("── not found ──")
+            .expect("not-found section present");
+        assert!(
+            content_idx < nf_idx,
+            "valid content must appear before the not-found section: {out}"
+        );
+
+        let nf = &out[nf_idx..];
+        let i1 = nf.find("aaa_missing").expect("first missing listed");
+        let i2 = nf.find("zzz_missing").expect("second missing listed");
+        assert!(
+            i1 < i2,
+            "missing paths must appear in input order, not sorted or reversed: {nf}"
+        );
+    }
+
+    /// Boundary check: the not-found section is batch-specific. A single
+    /// missing path keeps the prior Err behaviour, so callers that depend
+    /// on the explicit error code path still see it.
+    #[test]
+    fn single_missing_path_does_not_use_not_found_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("ghost_solo");
+        let args = serde_json::json!({ "paths": [missing.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let result = tool_read(&args, &cache, &session, false);
+        assert!(
+            result.is_err(),
+            "single missing path must surface as Err, not as a not-found section"
+        );
+    }
+
     // -- batch tool_edit --------------------------------------------------------
 
     fn anchor_for(content: &str, line: usize) -> String {

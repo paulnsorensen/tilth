@@ -97,7 +97,12 @@ pub(crate) fn tool_read(
         {
             // Per-path resolution so suffix/since/signature behave correctly.
             let mut parts: Vec<String> = Vec::with_capacity(paths.len());
+            let mut not_found: Vec<String> = Vec::new();
             for (path, suffix) in &parsed {
+                if !path.exists() {
+                    not_found.push(path.display().to_string());
+                    continue;
+                }
                 session.record_read(path);
                 if let Some(s_ts) = since {
                     if !crate::mcp::iso::file_changed_since(path, s_ts) {
@@ -125,7 +130,16 @@ pub(crate) fn tool_read(
                 };
                 parts.push(body);
             }
-            let combined = parts.join("\n\n");
+            let mut combined = parts.join("\n\n");
+            if !not_found.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str("── not found ──");
+                for p in &not_found {
+                    let _ = write!(combined, "\n{p}");
+                }
+            }
             // Multi-file responses don't carry per-file view-meta — the agent
             // can read each per-file `# path (...) [mode]` header inline.
             return Ok(finalize_response(
