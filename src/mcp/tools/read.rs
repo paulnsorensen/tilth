@@ -83,26 +83,42 @@ pub(crate) fn tool_read(
     let suffixes: Vec<&PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
     let now = std::time::SystemTime::now();
-    let has_any_suffix = suffixes.iter().any(|s| !matches!(s, PathSuffix::None));
 
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
-        if has_any_suffix
-            || since.is_some()
-            || force_signature
-            || force_stripped
-            || force_full
-            || mode_str == "auto"
-        {
-            // Per-path resolution so suffix/since/signature behave correctly.
-            let mut parts: Vec<String> = Vec::with_capacity(paths.len());
-            for (path, suffix) in &parsed {
+        use rayon::prelude::*;
+
+        // Per-path outcome. Workers are pure (read file, parse outline, format)
+        // except for `session.record_read` (atomic + Mutex internally) and
+        // `cache` access (DashMap). Partitioned after the join to preserve
+        // input order — `par_iter().collect()` is index-stable.
+        enum PerPath {
+            Content(String),
+            NotFound(String),
+        }
+
+        let outcomes: Vec<PerPath> = parsed
+            .par_iter()
+            .map(|(path, suffix)| {
+                if !path.exists() {
+                    return PerPath::NotFound(path.display().to_string());
+                }
+                // A `#symbol` suffix that resolves cleanly to "symbol absent
+                // from outline" is the symbol-equivalent of a missing file:
+                // route it to the `── not found ──` footer with the qualified
+                // `<path>#<symbol>` form. Precondition failures (unreadable
+                // file, non-code file) fall through to the existing inline
+                // error path so we don't misclassify them as "not found".
+                if let PathSuffix::Symbol(name) = suffix {
+                    if matches!(resolve_symbol(path, name), SymbolLookup::Missing) {
+                        return PerPath::NotFound(format!("{}#{}", path.display(), name));
+                    }
+                }
                 session.record_read(path);
                 if let Some(s_ts) = since {
                     if !crate::mcp::iso::file_changed_since(path, s_ts) {
-                        parts.push(crate::mcp::iso::unchanged_stub(path, s_ts));
-                        continue;
+                        return PerPath::Content(crate::mcp::iso::unchanged_stub(path, s_ts));
                     }
                 }
                 let signature = force_signature
@@ -123,20 +139,36 @@ pub(crate) fn tool_read(
                         cache,
                     )
                 };
-                parts.push(body);
+                PerPath::Content(body)
+            })
+            .collect();
+
+        let mut parts: Vec<String> = Vec::with_capacity(parsed.len());
+        let mut not_found: Vec<String> = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                PerPath::Content(s) => parts.push(s),
+                PerPath::NotFound(s) => not_found.push(s),
             }
-            let combined = parts.join("\n\n");
-            // Multi-file responses don't carry per-file view-meta — the agent
-            // can read each per-file `# path (...) [mode]` header inline.
-            return Ok(finalize_response(
-                Some(now),
-                serde_json::Map::new(),
-                combined,
-                budget,
-            ));
         }
-        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
-        return Ok(super::apply_budget(combined, budget));
+        let mut combined = parts.join("\n\n");
+        if !not_found.is_empty() {
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str("── not found ──");
+            for p in &not_found {
+                let _ = write!(combined, "\n{p}");
+            }
+        }
+        // Multi-file responses don't carry per-file view-meta — the agent
+        // can read each per-file `# path (...) [mode]` header inline.
+        return Ok(finalize_response(
+            Some(now),
+            serde_json::Map::new(),
+            combined,
+            budget,
+        ));
     }
 
     let path = paths.into_iter().next().expect("paths non-empty");
@@ -296,15 +328,38 @@ fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Opti
     None
 }
 
-/// Look up `name` in the file's outline; return its 1-indexed `(start, end)`.
-fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let ft = crate::lang::detect_file_type(path);
-    let crate::types::FileType::Code(lang) = ft else {
-        return None;
+/// Outcome of looking up `name` in `path`'s outline. Distinguishes a
+/// genuine miss (file parsed cleanly, symbol absent) from precondition
+/// failures (file unreadable, or not a code-with-grammar file). Lets the
+/// multi-file batch route only true misses to the `── not found ──`
+/// footer instead of misclassifying I/O or file-type errors as such.
+enum SymbolLookup {
+    Found(usize, usize),
+    Missing,
+    PreconditionFailed,
+}
+
+fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return SymbolLookup::PreconditionFailed;
+    };
+    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+        return SymbolLookup::PreconditionFailed;
     };
     let entries = crate::lang::outline::get_outline_entries(&content, lang);
-    find_symbol_entry(&entries, name)
+    match find_symbol_entry(&entries, name) {
+        Some((s, e)) => SymbolLookup::Found(s, e),
+        None => SymbolLookup::Missing,
+    }
+}
+
+/// Back-compat shim for `read_single_with_suffix`, which collapses all
+/// non-Found outcomes into a single inline error message.
+fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
+    match resolve_symbol(path, name) {
+        SymbolLookup::Found(s, e) => Some((s, e)),
+        SymbolLookup::Missing | SymbolLookup::PreconditionFailed => None,
+    }
 }
 
 fn should_auto_signature(path: &Path) -> bool {

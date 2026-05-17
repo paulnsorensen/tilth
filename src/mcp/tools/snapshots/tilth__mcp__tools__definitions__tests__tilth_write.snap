@@ -4,6 +4,8 @@ expression: desc
 ---
 Hash-anchored / overwrite / append edits across one or more files. Replaces the host Edit and Write tools — DO NOT use those.
 
+Example with `diff: true` (verify what landed, no follow-up read): `tilth_write(files: [{path: "src/foo.rs", mode: "hash", edits: [{start: "42:a1b", content: "let x = 2;\n"}]}], diff: true)` — response includes a `── diff ──\n--- before\n+++ after\n- <old line>\n+ <new line>` block per file.
+
 Example overwrite (new file): `tilth_write(files: [{path: "src/new.rs", mode: "overwrite", content: "fn main(){}\n"}])`.
 
 Request shape:
@@ -35,4 +37,4 @@ Modes per file: hash (default — replace lines at hash anchors), overwrite (who
 
 ALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Each path may appear only once per call. Never call tilth_write twice in a row.
 
-Pass `diff: true` to verify what landed without a separate read. If the diff reveals another needed edit, DO NOT call tilth_write again immediately — collect every visible follow-up, then issue ONE grouped follow-up call (after a read/search verification step if needed).
+If the diff reveals another needed edit, DO NOT call tilth_write again immediately — collect every visible follow-up, then issue ONE grouped follow-up call (after a read/search verification step if needed).
