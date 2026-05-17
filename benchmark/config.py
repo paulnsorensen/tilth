@@ -21,7 +21,7 @@ RUNNERS = {
 
 # MCP config arguments for codex (tilth server)
 TILTH_MCP_CODEX_ARGS = [
-    "-c", 'mcp_servers.tilth.command="/Users/flysikring/.cargo/bin/tilth"',
+    "-c", 'mcp_servers.tilth.command="tilth"',
     "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
 ]
 
@@ -104,9 +104,9 @@ MODES = {
     ),
     "tilth_forced": ModeConfig(
         name="tilth_forced",
-        tools=["Read", "Edit"],
+        tools=[],
         mcp_config_path=str(TILTH_MCP_CONFIG),
-        description="tilth MCP only (no Bash/Grep/Glob)",
+        description="tilth MCP only (no built-in tools)",
     ),
 }
 

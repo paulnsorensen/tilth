@@ -27,4 +27,9 @@ benchmark/fixtures/repo/
 benchmark/fixtures/repos/
 benchmark/results/*.jsonl
 benchmark/results/*.md
+benchmark/results/*.log
+benchmark/results/streams/
 !benchmark/results/.gitkeep
+
+# Local env (API keys, secrets)
+.env

@@ -9,8 +9,10 @@ Records token usage, cost, correctness, and tool usage to JSONL format.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,10 +39,13 @@ from fixtures.reset import reset_repo, ensure_repo_clean
 
 
 def _tilth_version() -> Optional[str]:
-    """Get installed tilth version via `tilth --version`."""
+    """Get installed tilth version via `tilth --version` (resolved on PATH)."""
+    binary = shutil.which("tilth")
+    if not binary:
+        return None
     try:
         result = subprocess.run(
-            ["/Users/flysikring/.cargo/bin/tilth", "--version"],
+            [binary, "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"
@@ -71,6 +76,15 @@ def _compact_tool_sequence(result):
                     args[k] = str(v).split("/")[-1]  # filename only
                 elif k in ("pattern", "query", "path", "scope", "kind", "section", "expand"):
                     args[k] = str(v)[:60]
+                elif k in ("paths", "sections", "patterns") and isinstance(v, list):
+                    # Batch-capable read/glob args — file or segment counts.
+                    args[f"{k}_count"] = len(v)
+                elif k == "files" and isinstance(v, list):
+                    # tilth_edit: count files in the batch AND total hunks across files.
+                    args["files_count"] = len(v)
+                    args["edits_count"] = sum(
+                        len(f.get("edits", [])) for f in v if isinstance(f, dict)
+                    )
                 # skip other large args
             if args:
                 entry["args"] = args
@@ -84,6 +98,8 @@ def run_single(
     model_name: str,
     repetition: int,
     verbose: bool = False,
+    stream_log_path: Optional[Path] = None,
+    bare: bool = False,
 ) -> dict:
     """
     Run a single benchmark iteration.
@@ -135,8 +151,29 @@ def run_single(
             "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
 
-        if mode.tools:
-            cmd += ["--tools", ",".join(mode.tools)]
+        # --bare strips slash commands, hooks, plugins, agents, and skills.
+        # Off by default because it also drops Grep/Glob from the built-in tool
+        # set, which makes baseline runs unfair. Opt in via --bare when you
+        # want a maximally stripped harness (e.g. measuring tilth in isolation).
+        if bare:
+            cmd += ["--bare"]
+
+        # Build the --tools allowlist. In --bare mode, explicitly inject
+        # Grep/Glob for any mode that already allows built-ins, since bare
+        # strips plugin-provided tools and we want baseline/tilth to keep
+        # Grep/Glob for fair comparison. tilth_forced (mode.tools=[]) stays
+        # empty on purpose — that mode is meant to expose only tilth MCP.
+        tools_list = list(mode.tools)
+        if bare and tools_list:
+            for t in ("Grep", "Glob"):
+                if t not in tools_list:
+                    tools_list.append(t)
+
+        # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
+        if tools_list:
+            cmd += ["--tools", ",".join(tools_list)]
+        elif mode.mcp_config_path:
+            cmd += ["--tools", ""]
 
         if mode.mcp_config_path:
             cmd += ["--mcp-config", mode.mcp_config_path]
@@ -149,14 +186,70 @@ def run_single(
     # Run subprocess (unset CLAUDECODE to allow nested claude -p)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     start_time = time.time()
-    result = subprocess.run(
-        cmd,
-        cwd=str(repo_path),
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env=env,
-    )
+
+    if runner == "claude" and stream_log_path is not None:
+        # Tee claude's stream-json stdout to disk line-by-line so the run is
+        # tailable while in-flight. Keeps the in-memory string for the existing
+        # parse path. Codex (single-object JSON) keeps the simple subprocess.run.
+        stream_log_path.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(repo_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+            env=env,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        stderr_pipe = proc.stderr
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        timed_out = False
+
+        def _drain_stderr() -> None:
+            stderr_chunks.append(stderr_pipe.read())
+
+        def _kill_on_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        stderr_thread = threading.Thread(target=_drain_stderr)
+        stderr_thread.start()
+        timer = threading.Timer(600, _kill_on_timeout)
+        timer.start()
+        try:
+            with open(stream_log_path, "w") as logf:
+                for line in proc.stdout:
+                    logf.write(line)
+                    logf.flush()
+                    stdout_chunks.append(line)
+            proc.wait()
+            stderr_thread.join()
+        finally:
+            timer.cancel()
+            proc.stdout.close()
+            stderr_pipe.close()
+
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, 600)
+
+        result = subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
+    else:
+        result = subprocess.run(
+            cmd,
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+        )
     elapsed_ms = int((time.time() - start_time) * 1000)
 
     if result.returncode != 0:
@@ -281,6 +374,14 @@ Examples:
         action="store_true",
         help="Print detailed output for debugging",
     )
+    parser.add_argument(
+        "--bare",
+        action="store_true",
+        help="Pass --bare to `claude -p`. Strips slash commands, hooks, "
+             "plugins, agents, and skills. Note: also drops Grep/Glob from "
+             "baseline's tool set, so use with care when comparing modes. "
+             "Claude runner only; ignored for codex.",
+    )
 
     args = parser.parse_args()
 
@@ -292,6 +393,35 @@ Examples:
     except ValueError as e:
         parser.error(str(e))
         return
+
+    # Verify every MCP server referenced by selected modes can actually spawn.
+    # Catches stale absolute paths in mcp config files (e.g. /Users/<other-user>/...).
+    for mode_name in modes:
+        cfg_path = MODES[mode_name].mcp_config_path
+        if not cfg_path:
+            continue
+        try:
+            with open(cfg_path) as fp:
+                mcp_cfg = json.load(fp)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"ERROR: cannot read MCP config {cfg_path} for mode '{mode_name}': {e}", file=sys.stderr)
+            sys.exit(1)
+        for server_name, server_cfg in mcp_cfg.get("mcpServers", {}).items():
+            cmd_str = server_cfg.get("command", "")
+            resolved = shutil.which(cmd_str) if "/" not in cmd_str else (cmd_str if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) else None)
+            if not resolved:
+                print(f"ERROR: MCP server '{server_name}' in {cfg_path} (mode '{mode_name}')", file=sys.stderr)
+                print(f"       command '{cmd_str}' is not executable / not on PATH.", file=sys.stderr)
+                print(f"       Fix the 'command' field in {cfg_path} or install the binary.", file=sys.stderr)
+                sys.exit(1)
+            # Smoke-test the binary with --version to catch broken installs.
+            try:
+                probe = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
+                if probe.returncode != 0:
+                    print(f"WARNING: MCP server '{server_name}' --version exited {probe.returncode}: {probe.stderr.strip()}", file=sys.stderr)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                print(f"ERROR: MCP server '{server_name}' at {resolved} failed to run: {e}", file=sys.stderr)
+                sys.exit(1)
 
     # Filter tasks by repo
     if args.repos.lower() != "all":
@@ -335,6 +465,7 @@ Examples:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
     output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
+    stream_log_dir = RESULTS_DIR / "streams" / timestamp
 
     # Print configuration summary
     print("=" * 70)
@@ -347,6 +478,7 @@ Examples:
     print(f"Repos:       {', '.join(repos_used)}")
     print(f"Repetitions: {args.reps}")
     print(f"Output:      {output_file}")
+    print(f"Streams:     {stream_log_dir}/<cell>.jsonl  (tail -f for live agent output)")
     print("=" * 70)
     print()
 
@@ -397,6 +529,10 @@ Examples:
                         print(f"[{current_run}/{total_runs}] {run_id}")
 
                         # Run benchmark
+                        cell_slug = (
+                            f"{current_run:02d}_{task_name}_{mode_name}"
+                            f"_{model_name}_rep{rep}"
+                        )
                         try:
                             result = run_single(
                                 task_name,
@@ -404,6 +540,8 @@ Examples:
                                 model_name,
                                 rep,
                                 verbose=args.verbose,
+                                stream_log_path=stream_log_dir / f"{cell_slug}.jsonl",
+                                bare=args.bare,
                             )
 
                             # Write JSONL record
@@ -425,7 +563,7 @@ Examples:
                                 print(f"  → {result['correctness_reason']}")
 
                         except subprocess.TimeoutExpired:
-                            print(f"  ✗ TIMEOUT (>300s)")
+                            print(f"  ✗ TIMEOUT (>600s)")
                             error_result = {
                                 "task": task_name,
                                 "mode": mode_name,
