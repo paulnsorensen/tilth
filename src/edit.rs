@@ -375,7 +375,14 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normal_count: usize = 0;
     for component in path.components() {
         match component {
-            Component::Prefix(_) | Component::RootDir => {
+            // On Windows, drive-relative paths like `C:foo` parse as
+            // `[Prefix("C:"), Normal("foo")]` with no `RootDir` — they are
+            // anchored to that drive's cwd but are NOT absolute, so leading
+            // `..` must still be preserved. Only `RootDir` flips the flag.
+            Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+            Component::RootDir => {
                 is_absolute = true;
                 out.push(component.as_os_str());
             }
