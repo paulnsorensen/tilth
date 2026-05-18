@@ -291,27 +291,31 @@ fn main() {
     let cache = tilth::cache::OutlineCache::new();
     let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
 
-    // When piped (not a TTY), force full output — scripts expect raw content.
-    // This promotion exists for FilePath queries (return full file instead of
-    // outline) and is harmless for Glob (which ignores `full`). Search queries
-    // also receive `full=true` here but stay outline-only — they do not auto-
-    // expand on piping. See the `cli.full` guard on the expand override below.
-    let full = cli.full || !is_tty;
+    // When piped (not a TTY), force full output for FilePath queries — scripts
+    // expect raw content. Harmless for Glob (which ignores `full_file`). Search
+    // queries stay outline-only here; they auto-expand only via the explicit
+    // `cli.full` guard below.
+    let full_file = cli.full || !is_tty;
 
     // Explicit `--full` on a search query means expand every match. Guarded on
-    // `cli.full` (NOT the piped-derived `full` above) so that subprocess /
+    // `cli.full` (NOT the piped-derived `full_file` above) so that subprocess /
     // pipeline callers (Claude Code's Bash tool, CI scripts, `tilth foo | rg`)
-    // still receive the concise outline they want. They opt into expand-all by
-    // adding `--full` themselves. Explicit `--expand=N` still wins because it
-    // produces `expand != 0`. We over-apply to all query types — `run_inner`
-    // only forwards `expand` to search dispatches, so the value is silently
-    // ignored for FilePath and Glob.
-    //
+    // still receive the concise outline they want. Explicit `--expand=N` still
+    // wins because it produces `expand != 0`. We over-apply to all query types
+    // — `run_inner` only forwards `expand` to search dispatches, so the value
+    // is silently ignored for FilePath and Glob.
     let expand = compute_expand(cli.expand, cli.full);
+
+    let cap = if cli.full {
+        tilth::MatchCap::Extended
+    } else {
+        tilth::MatchCap::Default
+    };
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(&query, &scope, expand, cli.budget, cli.glob.as_deref());
+        let result =
+            tilth::run_callers(&query, &scope, expand, cli.budget, cli.glob.as_deref(), cap);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -338,40 +342,16 @@ fn main() {
         return;
     }
 
-    let mode = SymbolMode::from(cli.kind);
-    let result = if expand > 0 {
-        tilth::run_expanded(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            full,
-            expand,
-            cli.glob.as_deref(),
-            &cache,
-            mode,
-        )
-    } else if full {
-        tilth::run_full(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-            mode,
-        )
-    } else {
-        tilth::run(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-            mode,
-        )
+    let config = tilth::RunConfig {
+        section: cli.section.as_deref(),
+        budget_tokens: cli.budget,
+        expand,
+        glob: cli.glob.as_deref(),
+        mode: SymbolMode::from(cli.kind),
+        full_file,
+        cap,
     };
+    let result = tilth::run(&query, &scope, &cache, config);
 
     emit_result(result, &query, cli.json, is_tty);
 }

@@ -32,6 +32,15 @@ use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 
 use crate::format::rel;
 
+/// Match-count cap when `--full` is set. Generous but bounded so a
+/// `tilth foo --full` on a huge repo can't blow up output. Shared by the
+/// symbol, content, and callers search arms so they stay in lock-step.
+pub(crate) const FULL_MAX_MATCHES: usize = 100;
+
+/// Walker early-quit threshold when `--full` is set. Proportional to
+/// `FULL_MAX_MATCHES` the same way the default thresholds are.
+pub(crate) const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
 // We skip these explicitly instead of relying on .gitignore so that locally-relevant
 // gitignored files (docs/, configs, generated code) are still searchable.
@@ -220,7 +229,7 @@ pub fn search_symbol(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, glob, mode)?;
+    let result = symbol::search(query, scope, glob, mode, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(
         &result,
@@ -234,6 +243,7 @@ pub fn search_symbol(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -243,9 +253,10 @@ pub fn search_symbol_expanded(
     expand: usize,
     glob: Option<&str>,
     mode: symbol::SymbolMode,
+    full: bool,
 ) -> Result<String, TilthError> {
     search_symbol_expanded_mode(
-        query, scope, cache, session, bloom, expand, glob, mode, false,
+        query, scope, cache, session, bloom, expand, glob, mode, false, full,
     )
 }
 
@@ -263,8 +274,9 @@ pub fn search_symbol_expanded_mode(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
     edit_mode: bool,
+    full: bool,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, glob, mode)?;
+    let result = symbol::search(query, scope, glob, mode, full)?;
     format_search_result(
         &result,
         cache,
@@ -288,12 +300,14 @@ pub fn search_multi_symbol_expanded_mode(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
     edit_mode: bool,
+    full: bool,
 ) -> Result<String, TilthError> {
     multi_symbol_inner(
-        queries, scope, cache, session, bloom, expand, glob, mode, edit_mode,
+        queries, scope, cache, session, bloom, expand, glob, mode, edit_mode, full,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
@@ -303,9 +317,10 @@ pub fn search_multi_symbol_expanded(
     expand: usize,
     glob: Option<&str>,
     mode: symbol::SymbolMode,
+    full: bool,
 ) -> Result<String, TilthError> {
     multi_symbol_inner(
-        queries, scope, cache, session, bloom, expand, glob, mode, false,
+        queries, scope, cache, session, bloom, expand, glob, mode, false, full,
     )
 }
 
@@ -320,6 +335,7 @@ fn multi_symbol_inner(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
     edit_mode: bool,
+    full: bool,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
@@ -336,7 +352,7 @@ fn multi_symbol_inner(
     let mut empty_stats: Option<(usize, usize)> = None;
 
     for query in queries {
-        let result = symbol::search(query, scope, glob, mode)?;
+        let result = symbol::search(query, scope, glob, mode, full)?;
         if result.matches.is_empty() {
             let (files_matched_glob, files_searched) =
                 *empty_stats.get_or_insert_with(|| count_files_for_empty(scope, glob));
@@ -388,7 +404,7 @@ pub fn search_content(
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, glob)?;
+    let result = content::search(pattern, scope, is_regex, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     let kind = if is_regex {
         format::EmptyHint::Regex
@@ -404,7 +420,7 @@ pub fn search_regex(
     cache: &OutlineCache,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, glob)?;
+    let result = content::search(pattern, scope, true, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(
         &result,
@@ -425,8 +441,9 @@ pub fn search_content_expanded(
     session: &Session,
     expand: usize,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
-    search_content_expanded_mode(query, scope, cache, session, expand, glob, false)
+    search_content_expanded_mode(query, scope, cache, session, expand, glob, false, full)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,9 +455,10 @@ pub fn search_content_expanded_mode(
     expand: usize,
     glob: Option<&str>,
     edit_mode: bool,
+    full: bool,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, glob)?;
+    let result = content::search(pattern, scope, is_regex, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     let kind = if is_regex {
         format::EmptyHint::Regex
@@ -467,8 +485,9 @@ pub fn search_regex_expanded(
     session: &Session,
     expand: usize,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
-    search_regex_expanded_mode(pattern, scope, cache, session, expand, glob, false)
+    search_regex_expanded_mode(pattern, scope, cache, session, expand, glob, false, full)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,8 +499,9 @@ pub fn search_regex_expanded_mode(
     expand: usize,
     glob: Option<&str>,
     edit_mode: bool,
+    full: bool,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, glob)?;
+    let result = content::search(pattern, scope, true, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(
         &result,
@@ -502,7 +522,7 @@ pub fn search_symbol_raw(
     glob: Option<&str>,
     mode: symbol::SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, glob, mode)
+    symbol::search(query, scope, glob, mode, false)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -512,7 +532,7 @@ pub fn search_content_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, glob)
+    content::search(pattern, scope, is_regex, glob, false)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
@@ -521,7 +541,7 @@ pub fn search_regex_raw(
     scope: &Path,
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, glob)
+    content::search(pattern, scope, true, glob, false)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1820,10 +1840,10 @@ mod tests {
     #[test]
     fn content_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all = content::search("TilthError", &scope, false, None).expect("search failed");
-        let rs_only = content::search("TilthError", &scope, false, Some("*.rs"))
+        let all = content::search("TilthError", &scope, false, None, false).expect("search failed");
+        let rs_only = content::search("TilthError", &scope, false, Some("*.rs"), false)
             .expect("search with glob failed");
-        let toml_only = content::search("TilthError", &scope, false, Some("*.toml"))
+        let toml_only = content::search("TilthError", &scope, false, Some("*.toml"), false)
             .expect("search with toml glob failed");
 
         assert!(all.total_found > 0, "unfiltered should find TilthError");
@@ -1845,10 +1865,22 @@ mod tests {
     #[test]
     fn symbol_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let rs_result = symbol::search("walker", &scope, Some("*.rs"), symbol::SymbolMode::Any)
-            .expect("symbol search failed");
-        let toml_result = symbol::search("walker", &scope, Some("*.toml"), symbol::SymbolMode::Any)
-            .expect("symbol search with toml failed");
+        let rs_result = symbol::search(
+            "walker",
+            &scope,
+            Some("*.rs"),
+            symbol::SymbolMode::Any,
+            false,
+        )
+        .expect("symbol search failed");
+        let toml_result = symbol::search(
+            "walker",
+            &scope,
+            Some("*.toml"),
+            symbol::SymbolMode::Any,
+            false,
+        )
+        .expect("symbol search with toml failed");
 
         assert!(rs_result.total_found > 0, "*.rs should find 'walker'");
         assert_eq!(
@@ -1871,10 +1903,11 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.rs"))
+        let rs_callers = callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.rs"))
             .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.toml"))
-            .expect("callers toml failed");
+        let toml_callers =
+            callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.toml"))
+                .expect("callers toml failed");
 
         assert!(
             !rs_callers.is_empty(),
@@ -1987,7 +2020,7 @@ mod tests {
         std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("linked")).unwrap();
 
         let result =
-            content::search("unique_symlink_test_symbol", tmp.path(), false, None).unwrap();
+            content::search("unique_symlink_test_symbol", tmp.path(), false, None, false).unwrap();
         // Should find the symbol in both real/api.rs and linked/api.rs
         assert!(
             result.total_found >= 2,

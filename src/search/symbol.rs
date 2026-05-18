@@ -20,6 +20,8 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
+use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
+
 const MAX_MATCHES: usize = 10;
 /// Stop walking once we have this many raw definition matches.
 const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
@@ -62,9 +64,24 @@ pub fn search(
     scope: &Path,
     glob: Option<&str>,
     mode: SymbolMode,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let (def_quit, usage_quit, cap) = if full {
+        (
+            FULL_EARLY_QUIT_THRESHOLD,
+            FULL_EARLY_QUIT_THRESHOLD,
+            FULL_MAX_MATCHES,
+        )
+    } else {
+        (
+            EARLY_QUIT_THRESHOLD_DEFINITIONS,
+            EARLY_QUIT_THRESHOLD_USAGES,
+            MAX_MATCHES,
+        )
+    };
+
     let (defs, usages) = match mode {
-        SymbolMode::Strict => (find_definitions(query, scope, glob)?, Vec::new()),
+        SymbolMode::Strict => (find_definitions(query, scope, glob, def_quit)?, Vec::new()),
         SymbolMode::Any => {
             let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
             let matcher =
@@ -73,8 +90,8 @@ pub fn search(
                     reason: e.to_string(),
                 })?;
             let (defs, usages) = rayon::join(
-                || find_definitions(query, scope, glob),
-                || find_usages(query, &matcher, scope, glob),
+                || find_definitions(query, scope, glob, def_quit),
+                || find_usages(query, &matcher, scope, glob, usage_quit),
             );
             (defs?, usages?)
         }
@@ -123,7 +140,7 @@ pub fn search(
         }
     };
 
-    merged.truncate(MAX_MATCHES);
+    merged.truncate(cap);
 
     Ok(SearchResult {
         query: query.to_string(),
@@ -148,6 +165,7 @@ fn find_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -163,7 +181,7 @@ fn find_definitions(
 
         Box::new(move |entry| {
             // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_DEFINITIONS {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -501,6 +519,7 @@ fn find_usages(
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
@@ -514,7 +533,7 @@ fn find_usages(
 
         Box::new(move |entry| {
             // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_USAGES {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -1053,7 +1072,7 @@ end
 
         // SymbolMode::Strict: only the class definition line
         let strict_result =
-            super::search("Foo", tmp.path(), None, super::SymbolMode::Strict).unwrap();
+            super::search("Foo", tmp.path(), None, super::SymbolMode::Strict, false).unwrap();
         assert_eq!(
             strict_result.matches.len(),
             1,
@@ -1071,7 +1090,8 @@ end
         assert!(strict_result.matches[0].is_definition);
 
         // SymbolMode::Any: comment (line 1) + definition (line 2) + usage (line 5).
-        let any_result = super::search("Foo", tmp.path(), None, super::SymbolMode::Any).unwrap();
+        let any_result =
+            super::search("Foo", tmp.path(), None, super::SymbolMode::Any, false).unwrap();
         let any_lines: Vec<(u32, bool)> = any_result
             .matches
             .iter()
@@ -1356,6 +1376,70 @@ Body to end.
             matches.iter().all(|m| m.def_weight >= 60),
             "displayed slice after cap must be all code defs, got {:?}",
             matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
+        );
+    }
+
+    /// `--full` raises the match cap from 10 → 100 and proportionally raises
+    /// the walker early-quit thresholds. Seeds 15 files, each defining a
+    /// distinct `WidelyUsedThing` so all 15 are real definitions. With
+    /// `full=false` the cap stays at 10; with `full=true` it lifts above 10.
+    /// `total_found` is computed pre-truncation and matches in both arms.
+    #[test]
+    fn full_flag_raises_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..15 {
+            let path = tmp.path().join(format!("file_{i}.rs"));
+            std::fs::write(&path, "pub fn WidelyUsedThing() {}\n").unwrap();
+        }
+
+        let default_result = super::search(
+            "WidelyUsedThing",
+            tmp.path(),
+            None,
+            super::SymbolMode::Strict,
+            false,
+        )
+        .unwrap();
+        assert!(
+            default_result.matches.len() <= 10,
+            "default cap should keep matches <= 10, got {}",
+            default_result.matches.len()
+        );
+        // Pre-truncation invariant: total_found reflects all 15 hits even though
+        // matches.len() was capped at 10. A future regression that wires the cap
+        // before total accounting would collapse this gap.
+        assert!(
+            default_result.total_found >= 15,
+            "total_found should reflect pre-truncation count, got {} (expected >= 15)",
+            default_result.total_found
+        );
+        assert!(
+            default_result.total_found > default_result.matches.len(),
+            "total_found must exceed matches.len() in the truncated default case: total={} displayed={}",
+            default_result.total_found,
+            default_result.matches.len()
+        );
+
+        let full_result = super::search(
+            "WidelyUsedThing",
+            tmp.path(),
+            None,
+            super::SymbolMode::Strict,
+            true,
+        )
+        .unwrap();
+        assert!(
+            full_result.matches.len() > 10,
+            "full=true should raise the cap above 10, got {}",
+            full_result.matches.len()
+        );
+
+        // total_found is pre-truncation; both arms must agree on it (modulo
+        // walker early-quit, which only matters once results exceed the
+        // raised threshold — 15 < 300, so they agree exactly here).
+        assert_eq!(
+            default_result.total_found, full_result.total_found,
+            "total_found should match pre-truncation across both arms"
         );
     }
 }

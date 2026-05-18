@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.8.1"
+version = "0.8.4"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -19,19 +19,19 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Tree-sitter (AST outlines)
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"
-tree-sitter-javascript = "0.23"
+tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-go = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.24"
-tree-sitter-scala = "0.24"
+tree-sitter-scala = "0.26"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
 tree-sitter-kotlin-ng = "1.1"
@@ -54,9 +54,9 @@ memmap2 = "0.9"
 # Parallelism
 rayon = "1"
 
-# Channel with select! for timeout wrapper (sibling of crossbeam-deque/-epoch/-utils
-# already present as rayon transitive deps; closer-to-Java-Future ergonomics than
-# std::sync::mpsc::recv_timeout).
+# Channel with select! for the timeout wrapper (sibling of crossbeam-deque/-utils
+# already pulled in transitively by rayon; gives the closer-to-Java-Future
+# ergonomics that std::sync::mpsc::recv_timeout cannot express on multiple arms).
 crossbeam-channel = "0.5"
 
 # Concurrent cache
@@ -65,7 +65,7 @@ dashmap = "6"
 # Structured data parsing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Error types
 thiserror = "2"
@@ -73,7 +73,7 @@ thiserror = "2"
 # Bloom filter (fast SIMD-optimized impl)
 fastbloom = "0.17"
 
-# String similarity (fuzzy symbol-rename detection, char-aware Levenshtein)
+# String similarity (char-aware Levenshtein for filename / heading suggestions)
 strsim = "0.11"
 
 # URI percent-decoding (file:// roots from MCP host)
