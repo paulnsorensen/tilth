@@ -105,7 +105,7 @@ pub fn search(
     let total = merged.len();
     let usage_count = total - def_count;
 
-    rank::sort(&mut merged, query, scope, context);
+    rank::sort(&mut merged, query, scope);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each

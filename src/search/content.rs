@@ -150,7 +150,7 @@ pub fn search(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort(&mut all_matches, pattern, scope);
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
