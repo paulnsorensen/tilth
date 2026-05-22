@@ -6,14 +6,33 @@ use std::path::Path;
 
 use crate::format;
 
-/// Overwrite `path` with `content`, creating parent dirs if absent.
-pub fn write_overwrite(path: &Path, content: &str) -> std::io::Result<()> {
+/// Write `content` to `path`, creating parent dirs if absent.
+///
+/// Defaults to **create-only**: an atomic `O_CREAT|O_EXCL` open fails with
+/// `ErrorKind::AlreadyExists` if the path already exists (regular file *or*
+/// dangling symlink) — no TOCTOU window, no silent clobber. Pass
+/// `overwrite = true` to swallow `AlreadyExists` and replace the existing
+/// file via `fs::write` (which follows symlinks the way the standard library
+/// does).
+pub fn write_overwrite(path: &Path, content: &str, overwrite: bool) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     if let Some(p) = path.parent() {
         if !p.as_os_str().is_empty() {
             fs::create_dir_all(p)?;
         }
     }
-    fs::write(path, content)
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => f.write_all(content.as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && overwrite => {
+            fs::write(path, content)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Append `content` to `path`, creating the file (and parent dirs) if absent.
@@ -86,6 +105,44 @@ pub fn fresh_region(path: &Path, start: usize, end: usize) -> std::io::Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_overwrite_creates_new_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new/nested/file.txt");
+        write_overwrite(&p, "hello\n", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn write_overwrite_create_only_fails_on_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.txt");
+        std::fs::write(&p, "original").unwrap();
+        let err = write_overwrite(&p, "new", false).expect_err("expected AlreadyExists");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "original");
+    }
+
+    #[test]
+    fn write_overwrite_with_overwrite_flag_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.txt");
+        std::fs::write(&p, "original").unwrap();
+        write_overwrite(&p, "replaced", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "replaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_overwrite_create_only_refuses_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(dir.path().join("missing-target"), &link).unwrap();
+        let err = write_overwrite(&link, "x", false).expect_err("dangling symlink → AlreadyExists");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 
     #[test]
     fn auto_fix_locate_exactly_one_match_relocates() {

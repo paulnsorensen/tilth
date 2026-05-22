@@ -221,8 +221,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     if edit_mode {
         tools.push(serde_json::json!({
-            "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
+            "name": "tilth_write",
+            "description": "Batch write one or more files in one call. Replaces the host Edit and Write tools — DO NOT use those. Three per-file modes: `hash` (default — replace lines at hash anchors from tilth_read), `overwrite` (whole file; create-only by default — pass `overwrite: true` to replace an existing file), `append` (append `content`, creates if absent). overwrite/append responses echo the file's hashlines so you can chain anchored edits in the next call without re-reading. ALWAYS group writes to multiple files into a single tilth_write call — never call tilth_write twice in a row. Each file is processed independently (best-effort): a failure on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -231,19 +231,25 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call.",
+                        "description": "One entry per file. Use a single-element array for a single-file write. Each path must be unique within the call.",
                         "items": {
                             "type": "object",
-                            "required": ["path", "edits"],
+                            "required": ["path"],
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path to edit."
+                                    "description": "Absolute or relative file path."
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["hash", "h", "overwrite", "w", "append", "a"],
+                                    "default": "hash",
+                                    "description": "Write mode. hash (default): replace lines at hash anchors via `edits`. overwrite: write whole file from `content`; create-only by default — set `overwrite: true` to replace existing. append: append `content`, creates if absent."
                                 },
                                 "edits": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "description": "Edit operations for this file, applied atomically per file.",
+                                    "description": "Hash-mode only: edit operations for this file, applied atomically per file.",
                                     "items": {
                                         "type": "object",
                                         "required": ["start", "content"],
@@ -262,6 +268,15 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             }
                                         }
                                     }
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "overwrite / append mode only: the file contents (overwrite) or text to append (append)."
+                                },
+                                "overwrite": {
+                                    "type": "boolean",
+                                    "default": false,
+                                    "description": "overwrite mode only: when true, replace an existing file. Default false fails with `AlreadyExists` so you don't clobber by accident."
                                 }
                             }
                         }
