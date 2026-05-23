@@ -12,8 +12,13 @@ use crate::format;
 /// `ErrorKind::AlreadyExists` if the path already exists (regular file *or*
 /// dangling symlink) — no TOCTOU window, no silent clobber. Pass
 /// `overwrite = true` to swallow `AlreadyExists` and replace the existing
-/// file via `fs::write` (which follows symlinks the way the standard library
-/// does).
+/// file. Overwrite refuses to follow symlinks (dangling or live): on Unix the
+/// rewrite open passes `O_NOFOLLOW`, so the kernel returns `ELOOP` rather
+/// than resolving the link and writing the target — closing the scope-escape
+/// at the syscall layer (no TOCTOU window between check and open). `ELOOP`
+/// is remapped to `ErrorKind::InvalidInput` with a "refusing to overwrite
+/// through symlink" message. On non-Unix targets the rewrite falls back to
+/// `fs::write` (Windows symlink semantics differ; no analogous escape).
 pub fn write_overwrite(path: &Path, content: &str, overwrite: bool) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -29,10 +34,38 @@ pub fn write_overwrite(path: &Path, content: &str, overwrite: bool) -> std::io::
     {
         Ok(mut f) => f.write_all(content.as_bytes()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && overwrite => {
-            fs::write(path, content)
+            rewrite_existing(path, content)
         }
         Err(e) => Err(e),
     }
+}
+
+#[cfg(unix)]
+fn rewrite_existing(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to overwrite through symlink",
+                )
+            } else {
+                e
+            }
+        })?;
+    f.write_all(content.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn rewrite_existing(path: &Path, content: &str) -> std::io::Result<()> {
+    fs::write(path, content)
 }
 
 /// Append `content` to `path`, creating the file (and parent dirs) if absent.
@@ -142,6 +175,32 @@ mod tests {
         symlink(dir.path().join("missing-target"), &link).unwrap();
         let err = write_overwrite(&link, "x", false).expect_err("dangling symlink → AlreadyExists");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_overwrite_with_overwrite_flag_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // Dangling symlink: fs::write would create the target.
+        let dangling = dir.path().join("dangling.txt");
+        symlink(dir.path().join("missing-target"), &dangling).unwrap();
+        let err = write_overwrite(&dangling, "x", true)
+            .expect_err("overwrite=true through dangling symlink must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Live symlink: fs::write would clobber the target through the link.
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "real").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+        let err = write_overwrite(&link, "x", true)
+            .expect_err("overwrite=true through live symlink must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "real",
+            "symlink target must be untouched"
+        );
     }
 
     #[test]

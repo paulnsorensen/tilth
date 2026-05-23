@@ -87,7 +87,13 @@ pub(crate) fn tool_write(
         match mode {
             "hash" | "h" => hash_tasks.push(parse_file_edit(i, f)),
             "overwrite" | "w" => {
-                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
+                    direct_results.push(format!(
+                        "## {}\nerror: 'content' must be a string",
+                        path.display()
+                    ));
+                    continue;
+                };
                 let Some(overwrite) = parse_overwrite_flag(f) else {
                     direct_results.push(format!(
                         "## {}\nerror: 'overwrite' must be a boolean",
@@ -101,7 +107,7 @@ pub(crate) fn tool_write(
                     .flatten();
                 match crate::mcp::write::write_overwrite(&path, content, overwrite) {
                     Ok(()) => {
-                        let line_count = content.matches('\n').count() + 1;
+                        let line_count = content.lines().count();
                         let verb = if pre_existed { "overwrote" } else { "created" };
                         let mut block = format!(
                             "## {}\n{verb}: {} bytes, {line_count} lines\n{}",
@@ -125,19 +131,37 @@ pub(crate) fn tool_write(
                 }
             }
             "append" | "a" => {
-                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
+                    direct_results.push(format!(
+                        "## {}\nerror: 'content' must be a string",
+                        path.display()
+                    ));
+                    continue;
+                };
                 let before = show_diff
                     .then(|| std::fs::read_to_string(&path).ok())
                     .flatten();
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
+                        // Echo only the appended region's hashlines so
+                        // log-shaped append targets don't balloon the
+                        // response. The agent can tilth_read the file
+                        // separately if it needs anchors for pre-existing
+                        // content.
                         let after = std::fs::read_to_string(&path)
                             .unwrap_or_else(|_| before.clone().unwrap_or_default() + content);
+                        let after_lines: Vec<&str> = after.lines().collect();
+                        let total = after_lines.len();
+                        let appended = content.lines().count().max(1);
+                        let start_idx = total.saturating_sub(appended);
+                        let tail = after_lines[start_idx..].join("\n");
+                        let start_line = (start_idx + 1) as u32;
                         let mut block = format!(
-                            "## {}\nappend: {} bytes\n{}",
+                            "## {}\nappend: {} bytes (echoing last {} of {total} lines)\n{}",
                             path.display(),
                             content.len(),
-                            crate::format::hashlines(&after, 1),
+                            total - start_idx,
+                            crate::format::hashlines(&tail, start_line),
                         );
                         if show_diff {
                             block.push_str(&render_text_diff(before.as_deref(), &after));
@@ -641,5 +665,121 @@ mod tests {
             "expected strict-bool rejection: {out}"
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn overwrite_non_string_content_rejected_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.rs");
+        std::fs::write(&p, "old\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "overwrite": true,
+                "content": 123,
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out =
+            tool_write(&args, &session, &bloom).expect("error reported per file, not at top level");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-type rejection: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "old\n",
+            "non-string content must not clobber under overwrite: true"
+        );
+    }
+
+    #[test]
+    fn overwrite_missing_content_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.rs");
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("partial-failure returns Ok");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-required rejection: {out}"
+        );
+        assert!(!p.exists(), "no file created when content missing");
+    }
+
+    #[test]
+    fn append_echoes_only_appended_region_not_full_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        // Pre-existing 50-line log.
+        let mut pre = String::new();
+        for n in 1..=50 {
+            use std::fmt::Write as _;
+            let _ = writeln!(pre, "pre-line-{n}");
+        }
+        std::fs::write(&p, &pre).unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": "new1\nnew2\n",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("append succeeds");
+        assert!(out.contains("append:"), "missing append verb: {out}");
+        assert!(
+            out.contains("|new1") && out.contains("|new2"),
+            "appended lines must appear in hashline echo: {out}"
+        );
+        for n in 1..=48 {
+            assert!(
+                !out.contains(&format!("|pre-line-{n}\n"))
+                    && !out.contains(&format!("|pre-line-{n}$"))
+                    && !out.contains(&format!("|pre-line-{n} ")),
+                "pre-existing line {n} must NOT appear in echo (bounded to appended region): {out}"
+            );
+        }
+        // Echo header reports how much was echoed vs total.
+        assert!(
+            out.contains("of 52 lines"),
+            "echo header should report total line count: {out}"
+        );
+    }
+
+    #[test]
+    fn append_non_string_content_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        std::fs::write(&p, "existing\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": null,
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out =
+            tool_write(&args, &session, &bloom).expect("error reported per file, not at top level");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-type rejection: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "existing\n",
+            "non-string content must not modify the file"
+        );
     }
 }

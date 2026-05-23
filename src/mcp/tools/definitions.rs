@@ -278,7 +278,22 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                     "default": false,
                                     "description": "overwrite mode only: when true, replace an existing file. Default false fails with `AlreadyExists` so you don't clobber by accident."
                                 }
-                            }
+                            },
+                            "allOf": [
+                                {
+                                    "if": {"properties": {"mode": {"enum": ["hash", "h"]}}},
+                                    "then": {"required": ["edits"]}
+                                },
+                                {
+                                    "if": {
+                                        "required": ["mode"],
+                                        "properties": {
+                                            "mode": {"enum": ["overwrite", "w", "append", "a"]}
+                                        }
+                                    },
+                                    "then": {"required": ["content"]}
+                                }
+                            ]
                         }
                     },
                     "diff": {
@@ -292,4 +307,86 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilth_write_schema_requires_mode_specific_fields() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present in edit mode");
+        let items = &write["inputSchema"]["properties"]["files"]["items"];
+        let all_of = items["allOf"]
+            .as_array()
+            .expect("items.allOf clauses present");
+        assert_eq!(all_of.len(), 2, "expected hash-branch + content-branch");
+        // Hash branch: when mode absent or in {hash, h}, require edits.
+        let hash_branch = &all_of[0];
+        assert_eq!(hash_branch["then"]["required"][0], "edits");
+        // Content branch: when mode in {overwrite, w, append, a}, require content.
+        let content_branch = &all_of[1];
+        assert_eq!(content_branch["then"]["required"][0], "content");
+        let content_modes = content_branch["if"]["properties"]["mode"]["enum"]
+            .as_array()
+            .expect("content-mode enum present");
+        let modes: Vec<&str> = content_modes.iter().filter_map(|v| v.as_str()).collect();
+        assert!(modes.contains(&"overwrite") && modes.contains(&"append"));
+    }
+
+    /// Compile the per-file `items` sub-schema and exercise the mode-required
+    /// rules end-to-end. Structural assertions above protect against
+    /// silent shape changes; this protects against drift in semantics.
+    #[test]
+    fn tilth_write_items_schema_enforces_mode_required_fields() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present in edit mode");
+        let items_schema = write["inputSchema"]["properties"]["files"]["items"].clone();
+        let compiled = jsonschema::JSONSchema::compile(&items_schema)
+            .expect("tilth_write items schema must be a valid JSON Schema");
+
+        let valid_hash = serde_json::json!({
+            "path": "src/x.rs",
+            "mode": "hash",
+            "edits": [{"start": "1:abc", "content": "y"}],
+        });
+        let valid_default = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"start": "1:abc", "content": "y"}],
+        });
+        let valid_overwrite = serde_json::json!({
+            "path": "src/x.rs", "mode": "overwrite", "content": "y",
+        });
+        let valid_append = serde_json::json!({
+            "path": "src/x.rs", "mode": "append", "content": "y",
+        });
+        for v in [&valid_hash, &valid_default, &valid_overwrite, &valid_append] {
+            assert!(compiled.is_valid(v), "expected valid instance to pass: {v}");
+        }
+
+        // Mode-required field omissions must fail validation, not merely
+        // produce per-file dispatcher errors.
+        let hash_missing_edits = serde_json::json!({"path": "x.rs", "mode": "hash"});
+        let default_missing_edits = serde_json::json!({"path": "x.rs"});
+        let overwrite_missing_content = serde_json::json!({"path": "x.rs", "mode": "overwrite"});
+        let append_missing_content = serde_json::json!({"path": "x.rs", "mode": "append"});
+        for v in [
+            &hash_missing_edits,
+            &default_missing_edits,
+            &overwrite_missing_content,
+            &append_missing_content,
+        ] {
+            assert!(
+                !compiled.is_valid(v),
+                "expected invalid instance to fail: {v}"
+            );
+        }
+    }
 }

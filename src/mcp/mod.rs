@@ -522,7 +522,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2329,
+            2424,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
