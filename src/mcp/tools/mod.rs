@@ -5,7 +5,6 @@ mod files;
 mod grok;
 mod read;
 mod search;
-mod session;
 mod write;
 
 pub(super) use definitions::tool_definitions;
@@ -15,7 +14,6 @@ pub(super) use files::tool_files;
 pub(super) use grok::tool_grok;
 pub(super) use read::tool_read;
 pub(super) use search::tool_search;
-pub(super) use session::tool_session;
 pub(super) use write::tool_write;
 
 use std::path::PathBuf;
@@ -42,10 +40,10 @@ pub(super) fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     (resolved, None)
 }
 
-pub(super) fn apply_budget(output: String, budget: Option<u64>) -> String {
+pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
     match budget {
-        Some(b) => crate::budget::apply(&output, b),
-        None => output,
+        Some(b) => crate::budget::apply(output, b),
+        None => crate::budget::apply(output, crate::budget::DEFAULT_BUDGET),
     }
 }
 
@@ -80,6 +78,27 @@ mod tests {
         assert_eq!(scope, PathBuf::from("."));
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("not a valid directory"));
+    }
+
+    #[test]
+    fn apply_budget_none_caps_at_default() {
+        // An output far larger than DEFAULT_BUDGET must be truncated even with
+        // no explicit budget — otherwise a broad read/regex/diff blows the host
+        // ~25K tool-response limit.
+        let oversized = format!(
+            "# header line\n{}",
+            "filler content that repeats and repeats\n".repeat(20_000)
+        );
+        let capped = apply_budget(&oversized, None);
+        assert!(
+            capped.len() < oversized.len(),
+            "output should be truncated below the default budget"
+        );
+        assert!(
+            capped.contains("truncated"),
+            "truncation notice should be present: {}",
+            &capped[capped.len().saturating_sub(120)..]
+        );
     }
 
     /// Reproduces issue #37: MCP host launches tilth with cwd=/. The --scope

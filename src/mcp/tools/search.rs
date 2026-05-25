@@ -80,10 +80,34 @@ pub(in crate::mcp) fn tool_search(
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
-            session.record_search(query);
-            crate::search::callers::search_callers_expanded(
-                query, &scope, bloom, expand, context, glob, false,
-            )
+            let targets: Vec<&str> = query
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            match targets.len() {
+                0 => return Err("missing required parameter: query".into()),
+                1 => {
+                    session.record_search(targets[0]);
+                    crate::search::callers::search_callers_expanded(
+                        targets[0], &scope, bloom, expand, context, glob, false,
+                    )
+                }
+                2..=5 => {
+                    for t in &targets {
+                        session.record_search(t);
+                    }
+                    crate::search::callers::search_callers_multi_expanded(
+                        &targets, &scope, bloom, expand, context, glob, false,
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "multi-symbol search limited to 5 queries (got {})",
+                        targets.len()
+                    ))
+                }
+            }
         }
         _ => {
             return Err(format!(
@@ -94,6 +118,62 @@ pub(in crate::mcp) fn tool_search(
     .map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
+    result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::OutlineCache;
+    use crate::index::bloom::BloomFilterCache;
+    use crate::session::Session;
+
+    /// Regression for P0-3: `kind=callers` with a comma query must search each
+    /// target separately, not for a literal symbol named "alpha,beta". Before
+    /// the fix this returned an empty no-callers message ~70% of real sessions.
+    #[test]
+    fn callers_comma_query_finds_both_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn uses_alpha() { alpha(); }\n\
+             fn uses_beta() { beta(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha,beta",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        // Both targets must be reported with a real call site, not a single
+        // literal "alpha,beta" lookup that finds nothing.
+        assert!(
+            out.contains("callers of \"alpha\""),
+            "missing alpha section: {out}"
+        );
+        assert!(
+            out.contains("callers of \"beta\""),
+            "missing beta section: {out}"
+        );
+        assert!(
+            out.contains("uses_alpha"),
+            "alpha call site not found: {out}"
+        );
+        assert!(out.contains("uses_beta"), "beta call site not found: {out}");
+        // The literal combined string must never be searched as one symbol.
+        assert!(
+            !out.contains("\"alpha,beta\""),
+            "comma query was treated as a literal symbol: {out}"
+        );
+    }
 }

@@ -35,9 +35,9 @@ pub fn search_header(
     defs: usize,
     usages: usize,
 ) -> String {
-    let parts = match (defs, usages) {
-        (0, _) => format!("{total} matches"),
-        (d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
+    let parts = match (total, defs, usages) {
+        (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
+        (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }
@@ -114,4 +114,30 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G3: a zero-match search must carry an actionable hint so agents stop
+    /// retrying the same query blindly, not just report "0 matches".
+    #[test]
+    fn search_header_zero_matches_includes_hint() {
+        let header = search_header("doesNotExist", Path::new("/repo"), 0, 0, 0);
+        assert!(header.contains("0 matches"), "{header}");
+        assert!(header.contains("kind=content"), "{header}");
+        assert!(header.contains("widen scope"), "{header}");
+        assert!(header.contains("check spelling"), "{header}");
+    }
+
+    #[test]
+    fn search_header_with_matches_has_no_hint() {
+        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2);
+        assert!(
+            header.contains("3 matches (1 definitions, 2 usages)"),
+            "{header}"
+        );
+        assert!(!header.contains("check spelling"), "{header}");
+    }
 }

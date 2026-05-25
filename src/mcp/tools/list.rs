@@ -95,6 +95,6 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
 
     let tree = crate::mcp::tree::render_tree(&scope, &entries);
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&super::apply_budget(tree, budget));
+    result.push_str(&super::apply_budget(&tree, budget));
     Ok(result)
 }

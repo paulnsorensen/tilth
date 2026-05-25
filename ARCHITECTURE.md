@@ -172,7 +172,7 @@ methods worth describing in detail:
 
 Tool dispatch is routed by name through `dispatch_tool` to
 `tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
-`tool_session` / `tool_edit` (the last only in edit mode).
+`tool_edit` (the last only in edit mode).
 `tilth_map` is no longer reachable through MCP — its schema is omitted
 from `tools/list` and the dispatch stub has been removed. The CLI
 still has `tilth --map`; the MCP boundary was retired after benchmark
@@ -599,7 +599,8 @@ callers fall back to text-based heuristics.
 
 ### `Session` (`session.rs`)
 
-Per-MCP-process counters for the `tilth_session` tool. Tracks read
+Per-MCP-process counters used internally by `tool_search` / `tool_read`
+for result dedup. Tracks read
 counts, search counts, top queries, hot directories (each indexed
 file's parent), and an `expanded` set keyed by `path:line` so re-expanding
 a previously shown definition can return `[shown earlier]` instead of
