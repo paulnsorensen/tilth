@@ -24,41 +24,45 @@ const MAX_LISTED: usize = 10;
 const DETAIL_MAX_CHARS: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     Error,
     Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
+pub(crate) struct ParseError {
     /// 1-indexed line number, suitable for direct display.
-    pub line: usize,
+    pub(crate) line: usize,
     /// 0-indexed column from `tree_sitter::Point::column`. Internal sort key
     /// only — never rendered, so the indexing offset doesn't appear in output.
-    pub col: usize,
-    pub kind: ErrorKind,
+    pub(crate) col: usize,
+    pub(crate) kind: ErrorKind,
     /// For `ERROR`: trimmed/truncated node text. For `MISSING`: the node `kind()`
     /// (i.e. what was expected, e.g. `;`).
-    pub detail: String,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct ParseReport {
-    pub new_errors: Vec<ParseError>,
+pub(crate) struct ParseReport {
+    pub(crate) new_errors: Vec<ParseError>,
     /// Total errors in the post-edit parse, used for the truncation summary.
-    pub total_post: usize,
+    pub(crate) total_post: usize,
 }
 
 /// Parse `before` and `after`, return a report of errors introduced by the
 /// edit. Returns `None` when:
 /// - the path's language has no tree-sitter grammar, or
 /// - no new errors were introduced.
-pub fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
+pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
     let FileType::Code(lang) = detect_file_type(path) else {
         return None;
     };
     let grammar = outline_language(lang)?;
 
+    // A `None` from parse_errors (tree-sitter `parser.parse()` failing
+    // internally) reads as a clean parse via `?`. Intentional advisory
+    // limitation — effectively unreachable here: tree-sitter is error-tolerant,
+    // the language is always set, and no parse timeout is configured.
     let pre = parse_errors(&grammar, before)?;
     let post = parse_errors(&grammar, after)?;
 
@@ -75,7 +79,7 @@ pub fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
 }
 
 /// Format a report as a `── parse ──` block, caps at `MAX_LISTED` lines.
-pub fn format_report(report: &ParseReport) -> String {
+pub(crate) fn format_report(report: &ParseReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("\u{2500}\u{2500} parse \u{2500}\u{2500}");
     for e in report.new_errors.iter().take(MAX_LISTED) {
@@ -117,8 +121,17 @@ fn collect_errors(node: tree_sitter::Node, source: &[u8], out: &mut Vec<ParseErr
         let (kind, detail) = if node.is_missing() {
             (ErrorKind::Missing, node.kind().to_string())
         } else {
+            // Cap detail at the first line. An unterminated bracket makes the
+            // ERROR node swallow the lines below it into its text; keying on the
+            // full text would let an unrelated edit *below* the bracket change
+            // the multiset key and false-flag a "new" error. The bracket's own
+            // line is stable across such edits.
             let text = node.utf8_text(source).unwrap_or("").trim();
-            (ErrorKind::Error, truncate_chars(text, DETAIL_MAX_CHARS))
+            let first_line = text.lines().next().unwrap_or("");
+            (
+                ErrorKind::Error,
+                truncate_chars(first_line, DETAIL_MAX_CHARS),
+            )
         };
         out.push(ParseError {
             line: pos.row + 1,
@@ -221,6 +234,23 @@ mod tests {
     }
 
     #[test]
+    fn edit_inside_preexisting_unterminated_region_is_silent() {
+        // A pre-existing unclosed `(` makes tree-sitter's ERROR node swallow the
+        // line below it into its text. Editing only that swallowed line must not
+        // false-flag a "new" error: detail is capped at the bracket's own line,
+        // so the multiset key stays stable across an edit beneath it. Without the
+        // first-line cap, the ERROR text changes ("return (\nx = 1" vs
+        // "return (\nx = 2") and the unrelated edit leaks as new.
+        let path = PathBuf::from("/tmp/unterminated.py");
+        let before = "def g():\n    return (\nx = 1\n";
+        let after = "def g():\n    return (\nx = 2\n"; // edit only the swallowed line
+        assert!(
+            check(&path, before, after).is_none(),
+            "edit inside a pre-existing unterminated region should stay silent"
+        );
+    }
+
+    #[test]
     fn missing_node_reported() {
         // Java grammar reports MISSING for omitted semicolons.
         let path = PathBuf::from("/tmp/T.java");
@@ -290,6 +320,7 @@ mod tests {
         let after = format!("fn a() {{ ({long} \n");
         let r = check(&rust("trunc"), before, &after).expect("should report");
         for e in &r.new_errors {
+            // +1 bounds the appended `…` ellipsis (truncate_chars adds one char).
             assert!(
                 e.detail.chars().count() <= DETAIL_MAX_CHARS + 1,
                 "detail too long: {:?}",
