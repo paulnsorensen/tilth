@@ -37,6 +37,7 @@ pub fn search_header(
 ) -> String {
     let parts = match (total, defs, usages) {
         (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
+        (_, 0, _) => format!("{total} matches"),
         (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
@@ -137,6 +138,21 @@ mod tests {
         assert!(
             header.contains("3 matches (1 definitions, 2 usages)"),
             "{header}"
+        );
+        assert!(!header.contains("check spelling"), "{header}");
+    }
+
+    /// Regression: a result with hits but zero definitions (every content
+    /// search, plus usage-only symbol searches) must print just "{total}
+    /// matches" — not the noisy "(0 definitions, N usages)" the zero-match
+    /// hint change accidentally reintroduced on this path.
+    #[test]
+    fn search_header_usages_only_omits_definition_counts() {
+        let header = search_header("logLine", Path::new("/repo"), 10, 0, 10);
+        assert!(header.contains("10 matches"), "{header}");
+        assert!(
+            !header.contains("0 definitions"),
+            "usage-only result must not show a 0-definitions count: {header}"
         );
         assert!(!header.contains("check spelling"), "{header}");
     }

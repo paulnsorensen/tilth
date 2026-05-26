@@ -103,7 +103,7 @@ pub(in crate::mcp) fn tool_search(
                 }
                 _ => {
                     return Err(format!(
-                        "multi-symbol search limited to 5 queries (got {})",
+                        "multi-target callers search limited to 5 queries (got {})",
                         targets.len()
                     ))
                 }
@@ -174,6 +174,44 @@ mod tests {
         assert!(
             !out.contains("\"alpha,beta\""),
             "comma query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// Regression for the duplicate-target render bug: query "alpha,alpha"
+    /// must still report alpha's call site once, not render an empty
+    /// no-callers section on the second occurrence after the first consumed
+    /// the matched bucket.
+    #[test]
+    fn callers_duplicate_target_does_not_render_empty_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn uses_alpha() { alpha(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha,alpha",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            out.contains("uses_alpha"),
+            "alpha call site not found: {out}"
+        );
+        // The duplicate must collapse to a single section: no no-callers
+        // message should appear — that is what the second occurrence rendered
+        // before the fix consumed the bucket on the first pass.
+        assert!(
+            !out.contains("no call sites") && !out.contains("no direct call sites"),
+            "duplicate target rendered a false no-callers section: {out}"
         );
     }
 }

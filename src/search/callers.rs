@@ -466,8 +466,18 @@ pub fn search_callers_multi_expanded(
         by_target.entry(name).or_default().push(m);
     }
 
+    // Dedupe targets, preserving first-seen order: a repeated target (e.g.
+    // query "foo,foo") must not render an empty no-callers section on its
+    // second occurrence after the first consumed the matched bucket.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let ordered: Vec<&str> = targets
+        .iter()
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .collect();
+
     let mut output = String::new();
-    for target in targets {
+    for target in &ordered {
         let mut callers = by_target.remove(*target).unwrap_or_default();
 
         let _ = write!(output, "## callers of \"{target}\"\n\n");
