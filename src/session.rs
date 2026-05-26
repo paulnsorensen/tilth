@@ -50,6 +50,10 @@ impl Session {
         }
     }
 
+    /// Retained internal API for the recorded counters. The `tilth_session`
+    /// MCP tool that called this was removed (undocumented drift); the read
+    /// counters and `record_*` plumbing stay for reuse.
+    #[allow(dead_code)]
     pub fn summary(&self) -> String {
         let reads = self.reads.load(Ordering::Relaxed);
         let searches = self.searches.load(Ordering::Relaxed);
@@ -91,6 +95,7 @@ impl Session {
         out
     }
 
+    #[allow(dead_code)]
     pub fn reset(&self) {
         self.reads.store(0, Ordering::Relaxed);
         self.searches.store(0, Ordering::Relaxed);

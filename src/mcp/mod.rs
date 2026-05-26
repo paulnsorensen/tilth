@@ -15,7 +15,7 @@ mod write;
 
 use tools::{
     tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_search,
-    tool_session, tool_write,
+    tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -302,7 +302,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, services.session()),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }

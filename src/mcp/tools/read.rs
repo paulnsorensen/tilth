@@ -56,7 +56,7 @@ pub(in crate::mcp) fn tool_read(
             }
         }
         let combined = results.join("\n\n");
-        return Ok(apply_budget(combined, budget));
+        return Ok(apply_budget(&combined, budget));
     }
 
     // Single file read
@@ -95,7 +95,7 @@ pub(in crate::mcp) fn tool_read(
         session.record_read(&path);
         let output =
             crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?;
-        return Ok(apply_budget(output, budget));
+        return Ok(apply_budget(&output, budget));
     }
 
     session.record_read(&path);
@@ -116,5 +116,5 @@ pub(in crate::mcp) fn tool_read(
         }
     }
 
-    Ok(apply_budget(output, budget))
+    Ok(apply_budget(&output, budget))
 }
