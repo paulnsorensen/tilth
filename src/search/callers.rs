@@ -455,7 +455,18 @@ pub fn search_callers_multi_expanded(
         (MAX_MATCHES, BATCH_EARLY_QUIT)
     };
 
-    let target_set: HashSet<String> = targets.iter().map(ToString::to_string).collect();
+    // Dedupe targets, preserving first-seen order: a repeated target (e.g.
+    // query "foo,foo") must not render an empty no-callers section on its
+    // second occurrence after the first consumed the matched bucket. The
+    // deduped list also feeds the batch search, so the input is deduped once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let ordered: Vec<&str> = targets
+        .iter()
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .collect();
+
+    let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
     let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
 
     // Bucket matches by which target they call. Preserve the caller-supplied
@@ -465,16 +476,6 @@ pub fn search_callers_multi_expanded(
     for (name, m) in raw {
         by_target.entry(name).or_default().push(m);
     }
-
-    // Dedupe targets, preserving first-seen order: a repeated target (e.g.
-    // query "foo,foo") must not render an empty no-callers section on its
-    // second occurrence after the first consumed the matched bucket.
-    let mut seen: HashSet<&str> = HashSet::new();
-    let ordered: Vec<&str> = targets
-        .iter()
-        .copied()
-        .filter(|t| seen.insert(*t))
-        .collect();
 
     let mut output = String::new();
     for target in &ordered {
