@@ -181,28 +181,27 @@ pub(crate) fn tool_write(
 
     let mut output = String::new();
     if !hash_tasks.is_empty() {
-        // Record session reads for every Ready task up front (matches legacy
-        // tilth_edit semantics: record_read counts attempts, not just
-        // successful commits, so dedup logic doesn't re-recommend a file the
-        // agent already touched even when hashes drifted).
-        for task in &hash_tasks {
-            if let crate::edit::FileEditTask::Ready { path, .. } = task {
-                session.record_read(path);
-            }
-        }
         // Pre-run strict auto-fix on hash-mode tasks. Capture original
         // anchor-range bodies, then try the standard apply_batch. If the
         // outcome reports hash mismatches per file, attempt auto-fix.
         let originals: Vec<Option<HashOriginal>> =
             hash_tasks.iter().map(capture_hash_original).collect();
         match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
-            Ok(combined) => {
+            Ok(outcome) => {
+                // Record reads only for files whose edits actually committed.
+                // `BatchOutcome.applied` gates session bookkeeping on real
+                // writes, so a drifted/failed file is not counted as read —
+                // the agent should re-read it before retrying.
+                for p in &outcome.applied {
+                    session.record_read(p);
+                }
                 // Per-file independence: when a file's section reports a hash
                 // mismatch, append a per-file auto-fix probe so spec criterion 9
                 // (strict auto-fix on mismatch, per file) holds even on partial
                 // batch success. The probe re-applies on a single-match
                 // relocation, so any path it touches is recorded as read.
-                let (augmented, reapplied) = append_per_file_auto_fix(&combined, &originals, bloom);
+                let (augmented, reapplied) =
+                    append_per_file_auto_fix(&outcome.output, &originals, bloom);
                 for p in &reapplied {
                     session.record_read(p);
                 }
@@ -356,7 +355,7 @@ fn reapply_at_relocation(
         path: orig.path.clone(),
         edits: shifted,
     };
-    apply_batch(vec![task], bloom, false).ok()
+    apply_batch(vec![task], bloom, false).ok().map(|o| o.output)
 }
 
 /// Probe one captured original for a strict-fingerprint relocation and,
