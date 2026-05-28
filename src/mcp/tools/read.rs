@@ -18,7 +18,14 @@ pub(in crate::mcp) fn tool_read(
     session: &Session,
     edit_mode: bool,
 ) -> Result<String, String> {
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
+    // `apply_budget` used by the other tools — an uncapped `mode=full` or
+    // multi-file batch read would otherwise exceed the host response limit.
+    let budget = Some(
+        args.get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET),
+    );
 
     let paths_arr = args
         .get("paths")

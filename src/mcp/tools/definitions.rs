@@ -60,9 +60,9 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["auto", "full", "signature"],
+                        "enum": ["auto", "full", "signature", "stripped"],
                         "default": "auto",
-                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
+                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline. stripped removes plain comments, debug logs, and blank-line runs (non-editable view)."
                     },
                     "if_modified_since": {
                         "type": "string",
