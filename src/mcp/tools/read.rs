@@ -27,10 +27,12 @@ pub(in crate::mcp) fn tool_read(
             .unwrap_or(crate::budget::DEFAULT_BUDGET),
     );
 
-    let paths_arr = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: paths (array of file paths; use a single-element array for one file)")?;
+    let paths_arr = match args.get("paths") {
+        Some(v) => v.as_array().ok_or(
+            "paths must be an array of file paths (use single-element array for one file)",
+        )?,
+        None => return Err("missing required parameter: paths (array of file paths)".into()),
+    };
 
     if paths_arr.is_empty() {
         return Err("paths must contain at least one file".into());
