@@ -86,7 +86,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Force full content output, bypass smart outlining."
+                        "description": "Legacy alias for mode='full'. Force full content output, bypass smart outlining."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "signature", "stripped"],
+                        "default": "auto",
+                        "description": "Read view. auto: smart default. full: full content. signature: hash-prefixed declarations only. stripped: whole-file content with plain comments/debug logs/extra blanks removed."
                     },
                     "budget": {
                         "type": "number",

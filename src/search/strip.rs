@@ -144,6 +144,11 @@ const KEEP_MARKERS: &[&str] = &["TODO", "FIXME", "NOTE", "HACK", "SAFETY", "WARN
 
 /// Returns `true` if the line is a plain comment that should be stripped.
 /// Preserves: doc comments, comments containing keep-markers.
+///
+/// Scope: line-comment stripping only. `/* */` block comments are NOT removed
+/// in any language — matching is per-line on the trimmed prefix, so a block
+/// comment's interior lines have no comment prefix and survive. Stripping them
+/// needs multi-line state tracking across lines, which this pass does not do.
 fn is_strippable_comment(trimmed: &str, lang: StripLang) -> bool {
     let is_comment = match lang {
         StripLang::Rust => {
