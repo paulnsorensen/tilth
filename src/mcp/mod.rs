@@ -861,7 +861,7 @@ mod tests {
         }
     }
 
-    // -- batch tool_edit --------------------------------------------------------
+    // -- batch tool_read --------------------------------------------------------
 
     /// `tilth_read` accepts the `path#n-m` suffix grammar.
     #[test]
