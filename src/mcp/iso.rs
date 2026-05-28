@@ -80,6 +80,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// without parsing prose; the rest is the payload body. Encoding goes
 /// through `serde_json` so the producer never has to think about quote /
 /// backslash / newline escaping inside the timestamp.
+#[allow(dead_code)]
 pub fn with_header(now: SystemTime, body: &str) -> String {
     with_meta_header(Some(now), serde_json::Map::new(), body)
 }

@@ -1,22 +1,7 @@
 use serde_json::Value;
 
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
-    let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
-         from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
-    } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read a specific line range or heading. \
-         Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
-    };
+    let read_desc = include_str!("../../../prompts/tools/read.md");
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
@@ -64,29 +49,24 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
+                "required": ["paths"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to read."
-                    },
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Pass every file you need in one call; for a single file use a one-element array. Singular `path` is not accepted."
                     },
-                    "section": {
+                    "mode": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                        "enum": ["auto", "full", "signature"],
+                        "default": "auto",
+                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
                     },
-                    "sections": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
-                    },
-                    "full": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Force full content output, bypass smart outlining."
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
                     },
                     "budget": {
                         "type": "number",

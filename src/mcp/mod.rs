@@ -10,6 +10,8 @@ use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
+mod iso;
+mod path_suffix;
 mod tools;
 mod write;
 
@@ -497,7 +499,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3466,
+            3594,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS

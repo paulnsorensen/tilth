@@ -22,14 +22,12 @@ Output per match:
 <name>  <path>:<start>-<end>  <signature>
 Re-expanding a previously shown definition returns [shown earlier].
 
-tilth_read: Read file content with smart outlining. Replaces cat/head/tail.
-Small files → full content. Large files → structural outline.
-section: "<start>-<end>" or "<heading text>"
-sections: array of ranges/headings — multiple slices from the same file in one call.
-paths: read multiple files in one call.
-Output:
-<line_number> │ <content>                  ← full/section mode
-[<start>-<end>]  <symbol name>             ← outline mode
+tilth_read: Read files with smart sizing. Replaces cat/head/tail.
+Batch-only: ALWAYS pass paths: [...] as an array, even for one file. DO NOT use a singular `path` — it is not accepted.
+Suffix grammar per path: path#n-m (line range), path#n (from line n), path### Heading (markdown heading), path#symbol (code symbol).
+mode: auto (default) | full (force full content) | signature (outline, no bodies) | stripped (comments/logs/blank lines removed).
+if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
+Output: <line>:<hash>|<content> per line.
 
 tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.
 patterns: run multiple globs in one call (e.g. patterns: ["*.rs", "*.toml"]).
