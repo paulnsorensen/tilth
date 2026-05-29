@@ -208,12 +208,18 @@ pub(crate) fn tool_write(
                 output.push_str(&augmented);
             }
             Err(msg) => {
-                // All-failed path. Try auto-fix for each captured original.
-                let (fixed, reapplied) = try_auto_fix(&msg, &originals, bloom);
+                // All-failed path. No file committed, so reuse the same
+                // per-file gate as the Ok branch: only sections that actually
+                // report a hash mismatch get an auto-fix probe. A non-hash
+                // failure (duplicate-path validation, parse/IO error) is
+                // surfaced verbatim — no misleading "hash mismatch" header and
+                // no relocation reapply that would write to disk despite the
+                // batch being rejected.
+                let (augmented, reapplied) = append_per_file_auto_fix(&msg, &originals, bloom);
                 for p in &reapplied {
                     session.record_read(p);
                 }
-                output.push_str(&fixed);
+                output.push_str(&augmented);
             }
         }
     }
@@ -461,25 +467,6 @@ fn append_per_file_auto_fix(
         rendered.push(s);
     }
     (rendered.join("\n\n---\n\n"), reapplied)
-}
-
-fn try_auto_fix(
-    original_msg: &str,
-    originals: &[Option<HashOriginal>],
-    bloom: &Arc<BloomFilterCache>,
-) -> (String, Vec<PathBuf>) {
-    let mut out = String::from("hash mismatch — attempted auto-fix:\n\n");
-    out.push_str(original_msg);
-    out.push_str("\n\n── auto-fix probe ──\n");
-    let mut reapplied: Vec<PathBuf> = Vec::new();
-    for orig in originals.iter().flatten() {
-        let probe = probe_one_auto_fix(orig, bloom);
-        if probe.contains("auto-fixed —") {
-            reapplied.push(orig.path.clone());
-        }
-        out.push_str(&probe);
-    }
-    (out, reapplied)
 }
 
 /// Parse one `files[]` entry. Parse errors are deferred onto the task so a

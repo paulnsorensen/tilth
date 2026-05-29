@@ -298,6 +298,10 @@ pub(crate) fn read_single_with_suffix(
             }
         }
         PathSuffix::None => {
+            debug_assert!(
+                !(signature && stripped),
+                "signature and stripped are mutually exclusive view modes"
+            );
             if signature {
                 // Multi-file batch path: discard the line count — view-meta is
                 // not emitted for multi-file responses.
