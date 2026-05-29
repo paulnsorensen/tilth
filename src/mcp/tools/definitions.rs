@@ -5,14 +5,28 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Omitting `kind` runs a merged default search — symbol, content, and caller results in one call (`## symbol/content/caller results`); set `kind` to narrow to a single mode.",
             "inputSchema": {
                 "type": "object",
-                "required": ["query"],
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
+                    },
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": {"type": "string"},
+                                "glob": {"type": "string"},
+                                "kind": {"type": "string", "enum": ["any", "symbol", "content", "regex", "callers"]}
+                            }
+                        },
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": "Batch form. Array of query objects, each run independently with optional per-entry `kind`/`glob` overriding the top-level values; results concatenate under `## query: <q>` headers. Use instead of `query` to search several things in one call."
                     },
                     "scope": {
                         "type": "string",
@@ -20,9 +34,9 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "enum": ["symbol", "content", "regex", "callers"],
-                        "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "enum": ["any", "symbol", "content", "regex", "callers"],
+                        "default": "any",
+                        "description": "Search type. Omit or 'any' for the merged default: symbol + content + caller results in one call. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
                     "expand": {
                         "type": "number",
@@ -40,8 +54,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
                     }
-                }
+                },
+                "anyOf": [{"required": ["query"]}, {"required": ["queries"]}]
             }
         }),
         serde_json::json!({
@@ -93,6 +112,36 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "scope": {
                         "type": "string",
                         "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max tokens in response."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_list",
+            "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern e.g. '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple glob patterns rendered into one tree. Mutually exclusive with `pattern`. Capped at 20."
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Cap directory depth (1 = top-level only)."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Directory to root the tree at. Default: current working directory."
                     },
                     "budget": {
                         "type": "number",
@@ -398,5 +447,56 @@ mod tests {
                 "expected invalid instance to fail: {v}"
             );
         }
+    }
+
+    /// `tilth_search` schema must stay aligned with the runtime: `any` is a
+    /// valid `kind` (top-level + per-entry), `any` is the default, and the
+    /// root requires one of `query`/`queries` so `{}` is rejected client-side.
+    #[test]
+    fn tilth_search_schema_matches_runtime_kind_and_requires_a_query() {
+        let tools = tool_definitions(false);
+        let search = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_search"))
+            .expect("tilth_search tool definition present");
+        let schema = &search["inputSchema"];
+
+        let kind = &schema["properties"]["kind"];
+        let kind_enum: Vec<&str> = kind["enum"]
+            .as_array()
+            .expect("kind enum present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            kind_enum.contains(&"any"),
+            "top-level kind enum must include 'any': {kind_enum:?}"
+        );
+        assert_eq!(
+            kind["default"], "any",
+            "top-level kind default must be 'any'"
+        );
+
+        let entry_enum: Vec<&str> = schema["properties"]["queries"]["items"]["properties"]["kind"]
+            ["enum"]
+            .as_array()
+            .expect("per-entry kind enum present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            entry_enum.contains(&"any"),
+            "per-entry kind enum must include 'any': {entry_enum:?}"
+        );
+
+        let compiled = jsonschema::JSONSchema::compile(schema)
+            .expect("tilth_search inputSchema must be a valid JSON Schema");
+        assert!(
+            !compiled.is_valid(&serde_json::json!({})),
+            "empty args must fail: neither query nor queries supplied"
+        );
+        assert!(compiled.is_valid(&serde_json::json!({"query": "x"})));
+        assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})));
+        assert!(compiled.is_valid(&serde_json::json!({"query": "x", "kind": "any"})));
     }
 }

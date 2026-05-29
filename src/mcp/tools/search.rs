@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+//! `tilth_search` — code search dispatcher. Supports `queries: [...]` batch
+//! form plus the legacy single-query form, with per-kind routing
+//! (symbol / any / content / regex / callers) and `if_modified_since`
+//! redaction of unchanged result sections.
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -14,16 +19,98 @@ pub(in crate::mcp) fn tool_search(
     cache: &OutlineCache,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
+    edit_mode: bool,
+) -> Result<String, String> {
+    let now = std::time::SystemTime::now();
+    let since = args
+        .get("if_modified_since")
+        .and_then(|v| v.as_str())
+        .and_then(crate::mcp::iso::parse_iso_utc);
+
+    // v2 surface: `queries: [{query, glob?, kind?}]`. When present, run each
+    // entry through the legacy single-query path and concatenate. Per-query
+    // glob/kind override the top-level values.
+    if let Some(queries_arr) = args.get("queries").and_then(|v| v.as_array()) {
+        if queries_arr.is_empty() {
+            return Err("queries array is empty".into());
+        }
+        if queries_arr.len() > 10 {
+            return Err(format!(
+                "queries array limited to 10 entries (got {})",
+                queries_arr.len()
+            ));
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
+        for (i, q) in queries_arr.iter().enumerate() {
+            let qstr = q
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("queries[{i}]: missing 'query' string"))?;
+            let mut sub = serde_json::Map::new();
+            sub.insert("query".into(), Value::String(qstr.to_string()));
+            if let Some(g) = q.get("glob").and_then(|v| v.as_str()) {
+                sub.insert("glob".into(), Value::String(g.to_string()));
+            } else if let Some(g) = args.get("glob").and_then(|v| v.as_str()) {
+                sub.insert("glob".into(), Value::String(g.to_string()));
+            }
+            let kind = q
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("kind").and_then(|v| v.as_str()));
+            if let Some(kind) = kind {
+                sub.insert("kind".into(), Value::String(kind.to_string()));
+            }
+            for k in ["expand", "scope", "budget", "if_modified_since"] {
+                if let Some(v) = args.get(k) {
+                    sub.insert(k.into(), v.clone());
+                }
+            }
+            let sub_val = Value::Object(sub);
+            let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
+            parts.push(format!("## query: {qstr}\n\n{body}"));
+        }
+        let combined = parts.join("\n\n---\n\n");
+        let (scope, _) = resolve_scope(args);
+        let combined = since
+            .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
+            .unwrap_or(combined);
+        // Per-entry budget caps each query in isolation; cap the concatenated
+        // batch once more so an N-entry batch can't return ~N× the budget.
+        let combined = apply_budget(
+            &combined,
+            args.get("budget").and_then(serde_json::Value::as_u64),
+        );
+        return Ok(crate::mcp::iso::with_meta_header(
+            Some(now),
+            serde_json::Map::new(),
+            &combined,
+        ));
+    }
+    let body = tool_search_single(args, cache, session, bloom, edit_mode)?;
+    let (scope, _) = resolve_scope(args);
+    let body = since
+        .map(|s| redact_unchanged_search_sections(&body, &scope, s))
+        .unwrap_or(body);
+    Ok(crate::mcp::iso::with_meta_header(
+        Some(now),
+        serde_json::Map::new(),
+        &body,
+    ))
+}
+
+fn tool_search_single(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    edit_mode: bool,
 ) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: query")?;
+        .ok_or("missing required parameter: query (or queries array)")?;
     let (scope, scope_warning) = resolve_scope(args);
-    let kind = args
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("symbol");
+    let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")
         .and_then(serde_json::Value::as_u64)
@@ -37,7 +124,13 @@ pub(in crate::mcp) fn tool_search(
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
-        "symbol" => {
+        None | Some("any") => {
+            session.record_search(query);
+            search_merged_default(
+                query, &scope, cache, session, bloom, expand, context, glob, edit_mode,
+            )
+        }
+        Some("symbol") => {
             let queries: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -67,19 +160,19 @@ pub(in crate::mcp) fn tool_search(
                 }
             }
         }
-        "content" => {
+        Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded(
                 query, &scope, cache, session, expand, context, glob, false,
             )
         }
-        "regex" => {
+        Some("regex") => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob, false)
-                .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            crate::search::search_regex_expanded(
+                query, &scope, cache, session, expand, context, glob, false,
+            )
         }
-        "callers" => {
+        Some("callers") => {
             let targets: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -109,9 +202,9 @@ pub(in crate::mcp) fn tool_search(
                 }
             }
         }
-        _ => {
+        Some(kind) => {
             return Err(format!(
-                "unknown search kind: {kind}. Use: symbol, content, regex, callers"
+                "unknown search kind: {kind}. Use: symbol, any, content, regex, callers"
             ))
         }
     }
@@ -120,6 +213,100 @@ pub(in crate::mcp) fn tool_search(
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_merged_default(
+    query: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    _edit_mode: bool,
+) -> Result<String, crate::error::TilthError> {
+    let mut sections = Vec::new();
+    sections.push(format!(
+        "## symbol results\n\n{}",
+        crate::search::search_symbol_expanded(
+            query, scope, cache, session, bloom, expand, context, glob, false,
+        )?
+    ));
+    sections.push(format!(
+        "## content results\n\n{}",
+        crate::search::search_content_expanded(
+            query, scope, cache, session, expand, context, glob, false,
+        )?
+    ));
+    if crate::classify::is_identifier(query) {
+        sections.push(format!(
+            "## caller results\n\n{}",
+            crate::search::callers::search_callers_expanded(
+                query, scope, bloom, expand, context, glob, false,
+            )?
+        ));
+    }
+    Ok(sections.join("\n\n---\n\n"))
+}
+
+fn redact_unchanged_search_sections(
+    output: &str,
+    scope: &Path,
+    since: std::time::SystemTime,
+) -> String {
+    let mut rendered = Vec::new();
+    let mut current = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+
+    for line in output.lines() {
+        if is_search_section_heading(line) {
+            flush_search_section(&mut rendered, &mut current, current_path.take(), since);
+            current_path = search_result_path(line, scope);
+        }
+        current.push(line.to_string());
+    }
+    flush_search_section(&mut rendered, &mut current, current_path, since);
+    rendered.join("\n")
+}
+
+fn flush_search_section(
+    rendered: &mut Vec<String>,
+    current: &mut Vec<String>,
+    current_path: Option<PathBuf>,
+    since: std::time::SystemTime,
+) {
+    if current.is_empty() {
+        return;
+    }
+    if let Some(path) = current_path {
+        if !crate::mcp::iso::file_changed_since(&path, since) {
+            rendered.push(crate::mcp::iso::unchanged_stub(&path, since));
+            current.clear();
+            return;
+        }
+    }
+    rendered.push(current.join("\n"));
+    current.clear();
+}
+
+fn is_search_section_heading(line: &str) -> bool {
+    line.starts_with("## ") || line.starts_with("### ")
+}
+
+fn search_result_path(line: &str, scope: &Path) -> Option<PathBuf> {
+    let rest = line
+        .strip_prefix("### ")
+        .or_else(|| line.strip_prefix("## "))?;
+    let loc = rest.split_whitespace().next()?;
+    let (path_part, _) = loc.rsplit_once(':')?;
+    if path_part.is_empty() {
+        return None;
+    }
+    // No existence check: flush_search_section calls file_changed_since, which
+    // already treats a missing file as changed (rendered as-is, never stubbed).
+    Some(scope.join(path_part))
 }
 
 #[cfg(test)]
@@ -153,7 +340,7 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
 
         // Both targets must be reported with a real call site, not a single
         // literal "alpha,beta" lookup that finds nothing.
@@ -200,7 +387,7 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
 
         assert!(
             out.contains("uses_alpha"),

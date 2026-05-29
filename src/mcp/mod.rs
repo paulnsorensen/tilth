@@ -310,7 +310,13 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     let edit_mode = services.edit_mode();
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
+        "tilth_search" => tool_search(
+            args,
+            services.cache(),
+            services.session(),
+            services.bloom(),
+            edit_mode,
+        ),
         "tilth_files" => tool_files(args),
         "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
@@ -2402,6 +2408,306 @@ mod tests {
         assert!(
             !out.contains("node_modules"),
             "node_modules must be skipped: {out}"
+        );
+    }
+
+    /// `tilth_list` rejects `pattern` and `patterns` together — the schema
+    /// advertises them as mutually exclusive, so the code must enforce it
+    /// rather than silently ignoring one.
+    #[test]
+    fn tool_list_both_pattern_and_patterns_rejected() {
+        let args = serde_json::json!({ "pattern": "*.rs", "patterns": ["*.toml"] });
+        let err = tool_list(&args).expect_err("both must error");
+        assert!(err.contains("mutually exclusive"), "unexpected: {err}");
+    }
+
+    // -- tilth_search wire layer: restored from pre-merge 3801a4c (PR-A)
+
+    /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
+    #[test]
+    fn tool_search_queries_array_form() {
+        let args = serde_json::json!({
+            "queries": [{ "query": "build_instructions" }],
+            "expand": 0
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "expected JSON cache-token header: {out}"
+        );
+        assert!(
+            out.contains("query: build_instructions"),
+            "expected per-query header: {out}"
+        );
+    }
+
+    /// `tilth_search` empty queries array errors clearly.
+    #[test]
+    fn tool_search_queries_empty_errors() {
+        let args = serde_json::json!({ "queries": [] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("empty errors");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// `tilth_search` queries[] entry missing `query` field returns a clear
+    /// error naming the offending index.
+    #[test]
+    fn tool_search_queries_missing_query_field_errors() {
+        let args = serde_json::json!({ "queries": [{ "glob": "*.rs" }] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("missing query");
+        assert!(err.contains("queries[0]"), "must name index: {err}");
+        assert!(err.contains("query"), "must mention 'query': {err}");
+    }
+
+    /// `tilth_search` queries[] enforces the 10-entry cap.
+    #[test]
+    fn tool_search_queries_over_limit_rejected() {
+        let mut qs = Vec::with_capacity(11);
+        for _ in 0..11 {
+            qs.push(serde_json::json!({ "query": "foo" }));
+        }
+        let args = serde_json::json!({ "queries": qs });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err(">10 must error");
+        assert!(err.contains("limited to 10"), "unexpected error: {err}");
+    }
+
+    // ── F5 hardening: a request that still carries the dropped `context`
+    // field must NOT error. Old agents have the parameter cached in their
+    // tool spec; tolerating it silently is the documented contract (the
+    // F5 verifier says "or is silently ignored — implementer's call").
+    #[test]
+    fn tool_search_tolerates_stray_context_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap(),
+            "context": "src/old.rs"
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false)
+            .expect("stray context must not fail the request");
+        assert!(
+            out.contains("handleAuth"),
+            "search must still find the symbol despite the stray field: {out}"
+        );
+    }
+
+    /// `tilth_search` honors `if_modified_since` by stubbing unchanged files
+    /// without leaking expanded source bodies.
+    #[test]
+    fn tool_search_if_modified_since_redacts_unchanged_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn demo() {\n    let needle_unique = \"secret body text\";\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "queries": [{"query": "needle_unique", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1,
+            "if_modified_since": "2099-01-01T00:00:00Z"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
+        assert!(out.contains("unchanged"), "stub missing: {out}");
+        assert!(
+            !out.contains("secret body text"),
+            "unchanged search body must be redacted: {out}"
+        );
+    }
+
+    // ── F1 hardening: the JSON cache-token must stand alone on the first
+    // line so a trivial JSON-line parse pulls the field. The prose-header
+    // baseline was 0 / 2,042 round-trips; the integration regression here
+    // is "response shape changed but the field is no longer parseable."
+    #[test]
+    fn tool_search_first_line_is_parseable_cache_token_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        let first = out.lines().next().expect("response has a first line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first).expect("first line must be valid one-line JSON");
+        let ts = parsed
+            .get("if_modified_since")
+            .and_then(|v| v.as_str())
+            .expect("if_modified_since field present");
+        assert!(
+            crate::mcp::iso::parse_iso_utc(ts).is_some(),
+            "ts must round-trip through parse_iso_utc: {ts}"
+        );
+    }
+
+    /// Default search merges symbol, content, and identifier-shaped caller
+    /// results when `kind` is omitted.
+    #[test]
+    fn tool_search_default_merges_symbol_content_and_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn target_fn() {\n    let _marker = \"content branch\";\n}\n\nfn caller() {\n    target_fn();\n}\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "target_fn"}],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 0
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("merged search ok");
+        assert!(
+            out.contains("symbol results"),
+            "symbol facet missing: {out}"
+        );
+        assert!(
+            out.contains("content results"),
+            "content facet missing: {out}"
+        );
+        assert!(
+            out.contains("caller results"),
+            "caller facet missing: {out}"
+        );
+        assert!(
+            out.contains("[caller: caller]"),
+            "caller result missing: {out}"
+        );
+    }
+
+    /// A per-query `kind` overrides the top-level `kind`. Entry 1 overrides to
+    /// `content` and queries a string literal whose enclosing fn name
+    /// (`enclosing_alpha`) surfaces only when content search matches — a
+    /// top-level `symbol` search would never match a string literal, so the
+    /// name appearing proves the override took effect. Entry 2 omits `kind`
+    /// and must inherit the top-level `symbol`, finding `other_beta`. Both
+    /// discriminator names are queried by neither entry, so the header echo
+    /// of the query strings cannot satisfy the assertions.
+    #[test]
+    fn tool_search_per_query_kind_overrides_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn enclosing_alpha() {\n    let _ = \"QUERYTOKEN_A\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn other_beta() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [
+                {"query": "QUERYTOKEN_A", "kind": "content"},
+                {"query": "other_beta"}
+            ],
+            "kind": "symbol",
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("override search ok");
+        assert!(
+            out.contains("enclosing_alpha"),
+            "entry 1 must override to kind=content — the string literal's \
+             enclosing fn appears only via a content match, never via the \
+             top-level symbol kind: {out}"
+        );
+        assert!(
+            out.contains("other_beta"),
+            "entry 2 must inherit top-level kind=symbol and find the fn def: {out}"
+        );
+    }
+
+    /// Batch redaction: `if_modified_since` stubs the unchanged file's section
+    /// while leaving the changed file's body intact across a multi-query batch.
+    #[test]
+    fn tool_search_batch_redacts_only_unchanged_query_sections() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let path_old = dir.path().join("old.rs");
+        let path_new = dir.path().join("new.rs");
+        // Query the fn name; assert on a body-only token (SECRET_*_BODY) so the
+        // `## query:` header echo of the query string can't mask redaction.
+        std::fs::write(
+            &path_old,
+            "fn old_target() {\n    let _ = \"SECRET_OLD_BODY\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &path_new,
+            "fn new_target() {\n    let _ = \"SECRET_NEW_BODY\";\n}\n",
+        )
+        .unwrap();
+
+        // since sits between the two files' mtimes: old < since < new.
+        let since = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path_old)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(900_000_000))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path_new)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_100_000_000))
+            .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [
+                {"query": "old_target", "kind": "content"},
+                {"query": "new_target", "kind": "content"}
+            ],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1,
+            "if_modified_since": crate::mcp::iso::iso_ts(since)
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("batch redaction ok");
+        assert!(
+            out.contains("unchanged"),
+            "unchanged file must be stubbed: {out}"
+        );
+        assert!(
+            !out.contains("SECRET_OLD_BODY"),
+            "unchanged file body must be redacted: {out}"
+        );
+        assert!(
+            out.contains("SECRET_NEW_BODY"),
+            "changed file body must remain intact: {out}"
         );
     }
 }

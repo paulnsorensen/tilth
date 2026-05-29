@@ -12,6 +12,9 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = super::resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
+    if args.get("patterns").is_some() && args.get("pattern").is_some() {
+        return Err("`pattern` and `patterns` are mutually exclusive — pass one".into());
+    }
     let patterns_arr_owned: Vec<Value>;
     let patterns_arr: &Vec<Value> = match args.get("patterns") {
         Some(v) => v.as_array().ok_or("patterns must be an array of globs")?,
