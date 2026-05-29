@@ -13,11 +13,12 @@ use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 mod iso;
 mod path_suffix;
 mod tools;
+mod tree;
 mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_search,
-    tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_list, tool_read,
+    tool_search, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -69,6 +70,26 @@ impl Services {
 // lockstep with what MCP hosts receive in the `instructions` field.
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
+
+/// Compose the MCP `instructions` field: optional overview, the base prompt,
+/// and (in edit mode) the edit-mode addendum, separated by single blank lines
+/// with no trailing whitespace.
+fn build_instructions(edit_mode: bool, overview: &str) -> String {
+    let base = SERVER_INSTRUCTIONS.trim_end();
+    let mut out = String::with_capacity(SERVER_INSTRUCTIONS.len() + EDIT_MODE_EXTRA.len() + 64);
+    if !overview.is_empty() {
+        out.push_str(overview);
+        out.push_str("\n\n");
+    }
+    out.push_str(base);
+    if edit_mode {
+        // EDIT_MODE_EXTRA owns the separator: it opens with "\n\n" (locked by
+        // edit_mode_extra_byte_lock), so appending it directly yields exactly
+        // one blank line between sections. A manual "\n\n" here doubles it.
+        out.push_str(EDIT_MODE_EXTRA.trim_end());
+    }
+    out
+}
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format.
@@ -234,17 +255,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                 let cwd = std::env::current_dir().unwrap_or_default();
                 crate::overview::fingerprint(&cwd)
             };
-            let instructions = if edit_mode {
-                if overview.is_empty() {
-                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                } else {
-                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                }
-            } else if overview.is_empty() {
-                SERVER_INSTRUCTIONS.to_string()
-            } else {
-                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
-            };
+            let instructions = build_instructions(edit_mode, &overview);
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -301,6 +312,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args),
+        "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
@@ -2193,6 +2205,203 @@ mod tests {
             !target.exists(),
             "file outside scope must not be written: {}",
             target.display()
+        );
+    }
+
+    // -- tilth_search / tilth_list / build_instructions: restored from pre-merge 3801a4c (dropped by #35)
+
+    #[test]
+    fn build_instructions_base_has_expected_anchors() {
+        let s = build_instructions(false, "");
+        // Adapted: pre-merge opening anchor was "tilth — AST-aware code
+        // intelligence MCP server."; current prompts/mcp-base.md opens with
+        // "tilth — code intelligence MCP server. Replaces grep, cat, find, ls".
+        assert!(
+            s.starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"),
+            "missing opening anchor: {:?}",
+            &s[..60.min(s.len())]
+        );
+        assert!(
+            s.contains("[+] added, [-] deleted, [~] body changed, [~:sig] signature changed"),
+            "missing closing anchor"
+        );
+        // Adapted: pre-merge edit-mode marker was "tilth_write is exposed";
+        // current EDIT_MODE_EXTRA opens with "tilth_write: Batch write".
+        assert!(
+            !s.contains("tilth_write: Batch write"),
+            "edit-mode pointer leaked into base"
+        );
+    }
+
+    #[test]
+    fn build_instructions_edit_appends_thin_pointer() {
+        let s = build_instructions(true, "");
+        // Adapted: pre-merge asserted the marker "tilth_write is exposed";
+        // current EDIT_MODE_EXTRA opens with "tilth_write: Batch write".
+        assert!(
+            s.contains("tilth_write: Batch write"),
+            "expected tilth_write addendum in edit-mode instructions"
+        );
+        assert!(
+            !s.contains("Legacy alias: tilth_edit"),
+            "tilth_edit must not be advertised"
+        );
+        // Adapted: pre-merge AC-12 kept the server prompt "thin" and asserted
+        // the request-shape JSON and batching rule were ABSENT. The current
+        // EDIT_MODE_EXTRA intentionally embeds the full request shape
+        // (`Shape: {"files": ...}`) and the batching rule ("ALWAYS group
+        // writes"), so the edit-mode build must now CONTAIN them.
+        assert!(
+            s.contains("\"files\":"),
+            "request-shape JSON missing from edit-mode prompt: {s}"
+        );
+        assert!(
+            s.contains("ALWAYS group writes"),
+            "batching rule missing from edit-mode prompt: {s}"
+        );
+    }
+
+    #[test]
+    fn build_instructions_no_trailing_whitespace() {
+        for &edit in &[false, true] {
+            let s = build_instructions(edit, "");
+            assert!(
+                !s.ends_with('\n') && !s.ends_with(' '),
+                "wire output must not end with whitespace (edit={edit})"
+            );
+        }
+    }
+
+    #[test]
+    fn build_instructions_edit_single_blank_line_and_byte_lock() {
+        // Regression guard for the composed edit-mode string. A prior manual
+        // "\n\n" was pushed on top of EDIT_MODE_EXTRA's own leading "\n\n",
+        // producing a four-newline (double blank) junction that broke the
+        // byte-identical invariant the revival claimed. The piece-wise locks
+        // (edit_mode_extra_byte_lock, SERVER_INSTRUCTIONS checks) do not guard
+        // the *composed* output, so lock it here.
+        let edit = build_instructions(true, "");
+        assert!(
+            edit.contains(
+                "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch write"
+            ),
+            "edit-mode section junction must be a single blank line"
+        );
+        assert!(
+            !edit.contains("\n\n\n"),
+            "edit-mode composition must not contain a triple newline (double blank line)"
+        );
+        assert_eq!(
+            build_instructions(false, "").len(),
+            3594,
+            "non-edit composed instructions byte count drifted"
+        );
+        assert_eq!(
+            edit.len(),
+            6018,
+            "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
+        );
+    }
+
+    #[test]
+    fn build_instructions_overview_prepends_with_blank_line() {
+        let s = build_instructions(false, "OVERVIEW");
+        assert!(
+            s.starts_with("OVERVIEW\n\ntilth — "),
+            "overview should be followed by blank line then base"
+        );
+    }
+
+    /// Tightened tree-shape assertion: the rendered tree carries the box-
+    /// drawing connectors and a per-directory token rollup, not just the
+    /// substring `src/`.
+    #[test]
+    fn tool_list_emits_tree_shape_with_connectors_and_rollups() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["**/*.rs"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(
+            out.contains("├── ") || out.contains("└── "),
+            "expected box-drawing connector: {out}"
+        );
+        // Per-file token annotation
+        assert!(out.contains("a.rs"), "expected a.rs entry: {out}");
+        assert!(out.contains("tokens"), "expected token rollup: {out}");
+        // Files count on directory line
+        assert!(
+            out.lines()
+                .any(|l| l.contains("src/") && l.contains("files")),
+            "expected src/ line with files rollup: {out}"
+        );
+    }
+
+    /// `tilth_list` empty patterns rejected.
+    #[test]
+    fn tool_list_empty_patterns_rejected() {
+        let args = serde_json::json!({ "patterns": [] });
+        let err = tool_list(&args).expect_err("empty must error");
+        assert!(err.contains("at least one"), "unexpected: {err}");
+    }
+
+    /// `tilth_list` enforces the 20-pattern cap.
+    #[test]
+    fn tool_list_patterns_over_limit_rejected() {
+        let mut ps = Vec::with_capacity(21);
+        for _ in 0..21 {
+            ps.push(serde_json::json!("*.rs"));
+        }
+        let args = serde_json::json!({ "patterns": ps });
+        let err = tool_list(&args).expect_err(">20 must error");
+        assert!(err.contains("limited to 20"), "unexpected: {err}");
+    }
+
+    /// `tilth_list` emits a tree with rolled-up token counts.
+    #[test]
+    fn tool_list_produces_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(out.contains("src/"), "expected src/ in tree: {out}");
+        assert!(out.contains("a.rs"), "expected a.rs: {out}");
+        assert!(out.contains("tokens"), "expected token rollup: {out}");
+    }
+
+    /// Correctness: `tool_list` must respect `SKIP_DIRS` so `target/`,
+    /// `node_modules/`, `.git/` don't blow the budget.
+    #[test]
+    fn tool_list_walker_respects_skip_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/keep.rs"), "fn k(){}").unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/skip.rs"), "fn s(){}").unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/skip.js"), "x").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["**/*"],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_list(&args).expect("list ok");
+        assert!(
+            out.contains("keep.rs"),
+            "expected src/keep.rs in tree: {out}"
+        );
+        assert!(!out.contains("target/"), "target/ must be skipped: {out}");
+        assert!(
+            !out.contains("node_modules"),
+            "node_modules must be skipped: {out}"
         );
     }
 }
