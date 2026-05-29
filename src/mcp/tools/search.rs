@@ -298,8 +298,9 @@ fn search_result_path(line: &str, scope: &Path) -> Option<PathBuf> {
     if path_part.is_empty() {
         return None;
     }
-    let path = scope.join(path_part);
-    path.exists().then_some(path)
+    // No existence check: flush_search_section calls file_changed_since, which
+    // already treats a missing file as changed (rendered as-is, never stubbed).
+    Some(scope.join(path_part))
 }
 
 #[cfg(test)]

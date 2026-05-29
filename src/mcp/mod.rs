@@ -2322,6 +2322,16 @@ mod tests {
         assert!(err.contains("at least one"), "unexpected: {err}");
     }
 
+    /// `tilth_list` rejects `pattern` and `patterns` together — the schema
+    /// advertises them as mutually exclusive, so the code must enforce it
+    /// rather than silently ignoring one.
+    #[test]
+    fn tool_list_both_pattern_and_patterns_rejected() {
+        let args = serde_json::json!({ "pattern": "*.rs", "patterns": ["*.toml"] });
+        let err = tool_list(&args).expect_err("both must error");
+        assert!(err.contains("mutually exclusive"), "unexpected: {err}");
+    }
+
     /// `tilth_list` enforces the 20-pattern cap.
     #[test]
     fn tool_list_patterns_over_limit_rejected() {
@@ -2560,6 +2570,111 @@ mod tests {
         assert!(
             out.contains("[caller: caller]"),
             "caller result missing: {out}"
+        );
+    }
+
+    /// A per-query `kind` overrides the top-level `kind`. Entry 1 overrides to
+    /// `content` and queries a string literal whose enclosing fn name
+    /// (`enclosing_alpha`) surfaces only when content search matches — a
+    /// top-level `symbol` search would never match a string literal, so the
+    /// name appearing proves the override took effect. Entry 2 omits `kind`
+    /// and must inherit the top-level `symbol`, finding `other_beta`. Both
+    /// discriminator names are queried by neither entry, so the header echo
+    /// of the query strings cannot satisfy the assertions.
+    #[test]
+    fn tool_search_per_query_kind_overrides_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn enclosing_alpha() {\n    let _ = \"QUERYTOKEN_A\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn other_beta() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [
+                {"query": "QUERYTOKEN_A", "kind": "content"},
+                {"query": "other_beta"}
+            ],
+            "kind": "symbol",
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("override search ok");
+        assert!(
+            out.contains("enclosing_alpha"),
+            "entry 1 must override to kind=content — the string literal's \
+             enclosing fn appears only via a content match, never via the \
+             top-level symbol kind: {out}"
+        );
+        assert!(
+            out.contains("other_beta"),
+            "entry 2 must inherit top-level kind=symbol and find the fn def: {out}"
+        );
+    }
+
+    /// Batch redaction: `if_modified_since` stubs the unchanged file's section
+    /// while leaving the changed file's body intact across a multi-query batch.
+    #[test]
+    fn tool_search_batch_redacts_only_unchanged_query_sections() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let path_old = dir.path().join("old.rs");
+        let path_new = dir.path().join("new.rs");
+        // Query the fn name; assert on a body-only token (SECRET_*_BODY) so the
+        // `## query:` header echo of the query string can't mask redaction.
+        std::fs::write(
+            &path_old,
+            "fn old_target() {\n    let _ = \"SECRET_OLD_BODY\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &path_new,
+            "fn new_target() {\n    let _ = \"SECRET_NEW_BODY\";\n}\n",
+        )
+        .unwrap();
+
+        // since sits between the two files' mtimes: old < since < new.
+        let since = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path_old)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(900_000_000))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path_new)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_100_000_000))
+            .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [
+                {"query": "old_target", "kind": "content"},
+                {"query": "new_target", "kind": "content"}
+            ],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1,
+            "if_modified_since": crate::mcp::iso::iso_ts(since)
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("batch redaction ok");
+        assert!(
+            out.contains("unchanged"),
+            "unchanged file must be stubbed: {out}"
+        );
+        assert!(
+            !out.contains("SECRET_OLD_BODY"),
+            "unchanged file body must be redacted: {out}"
+        );
+        assert!(
+            out.contains("SECRET_NEW_BODY"),
+            "changed file body must remain intact: {out}"
         );
     }
 }

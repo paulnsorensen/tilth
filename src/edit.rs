@@ -472,11 +472,9 @@ pub struct BatchOutcome {
 }
 
 /// Process one task into a `(section, applied_path)` tuple. The path is
-/// `Some` only when the file's edits committed — callers use that to gate
-/// session bookkeeping (e.g. `record_read`) on actual writes rather than on
-/// the upstream `Ready`/`ParseError` discriminant, which only reflects parse
-/// validation. Kept separate so the parallel closure stays trivial and
-/// per-file logic is testable in isolation.
+/// `Some` only when the file's edits committed (see [`BatchOutcome`] for why
+/// callers gate session bookkeeping on that). Kept separate so the parallel
+/// closure stays trivial and per-file logic is testable in isolation.
 fn apply_one(
     task: FileEditTask,
     bloom: &BloomFilterCache,
