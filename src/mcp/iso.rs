@@ -75,16 +75,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Wrap an output with a leading JSON cache-token line. The first line is
-/// a single JSON object so agents can pattern-match on the structured field
-/// without parsing prose; the rest is the payload body. Encoding goes
-/// through `serde_json` so the producer never has to think about quote /
-/// backslash / newline escaping inside the timestamp.
-#[allow(dead_code)]
-pub fn with_header(now: SystemTime, body: &str) -> String {
-    with_meta_header(Some(now), serde_json::Map::new(), body)
-}
-
 /// Wrap an output with a leading JSON header line that combines the cache
 /// token (when `now` is `Some`) with view-shape metadata (when `meta` is a
 /// JSON object). Both are merged into a single first-line object so agents
@@ -179,22 +169,6 @@ mod tests {
         assert!(s.contains("src/foo.rs"), "path missing: {s}");
         assert!(s.contains("unchanged"), "unchanged marker missing: {s}");
         assert!(s.contains("2023"), "timestamp year missing: {s}");
-    }
-
-    #[test]
-    fn with_header_prefixes_json_cache_token() {
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let out = with_header(now, "body");
-        let first_line = out.lines().next().expect("at least one line");
-        let parsed: serde_json::Value =
-            serde_json::from_str(first_line).expect("first line must be valid JSON");
-        let ts = parsed
-            .get("if_modified_since")
-            .and_then(|v| v.as_str())
-            .expect("if_modified_since field present");
-        assert!(ts.ends_with('Z'), "iso timestamp expected: {ts}");
-        assert!(parse_iso_utc(ts).is_some(), "round-trips: {ts}");
-        assert!(out.ends_with("body"), "body missing: {out}");
     }
 
     #[test]

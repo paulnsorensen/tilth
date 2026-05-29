@@ -1449,4 +1449,750 @@ mod tests {
             out.len()
         );
     }
+
+    // -- tilth_write tool: batch edits, hash anchoring, overwrite/append,
+    //    strict auto-fix, scope guard -----------------------------------
+    // Restored from pre-merge 3801a4c (dropped by the #35 upstream merge).
+    // The legacy `tool_edit` alias was consolidated into `tool_write`; the
+    // four read-tracking tests were renamed accordingly.
+
+    fn anchor_for(content: &str, line: usize) -> String {
+        let lines: Vec<_> = content.lines().collect();
+        let h = crate::format::line_hash(lines[line - 1].as_bytes());
+        format!("{line}:{h:03x}")
+    }
+
+    /// Anchor with a hash guaranteed not to match the line's real hash.
+    /// XOR-flipping a bit can't collide with the original — used to force
+    /// hash-mismatch paths without depending on hardcoded sentinel values.
+    fn wrong_anchor_for(content: &str, line: usize) -> String {
+        let lines: Vec<_> = content.lines().collect();
+        let real = crate::format::line_hash(lines[line - 1].as_bytes());
+        let wrong = (real ^ 0x1) & 0xFFF;
+        format!("{line}:{wrong:03x}")
+    }
+
+    fn edit_services() -> (Session, Arc<BloomFilterCache>) {
+        (Session::new(), Arc::new(BloomFilterCache::new()))
+    }
+
+    #[test]
+    fn batch_edit_two_files_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_content = "alpha\nbravo\ncharlie\n";
+        let b_content = "uno\ndos\ntres\n";
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, a_content).unwrap();
+        std::fs::write(&b, b_content).unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": a.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for(a_content, 2), "content": "BRAVO" }]
+                },
+                {
+                    "path": b.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for(b_content, 1), "content": "UNO" }]
+                }
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("batch should succeed");
+
+        assert!(
+            out.contains(a.to_str().unwrap()),
+            "must mention file a: {out}"
+        );
+        assert!(
+            out.contains(b.to_str().unwrap()),
+            "must mention file b: {out}"
+        );
+        assert!(
+            !out.contains("error:") && !out.contains("hash mismatch"),
+            "successful batch must not contain error markers: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("file a should be readable"),
+            "alpha\nBRAVO\ncharlie\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).expect("file b should be readable"),
+            "UNO\ndos\ntres\n"
+        );
+    }
+
+    /// A bad-hash failure on file B must not block file A from applying;
+    /// the response is `Ok` because at least one file succeeded, and includes
+    /// both sections separated by `---`.
+    #[test]
+    fn batch_edit_partial_failure_does_not_block_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_content = "first\nsecond\nthird\n";
+        // Duplicate lines so `tool_write`'s strict auto-fix finds >1 match for
+        // the drifted anchor and declines to relocate — the mismatch must
+        // stand so the sibling-independence assertion is exercised. (A unique
+        // line would be auto-fixed and applied, which is correct but a
+        // different code path, covered by tool_write_auto_fix_applies_*.)
+        let b_content = "dup\ndup\ndup\n";
+        let a = dir.path().join("first.txt");
+        let b = dir.path().join("second.txt");
+        std::fs::write(&a, a_content).unwrap();
+        std::fs::write(&b, b_content).unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": a.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for(a_content, 2), "content": "SECOND" }]
+                },
+                {
+                    "path": b.to_str().unwrap(),
+                    "edits": [{ "start": "1:000", "content": "ONE" }]
+                }
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("batch is Ok if any file succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("file a should be readable"),
+            "first\nSECOND\nthird\n",
+            "first file must have applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).expect("file b should be readable"),
+            b_content,
+            "second file must remain untouched"
+        );
+        assert!(
+            out.contains("---"),
+            "must separate per-file sections: {out}"
+        );
+        let (a_section, b_section) = out.split_once("\n\n---\n\n").expect("two sections");
+        assert!(
+            !a_section.contains("hash mismatch"),
+            "file a's section must not report hash mismatch: {a_section}"
+        );
+        assert!(
+            b_section.contains("hash mismatch"),
+            "file b's section must report hash mismatch: {b_section}"
+        );
+    }
+
+    #[test]
+    fn batch_edit_over_limit_rejected() {
+        let tmp = std::env::temp_dir();
+        let mut files = Vec::with_capacity(21);
+        for i in 0..21 {
+            files.push(serde_json::json!({
+                "path": tmp.join(format!("tilth_nonexistent_{i}.txt")).to_str().unwrap(),
+                "edits": [{ "start": "1:000", "content": "x" }]
+            }));
+        }
+        let args = serde_json::json!({ "files": files });
+
+        let (session, bloom) = edit_services();
+        let err = tool_write(&args, &session, &bloom).expect_err("21 files must be rejected");
+        assert!(err.contains("limited to 20"), "must mention limit: {err}");
+    }
+
+    /// All-failed batch: `tool_write` returns `Ok` with a per-file error
+    /// section for each file (the consolidated tool reports failures inline and
+    /// runs auto-fix probes rather than propagating `Err`; the removed
+    /// `tool_edit` alias used to return `Err`). Both files must still surface.
+    #[test]
+    fn batch_edit_all_failed_reports_each_section() {
+        let tmp = std::env::temp_dir();
+        let p1 = tmp.join("tilth_does_not_exist_xyz_1.txt");
+        let p2 = tmp.join("tilth_does_not_exist_xyz_2.txt");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": p1.to_str().unwrap(),
+                    "edits": [{ "start": "1:000", "content": "x" }]
+                },
+                {
+                    "path": p2.to_str().unwrap(),
+                    "edits": [{ "start": "1:000", "content": "x" }]
+                }
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("tool_write reports failures inline");
+        assert!(
+            out.contains("tilth_does_not_exist_xyz_1"),
+            "must include file 1: {out}"
+        );
+        assert!(
+            out.contains("tilth_does_not_exist_xyz_2"),
+            "must include file 2: {out}"
+        );
+        assert!(out.contains("---"), "must separate sections: {out}");
+        assert_eq!(
+            session.reads_count(),
+            0,
+            "no file committed, so nothing is recorded as read"
+        );
+    }
+
+    #[test]
+    fn batch_edit_empty_files_array_rejected() {
+        let args = serde_json::json!({ "files": [] });
+        let (session, bloom) = edit_services();
+        let err =
+            tool_write(&args, &session, &bloom).expect_err("empty files array must be rejected");
+        assert!(err.contains("empty"), "must mention empty: {err}");
+    }
+
+    /// Empty `edits` array must be rejected at parse time. Otherwise
+    /// `apply_edits` short-circuits to `Applied` without writing the file,
+    /// and the path would still flow into `BatchOutcome.applied` — inflating
+    /// the session read counter for a file that was never touched.
+    #[test]
+    fn batch_edit_empty_edits_array_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let untouched = dir.path().join("untouched.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        std::fs::write(&untouched, "beta\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": untouched.to_str().unwrap(),
+                    "edits": [],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains("'edits' array is empty"),
+            "empty edits must surface as parse error: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "beta\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "empty-edits file must not be counted as read"
+        );
+    }
+
+    /// A batch with one good file and one file with a deliberate hash
+    /// mismatch must record exactly one read — only the file whose edit
+    /// actually committed. Guards against the prior bug where every `Ready`
+    /// task counted as a read regardless of `apply_batch` outcome.
+    #[test]
+    fn tool_write_records_read_only_for_applied_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        // Duplicate lines so the drifted anchor has >1 strict-fingerprint
+        // match and `tool_write`'s auto-fix declines — the mismatch stands and
+        // the file genuinely does not commit, exercising the applied-only gate.
+        std::fs::write(&bad, "beta\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": bad.to_str().unwrap(),
+                    // Derive a guaranteed-wrong hash so the mismatch is
+                    // forced regardless of what `beta` actually hashes to.
+                    "edits": [{ "start": wrong_anchor_for("beta\n", 1), "content": "BETA" }],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("good half should keep batch alive");
+
+        assert!(out.contains("hash mismatch"), "bad file reports mismatch");
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "beta\nbeta\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "only the applied file should be counted as read"
+        );
+    }
+
+    /// Boundary: an IO failure on a `Ready` task (file doesn't exist) is a
+    /// different code path than a hash mismatch — it never reaches the hash
+    /// check. The applied-list gate must still exclude it from `record_read`.
+    #[test]
+    fn tool_write_io_failure_excludes_from_reads_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        let missing = dir.path().join("nonexistent.txt"); // never created
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": missing.to_str().unwrap(),
+                    // Hash value is irrelevant — the file read fails first.
+                    "edits": [{ "start": "1:000", "content": "X" }],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains(&format!("## {}", missing.display())),
+            "missing file should still get a section header: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "IO failures must not inflate the read counter"
+        );
+    }
+
+    /// Boundary: when every entry is a parse error, `applied` is empty so
+    /// `apply_batch` returns `Err`. `tool_write` reports those parse errors
+    /// inline (returning `Ok` with the per-file sections) AND leaves the read
+    /// counter at zero — no `Ready` task ever existed.
+    #[test]
+    fn tool_write_all_parse_errors_record_no_reads() {
+        let args = serde_json::json!({
+            "files": [
+                { "path": "a.txt" }, // missing 'edits'
+                { "path": "b.txt", "edits": [{ "no_start": "x" }] }, // malformed edit
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom)
+            .expect("parse errors are reported inline, not propagated as Err");
+
+        assert!(out.contains("a.txt") || out.contains("b.txt"), "out: {out}");
+        assert_eq!(
+            session.reads_count(),
+            0,
+            "no Ready task means no read should be recorded"
+        );
+    }
+
+    /// Boundary: a mixed parse-error + good-file batch at the wire layer.
+    /// The record_read gate sits in `tool_write`, not in `apply_batch`, so it
+    /// needs explicit wire-level coverage.
+    #[test]
+    fn tool_write_mixed_parse_error_and_good_file_records_only_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                { "path": "malformed.txt" }, // parse error: missing 'edits'
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains("missing 'edits'"),
+            "parse error should surface in output: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "parse errors must not inflate the read counter"
+        );
+    }
+
+    /// `tilth_write` overwrite mode creates a new file.
+    #[test]
+    fn tool_write_overwrite_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.txt");
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "hello world\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("overwrite ok");
+        assert!(out.contains("created"), "expected created report: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello world\n");
+    }
+
+    /// `tilth_write` append mode appends to existing or creates.
+    #[test]
+    fn tool_write_append_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        std::fs::write(&p, "start\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": "more\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let _ = tool_write(&args, &session, &bloom).expect("append ok");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "start\nmore\n");
+    }
+
+    /// `tool_write` hash-mode happy path: anchored edit applies, session
+    /// records exactly one read for the touched file.
+    #[test]
+    fn tool_write_hash_mode_applies_anchored_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": anchor_for("alpha\nbeta\ngamma\n", 2), "content": "BETA" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("hash apply ok");
+        assert!(!out.contains("hash mismatch"), "must not mismatch: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(session.reads_count(), 1, "applied file is recorded");
+    }
+
+    /// `tool_write` hash-mode mismatch triggers the auto-fix probe and surfaces
+    /// the relocation candidate in the response (strict fingerprint, exactly-
+    /// one-match path). Spec criterion 9.
+    #[test]
+    fn tool_write_hash_mismatch_emits_auto_fix_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        // "target unique line" appears exactly once; agent's anchor hash is
+        // wrong so apply_batch returns Err and auto-fix runs.
+        std::fs::write(&p, "prefix\ntarget unique line\ntail\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": wrong_anchor_for("prefix\ntarget unique line\ntail\n", 2), "content": "NEW" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("mismatch is surfaced, not Err");
+        assert!(
+            out.contains("hash mismatch"),
+            "mismatch marker missing: {out}"
+        );
+        assert!(
+            out.contains("auto-fix"),
+            "auto-fix probe must run on mismatch: {out}"
+        );
+        // Spec criterion 9: exactly one match → apply edit at that new
+        // location with the verbatim `auto-fixed: <old> → <new>` signal.
+        assert!(
+            out.contains("auto-fixed: 2 → 2"),
+            "verbatim auto-fixed line missing: {out}"
+        );
+        // File IS mutated when auto-fix succeeds (one-match relocation).
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "prefix\nNEW\ntail\n",
+            "single-match relocation must re-apply the edit"
+        );
+    }
+
+    /// `tool_write` mixed-mode batch: overwrite + append + bad-mode coexist;
+    /// per-file independence preserved.
+    #[test]
+    fn tool_write_mixed_mode_batch_independent_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let ow = dir.path().join("ow.txt");
+        let ap = dir.path().join("ap.txt");
+        std::fs::write(&ap, "start\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [
+                { "path": ow.to_str().unwrap(), "mode": "overwrite", "content": "X\n" },
+                { "path": ap.to_str().unwrap(), "mode": "append", "content": "Y\n" },
+                { "path": dir.path().join("bogus.txt").to_str().unwrap(), "mode": "bogus", "content": "" }
+            ]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("mixed batch ok");
+        assert_eq!(std::fs::read_to_string(&ow).unwrap(), "X\n");
+        assert_eq!(std::fs::read_to_string(&ap).unwrap(), "start\nY\n");
+        assert!(out.contains("unknown mode"), "bad mode must surface: {out}");
+    }
+
+    /// `tool_write` overwrite mode honors `diff: true` and includes a diff
+    /// block in the response.
+    #[test]
+    fn tool_write_overwrite_with_diff_includes_diff_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.txt");
+        std::fs::write(&p, "old\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            // Clobbering an existing file requires the explicit per-file
+            // `overwrite: true` flag under create-only semantics; the diff
+            // block's `before` side only renders when a prior file existed.
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "overwrite": true,
+                "content": "new\n"
+            }],
+            "diff": true
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("overwrite ok");
+        assert!(out.contains("── diff ──"), "diff block expected: {out}");
+        assert!(out.contains("--- before"), "before marker expected: {out}");
+        assert!(out.contains("+++ after"), "after marker expected: {out}");
+        assert!(out.contains("- old"), "removed line marker expected: {out}");
+        assert!(out.contains("+ new"), "added line marker expected: {out}");
+    }
+
+    /// `tool_write` rejects empty `files` array clearly.
+    #[test]
+    fn tool_write_empty_files_rejected() {
+        let args = serde_json::json!({ "files": [] });
+        let (session, bloom) = edit_services();
+        let err = tool_write(&args, &session, &bloom).expect_err("empty must error");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// Spec criterion 9 / per-file independence: a batch with one applying
+    /// file and one mismatching file must emit a per-file auto-fix probe for
+    /// the mismatcher while leaving the applied file untouched. (No more all-
+    /// or-nothing auto-fix.)
+    #[test]
+    fn tool_write_per_file_auto_fix_on_partial_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(&bad, "prefix\nunique relocatable anchor\ntail\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "mode": "hash",
+                    "edits": [{
+                        "start": anchor_for("alpha\nbeta\ngamma\n", 2),
+                        "content": "BETA"
+                    }]
+                },
+                {
+                    "path": bad.to_str().unwrap(),
+                    "mode": "hash",
+                    "edits": [{
+                        "start": wrong_anchor_for("prefix\nunique relocatable anchor\ntail\n", 2),
+                        "content": "NEW"
+                    }]
+                }
+            ]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("partial batch ok");
+        // Good file applied.
+        assert_eq!(
+            std::fs::read_to_string(&good).unwrap(),
+            "alpha\nBETA\ngamma\n",
+            "good file edit must land"
+        );
+        // Bad file: spec criterion 9 — single-match relocation re-applies
+        // the edit at the new location (here the same line, since the body
+        // hasn't moved but the agent's hash was stale).
+        assert_eq!(
+            std::fs::read_to_string(&bad).unwrap(),
+            "prefix\nNEW\ntail\n",
+            "single-match relocation must re-apply the edit on the bad file"
+        );
+        // Per-file probe block present, with the verbatim auto-fixed line.
+        assert!(
+            out.contains("── auto-fix probe ──"),
+            "per-file auto-fix probe must appear: {out}"
+        );
+        assert!(
+            out.contains("auto-fixed: "),
+            "verbatim auto-fixed signal must appear: {out}"
+        );
+    }
+
+    /// Spec criterion 9: when the agent's anchor hash is stale but the
+    /// captured body fingerprint resolves to exactly one location, tilth
+    /// re-applies the edit at that location and emits the verbatim
+    /// `auto-fixed: <old> → <new>` signal (with the resolved new line, which
+    /// equals the old when the body still sits at the agent's claimed line).
+    #[test]
+    fn tool_write_auto_fix_applies_on_single_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("src.txt");
+        std::fs::write(&p, "prefix\nunique_body_token\ntail\n").unwrap();
+        let stale = wrong_anchor_for("prefix\nunique_body_token\ntail\n", 2);
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": stale, "content": "REPLACED" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("auto-fix path ok");
+        assert!(
+            out.contains("auto-fixed: 2 → 2"),
+            "verbatim auto-fixed line missing: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "prefix\nREPLACED\ntail\n",
+            "edit must be re-applied at the resolved single-match line"
+        );
+    }
+
+    /// Realistic agent-retry: the file has shifted so the anchor body lives
+    /// at a new line, while the agent's claimed line now holds different
+    /// content. `capture_hash_original` reads the body from the CURRENT
+    /// file at the agent's claimed line, so the captured body is whatever
+    /// has shifted INTO that slot — never the body the agent intended. The
+    /// auto-fix can't recover the original body from a 12-bit hash alone,
+    /// so this scenario does not produce `auto-fixed: <old> → <new>`. The
+    /// response instead surfaces a fresh hashlined region so the agent can
+    /// retry in one turn. This test documents the actual contract so a
+    /// future design change (per-session file snapshot, body in the
+    /// request, …) that adds genuine relocation flips a red flag.
+    #[test]
+    fn tool_write_auto_fix_shift_returns_fresh_region_not_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shift.txt");
+
+        use std::fmt::Write as _;
+
+        // C0: TARGET_BODY_TOKEN at line 10.
+        let mut c0 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c0, "orig{i}");
+        }
+        c0.push_str("TARGET_BODY_TOKEN\n");
+        c0.push_str("after\n");
+        std::fs::write(&p, &c0).unwrap();
+
+        // Anchor captured from C0 — line 10 hashes the target line.
+        let anchor = anchor_for(&c0, 10);
+
+        // C1: insert 5 blank lines above the target so it now lives at 15.
+        let mut c1 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c1, "orig{i}");
+        }
+        for _ in 0..5 {
+            c1.push('\n');
+        }
+        c1.push_str("TARGET_BODY_TOKEN\n");
+        c1.push_str("after\n");
+        std::fs::write(&p, &c1).unwrap();
+
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": anchor, "content": "REPLACED" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("response renders");
+
+        // Hash mismatch must surface — agent's hash is stale against C1.
+        assert!(
+            out.contains("hash mismatch"),
+            "shifted file must trip the hash mismatch path: {out}"
+        );
+        // The auto-fix probe must run …
+        assert!(
+            out.contains("── auto-fix probe ──"),
+            "probe block must run even though it can't recover the old body: {out}"
+        );
+        // … but a body-relocation auto-fix is impossible without the
+        // original body, so the verbatim signal must NOT fire.
+        assert!(
+            !out.contains("auto-fixed: 10 → 15"),
+            "auto-fix must not pretend to relocate when the captured body is post-shift: {out}"
+        );
+        // Instead a fresh hashlined region is returned for the agent to
+        // retry in one turn (per the prompt's narrower claim).
+        assert!(
+            out.contains("fresh region"),
+            "shifted-body retry must surface a fresh hashlined region: {out}"
+        );
+        // The file content is left untouched — the edit did NOT silently
+        // land on the wrong line.
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            after, c1,
+            "file must be unchanged when auto-fix cannot recover"
+        );
+    }
+
+    /// Security: overwrite/append outside the configured scope is refused.
+    #[test]
+    fn tool_write_overwrite_outside_scope_refused() {
+        let scope = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let target = outside_dir.path().join("escape.txt");
+        let args = serde_json::json!({
+            "scope": scope.path().to_str().unwrap(),
+            "files": [{
+                "path": target.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "escaped\n"
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("refusal is in-band");
+        assert!(
+            out.contains("outside scope"),
+            "expected refusal marker: {out}"
+        );
+        assert!(
+            !target.exists(),
+            "file outside scope must not be written: {}",
+            target.display()
+        );
+    }
 }

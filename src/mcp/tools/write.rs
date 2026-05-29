@@ -181,40 +181,45 @@ pub(crate) fn tool_write(
 
     let mut output = String::new();
     if !hash_tasks.is_empty() {
-        // Record session reads for every Ready task up front (matches legacy
-        // tilth_edit semantics: record_read counts attempts, not just
-        // successful commits, so dedup logic doesn't re-recommend a file the
-        // agent already touched even when hashes drifted).
-        for task in &hash_tasks {
-            if let crate::edit::FileEditTask::Ready { path, .. } = task {
-                session.record_read(path);
-            }
-        }
         // Pre-run strict auto-fix on hash-mode tasks. Capture original
         // anchor-range bodies, then try the standard apply_batch. If the
         // outcome reports hash mismatches per file, attempt auto-fix.
         let originals: Vec<Option<HashOriginal>> =
             hash_tasks.iter().map(capture_hash_original).collect();
         match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
-            Ok(combined) => {
+            Ok(outcome) => {
+                // Record reads only for files whose edits actually committed.
+                // `BatchOutcome.applied` gates session bookkeeping on real
+                // writes, so a drifted/failed file is not counted as read —
+                // the agent should re-read it before retrying.
+                for p in &outcome.applied {
+                    session.record_read(p);
+                }
                 // Per-file independence: when a file's section reports a hash
                 // mismatch, append a per-file auto-fix probe so spec criterion 9
                 // (strict auto-fix on mismatch, per file) holds even on partial
                 // batch success. The probe re-applies on a single-match
                 // relocation, so any path it touches is recorded as read.
-                let (augmented, reapplied) = append_per_file_auto_fix(&combined, &originals, bloom);
+                let (augmented, reapplied) =
+                    append_per_file_auto_fix(&outcome.output, &originals, bloom);
                 for p in &reapplied {
                     session.record_read(p);
                 }
                 output.push_str(&augmented);
             }
             Err(msg) => {
-                // All-failed path. Try auto-fix for each captured original.
-                let (fixed, reapplied) = try_auto_fix(&msg, &originals, bloom);
+                // All-failed path. No file committed, so reuse the same
+                // per-file gate as the Ok branch: only sections that actually
+                // report a hash mismatch get an auto-fix probe. A non-hash
+                // failure (duplicate-path validation, parse/IO error) is
+                // surfaced verbatim — no misleading "hash mismatch" header and
+                // no relocation reapply that would write to disk despite the
+                // batch being rejected.
+                let (augmented, reapplied) = append_per_file_auto_fix(&msg, &originals, bloom);
                 for p in &reapplied {
                     session.record_read(p);
                 }
-                output.push_str(&fixed);
+                output.push_str(&augmented);
             }
         }
     }
@@ -356,7 +361,7 @@ fn reapply_at_relocation(
         path: orig.path.clone(),
         edits: shifted,
     };
-    apply_batch(vec![task], bloom, false).ok()
+    apply_batch(vec![task], bloom, false).ok().map(|o| o.output)
 }
 
 /// Probe one captured original for a strict-fingerprint relocation and,
@@ -462,25 +467,6 @@ fn append_per_file_auto_fix(
         rendered.push(s);
     }
     (rendered.join("\n\n---\n\n"), reapplied)
-}
-
-fn try_auto_fix(
-    original_msg: &str,
-    originals: &[Option<HashOriginal>],
-    bloom: &Arc<BloomFilterCache>,
-) -> (String, Vec<PathBuf>) {
-    let mut out = String::from("hash mismatch — attempted auto-fix:\n\n");
-    out.push_str(original_msg);
-    out.push_str("\n\n── auto-fix probe ──\n");
-    let mut reapplied: Vec<PathBuf> = Vec::new();
-    for orig in originals.iter().flatten() {
-        let probe = probe_one_auto_fix(orig, bloom);
-        if probe.contains("auto-fixed —") {
-            reapplied.push(orig.path.clone());
-        }
-        out.push_str(&probe);
-    }
-    (out, reapplied)
 }
 
 /// Parse one `files[]` entry. Parse errors are deferred onto the task so a
