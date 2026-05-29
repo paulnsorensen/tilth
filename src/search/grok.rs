@@ -1427,9 +1427,24 @@ fn h() {}
 
         let _ = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
 
-        // Bump mtime by overwriting (sleep 10ms to guarantee mtime tick on coarse FS).
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::write(&path, long_body_fixture("stale")).unwrap();
+        // Bump mtime by overwriting. Coarse-resolution filesystems (e.g. 1s
+        // HFS+) may not tick on a fast rewrite, so loop until the reported
+        // mtime actually advances and assert it did — otherwise the test would
+        // silently pass without exercising the staleness path.
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut mtime_changed = false;
+        for _ in 0..100 {
+            std::fs::write(&path, long_body_fixture("stale")).unwrap();
+            if std::fs::metadata(&path).unwrap().modified().unwrap() != mtime_before {
+                mtime_changed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            mtime_changed,
+            "filesystem mtime did not advance after rewrite — cannot exercise staleness"
+        );
 
         let r2 = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
         assert!(
