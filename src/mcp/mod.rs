@@ -83,7 +83,9 @@ fn build_instructions(edit_mode: bool, overview: &str) -> String {
     }
     out.push_str(base);
     if edit_mode {
-        out.push_str("\n\n");
+        // EDIT_MODE_EXTRA owns the separator: it opens with "\n\n" (locked by
+        // edit_mode_extra_byte_lock), so appending it directly yields exactly
+        // one blank line between sections. A manual "\n\n" here doubles it.
         out.push_str(EDIT_MODE_EXTRA.trim_end());
     }
     out
@@ -318,7 +320,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_files" => tool_files(args),
         "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom()),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
@@ -2277,6 +2279,37 @@ mod tests {
     }
 
     #[test]
+    fn build_instructions_edit_single_blank_line_and_byte_lock() {
+        // Regression guard for the composed edit-mode string. A prior manual
+        // "\n\n" was pushed on top of EDIT_MODE_EXTRA's own leading "\n\n",
+        // producing a four-newline (double blank) junction that broke the
+        // byte-identical invariant the revival claimed. The piece-wise locks
+        // (edit_mode_extra_byte_lock, SERVER_INSTRUCTIONS checks) do not guard
+        // the *composed* output, so lock it here.
+        let edit = build_instructions(true, "");
+        assert!(
+            edit.contains(
+                "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch write"
+            ),
+            "edit-mode section junction must be a single blank line"
+        );
+        assert!(
+            !edit.contains("\n\n\n"),
+            "edit-mode composition must not contain a triple newline (double blank line)"
+        );
+        assert_eq!(
+            build_instructions(false, "").len(),
+            3594,
+            "non-edit composed instructions byte count drifted"
+        );
+        assert_eq!(
+            edit.len(),
+            6018,
+            "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
+        );
+    }
+
+    #[test]
     fn build_instructions_overview_prepends_with_blank_line() {
         let s = build_instructions(false, "OVERVIEW");
         assert!(
@@ -2320,16 +2353,6 @@ mod tests {
         let args = serde_json::json!({ "patterns": [] });
         let err = tool_list(&args).expect_err("empty must error");
         assert!(err.contains("at least one"), "unexpected: {err}");
-    }
-
-    /// `tilth_list` rejects `pattern` and `patterns` together — the schema
-    /// advertises them as mutually exclusive, so the code must enforce it
-    /// rather than silently ignoring one.
-    #[test]
-    fn tool_list_both_pattern_and_patterns_rejected() {
-        let args = serde_json::json!({ "pattern": "*.rs", "patterns": ["*.toml"] });
-        let err = tool_list(&args).expect_err("both must error");
-        assert!(err.contains("mutually exclusive"), "unexpected: {err}");
     }
 
     /// `tilth_list` enforces the 20-pattern cap.
@@ -2386,6 +2409,16 @@ mod tests {
             !out.contains("node_modules"),
             "node_modules must be skipped: {out}"
         );
+    }
+
+    /// `tilth_list` rejects `pattern` and `patterns` together — the schema
+    /// advertises them as mutually exclusive, so the code must enforce it
+    /// rather than silently ignoring one.
+    #[test]
+    fn tool_list_both_pattern_and_patterns_rejected() {
+        let args = serde_json::json!({ "pattern": "*.rs", "patterns": ["*.toml"] });
+        let err = tool_list(&args).expect_err("both must error");
+        assert!(err.contains("mutually exclusive"), "unexpected: {err}");
     }
 
     // -- tilth_search wire layer: restored from pre-merge 3801a4c (PR-A)

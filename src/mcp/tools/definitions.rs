@@ -150,6 +150,36 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "tilth_list",
+            "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern e.g. '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple glob patterns rendered into one tree. Mutually exclusive with `pattern`. Capped at 20."
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Cap directory depth (1 = top-level only)."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Directory to root the tree at. Default: current working directory."
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max tokens in response."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "tilth_deps",
             "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
