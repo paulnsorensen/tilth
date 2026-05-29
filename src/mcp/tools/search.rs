@@ -74,6 +74,12 @@ pub(in crate::mcp) fn tool_search(
         let combined = since
             .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
             .unwrap_or(combined);
+        // Per-entry budget caps each query in isolation; cap the concatenated
+        // batch once more so an N-entry batch can't return ~N× the budget.
+        let combined = apply_budget(
+            &combined,
+            args.get("budget").and_then(serde_json::Value::as_u64),
+        );
         return Ok(crate::mcp::iso::with_meta_header(
             Some(now),
             serde_json::Map::new(),
