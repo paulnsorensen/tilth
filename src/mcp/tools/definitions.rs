@@ -8,11 +8,25 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
-                "required": ["query"],
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
+                    },
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": {"type": "string"},
+                                "glob": {"type": "string"},
+                                "kind": {"type": "string", "enum": ["symbol", "content", "regex", "callers"]}
+                            }
+                        },
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": "Batch form. Array of query objects, each run independently with optional per-entry `kind`/`glob` overriding the top-level values; results concatenate under `## query: <q>` headers. Use instead of `query` to search several things in one call."
                     },
                     "scope": {
                         "type": "string",
@@ -40,6 +54,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
                     }
                 }
             }

@@ -308,7 +308,13 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     let edit_mode = services.edit_mode();
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
+        "tilth_search" => tool_search(
+            args,
+            services.cache(),
+            services.session(),
+            services.bloom(),
+            edit_mode,
+        ),
         "tilth_files" => tool_files(args),
         "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
@@ -2369,6 +2375,191 @@ mod tests {
         assert!(
             !out.contains("node_modules"),
             "node_modules must be skipped: {out}"
+        );
+    }
+
+    // -- tilth_search wire layer: restored from pre-merge 3801a4c (PR-A)
+
+    /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
+    #[test]
+    fn tool_search_queries_array_form() {
+        let args = serde_json::json!({
+            "queries": [{ "query": "build_instructions" }],
+            "expand": 0
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "expected JSON cache-token header: {out}"
+        );
+        assert!(
+            out.contains("query: build_instructions"),
+            "expected per-query header: {out}"
+        );
+    }
+
+    /// `tilth_search` empty queries array errors clearly.
+    #[test]
+    fn tool_search_queries_empty_errors() {
+        let args = serde_json::json!({ "queries": [] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("empty errors");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// `tilth_search` queries[] entry missing `query` field returns a clear
+    /// error naming the offending index.
+    #[test]
+    fn tool_search_queries_missing_query_field_errors() {
+        let args = serde_json::json!({ "queries": [{ "glob": "*.rs" }] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("missing query");
+        assert!(err.contains("queries[0]"), "must name index: {err}");
+        assert!(err.contains("query"), "must mention 'query': {err}");
+    }
+
+    /// `tilth_search` queries[] enforces the 10-entry cap.
+    #[test]
+    fn tool_search_queries_over_limit_rejected() {
+        let mut qs = Vec::with_capacity(11);
+        for _ in 0..11 {
+            qs.push(serde_json::json!({ "query": "foo" }));
+        }
+        let args = serde_json::json!({ "queries": qs });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err(">10 must error");
+        assert!(err.contains("limited to 10"), "unexpected error: {err}");
+    }
+
+    // ── F5 hardening: a request that still carries the dropped `context`
+    // field must NOT error. Old agents have the parameter cached in their
+    // tool spec; tolerating it silently is the documented contract (the
+    // F5 verifier says "or is silently ignored — implementer's call").
+    #[test]
+    fn tool_search_tolerates_stray_context_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap(),
+            "context": "src/old.rs"
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false)
+            .expect("stray context must not fail the request");
+        assert!(
+            out.contains("handleAuth"),
+            "search must still find the symbol despite the stray field: {out}"
+        );
+    }
+
+    /// `tilth_search` honors `if_modified_since` by stubbing unchanged files
+    /// without leaking expanded source bodies.
+    #[test]
+    fn tool_search_if_modified_since_redacts_unchanged_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn demo() {\n    let needle_unique = \"secret body text\";\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "queries": [{"query": "needle_unique", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 1,
+            "if_modified_since": "2099-01-01T00:00:00Z"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
+        assert!(out.contains("unchanged"), "stub missing: {out}");
+        assert!(
+            !out.contains("secret body text"),
+            "unchanged search body must be redacted: {out}"
+        );
+    }
+
+    // ── F1 hardening: the JSON cache-token must stand alone on the first
+    // line so a trivial JSON-line parse pulls the field. The prose-header
+    // baseline was 0 / 2,042 round-trips; the integration regression here
+    // is "response shape changed but the field is no longer parseable."
+    #[test]
+    fn tool_search_first_line_is_parseable_cache_token_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        let first = out.lines().next().expect("response has a first line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first).expect("first line must be valid one-line JSON");
+        let ts = parsed
+            .get("if_modified_since")
+            .and_then(|v| v.as_str())
+            .expect("if_modified_since field present");
+        assert!(
+            crate::mcp::iso::parse_iso_utc(ts).is_some(),
+            "ts must round-trip through parse_iso_utc: {ts}"
+        );
+    }
+
+    /// Default search merges symbol, content, and identifier-shaped caller
+    /// results when `kind` is omitted.
+    #[test]
+    fn tool_search_default_merges_symbol_content_and_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lib.rs");
+        std::fs::write(
+            &p,
+            "fn target_fn() {\n    let _marker = \"content branch\";\n}\n\nfn caller() {\n    target_fn();\n}\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "target_fn"}],
+            "scope": dir.path().to_str().unwrap(),
+            "expand": 0
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("merged search ok");
+        assert!(
+            out.contains("symbol results"),
+            "symbol facet missing: {out}"
+        );
+        assert!(
+            out.contains("content results"),
+            "content facet missing: {out}"
+        );
+        assert!(
+            out.contains("caller results"),
+            "caller facet missing: {out}"
+        );
+        assert!(
+            out.contains("[caller: caller]"),
+            "caller result missing: {out}"
         );
     }
 }
