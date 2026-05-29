@@ -74,14 +74,22 @@ pub(in crate::mcp) fn tool_search(
         let combined = since
             .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
             .unwrap_or(combined);
-        return Ok(crate::mcp::iso::with_header(now, &combined));
+        return Ok(crate::mcp::iso::with_meta_header(
+            Some(now),
+            serde_json::Map::new(),
+            &combined,
+        ));
     }
     let body = tool_search_single(args, cache, session, bloom, edit_mode)?;
     let (scope, _) = resolve_scope(args);
     let body = since
         .map(|s| redact_unchanged_search_sections(&body, &scope, s))
         .unwrap_or(body);
-    Ok(crate::mcp::iso::with_header(now, &body))
+    Ok(crate::mcp::iso::with_meta_header(
+        Some(now),
+        serde_json::Map::new(),
+        &body,
+    ))
 }
 
 fn tool_search_single(
