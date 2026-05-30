@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_section_replacement_keeps_multiline_arrays_intact() {
+    fn toml_section_replacement_handles_multiline_arrays_before_next_table() {
         let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = [\n  \"old-a\",\n  \"old-b\",\n]\n[other]\nk = 1\n";
         let out = upsert_toml_section(
             existing,
