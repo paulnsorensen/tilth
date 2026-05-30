@@ -147,6 +147,20 @@ impl<'a> Iterator for IdentifierIter<'a> {
                         continue;
                     }
                     if b == b'\'' {
+                        // Distinguish a Rust lifetime (`'a`, `'static`) from a char
+                        // literal (`'a'`, `'\n'`). A char literal has a closing quote
+                        // right after a single char/escape; a lifetime is a tick
+                        // followed by an identifier with no closing quote. Treating a
+                        // lifetime as a string opener would swallow every following
+                        // identifier up to the next tick, dropping them from the filter
+                        // and producing a false negative (the one thing Bloom forbids).
+                        let is_lifetime = i + 1 < len
+                            && is_ident_start(bytes[i + 1])
+                            && !(i + 2 < len && bytes[i + 2] == b'\'');
+                        if is_lifetime {
+                            self.pos += 1;
+                            continue;
+                        }
                         self.state = ScanState::StringSingle;
                         self.pos += 1;
                         continue;
@@ -268,6 +282,29 @@ mod tests {
         assert!(bf.contains("foo"));
         assert!(bf.contains("bar"));
         assert!(bf.contains("baz"));
+    }
+
+    #[test]
+    fn extracts_identifiers_across_rust_lifetimes() {
+        let src = "fn longest<'a>(x: &'a str, y: &'a str) -> &'a str { x }";
+        let idents: Vec<&str> = extract_identifiers(src).collect();
+        for want in ["fn", "longest", "x", "y", "str"] {
+            assert!(
+                idents.contains(&want),
+                "lifetime tick swallowed identifier {want:?}; got {idents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn char_literal_is_still_skipped() {
+        let src = "let c = 'a'; let d = '\\n'; fn target() {}";
+        let idents: Vec<&str> = extract_identifiers(src).collect();
+        assert!(idents.contains(&"target"), "got {idents:?}");
+        assert!(
+            !idents.contains(&"a"),
+            "char-literal body leaked: {idents:?}"
+        );
     }
 
     #[test]

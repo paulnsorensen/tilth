@@ -91,6 +91,20 @@ fn build_instructions(edit_mode: bool, overview: &str) -> String {
     out
 }
 
+/// Change the process working directory, logging failures to stderr.
+///
+/// A swallowed chdir leaves the server searching the wrong root while every
+/// later tool call still looks successful, so the operator needs a grep-able
+/// line when the configured root is unusable.
+fn chdir_or_log(path: &Path) {
+    if let Err(e) = std::env::set_current_dir(path) {
+        eprintln!(
+            "tilth: failed to set working directory to {}: {e}",
+            path.display()
+        );
+    }
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format.
 ///
@@ -104,12 +118,12 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
     if let Some(s) = scope {
         if s.is_dir() {
-            let _ = std::env::set_current_dir(s);
+            chdir_or_log(s);
         }
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(root) = crate::lang::package_root(&cwd) {
-            let _ = std::env::set_current_dir(root);
+            chdir_or_log(root);
         }
     }
 
@@ -122,7 +136,13 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     let mut pending_roots_id: Option<Value> = None;
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("tilth: stdin read error, shutting down: {e}");
+                return Err(e);
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -143,7 +163,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                 // Only apply roots on success and if --scope was NOT explicitly provided
                 if !scope_is_explicit {
                     if let Some(root_path) = extract_root_from_response(&msg) {
-                        let _ = std::env::set_current_dir(&root_path);
+                        chdir_or_log(&root_path);
                     }
                 }
                 continue;
@@ -364,13 +384,22 @@ fn run_tool_with_timeout(
 
     match outcome {
         Ok(inner) => inner,
-        Err(SpawnFailure::Timeout) => Err(format!(
-            "tool timed out after {}s — the operation took too long. \
-             Try: reduce scope, use section instead of full, or set \
-             TILTH_TIMEOUT=<seconds> to increase the limit.",
-            timeout.as_secs()
-        )),
-        Err(SpawnFailure::Panic) => Err("tool panicked during execution".into()),
+        Err(SpawnFailure::Timeout) => {
+            eprintln!(
+                "tilth: tool '{tool_name}' timed out after {}s",
+                timeout.as_secs()
+            );
+            Err(format!(
+                "tool timed out after {}s — the operation took too long. \
+                 Try: reduce scope, use section instead of full, or set \
+                 TILTH_TIMEOUT=<seconds> to increase the limit.",
+                timeout.as_secs()
+            ))
+        }
+        Err(SpawnFailure::Panic) => {
+            eprintln!("tilth: tool '{tool_name}' panicked during execution");
+            Err("tool panicked during execution".into())
+        }
     }
 }
 

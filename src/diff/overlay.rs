@@ -300,8 +300,8 @@ fn get_old_content(path: &Path, old_path: Option<&Path>, source: &DiffSource) ->
             if let Some((left, _)) = r.split_once("..") {
                 git_show(&format!("{left}:{path_str}"))
             } else {
-                // `git diff HEAD~1` compares HEAD~1 (old) against HEAD (new).
-                // So old content is at the ref itself.
+                // `git diff <ref>` compares <ref> (old) against the working tree
+                // (new), so the old content is the file at the ref itself.
                 git_show(&format!("{r}:{path_str}"))
             }
         }
@@ -320,9 +320,10 @@ fn get_new_content(path: &Path, source: &DiffSource) -> String {
             if let Some((_, right)) = r.split_once("..") {
                 git_show(&format!("{right}:{path_str}"))
             } else {
-                // `git diff HEAD~1` compares HEAD~1 against HEAD.
-                // New content is HEAD (current commit).
-                git_show(&format!("HEAD:{path_str}"))
+                // `git diff <ref>` (single ref, no range) diffs <ref> against the
+                // working tree — not against HEAD. The new content is therefore the
+                // current file on disk, not `git show HEAD:<path>`.
+                std::fs::read_to_string(path).unwrap_or_default()
             }
         }
         DiffSource::Files(_, b) => std::fs::read_to_string(b).unwrap_or_default(),
@@ -522,4 +523,25 @@ fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_git_ref_new_content_reads_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sample.rs");
+        std::fs::write(&file, "fn worktree_only() {}\n").unwrap();
+
+        // A single ref (no `..`) diffs against the working tree, so the new
+        // content must come from the file on disk — not `git show HEAD:<path>`,
+        // which would return empty here and silently mis-attribute the diff.
+        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()));
+        assert!(
+            content.contains("worktree_only"),
+            "bare GitRef new content must be the working tree, got {content:?}"
+        );
+    }
 }
