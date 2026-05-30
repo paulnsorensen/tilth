@@ -242,7 +242,10 @@ pub fn diff(
         return Ok("No changes.".to_string());
     }
 
-    // 2. Build structural overlays.
+    // 2. Build structural overlays in parallel — each FileDiff is independent
+    // and `compute_overlay` constructs its own tree-sitter parser per call
+    // (see `lang::outline::get_outline_entries`), so no shared mutable state
+    // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
         .map(|fd| overlay::compute_overlay(fd, source))
@@ -402,7 +405,13 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
     let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let bloom = crate::index::bloom::BloomFilterCache::new();
 
-    match crate::search::callers::find_callers_batch(&sig_changed, &scope, &bloom, None) {
+    match crate::search::callers::find_callers_batch(
+        &sig_changed,
+        &scope,
+        &bloom,
+        None,
+        crate::search::callers::BATCH_EARLY_QUIT,
+    ) {
         Ok(matches) => {
             let mut counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();

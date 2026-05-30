@@ -160,9 +160,10 @@ methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
   and an `instructions` string. The instructions are the
-  `SERVER_INSTRUCTIONS` constant (recently rewritten on `fd3de77` as a
-  pre-flight gate naming the exact Bash commands and host tools to
-  avoid, with concrete `<bad>→<good>` rewrites). When
+  `SERVER_INSTRUCTIONS` constant, loaded at compile time via
+  `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
+  as a pre-flight gate naming the exact Bash commands and host tools to
+  avoid, with concrete `<bad>→<good>` rewrites. When
   `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
   prepended — a project summary built in <250ms (a stderr warning fires
   if it overruns).
@@ -171,7 +172,7 @@ methods worth describing in detail:
 
 Tool dispatch is routed by name through `dispatch_tool` to
 `tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
-`tool_session` / `tool_edit` (the last only in edit mode).
+`tool_edit` (the last only in edit mode).
 `tilth_map` is no longer reachable through MCP — its schema is omitted
 from `tools/list` and the dispatch stub has been removed. The CLI
 still has `tilth --map`; the MCP boundary was retired after benchmark
@@ -598,7 +599,8 @@ callers fall back to text-based heuristics.
 
 ### `Session` (`session.rs`)
 
-Per-MCP-process counters for the `tilth_session` tool. Tracks read
+Per-MCP-process counters used internally by `tool_search` / `tool_read`
+for result dedup. Tracks read
 counts, search counts, top queries, hot directories (each indexed
 file's parent), and an `expanded` set keyed by `path:line` so re-expanding
 a previously shown definition can return `[shown earlier]` instead of
@@ -726,19 +728,24 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 lookups rather than typed structs.
 
 **Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. It names exact bad
-commands (`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites
-because agents kept reaching for those despite earlier "DO NOT use
+strategic guidance every host gets at `initialize`. It lives in
+`prompts/mcp-base.md` and is wired in at compile time via
+`include_str!`. The text names exact bad commands
+(`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
+agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-with the `tilth_edit` instructions. `overview::fingerprint(cwd)` is
-prepended unless `TILTH_NO_OVERVIEW` is set — a brief summary of
-language counts, manifests, hot files, and git context.
+from `prompts/mcp-edit.md` with the `tilth_edit` instructions.
+`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
+is set — a brief summary of language counts, manifests, hot files,
+and git context.
 
 `AGENTS.md` at the repo root is the user-facing copy of these
 instructions for hosts that read prompts from disk rather than via
-the MCP `instructions` field. It must stay in sync with
-`SERVER_INSTRUCTIONS`; that's a manual discipline, not enforced by
-tooling.
+the MCP `instructions` field. It is regenerated from the same
+`prompts/*.md` files via `scripts/regen-agents-md.sh`, so editing the
+markdown and re-running the script keeps both surfaces in lockstep.
+Byte-equality tests in `src/mcp/mod.rs` lock the runtime strings to
+their refactor baseline and flag accidental drift.
 
 ## Cross-cutting modules
 

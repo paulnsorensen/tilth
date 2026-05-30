@@ -32,6 +32,7 @@ from config import (
     RESULTS_DIR,
     DEFAULT_REPS,
     TILTH_MCP_CODEX_ARGS,
+    TILTH_BIN,
 )
 from parse import parse_stream_json, parse_codex_json, tool_call_counts
 from tasks import TASKS
@@ -39,13 +40,10 @@ from fixtures.reset import reset_repo, ensure_repo_clean
 
 
 def _tilth_version() -> Optional[str]:
-    """Get installed tilth version via `tilth --version` (resolved on PATH)."""
-    binary = shutil.which("tilth")
-    if not binary:
-        return None
+    """Get installed tilth version via `tilth --version`."""
     try:
         result = subprocess.run(
-            [binary, "--version"],
+            [TILTH_BIN, "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"

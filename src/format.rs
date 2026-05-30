@@ -35,11 +35,58 @@ pub fn search_header(
     defs: usize,
     usages: usize,
 ) -> String {
-    let parts = match (defs, usages) {
-        (0, _) => format!("{total} matches"),
-        (d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
+    let parts = match (total, defs, usages) {
+        (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
+        (_, 0, _) => format!("{total} matches"),
+        (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
+}
+
+/// Which search-kind produced a zero-result response. Determines which hint
+/// the empty-result header surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyHint {
+    Symbol,
+    Content,
+    Regex,
+    Merged,
+}
+
+/// Emit the zero-result search header with three counts and a hint chosen
+/// from the dispatch table:
+///
+/// * `files_matched_glob == 0` → `glob matched no files — broaden glob or check path`
+/// * `Symbol` → `no symbols matched; try kind: content or check spelling`
+/// * `Content` → `no content matches; try kind: symbol or a broader pattern`
+/// * `Regex` → `regex matched zero content; try kind: symbol or a broader pattern`
+/// * `Merged` → `no matches in any mode — re-check the query and glob`
+pub fn search_empty_header(
+    query: &str,
+    scope: &Path,
+    files_matched_glob: usize,
+    files_searched: usize,
+    content_hits: usize,
+    kind: EmptyHint,
+) -> String {
+    let hint = if files_matched_glob == 0 {
+        "glob matched no files — broaden glob or check path"
+    } else {
+        match kind {
+            EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
+            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
+            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
+            EmptyHint::Merged => "no matches in any mode — re-check the query and glob",
+        }
+    };
+    format!(
+        "# Search: \"{query}\" in {scope_disp} — 0 matches\n  \
+         Files matched glob: {files_matched_glob}\n  \
+         Files searched:     {files_searched}\n  \
+         Content hits:       {content_hits}\n  \
+         Hint: {hint}",
+        scope_disp = scope.display()
+    )
 }
 
 /// Human-readable file size. Integer math only — no floats.
@@ -114,4 +161,99 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G3: a zero-match search must carry an actionable hint so agents stop
+    /// retrying the same query blindly, not just report "0 matches".
+    #[test]
+    fn search_header_zero_matches_includes_hint() {
+        let header = search_header("doesNotExist", Path::new("/repo"), 0, 0, 0);
+        assert!(header.contains("0 matches"), "{header}");
+        assert!(header.contains("kind=content"), "{header}");
+        assert!(header.contains("widen scope"), "{header}");
+        assert!(header.contains("check spelling"), "{header}");
+    }
+
+    #[test]
+    fn search_header_with_matches_has_no_hint() {
+        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2);
+        assert!(
+            header.contains("3 matches (1 definitions, 2 usages)"),
+            "{header}"
+        );
+        assert!(!header.contains("check spelling"), "{header}");
+    }
+
+    /// Regression: a result with hits but zero definitions (every content
+    /// search, plus usage-only symbol searches) must print just "{total}
+    /// matches" — not the noisy "(0 definitions, N usages)" the zero-match
+    /// hint change accidentally reintroduced on this path.
+    #[test]
+    fn search_header_usages_only_omits_definition_counts() {
+        let header = search_header("logLine", Path::new("/repo"), 10, 0, 10);
+        assert!(header.contains("10 matches"), "{header}");
+        assert!(
+            !header.contains("0 definitions"),
+            "usage-only result must not show a 0-definitions count: {header}"
+        );
+        assert!(!header.contains("check spelling"), "{header}");
+    }
+
+    fn scope() -> std::path::PathBuf {
+        std::path::PathBuf::from("/repo")
+    }
+
+    #[test]
+    fn empty_header_glob_zero_overrides_kind() {
+        // files_matched_glob == 0 wins regardless of kind.
+        let out = search_empty_header("foo", &scope(), 0, 0, 0, EmptyHint::Symbol);
+        assert!(out.contains("0 matches"), "{out}");
+        assert!(out.contains("Files matched glob: 0"), "{out}");
+        assert!(
+            out.contains("glob matched no files — broaden glob or check path"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_symbol_branch() {
+        let out = search_empty_header("Foo", &scope(), 47, 47, 0, EmptyHint::Symbol);
+        assert!(
+            out.contains("no symbols matched; try kind: content or check spelling"),
+            "{out}"
+        );
+        assert!(out.contains("Files searched:     47"), "{out}");
+    }
+
+    #[test]
+    fn empty_header_content_branch() {
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Content);
+        assert!(
+            out.contains("no content matches; try kind: symbol or a broader pattern"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_regex_branch() {
+        // Regex has its own hint, distinct from Content's.
+        let out = search_empty_header("foo.*bar", &scope(), 47, 47, 0, EmptyHint::Regex);
+        assert!(
+            out.contains("regex matched zero content; try kind: symbol or a broader pattern"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_merged_branch() {
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Merged);
+        assert!(
+            out.contains("no matches in any mode — re-check the query and glob"),
+            "{out}"
+        );
+    }
 }
