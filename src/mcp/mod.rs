@@ -105,6 +105,18 @@ fn chdir_or_log(path: &Path) {
     }
 }
 
+/// The current working directory, logging to stderr and falling back to an
+/// empty path when `current_dir` fails (rare, but previously swallowed silently).
+fn current_dir_or_log() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("tilth: failed to read current dir: {e}");
+            PathBuf::new()
+        }
+    }
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format.
 ///
@@ -121,7 +133,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             chdir_or_log(s);
         }
     } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = current_dir_or_log();
         if let Some(root) = crate::lang::package_root(&cwd) {
             chdir_or_log(root);
         }
@@ -272,7 +284,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
                 String::new()
             } else {
-                let cwd = std::env::current_dir().unwrap_or_default();
+                let cwd = current_dir_or_log();
                 crate::overview::fingerprint(&cwd)
             };
             let instructions = build_instructions(edit_mode, &overview);

@@ -74,8 +74,6 @@ fn code_lang(path: &Path) -> Option<Lang> {
         | FileType::StructuredData
         | FileType::Tabular
         | FileType::Log
-        | FileType::Generated
-        | FileType::Binary
         | FileType::Other => None,
     }
 }
