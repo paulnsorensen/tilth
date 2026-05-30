@@ -613,7 +613,7 @@ mod tests {
     // Restored from pre-merge 3801a4c (dropped by the #35 upstream merge).
     // These guard every behavior the batch-only read revert restored.
 
-    /// Helper: parse the first line of a tool_read response as JSON when the
+    /// Helper: parse the first line of a `tool_read` response as JSON when the
     /// header is present. Returns `None` when the response body has no JSON
     /// header (full content with no since/view-meta).
     fn parse_first_line_json(out: &str) -> Option<serde_json::Value> {
@@ -999,7 +999,7 @@ mod tests {
         assert!(out.contains("hello world"), "expected body: {out}");
     }
 
-    /// `tilth_read` `path#n` (FromLine) suffix returns from line n to end.
+    /// `tilth_read` `path#n` (`FromLine`) suffix returns from line n to end.
     #[test]
     fn tool_read_from_line_suffix() {
         let dir = tempfile::tempdir().unwrap();
@@ -1444,7 +1444,7 @@ mod tests {
         // for it to find a non-zero cut point.
         let mut src = String::new();
         for i in 0..100 {
-            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+            write!(src, "fn f{i}() {{\n    let l = {i};\n}}\n\n").unwrap();
         }
         std::fs::write(&p, src).unwrap();
         let args = serde_json::json!({
@@ -1483,7 +1483,7 @@ mod tests {
         let p = dir.path().join("big.rs");
         let mut src = String::new();
         for i in 0..400 {
-            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+            write!(src, "fn f{i}() {{\n    let l = {i};\n}}\n\n").unwrap();
         }
         std::fs::write(&p, src).unwrap();
         let budget = 500u64;
@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     /// Boundary: a mixed parse-error + good-file batch at the wire layer.
-    /// The record_read gate sits in `tool_write`, not in `apply_batch`, so it
+    /// The `record_read` gate sits in `tool_write`, not in `apply_batch`, so it
     /// needs explicit wire-level coverage.
     #[test]
     fn tool_write_mixed_parse_error_and_good_file_records_only_good() {
@@ -2158,8 +2158,6 @@ mod tests {
     fn tool_write_auto_fix_shift_returns_fresh_region_not_relocation() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("shift.txt");
-
-        use std::fmt::Write as _;
 
         // C0: TARGET_BODY_TOKEN at line 10.
         let mut c0 = String::new();
@@ -2705,7 +2703,7 @@ mod tests {
             .write(true)
             .open(&path_old)
             .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_secs(900_000_000))
+            .set_modified(UNIX_EPOCH + Duration::from_hours(250_000))
             .unwrap();
         std::fs::File::options()
             .write(true)
@@ -2741,7 +2739,7 @@ mod tests {
         );
     }
 
-    /// Spec criterion 4: in edit_mode, expanded search source lines carry
+    /// Spec criterion 4: in `edit_mode`, expanded search source lines carry
     /// `<line>:<hash>` prefixes (no leading gutter), ready to round-trip
     /// through `tilth_write` hash anchors.
     #[test]
