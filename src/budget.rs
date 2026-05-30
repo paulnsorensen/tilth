@@ -136,17 +136,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_info_no_newline_at_all_does_not_panic() {
-        // Issue #39 bug 2: when the whole output has no `\n`, `header_end = 0`,
-        // `body` is the entire output, and all three `rfind`s return None — so
-        // the fallback (`.unwrap_or(safe_max)`) is what prevents `&body[..max_bytes]`
-        // from slicing mid-codepoint. Use a 3-byte codepoint (☃ U+2603): since
-        // `max_bytes = content_budget * 4` is always a multiple of 4, an unclamped
-        // `&body[..max_bytes]` lands mid-☃ — a 4-byte char (🦀) would stay aligned
-        // and let the pre-fix code pass vacuously.
-        let input: String = "☃".repeat(500); // 1500 bytes, not one newline
+    fn apply_with_info_mixed_width_no_newline_does_not_panic() {
+        // Issue #39 bug 2: with no `\n` anywhere, `header_end = 0`, `body` is the
+        // whole output, and all three `rfind`s return None — so `.unwrap_or(safe_max)`
+        // is the only thing keeping `&body[..max_bytes]` off a mid-codepoint slice.
+        //
+        // `max_bytes = content_budget * 4` is always a multiple of 4, so an all-🦀
+        // (4-byte) body stays perfectly aligned and can never witness the panic.
+        // Mixing 1/2/3/4-byte codepoints — ASCII, é (2B), ☃ (3B), 🦀 (4B) — knocks
+        // the char boundaries off the ×4 grid so the unclamped cut lands inside a
+        // codepoint (here, mid-🦀 at bytes 122..126).
+        let unit = "ab🦀cd☃é🦀x! "; // 20 bytes, mixed width, no newline
+        let input = unit.repeat(100); // 2000 bytes
         assert!(!input.contains('\n'), "test input must have no newline");
-        let (out, info) = apply_with_info(&input, 100);
+
+        // Mirror apply_with_info's budget math (header_reserve = 50, ×4 inverse of
+        // estimate_tokens) and assert the pre-fix cut is genuinely mid-codepoint, so
+        // this test can never silently go vacuous the way an all-🦀 body would.
+        let budget = 81u64;
+        let max_bytes = (budget as usize - 50) * 4; // = 124
+        assert!(
+            !input.is_char_boundary(max_bytes),
+            "vacuous: max_bytes={max_bytes} sits on a char boundary — pick a mix that misaligns"
+        );
+
+        let (out, info) = apply_with_info(&input, budget);
         let info = info.expect("must truncate on tight budget");
         assert!(info.at_line >= 1, "line accounting stays sane");
         assert!(out.contains("truncated"), "marker line missing: {out}");
