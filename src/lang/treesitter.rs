@@ -49,12 +49,12 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     // Try standard field names
     for field in &["name", "identifier", "declarator"] {
         if let Some(child) = node.child_by_field_name(field) {
-            let text = node_text_simple(child, lines);
+            let text = node_text_simple(child, lines, NodeTextMode::Full);
             if !text.is_empty() {
                 // For variable_declarator, get the identifier inside
                 if child.kind().contains("declarator") {
                     if let Some(id) = child.child_by_field_name("name") {
-                        return Some(node_text_simple(id, lines));
+                        return Some(node_text_simple(id, lines, NodeTextMode::Full));
                     }
                 }
                 return Some(text);
@@ -81,7 +81,7 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         for child in node.children(&mut cursor) {
             if child.kind() == "variable_declarator" {
                 if let Some(name_node) = child.child_by_field_name("name") {
-                    let text = node_text_simple(name_node, lines);
+                    let text = node_text_simple(name_node, lines, NodeTextMode::Full);
                     if !text.is_empty() {
                         return Some(text);
                     }
@@ -93,11 +93,26 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     None
 }
 
-/// Get the text of a single-line node from pre-split source lines.
+/// Controls how [`node_text_simple`] renders a node that spans multiple lines.
+#[derive(Clone, Copy)]
+pub(crate) enum NodeTextMode {
+    /// Return the node's start line untruncated.
+    Full,
+    /// Truncate the node's start line to roughly 80 characters.
+    Truncated,
+}
+
+/// Returns a node's text from pre-split source lines.
 ///
-/// Returns the text slice for single-line nodes, or the text from the start
-/// column to end-of-line for multi-line nodes.
-pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> String {
+/// For a single-line node, returns its exact slice. For a multi-line node,
+/// returns only the start line (start column to end-of-line) — never the full
+/// multi-line span; `mode` then decides whether that start line is returned in
+/// full or truncated.
+pub(crate) fn node_text_simple(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    mode: NodeTextMode,
+) -> String {
     let row = node.start_position().row;
     let col_start = node.start_position().column;
     let end_row = node.end_position().row;
@@ -105,7 +120,17 @@ pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> Strin
         let col_end = node.end_position().column.min(lines[row].len());
         lines[row][col_start..col_end].to_string()
     } else if row < lines.len() {
-        lines[row][col_start..].to_string()
+        let text = &lines[row][col_start..];
+        match mode {
+            NodeTextMode::Full => text.to_string(),
+            NodeTextMode::Truncated => {
+                if text.len() > 80 {
+                    format!("{}...", crate::types::truncate_str(text, 77))
+                } else {
+                    text.to_string()
+                }
+            }
+        }
     } else {
         String::new()
     }
@@ -115,13 +140,13 @@ pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> Strin
 /// Returns None for inherent impls (no trait).
 pub(crate) fn extract_impl_trait(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let trait_node = node.child_by_field_name("trait")?;
-    Some(node_text_simple(trait_node, lines))
+    Some(node_text_simple(trait_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implementing type from Rust `impl ... for Type` node.
 pub(crate) fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let type_node = node.child_by_field_name("type")?;
-    Some(node_text_simple(type_node, lines))
+    Some(node_text_simple(type_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implemented interface names from TS/Java class declaration.
@@ -137,7 +162,7 @@ pub(crate) fn extract_implemented_interfaces(
             let mut inner = child.walk();
             for ident in child.children(&mut inner) {
                 if ident.kind().contains("identifier") {
-                    let text = node_text_simple(ident, lines);
+                    let text = node_text_simple(ident, lines, NodeTextMode::Full);
                     if !text.is_empty() {
                         interfaces.push(text);
                     }
@@ -193,7 +218,7 @@ pub(crate) fn is_elixir_definition(node: tree_sitter::Node, lines: &[&str]) -> b
     let Some(target) = node.child_by_field_name("target") else {
         return false;
     };
-    let kw = node_text_simple(target, lines);
+    let kw = node_text_simple(target, lines, NodeTextMode::Full);
     ELIXIR_DEFINITION_TARGETS.contains(&kw.as_str())
 }
 
@@ -207,7 +232,7 @@ pub(crate) fn extract_elixir_definition_name(
     lines: &[&str],
 ) -> Option<String> {
     let target = node.child_by_field_name("target")?;
-    let kw = node_text_simple(target, lines);
+    let kw = node_text_simple(target, lines, NodeTextMode::Full);
     let args = elixir_arguments(node)?;
 
     match kw.as_str() {
@@ -219,7 +244,7 @@ pub(crate) fn extract_elixir_definition_name(
             let mut cursor = args.walk();
             for child in args.children(&mut cursor) {
                 if child.is_named() {
-                    return Some(node_text_simple(child, lines));
+                    return Some(node_text_simple(child, lines, NodeTextMode::Full));
                 }
             }
             None
@@ -260,8 +285,8 @@ pub(crate) fn elixir_extract_func_head_name(
     match node.kind() {
         "call" => node
             .child_by_field_name("target")
-            .map(|t| node_text_simple(t, lines)),
-        "identifier" => Some(node_text_simple(node, lines)),
+            .map(|t| node_text_simple(t, lines, NodeTextMode::Full)),
+        "identifier" => Some(node_text_simple(node, lines, NodeTextMode::Full)),
         "binary_operator" => {
             // Guard clause: `foo(x) when x > 0` → left is the function head
             let left = node.child_by_field_name("left")?;
@@ -276,7 +301,7 @@ pub(crate) fn elixir_definition_weight(node: tree_sitter::Node, lines: &[&str]) 
     let Some(target) = node.child_by_field_name("target") else {
         return 50;
     };
-    let kw = node_text_simple(target, lines);
+    let kw = node_text_simple(target, lines, NodeTextMode::Full);
     match kw.as_str() {
         "defmodule" | "defprotocol" | "def" | "defp" | "defmacro" | "defmacrop" | "defguard"
         | "defguardp" | "defdelegate" => 100,
@@ -311,5 +336,38 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         "lexical_declaration" | "variable_declaration" => 40,
         "export_statement" => 30,
         _ => 50,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_text_mode_controls_multiline_truncation() {
+        let first_line =
+            "pub fn very_long_function_name_with_enough_characters_to_force_truncation_for_outline_test() {";
+        let source = format!("{first_line}\n}}\n");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust parser should load");
+        let tree = parser
+            .parse(&source, None)
+            .expect("rust source should parse");
+        let node = tree
+            .root_node()
+            .named_child(0)
+            .expect("source should contain a function node");
+
+        assert_eq!(
+            node_text_simple(node, &lines, NodeTextMode::Full),
+            first_line
+        );
+        assert_eq!(
+            node_text_simple(node, &lines, NodeTextMode::Truncated),
+            format!("{}...", &first_line[..77])
+        );
     }
 }

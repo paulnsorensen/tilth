@@ -144,6 +144,7 @@ pub(crate) fn find_callers_batch(
                 return ignore::WalkState::Continue;
             };
 
+            let content = Arc::new(content);
             let file_callers =
                 find_callers_treesitter_batch(path, targets, &ts_lang, &content, lang);
 
@@ -170,7 +171,7 @@ fn find_callers_treesitter_batch(
     path: &Path,
     targets: &HashSet<String>,
     ts_lang: &tree_sitter::Language,
-    content: &str,
+    content: &Arc<String>,
     lang: crate::types::Lang,
 ) -> Vec<(String, CallerMatch)> {
     // Get the query string for this language
@@ -183,15 +184,13 @@ fn find_callers_treesitter_batch(
         return Vec::new();
     }
 
-    let Some(tree) = parser.parse(content, None) else {
+    let content_str = content.as_str();
+    let Some(tree) = parser.parse(content_str, None) else {
         return Vec::new();
     };
 
-    let content_bytes = content.as_bytes();
-    let lines: Vec<&str> = content.lines().collect();
-
-    // One Arc per file — all call sites share the same allocation.
-    let shared_content: Arc<String> = Arc::new(content.to_string());
+    let content_bytes = content_str.as_bytes();
+    let lines: Vec<&str> = content_str.lines().collect();
 
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
@@ -248,7 +247,7 @@ fn find_callers_treesitter_batch(
                         calling_function,
                         call_text,
                         caller_range,
-                        content: Arc::clone(&shared_content),
+                        content: Arc::clone(content),
                     },
                 ));
             }
@@ -614,6 +613,40 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_matches_reuse_original_file_content_arc() {
+        let source = Arc::new(
+            "fn callee() {}\n\nfn caller() {\n    callee();\n    callee();\n}\n".to_string(),
+        );
+        let targets = HashSet::from(["callee".to_string()]);
+        let lang = crate::types::Lang::Rust;
+        let ts_lang = outline_language(lang).expect("rust grammar should be available");
+
+        let matches = find_callers_treesitter_batch(
+            Path::new("sample.rs"),
+            &targets,
+            &ts_lang,
+            &source,
+            lang,
+        );
+
+        let mut actual = Vec::new();
+        for (target, caller) in &matches {
+            actual.push((target.as_str(), caller.line, caller.call_text.as_str()));
+        }
+        actual.sort_by_key(|&(_, line, _)| line);
+        assert_eq!(
+            actual,
+            vec![("callee", 4, "callee();"), ("callee", 5, "callee();")]
+        );
+        for (_, caller) in &matches {
+            assert!(
+                Arc::ptr_eq(&caller.content, &source),
+                "caller content should reuse the Arc created for the file"
+            );
+        }
+    }
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {

@@ -22,16 +22,11 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let entries = walk_top_level(root, &lines, lang);
 
-    format_entries(&entries, &lines, max_lines, lang)
+    format_entries(&entries, max_lines, lang)
 }
 
 /// Format outline entries into the spec'd output format.
-fn format_entries(
-    entries: &[OutlineEntry],
-    _lines: &[&str],
-    max_lines: usize,
-    lang: Lang,
-) -> String {
+fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> String {
     let mut out = Vec::new();
     let mut import_groups: Vec<&str> = Vec::new();
     // Track the start line of the first import in the current group.
@@ -205,13 +200,29 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
 }
 
 /// Fallback when tree-sitter grammar isn't available.
-fn fallback_outline(content: &str, _max_lines: usize) -> String {
-    super::fallback::head_tail(content)
+fn fallback_outline(content: &str, max_lines: usize) -> String {
+    if max_lines == usize::MAX {
+        return super::fallback::head_tail(content);
+    }
+
+    let mut out = Vec::new();
+    for line in content.lines().take(max_lines) {
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_outline_respects_max_lines() {
+        let content = "line 1\nline 2\nline 3\nline 4";
+        let outline = fallback_outline(content, 2);
+
+        assert_eq!(outline, "line 1\nline 2");
+    }
 
     #[test]
     fn scala_outline_constructs() {
