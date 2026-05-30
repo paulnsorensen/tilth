@@ -43,6 +43,7 @@ from .gin_edit_tasks import (
 )
 from .gin_multi_edit_tasks import GinMultiContextTask
 from .gin_render_cascade_tasks import GinRenderContractCascadeTask
+from .gin_render_runtime_tasks import GinRenderRuntimeCascadeTask
 from .express_tasks import (
     ExpressJsonSendTask,
     ExpressRenderChainTask,
@@ -103,6 +104,7 @@ TASKS = {
     "gin_edit_context_reset": GinEditContextResetTask(),
     "gin_edit_multi_context": GinMultiContextTask(),
     "gin_edit_render_cascade": GinRenderContractCascadeTask(),
+    "gin_edit_render_runtime": GinRenderRuntimeCascadeTask(),
     # express (JavaScript)
     "express_json_send": ExpressJsonSendTask(),
     "express_render_chain": ExpressRenderChainTask(),
