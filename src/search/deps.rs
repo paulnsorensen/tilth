@@ -551,7 +551,7 @@ fn apply_budget_truncation(
         |hdr, _ul, _ue, _pd, _td, _bn, _sc| hdr.to_string(),
     ];
 
-    for candidate_fn in candidates {
+    for (level, candidate_fn) in candidates.iter().enumerate() {
         let candidate = candidate_fn(
             header,
             uses_local_full,
@@ -563,12 +563,20 @@ fn apply_budget_truncation(
         );
         let tokens = crate::types::estimate_tokens(candidate.len() as u64) as usize;
         if tokens <= budget {
-            return candidate;
+            return if level == 0 {
+                candidate
+            } else {
+                format!(
+                    "{candidate}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
+                )
+            };
         }
     }
 
-    // Absolute fallback: just the header
-    header.to_string()
+    // Absolute fallback: header only.
+    format!(
+        "{header}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
+    )
 }
 
 /// Join non-empty parts with double newlines.

@@ -12,7 +12,7 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
-use super::{apply_budget, resolve_scope};
+use super::resolve_scope;
 
 pub(in crate::mcp) fn tool_search(
     args: &Value,
@@ -43,6 +43,16 @@ pub(in crate::mcp) fn tool_search(
             queries_arr.len()
         ));
     }
+
+    // Batch budget: split the total across queries so every query is
+    // represented (no silent trailing drops). Per-query truncation cites the
+    // total `budget` as the lever; an aggregate ceiling caps the whole batch.
+    let budget = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let per_query = crate::budget::item_budget(budget, queries_arr.len());
+
     let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
     for (i, q) in queries_arr.iter().enumerate() {
         let qstr = q
@@ -63,26 +73,25 @@ pub(in crate::mcp) fn tool_search(
         if let Some(kind) = kind {
             sub.insert("kind".into(), Value::String(kind.to_string()));
         }
-        for k in ["expand", "scope", "budget", "if_modified_since"] {
+        for k in ["expand", "scope", "if_modified_since"] {
             if let Some(v) = args.get(k) {
                 sub.insert(k.into(), v.clone());
             }
         }
         let sub_val = Value::Object(sub);
         let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
-        parts.push(format!("## query: {qstr}\n\n{body}"));
+        let headed = format!("## query: {qstr}\n\n{body}");
+        parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
     let combined = parts.join("\n\n---\n\n");
     let (scope, _) = resolve_scope(args);
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
-    // Per-entry budget caps each query in isolation; cap the concatenated
-    // batch once more so an N-entry batch can't return ~N× the budget.
-    let combined = apply_budget(
-        &combined,
-        args.get("budget").and_then(serde_json::Value::as_u64),
-    );
+    // Aggregate ceiling: the per-query split already bounds the total, but
+    // header/separator overhead can nudge it over — cap once more so the
+    // batch can never exceed the host response limit.
+    let combined = crate::budget::apply(&combined, budget);
     Ok(crate::mcp::iso::with_meta_header(
         Some(now),
         serde_json::Map::new(),
@@ -113,7 +122,6 @@ fn tool_search_single(
         .map(PathBuf::from);
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
         None | Some("any") => {
@@ -234,7 +242,7 @@ fn tool_search_single(
     .map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&output, budget));
+    result.push_str(&output);
     Ok(result)
 }
 
