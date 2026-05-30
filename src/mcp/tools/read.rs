@@ -53,16 +53,15 @@ pub(in crate::mcp) fn tool_read(
         ));
     }
 
-    let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
 
-    // Multi-file batch read (capped at 20 to bound I/O). section/sections are
-    // single-file controls — reject them rather than silently ignore. `mode`
+    // Multi-file batch read (capped at 20 to bound I/O). `sections` is a
+    // single-file control — reject it rather than silently ignore. `mode`
     // (and its legacy `full` alias) reshape each file, so they're fine in batch.
     if paths_arr.len() > 1 {
-        if section.is_some() || sections_arr.is_some() {
+        if sections_arr.is_some() {
             return Err(
-                "section / sections apply to a single file — pass exactly one path in `paths` to use them"
+                "sections applies to a single file — pass exactly one path in `paths` to use it"
                     .into(),
             );
         }
@@ -114,16 +113,12 @@ pub(in crate::mcp) fn tool_read(
         .ok_or("paths must be an array of strings")?;
     let path = PathBuf::from(path_str);
 
-    if section.is_some() && sections_arr.is_some() {
-        return Err("provide either section (single) or sections (array), not both".into());
-    }
-
     // signature/stripped reshape the whole file; a section selection has no
     // meaning there. Error rather than silently dropping the mode.
-    if (force_signature || force_stripped) && (section.is_some() || sections_arr.is_some()) {
+    if (force_signature || force_stripped) && sections_arr.is_some() {
         return Err(format!(
-            "mode={mode_str} cannot be combined with section/sections — \
-             {mode_str} reshapes the whole file. Drop section/sections or pick mode=auto/full."
+            "mode={mode_str} cannot be combined with sections — \
+             {mode_str} reshapes the whole file. Drop sections or pick mode=auto/full."
         ));
     }
 
@@ -155,21 +150,21 @@ pub(in crate::mcp) fn tool_read(
     }
 
     session.record_read(&path);
-    let mut output = if section.is_none() && force_signature {
+    let mut output = if force_signature {
         read_signature_file(&path, cache)
             .map(|(body, _)| body)
             .map_err(|e| e.to_string())?
-    } else if section.is_none() && force_stripped {
+    } else if force_stripped {
         read_stripped_file(&path, cache)
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
+        crate::read::read_file(&path, None, force_full, cache, edit_mode)
             .map_err(|e| e.to_string())?
     };
 
-    // Append related-file hint for outlined code files (not section reads, not batch).
-    if section.is_none() && crate::read::would_outline(&path) {
+    // Append related-file hint for outlined code files (not batch reads).
+    if crate::read::would_outline(&path) {
         let related = crate::read::imports::resolve_related_files(&path);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
@@ -514,8 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_read_signature_mode_rejects_section() {
-        // Combining a reshaping mode with section must error, not silently drop the
+    fn tool_read_signature_mode_rejects_sections() {
+        // Combining a reshaping mode with sections must error, not silently drop the
         // mode (which would return a section slice and ignore signature entirely).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conflict.rs");
@@ -523,15 +518,15 @@ mod tests {
         let args = serde_json::json!({
             "paths": [path.to_str().unwrap()],
             "mode": "signature",
-            "section": "1-1",
+            "sections": ["1-1"],
         });
         let cache = OutlineCache::new();
         let session = Session::new();
 
         let err =
-            tool_read(&args, &cache, &session, false).expect_err("signature + section must error");
+            tool_read(&args, &cache, &session, false).expect_err("signature + sections must error");
         assert!(
-            err.contains("signature") && err.contains("section"),
+            err.contains("signature") && err.contains("sections"),
             "error must name the conflict: {err}"
         );
     }
