@@ -93,13 +93,21 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     None
 }
 
+/// Controls how [`node_text_simple`] renders a node that spans multiple lines.
 #[derive(Clone, Copy)]
 pub(crate) enum NodeTextMode {
+    /// Return the node's start line untruncated.
     Full,
+    /// Truncate the node's start line to roughly 80 characters.
     Truncated,
 }
 
-/// Get the text of a node from pre-split source lines.
+/// Returns a node's text from pre-split source lines.
+///
+/// For a single-line node, returns its exact slice. For a multi-line node,
+/// returns only the start line (start column to end-of-line) — never the full
+/// multi-line span; `mode` then decides whether that start line is returned in
+/// full or truncated.
 pub(crate) fn node_text_simple(
     node: tree_sitter::Node,
     lines: &[&str],

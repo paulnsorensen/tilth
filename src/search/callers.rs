@@ -635,6 +635,7 @@ mod tests {
         for (target, caller) in &matches {
             actual.push((target.as_str(), caller.line, caller.call_text.as_str()));
         }
+        actual.sort_by_key(|&(_, line, _)| line);
         assert_eq!(
             actual,
             vec![("callee", 4, "callee();"), ("callee", 5, "callee();")]
