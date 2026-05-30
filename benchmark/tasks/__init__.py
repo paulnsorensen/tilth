@@ -42,6 +42,7 @@ from .gin_edit_tasks import (
     GinEditContextResetTask,
 )
 from .gin_multi_edit_tasks import GinMultiContextTask
+from .gin_render_cascade_tasks import GinRenderContractCascadeTask
 from .express_tasks import (
     ExpressJsonSendTask,
     ExpressRenderChainTask,
@@ -101,6 +102,7 @@ TASKS = {
     "gin_edit_abort_check": GinEditAbortCheckTask(),
     "gin_edit_context_reset": GinEditContextResetTask(),
     "gin_edit_multi_context": GinMultiContextTask(),
+    "gin_edit_render_cascade": GinRenderContractCascadeTask(),
     # express (JavaScript)
     "express_json_send": ExpressJsonSendTask(),
     "express_render_chain": ExpressRenderChainTask(),
