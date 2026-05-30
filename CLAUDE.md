@@ -84,14 +84,16 @@ Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<vers
 
 ## Benchmarks
 
-26 code navigation tasks across 4 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings.
+48 tasks across a synthetic repo and 4 real repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust), spanning code navigation, multi-file edits, diff comprehension, and symbol "grok" understanding. Navigation/grok tasks run headless `claude -p` and check the answer against ground-truth strings; edit/diff tasks inject mutations and pass only when the task's `test_command` goes green.
 
 **Setup** (one-time — clones repos at pinned commits):
+
 ```bash
 python benchmark/fixtures/setup.py
 ```
 
 **Run** (from project root — works inside Conductor/Claude Code sessions, `run.py` strips `CLAUDECODE` env var):
+
 ```bash
 # Full suite: all tasks, baseline + tilth, 3 reps per task
 python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all
@@ -107,6 +109,7 @@ python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_tr
 Hard tasks take 2-5 min each. Run in background for multi-task suites. Do NOT pipe output through `head` or similar — it breaks the pipe and causes timeouts.
 
 **Analyze**:
+
 ```bash
 python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 python benchmark/compare_versions.py old.jsonl new.jsonl
@@ -124,12 +127,14 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 ## MCP instructions
 
 Server instructions sent via MCP protocol live in `prompts/`:
+
 - `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
 - `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
 
 `src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
+
 - Instruction positioning (top-weighted — put important guidance first)
 - Framing ("DO NOT" works better than "IMPORTANT:" for weaker models)
 - Concrete examples (tool call patterns, not abstract descriptions)
