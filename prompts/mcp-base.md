@@ -30,7 +30,7 @@ mode: auto (default) | full (force full content) | signature (outline, no bodies
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
 Output: <line>:<hash>|<content> per line.
 
-tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, pwd, tree, and the host Glob tool.
+tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, tree, and the host Glob tool.
 Batch-only: ALWAYS pass patterns: [...] as an array, even for one glob (e.g. patterns: ["*.rs"] or ["*.rs", "*.toml"]). A singular `pattern` is not accepted.
 depth: cap directory depth (1 = top-level only).
 Output: tree with per-file (~<token_count> tokens) and per-directory rollups.

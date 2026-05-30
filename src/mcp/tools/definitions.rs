@@ -473,8 +473,6 @@ mod tests {
         }
     }
 
-    /// Tool names must be unique. A duplicate function name is itself an
-    /// invalid request under OpenAI/Codex. Regression for the duplicate
     /// `tilth_files` was consolidated into `tilth_list`; it must no longer be
     /// advertised so clients can't discover a removed tool.
     #[test]
@@ -493,6 +491,9 @@ mod tests {
         }
     }
 
+    /// Tool names must be unique. A duplicate function name is itself an
+    /// invalid request under OpenAI/Codex. Regression for the duplicate
+    /// `tilth_list` registration removed alongside #47.
     #[test]
     fn tool_names_are_unique() {
         let mut seen = std::collections::HashSet::new();

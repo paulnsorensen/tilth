@@ -142,7 +142,8 @@ mod tests {
             "After chdir to project, . should resolve correctly"
         );
 
-        // Verify tilth_list would search in the project, not /
+        // Confirm the working dir resolved to the project, not / — so
+        // scope-relative lookups land in the right tree.
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(cwd, project_path.canonicalize().unwrap());
 
