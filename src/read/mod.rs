@@ -1,3 +1,4 @@
+pub mod fuzzy_path;
 pub mod imports;
 pub mod outline;
 
@@ -171,6 +172,73 @@ pub fn read_file(
     };
     let header = format::file_header(path, byte_len, line_count, mode);
     Ok(format!("{header}\n\n{outline}"))
+}
+
+/// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
+///
+/// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
+/// relative) query against the gitignore-pruned tree. A confident `Resolved`
+/// auto-opens the winning file with a `# <real-path> (corrected from "<query>")`
+/// header; `Suggestions` enrich the `NotFound` with a ranked "did you mean"
+/// list; `None` returns the unchanged `NotFound` (today's behaviour). A
+/// successful read never walks — it returns `read_file`'s result untouched.
+/// Reduce `path` to a scope-relative query string for fuzzy matching.
+///
+/// Candidates from the walker are relative to `scope`, so the query must be too.
+/// Stripping the scope prefix handles the common case, but a *relative* `scope`
+/// (e.g. the MCP layer's `"."`) strips nothing from an absolute caller path, so
+/// the query would stay absolute and never subsequence-match a relative
+/// candidate. When the strip leaves the query absolute, re-strip against the
+/// canonical scope so an absolute MCP path still reduces to the relative form.
+fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a, str> {
+    let stripped = path.strip_prefix(scope).unwrap_or(path);
+    if stripped.is_absolute() {
+        if let Ok(abs_scope) = scope.canonicalize() {
+            return stripped
+                .strip_prefix(&abs_scope)
+                .unwrap_or(stripped)
+                .to_string_lossy();
+        }
+    }
+    stripped.to_string_lossy()
+}
+
+pub fn read_file_resolving(
+    path: &Path,
+    section: Option<&str>,
+    full: bool,
+    cache: &OutlineCache,
+    edit_mode: bool,
+    scope: &Path,
+) -> Result<String, TilthError> {
+    // Only NotFound triggers a walk; every other outcome (success or other
+    // error) returns untouched, so a successful read never pays for the tree walk.
+    let (missing, suggestion) = match read_file(path, section, full, cache, edit_mode) {
+        Err(TilthError::NotFound { path, suggestion }) => (path, suggestion),
+        other => return other,
+    };
+
+    // The query is the scope-relative path the caller asked for.
+    let query = scope_relative_query(path, scope);
+    match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
+        fuzzy_path::FuzzyResolution::Resolved(hit) => {
+            hit.log_auto_open(&query);
+            let real = scope.join(&hit.path);
+            let body = read_file(&real, section, full, cache, edit_mode)?;
+            Ok(format!(
+                "# {} (corrected from \"{query}\")\n\n{body}",
+                hit.path.display()
+            ))
+        }
+        fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
+            path: missing,
+            suggestion: Some(s.join(", ")),
+        }),
+        fuzzy_path::FuzzyResolution::None => Err(TilthError::NotFound {
+            path: missing,
+            suggestion,
+        }),
+    }
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?
@@ -782,6 +850,115 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         path
+    }
+
+    #[test]
+    fn read_file_resolving_auto_opens_with_correction_header() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
+        std::fs::write(
+            dir.path().join("src/search/symbol.rs"),
+            "pub fn find() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub mod search;\n").unwrap();
+
+        let cache = OutlineCache::new();
+        // Basename-only miss resolves to the unique real file.
+        let missing = dir.path().join("symbol.rs");
+        let out = read_file_resolving(&missing, None, false, &cache, false, dir.path()).unwrap();
+
+        assert!(
+            out.contains("src/search/symbol.rs (corrected from \"symbol.rs\")"),
+            "expected correction header, got: {out}"
+        );
+        assert!(
+            out.contains("pub fn find"),
+            "expected resolved file body: {out}"
+        );
+    }
+
+    #[test]
+    fn scope_relative_query_strips_absolute_under_dot_scope() {
+        // The MCP read entry passes scope="." with a caller-supplied path that may
+        // be absolute. `strip_prefix(".")` strips nothing, so without the canonical
+        // fallback the query would stay absolute and never match a scope-relative
+        // candidate. Reads (not mutates) cwd, so it's safe under parallel tests.
+        let cwd = std::env::current_dir().unwrap();
+        let absolute = cwd.join("src/serch/symbol.rs");
+        let query = scope_relative_query(&absolute, Path::new("."));
+        assert_eq!(
+            query, "src/serch/symbol.rs",
+            "absolute path under a '.' scope must reduce to the scope-relative query"
+        );
+    }
+
+    #[test]
+    fn scope_relative_query_absolute_scope_and_relative_input_unchanged() {
+        // Absolute scope + absolute path under it strips directly (the existing
+        // tempdir tests rely on this; no canonicalization, so macOS /var symlinks
+        // don't bite). A relative input is returned untouched.
+        let scope = Path::new("/abs/proj");
+        assert_eq!(
+            scope_relative_query(Path::new("/abs/proj/src/foo.rs"), scope),
+            "src/foo.rs"
+        );
+        assert_eq!(
+            scope_relative_query(Path::new("src/bar.rs"), scope),
+            "src/bar.rs"
+        );
+    }
+
+    #[test]
+    fn read_file_resolving_exact_path_is_byte_identical() {
+        // An existing path must not walk and must match plain read_file exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("present.rs");
+        std::fs::write(&real, "fn main() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let plain = read_file(&real, None, false, &cache, false).unwrap();
+        let resolving = read_file_resolving(&real, None, false, &cache, false, dir.path()).unwrap();
+        assert_eq!(plain, resolving, "happy-path read must be byte-identical");
+    }
+
+    #[test]
+    fn read_file_resolving_ambiguous_enriches_notfound_suggestion() {
+        // An ambiguous basename miss must NOT auto-open; it returns NotFound
+        // enriched with the ranked candidates as a "did you mean" list.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("a/mod.rs"), "// a\n").unwrap();
+        std::fs::write(dir.path().join("b/mod.rs"), "// b\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let missing = dir.path().join("mod.rs");
+        let err = read_file_resolving(&missing, None, false, &cache, false, dir.path())
+            .expect_err("ambiguous basename must stay NotFound, not auto-open");
+        let TilthError::NotFound { suggestion, .. } = err else {
+            panic!("expected NotFound, got: {err:?}");
+        };
+        let suggestion = suggestion.expect("ambiguous miss must carry suggestions");
+        assert!(
+            suggestion.contains("a/mod.rs") && suggestion.contains("b/mod.rs"),
+            "both candidates must appear in the suggestion: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn read_file_resolving_garbage_stays_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.rs"), "fn main() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let missing = dir.path().join("zzqq/nonexistent_xyzzy.bin");
+        let err = read_file_resolving(&missing, None, false, &cache, false, dir.path())
+            .expect_err("garbage path must stay NotFound");
+        assert!(
+            matches!(err, TilthError::NotFound { .. }),
+            "expected NotFound, got: {err:?}"
+        );
     }
 
     #[test]

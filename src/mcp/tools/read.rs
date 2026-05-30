@@ -231,8 +231,11 @@ pub(in crate::mcp) fn tool_read(
         return respond_stripped(&path, cache, budget);
     }
 
-    let mut output = crate::read::read_file(&path, None, force_full, cache, edit_mode)
-        .map_err(|e| e.to_string())?;
+    // Cold-path fuzzy resolution: the server has chdir'd to the project root, so
+    // the current directory is the scope for the gitignore-aware tree walk.
+    let mut output =
+        crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, Path::new("."))
+            .map_err(|e| e.to_string())?;
 
     // Append related-file hint for outlined code files.
     if crate::read::would_outline(&path) {
