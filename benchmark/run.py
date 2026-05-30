@@ -150,22 +150,13 @@ def run_single(
         ]
 
         # --bare strips slash commands, hooks, plugins, agents, and skills.
-        # Off by default because it also drops Grep/Glob from the built-in tool
-        # set, which makes baseline runs unfair. Opt in via --bare when you
-        # want a maximally stripped harness (e.g. measuring tilth in isolation).
+        # Opt in for a maximally stripped harness (e.g. measuring tilth in
+        # isolation). It does not touch the built-in tool set, so the --tools
+        # allowlist below governs Grep/Glob identically with or without --bare.
         if bare:
             cmd += ["--bare"]
 
-        # Build the --tools allowlist. In --bare mode, explicitly inject
-        # Grep/Glob for any mode that already allows built-ins, since bare
-        # strips plugin-provided tools and we want baseline/tilth to keep
-        # Grep/Glob for fair comparison. tilth_forced (mode.tools=[]) stays
-        # empty on purpose — that mode is meant to expose only tilth MCP.
         tools_list = list(mode.tools)
-        if bare and tools_list:
-            for t in ("Grep", "Glob"):
-                if t not in tools_list:
-                    tools_list.append(t)
 
         # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
         if tools_list:
