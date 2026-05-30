@@ -37,13 +37,34 @@ pub(in crate::mcp) fn tool_read(
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
 
-    // Multi-file batch read (capped at 20 to bound I/O)
-    if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
-        if paths_arr.len() > 20 {
-            return Err(format!(
-                "batch read limited to 20 files (got {})",
-                paths_arr.len()
-            ));
+    // Batch-only API: `paths` is required — pass a single-element array to read
+    // one file. The singular `path` parameter was removed; accepting both made
+    // agents guess which one each call wanted.
+    let paths_arr = args.get("paths").and_then(|v| v.as_array()).ok_or(
+        "missing required parameter: paths (array of file paths; use a single-element array to read one file)",
+    )?;
+    if paths_arr.is_empty() {
+        return Err("paths must contain at least one file path".into());
+    }
+    if paths_arr.len() > 20 {
+        return Err(format!(
+            "batch read limited to 20 files (got {})",
+            paths_arr.len()
+        ));
+    }
+
+    let section = args.get("section").and_then(|v| v.as_str());
+    let sections_arr = args.get("sections").and_then(|v| v.as_array());
+
+    // Multi-file batch read (capped at 20 to bound I/O). section/sections are
+    // single-file controls — reject them rather than silently ignore. `mode`
+    // (and its legacy `full` alias) reshape each file, so they're fine in batch.
+    if paths_arr.len() > 1 {
+        if section.is_some() || sections_arr.is_some() {
+            return Err(
+                "section / sections apply to a single file — pass exactly one path in `paths` to use them"
+                    .into(),
+            );
         }
 
         // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
@@ -87,14 +108,11 @@ pub(in crate::mcp) fn tool_read(
         return Ok(apply_budget(&combined, budget));
     }
 
-    // Single file read
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path (or use paths for batch read)")?;
+    // Single-file read (`paths` has exactly one entry).
+    let path_str = paths_arr[0]
+        .as_str()
+        .ok_or("paths must be an array of strings")?;
     let path = PathBuf::from(path_str);
-    let section = args.get("section").and_then(|v| v.as_str());
-    let sections_arr = args.get("sections").and_then(|v| v.as_array());
 
     if section.is_some() && sections_arr.is_some() {
         return Err("provide either section (single) or sections (array), not both".into());
@@ -289,7 +307,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
         });
         let cache = OutlineCache::new();
@@ -322,7 +340,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "stripped",
         });
         let cache = OutlineCache::new();
@@ -350,7 +368,7 @@ mod tests {
         let path = dir.path().join("any.rs");
         std::fs::write(&path, "fn f() {}\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "outline",
         });
         let cache = OutlineCache::new();
@@ -373,7 +391,7 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "alpha line\nbeta line\ngamma line\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
         });
         let cache = OutlineCache::new();
@@ -396,7 +414,7 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "alpha line\nbeta line\ngamma line\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "stripped",
         });
         let cache = OutlineCache::new();
@@ -428,21 +446,21 @@ mod tests {
         let session = Session::new();
 
         let via_flag = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap(), "full": true }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()], "full": true }),
             &cache,
             &session,
             false,
         )
         .expect("full:true read");
         let via_mode = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap(), "mode": "full" }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()], "mode": "full" }),
             &cache,
             &session,
             false,
         )
         .expect("mode:full read");
         let via_auto = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap() }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()] }),
             &cache,
             &session,
             false,
@@ -476,7 +494,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
             "full": true,
         });
@@ -503,7 +521,7 @@ mod tests {
         let path = dir.path().join("conflict.rs");
         std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
             "section": "1-1",
         });
