@@ -29,8 +29,6 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> File
             path: path.clone(),
             symbol_changes: Vec::new(),
             attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
         };
     }
 
@@ -224,8 +222,6 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 
@@ -239,8 +235,6 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 
@@ -254,8 +248,6 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: None,
     }
 }
 
@@ -281,8 +273,6 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 

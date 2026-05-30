@@ -93,7 +93,7 @@ fn extract_identifiers(content: &str) -> impl Iterator<Item = &str> {
 }
 
 /// States for the identifier extraction state machine.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum ScanState {
     /// Normal code scanning.
     Code,
