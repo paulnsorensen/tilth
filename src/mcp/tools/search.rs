@@ -117,10 +117,39 @@ fn tool_search_single(
 
     let output = match kind {
         None | Some("any") => {
-            session.record_search(query);
-            search_merged_default(
-                query, &scope, cache, session, bloom, expand, context, glob, edit_mode,
-            )
+            // Comma = multi-symbol lookup, identical to kind:symbol. Without this
+            // split the merged default searches the literal "a,b" string as one
+            // symbol (and as content), silently breaking the comma syntax the tool
+            // schema advertises under the default mode.
+            let symbols: Vec<&str> = query
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            match symbols.len() {
+                0 => return Err("missing required parameter: query".into()),
+                1 => {
+                    session.record_search(symbols[0]);
+                    search_merged_default(
+                        symbols[0], &scope, cache, session, bloom, expand, context, glob, edit_mode,
+                    )
+                }
+                2..=5 => {
+                    for q in &symbols {
+                        session.record_search(q);
+                    }
+                    crate::search::search_multi_symbol_expanded(
+                        &symbols, &scope, cache, session, bloom, expand, context, glob, false,
+                        edit_mode,
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "multi-symbol search limited to 5 queries (got {})",
+                        symbols.len()
+                    ))
+                }
+            }
         }
         Some("symbol") => {
             let queries: Vec<&str> = query
@@ -354,6 +383,41 @@ mod tests {
         assert!(
             !out.contains("\"alpha,beta\""),
             "comma query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// Regression: a comma query under the default (merged/`any`) kind must be
+    /// treated as a multi-symbol lookup, not searched as a literal "a,b" string.
+    /// Before the fix `search_merged_default` passed the raw comma string to
+    /// symbol + content search, so e.g. "Planner,planning_agent" found nothing
+    /// even though `Planner` existed.
+    #[test]
+    fn default_comma_query_finds_both_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        // No `kind` → default merged/any path.
+        let args = serde_json::json!({
+            "queries": [{"query": "alpha,beta"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(out.contains("alpha"), "missing alpha: {out}");
+        assert!(out.contains("beta"), "missing beta: {out}");
+        // The literal combined string must never be searched as one symbol.
+        assert!(
+            !out.contains("\"alpha,beta\""),
+            "comma query was treated as a literal symbol under default kind: {out}"
         );
     }
 
