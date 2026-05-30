@@ -180,7 +180,7 @@ fn main() {
                 }
             }
             Command::Overview => {
-                let cwd = std::env::current_dir().unwrap_or_default();
+                let cwd = current_dir_or_log();
                 let output = tilth::overview::fingerprint(&cwd);
                 if output.is_empty() {
                     eprintln!("No project fingerprint could be generated.");
@@ -335,7 +335,7 @@ fn main() {
             if scope_path.exists() {
                 scope_path
             } else {
-                let cwd_path = std::env::current_dir().unwrap_or_default().join(&query);
+                let cwd_path = current_dir_or_log().join(&query);
                 if cwd_path.exists() {
                     cwd_path
                 } else {
@@ -381,6 +381,16 @@ fn main() {
     };
 
     emit_result(result, &query, cli.json, is_tty);
+}
+
+fn current_dir_or_log() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("tilth: failed to read current dir: {e}");
+            PathBuf::new()
+        }
+    }
 }
 
 fn emit_result(

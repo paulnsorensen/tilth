@@ -577,6 +577,21 @@ mod tests {
     }
 
     #[test]
+    fn toml_section_replacement_keeps_multiline_arrays_intact() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = [\n  \"old-a\",\n  \"old-b\",\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n",
+        );
+
+        assert_eq!(
+            out,
+            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n[other]\nk = 1\n"
+        );
+    }
+
+    #[test]
     fn amp_resolve_host() {
         let info = resolve_host("amp").expect("amp should resolve");
         assert!(
