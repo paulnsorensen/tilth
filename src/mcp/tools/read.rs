@@ -146,8 +146,17 @@ pub(in crate::mcp) fn tool_read(
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
-            .map_err(|e| e.to_string())?
+        // scope is the process cwd: the MCP server chdir's to the project root at
+        // startup, so a relative "." anchors the cold-path fuzzy walk correctly.
+        crate::read::read_file_resolving(
+            &path,
+            section,
+            force_full,
+            cache,
+            edit_mode,
+            std::path::Path::new("."),
+        )
+        .map_err(|e| e.to_string())?
     };
 
     // Append related-file hint for outlined code files (not section reads, not batch).

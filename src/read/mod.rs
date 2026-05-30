@@ -1,3 +1,4 @@
+pub mod fuzzy_path;
 pub mod imports;
 pub mod outline;
 
@@ -215,6 +216,66 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     #[allow(clippy::cast_possible_truncation)]
     let level = query_level as u8;
     find_section(tree.root_node(), &lines, level, query_text)
+}
+
+/// Reduce a caller-supplied path to the scope-relative form fuzzy matching
+/// expects. Stripping the scope prefix handles the common case, but a
+/// *relative* `scope` (e.g. the MCP layer's `"."`) strips nothing from an
+/// absolute caller path, so the query would stay absolute and never
+/// subsequence-match a relative candidate. When the strip leaves the query
+/// absolute, re-strip against the canonical scope so an absolute MCP path
+/// still reduces to the relative form.
+fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a, str> {
+    let stripped = path.strip_prefix(scope).unwrap_or(path);
+    if stripped.is_absolute() {
+        if let Ok(abs_scope) = scope.canonicalize() {
+            return stripped
+                .strip_prefix(&abs_scope)
+                .unwrap_or(stripped)
+                .to_string_lossy();
+        }
+    }
+    stripped.to_string_lossy()
+}
+
+/// `read_file` wrapper that, on a `NotFound`, attempts fuzzy path resolution
+/// against the tree under `scope` and auto-opens the best-matching real file
+/// with a correction header. Only `NotFound` triggers the cold-path tree walk;
+/// every other outcome (success or other error) returns untouched, so a
+/// successful read never pays for the walk.
+pub fn read_file_resolving(
+    path: &Path,
+    section: Option<&str>,
+    full: bool,
+    cache: &OutlineCache,
+    edit_mode: bool,
+    scope: &Path,
+) -> Result<String, TilthError> {
+    let (missing, suggestion) = match read_file(path, section, full, cache, edit_mode) {
+        Err(TilthError::NotFound { path, suggestion }) => (path, suggestion),
+        other => return other,
+    };
+
+    let query = scope_relative_query(path, scope);
+    match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
+        fuzzy_path::FuzzyResolution::Resolved(hit) => {
+            hit.log_auto_open(&query);
+            let real = scope.join(&hit.path);
+            let body = read_file(&real, section, full, cache, edit_mode)?;
+            Ok(format!(
+                "# {} (corrected from \"{query}\")\n\n{body}",
+                hit.path.display()
+            ))
+        }
+        fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
+            path: missing,
+            suggestion: Some(s.join(", ")),
+        }),
+        fuzzy_path::FuzzyResolution::None => Err(TilthError::NotFound {
+            path: missing,
+            suggestion,
+        }),
+    }
 }
 
 /// Recursive section-tree walk for `resolve_heading`. Returns the first
