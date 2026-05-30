@@ -623,9 +623,9 @@ mod tests {
             budget,
         );
 
-        assert!(
-            out.contains("truncated"),
-            "must keep the truncation notice when it fits: {out}"
+        assert_eq!(
+            out,
+            "# deps for src/lib.rs\n\n... truncated — raise `budget` (currently 32) to see full dependency detail"
         );
         assert!(
             fits_budget(&out, budget),
