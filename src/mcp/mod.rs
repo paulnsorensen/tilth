@@ -542,7 +542,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2424,
+            2532,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
@@ -2304,7 +2304,7 @@ mod tests {
         );
         assert_eq!(
             edit.len(),
-            6018,
+            6126,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2718,9 +2718,12 @@ mod tests {
     fn tool_search_expand_emits_hashlines_in_edit_mode() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("hello.rs");
+        // Consecutive blank lines (3, 4) exercise the blank-line collapse /
+        // noise-stripping path. The marker on line 5 must keep its correct
+        // absolute anchor number even though lines above it are collapsed.
         std::fs::write(
             &p,
-            "fn unique_symbol_for_hashline_test() {\n    1 + 1;\n}\n",
+            "fn unique_symbol_for_hashline_test() {\n    let a = 1;\n\n\n    let marker_xyz = a + 1;\n    marker_xyz\n}\n",
         )
         .unwrap();
         let args = serde_json::json!({
@@ -2739,6 +2742,14 @@ mod tests {
         assert!(
             has_hash_anchor,
             "expected <line>:<hash>| anchor in expanded source: {out}"
+        );
+        // The marker is on source line 5; its anchor must read `5:` despite the
+        // collapsed blank run above it. Proves stripping preserves absolute line
+        // numbers (anchors stay valid for round-tripping into tilth_write).
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("5:") && l.contains("marker_xyz")),
+            "expected marker line to keep absolute anchor 5: {out}"
         );
         // The gutter form must NOT appear when edit_mode is set.
         assert!(

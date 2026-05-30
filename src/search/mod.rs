@@ -149,8 +149,11 @@ fn passes_stat_filter(path: &Path) -> bool {
 }
 
 /// Files-matched-glob and files-searched counts for the empty-result header.
-/// Re-walks the scope with the same glob the search used, applying the same
-/// stat-only skip rules as `content::search`. Only runs when matches is
+/// Re-walks the scope with the same glob the search used, applying only the
+/// cheap stat-only skip rules (`passes_stat_filter`). `files_searched` is
+/// therefore an upper bound: the real search additionally skips byte-content
+/// minified files and (for symbol search) files with no tree-sitter grammar,
+/// so it may search fewer files than reported here. Only runs when matches is
 /// empty, so the extra walk is rare on hot paths.
 fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -278,6 +281,18 @@ pub fn search_multi_symbol_expanded(
 
     for query in queries {
         let result = symbol::search(query, scope, context, glob, full)?;
+        if result.matches.is_empty() {
+            let (files_matched_glob, files_searched) = count_files_for_empty(scope, glob);
+            sections.push(format::search_empty_header(
+                &result.query,
+                &result.scope,
+                files_matched_glob,
+                files_searched,
+                result.total_found,
+                format::EmptyHint::Symbol,
+            ));
+            continue;
+        }
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -1352,10 +1367,19 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
             continue;
         }
 
-        // Extract line number from formatted line: "  42 │ content"
-        let line_num = segment
-            .find('│')
-            .and_then(|pos| segment[..pos].trim().parse::<u32>().ok());
+        // Extract the line number from a formatted content line. Two gutter
+        // formats exist: the default `"  42 │ content"` (number before the `│`
+        // gutter) and edit-mode hashlines `"42:a3f|content"` (number is the
+        // `line:` prefix before the `|` delimiter). Parse both so noise
+        // stripping/truncation works in edit mode too.
+        let line_num = if let Some(pos) = segment.find('│') {
+            segment[..pos].trim().parse::<u32>().ok()
+        } else {
+            segment
+                .find('|')
+                .and_then(|pos| segment[..pos].split(':').next())
+                .and_then(|n| n.trim().parse::<u32>().ok())
+        };
 
         if let Some(num) = line_num {
             if skip_lines.contains(&num) {
@@ -1615,6 +1639,36 @@ mod tests {
             .filter_map(|p| p.extension())
             .map(|e| e.to_string_lossy().to_string())
             .collect()
+    }
+
+    // ── filter_code_lines unit tests ──
+
+    #[test]
+    fn filter_code_lines_strips_in_both_gutter_formats() {
+        let mut skip = HashSet::new();
+        skip.insert(2u32);
+
+        // Default gutter format: "  N │ content".
+        let gutter = "```src/x.rs:1-3\n   1 │ a\n   2 │ b\n   3 │ c\n```";
+        let filtered = filter_code_lines(gutter, &skip);
+        assert!(filtered.contains("│ a"), "{filtered}");
+        assert!(
+            !filtered.contains("│ b"),
+            "line 2 should be stripped: {filtered}"
+        );
+        assert!(filtered.contains("│ c"), "{filtered}");
+
+        // Edit-mode hashline format: "N:hash|content". Regression for the bug
+        // where filter_code_lines only recognized the │ gutter, so stripping
+        // silently no-opped in edit mode.
+        let edit = "```src/x.rs:1-3\n1:001|a\n2:002|b\n3:003|c\n```";
+        let filtered = filter_code_lines(edit, &skip);
+        assert!(filtered.contains("1:001|a"), "{filtered}");
+        assert!(
+            !filtered.contains("2:002|b"),
+            "edit-mode line 2 should be stripped: {filtered}"
+        );
+        assert!(filtered.contains("3:003|c"), "{filtered}");
     }
 
     // ── walker unit tests ──
