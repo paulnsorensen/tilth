@@ -182,6 +182,27 @@ pub fn read_file(
 /// header; `Suggestions` enrich the `NotFound` with a ranked "did you mean"
 /// list; `None` returns the unchanged `NotFound` (today's behaviour). A
 /// successful read never walks — it returns `read_file`'s result untouched.
+/// Reduce `path` to a scope-relative query string for fuzzy matching.
+///
+/// Candidates from the walker are relative to `scope`, so the query must be too.
+/// Stripping the scope prefix handles the common case, but a *relative* `scope`
+/// (e.g. the MCP layer's `"."`) strips nothing from an absolute caller path, so
+/// the query would stay absolute and never subsequence-match a relative
+/// candidate. When the strip leaves the query absolute, re-strip against the
+/// canonical scope so an absolute MCP path still reduces to the relative form.
+fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a, str> {
+    let stripped = path.strip_prefix(scope).unwrap_or(path);
+    if stripped.is_absolute() {
+        if let Ok(abs_scope) = scope.canonicalize() {
+            return stripped
+                .strip_prefix(&abs_scope)
+                .unwrap_or(stripped)
+                .to_string_lossy();
+        }
+    }
+    stripped.to_string_lossy()
+}
+
 pub fn read_file_resolving(
     path: &Path,
     section: Option<&str>,
@@ -197,9 +218,8 @@ pub fn read_file_resolving(
         other => return other,
     };
 
-    // The query is the scope-relative path the caller asked for: strip the scope
-    // prefix so an absolute resolved path matches the relative candidate set.
-    let query = path.strip_prefix(scope).unwrap_or(path).to_string_lossy();
+    // The query is the scope-relative path the caller asked for.
+    let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
         fuzzy_path::FuzzyResolution::Resolved(hit) => {
             hit.log_auto_open(&query);
@@ -855,6 +875,37 @@ mod tests {
         assert!(
             out.contains("pub fn find"),
             "expected resolved file body: {out}"
+        );
+    }
+
+    #[test]
+    fn scope_relative_query_strips_absolute_under_dot_scope() {
+        // The MCP read entry passes scope="." with a caller-supplied path that may
+        // be absolute. `strip_prefix(".")` strips nothing, so without the canonical
+        // fallback the query would stay absolute and never match a scope-relative
+        // candidate. Reads (not mutates) cwd, so it's safe under parallel tests.
+        let cwd = std::env::current_dir().unwrap();
+        let absolute = cwd.join("src/serch/symbol.rs");
+        let query = scope_relative_query(&absolute, Path::new("."));
+        assert_eq!(
+            query, "src/serch/symbol.rs",
+            "absolute path under a '.' scope must reduce to the scope-relative query"
+        );
+    }
+
+    #[test]
+    fn scope_relative_query_absolute_scope_and_relative_input_unchanged() {
+        // Absolute scope + absolute path under it strips directly (the existing
+        // tempdir tests rely on this; no canonicalization, so macOS /var symlinks
+        // don't bite). A relative input is returned untouched.
+        let scope = Path::new("/abs/proj");
+        assert_eq!(
+            scope_relative_query(Path::new("/abs/proj/src/foo.rs"), scope),
+            "src/foo.rs"
+        );
+        assert_eq!(
+            scope_relative_query(Path::new("src/bar.rs"), scope),
+            "src/bar.rs"
         );
     }
 
