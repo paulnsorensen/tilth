@@ -140,9 +140,11 @@ mod tests {
         // Issue #39 bug 2: when the whole output has no `\n`, `header_end = 0`,
         // `body` is the entire output, and all three `rfind`s return None — so
         // the fallback (`.unwrap_or(safe_max)`) is what prevents `&body[..max_bytes]`
-        // from slicing mid-codepoint. A minified/emoji single line with zero
-        // newlines is the exact trigger.
-        let input: String = "🦀".repeat(500); // 2000 bytes, not one newline
+        // from slicing mid-codepoint. Use a 3-byte codepoint (☃ U+2603): since
+        // `max_bytes = content_budget * 4` is always a multiple of 4, an unclamped
+        // `&body[..max_bytes]` lands mid-☃ — a 4-byte char (🦀) would stay aligned
+        // and let the pre-fix code pass vacuously.
+        let input: String = "☃".repeat(500); // 1500 bytes, not one newline
         assert!(!input.contains('\n'), "test input must have no newline");
         let (out, info) = apply_with_info(&input, 100);
         let info = info.expect("must truncate on tight budget");
