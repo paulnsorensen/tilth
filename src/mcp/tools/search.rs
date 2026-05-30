@@ -221,6 +221,22 @@ fn search_merged_default(
     glob: Option<&str>,
     edit_mode: bool,
 ) -> Result<String, crate::error::TilthError> {
+    // Path-like miss auto-open: the default search returns an empty-result
+    // header on a miss, so a slightly-off path (`src/serch/symbol.rs`) would
+    // never reach the basic-path fuzzy fallback. For a path-like query with no
+    // symbol/content match anywhere, resolve it to the closest real file and
+    // auto-open. Gated on `is_path_like` so a normal empty search never walks.
+    if crate::read::fuzzy_path::is_path_like(query) {
+        let sym_hits = crate::search::search_symbol_raw(query, scope, glob)?.total_found;
+        let content_hits = crate::search::search_content_raw(query, scope, glob)?.total_found;
+        if sym_hits == 0 && content_hits == 0 {
+            if let Some(body) = crate::read::fuzzy_path::auto_open_search_miss(scope, query, cache)
+            {
+                return Ok(body);
+            }
+        }
+    }
+
     let mut sections = Vec::new();
     sections.push(format!(
         "## symbol results\n\n{}",
@@ -354,6 +370,79 @@ mod tests {
         assert!(
             !out.contains("\"alpha,beta\""),
             "comma query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// The default MCP search path returns an empty-result header on a miss, so
+    /// a path-like query that does not resolve to a real file would never reach
+    /// the basic-path fuzzy fallback. A slightly-off path with no search matches
+    /// must auto-open the closest real file under the distinct search header.
+    #[test]
+    fn merged_default_auto_opens_path_like_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/search/symbol.rs"),
+            "pub fn find() {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub mod search;\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        // `serch/symbol.rs` — deletion typo, path-like, single winner, no kind.
+        let args = serde_json::json!({
+            "queries": [{"query": "serch/symbol.rs"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("resolved from path-like query \"serch/symbol.rs\""),
+            "expected distinct search auto-open header on the MCP path: {out}"
+        );
+        assert!(
+            out.contains("no search matches; closest file auto-opened"),
+            "header must announce the search→file switch: {out}"
+        );
+        assert!(out.contains("pub fn find"), "expected resolved body: {out}");
+    }
+
+    /// A non-path-like miss on the default MCP path must NOT auto-open — it stays
+    /// the normal empty-result response, never a surprise file body.
+    #[test]
+    fn merged_default_non_path_like_miss_does_not_auto_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/search/symbol.rs"),
+            "pub fn find() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        // `symbol` IS a subsequence of `src/search/symbol.rs` but is not
+        // path-like (no separator/extension), so it isolates the `is_path_like`
+        // gate — not merely the subsequence filter, which a garbage query would
+        // also trip. It matches no symbol or content in the fixture either.
+        let args = serde_json::json!({
+            "queries": [{"query": "symbol"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            !out.contains("closest file auto-opened"),
+            "non-path-like subsequence miss must not auto-open: {out}"
+        );
+        assert!(
+            out.contains("0 matches"),
+            "expected the normal empty-result response: {out}"
         );
     }
 

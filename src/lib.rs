@@ -255,7 +255,7 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false)?;
+            let mut out = read::read_file_resolving(&path, section, full, cache, false, scope)?;
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = read::imports::resolve_related_files(&path);
                 if !related.is_empty() {
@@ -430,10 +430,34 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, text),
-    })
+    fuzzy_path_fallback(scope, text, text, cache)
+}
+
+/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Attempts to
+/// resolve a path-like miss to a real file and auto-open it with a distinct
+/// header; otherwise enriches the `NotFound` with ranked suggestions, falling
+/// back to today's basename suggestion (`legacy_suggest_query`) when nothing
+/// subsequence-matches.
+fn fuzzy_path_fallback(
+    scope: &Path,
+    query: &str,
+    legacy_suggest_query: &str,
+    cache: &cache::OutlineCache,
+) -> Result<String, error::TilthError> {
+    use read::fuzzy_path::{
+        resolve_fuzzy_path, search_auto_open_body, FuzzyResolution, GateProfile,
+    };
+    match resolve_fuzzy_path(scope, query, GateProfile::Search) {
+        FuzzyResolution::Resolved(hit) => search_auto_open_body(scope, &hit, query, cache),
+        FuzzyResolution::Suggestions(s) => Err(error::TilthError::NotFound {
+            path: scope.join(query),
+            suggestion: Some(s.join(", ")),
+        }),
+        FuzzyResolution::None => Err(error::TilthError::NotFound {
+            path: scope.join(query),
+            suggestion: read::suggest_similar_file(scope, legacy_suggest_query),
+        }),
+    }
 }
 
 /// Multi-word concept search: exact phrase first, then relaxed word proximity.
@@ -476,8 +500,60 @@ fn multi_word_concept_search(
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, first_word),
-    })
+    fuzzy_path_fallback(scope, text, first_word, cache)
+}
+
+#[cfg(test)]
+mod fuzzy_search_tests {
+    use super::*;
+
+    /// A path-like Fallthrough miss with no search hits auto-opens the closest
+    /// real file under a distinct, self-explaining header.
+    #[test]
+    fn search_fallthrough_auto_opens_path_like_query() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
+        std::fs::write(
+            dir.path().join("src/search/symbol.rs"),
+            "pub fn find() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub mod search;\n").unwrap();
+
+        let cache = cache::OutlineCache::new();
+        // `serch/symbol.rs` — deletion typo, path-like, single winner.
+        let out = single_query_search("serch/symbol.rs", dir.path(), &cache, false, None).unwrap();
+
+        assert!(
+            out.contains("resolved from path-like query \"serch/symbol.rs\""),
+            "expected distinct search auto-open header, got: {out}"
+        );
+        assert!(
+            out.contains("no search matches; closest file auto-opened"),
+            "header must announce the search→file switch: {out}"
+        );
+        assert!(out.contains("pub fn find"), "expected resolved body: {out}");
+    }
+
+    /// A non-path-like concept miss must NOT auto-open — it stays a `NotFound`
+    /// (optionally with suggestions), never a surprise file body.
+    #[test]
+    fn search_non_path_like_query_does_not_auto_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
+        std::fs::write(
+            dir.path().join("src/search/symbol.rs"),
+            "pub fn find() {}\n",
+        )
+        .unwrap();
+
+        let cache = cache::OutlineCache::new();
+        // `symbol` is a subsequence of the file path but is not path-like.
+        let err = single_query_search("symbol", dir.path(), &cache, false, None)
+            .expect_err("non-path-like miss must not auto-open");
+        assert!(
+            matches!(err, error::TilthError::NotFound { .. }),
+            "expected NotFound, got: {err:?}"
+        );
+    }
 }
