@@ -1,4 +1,4 @@
-use crate::lang::treesitter::node_text_simple;
+use crate::lang::treesitter::{node_text_simple, NodeTextMode};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -89,7 +89,7 @@ pub fn heading_text(node: tree_sitter::Node, lines: &[&str]) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "inline" {
-            let text = node_text_simple(child, lines);
+            let text = node_text_simple(child, lines, NodeTextMode::Full);
             return text.trim().trim_end_matches('#').trim().to_string();
         }
     }
@@ -391,26 +391,7 @@ fn find_child_text(node: tree_sitter::Node, field: &str, lines: &[&str]) -> Opti
 
 /// Get the text of a node, truncated to the first line.
 fn node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
-
-    if row < lines.len() {
-        if row == end_row {
-            let col_end = node.end_position().column.min(lines[row].len());
-            lines[row][col_start..col_end].to_string()
-        } else {
-            // Multi-line — take first line only, truncated
-            let text = &lines[row][col_start..];
-            if text.len() > 80 {
-                format!("{}...", crate::types::truncate_str(text, 77))
-            } else {
-                text.to_string()
-            }
-        }
-    } else {
-        String::new()
-    }
+    node_text_simple(node, lines, NodeTextMode::Truncated)
 }
 
 /// Find the first identifier-like child.
