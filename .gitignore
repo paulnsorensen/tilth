@@ -18,6 +18,9 @@ Thumbs.db
 .vscode/
 *.iml
 
+# Tooling (fork-local; not synced upstream)
+.serena/
+
 # Python
 __pycache__/
 *.pyc
