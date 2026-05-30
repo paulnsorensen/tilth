@@ -133,40 +133,17 @@ struct IdentifierIter<'a> {
     src: &'a str,
     pos: usize,
     state: ScanState,
-    is_rust: bool,
+    lang: Option<Lang>,
 }
 
 impl<'a> IdentifierIter<'a> {
     fn new(content: &'a str, lang: Option<Lang>) -> Self {
-        let is_rust = match lang {
-            Some(Lang::Rust) => true,
-            Some(
-                Lang::TypeScript
-                | Lang::Tsx
-                | Lang::JavaScript
-                | Lang::Python
-                | Lang::Go
-                | Lang::Java
-                | Lang::Scala
-                | Lang::C
-                | Lang::Cpp
-                | Lang::Ruby
-                | Lang::Php
-                | Lang::Swift
-                | Lang::Kotlin
-                | Lang::CSharp
-                | Lang::Elixir
-                | Lang::Dockerfile
-                | Lang::Make,
-            )
-            | None => false,
-        };
         Self {
             bytes: content.as_bytes(),
             src: content,
             pos: 0,
             state: ScanState::Code,
-            is_rust,
+            lang,
         }
     }
 }
@@ -199,9 +176,10 @@ impl<'a> Iterator for IdentifierIter<'a> {
                         // identifier up to the next tick, dropping them from the filter
                         // and producing a false negative (the one thing Bloom forbids).
                         // Lifetimes are Rust-only; in other languages a `'` opens a
-                        // single-quoted string, so the heuristic is gated on `is_rust`
-                        // to avoid swallowing identifiers after a `'foo'` string there.
-                        let is_lifetime = self.is_rust
+                        // single-quoted string, so the heuristic is gated on
+                        // `has_lifetimes` to avoid swallowing identifiers after a
+                        // `'foo'` string there.
+                        let is_lifetime = self.lang.is_some_and(Lang::has_lifetimes)
                             && i + 1 < len
                             && is_ident_start(bytes[i + 1])
                             && !(i + 2 < len && bytes[i + 2] == b'\'');
