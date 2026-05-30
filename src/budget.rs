@@ -141,13 +141,13 @@ mod tests {
         // whole output, and all three `rfind`s return None — so `.unwrap_or(safe_max)`
         // is the only thing keeping `&body[..max_bytes]` off a mid-codepoint slice.
         //
-        // `max_bytes = content_budget * 4` is always a multiple of 4, so an all-🦀
-        // (4-byte) body stays perfectly aligned and can never witness the panic.
-        // Mixing 1/2/3/4-byte codepoints — ASCII, é (2B), ☃ (3B), 🦀 (4B) — knocks
-        // the char boundaries off the ×4 grid so the unclamped cut lands inside a
-        // codepoint (here, mid-🦀 at bytes 122..126).
-        let unit = "ab🦀cd☃é🦀x! "; // 20 bytes, mixed width, no newline
-        let input = unit.repeat(100); // 2000 bytes
+        // `max_bytes = content_budget * 4` is always a multiple of 4, so a body of
+        // only 4-byte codepoints (🦀, 🍌) stays perfectly aligned and can never
+        // witness the panic. Interleaving 1-byte letters knocks the char boundaries
+        // off the ×4 grid, so the unclamped cut lands inside a 4-byte glyph (here,
+        // mid-🍌 at bytes 122..126).
+        let unit = "go🦀nuts🍌yo"; // 16 bytes: letters + crab + banana, no newline
+        let input = unit.repeat(100); // 1600 bytes
         assert!(!input.contains('\n'), "test input must have no newline");
 
         // Mirror apply_with_info's budget math (header_reserve = 50, ×4 inverse of
