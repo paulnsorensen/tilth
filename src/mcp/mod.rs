@@ -566,7 +566,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            4119,
+            4192,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -577,9 +577,7 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
-        assert!(
-            SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate symbols with a comma")
-        );
+        assert!(SERVER_INSTRUCTIONS.contains("Comma-OR is for kind any/symbol/callers"));
         assert!(SERVER_INSTRUCTIONS
             .contains("Re-expanding a previously shown definition returns [shown earlier]"));
         assert!(
@@ -2347,12 +2345,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            4119,
+            4192,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            6651,
+            6724,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
