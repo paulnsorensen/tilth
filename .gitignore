@@ -18,6 +18,14 @@ Thumbs.db
 .vscode/
 *.iml
 
+# Serena tooling — track project.yml, ignore cache + local overrides
+.serena/*
+!.serena/project.yml
+
+# Cheese workflow artifacts — track specs only
+.cheese/*
+!.cheese/specs/
+
 # Python
 __pycache__/
 *.pyc
