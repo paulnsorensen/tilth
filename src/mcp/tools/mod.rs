@@ -1,7 +1,6 @@
 mod definitions;
 mod deps;
 mod diff;
-mod files;
 mod grok;
 mod list;
 mod read;
@@ -11,7 +10,6 @@ mod write;
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;
-pub(super) use files::tool_files;
 pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
 pub(super) use read::tool_read;
@@ -144,7 +142,7 @@ mod tests {
             "After chdir to project, . should resolve correctly"
         );
 
-        // Verify tilth_files would search in the project, not /
+        // Verify tilth_list would search in the project, not /
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(cwd, project_path.canonicalize().unwrap());
 
