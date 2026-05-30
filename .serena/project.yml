@@ -73,7 +73,13 @@ additional_workspace_folders: []
 # list of additional paths to ignore in this project.
 # Same syntax as gitignore, so you can use * and **.
 # Note: global ignored_paths from serena_config.yml are also applied additively.
-ignored_paths: []
+# fuzz/ is a standalone cargo-fuzz crate (not a workspace member); oss-fuzz/
+# is OSS-Fuzz build infra. Neither is code you navigate — keep their symbols
+# out of find_symbol results. target/ needs no entry: it's gitignored and
+# ignore_all_files_in_gitignore already excludes it.
+ignored_paths:
+- "fuzz/**"
+- "oss-fuzz/**"
 
 # whether the project is in read-only mode
 # If set to true, all editing tools will be disabled and attempts to use them will result in an error
