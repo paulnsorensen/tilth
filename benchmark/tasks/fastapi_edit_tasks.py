@@ -28,7 +28,7 @@ class FastAPIEditDepCacheTask(Task):
 
     @property
     def test_command(self) -> list[str]:
-        return ["/usr/local/bin/python3.10", "-m", "pytest",
+        return ["uv", "run", "pytest",
                 "tests/test_dependency_cache.py::test_sub_counter", "-x", "-q"]
 
     @property
@@ -75,7 +75,7 @@ class FastAPIEditResponseFilterTask(Task):
 
     @property
     def test_command(self) -> list[str]:
-        return ["/usr/local/bin/python3.10", "-m", "pytest",
+        return ["uv", "run", "pytest",
                 "tests/test_response_model_data_filter.py::test_filter_second_level_model",
                 "-x", "-q"]
 
@@ -123,7 +123,7 @@ class FastAPIEditScopeCacheTask(Task):
 
     @property
     def test_command(self) -> list[str]:
-        return ["/usr/local/bin/python3.10", "-m", "pytest",
+        return ["uv", "run", "pytest",
                 "tests/test_dependency_cache.py::test_security_cache", "-x", "-q"]
 
     @property

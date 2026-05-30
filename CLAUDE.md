@@ -83,7 +83,7 @@ Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<vers
 
 ## Benchmarks
 
-26 code navigation tasks across 4 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings.
+51 tasks across a synthetic repo and 4 real repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust), spanning code navigation, multi-file edits, diff comprehension, and symbol "grok" understanding. Navigation/grok tasks run headless `claude -p` and check the answer against ground-truth strings; edit/diff tasks inject mutations and pass only when the task's `test_command` goes green.
 
 **Setup** (one-time — clones repos at pinned commits):
 

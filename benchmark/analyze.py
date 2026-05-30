@@ -130,6 +130,37 @@ def format_delta(baseline_val: float, tilth_val: float) -> str:
     return f"{sign}{pct_change:.0f}%"
 
 
+MODE_ORDER = ["baseline", "tilth", "tilth_forced"]
+MODE_LABELS = {
+    "baseline": "baseline",
+    "tilth": "tilth-added",
+    "tilth_forced": "tilth-only",
+}
+
+
+def ordered_modes(mode_names: set[str]) -> list[str]:
+    """Return benchmark modes in report order, with unknown modes last."""
+    known = [mode for mode in MODE_ORDER if mode in mode_names]
+    unknown = sorted(mode_names - set(MODE_ORDER))
+    return known + unknown
+
+
+def mode_label(mode_name: str) -> str:
+    return MODE_LABELS.get(mode_name, mode_name)
+
+
+def format_metric_value(key: str, value: float) -> str:
+    if key == "total_cost_usd":
+        return f"${value:.4f}"
+    return f"{value:.0f}"
+
+
+def correctness_pct(runs: list[dict]) -> float:
+    if not runs:
+        return 0.0
+    return (sum(1 for r in runs if r["correct"]) / len(runs)) * 100
+
+
 def find_median_run(runs: list[dict], metric: str) -> dict:
     """Find the run with median value for given metric."""
     if not runs:
@@ -170,7 +201,7 @@ def generate_report(results: list[dict]) -> str:
     # Extract metadata
     models = sorted(set(r["model"] for r in valid_results))
     tasks = sorted(set(r["task"] for r in valid_results))
-    modes = sorted(set(r["mode"] for r in valid_results))
+    modes = ordered_modes(set(r["mode"] for r in valid_results))
     repos = sorted(set(r.get("repo", "synthetic") for r in valid_results))
     max_rep = max(r["repetition"] for r in valid_results)
     num_reps = max_rep + 1
@@ -215,163 +246,153 @@ def generate_report(results: list[dict]) -> str:
             lines.append(f"*Repo: {task_repo}*")
             lines.append("")
 
-        # Group by mode
+        # Group by mode and show every present mode side by side.
         mode_groups = group_by(task_results, "mode")
+        present_modes = [mode for mode in modes if (mode,) in mode_groups]
+        runs_by_mode = {mode: mode_groups[(mode,)] for mode in present_modes}
+        has_baseline = "baseline" in runs_by_mode
 
-        # Check if we have both baseline and tilth
-        has_baseline = ("baseline",) in mode_groups
-        has_tilth = ("tilth",) in mode_groups
-
-        if has_baseline and has_tilth:
-            baseline_runs = mode_groups[("baseline",)]
-            tilth_runs = mode_groups[("tilth",)]
-
-            # Compute stats
-            metrics = [
-                ("Context tokens", "context_tokens"),
-                ("Output tokens", "output_tokens"),
-                ("Turns", "num_turns"),
-                ("Tool calls", "num_tool_calls"),
-                ("Cost USD", "total_cost_usd"),
-                ("Duration ms", "duration_ms"),
-            ]
-
-            lines.append("| Metric | baseline | tilth | delta |")
-            lines.append("|--------|----------|-------|-------|")
-
-            for label, key in metrics:
-                baseline_stats = compute_stats([r[key] for r in baseline_runs])
-                tilth_stats = compute_stats([r[key] for r in tilth_runs])
-                delta = format_delta(baseline_stats["median"], tilth_stats["median"])
-
-                if key == "total_cost_usd":
-                    baseline_fmt = f"${baseline_stats['median']:.4f}"
-                    tilth_fmt = f"${tilth_stats['median']:.4f}"
-                else:
-                    baseline_fmt = f"{baseline_stats['median']:.0f}"
-                    tilth_fmt = f"{tilth_stats['median']:.0f}"
-
-                lines.append(f"| {label} (median) | {baseline_fmt} | {tilth_fmt} | {delta} |")
-
-            # Correctness
-            baseline_correct = sum(1 for r in baseline_runs if r["correct"])
-            tilth_correct = sum(1 for r in tilth_runs if r["correct"])
-            baseline_pct = (baseline_correct / len(baseline_runs)) * 100
-            tilth_pct = (tilth_correct / len(tilth_runs)) * 100
-
-            lines.append(f"| Correctness | {baseline_pct:.0f}% | {tilth_pct:.0f}% | — |")
+        if not present_modes:
+            lines.append("_No valid mode results._")
             lines.append("")
+            continue
 
-            # Cost breakdown
-            baseline_median_run_cost = find_median_run(baseline_runs, "total_cost_usd")
-            tilth_median_run_cost = find_median_run(tilth_runs, "total_cost_usd")
+        metrics = [
+            ("Context tokens", "context_tokens"),
+            ("Output tokens", "output_tokens"),
+            ("Turns", "num_turns"),
+            ("Tool calls", "num_tool_calls"),
+            ("Cost USD", "total_cost_usd"),
+            ("Duration ms", "duration_ms"),
+        ]
 
-            baseline_costs = compute_cost_breakdown(baseline_median_run_cost)
-            tilth_costs = compute_cost_breakdown(tilth_median_run_cost)
+        delta_modes = [mode for mode in present_modes if mode != "baseline"] if has_baseline else []
+        headers = ["Metric"] + [mode_label(mode) for mode in present_modes]
+        headers += [f"{mode_label(mode)} Δ" for mode in delta_modes]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
 
-            baseline_total = baseline_median_run_cost.get("total_cost_usd", 0.0)
-            tilth_total = tilth_median_run_cost.get("total_cost_usd", 0.0)
-            total_delta = tilth_total - baseline_total
+        for label, key in metrics:
+            medians = {
+                mode: compute_stats([r[key] for r in runs])["median"]
+                for mode, runs in runs_by_mode.items()
+            }
+            row = [f"{label} (median)"]
+            row.extend(format_metric_value(key, medians[mode]) for mode in present_modes)
+            if has_baseline:
+                baseline_value = medians["baseline"]
+                row.extend(format_delta(baseline_value, medians[mode]) for mode in delta_modes)
+            lines.append("| " + " | ".join(row) + " |")
 
-            baseline_turns = baseline_median_run_cost.get("num_turns", 0)
-            tilth_turns = tilth_median_run_cost.get("num_turns", 0)
-            turns_delta = tilth_turns - baseline_turns
+        correctness = {mode: correctness_pct(runs) for mode, runs in runs_by_mode.items()}
+        row = ["Correctness"]
+        row.extend(f"{correctness[mode]:.0f}%" for mode in present_modes)
+        if has_baseline:
+            baseline_correctness = correctness["baseline"]
+            row.extend(f"{correctness[mode] - baseline_correctness:+.0f}pp" for mode in delta_modes)
+        lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
 
-            baseline_correct_str = "correct" if baseline_median_run_cost.get("correct", False) else "incorrect"
-            tilth_correct_str = "correct" if tilth_median_run_cost.get("correct", False) else "incorrect"
+        # Cost breakdown
+        median_cost_runs = {
+            mode: find_median_run(runs, "total_cost_usd")
+            for mode, runs in runs_by_mode.items()
+        }
+        median_costs = {
+            mode: compute_cost_breakdown(run)
+            for mode, run in median_cost_runs.items()
+        }
+        label_width = max(len(mode_label(mode)) for mode in present_modes)
 
-            lines.append("**Cost breakdown (median run):**")
+        lines.append("**Cost breakdown (median run):**")
+        lines.append("")
+        for mode in present_modes:
+            run = median_cost_runs[mode]
+            total = run.get("total_cost_usd", 0.0)
+            turns = run.get("num_turns", 0)
+            correct_str = "correct" if run.get("correct", False) else "incorrect"
+            label = mode_label(mode).ljust(label_width)
+            lines.append(f"  {label}: {turns} turns, ${total:.2f}, {correct_str}")
+            lines.append(format_cost_breakdown(median_costs[mode]))
+
+        if has_baseline and delta_modes:
+            baseline_run = median_cost_runs["baseline"]
+            baseline_costs = median_costs["baseline"]
+            baseline_total = baseline_run.get("total_cost_usd", 0.0)
+            baseline_turns = baseline_run.get("num_turns", 0)
+            for mode in delta_modes:
+                run = median_cost_runs[mode]
+                total_delta = run.get("total_cost_usd", 0.0) - baseline_total
+                turns_delta = run.get("num_turns", 0) - baseline_turns
+                lines.append(
+                    f"  {mode_label(mode)} vs baseline: "
+                    f"{'+' if turns_delta >= 0 else ''}{turns_delta} turns, "
+                    f"{'+' if total_delta >= 0 else ''}${total_delta:.2f}"
+                )
+                lines.append(format_cost_delta(baseline_costs, median_costs[mode]))
+        lines.append("")
+
+        # Per-turn sparklines
+        median_context_runs = {
+            mode: find_median_run(runs, "context_tokens")
+            for mode, runs in runs_by_mode.items()
+        }
+        per_turn_by_mode = {
+            mode: run.get("per_turn_context_tokens", [])
+            for mode, run in median_context_runs.items()
+        }
+        if any(per_turn_by_mode.values()):
+            lines.append("**Per-turn context tokens (median run):**")
             lines.append("")
-            lines.append(f"  baseline: {baseline_turns} turns, ${baseline_total:.2f}, {baseline_correct_str}")
-            lines.append(format_cost_breakdown(baseline_costs))
-            lines.append(f"  tilth:    {tilth_turns} turns, ${tilth_total:.2f}, {tilth_correct_str}")
-            lines.append(format_cost_breakdown(tilth_costs))
-            lines.append(f"  delta:    {'+' if turns_delta >= 0 else ''}{turns_delta} turns, {'+' if total_delta >= 0 else ''}${total_delta:.2f}")
-            lines.append(format_cost_delta(baseline_costs, tilth_costs))
-            lines.append("")
-
-            # Per-turn sparklines
-            baseline_median_run = find_median_run(baseline_runs, "context_tokens")
-            tilth_median_run = find_median_run(tilth_runs, "context_tokens")
-
-            baseline_per_turn = baseline_median_run.get("per_turn_context_tokens", [])
-            tilth_per_turn = tilth_median_run.get("per_turn_context_tokens", [])
-
-            if baseline_per_turn and tilth_per_turn:
-                lines.append("**Per-turn context tokens (median run):**")
-                lines.append("")
-                baseline_spark = ascii_sparkline(baseline_per_turn)
-                tilth_spark = ascii_sparkline(tilth_per_turn)
-                baseline_range = f"{min(baseline_per_turn):,} → {max(baseline_per_turn):,}"
-                tilth_range = f"{min(tilth_per_turn):,} → {max(tilth_per_turn):,}"
-                lines.append(f"  baseline: {baseline_spark} ({baseline_range})")
-                lines.append(f"  tilth:    {tilth_spark} ({tilth_range})")
-                lines.append("")
-
-            # Tool breakdown
-            baseline_tools = merge_tool_calls(baseline_runs)
-            tilth_tools = merge_tool_calls(tilth_runs)
-
-            if baseline_tools or tilth_tools:
-                lines.append("**Tool breakdown (median counts):**")
-                lines.append("")
-                if baseline_tools:
-                    tool_strs = [f"{name}={count:.0f}" for name, count in baseline_tools.items()]
-                    lines.append(f"  baseline: {', '.join(tool_strs)}")
-                if tilth_tools:
-                    tool_strs = [f"{name}={count:.0f}" for name, count in tilth_tools.items()]
-                    lines.append(f"  tilth:    {', '.join(tool_strs)}")
-                lines.append("")
-
-        else:
-            # Only one mode available
-            for mode_name in modes:
-                mode_results = mode_groups.get((mode_name,), [])
-                if not mode_results:
+            for mode in present_modes:
+                per_turn = per_turn_by_mode[mode]
+                if not per_turn:
                     continue
+                spark = ascii_sparkline(per_turn)
+                token_range = f"{min(per_turn):,} → {max(per_turn):,}"
+                label = mode_label(mode).ljust(label_width)
+                lines.append(f"  {label}: {spark} ({token_range})")
+            lines.append("")
 
-                lines.append(f"**Mode: {mode_name}**")
-                lines.append("")
-                lines.append("| Metric | Median |")
-                lines.append("|--------|--------|")
-
-                metrics = [
-                    ("Context tokens", "context_tokens"),
-                    ("Output tokens", "output_tokens"),
-                    ("Turns", "num_turns"),
-                    ("Tool calls", "num_tool_calls"),
-                    ("Cost USD", "total_cost_usd"),
-                    ("Duration ms", "duration_ms"),
-                ]
-
-                for label, key in metrics:
-                    stats = compute_stats([r[key] for r in mode_results])
-                    if key == "total_cost_usd":
-                        val_fmt = f"${stats['median']:.4f}"
-                    else:
-                        val_fmt = f"{stats['median']:.0f}"
-                    lines.append(f"| {label} | {val_fmt} |")
-
-                correct = sum(1 for r in mode_results if r["correct"])
-                pct = (correct / len(mode_results)) * 100
-                lines.append(f"| Correctness | {pct:.0f}% |")
-                lines.append("")
+        # Tool breakdown
+        tools_by_mode = {
+            mode: merge_tool_calls(runs)
+            for mode, runs in runs_by_mode.items()
+        }
+        if any(tools_by_mode.values()):
+            lines.append("**Tool breakdown (median counts):**")
+            lines.append("")
+            for mode in present_modes:
+                tools = tools_by_mode[mode]
+                if not tools:
+                    continue
+                tool_strs = [f"{name}={count:.0f}" for name, count in sorted(tools.items())]
+                label = mode_label(mode).ljust(label_width)
+                lines.append(f"  {label}: {', '.join(tool_strs)}")
+            lines.append("")
 
         lines.append("")
 
-    # Summary section (only if we have both modes)
-    baseline_all = [r for r in valid_results if r["mode"] == "baseline"]
-    tilth_all = [r for r in valid_results if r["mode"] == "tilth"]
+    # Summary section (if multiple modes are present)
+    runs_by_mode_all = {
+        mode: [r for r in valid_results if r["mode"] == mode]
+        for mode in modes
+    }
+    present_modes_all = [mode for mode, runs in runs_by_mode_all.items() if runs]
 
-    if baseline_all and tilth_all:
+    if len(present_modes_all) > 1:
         lines.append("## Summary")
         lines.append("")
         lines.append("Averaged across all tasks (median of medians):")
         lines.append("")
-        lines.append("| Metric | baseline | tilth | Improvement |")
-        lines.append("|--------|----------|-------|-------------|")
 
-        # Compute median-of-medians for each metric
+        has_baseline = "baseline" in runs_by_mode_all and bool(runs_by_mode_all["baseline"])
+        delta_modes = [mode for mode in present_modes_all if mode != "baseline"] if has_baseline else []
+        headers = ["Metric"] + [mode_label(mode) for mode in present_modes_all]
+        headers += [f"{mode_label(mode)} Δ" for mode in delta_modes]
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+
         metrics = [
             ("Context tokens", "context_tokens"),
             ("Turns", "num_turns"),
@@ -380,32 +401,32 @@ def generate_report(results: list[dict]) -> str:
         ]
 
         for label, key in metrics:
-            # Group baseline/tilth by task, compute median for each task, then median of those
-            baseline_by_task = group_by(baseline_all, "task")
-            tilth_by_task = group_by(tilth_all, "task")
+            medians_by_mode = {}
+            for mode in present_modes_all:
+                by_task = group_by(runs_by_mode_all[mode], "task")
+                task_medians = [
+                    compute_stats([r[key] for r in runs])["median"]
+                    for runs in by_task.values()
+                ]
+                if task_medians:
+                    medians_by_mode[mode] = median(task_medians)
 
-            baseline_medians = [
-                compute_stats([r[key] for r in runs])["median"]
-                for runs in baseline_by_task.values()
-            ]
-            tilth_medians = [
-                compute_stats([r[key] for r in runs])["median"]
-                for runs in tilth_by_task.values()
-            ]
+            if not medians_by_mode:
+                continue
 
-            if baseline_medians and tilth_medians:
-                baseline_val = median(baseline_medians)
-                tilth_val = median(tilth_medians)
-                improvement = format_delta(baseline_val, tilth_val)
-
-                if key == "total_cost_usd":
-                    baseline_fmt = f"${baseline_val:.4f}"
-                    tilth_fmt = f"${tilth_val:.4f}"
-                else:
-                    baseline_fmt = f"{baseline_val:.0f}"
-                    tilth_fmt = f"{tilth_val:.0f}"
-
-                lines.append(f"| {label} | {baseline_fmt} | {tilth_fmt} | {improvement} |")
+            row = [label]
+            row.extend(
+                format_metric_value(key, medians_by_mode.get(mode, 0))
+                for mode in present_modes_all
+            )
+            if has_baseline and "baseline" in medians_by_mode:
+                baseline_value = medians_by_mode["baseline"]
+                row.extend(
+                    format_delta(baseline_value, medians_by_mode[mode])
+                    if mode in medians_by_mode else "—"
+                    for mode in delta_modes
+                )
+            lines.append("| " + " | ".join(row) + " |")
 
         lines.append("")
 

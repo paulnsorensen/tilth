@@ -32,7 +32,7 @@ class FastAPIDiffWhichCommitTask(Task):
 
     @property
     def test_command(self) -> list[str]:
-        return ["/usr/local/bin/python3.10", "-m", "pytest",
+        return ["uv", "run", "pytest",
                 "tests/test_dependency_cache.py::test_sub_counter", "-x", "-q"]
 
     def apply_mutations(self, repo_path: str, commit: bool = True) -> None:
