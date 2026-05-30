@@ -561,22 +561,29 @@ fn apply_budget_truncation(
             barrel_note,
             scope,
         );
-        let tokens = crate::types::estimate_tokens(candidate.len() as u64) as usize;
-        if tokens <= budget {
-            return if level == 0 {
-                candidate
-            } else {
-                format!(
-                    "{candidate}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
-                )
-            };
+        if level == 0 && fits_budget(&candidate, budget) {
+            return candidate;
+        }
+        if level > 0 {
+            if let Some(candidate) = with_truncation_notice(&candidate, budget) {
+                return candidate;
+            }
         }
     }
 
     // Absolute fallback: header only.
-    format!(
-        "{header}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
-    )
+    with_truncation_notice(header, budget).unwrap_or_else(|| header.to_string())
+}
+
+fn with_truncation_notice(candidate: &str, budget: usize) -> Option<String> {
+    let candidate = format!(
+        "{candidate}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
+    );
+    fits_budget(&candidate, budget).then_some(candidate)
+}
+
+fn fits_budget(output: &str, budget: usize) -> bool {
+    crate::types::estimate_tokens(output.len() as u64) as usize <= budget
 }
 
 /// Join non-empty parts with double newlines.
@@ -587,4 +594,42 @@ fn assemble(parts: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_truncation_keeps_notice_inside_budget() {
+        let header = "# deps for src/lib.rs";
+        let uses_local = format!(
+            "## Uses (local)\n{}",
+            (0..100)
+                .map(|i| format!("src/module_{i}.rs  symbol_{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let budget = 32;
+
+        let out = apply_budget_truncation(
+            header,
+            &uses_local,
+            "",
+            &[],
+            &[],
+            "",
+            Path::new("."),
+            budget,
+        );
+
+        assert!(
+            out.contains("truncated"),
+            "must keep the truncation notice when it fits: {out}"
+        );
+        assert!(
+            fits_budget(&out, budget),
+            "truncation notice must count against budget: {out}"
+        );
+    }
 }
