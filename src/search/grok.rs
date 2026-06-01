@@ -84,20 +84,41 @@ fn resolve_with_source(
 }
 
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let result = search_symbol_raw(name, scope, None)?;
+    if let Some(resolved) = resolve_def_by_query(name, scope)? {
+        return Ok(resolved);
+    }
+    // Qualified target (`Type::method` or `Type.method`): the literal spec never
+    // equals a bare definition name, so retry with the trailing segment.
+    let bare = name.rsplit([':', '.']).next().unwrap_or(name);
+    if bare != name && !bare.is_empty() {
+        if let Some(resolved) = resolve_def_by_query(bare, scope)? {
+            return Ok(resolved);
+        }
+    }
+    Err(TilthError::NotFound {
+        path: PathBuf::from(name),
+        suggestion: None,
+    })
+}
+
+/// Search for `query` as a symbol and resolve the top definition to a full
+/// target. Returns `None` when no definition matches, letting the caller retry
+/// with a different query (e.g. the bare segment of a qualified target).
+fn resolve_def_by_query(
+    query: &str,
+    scope: &Path,
+) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
+    let result = search_symbol_raw(query, scope, None)?;
     let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
     let Some(top) = definitions.first() else {
-        return Err(TilthError::NotFound {
-            path: PathBuf::from(name),
-            suggestion: None,
-        });
+        return Ok(None);
     };
     let other_def_count = definitions.len().saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
-        reason: format!("definition match for `{name}` had no def_range"),
+        reason: format!("definition match for `{query}` had no def_range"),
     })?;
-    enrich_from_outline(top.path.clone(), start, name.to_string(), other_def_count)
+    enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count).map(Some)
 }
 
 fn resolve_by_path_line(
@@ -974,6 +995,67 @@ mod tests {
         // Relative path is joined with scope.
         let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
         assert_eq!(target.name, "two");
+    }
+
+    #[test]
+    fn resolve_qualified_target_strips_type_prefix() {
+        // Issue #59: `tilth_grok(target: "Executor.dispatch")` — and the
+        // documented `Type::method` form — must resolve to the bare method
+        // instead of returning `not found: Executor.dispatch`.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub struct Executor;
+
+impl Executor {
+    pub fn dispatch(&self) -> u32 {
+        1
+    }
+}
+";
+        write_fixture(tmp.path(), "src/exec.rs", body);
+
+        for spec in ["Executor::dispatch", "Executor.dispatch"] {
+            let (target, _, _) = resolve_with_source(spec, tmp.path())
+                .unwrap_or_else(|e| panic!("grok could not resolve `{spec}`: {e}"));
+            assert_eq!(
+                target.name, "dispatch",
+                "spec `{spec}` should resolve to method `dispatch`"
+            );
+            assert_eq!(target.other_def_count, 0);
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_still_404s_when_method_absent() {
+        // The trailing-segment retry must stay bounded: a qualified target whose
+        // method doesn't exist must still return NotFound, not resolve to junk.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "pub struct Executor;\n\nimpl Executor {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/exec.rs", body);
+
+        let err = resolve_with_source("Executor::missing", tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, TilthError::NotFound { .. }),
+            "absent method should 404, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_ambiguous_segment_reports_other_defs() {
+        // When the trailing segment matches multiple definitions, grok resolves
+        // the top one and reports the rest via other_def_count.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "pub struct Alpha;\n\nimpl Alpha {\n    pub fn dispatch(&self) {}\n}\n";
+        let b = "pub struct Beta;\n\nimpl Beta {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/alpha.rs", a);
+        write_fixture(tmp.path(), "src/beta.rs", b);
+
+        let (target, _, _) = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap();
+        assert_eq!(target.name, "dispatch");
+        assert_eq!(
+            target.other_def_count, 1,
+            "second `dispatch` definition should be counted"
+        );
     }
 
     // -- collect_siblings ------------------------------------------------
