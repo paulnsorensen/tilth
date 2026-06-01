@@ -289,6 +289,20 @@ fn find_definitions(
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// Return every structural definition matching `query`, ranked like display search
+/// but not truncated to the interactive result cap. Programmatic resolvers use
+/// this when correctness depends on considering owners beyond the first page.
+pub(crate) fn all_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<Vec<Match>, TilthError> {
+    let mut defs = find_definitions(query, scope, glob, usize::MAX)?;
+    rank::sort(&mut defs, query, scope, None);
+    defs.sort_by_key(stratum_for_display);
+    Ok(defs)
+}
+
 /// Tree-sitter structural definition detection.
 /// Accepts pre-read content — no redundant file read.
 fn find_defs_treesitter(

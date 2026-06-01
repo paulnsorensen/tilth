@@ -134,13 +134,13 @@ fn resolve_def_by_query(
     qualifier: Option<&str>,
     scope: &Path,
 ) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
-    let result = search_symbol_raw(query, scope, None)?;
-    let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
-    if definitions.is_empty() {
-        return Ok(None);
-    }
-
     let Some(qualifier) = qualifier else {
+        let result = search_symbol_raw(query, scope, None)?;
+        let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
+        if definitions.is_empty() {
+            return Ok(None);
+        }
+
         // Bare resolution: top-ranked definition, rest reported as ambiguous.
         let top = definitions[0];
         let other_def_count = definitions.len() - 1;
@@ -148,6 +148,11 @@ fn resolve_def_by_query(
         return enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count)
             .map(Some);
     };
+
+    let definitions = crate::search::symbol::all_definitions(query, scope, None)?;
+    if definitions.is_empty() {
+        return Ok(None);
+    }
 
     // Qualified resolution: partition candidates by whether their owner matches.
     let cache = OutlineCache::new();
@@ -299,7 +304,7 @@ fn go_receiver_type(path: &Path, start_line: u32, cache: &OutlineCache) -> Optio
 fn owner_suggestion(
     bare: &str,
     qualifier: &str,
-    definitions: &[&crate::types::Match],
+    definitions: &[crate::types::Match],
     cache: &OutlineCache,
 ) -> String {
     let mut locations = String::new();
@@ -1269,6 +1274,33 @@ impl Executor {
         assert!(
             target.path.ends_with("beta.rs"),
             "Beta::dispatch must resolve to Beta's dispatch, got {}",
+            target.path.display()
+        );
+        assert_eq!(target.other_def_count, 0);
+    }
+
+    #[test]
+    fn resolve_qualified_target_owner_beyond_default_cap() {
+        // Qualified resolution must inspect every same-named definition, not just
+        // the default rendered top 10. The requested owner is sorted after the
+        // first ten files, so a capped candidate set would miss it.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            let owner = format!("Owner{i:02}");
+            let body = format!(
+                "pub struct {owner};\n\nimpl {owner} {{\n    pub fn dispatch(&self) {{}}\n}}\n"
+            );
+            write_fixture(tmp.path(), &format!("src/{owner}.rs"), &body);
+        }
+        let body = "pub struct Owner99;\n\nimpl Owner99 {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/zz_owner99.rs", body);
+
+        let (target, _, _) = resolve_with_source("Owner99::dispatch", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve capped owner: {e}"));
+        assert_eq!(target.name, "dispatch");
+        assert!(
+            target.path.ends_with("zz_owner99.rs"),
+            "Owner99::dispatch must resolve past the default cap, got {}",
             target.path.display()
         );
         assert_eq!(target.other_def_count, 0);
