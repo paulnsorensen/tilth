@@ -322,15 +322,31 @@ opinionated defaults:
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,
   `dist`, `build`, `__pycache__`, `vendor`, `.next`, `.venv`,
-  `.mypy_cache`, etc. ~30 entries. Enforced even with
-  `TILTH_NO_IGNORE=1`.
-- **Per-repo `.gitignore`** is honored by default
-  (`apply_ignore_settings`).
-- **`.tilthignore`** — gitignore syntax — is layered on top.
-  `!path` lines re-include files that `.gitignore` would have excluded.
-- **Global gitignore** and `.git/info/exclude` are deliberately
-  **never** consulted; those tend to list per-engineer files (agent
-  state, editor scratch) that grep-style queries should still find.
+  `.mypy_cache`, etc. ~30 entries. Hard-coded; not configurable.
+- **`.gitignore` / `.ignore` / `.git/info/exclude` / global gitignore
+  are deliberately NOT honored.** Every git ignore layer is disabled
+  (`git_ignore(false)`, `git_global(false)`, `git_exclude(false)`,
+  `ignore(false)`). Gitignored-but-relevant files (generated code,
+  local configs) stay findable — that is the point of doing tilth's own
+  walking instead of leaning on git. Searching gitignored files is the
+  intended default, not an oversight.
+- **`.tilthignore`** is the one ignore file tilth honors and the only
+  per-repo deny knob. Gitignore syntax, including `!path` re-include;
+  per-directory; layered via `ignore`'s `add_custom_ignore_filename`
+  (`apply_tilthignore`), which the crate builds independently of the
+  disabled git layers. Applied to every walker — search, `tilth_list`,
+  and `map`. An explicit `tilth_read` of a path also respects it
+  (`read::tilthignore_denies`), so a repo can hard-deny a deliberate
+  read of its secret files; the read returns `IgnoreDenied`.
+- **Built-in secrets denylist** (`detection::is_secret_file`):
+  defense-in-depth that applies even with no `.tilthignore`. When a
+  search matches a secret file (`.env`/`.env.*` except templates,
+  `*.pem`/`*.key`/`*.p12`, `id_rsa`/`*_rsa`/`*_ed25519`,
+  `credentials*`, `.netrc`, `.npmrc`, …) the result lists the path but
+  the formatter redacts the body — matched line, outline, and expansion
+  are all withheld (`is_secret_match` in `search/mod.rs`). The agent
+  must `tilth_read` the file deliberately to see its contents; reading
+  an explicit secret path is allowed (only `.tilthignore` blocks it).
 - **Symlinks are followed** (`follow_links(true)`). This is the
   upstream `feat: follow symlinks in all file walkers (#46)` change
   and creates a known duplicate-match problem when a path is reachable
@@ -341,6 +357,10 @@ opinionated defaults:
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.
+
+One scoping caveat: the walker sets `parents(false)`, so a
+`.tilthignore` in a directory *above* the search scope is not consulted
+— place repo-wide rules at the repo root and search from there.
 
 ### Symbol search (`symbol.rs`)
 
@@ -556,7 +576,7 @@ Make.
 - `is_generated_by_name`, `is_generated_by_content` — lockfile names
   and `@generated`/`DO NOT EDIT`-style markers (12 variants).
 - `is_minified_by_name`, `is_minified_by_content` — naming convention
-  + density check.
+  - density check.
 
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all

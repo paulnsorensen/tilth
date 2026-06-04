@@ -100,6 +100,9 @@ pub(in crate::mcp) fn tool_read(
                 if !path.exists() {
                     return PerPath::NotFound(path.display().to_string());
                 }
+                if crate::read::tilthignore_denies(path) {
+                    return PerPath::Content(crate::read::blocked_notice(path));
+                }
                 // A `#symbol` suffix that resolves cleanly to "symbol absent
                 // from outline" is the symbol-equivalent of a missing file:
                 // route it to the `── not found ──` footer with the qualified
@@ -183,6 +186,16 @@ pub(in crate::mcp) fn tool_read(
         .next()
         .cloned()
         .unwrap_or(PathSuffix::None);
+
+    // A repo's .tilthignore hard-denies an explicit read of this path.
+    if crate::read::tilthignore_denies(&path) {
+        return Ok(finalize_response(
+            None,
+            serde_json::Map::new(),
+            &crate::read::blocked_notice(&path),
+            None,
+        ));
+    }
 
     // if_modified_since on a single path
     if let Some(s_ts) = since {
