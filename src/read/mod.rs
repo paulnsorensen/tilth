@@ -4,7 +4,7 @@ pub mod outline;
 
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use memmap2::Mmap;
 
@@ -27,6 +27,74 @@ fn full_read_size_cap() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2_000_000)
+}
+
+/// True if `path` is denied by a `.tilthignore` file in its directory ancestry
+/// (gitignore syntax, closest file wins, `!` re-include supported). Walks up to
+/// and including the repo root (first ancestor containing `.git`), else the
+/// filesystem root.
+///
+/// The walker honors `.tilthignore` for search/list/map automatically, but an
+/// explicit `tilth_read` bypasses the walker — this is the hook that lets a repo
+/// hard-deny a deliberate read of its secret files. Built-in secret files
+/// (`.env`, keys) are intentionally NOT blocked here: reading one explicitly is
+/// a deliberate act; only a repo's own `.tilthignore` makes a read fail.
+pub(crate) fn tilthignore_denies(path: &Path) -> bool {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let Some(abs) = absolute_lexical(path) else {
+        return false;
+    };
+
+    let mut dir = abs.parent();
+    while let Some(d) = dir {
+        let ignore_file = d.join(crate::search::TILTHIGNORE_FILE);
+        if ignore_file.is_file() {
+            let mut builder = GitignoreBuilder::new(d);
+            if builder.add(&ignore_file).is_none() {
+                if let Ok(gi) = builder.build() {
+                    // Closest .tilthignore wins — first definitive verdict ends it.
+                    let verdict = gi.matched_path_or_any_parents(&abs, false);
+                    if verdict.is_ignore() {
+                        return true;
+                    }
+                    if verdict.is_whitelist() {
+                        return false;
+                    }
+                }
+            }
+        }
+        if d.join(".git").exists() {
+            break; // stop at the repo root
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+fn absolute_lexical(path: &Path) -> Option<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn blocked_notice(path: &Path) -> String {
+    format!("# {}\nblocked: denied by .tilthignore", path.display())
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -1096,5 +1164,107 @@ mod tests {
         assert!(line_one_match, "expected hashline for line 1: {out}");
         assert!(line_six_match, "expected hashline for line 6: {out}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tilthignore_denies_listed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "cluster/.env\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("cluster")).unwrap();
+        let secret = dir.path().join("cluster/.env");
+        std::fs::write(&secret, "API_KEY=abc\n").unwrap();
+
+        assert!(
+            tilthignore_denies(&secret),
+            "path listed in .tilthignore must be denied"
+        );
+    }
+
+    #[test]
+    fn tilthignore_allows_unlisted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "secrets/\n").unwrap();
+        let ok = dir.path().join("main.rs");
+        std::fs::write(&ok, "fn main() {}\n").unwrap();
+
+        assert!(!tilthignore_denies(&ok), "unlisted path must not be denied");
+    }
+
+    #[test]
+    fn tilthignore_does_not_block_plain_secret_read() {
+        // A built-in secret file with no .tilthignore is still explicitly
+        // readable — only a repo's .tilthignore makes a deliberate read fail.
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join(".env");
+        std::fs::write(&env, "API_KEY=abc\n").unwrap();
+
+        assert!(
+            !tilthignore_denies(&env),
+            "secrets denylist must not block explicit reads; only .tilthignore does"
+        );
+    }
+
+    #[test]
+    fn tilthignore_nested_closest_wins() {
+        // A parent .tilthignore denies all *.env; a child .tilthignore in a
+        // subdirectory re-includes one of them via `!`. The closest file wins.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "*.env\n").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".tilthignore"), "!keep.env\n").unwrap();
+
+        let kept = sub.join("keep.env");
+        let denied_child = sub.join("other.env");
+        let denied_root = dir.path().join("root.env");
+        std::fs::write(&kept, "x").unwrap();
+        std::fs::write(&denied_child, "y").unwrap();
+        std::fs::write(&denied_root, "z").unwrap();
+
+        assert!(
+            !tilthignore_denies(&kept),
+            "child `!keep.env` must override the parent `*.env` deny"
+        );
+        assert!(
+            tilthignore_denies(&denied_child),
+            "other.env in the child dir is still caught by the parent `*.env`"
+        );
+        assert!(
+            tilthignore_denies(&denied_root),
+            "root.env is denied by the root `*.env`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tilthignore_denies_symlink_path_without_resolving_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "secret.env\n").unwrap();
+        let target = outside.path().join("target.env");
+        std::fs::write(&target, "API_KEY=abc\n").unwrap();
+        let link = dir.path().join("secret.env");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            tilthignore_denies(&link),
+            ".tilthignore must match the requested symlink path, not the resolved target"
+        );
+    }
+
+    #[test]
+    fn tilthignore_negation_reincludes_for_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "*.env\n!keep.env\n").unwrap();
+        let denied = dir.path().join("prod.env");
+        let kept = dir.path().join("keep.env");
+        std::fs::write(&denied, "x").unwrap();
+        std::fs::write(&kept, "y").unwrap();
+
+        assert!(tilthignore_denies(&denied), "prod.env should be denied");
+        assert!(
+            !tilthignore_denies(&kept),
+            "`!keep.env` should re-allow keep.env"
+        );
     }
 }

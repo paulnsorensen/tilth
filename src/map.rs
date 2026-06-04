@@ -24,6 +24,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
         .git_exclude(false)
         .ignore(false)
         .parents(false)
+        .add_custom_ignore_filename(crate::search::TILTHIGNORE_FILE)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {

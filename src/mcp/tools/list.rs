@@ -53,6 +53,11 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         .follow_links(true)
         .hidden(false)
         .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .add_custom_ignore_filename(crate::search::TILTHIGNORE_FILE)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {

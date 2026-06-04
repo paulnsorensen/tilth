@@ -92,6 +92,64 @@ pub fn is_minified_by_content(buf: &[u8]) -> bool {
     newlines < 2
 }
 
+/// Built-in secrets denylist, matched against a file's basename. Search may
+/// still list a matching path as a hit, but the result formatter never inlines
+/// the file's contents (matched lines, outline, or expanded body) — the agent
+/// must `tilth_read` it deliberately. This is defense-in-depth on top of the
+/// repo-author `.tilthignore` knob: it protects `.env`/key material even when a
+/// repo has no `.tilthignore`.
+///
+/// Conservative by design: false positives only cost an inline preview (the
+/// path is still findable and readable), so the bias is toward redacting
+/// anything that commonly holds credentials.
+pub fn is_secret_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map(|(_, e)| e);
+
+    // Public keys are safe to inline; their private counterparts are not.
+    if ext == Some("pub") {
+        return false;
+    }
+
+    // `.env` family — but allow committed, secret-free templates.
+    if lower == ".env" {
+        return true;
+    }
+    if let Some(variant) = lower.strip_prefix(".env.") {
+        return !matches!(
+            variant,
+            "example" | "sample" | "template" | "dist" | "defaults"
+        );
+    }
+
+    // Exact-name credential stores.
+    if matches!(
+        lower.as_str(),
+        ".netrc" | ".npmrc" | ".pgpass" | ".htpasswd"
+    ) {
+        return true;
+    }
+
+    // `credentials`, `credentials.json`, `aws_credentials`, …
+    if lower.starts_with("credentials") {
+        return true;
+    }
+
+    // Private key / certificate material by extension.
+    if matches!(
+        ext,
+        Some("pem" | "key" | "p12" | "pfx" | "pkcs12" | "keystore" | "jks")
+    ) {
+        return true;
+    }
+
+    // SSH/PGP private keys: `id_rsa`, `id_ed25519`, `server_dsa`, … The `.pub`
+    // companions already returned false above.
+    ["_rsa", "_dsa", "_ecdsa", "_ed25519"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +199,70 @@ mod tests {
         assert!(!is_minified_by_name(".min.config"));
         assert!(!is_minified_by_name(".min.env"));
         assert!(!is_minified_by_name(".min.json"));
+    }
+
+    #[test]
+    fn secret_env_family() {
+        // `.ENV` confirms case-insensitive matching.
+        for name in [".env", ".env.local", ".env.production", ".ENV"] {
+            assert!(is_secret_file(name), "{name} should be a secret");
+        }
+        // Templates are committed and secret-free.
+        for name in [".env.example", ".env.sample", ".env.template"] {
+            assert!(
+                !is_secret_file(name),
+                "{name} template should not be a secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_key_material() {
+        for name in [
+            "server.key",
+            "tls.pem",
+            "cert.p12",
+            "store.jks",
+            "id_rsa",
+            "id_ed25519",
+            "deploy_dsa",
+        ] {
+            assert!(is_secret_file(name), "{name} should be a secret");
+        }
+        // Public keys are safe to inline; their private counterparts are not.
+        for name in ["id_rsa.pub", "id_ed25519.pub"] {
+            assert!(
+                !is_secret_file(name),
+                "{name} (public key) should not be a secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_credential_stores() {
+        for name in [
+            ".netrc",
+            ".npmrc",
+            ".pgpass",
+            ".htpasswd",
+            "credentials",
+            "credentials.json",
+        ] {
+            assert!(is_secret_file(name), "{name} should be a secret");
+        }
+    }
+
+    #[test]
+    fn secret_negatives() {
+        for name in [
+            "main.rs",
+            "config.yaml",
+            "README.md",
+            ".gitignore",
+            "Cargo.toml",
+        ] {
+            assert!(!is_secret_file(name), "{name} should not be a secret");
+        }
     }
 
     #[test]

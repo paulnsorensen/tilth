@@ -12,6 +12,8 @@ pub enum TilthError {
     },
     #[error("{} [permission denied]", path.display())]
     PermissionDenied { path: PathBuf },
+    #[error("{} [denied by .tilthignore]", path.display())]
+    IgnoreDenied { path: PathBuf },
     #[error("invalid query \"{query}\": {reason}")]
     InvalidQuery { query: String, reason: String },
     #[error("{}: {source}", path.display())]
@@ -30,7 +32,7 @@ impl TilthError {
         match self {
             Self::NotFound { .. } | Self::IoError { .. } => 2,
             Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,
-            Self::PermissionDenied { .. } => 4,
+            Self::PermissionDenied { .. } | Self::IgnoreDenied { .. } => 4,
         }
     }
 }

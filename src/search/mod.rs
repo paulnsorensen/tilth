@@ -72,13 +72,36 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+const SECRET_REDACTION_NOTICE: &str =
+    "\n→ contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
+
+fn path_is_secret_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::lang::detection::is_secret_file)
+}
+
+fn is_secret_match(m: &Match) -> bool {
+    path_is_secret_file(&m.path)
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
-/// Build a parallel directory walker that searches ALL files except known junk directories.
-/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
+/// Filename of the per-repo deny list, layered onto every walker via
+/// `add_custom_ignore_filename`. Gitignore syntax (supports `!` re-include).
+/// The `ignore` crate builds the custom-ignore matcher independently of the
+/// git layers (which stay disabled), so this is the one ignore mechanism tilth
+/// honors — a repo can hard-deny secret or noisy files from search/list/map
+/// even though `.gitignore` is intentionally not consulted.
+pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
+
+/// Build a parallel directory walker that searches ALL files except known junk
+/// directories and anything a repo's `.tilthignore` excludes. `.gitignore` is
+/// intentionally NOT honored — gitignored-but-relevant files (generated code,
+/// local configs) stay findable; `.tilthignore` is the opt-in deny knob.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
@@ -99,6 +122,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
         .ignore(false)
         .parents(false)
         .threads(threads)
+        .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
@@ -611,6 +635,13 @@ fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, o
     }
     out.push(']');
 
+    // Secrets denylist: list the path but suppress the outline (it can leak
+    // structured key/value pairs from a credentials file).
+    if is_secret_match(first) {
+        out.push_str(SECRET_REDACTION_NOTICE);
+        return;
+    }
+
     // Show outline context once for the group
     if let Some(context) = outline_context_for_match(&first.path, first.line, cache) {
         out.push_str(&context);
@@ -702,6 +733,14 @@ fn format_single_match(
             rel(&m.path, scope),
             m.line
         );
+    }
+
+    // Secrets denylist: the path is listed (above) so the agent knows there's a
+    // hit, but the matched line, outline, and expanded body are all suppressed —
+    // they would inline credentials. The agent can `tilth_read` it deliberately.
+    if is_secret_match(m) {
+        out.push_str(SECRET_REDACTION_NOTICE);
+        return;
     }
 
     // Markdown-heading defs (`def_weight == 30`): the heading text alone is
@@ -994,6 +1033,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(true)
         .git_ignore(true)
+        .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .max_depth(Some(6))
         .build();
 
@@ -1040,6 +1080,9 @@ fn basename_file_outline(
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
         .or_else(|| find_basename_fallback(scope, &query_lower))?;
+    if path_is_secret_file(&matched_path) {
+        return None;
+    }
 
     // Read file and generate outline
     let content = std::fs::read_to_string(&matched_path).ok()?;
@@ -1717,6 +1760,151 @@ mod tests {
         let all = walk_paths(&scope, None);
         let empty = walk_paths(&scope, Some(""));
         assert_eq!(all.len(), empty.len(), "empty glob should behave like None");
+    }
+
+    #[test]
+    fn walker_honors_tilthignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("keep.rs"), "fn keep() {}").unwrap();
+        std::fs::write(tmp.path().join("drop.rs"), "fn drop_me() {}").unwrap();
+        std::fs::write(tmp.path().join(".tilthignore"), "drop.rs\n").unwrap();
+
+        let names: Vec<String> = walk_paths(tmp.path(), None)
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"keep.rs".to_string()), "got: {names:?}");
+        assert!(
+            !names.contains(&"drop.rs".to_string()),
+            ".tilthignore should exclude drop.rs: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walker_tilthignore_negation_reincludes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("keepme.txt"), "y").unwrap();
+        // Deny all .txt, then re-include keepme.txt via `!`.
+        std::fs::write(tmp.path().join(".tilthignore"), "*.txt\n!keepme.txt\n").unwrap();
+
+        let names: Vec<String> = walk_paths(tmp.path(), None)
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(String::from))
+            .collect();
+        assert!(
+            names.contains(&"keepme.txt".to_string()),
+            "`!` should re-include keepme.txt: {names:?}"
+        );
+        assert!(
+            !names.contains(&"secret.txt".to_string()),
+            "secret.txt should stay excluded: {names:?}"
+        );
+    }
+
+    #[test]
+    fn content_search_basename_overview_skips_secret_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("credentials.json"),
+            "{\n  \"credentials\": \"TOPSECRET_value_999\"\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = search_content_expanded(
+            "credentials",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("search failed");
+
+        assert!(
+            out.contains("credentials.json"),
+            "path should still be listed: {out}"
+        );
+        assert!(
+            !out.contains("File overview: credentials.json"),
+            "secret basename must not produce a file overview: {out}"
+        );
+        assert!(
+            !out.contains("TOPSECRET_value_999"),
+            "secret value must never appear: {out}"
+        );
+    }
+
+    #[test]
+    fn content_search_lists_secret_path_but_redacts_body() {
+        // Mirrors issue #63: a benign query (a version string) matches a line in
+        // a .env, and the result must not inline the file — so secrets on OTHER
+        // lines never reach the agent's context.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "VERSION=1.2.3\nAPI_KEY=supersecret_value_12345\nDB_PASS=hunter2\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = search_content_expanded(
+            "VERSION",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("search failed");
+
+        assert!(
+            out.contains(".env"),
+            "secret file path should still be listed as a hit: {out}"
+        );
+        assert!(
+            !out.contains("supersecret_value_12345"),
+            "a secret on an unsearched line must never leak: {out}"
+        );
+        assert!(
+            !out.contains("hunter2"),
+            "no line from the secret file may be inlined: {out}"
+        );
+        assert!(
+            out.contains("redacted"),
+            "output should explain the redaction: {out}"
+        );
+
+        // The strongest statement of the property: even when the query matches
+        // the secret line ITSELF, the value on that line is suppressed. (The
+        // header echoes the query `API_KEY` — that's the agent's own input, not
+        // a leak; the secret is the VALUE, which must not appear.)
+        let out2 = search_content_expanded(
+            "API_KEY",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("search failed");
+        assert!(out2.contains(".env"), "path should still be listed: {out2}");
+        assert!(
+            !out2.contains("supersecret_value_12345"),
+            "the matched secret line's value must be redacted: {out2}"
+        );
     }
 
     #[test]
@@ -2426,6 +2614,51 @@ mod tests {
         assert!(
             !out.starts_with("\n\n## "),
             "grouped-usage heading must not be H2, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_grouped_usages_redacts_secret_file() {
+        use crate::types::Match;
+
+        // credentials.json outlines as structured data, so without the guard the
+        // grouped formatter would append the file's outline (key/value pairs).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("credentials.json");
+        std::fs::write(&p, "{\n  \"region\": \"us-east-1\",\n  \"region2\": \"us-east-2\",\n  \"token\": \"TOPSECRET_value_999\"\n}\n").unwrap();
+
+        let mk = |line: u32| Match {
+            path: p.clone(),
+            line,
+            text: "  \"region\": \"us-east-1\",".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 60,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let m1 = mk(2);
+        let m2 = mk(3);
+        let group: Vec<&Match> = vec![&m1, &m2];
+        let cache = OutlineCache::new();
+        let mut out = String::new();
+        format_grouped_usages(&group, tmp.path(), &cache, &mut out);
+
+        assert!(
+            out.contains("credentials.json"),
+            "secret path should still be listed: {out:?}"
+        );
+        assert!(
+            out.trim_end()
+                .ends_with(".tilthignore allows explicit reads"),
+            "nothing (no outline) may follow the redaction notice: {out:?}"
+        );
+        assert!(
+            !out.contains("TOPSECRET_value_999"),
+            "secret value must never appear: {out:?}"
         );
     }
 }
