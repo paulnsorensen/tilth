@@ -332,11 +332,11 @@ opinionated defaults:
   intended default, not an oversight.
 - **`.tilthignore`** is the one ignore file tilth honors and the only
   per-repo deny knob. Gitignore syntax, including `!path` re-include;
-  per-directory; layered via `ignore`'s `add_custom_ignore_filename`
-  (`apply_tilthignore`), which the crate builds independently of the
-  disabled git layers. Applied to every walker — search, `tilth_list`,
-  and `map`. An explicit `tilth_read` of a path also respects it
-  (`read::tilthignore_denies`), so a repo can hard-deny a deliberate
+  per-directory; layered via `ignore`'s `add_custom_ignore_filename`,
+  which the crate builds independently of the disabled git layers.
+  Applied to every walker — search, `tilth_list`, and `map`. An
+  explicit `tilth_read` of a path also respects it (`read::tilthignore_denies`),
+  so a repo can hard-deny a deliberate
   read of its secret files; the read returns `IgnoreDenied`.
 - **Built-in secrets denylist** (`detection::is_secret_file`):
   defense-in-depth that applies even with no `.tilthignore`. When a
@@ -576,7 +576,7 @@ Make.
 - `is_generated_by_name`, `is_generated_by_content` — lockfile names
   and `@generated`/`DO NOT EDIT`-style markers (12 variants).
 - `is_minified_by_name`, `is_minified_by_content` — naming convention
-  - density check.
+  plus density check.
 
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all

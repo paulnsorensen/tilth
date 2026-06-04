@@ -4,7 +4,7 @@ pub mod outline;
 
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use memmap2::Mmap;
 
@@ -42,10 +42,7 @@ fn full_read_size_cap() -> u64 {
 pub(crate) fn tilthignore_denies(path: &Path) -> bool {
     use ignore::gitignore::GitignoreBuilder;
 
-    // Canonicalize so each matcher root is a genuine ancestor of the target
-    // (matched_path_or_any_parents panics otherwise). Missing/unreadable paths
-    // return false — the normal read path reports the real error.
-    let Ok(abs) = path.canonicalize() else {
+    let Some(abs) = absolute_lexical(path) else {
         return false;
     };
 
@@ -73,6 +70,27 @@ pub(crate) fn tilthignore_denies(path: &Path) -> bool {
         dir = d.parent();
     }
     false
+}
+
+fn absolute_lexical(path: &Path) -> Option<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    Some(out)
 }
 
 pub(crate) fn blocked_notice(path: &Path) -> String {
@@ -1214,6 +1232,23 @@ mod tests {
         assert!(
             tilthignore_denies(&denied_root),
             "root.env is denied by the root `*.env`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tilthignore_denies_symlink_path_without_resolving_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "secret.env\n").unwrap();
+        let target = outside.path().join("target.env");
+        std::fs::write(&target, "API_KEY=abc\n").unwrap();
+        let link = dir.path().join("secret.env");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            tilthignore_denies(&link),
+            ".tilthignore must match the requested symlink path, not the resolved target"
         );
     }
 

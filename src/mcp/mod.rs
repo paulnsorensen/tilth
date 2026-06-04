@@ -2465,7 +2465,36 @@ mod tests {
         );
     }
 
-    // -- tilth_search wire layer: restored from pre-merge 3801a4c (PR-A)
+    #[test]
+    fn tool_list_ignores_ignore_files_except_tilthignore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        std::fs::write(dir.path().join(".ignore"), "hidden.rs\n").unwrap();
+        std::fs::write(dir.path().join(".git/info/exclude"), "excluded.rs\n").unwrap();
+        std::fs::write(dir.path().join("hidden.rs"), "fn hidden() {}\n").unwrap();
+        std::fs::write(dir.path().join("excluded.rs"), "fn excluded() {}\n").unwrap();
+        std::fs::write(dir.path().join("denied.rs"), "fn denied() {}\n").unwrap();
+        std::fs::write(dir.path().join(".tilthignore"), "denied.rs\n").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": dir.path().to_str().unwrap()
+        });
+
+        let out = tool_list(&args).expect("list ok");
+
+        assert!(
+            out.contains("hidden.rs"),
+            ".ignore must not hide files: {out}"
+        );
+        assert!(
+            out.contains("excluded.rs"),
+            ".git/info/exclude must not hide files: {out}"
+        );
+        assert!(
+            !out.contains("denied.rs"),
+            ".tilthignore must deny files: {out}"
+        );
+    }
 
     /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
     #[test]

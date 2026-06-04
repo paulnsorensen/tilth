@@ -73,13 +73,16 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
 const SECRET_REDACTION_NOTICE: &str =
-    "\n→ contents redacted (secrets denylist) — read explicitly with tilth_read to view";
+    "\n→ contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
 
-fn is_secret_match(m: &Match) -> bool {
-    m.path
-        .file_name()
+fn path_is_secret_file(path: &Path) -> bool {
+    path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(crate::lang::detection::is_secret_file)
+}
+
+fn is_secret_match(m: &Match) -> bool {
+    path_is_secret_file(&m.path)
 }
 
 /// Cap for inlined markdown section bodies in the default preview slot.
@@ -1077,6 +1080,9 @@ fn basename_file_outline(
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
         .or_else(|| find_basename_fallback(scope, &query_lower))?;
+    if path_is_secret_file(&matched_path) {
+        return None;
+    }
 
     // Read file and generate outline
     let content = std::fs::read_to_string(&matched_path).ok()?;
@@ -1793,6 +1799,44 @@ mod tests {
         assert!(
             !names.contains(&"secret.txt".to_string()),
             "secret.txt should stay excluded: {names:?}"
+        );
+    }
+
+    #[test]
+    fn content_search_basename_overview_skips_secret_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("credentials.json"),
+            "{\n  \"credentials\": \"TOPSECRET_value_999\"\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = search_content_expanded(
+            "credentials",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("search failed");
+
+        assert!(
+            out.contains("credentials.json"),
+            "path should still be listed: {out}"
+        );
+        assert!(
+            !out.contains("File overview: credentials.json"),
+            "secret basename must not produce a file overview: {out}"
+        );
+        assert!(
+            !out.contains("TOPSECRET_value_999"),
+            "secret value must never appear: {out}"
         );
     }
 
@@ -2608,7 +2652,8 @@ mod tests {
             "secret path should still be listed: {out:?}"
         );
         assert!(
-            out.trim_end().ends_with("tilth_read to view"),
+            out.trim_end()
+                .ends_with(".tilthignore allows explicit reads"),
             "nothing (no outline) may follow the redaction notice: {out:?}"
         );
         assert!(
