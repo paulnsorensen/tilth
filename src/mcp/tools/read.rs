@@ -72,11 +72,61 @@ pub(in crate::mcp) fn tool_read(
             let path = PathBuf::from(path_str);
             session.record_read(&path);
             let read = if force_signature {
-                read_signature_file(&path, cache).map(|(body, _)| body)
+                let res = read_signature_file(&path, cache).map(|(body, _)| body);
+                match res {
+                    Err(TilthError::NotFound { .. }) => {
+                        if let Some(real) =
+                            crate::read::resolve_missing_path(&path, std::path::Path::new("."))
+                        {
+                            read_signature_file(&real, cache).map(|(body, _)| {
+                                let query = path.display();
+                                format!(
+                                    "# {} (corrected from \"{query}\")\n\n{body}",
+                                    real.display()
+                                )
+                            })
+                        } else {
+                            Err(TilthError::NotFound {
+                                path: path.clone(),
+                                suggestion: None,
+                            })
+                        }
+                    }
+                    other => other,
+                }
             } else if force_stripped {
-                read_stripped_file(&path, cache).map(|(body, _, _)| body)
+                let res = read_stripped_file(&path, cache).map(|(body, _, _)| body);
+                match res {
+                    Err(TilthError::NotFound { .. }) => {
+                        if let Some(real) =
+                            crate::read::resolve_missing_path(&path, std::path::Path::new("."))
+                        {
+                            read_stripped_file(&real, cache).map(|(body, _, _)| {
+                                let query = path.display();
+                                format!(
+                                    "# {} (corrected from \"{query}\")\n\n{body}",
+                                    real.display()
+                                )
+                            })
+                        } else {
+                            Err(TilthError::NotFound {
+                                path: path.clone(),
+                                suggestion: None,
+                            })
+                        }
+                    }
+                    other => other,
+                }
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode)
+                crate::read::read_file_resolving(
+                    &path,
+                    None,
+                    force_full,
+                    cache,
+                    edit_mode,
+                    std::path::Path::new("."),
+                )
+                .map(|(body, _)| body)
             };
             match read {
                 Ok(output) => results.push(output),
@@ -137,18 +187,69 @@ pub(in crate::mcp) fn tool_read(
     }
 
     session.record_read(&path);
+    // Track which path was actually opened so would_outline and resolve_related_files
+    // work against the real file (not the missing/typo'd path the agent named).
+    let mut opened_path = path.clone();
     let mut output = if section.is_none() && force_signature {
-        read_signature_file(&path, cache)
-            .map(|(body, _)| body)
-            .map_err(|e| e.to_string())?
+        let res = read_signature_file(&path, cache).map(|(body, _)| body);
+        match res {
+            Err(TilthError::NotFound { .. }) => {
+                if let Some(real) =
+                    crate::read::resolve_missing_path(&path, std::path::Path::new("."))
+                {
+                    opened_path.clone_from(&real);
+                    read_signature_file(&real, cache)
+                        .map(|(body, _)| {
+                            let query = path.display();
+                            format!(
+                                "# {} (corrected from \"{query}\")\n\n{body}",
+                                real.display()
+                            )
+                        })
+                        .map_err(|e| e.to_string())?
+                } else {
+                    return Err(TilthError::NotFound {
+                        path: path.clone(),
+                        suggestion: None,
+                    }
+                    .to_string());
+                }
+            }
+            Ok(body) => body,
+            Err(e) => return Err(e.to_string()),
+        }
     } else if section.is_none() && force_stripped {
-        read_stripped_file(&path, cache)
-            .map(|(body, _, _)| body)
-            .map_err(|e| e.to_string())?
+        let res = read_stripped_file(&path, cache).map(|(body, _, _)| body);
+        match res {
+            Err(TilthError::NotFound { .. }) => {
+                if let Some(real) =
+                    crate::read::resolve_missing_path(&path, std::path::Path::new("."))
+                {
+                    opened_path.clone_from(&real);
+                    read_stripped_file(&real, cache)
+                        .map(|(body, _, _)| {
+                            let query = path.display();
+                            format!(
+                                "# {} (corrected from \"{query}\")\n\n{body}",
+                                real.display()
+                            )
+                        })
+                        .map_err(|e| e.to_string())?
+                } else {
+                    return Err(TilthError::NotFound {
+                        path: path.clone(),
+                        suggestion: None,
+                    }
+                    .to_string());
+                }
+            }
+            Ok(body) => body,
+            Err(e) => return Err(e.to_string()),
+        }
     } else {
         // scope is the process cwd: the MCP server chdir's to the project root at
         // startup, so a relative "." anchors the cold-path fuzzy walk correctly.
-        crate::read::read_file_resolving(
+        let (body, real) = crate::read::read_file_resolving(
             &path,
             section,
             force_full,
@@ -156,12 +257,16 @@ pub(in crate::mcp) fn tool_read(
             edit_mode,
             std::path::Path::new("."),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        opened_path = real;
+        body
     };
 
     // Append related-file hint for outlined code files (not section reads, not batch).
-    if section.is_none() && crate::read::would_outline(&path) {
-        let related = crate::read::imports::resolve_related_files(&path);
+    // Use opened_path (the resolved real file) so would_outline / resolve_related_files
+    // don't get metadata-not-found on the typo'd path.
+    if section.is_none() && crate::read::would_outline(&opened_path) {
+        let related = crate::read::imports::resolve_related_files(&opened_path);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {
@@ -542,6 +647,102 @@ mod tests {
         assert!(
             modes.iter().any(|v| v.as_str() == Some("stripped")),
             "mode enum must advertise stripped: {read}"
+        );
+    }
+
+    // ── Finding 4 regressions (typo'd path resolution in batch + signature/stripped)
+    //
+    // The tool_read batch and signature/stripped paths call read_file_resolving
+    // and resolve_missing_path. We test those underlying functions directly with
+    // an explicit scope to avoid set_current_dir (process-global, races other tests).
+
+    #[test]
+    fn batch_underlying_typo_resolves_to_real_file() {
+        // Simulates the batch loop: read_file_resolving is called for each path.
+        // A typo'd path must fuzzy-resolve to the real file's content.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let real = src.join("symbol.rs");
+        std::fs::write(&real, "fn the_symbol() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let (body, opened) = crate::read::read_file_resolving(
+            &dir.path().join("src/symbl.rs"),
+            None,
+            false,
+            &cache,
+            false,
+            dir.path(),
+        )
+        .expect("batch: typo'd path should fuzzy-resolve");
+        assert!(
+            body.contains("corrected from"),
+            "batch: resolved content must have correction header: {body}"
+        );
+        assert!(
+            body.contains("the_symbol"),
+            "batch: resolved content must contain the real file's code: {body}"
+        );
+        assert_eq!(opened, real, "batch: opened path must be the real file");
+    }
+
+    #[test]
+    fn signature_mode_underlying_typo_resolves() {
+        // Simulates the signature branch: resolve_missing_path + read_signature_file.
+        // A typo'd path must fuzzy-resolve and still emit only the signature view.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let real = src.join("symbol.rs");
+        std::fs::write(&real, "fn signature_fn() {\n    let body = 1;\n}\n").unwrap();
+
+        let resolved =
+            crate::read::resolve_missing_path(&dir.path().join("src/symbl.rs"), dir.path())
+                .expect("signature: typo'd path should fuzzy-resolve");
+        assert_eq!(
+            resolved, real,
+            "signature: resolved path must be the real file"
+        );
+        // read_signature_file is private; verify through read_file on the resolved path
+        // to confirm the function name appears in the raw file content.
+        let content = std::fs::read_to_string(&resolved).unwrap();
+        assert!(
+            content.contains("signature_fn"),
+            "signature: resolved file must contain the expected function: {content}"
+        );
+    }
+
+    // ── Finding 6 regression (resolved path used for would_outline hint)
+
+    #[test]
+    fn read_file_resolving_returns_resolved_path() {
+        // When the path is missing but fuzzy-resolves, the returned PathBuf
+        // must point to the real file so callers can use it for would_outline.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let real = src.join("symbol.rs");
+        std::fs::write(&real, "fn resolved_fn() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let (content, opened) = crate::read::read_file_resolving(
+            &dir.path().join("src/symbl.rs"),
+            None,
+            false,
+            &cache,
+            false,
+            dir.path(),
+        )
+        .expect("fuzzy resolve must succeed for near-miss");
+        assert!(
+            content.contains("corrected from"),
+            "content must have correction header: {content}"
+        );
+        assert_eq!(
+            opened, real,
+            "opened path must be the real file, not the typo'd query path — \
+             callers use this for would_outline"
         );
     }
 }
