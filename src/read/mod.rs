@@ -257,20 +257,41 @@ pub fn read_file_resolving(
     edit_mode: bool,
     scope: &Path,
 ) -> Result<(String, PathBuf), TilthError> {
-    let (missing, suggestion) = match read_file(path, section, full, cache, edit_mode) {
+    read_with_fuzzy_retry(path, scope, |p| {
+        read_file(p, section, full, cache, edit_mode)
+    })
+}
+
+/// Fuzzy-retry wrapper: runs `read_fn(path)`; on `NotFound` fuzzy-resolves the
+/// path under `scope` and retries `read_fn(real)`, prepending a correction header.
+/// `Suggestions` from the fuzzy resolver surface into `NotFound.suggestion` so
+/// callers see "did you mean" hints instead of a bare missing-path error.
+/// Every other outcome (success or non-`NotFound` error) is returned untouched.
+///
+/// Returns `(content, opened_path)` where `opened_path` is the actually-opened
+/// file — callers should use it for `would_outline` / `resolve_related_files`.
+pub fn read_with_fuzzy_retry<F>(
+    path: &Path,
+    scope: &Path,
+    read_fn: F,
+) -> Result<(String, PathBuf), TilthError>
+where
+    F: Fn(&Path) -> Result<String, TilthError>,
+{
+    let (missing, suggestion) = match read_fn(path) {
         Ok(body) => return Ok((body, path.to_path_buf())),
         Err(TilthError::NotFound { path, suggestion }) => (path, suggestion),
         Err(other) => return Err(other),
     };
-
     let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
         fuzzy_path::FuzzyResolution::Resolved(hit) => {
             hit.log_auto_open(&query);
             let real = scope.join(&hit.path);
-            let body = read_file(&real, section, full, cache, edit_mode)?;
+            let body = read_fn(&real)?;
             let content = format!(
-                "# {} (corrected from \"{query}\")\n\n{body}",
+                "# {} (corrected from \"{query}\")\
+\n\n{body}",
                 hit.path.display()
             );
             Ok((content, real))
@@ -286,21 +307,6 @@ pub fn read_file_resolving(
     }
 }
 
-/// Resolve a missing (typo'd or path-shifted) path to the real file it
-/// most likely refers to, using the same fuzzy walk as [`read_file_resolving`].
-/// Returns the resolved real path on a confident match, `None` otherwise.
-/// Callers use this to retry helpers (signature, stripped) that can't go
-/// through `read_file_resolving` directly.
-pub fn resolve_missing_path(path: &Path, scope: &Path) -> Option<PathBuf> {
-    let query = scope_relative_query(path, scope);
-    match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
-        fuzzy_path::FuzzyResolution::Resolved(hit) => {
-            hit.log_auto_open(&query);
-            Some(scope.join(&hit.path))
-        }
-        _ => None,
-    }
-}
 /// Recursive section-tree walk for `resolve_heading`. Returns the first
 /// section whose `atx_heading` matches `(level, text)`.
 fn find_section(

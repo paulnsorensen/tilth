@@ -72,51 +72,15 @@ pub(in crate::mcp) fn tool_read(
             let path = PathBuf::from(path_str);
             session.record_read(&path);
             let read = if force_signature {
-                let res = read_signature_file(&path, cache).map(|(body, _)| body);
-                match res {
-                    Err(TilthError::NotFound { .. }) => {
-                        if let Some(real) =
-                            crate::read::resolve_missing_path(&path, std::path::Path::new("."))
-                        {
-                            read_signature_file(&real, cache).map(|(body, _)| {
-                                let query = path.display();
-                                format!(
-                                    "# {} (corrected from \"{query}\")\n\n{body}",
-                                    real.display()
-                                )
-                            })
-                        } else {
-                            Err(TilthError::NotFound {
-                                path: path.clone(),
-                                suggestion: None,
-                            })
-                        }
-                    }
-                    other => other,
-                }
+                crate::read::read_with_fuzzy_retry(&path, std::path::Path::new("."), |p| {
+                    read_signature_file(p, cache).map(|(body, _)| body)
+                })
+                .map(|(body, _)| body)
             } else if force_stripped {
-                let res = read_stripped_file(&path, cache).map(|(body, _, _)| body);
-                match res {
-                    Err(TilthError::NotFound { .. }) => {
-                        if let Some(real) =
-                            crate::read::resolve_missing_path(&path, std::path::Path::new("."))
-                        {
-                            read_stripped_file(&real, cache).map(|(body, _, _)| {
-                                let query = path.display();
-                                format!(
-                                    "# {} (corrected from \"{query}\")\n\n{body}",
-                                    real.display()
-                                )
-                            })
-                        } else {
-                            Err(TilthError::NotFound {
-                                path: path.clone(),
-                                suggestion: None,
-                            })
-                        }
-                    }
-                    other => other,
-                }
+                crate::read::read_with_fuzzy_retry(&path, std::path::Path::new("."), |p| {
+                    read_stripped_file(p, cache).map(|(body, _, _)| body)
+                })
+                .map(|(body, _)| body)
             } else {
                 crate::read::read_file_resolving(
                     &path,
@@ -189,67 +153,20 @@ pub(in crate::mcp) fn tool_read(
     session.record_read(&path);
     // Track which path was actually opened so would_outline and resolve_related_files
     // work against the real file (not the missing/typo'd path the agent named).
-    let mut opened_path = path.clone();
-    let mut output = if section.is_none() && force_signature {
-        let res = read_signature_file(&path, cache).map(|(body, _)| body);
-        match res {
-            Err(TilthError::NotFound { .. }) => {
-                if let Some(real) =
-                    crate::read::resolve_missing_path(&path, std::path::Path::new("."))
-                {
-                    opened_path.clone_from(&real);
-                    read_signature_file(&real, cache)
-                        .map(|(body, _)| {
-                            let query = path.display();
-                            format!(
-                                "# {} (corrected from \"{query}\")\n\n{body}",
-                                real.display()
-                            )
-                        })
-                        .map_err(|e| e.to_string())?
-                } else {
-                    return Err(TilthError::NotFound {
-                        path: path.clone(),
-                        suggestion: None,
-                    }
-                    .to_string());
-                }
-            }
-            Ok(body) => body,
-            Err(e) => return Err(e.to_string()),
-        }
+    let (mut output, opened_path) = if section.is_none() && force_signature {
+        crate::read::read_with_fuzzy_retry(&path, std::path::Path::new("."), |p| {
+            read_signature_file(p, cache).map(|(body, _)| body)
+        })
+        .map_err(|e| e.to_string())?
     } else if section.is_none() && force_stripped {
-        let res = read_stripped_file(&path, cache).map(|(body, _, _)| body);
-        match res {
-            Err(TilthError::NotFound { .. }) => {
-                if let Some(real) =
-                    crate::read::resolve_missing_path(&path, std::path::Path::new("."))
-                {
-                    opened_path.clone_from(&real);
-                    read_stripped_file(&real, cache)
-                        .map(|(body, _, _)| {
-                            let query = path.display();
-                            format!(
-                                "# {} (corrected from \"{query}\")\n\n{body}",
-                                real.display()
-                            )
-                        })
-                        .map_err(|e| e.to_string())?
-                } else {
-                    return Err(TilthError::NotFound {
-                        path: path.clone(),
-                        suggestion: None,
-                    }
-                    .to_string());
-                }
-            }
-            Ok(body) => body,
-            Err(e) => return Err(e.to_string()),
-        }
+        crate::read::read_with_fuzzy_retry(&path, std::path::Path::new("."), |p| {
+            read_stripped_file(p, cache).map(|(body, _, _)| body)
+        })
+        .map_err(|e| e.to_string())?
     } else {
         // scope is the process cwd: the MCP server chdir's to the project root at
         // startup, so a relative "." anchors the cold-path fuzzy walk correctly.
-        let (body, real) = crate::read::read_file_resolving(
+        crate::read::read_file_resolving(
             &path,
             section,
             force_full,
@@ -257,9 +174,7 @@ pub(in crate::mcp) fn tool_read(
             edit_mode,
             std::path::Path::new("."),
         )
-        .map_err(|e| e.to_string())?;
-        opened_path = real;
-        body
+        .map_err(|e| e.to_string())?
     };
 
     // Append related-file hint for outlined code files (not section reads, not batch).
@@ -653,7 +568,7 @@ mod tests {
     // ── Finding 4 regressions (typo'd path resolution in batch + signature/stripped)
     //
     // The tool_read batch and signature/stripped paths call read_file_resolving
-    // and resolve_missing_path. We test those underlying functions directly with
+    // and read_with_fuzzy_retry. We test those underlying functions directly with
     // an explicit scope to avoid set_current_dir (process-global, races other tests).
 
     #[test]
@@ -689,24 +604,26 @@ mod tests {
 
     #[test]
     fn signature_mode_underlying_typo_resolves() {
-        // Simulates the signature branch: resolve_missing_path + read_signature_file.
-        // A typo'd path must fuzzy-resolve and still emit only the signature view.
+        // read_with_fuzzy_retry wraps read_signature_file in the signature branch.
+        // A typo'd path must fuzzy-resolve and emit only the signature view with a
+        // correction header, and the returned PathBuf must point to the real file.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         let real = src.join("symbol.rs");
         std::fs::write(&real, "fn signature_fn() {\n    let body = 1;\n}\n").unwrap();
+        let cache = OutlineCache::new();
 
-        let resolved =
-            crate::read::resolve_missing_path(&dir.path().join("src/symbl.rs"), dir.path())
-                .expect("signature: typo'd path should fuzzy-resolve");
-        assert_eq!(
-            resolved, real,
-            "signature: resolved path must be the real file"
+        let (content, opened) =
+            crate::read::read_with_fuzzy_retry(&dir.path().join("src/symbl.rs"), dir.path(), |p| {
+                read_signature_file(p, &cache).map(|(body, _)| body)
+            })
+            .expect("signature: typo'd path should fuzzy-resolve");
+        assert_eq!(opened, real, "signature: opened path must be the real file");
+        assert!(
+            content.contains("corrected from"),
+            "signature: correction header must be present: {content}"
         );
-        // read_signature_file is private; verify through read_file on the resolved path
-        // to confirm the function name appears in the raw file content.
-        let content = std::fs::read_to_string(&resolved).unwrap();
         assert!(
             content.contains("signature_fn"),
             "signature: resolved file must contain the expected function: {content}"
@@ -744,5 +661,44 @@ mod tests {
             "opened path must be the real file, not the typo'd query path — \
              callers use this for would_outline"
         );
+    }
+
+    #[test]
+    fn signature_mode_suggestions_surface_on_ambiguous_typo() {
+        // When fuzzy resolution yields Suggestions (multiple near-misses, no clear
+        // winner), the NotFound error must carry suggestion text instead of None.
+        // Previously resolve_missing_path dropped Suggestions entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Two files equally close to "foo.rs" — forces a Suggestions outcome.
+        std::fs::write(src.join("fooa.rs"), "fn fooa() {}\n").unwrap();
+        std::fs::write(src.join("foob.rs"), "fn foob() {}\n").unwrap();
+        let cache = OutlineCache::new();
+
+        let err =
+            crate::read::read_with_fuzzy_retry(&dir.path().join("src/foo.rs"), dir.path(), |p| {
+                read_signature_file(p, &cache).map(|(body, _)| body)
+            })
+            .unwrap_err();
+        // The important contract: when fuzzy found candidates (Suggestions), the error
+        // must carry suggestion text. Previously resolve_missing_path dropped Suggestions
+        // and returned NotFound { suggestion: None } — that's the regression to catch.
+        match err {
+            crate::error::TilthError::NotFound {
+                suggestion: Some(s),
+                ..
+            } => {
+                assert!(s.contains("foo"), "suggestion should name a candidate: {s}");
+            }
+            crate::error::TilthError::NotFound {
+                suggestion: None, ..
+            } => {
+                panic!("suggestion must not be None when fuzzy found candidates — regression!");
+            }
+            other => {
+                panic!("expected NotFound, got: {other}");
+            }
+        }
     }
 }
