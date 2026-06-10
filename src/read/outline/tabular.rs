@@ -34,7 +34,7 @@ pub fn outline(content: &str, _max_lines: usize) -> (String, bool) {
     }
 
     // Gap indicator + last 3 rows
-    let total = newline_count + 1; // total line count including header
+    let total = data_rows + 1; // logical line count: header + data rows (trailing-newline safe)
     if total > 9 {
         out.push(format!("... {} rows omitted", total - 9));
         out.push(String::new());
@@ -82,5 +82,20 @@ mod tests {
     fn empty_input() {
         let (result, _) = outline("", 100);
         assert_eq!(result, "(empty)");
+    }
+
+    /// Regression: the "... N rows omitted" count must not be inflated by a
+    /// trailing newline. header + 12 data rows (trailing \n) omits 4, not 5.
+    #[test]
+    fn rows_omitted_count_trailing_newline() {
+        let mut csv = String::from("a,b\n");
+        for i in 1..=12 {
+            csv.push_str(&format!("{i},{i}\n"));
+        }
+        let (result, _) = outline(&csv, 100);
+        assert!(
+            result.contains("... 4 rows omitted"),
+            "trailing-newline CSV (12 data rows) must omit 4, got:\n{result}"
+        );
     }
 }
