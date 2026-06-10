@@ -1,7 +1,8 @@
 use std::path::Path;
 
 /// Depth-limited outline for JSON, YAML, TOML.
-pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
+/// Returns the rendered outline and whether entries were dropped at `max_lines`.
+pub fn outline(path: &Path, content: &str, max_lines: usize) -> (String, bool) {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => json_outline(content, max_lines),
         Some("yaml" | "yml") => yaml_outline(content, max_lines),
@@ -10,14 +11,15 @@ pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
     }
 }
 
-fn json_outline(content: &str, max_lines: usize) -> String {
+fn json_outline(content: &str, max_lines: usize) -> (String, bool) {
     let value: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
-        Err(e) => return format!("[parse error: {e}]"),
+        Err(e) => return (format!("[parse error: {e}]"), false),
     };
     let mut lines = Vec::new();
-    walk_json(&value, "", 0, 2, max_lines, &mut lines);
-    lines.join("\n")
+    let mut truncated = false;
+    walk_json(&value, "", 0, 2, max_lines, &mut lines, &mut truncated);
+    (lines.join("\n"), truncated)
 }
 
 fn walk_json(
@@ -27,8 +29,10 @@ fn walk_json(
     max_depth: usize,
     max_lines: usize,
     lines: &mut Vec<String>,
+    truncated: &mut bool,
 ) {
     if lines.len() >= max_lines {
+        *truncated = true;
         return;
     }
 
@@ -42,6 +46,7 @@ fn walk_json(
             }
             for (key, val) in map {
                 if lines.len() >= max_lines {
+                    *truncated = true;
                     return;
                 }
                 let full_key = if prefix.is_empty() {
@@ -64,7 +69,15 @@ fn walk_json(
                                 inner.len()
                             ));
                         } else {
-                            walk_json(val, &full_key, depth + 1, max_depth, max_lines, lines);
+                            walk_json(
+                                val,
+                                &full_key,
+                                depth + 1,
+                                max_depth,
+                                max_lines,
+                                lines,
+                                truncated,
+                            );
                         }
                     }
                     serde_json::Value::Array(arr) => {
@@ -123,10 +136,12 @@ fn truncate_json_value(v: &serde_json::Value, max: usize) -> String {
 /// YAML outline via line scan — no parser needed.
 /// Detect keys by: optional whitespace, then a word, then `: ` or `:`+EOL.
 /// Indentation level = nesting depth (2-space standard).
-fn yaml_outline(content: &str, max_lines: usize) -> String {
+fn yaml_outline(content: &str, max_lines: usize) -> (String, bool) {
     let mut entries = Vec::new();
+    let mut truncated = false;
     for (i, line) in content.lines().enumerate() {
         if entries.len() >= max_lines {
+            truncated = true;
             break;
         }
         let trimmed = line.trim_start();
@@ -160,19 +175,20 @@ fn yaml_outline(content: &str, max_lines: usize) -> String {
             }
         }
     }
-    entries.join("\n")
+    (entries.join("\n"), truncated)
 }
 
-fn toml_outline(content: &str, max_lines: usize) -> String {
+fn toml_outline(content: &str, max_lines: usize) -> (String, bool) {
     // toml 1.1: `Value::from_str` (via `content.parse()`) parses a single value
     // and rejects further content. `toml::from_str` parses the full document.
     let value: toml::Value = match toml::from_str(content) {
         Ok(v) => v,
-        Err(e) => return format!("[parse error: {e}]"),
+        Err(e) => return (format!("[parse error: {e}]"), false),
     };
     let mut lines = Vec::new();
-    walk_toml(&value, 0, 2, max_lines, &mut lines);
-    lines.join("\n")
+    let mut truncated = false;
+    walk_toml(&value, 0, 2, max_lines, &mut lines, &mut truncated);
+    (lines.join("\n"), truncated)
 }
 
 fn walk_toml(
@@ -181,8 +197,10 @@ fn walk_toml(
     max_depth: usize,
     max_lines: usize,
     lines: &mut Vec<String>,
+    truncated: &mut bool,
 ) {
     if lines.len() >= max_lines {
+        *truncated = true;
         return;
     }
     let indent = "  ".repeat(depth);
@@ -190,12 +208,13 @@ fn walk_toml(
     if let toml::Value::Table(table) = value {
         for (key, val) in table {
             if lines.len() >= max_lines {
+                *truncated = true;
                 return;
             }
             match val {
                 toml::Value::Table(inner) if depth < max_depth => {
                     lines.push(format!("{indent}[{key}]"));
-                    walk_toml(val, depth + 1, max_depth, max_lines, lines);
+                    walk_toml(val, depth + 1, max_depth, max_lines, lines, truncated);
                 }
                 toml::Value::Table(inner) => {
                     lines.push(format!("{indent}{key}: {{{} keys}}", inner.len()));
@@ -217,12 +236,14 @@ fn walk_toml(
     }
 }
 
-fn key_value_outline(content: &str, max_lines: usize) -> String {
-    content
+fn key_value_outline(content: &str, max_lines: usize) -> (String, bool) {
+    let truncated = content.lines().count() > max_lines;
+    let body = content
         .lines()
         .take(max_lines)
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    (body, truncated)
 }
 
 #[cfg(test)]
@@ -249,7 +270,7 @@ tokio = { version = \"1\", features = [\"full\"] }
 [features]
 default = [\"std\"]
 ";
-        let out = toml_outline(content, 100);
+        let (out, _) = toml_outline(content, 100);
         assert!(
             out.contains("[package]"),
             "missing [package] header:\n{out}"
@@ -281,7 +302,7 @@ default = [\"std\"]
 key = \"deep\"
 ";
         // max_depth in toml_outline is hard-coded to 2; `[a.b.c]` is depth 3.
-        let out = toml_outline(content, 100);
+        let (out, _) = toml_outline(content, 100);
         // The collapsed form names the key-count of the inner table.
         assert!(
             out.contains('{') && out.contains("keys}"),
@@ -297,7 +318,7 @@ key = \"deep\"
 [build]
 features = [\"a\", \"b\", \"c\", \"d\"]
 ";
-        let out = toml_outline(content, 100);
+        let (out, _) = toml_outline(content, 100);
         assert!(
             out.contains("features: [4 items]"),
             "array should render as item count, got:\n{out}"
@@ -307,7 +328,7 @@ features = [\"a\", \"b\", \"c\", \"d\"]
     /// Parse errors produce a structured marker rather than a panic.
     #[test]
     fn toml_outline_parse_error_is_caught() {
-        let out = toml_outline("this is not = valid toml [[[ at all", 10);
+        let (out, _) = toml_outline("this is not = valid toml [[[ at all", 10);
         assert!(
             out.starts_with("[parse error:"),
             "malformed TOML should surface as parse error marker, got:\n{out}"

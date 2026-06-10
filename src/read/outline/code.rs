@@ -4,7 +4,7 @@ use crate::types::{Lang, OutlineEntry, OutlineKind};
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
 /// emitting signatures without bodies.
 #[must_use]
-pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
+pub fn outline(content: &str, lang: Lang, max_lines: usize) -> (String, bool) {
     let Some(language) = outline_language(lang) else {
         return fallback_outline(content, max_lines);
     };
@@ -26,14 +26,18 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
 }
 
 /// Format outline entries into the spec'd output format.
-fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> String {
+/// Returns the rendered outline and whether entries were dropped because
+/// `max_lines` was hit (the truncation signal the omission note keys on).
+fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> (String, bool) {
     let mut out = Vec::new();
     let mut import_groups: Vec<&str> = Vec::new();
     // Track the start line of the first import in the current group.
     let mut import_group_start: u32 = 1;
+    let mut truncated = false;
 
     for entry in entries {
         if out.len() >= max_lines {
+            truncated = true;
             break;
         }
 
@@ -60,11 +64,13 @@ fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> Str
             out.push(format_entry(entry, 0, lang));
             for child in &entry.children {
                 if out.len() >= max_lines {
+                    truncated = true;
                     break;
                 }
                 out.push(format_entry(child, 1, lang));
                 for grandchild in &child.children {
                     if out.len() >= max_lines {
+                        truncated = true;
                         break;
                     }
                     out.push(format_entry(grandchild, 2, lang));
@@ -74,6 +80,7 @@ fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> Str
             out.push(format_entry(entry, 0, lang));
             for child in &entry.children {
                 if out.len() >= max_lines {
+                    truncated = true;
                     break;
                 }
                 out.push(format_entry(child, 1, lang));
@@ -86,14 +93,12 @@ fn format_entries(entries: &[OutlineEntry], max_lines: usize, lang: Lang) -> Str
         out.push(format_imports(&import_groups, import_group_start, lang));
     }
 
-    out.join("\n")
+    (out.join("\n"), truncated)
 }
 
 /// Format a collapsed import summary grouped by source with counts.
 /// Spec format: `imports: react(4), express(2), @/lib(3)`
 fn format_imports(imports: &[&str], start: u32, lang: Lang) -> String {
-    let count = imports.len();
-
     // Extract source modules and count occurrences
     let mut sources: Vec<String> = Vec::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -117,8 +122,11 @@ fn format_imports(imports: &[&str], start: u32, lang: Lang) -> String {
         }
     }
 
-    let suffix = if count > 5 {
-        format!(", ... ({count} total)")
+    // Elision is by unique source, not by raw import count: six imports from
+    // one source show one `source(6)` entry with nothing hidden, so gating on
+    // `count` would emit a spurious "... total" suffix.
+    let suffix = if sources.len() > 5 {
+        format!(", ... ({} sources)", sources.len())
     } else {
         String::new()
     };
@@ -200,16 +208,17 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
 }
 
 /// Fallback when tree-sitter grammar isn't available.
-fn fallback_outline(content: &str, max_lines: usize) -> String {
+fn fallback_outline(content: &str, max_lines: usize) -> (String, bool) {
     if max_lines == usize::MAX {
-        return super::fallback::head_tail(content);
+        return (super::fallback::head_tail(content), false);
     }
 
+    let total = content.lines().count();
     let mut out = Vec::new();
     for line in content.lines().take(max_lines) {
         out.push(line);
     }
-    out.join("\n")
+    (out.join("\n"), total > max_lines)
 }
 
 #[cfg(test)]
@@ -219,9 +228,10 @@ mod tests {
     #[test]
     fn fallback_outline_respects_max_lines() {
         let content = "line 1\nline 2\nline 3\nline 4";
-        let outline = fallback_outline(content, 2);
+        let (outline, truncated) = fallback_outline(content, 2);
 
         assert_eq!(outline, "line 1\nline 2");
+        assert!(truncated, "4 lines capped at 2 must report truncation");
     }
 
     #[test]
@@ -253,7 +263,7 @@ enum Color {
 type UserId = String
 "#;
 
-        let outline = outline(scala_code, Lang::Scala, 1000);
+        let (outline, _) = outline(scala_code, Lang::Scala, 1000);
 
         assert!(outline.contains("trait DataSource"));
         assert!(outline.contains("class Database"));
@@ -289,7 +299,7 @@ class UserService {
 }
 ";
 
-        let outline = outline(php_code, Lang::Php, 1000);
+        let (outline, _) = outline(php_code, Lang::Php, 1000);
 
         assert!(outline.contains("mod App\\Services"));
         assert!(outline.contains("imports: App\\Support\\Client"));
@@ -343,7 +353,7 @@ fun main() {
 }
 "#;
 
-        let outline = outline(kotlin_code, Lang::Kotlin, 1000);
+        let (outline, _) = outline(kotlin_code, Lang::Kotlin, 1000);
 
         // Imports
         assert!(
@@ -409,7 +419,7 @@ export * from './bar';
 export default class Bar {}
 ";
 
-        let outline = outline(ts_code, Lang::TypeScript, 1000);
+        let (outline, _) = outline(ts_code, Lang::TypeScript, 1000);
 
         // No outline line may contain a doubled `export` keyword.
         for line in outline.lines() {

@@ -195,17 +195,14 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
 
 fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
-        Ok(s) => s,
-        Err(_) => {
-            // git error fetching old side — skip symbol analysis to avoid
-            // confidently-wrong all-Added overlay.
-            return FileOverlay {
-                path: path.clone(),
-                symbol_changes: Vec::new(),
-                attributed_hunks: Vec::new(),
-            };
-        }
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+        // git error fetching old side — skip symbol analysis to avoid
+        // confidently-wrong all-Added overlay.
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
     };
     let new_content = get_new_content(path, source).unwrap_or_default();
 
@@ -265,15 +262,12 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
-        Ok(s) => s,
-        Err(_) => {
-            return FileOverlay {
-                path: path.clone(),
-                symbol_changes: Vec::new(),
-                attributed_hunks: Vec::new(),
-            };
-        }
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
     };
     let new_content = get_new_content(path, source).unwrap_or_default();
 

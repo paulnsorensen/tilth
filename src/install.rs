@@ -198,30 +198,70 @@ fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
     };
 
     let rest = &existing[start..];
-    // Find the end of this section: the next line that begins a new table
-    // header (starts with `[` at column 0, after a newline). Plain `\n[`
-    // would match multi-line array elements like `["item"]` on their own
-    // line, so we scan line-by-line and only stop at a line-start `[`.
-    let section_tail = &rest[1..]; // skip the opening '[' of the current header
-    let end = section_tail
-        .find('\n')
-        .and_then(|nl| {
-            let after_first_nl = &section_tail[nl..];
-            after_first_nl
-                .char_indices()
-                .skip(1) // skip the '\n' itself
-                .scan(true, |at_line_start, (i, ch)| {
-                    if *at_line_start && ch == '[' {
-                        return Some(Some(nl + i));
-                    }
-                    *at_line_start = ch == '\n';
-                    Some(None)
-                })
-                .find_map(|x| x)
-                .map(|i| start + 1 + i)
-        })
-        .unwrap_or(existing.len());
+    let end = start + toml_section_end(rest);
     format!("{}{}{}", &existing[..start], section, &existing[end..])
+}
+
+/// Byte offset (within `rest`, which starts at the current table header) of the
+/// next top-level table header — a line-start `[` at array-bracket depth 0 and
+/// outside any string. A bare "line starts with `[`" test cannot distinguish a
+/// real header `[other]` from a multi-line array element like `["a", "b"],`, so
+/// we track bracket nesting (skipping bracket characters inside strings and
+/// comments). Returns `rest.len()` when no following header exists.
+fn toml_section_end(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut escaped = false;
+    let mut at_line_start = true;
+    let mut past_header_line = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == quote {
+                in_str = None;
+            }
+            at_line_start = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\n' => {
+                at_line_start = true;
+                past_header_line = true;
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' | b'\'' => {
+                in_str = Some(c);
+                at_line_start = false;
+            }
+            b'[' => {
+                if at_line_start && depth == 0 && past_header_line {
+                    return i;
+                }
+                depth += 1;
+                at_line_start = false;
+            }
+            b']' => {
+                depth -= 1;
+                at_line_start = false;
+            }
+            _ if c.is_ascii_whitespace() => {}
+            _ => at_line_start = false,
+        }
+        i += 1;
+    }
+    rest.len()
 }
 
 /// Returns (command, args) for the tilth MCP server entry.

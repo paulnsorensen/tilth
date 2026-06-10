@@ -49,18 +49,23 @@ impl OutlineCache {
     }
 
     /// Get cached outline or compute and cache it. Accepts `&Path` (not `&PathBuf`).
-    /// Uses `entry()` API to avoid TOCTOU race between get and insert.
     pub fn get_or_compute(
         &self,
         path: &Path,
         mtime: SystemTime,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
-        match self.entries.entry((path.to_path_buf(), mtime)) {
+        let key = (path.to_path_buf(), mtime);
+        if let Some(e) = self.entries.get(&key) {
+            return Arc::clone(&e.outline);
+        }
+        // Evict stale entries for this path (different mtime) BEFORE taking an
+        // entry guard. `retain` locks every shard, so calling it while holding
+        // an `entry()` guard on the same map deadlocks — it must run first.
+        self.entries.retain(|(p, t), _| p != path || *t == mtime);
+        match self.entries.entry(key) {
             Entry::Occupied(e) => Arc::clone(&e.get().outline),
             Entry::Vacant(e) => {
-                // Evict any stale entry for the same path with a different mtime.
-                self.entries.retain(|(p, t), _| p != path || *t == mtime);
                 let outline: Arc<str> = compute().into();
                 e.insert(CacheEntry {
                     outline: Arc::clone(&outline),
@@ -80,11 +85,16 @@ impl OutlineCache {
         if meta.len() > 500_000 {
             return None;
         }
-        match self.parsed.entry((path.to_path_buf(), mtime)) {
+        let key = (path.to_path_buf(), mtime);
+        if let Some(e) = self.parsed.get(&key) {
+            return Some(Arc::clone(&e));
+        }
+        // Evict stale entries for this path BEFORE taking an entry guard
+        // (see `get_or_compute`: `retain` under a held guard deadlocks).
+        self.parsed.retain(|(p, t), _| p != path || *t == mtime);
+        match self.parsed.entry(key) {
             Entry::Occupied(e) => Some(Arc::clone(e.get())),
             Entry::Vacant(e) => {
-                // Evict any stale entry for the same path with a different mtime.
-                self.parsed.retain(|(p, t), _| p != path || *t == mtime);
                 let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
                     return None;
                 };
