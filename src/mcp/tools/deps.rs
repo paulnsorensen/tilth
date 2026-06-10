@@ -20,7 +20,7 @@ pub(in crate::mcp) fn tool_deps(
     let budget = args
         .get("budget")
         .and_then(serde_json::Value::as_u64)
-        .map(|b| b as usize);
+        .unwrap_or(crate::budget::DEFAULT_BUDGET) as usize;
 
     let deps_result =
         crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
@@ -28,7 +28,7 @@ pub(in crate::mcp) fn tool_deps(
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,
         &scope,
-        budget,
+        Some(budget),
     ));
     Ok(output)
 }
