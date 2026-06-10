@@ -22,7 +22,8 @@ pub struct ParsedFile {
 }
 
 /// Outline cache keyed by (canonical path, mtime). If the file changes,
-/// mtime changes and the old entry is never hit again.
+/// mtime changes; the old entry is evicted on the next insert so the cache
+/// holds at most one entry per live path.
 ///
 /// Stores two derived analyses: rendered outline strings (used by search
 /// formatting) and parsed tree-sitter trees (used by AST scope queries).
@@ -58,6 +59,8 @@ impl OutlineCache {
         match self.entries.entry((path.to_path_buf(), mtime)) {
             Entry::Occupied(e) => Arc::clone(&e.get().outline),
             Entry::Vacant(e) => {
+                // Evict any stale entry for the same path with a different mtime.
+                self.entries.retain(|(p, t), _| p != path || *t == mtime);
                 let outline: Arc<str> = compute().into();
                 e.insert(CacheEntry {
                     outline: Arc::clone(&outline),
@@ -80,6 +83,8 @@ impl OutlineCache {
         match self.parsed.entry((path.to_path_buf(), mtime)) {
             Entry::Occupied(e) => Some(Arc::clone(e.get())),
             Entry::Vacant(e) => {
+                // Evict any stale entry for the same path with a different mtime.
+                self.parsed.retain(|(p, t), _| p != path || *t == mtime);
                 let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
                     return None;
                 };
@@ -97,5 +102,31 @@ impl OutlineCache {
                 Some(parsed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn evicts_stale_mtime_on_reinsert() {
+        let cache = OutlineCache::new();
+        let path = std::path::Path::new("fake/path.rs");
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(1);
+
+        // Insert with t0.
+        cache.get_or_compute(path, t0, || "outline v0".to_string());
+        assert_eq!(cache.entries.len(), 1);
+
+        // Re-insert with t1 — stale t0 entry must be evicted.
+        cache.get_or_compute(path, t1, || "outline v1".to_string());
+        assert_eq!(cache.entries.len(), 1, "stale entry was not evicted");
+
+        // Confirm only the new entry survives.
+        let hit = cache.get_or_compute(path, t1, || panic!("should hit cache"));
+        assert_eq!(&*hit, "outline v1");
     }
 }

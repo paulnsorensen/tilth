@@ -100,6 +100,21 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Write `content` to `path` atomically: write to a sibling temp file first,
+/// then rename over the target so an interrupted write never truncates `path`.
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!(".tilth_install_tmp{unique}"));
+    fs::write(&tmp, content).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to rename to {}: {e}", path.display())
+    })
+}
+
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
@@ -123,8 +138,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
-    fs::write(&host_info.path, &out)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    atomic_write(&host_info.path, &out)?;
     Ok(())
 }
 
@@ -152,8 +166,7 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 
     let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
 
-    fs::write(&host_info.path, &output)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    atomic_write(&host_info.path, &output)?;
     Ok(())
 }
 
@@ -185,9 +198,29 @@ fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
     };
 
     let rest = &existing[start..];
-    let end = rest[1..] // skip the opening '['
-        .find("\n[")
-        .map_or(existing.len(), |i| start + 1 + i + 1);
+    // Find the end of this section: the next line that begins a new table
+    // header (starts with `[` at column 0, after a newline). Plain `\n[`
+    // would match multi-line array elements like `["item"]` on their own
+    // line, so we scan line-by-line and only stop at a line-start `[`.
+    let section_tail = &rest[1..]; // skip the opening '[' of the current header
+    let end = section_tail
+        .find('\n')
+        .and_then(|nl| {
+            let after_first_nl = &section_tail[nl..];
+            after_first_nl
+                .char_indices()
+                .skip(1) // skip the '\n' itself
+                .scan(true, |at_line_start, (i, ch)| {
+                    if *at_line_start && ch == '[' {
+                        return Some(Some(nl + i));
+                    }
+                    *at_line_start = ch == '\n';
+                    Some(None)
+                })
+                .find_map(|x| x)
+                .map(|i| start + 1 + i)
+        })
+        .unwrap_or(existing.len());
     format!("{}{}{}", &existing[..start], section, &existing[end..])
 }
 
@@ -588,6 +621,22 @@ mod tests {
         assert_eq!(
             out,
             "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n[other]\nk = 1\n"
+        );
+    }
+
+    #[test]
+    fn toml_section_end_not_truncated_by_value_starting_with_bracket() {
+        // A value line that starts with '[' (array-of-arrays element) must NOT
+        // be treated as a table header when finding the section end.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nmatrix = [\n[\"a\", \"b\"],\n[\"c\"],\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert_eq!(
+            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
+            "section end was truncated by a value line starting with '[': {out:?}"
         );
     }
 

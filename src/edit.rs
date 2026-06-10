@@ -218,9 +218,23 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         output.push_str(line_sep);
     }
 
-    fs::write(path, &output).map_err(|e| TilthError::IoError {
+    // Write atomically: temp file in the same directory, then rename so a
+    // crash or full-disk mid-write never corrupts the original.
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp_path = dir.join(format!(".tilth_edit_tmp{unique}"));
+    fs::write(&tmp_path, &output).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
+    })?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        }
     })?;
 
     // Phase 4: Build diffs and context around each edit site.
