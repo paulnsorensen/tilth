@@ -199,8 +199,7 @@ pub enum OutlineKind {
     Variable,
     ImmutableVariable,
     Export,
-    // Property IS constructed in lang/outline.rs (property_declaration nodes);
-    // the allow is no longer needed but harmless.
+    // Property is constructed in lang/outline.rs (property_declaration nodes).
     Property,
     Module,
     // Reserved/roadmap: no tree-sitter grammar currently emits TestSuite nodes.
