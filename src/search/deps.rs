@@ -364,6 +364,15 @@ fn is_placeholder_name(name: &str) -> bool {
     false
 }
 
+/// Known single-segment Go standard library packages.
+/// Used by `is_stdlib` to avoid misclassifying local packages like `mypackage` or `fmtlib`.
+const GO_STDLIB_SINGLE_SEGMENT: &[&str] = &[
+    "bufio", "bytes", "context", "crypto", "embed", "errors", "flag", "fmt", "hash", "html",
+    "http", "image", "io", "log", "math", "mime", "net", "os", "path", "plugin", "reflect",
+    "regexp", "runtime", "slices", "sort", "strconv", "strings", "sync", "syscall", "testing",
+    "time", "unicode", "unsafe", "utf8",
+];
+
 /// Returns true if the import source is a standard library module.
 /// Agents can't navigate into stdlib — showing these is noise.
 fn is_stdlib(source: &str, lang: crate::types::Lang) -> bool {
@@ -402,7 +411,7 @@ fn is_stdlib(source: &str, lang: crate::types::Lang) -> bool {
                     | "asyncio"
             )
         }
-        Lang::Go => source.starts_with("fmt") || !source.contains('.'),
+        Lang::Go => GO_STDLIB_SINGLE_SEGMENT.contains(&source),
         _ => false,
     }
 }
@@ -631,5 +640,36 @@ mod tests {
             fits_budget(&out, budget),
             "truncation notice must count against budget: {out}"
         );
+    }
+
+    #[test]
+    fn go_stdlib_fmt_is_stdlib() {
+        assert!(is_stdlib("fmt", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_stdlib_fmtlib_is_not_stdlib() {
+        // "fmtlib" is not a Go stdlib package—previously matched via starts_with("fmt")
+        assert!(!is_stdlib("fmtlib", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_stdlib_fmtutil_is_not_stdlib() {
+        assert!(!is_stdlib("fmtutil", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_local_package_without_dot_is_not_stdlib() {
+        // A local package like "mypackage" has no dot but is NOT stdlib—
+        // the old !source.contains('.') rule wrongly classified it as stdlib.
+        assert!(!is_stdlib("mypackage", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_external_dotted_path_is_not_stdlib() {
+        assert!(!is_stdlib(
+            "github.com/gin-gonic/gin",
+            crate::types::Lang::Go
+        ));
     }
 }
