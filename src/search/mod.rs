@@ -1022,6 +1022,15 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
     candidate.map(Path::to_path_buf)
 }
 
+/// Format a token count into a human-readable string (e.g. "~1.2k" or "~743").
+pub(crate) fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
+    } else {
+        format!("~{tokens}")
+    }
+}
+
 /// Fallback: lightweight directory walk to find a basename-matching file
 /// when it didn't survive ranking/truncation in the match set.
 fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
@@ -1031,8 +1040,8 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
     let walker = ignore::WalkBuilder::new(scope)
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(true)
-        .git_ignore(true)
+        .hidden(false)
+        .git_ignore(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .max_depth(Some(6))
         .build();
