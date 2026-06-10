@@ -27,6 +27,9 @@ pub fn parse_iso_utc(s: &str) -> Option<SystemTime> {
     let hh: u32 = tparts.next()?.parse().ok()?;
     let mm: u32 = tparts.next()?.parse().ok()?;
     let ss: u32 = tparts.next().unwrap_or("0").parse().ok()?;
+    if mo == 0 || mo > 12 || d == 0 || d > 31 || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
     let secs = days_from_civil(y, mo, d) * 86_400
         + i64::from(hh) * 3600
         + i64::from(mm) * 60
@@ -132,10 +135,10 @@ mod tests {
     #[test]
     fn parse_iso_malformed_returns_none() {
         assert!(parse_iso_utc("not a date").is_none());
+        // Out-of-range fields must be rejected, not silently wrapped.
         assert!(
-            parse_iso_utc("2026-13-99T99:99:99Z").is_some()
-                || parse_iso_utc("2026-13-99T99:99:99Z").is_none(),
-            "malformed date must not panic"
+            parse_iso_utc("2026-13-99T99:99:99Z").is_none(),
+            "out-of-range month/day/time must return None"
         );
         assert!(parse_iso_utc("").is_none());
         assert!(parse_iso_utc("2026-05-14").is_none(), "missing T separator");
