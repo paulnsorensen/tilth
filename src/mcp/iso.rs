@@ -27,7 +27,7 @@ pub fn parse_iso_utc(s: &str) -> Option<SystemTime> {
     let hh: u32 = tparts.next()?.parse().ok()?;
     let mm: u32 = tparts.next()?.parse().ok()?;
     let ss: u32 = tparts.next().unwrap_or("0").parse().ok()?;
-    if mo == 0 || mo > 12 || d == 0 || d > 31 || hh > 23 || mm > 59 || ss > 59 {
+    if mo == 0 || mo > 12 || d == 0 || d > days_in_month(y, mo) || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
     let secs = days_from_civil(y, mo, d) * 86_400
@@ -51,6 +51,18 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = ((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1) as u64;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe as i64 - 719_468
+}
+
+// Calendar length of a month, leap-year aware. `m` is assumed 1..=12
+// (callers range-check first).
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn format_iso_utc(secs: u64) -> String {
@@ -142,6 +154,23 @@ mod tests {
         );
         assert!(parse_iso_utc("").is_none());
         assert!(parse_iso_utc("2026-05-14").is_none(), "missing T separator");
+        // Impossible calendar dates must be rejected, not normalized.
+        assert!(
+            parse_iso_utc("2026-02-31T00:00:00Z").is_none(),
+            "Feb 31 must return None, not normalize into March"
+        );
+        assert!(
+            parse_iso_utc("2025-02-29T00:00:00Z").is_none(),
+            "Feb 29 in a non-leap year must return None"
+        );
+        assert!(
+            parse_iso_utc("2024-02-29T00:00:00Z").is_some(),
+            "Feb 29 in a leap year must parse"
+        );
+        assert!(
+            parse_iso_utc("2026-04-31T00:00:00Z").is_none(),
+            "April 31 must return None"
+        );
     }
 
     #[test]

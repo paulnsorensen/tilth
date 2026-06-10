@@ -243,7 +243,13 @@ fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
         let raw_path = if raw_path.starts_with('/') {
             raw_path
         } else {
-            raw_path.find('/').map_or(raw_path, |i| &raw_path[i..])
+            // Authority-only forms (file://host with no '/' after the host)
+            // have no path component — skip them rather than fall back to the
+            // bare authority as a relative path.
+            match raw_path.find('/') {
+                Some(i) => &raw_path[i..],
+                None => continue,
+            }
         };
         // On invalid UTF-8 in a percent-encoded path, fall back to the
         // original input rather than substituting U+FFFD replacements.
