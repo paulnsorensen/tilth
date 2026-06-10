@@ -195,8 +195,19 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
 
 fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content = get_old_content(path, file_diff.old_path.as_deref(), source);
-    let new_content = get_new_content(path, source);
+    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
+        Ok(s) => s,
+        Err(_) => {
+            // git error fetching old side — skip symbol analysis to avoid
+            // confidently-wrong all-Added overlay.
+            return FileOverlay {
+                path: path.clone(),
+                symbol_changes: Vec::new(),
+                attributed_hunks: Vec::new(),
+            };
+        }
+    };
+    let new_content = get_new_content(path, source).unwrap_or_default();
 
     let ft = detect_file_type(path);
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
@@ -227,7 +238,7 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let new_content = get_new_content(path, source);
+    let new_content = get_new_content(path, source).unwrap_or_default();
 
     let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
 
@@ -240,7 +251,8 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content = get_old_content(path, file_diff.old_path.as_deref(), source);
+    let old_content =
+        get_old_content(path, file_diff.old_path.as_deref(), source).unwrap_or_default();
 
     let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
 
@@ -253,8 +265,17 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content = get_old_content(path, file_diff.old_path.as_deref(), source);
-    let new_content = get_new_content(path, source);
+    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
+        Ok(s) => s,
+        Err(_) => {
+            return FileOverlay {
+                path: path.clone(),
+                symbol_changes: Vec::new(),
+                attributed_hunks: Vec::new(),
+            };
+        }
+    };
+    let new_content = get_new_content(path, source).unwrap_or_default();
 
     let ft = detect_file_type(path);
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
@@ -280,7 +301,17 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 // Content fetching helpers
 // ---------------------------------------------------------------------------
 
-fn get_old_content(path: &Path, old_path: Option<&Path>, source: &DiffSource) -> String {
+/// Fetch the old-side content for a file diff.
+///
+/// Returns `Ok(content)` on success (including legitimately empty for new files).
+/// Returns `Err(reason)` when the git command itself fails — the caller should
+/// treat this as "content unavailable" and skip symbol analysis rather than
+/// emitting a confidently-wrong all-Added overlay.
+fn get_old_content(
+    path: &Path,
+    old_path: Option<&Path>,
+    source: &DiffSource,
+) -> Result<String, String> {
     let effective_path = old_path.unwrap_or(path);
     let path_str = effective_path.to_string_lossy();
 
@@ -295,8 +326,10 @@ fn get_old_content(path: &Path, old_path: Option<&Path>, source: &DiffSource) ->
                 git_show(&format!("{r}:{path_str}"))
             }
         }
-        DiffSource::Files(a, _) => std::fs::read_to_string(a).unwrap_or_default(),
-        DiffSource::Patch(_) | DiffSource::Log(_) => String::new(),
+        DiffSource::Files(a, _) => {
+            std::fs::read_to_string(a).map_err(|e| format!("read {}: {e}", a.display()))
+        }
+        DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
     }
 }
 
@@ -320,29 +353,38 @@ fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
     }
 }
 
-fn get_new_content(path: &Path, source: &DiffSource) -> String {
+fn get_new_content(path: &Path, source: &DiffSource) -> Result<String, String> {
     let path_str = path.to_string_lossy();
 
     match source {
-        DiffSource::GitUncommitted => std::fs::read_to_string(path).unwrap_or_default(),
+        DiffSource::GitUncommitted => {
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+        }
         DiffSource::GitStaged => git_show(&format!(":{path_str}")),
         DiffSource::GitRef(r) => match resolve_git_ref_new_side(r, &path_str) {
             GitRefNewSide::Committed(spec) => git_show(&spec),
-            GitRefNewSide::WorkingTree => std::fs::read_to_string(path).unwrap_or_default(),
+            GitRefNewSide::WorkingTree => {
+                std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+            }
         },
-        DiffSource::Files(_, b) => std::fs::read_to_string(b).unwrap_or_default(),
-        DiffSource::Patch(_) | DiffSource::Log(_) => String::new(),
+        DiffSource::Files(_, b) => {
+            std::fs::read_to_string(b).map_err(|e| format!("read {}: {e}", b.display()))
+        }
+        DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
     }
 }
 
-fn git_show(spec: &str) -> String {
-    Command::new("git")
-        .args(["show", spec])
+fn git_show(spec: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["-c", "core.quotePath=false", "show", spec])
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .map_err(|e| format!("git show failed: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("git show {spec}: {}", stderr.trim()))
+    }
 }
 
 fn get_entries_for_path(path: &Path, content: &str) -> Vec<OutlineEntry> {
@@ -542,7 +584,8 @@ mod tests {
         // A single ref (no `..`) diffs against the working tree, so the new
         // content must come from the file on disk — not `git show HEAD:<path>`,
         // which would return empty here and silently mis-attribute the diff.
-        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()));
+        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()))
+            .expect("working-tree read must succeed");
         assert!(
             content.contains("worktree_only"),
             "bare GitRef new content must be the working tree, got {content:?}"
@@ -571,5 +614,23 @@ mod tests {
                 panic!("range ref must read the committed blob, not the working tree")
             }
         }
+    }
+
+    #[test]
+    fn git_show_error_skips_symbol_analysis() {
+        // When get_old_content returns Err, compute_modified must return an
+        // empty overlay rather than a confidently-wrong all-Added result.
+        // Simulate with Files source pointing at a missing file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("foo.rs");
+        std::fs::write(&file, "fn new_fn() {}\n").unwrap();
+
+        let missing = dir.path().join("does_not_exist.rs");
+        let result = get_old_content(
+            &file,
+            None,
+            &DiffSource::Files(missing.clone(), file.clone()),
+        );
+        assert!(result.is_err(), "missing file path must yield Err, got Ok");
     }
 }
