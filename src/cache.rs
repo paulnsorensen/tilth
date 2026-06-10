@@ -22,7 +22,8 @@ pub struct ParsedFile {
 }
 
 /// Outline cache keyed by (canonical path, mtime). If the file changes,
-/// mtime changes and the old entry is never hit again.
+/// mtime changes; the old entry is evicted on the next insert so the cache
+/// holds at most one entry per live path.
 ///
 /// Stores two derived analyses: rendered outline strings (used by search
 /// formatting) and parsed tree-sitter trees (used by AST scope queries).
@@ -48,14 +49,21 @@ impl OutlineCache {
     }
 
     /// Get cached outline or compute and cache it. Accepts `&Path` (not `&PathBuf`).
-    /// Uses `entry()` API to avoid TOCTOU race between get and insert.
     pub fn get_or_compute(
         &self,
         path: &Path,
         mtime: SystemTime,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
-        match self.entries.entry((path.to_path_buf(), mtime)) {
+        let key = (path.to_path_buf(), mtime);
+        if let Some(e) = self.entries.get(&key) {
+            return Arc::clone(&e.outline);
+        }
+        // Evict stale entries for this path (different mtime) BEFORE taking an
+        // entry guard. `retain` locks every shard, so calling it while holding
+        // an `entry()` guard on the same map deadlocks — it must run first.
+        self.entries.retain(|(p, t), _| p != path || *t == mtime);
+        match self.entries.entry(key) {
             Entry::Occupied(e) => Arc::clone(&e.get().outline),
             Entry::Vacant(e) => {
                 let outline: Arc<str> = compute().into();
@@ -77,7 +85,14 @@ impl OutlineCache {
         if meta.len() > 500_000 {
             return None;
         }
-        match self.parsed.entry((path.to_path_buf(), mtime)) {
+        let key = (path.to_path_buf(), mtime);
+        if let Some(e) = self.parsed.get(&key) {
+            return Some(Arc::clone(&e));
+        }
+        // Evict stale entries for this path BEFORE taking an entry guard
+        // (see `get_or_compute`: `retain` under a held guard deadlocks).
+        self.parsed.retain(|(p, t), _| p != path || *t == mtime);
+        match self.parsed.entry(key) {
             Entry::Occupied(e) => Some(Arc::clone(e.get())),
             Entry::Vacant(e) => {
                 let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
@@ -97,5 +112,31 @@ impl OutlineCache {
                 Some(parsed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn evicts_stale_mtime_on_reinsert() {
+        let cache = OutlineCache::new();
+        let path = std::path::Path::new("fake/path.rs");
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(1);
+
+        // Insert with t0.
+        cache.get_or_compute(path, t0, || "outline v0".to_string());
+        assert_eq!(cache.entries.len(), 1);
+
+        // Re-insert with t1 — stale t0 entry must be evicted.
+        cache.get_or_compute(path, t1, || "outline v1".to_string());
+        assert_eq!(cache.entries.len(), 1, "stale entry was not evicted");
+
+        // Confirm only the new entry survives.
+        let hit = cache.get_or_compute(path, t1, || panic!("should hit cache"));
+        assert_eq!(&*hit, "outline v1");
     }
 }

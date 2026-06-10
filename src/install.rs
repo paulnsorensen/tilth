@@ -100,6 +100,26 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Write `content` to `path` atomically: write to a sibling temp file first,
+/// then rename over the target so an interrupted write never truncates `path`.
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    // Qualify the temp name with pid + a process-wide counter so concurrent or
+    // batched writes in the same directory can't collide on the temp path.
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".tilth-install-tmp.{}.{n}", std::process::id()));
+    fs::write(&tmp, content).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to write {}: {e}", path.display())
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to rename to {}: {e}", path.display())
+    })
+}
+
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
@@ -123,8 +143,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
-    fs::write(&host_info.path, &out)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    atomic_write(&host_info.path, &out)?;
     Ok(())
 }
 
@@ -152,8 +171,7 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 
     let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
 
-    fs::write(&host_info.path, &output)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    atomic_write(&host_info.path, &output)?;
     Ok(())
 }
 
@@ -185,10 +203,70 @@ fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
     };
 
     let rest = &existing[start..];
-    let end = rest[1..] // skip the opening '['
-        .find("\n[")
-        .map_or(existing.len(), |i| start + 1 + i + 1);
+    let end = start + toml_section_end(rest);
     format!("{}{}{}", &existing[..start], section, &existing[end..])
+}
+
+/// Byte offset (within `rest`, which starts at the current table header) of the
+/// next top-level table header — a line-start `[` at array-bracket depth 0 and
+/// outside any string. A bare "line starts with `[`" test cannot distinguish a
+/// real header `[other]` from a multi-line array element like `["a", "b"],`, so
+/// we track bracket nesting (skipping bracket characters inside strings and
+/// comments). Returns `rest.len()` when no following header exists.
+fn toml_section_end(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut escaped = false;
+    let mut at_line_start = true;
+    let mut past_header_line = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == quote {
+                in_str = None;
+            }
+            at_line_start = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\n' => {
+                at_line_start = true;
+                past_header_line = true;
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' | b'\'' => {
+                in_str = Some(c);
+                at_line_start = false;
+            }
+            b'[' => {
+                if at_line_start && depth == 0 && past_header_line {
+                    return i;
+                }
+                depth += 1;
+                at_line_start = false;
+            }
+            b']' => {
+                depth -= 1;
+                at_line_start = false;
+            }
+            _ if c.is_ascii_whitespace() => {}
+            _ => at_line_start = false,
+        }
+        i += 1;
+    }
+    rest.len()
 }
 
 /// Returns (command, args) for the tilth MCP server entry.
@@ -588,6 +666,22 @@ mod tests {
         assert_eq!(
             out,
             "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n[other]\nk = 1\n"
+        );
+    }
+
+    #[test]
+    fn toml_section_end_not_truncated_by_value_starting_with_bracket() {
+        // A value line that starts with '[' (array-of-arrays element) must NOT
+        // be treated as a table header when finding the section end.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nmatrix = [\n[\"a\", \"b\"],\n[\"c\"],\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert_eq!(
+            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
+            "section end was truncated by a value line starting with '[': {out:?}"
         );
     }
 
