@@ -24,7 +24,7 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     // Pre-compute context's package root once (same for entire batch)
     let ctx_parent = context.and_then(|c| c.parent());
     let ctx_pkg_root = context
-        .and_then(package_root)
+        .and_then(crate::lang::package_root)
         .map(std::path::Path::to_path_buf);
 
     // Cache package roots for match paths — avoids repeated stat walks
@@ -183,9 +183,9 @@ fn context_proximity(
             Some(d) => d.to_path_buf(),
             None => return score,
         };
-        let match_root = pkg_cache
-            .entry(match_dir)
-            .or_insert_with_key(|dir| package_root(dir).map(std::path::Path::to_path_buf));
+        let match_root = pkg_cache.entry(match_dir).or_insert_with_key(|dir| {
+            crate::lang::package_root(dir).map(std::path::Path::to_path_buf)
+        });
         if let Some(ref mr) = match_root {
             if mr == cp_root {
                 score += 75;
@@ -279,19 +279,32 @@ fn exported_api_boost(m: &Match) -> i32 {
 
 /// Penalize matches in test fixtures, mocks, stubs, etc. Capped at 200.
 fn fixture_penalty(m: &Match) -> i32 {
-    let path = m.path.to_string_lossy().to_ascii_lowercase();
-    let text = m.text.to_ascii_lowercase();
+    // Anchor path matching to a PATH COMPONENT to avoid false positives like
+    // `examples_parser.rs` being penalized because "examples" is a substring.
+    let has_fixture_component = m.path.components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|s| {
+            let s = s.to_ascii_lowercase();
+            matches!(
+                s.as_str(),
+                "mock"
+                    | "mocks"
+                    | "fixture"
+                    | "fixtures"
+                    | "stub"
+                    | "stubs"
+                    | "fake"
+                    | "fakes"
+                    | "example"
+                    | "examples"
+            )
+        })
+    });
 
-    let mut score = 0;
-    for needle in ["mock", "fixture", "stub", "fake", "example"] {
-        if path.contains(needle) {
-            score += 90;
-        }
-        if text.contains(needle) {
-            score += 40;
-        }
+    if has_fixture_component {
+        90
+    } else {
+        0
     }
-    score.min(200)
 }
 
 /// Penalize matches that appear only in comments (not code).
@@ -355,9 +368,18 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
     let text_lower = m.text.to_ascii_lowercase();
     let haystack = format!("{path_lower} {text_lower}");
 
+    // Whole-word matching: split haystack on non-alphanumeric boundaries so
+    // short words like "in" or "to" don't match unrelated substrings.
+    let haystack_words: Vec<&str> = haystack
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
     let matched = words
         .iter()
-        .filter(|w| haystack.contains(&w.to_ascii_lowercase()))
+        .filter(|w| {
+            let wl = w.to_ascii_lowercase();
+            haystack_words.iter().any(|hw| *hw == wl)
+        })
         .count();
 
     if matched == words.len() {
@@ -417,12 +439,6 @@ fn shared_prefix_depth(a: &Path, b: &Path) -> usize {
         .take_while(|(l, r)| l == r)
         .count()
 }
-
-/// Re-export from lang module to keep rank.rs self-contained.
-fn package_root(path: &Path) -> Option<&Path> {
-    crate::lang::package_root(path)
-}
-
 /// Check if path contains a vendor directory component.
 fn is_vendor_path(path: &Path) -> bool {
     path.components().any(|c| {
@@ -693,6 +709,21 @@ mod tests {
             true,
             Some("handleAuth"),
         );
+        assert_eq!(super::fixture_penalty(&m), 0);
+    }
+
+    #[test]
+    fn fixture_penalty_examples_component_penalized() {
+        // `examples/` as a path COMPONENT should be penalized.
+        let m = make_match("/repo/examples/demo.rs", "fn main() {}", false, None);
+        assert!(super::fixture_penalty(&m) > 0);
+    }
+
+    #[test]
+    fn fixture_penalty_examples_substring_not_penalized() {
+        // `examples_parser.rs` contains "examples" as a substring but NOT as a
+        // standalone path component — must NOT be penalized.
+        let m = make_match("/repo/src/examples_parser.rs", "fn parse() {}", false, None);
         assert_eq!(super::fixture_penalty(&m), 0);
     }
 
