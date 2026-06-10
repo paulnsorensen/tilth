@@ -579,6 +579,9 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
 // ---------------------------------------------------------------------------
 
 /// Run a git command with a 200ms timeout. Returns None if it fails or times out.
+/// Best-effort: every git failure (spawn error, non-zero exit, timeout, I/O error)
+/// is intentionally swallowed into None — git context is a cosmetic fingerprint
+/// and must never break the primary read/search path.
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     let mut child = Command::new("git")
         .args(args)
