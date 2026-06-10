@@ -73,7 +73,7 @@ pub(in crate::mcp) fn tool_search(
         if let Some(kind) = kind {
             sub.insert("kind".into(), Value::String(kind.to_string()));
         }
-        for k in ["expand", "scope", "if_modified_since"] {
+        for k in ["expand", "scope", "if_modified_since", "context"] {
             if let Some(v) = args.get(k) {
                 sub.insert(k.into(), v.clone());
             }
