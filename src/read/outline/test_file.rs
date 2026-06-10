@@ -3,7 +3,7 @@ use crate::types::Lang;
 /// Extract test structure (describe/it/test) via tree-sitter queries.
 /// Returns a structured test outline with suite nesting, or None if
 /// no test structure was found.
-pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<String> {
+pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<(String, bool)> {
     let language = crate::lang::outline::outline_language(lang)?;
 
     let mut parser = tree_sitter::Parser::new();
@@ -13,14 +13,15 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
     let mut entries = Vec::new();
+    let mut truncated = false;
 
-    extract_test_calls(root, &lines, 0, max_lines, &mut entries);
+    extract_test_calls(root, &lines, 0, max_lines, &mut entries, &mut truncated);
 
     if entries.is_empty() {
         return None;
     }
 
-    Some(entries.join("\n"))
+    Some((entries.join("\n"), truncated))
 }
 
 /// Recursively find describe/it/test call expressions.
@@ -30,8 +31,10 @@ fn extract_test_calls(
     depth: usize,
     max_lines: usize,
     entries: &mut Vec<String>,
+    truncated: &mut bool,
 ) {
     if entries.len() >= max_lines {
+        *truncated = true;
         return;
     }
 
@@ -53,7 +56,7 @@ fn extract_test_calls(
             if label == "suite" {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    extract_test_calls(child, lines, depth + 1, max_lines, entries);
+                    extract_test_calls(child, lines, depth + 1, max_lines, entries, truncated);
                 }
                 return;
             }
@@ -63,7 +66,7 @@ fn extract_test_calls(
     // Recurse
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_test_calls(child, lines, depth, max_lines, entries);
+        extract_test_calls(child, lines, depth, max_lines, entries, truncated);
     }
 }
 
