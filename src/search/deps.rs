@@ -373,6 +373,7 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "archive",
     "bufio",
     "bytes",
+    "cmp",
     "compress",
     "container",
     "context",
@@ -392,6 +393,7 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "index",
     "io",
     "log",
+    "maps",
     "math",
     "mime",
     "net",
@@ -740,5 +742,12 @@ mod tests {
             "github.com/gin-gonic/gin",
             crate::types::Lang::Go
         ));
+    }
+
+    #[test]
+    fn go_stdlib_cmp_and_maps_are_stdlib() {
+        // Go 1.21+ added `cmp` and `maps` to the standard library.
+        assert!(is_stdlib("cmp", crate::types::Lang::Go));
+        assert!(is_stdlib("maps", crate::types::Lang::Go));
     }
 }

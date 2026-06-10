@@ -277,7 +277,8 @@ fn exported_api_boost(m: &Match) -> i32 {
     }
 }
 
-/// Penalize matches in test fixtures, mocks, stubs, etc. Capped at 200.
+/// Penalize matches in test fixtures, mocks, stubs, etc. Returns 90 for a path
+/// with a fixture component, else 0.
 fn fixture_penalty(m: &Match) -> i32 {
     // Anchor path matching to a PATH COMPONENT to avoid false positives like
     // `examples_parser.rs` being penalized because "examples" is a substring.
@@ -685,8 +686,9 @@ mod tests {
     }
 
     #[test]
-    fn fixture_penalty_capped_at_200() {
-        // A path hitting multiple needles should be capped
+    fn fixture_penalty_flags_fixture_component() {
+        // A path with one or more fixture components returns the flat 90 penalty
+        // (there is no longer a 200 cap — the max contributor is a single 90).
         let m = make_match(
             "/repo/src/fixtures/mock_stub_fake.ts",
             "example fixture mock stub fake",
@@ -694,11 +696,10 @@ mod tests {
             None,
         );
         let penalty = super::fixture_penalty(&m);
-        assert!(
-            penalty <= 200,
-            "fixture_penalty was {penalty}, expected <= 200"
+        assert_eq!(
+            penalty, 90,
+            "a fixture-component path must return the flat 90 penalty, got {penalty}"
         );
-        assert!(penalty > 0);
     }
 
     #[test]
