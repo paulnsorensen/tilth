@@ -9,6 +9,21 @@ use crate::error::TilthError;
 use crate::format;
 use crate::index::bloom::BloomFilterCache;
 
+/// A collision-free sibling temp path for an atomic write. A bare timestamp
+/// collides when a batch writes two files in the same directory in the same
+/// nanosecond, so we qualify the name with the pid and a process-wide counter
+/// (plus the target's name for debuggability).
+fn unique_tmp_path(dir: &Path, target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stem = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("tilth");
+    dir.join(format!(".{stem}.tilth-tmp.{}.{n}", std::process::id()))
+}
+
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
 pub struct Edit {
@@ -221,13 +236,13 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     // Write atomically: temp file in the same directory, then rename so a
     // crash or full-disk mid-write never corrupts the original.
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp_path = dir.join(format!(".tilth_edit_tmp{unique}"));
-    fs::write(&tmp_path, &output).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
+    let tmp_path = unique_tmp_path(dir, path);
+    fs::write(&tmp_path, &output).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        }
     })?;
     fs::rename(&tmp_path, path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);

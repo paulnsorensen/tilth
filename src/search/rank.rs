@@ -300,11 +300,11 @@ fn fixture_penalty(m: &Match) -> i32 {
         })
     });
 
-    let mut score = 0;
     if has_fixture_component {
-        score += 90;
+        90
+    } else {
+        0
     }
-    score.min(200)
 }
 
 /// Penalize matches that appear only in comments (not code).

@@ -1317,11 +1317,7 @@ fn format_search_result(
     }
 
     let tokens = estimate_tokens(out.len() as u64);
-    let token_str = if tokens >= 1000 {
-        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
-    } else {
-        format!("~{tokens}")
-    };
+    let token_str = format_token_count(tokens);
     let _ = write!(out, "\n\n({token_str} tokens)");
 
     Ok(out)

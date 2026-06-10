@@ -103,12 +103,17 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 /// Write `content` to `path` atomically: write to a sibling temp file first,
 /// then rename over the target so an interrupted write never truncates `path`.
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp = dir.join(format!(".tilth_install_tmp{unique}"));
-    fs::write(&tmp, content).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    // Qualify the temp name with pid + a process-wide counter so concurrent or
+    // batched writes in the same directory can't collide on the temp path.
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".tilth-install-tmp.{}.{n}", std::process::id()));
+    fs::write(&tmp, content).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to write {}: {e}", path.display())
+    })?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("failed to rename to {}: {e}", path.display())
