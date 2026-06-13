@@ -54,6 +54,9 @@ pub(crate) fn tool_write(
     // Partition into hash-mode tasks (delegate to existing apply_batch) and
     // direct overwrite/append tasks (handled inline).
     let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
+    // Tracks resolved paths for hash-mode files that were relative (no root),
+    // so we can fire the cross-worktree warning after apply_batch.
+    let mut hash_relative_paths: Vec<PathBuf> = Vec::new();
     let mut direct_results: Vec<String> = Vec::new();
     let mut direct_applied: Vec<PathBuf> = Vec::new();
     let (scope_root, _scope_warn) = super::resolve_scope(args);
@@ -96,7 +99,12 @@ pub(crate) fn tool_write(
             }
         }
         match mode {
-            "hash" | "h" => hash_tasks.push(parse_file_edit(i, f, root.as_deref())),
+            "hash" | "h" => {
+                if root.is_none() && !PathBuf::from(path_str).is_absolute() {
+                    hash_relative_paths.push(path.clone());
+                }
+                hash_tasks.push(parse_file_edit(i, f, root.as_deref()));
+            }
             "overwrite" | "w" => {
                 let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
                     direct_results.push(format!(
@@ -235,6 +243,22 @@ pub(crate) fn tool_write(
                     session.record_read(p);
                 }
                 output.push_str(&augmented);
+                // Cross-worktree warning for hash-mode relative paths.
+                if !hash_relative_paths.is_empty() {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    for p in &outcome.applied {
+                        // Only warn for paths that were relative and no root was given.
+                        let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        let was_relative = hash_relative_paths
+                            .iter()
+                            .any(|r| r.canonicalize().unwrap_or_else(|_| r.clone()) == p_canon);
+                        if was_relative {
+                            if let Some(warn) = cross_worktree_warning(p, &cwd) {
+                                output.push_str(&warn);
+                            }
+                        }
+                    }
+                }
             }
             Err(msg) => {
                 // All-failed path. No file committed, so reuse the same
@@ -1028,6 +1052,114 @@ mod tests {
         assert!(
             warn.is_none(),
             "no cross-worktree warning for a write within the same git root"
+        );
+    }
+
+    // -- hash-mode tests (issue #73 fix B/C) --
+
+    #[test]
+    fn hash_mode_root_anchors_relative_path() {
+        // hash-mode relative path + explicit `root` → file lands under root, output echoes abs path.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root_path = root_dir.path();
+
+        // Create the target file under root so hash mode can read and edit it.
+        let subdir = root_path.join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        let content = "line one\nline two\n";
+        let target = subdir.join("edit_me.rs");
+        std::fs::write(&target, content).unwrap();
+
+        // Compute the hash anchor for line 1.
+        let h = crate::format::line_hash(b"line one");
+        let anchor = format!("1:{h:03x}");
+
+        let (session, bloom) = services();
+        let args = serde_json::json!({
+            "root": root_path.to_str().unwrap(),
+            "files": [{
+                "path": "src/edit_me.rs",
+                "mode": "hash",
+                "edits": [{
+                    "start": anchor,
+                    "end": anchor,
+                    "content": "line ONE"
+                }]
+            }]
+        });
+        let out = tool_write(&args, &session, &bloom).expect("hash edit succeeds");
+
+        // File must exist under root with new content.
+        assert!(
+            target.exists(),
+            "file must remain under root: {}",
+            target.display()
+        );
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            written.contains("line ONE"),
+            "edit must have applied: {written}"
+        );
+        // cwd-relative path must NOT have been created.
+        assert!(
+            !std::path::Path::new("src/edit_me.rs").exists(),
+            "file must NOT land in cwd at the relative path"
+        );
+        // Output must echo the resolved absolute path.
+        let abs = target.canonicalize().unwrap();
+        assert!(
+            out.contains(abs.to_str().unwrap()),
+            "output must echo resolved absolute path; got: {out}"
+        );
+    }
+
+    #[test]
+    fn hash_mode_cross_worktree_warning_fires() {
+        // Verify the cross-worktree warning fires when a hash-mode applied path
+        // lands in a different git root than cwd. We test via cross_worktree_warning
+        // directly (the same function called by the hash-mode branch) because
+        // triggering it through tool_write requires a relative path that traverses
+        // git roots, which is environment-dependent.
+        let wt1 = tempfile::tempdir().unwrap();
+        let wt2 = tempfile::tempdir().unwrap();
+
+        // Give each temp dir its own .git so they appear as separate git roots.
+        std::fs::create_dir(wt1.path().join(".git")).unwrap();
+        std::fs::create_dir(wt2.path().join(".git")).unwrap();
+
+        let target = wt2.path().join("file.rs");
+        std::fs::write(&target, "x\n").unwrap();
+
+        // Warning must fire: target is in wt2, cwd-analog is wt1.
+        let warn = cross_worktree_warning(&target, wt1.path());
+        assert!(
+            warn.is_some(),
+            "hash-mode cross-worktree warning must fire when write lands in a different git root"
+        );
+        let warn_str = warn.unwrap();
+        assert!(
+            warn_str.contains("cross-worktree write"),
+            "warning text must mention cross-worktree write: {warn_str}"
+        );
+        assert!(
+            warn_str.contains("Pass `root`"),
+            "warning must suggest passing root: {warn_str}"
+        );
+    }
+
+    #[test]
+    fn hash_mode_no_warning_for_in_tree_write() {
+        // hash-mode write to a path within the same git root as cwd → no warning.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir(wt.path().join(".git")).unwrap();
+        let target = wt.path().join("inplace.rs");
+        std::fs::write(&target, "x\n").unwrap();
+
+        // Cwd-analog = wt.path(), write target also under wt → same git root.
+        let warn = cross_worktree_warning(&target, wt.path());
+        assert!(
+            warn.is_none(),
+            "no cross-worktree warning expected for an in-tree hash-mode write"
         );
     }
 }
