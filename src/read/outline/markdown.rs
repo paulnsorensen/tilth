@@ -5,29 +5,31 @@
 /// `fenced_code_block` nodes and never produce false-positive headings.
 use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 
-pub fn outline(buf: &[u8], max_lines: usize) -> String {
+pub fn outline(buf: &[u8], max_lines: usize) -> (String, bool) {
     let Ok(content) = std::str::from_utf8(buf) else {
-        return String::new();
+        return (String::new(), false);
     };
     let Some(tree) = parse_markdown(content) else {
-        return String::new();
+        return (String::new(), false);
     };
     let lines: Vec<&str> = content.lines().collect();
 
     let mut entries = Vec::new();
     let mut code_block_count = 0u32;
+    let mut truncated = false;
     walk(
         tree.root_node(),
         &lines,
         max_lines,
         &mut entries,
         &mut code_block_count,
+        &mut truncated,
     );
 
     if code_block_count > 0 {
         entries.push(format!("\n({code_block_count} code blocks)"));
     }
-    entries.join("\n")
+    (entries.join("\n"), truncated)
 }
 
 fn walk(
@@ -36,21 +38,37 @@ fn walk(
     max_lines: usize,
     entries: &mut Vec<String>,
     code_block_count: &mut u32,
+    truncated: &mut bool,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if entries.len() >= max_lines {
+        if entries.len() >= max_lines && child.kind() == "section" {
+            *truncated = true;
             return;
         }
         match child.kind() {
             "section" => {
                 emit_section_heading(child, lines, entries);
-                walk(child, lines, max_lines, entries, code_block_count);
+                walk(
+                    child,
+                    lines,
+                    max_lines,
+                    entries,
+                    code_block_count,
+                    truncated,
+                );
             }
             "fenced_code_block" => {
                 *code_block_count += 1;
             }
-            _ => walk(child, lines, max_lines, entries, code_block_count),
+            _ => walk(
+                child,
+                lines,
+                max_lines,
+                entries,
+                code_block_count,
+                truncated,
+            ),
         }
     }
 }
@@ -107,7 +125,7 @@ mod tests {
     #[test]
     fn basic_headings() {
         let input = b"# H1\nSome text\n## H2\nMore text\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
 
         assert_eq!(lines.len(), 2);
@@ -120,7 +138,7 @@ mod tests {
     #[test]
     fn code_blocks_skipped() {
         let input = b"# Real Heading\n\n```\ncode\n```\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
 
         // Should only find the real heading, not any inside code block
         assert!(result.starts_with("[1-5] # Real Heading"));
@@ -131,7 +149,7 @@ mod tests {
     #[test]
     fn code_block_count() {
         let input = b"# Heading\n```\ncode\n```\n```\nmore\n```\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
 
         assert!(result.contains("(2 code blocks)"));
     }
@@ -139,7 +157,7 @@ mod tests {
     #[test]
     fn nested_heading_ranges() {
         let input = b"# A\ntext\n## B\ntext\n## C\ntext\n# D\ntext\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
 
         assert_eq!(lines.len(), 4);
@@ -156,7 +174,7 @@ mod tests {
     #[test]
     fn last_heading_to_eof() {
         let input = b"# Heading\nline 2\nline 3\nline 4\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
 
         // Heading should extend to line 4 (total line count)
         assert_eq!(result, "[1-4] # Heading");
@@ -165,7 +183,7 @@ mod tests {
     #[test]
     fn empty_file() {
         let input = b"";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
 
         assert_eq!(result, "");
     }
@@ -177,7 +195,7 @@ mod tests {
     #[test]
     fn hash_inside_fenced_code_does_not_become_heading() {
         let input = b"# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
         let heading_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with('[')).collect();
         assert_eq!(heading_lines.len(), 2);
@@ -192,7 +210,7 @@ mod tests {
     #[test]
     fn setext_headings_silently_ignored() {
         let input = b"Top\n===\n\ncontent\n";
-        let result = outline(input, 100);
+        let (result, _) = outline(input, 100);
         assert_eq!(result, "");
     }
 }

@@ -24,39 +24,36 @@ pub fn generate(
     // Test files get special treatment regardless of language
     if crate::types::is_test_file(path) {
         if let FileType::Code(lang) = file_type {
-            if let Some(outline) = test_file::outline(content, lang, max_lines) {
-                return with_omission_note(outline, max_lines);
+            if let Some((outline, truncated)) = test_file::outline(content, lang, max_lines) {
+                return with_omission_note(outline, truncated);
             }
         }
     }
 
-    let outline = match file_type {
+    // Each backend reports whether it dropped entries at `max_lines`. The
+    // head/tail fallbacks (log/other) carry their own elision indicator and
+    // are not symbol outlines, so they never trigger the omission note.
+    let (outline, truncated) = match file_type {
         FileType::Code(lang) => code::outline(content, lang, max_lines),
         FileType::Markdown => markdown::outline(buf, max_lines),
         FileType::StructuredData => structured::outline(path, content, max_lines),
         FileType::Tabular => tabular::outline(content, max_lines),
-        FileType::Log => fallback::log_view(content),
-        FileType::Other => fallback::head_tail(content),
+        FileType::Log => (fallback::log_view(content), false),
+        FileType::Other => (fallback::head_tail(content), false),
     };
-    with_omission_note(outline, max_lines)
+    with_omission_note(outline, truncated)
 }
 
-/// Append a note when the outline likely hit `max_lines` and more symbols
+/// Append a note when the outline actually hit `max_lines` and more symbols
 /// exist below. Without this note, agents read the outline as exhaustive
 /// and miss symbols below the cap.
 ///
-/// Note: `max_lines` is an entry cap inside `format_entries` (one
-/// `out.push(...)` per entry, joined with `\n`). For the code-outline path
-/// `outline.lines().count() == entry_count` exactly. For other backends
-/// (markdown, structured, tabular) the same identity holds because each
-/// pushes single-line entries. So the heuristic compares like-for-like.
-/// We avoid claiming a specific count in the user-facing message — we
-/// only state that more symbols exist, which is the actionable signal.
-fn with_omission_note(outline: String, max_lines: usize) -> String {
-    if max_lines == usize::MAX {
-        return outline;
-    }
-    if outline.lines().count() < max_lines {
+/// `truncated` is the real drop signal from the backend — set only when a
+/// symbol/entry was elided because the cap was reached. This replaces the
+/// former `lines().count() == max_lines` heuristic, which falsely fired on a
+/// file with exactly `OUTLINE_CAP` symbols and nothing actually dropped.
+fn with_omission_note(outline: String, truncated: bool) -> String {
+    if !truncated {
         return outline;
     }
     format!(
@@ -72,32 +69,35 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
-    fn note_appended_when_at_cap() {
+    fn note_appended_when_truncated() {
         let outline = (0..100)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = with_omission_note(outline, 100);
+        let result = with_omission_note(outline, true);
         assert!(result.contains("outline truncated"));
     }
 
     #[test]
-    fn no_note_when_under_cap() {
+    fn no_note_when_not_truncated() {
         let outline = (0..50)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = with_omission_note(outline.clone(), 100);
+        let result = with_omission_note(outline.clone(), false);
         assert_eq!(result, outline);
     }
 
+    /// Regression: a file with exactly `OUTLINE_CAP` entries and nothing
+    /// dropped must NOT get the truncation note — the old line-count
+    /// heuristic falsely fired here.
     #[test]
-    fn no_note_when_uncapped() {
-        let outline = (0..200)
+    fn no_note_at_exact_cap_without_truncation() {
+        let outline = (0..100)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = with_omission_note(outline.clone(), usize::MAX);
+        let result = with_omission_note(outline.clone(), false);
         assert_eq!(result, outline);
     }
 
