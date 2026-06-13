@@ -32,7 +32,6 @@ fn walk_json(
     truncated: &mut bool,
 ) {
     if lines.len() >= max_lines {
-        *truncated = true;
         return;
     }
 
@@ -141,7 +140,26 @@ fn yaml_outline(content: &str, max_lines: usize) -> (String, bool) {
     let mut truncated = false;
     for (i, line) in content.lines().enumerate() {
         if entries.len() >= max_lines {
-            truncated = true;
+            // only truncated if a key at a supported depth follows
+            let remaining_has_key = content.lines().skip(i + 1).any(|l| {
+                let t = l.trim_start();
+                if t.is_empty() || t.starts_with('#') || t.starts_with('-') {
+                    return false;
+                }
+                if let Some(c) = t.find(':') {
+                    let k = &t[..c];
+                    if k.contains(' ') {
+                        return false;
+                    }
+                    let d = (l.len() - t.len()) / 2;
+                    d <= 2
+                } else {
+                    false
+                }
+            });
+            if remaining_has_key {
+                truncated = true;
+            }
             break;
         }
         let trimmed = line.trim_start();
@@ -200,7 +218,6 @@ fn walk_toml(
     truncated: &mut bool,
 ) {
     if lines.len() >= max_lines {
-        *truncated = true;
         return;
     }
     let indent = "  ".repeat(depth);

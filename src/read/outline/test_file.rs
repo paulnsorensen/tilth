@@ -34,7 +34,6 @@ fn extract_test_calls(
     truncated: &mut bool,
 ) {
     if entries.len() >= max_lines {
-        *truncated = true;
         return;
     }
 
@@ -43,6 +42,10 @@ fn extract_test_calls(
     // Look for call expressions: describe(...), it(...), test(...)
     if kind == "call_expression" || kind == "expression_statement" {
         if let Some(name) = extract_test_name(node, lines) {
+            if entries.len() >= max_lines {
+                *truncated = true;
+                return;
+            }
             let line = node.start_position().row as u32 + 1;
             let indent = "  ".repeat(depth);
             let label = if name.starts_with("describe") || name.starts_with("context") {

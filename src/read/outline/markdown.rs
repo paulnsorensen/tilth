@@ -42,7 +42,7 @@ fn walk(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if entries.len() >= max_lines {
+        if entries.len() >= max_lines && child.kind() == "section" {
             *truncated = true;
             return;
         }
