@@ -103,21 +103,8 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 /// Write `content` to `path` atomically: write to a sibling temp file first,
 /// then rename over the target so an interrupted write never truncates `path`.
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    // Qualify the temp name with pid + a process-wide counter so concurrent or
-    // batched writes in the same directory can't collide on the temp path.
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".tilth-install-tmp.{}.{n}", std::process::id()));
-    fs::write(&tmp, content).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("failed to write {}: {e}", path.display())
-    })?;
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("failed to rename to {}: {e}", path.display())
-    })
+    crate::util::atomic_write_bytes(path, content.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
@@ -226,7 +213,7 @@ fn toml_section_end(rest: &str) -> usize {
         if let Some(quote) = in_str {
             if escaped {
                 escaped = false;
-            } else if c == b'\\' {
+            } else if c == b'\\' && quote == b'"' {
                 escaped = true;
             } else if c == quote {
                 in_str = None;
