@@ -424,7 +424,7 @@ pub fn search_callers_expanded(
                         .filter(|c| c.calling_function != "<top-level>")
                         .map(|c| c.calling_function.as_str())
                         .collect();
-                    hop1_fns.len() + count
+                    hop1_fns.len() + unique_total
                 });
             }
         }

@@ -388,7 +388,6 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "go",
     "hash",
     "html",
-    "http",
     "image",
     "index",
     "io",
@@ -414,7 +413,6 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "time",
     "unicode",
     "unsafe",
-    "utf8",
 ];
 
 /// Returns true if the import source is a standard library module.

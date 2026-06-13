@@ -360,7 +360,11 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
         return 0;
     }
 
-    let words: Vec<&str> = query.split_whitespace().collect();
+    let words: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
     if words.len() < 2 {
         return 0;
     }
@@ -377,10 +381,7 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
         .collect();
     let matched = words
         .iter()
-        .filter(|w| {
-            let wl = w.to_ascii_lowercase();
-            haystack_words.iter().any(|hw| *hw == wl)
-        })
+        .filter(|w| haystack_words.contains(&w.as_str()))
         .count();
 
     if matched == words.len() {

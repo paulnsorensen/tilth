@@ -1042,6 +1042,10 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(false)
         .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .max_depth(Some(6))
         .build();
