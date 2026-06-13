@@ -238,6 +238,19 @@ fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
     for root in roots {
         let uri = root.get("uri")?.as_str()?;
         let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
+        // Drop authority (host) component: file://host/path → /path.
+        // file:///abs already starts with '/' after stripping "file://".
+        let raw_path = if raw_path.starts_with('/') {
+            raw_path
+        } else {
+            // Authority-only forms (file://host with no '/' after the host)
+            // have no path component — skip them rather than fall back to the
+            // bare authority as a relative path.
+            match raw_path.find('/') {
+                Some(i) => &raw_path[i..],
+                None => continue,
+            }
+        };
         // On invalid UTF-8 in a percent-encoded path, fall back to the
         // original input rather than substituting U+FFFD replacements.
         let decoded = percent_encoding::percent_decode_str(raw_path)
@@ -340,12 +353,21 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
-    if let Some(b) = args.get("budget") {
-        if !matches!(b.as_u64(), Some(n) if n >= 1) {
-            return Err(format!(
-                "budget must be a positive integer ≥ 1 (got {b}); omit it for the default {}",
-                crate::budget::DEFAULT_BUDGET
-            ));
+    // Budget validation only applies to tools that honour the budget param.
+    // tilth_list and tilth_write ignore budget; rejecting budget:0 for them
+    // produces a confusing read-oriented error on non-read operations.
+    let budget_aware = matches!(
+        tool,
+        "tilth_read" | "tilth_search" | "tilth_deps" | "tilth_diff" | "tilth_grok"
+    );
+    if budget_aware {
+        if let Some(b) = args.get("budget") {
+            if !matches!(b.as_u64(), Some(n) if n >= 1) {
+                return Err(format!(
+                    "budget must be a positive integer ≥ 1 (got {b}); omit it for the default {}",
+                    crate::budget::DEFAULT_BUDGET
+                ));
+            }
         }
     }
     match tool {
@@ -532,6 +554,18 @@ mod tests {
         assert_eq!(path, Some(tmp.path().to_path_buf()));
     }
 
+    #[test]
+    fn extract_root_authority_form_strips_host() {
+        // file://host/path (RFC 8089 authority) must resolve to /path, not host/path.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://localhost{}", tmp.path().display());
+        let msg = serde_json::json!({
+            "result": { "roots": [{ "uri": uri }] }
+        });
+        let path = extract_root_from_response(&msg);
+        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    }
+
     // -- package_root fallback from subdirectory ------------------------------
 
     #[test]
@@ -566,7 +600,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            4438,
+            4443,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -2353,12 +2387,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            4438,
+            4443,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            7319,
+            7324,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2542,6 +2576,32 @@ mod tests {
         assert!(
             dispatch_tool("tilth_search", &ok, &services).is_ok(),
             "a valid budget must still dispatch"
+        );
+    }
+
+    /// tilth_write and tilth_list don't consume budget; passing budget:0 must
+    /// not produce a budget error — the error should come from their own
+    /// parameter validation, not the budget gate.
+    #[test]
+    fn budget_validation_skipped_for_non_budget_tools() {
+        // tilth_write in edit_mode=true, budget:0 → own files-array error, not budget error.
+        let services = Services::new(true);
+        let args = serde_json::json!({ "budget": 0, "files": [] });
+        let err = dispatch_tool("tilth_write", &args, &services)
+            .expect_err("empty files array must be rejected");
+        assert!(
+            !err.contains("positive integer"),
+            "budget gate must not fire for tilth_write: {err}"
+        );
+
+        // tilth_list, budget:0 → own patterns error, not budget error.
+        let services = Services::new(false);
+        let args = serde_json::json!({ "budget": 0, "patterns": [] });
+        let err = dispatch_tool("tilth_list", &args, &services)
+            .expect_err("empty patterns must be rejected");
+        assert!(
+            !err.contains("positive integer"),
+            "budget gate must not fire for tilth_list: {err}"
         );
     }
 

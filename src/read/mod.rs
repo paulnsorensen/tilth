@@ -51,8 +51,12 @@ pub(crate) fn tilthignore_denies(path: &Path) -> bool {
         let ignore_file = d.join(crate::search::TILTHIGNORE_FILE);
         if ignore_file.is_file() {
             let mut builder = GitignoreBuilder::new(d);
-            if builder.add(&ignore_file).is_none() {
-                if let Ok(gi) = builder.build() {
+            // `add` returns Some(Error) for partial parse errors — those are
+            // advisory (the rest of the file still applies). Call `build()`
+            // regardless so valid patterns are honoured even alongside bad ones.
+            let _ = builder.add(&ignore_file);
+            match builder.build() {
+                Ok(gi) => {
                     // Closest .tilthignore wins — first definitive verdict ends it.
                     let verdict = gi.matched_path_or_any_parents(&abs, false);
                     if verdict.is_ignore() {
@@ -61,6 +65,10 @@ pub(crate) fn tilthignore_denies(path: &Path) -> bool {
                     if verdict.is_whitelist() {
                         return false;
                     }
+                }
+                Err(_) => {
+                    // Failed to build a matcher — fail closed to protect secrets.
+                    return true;
                 }
             }
         }
@@ -1265,6 +1273,24 @@ mod tests {
         assert!(
             !tilthignore_denies(&kept),
             "`!keep.env` should re-allow keep.env"
+        );
+    }
+
+    /// Regression: a malformed glob pattern in .tilthignore (e.g. unclosed `[`)
+    /// must NOT cause the entire file to be skipped, leaving secrets readable.
+    /// The `ignore` crate treats parse errors as advisory — valid patterns still
+    /// apply. This test confirms a secret listed after a bad pattern is denied.
+    #[test]
+    fn tilthignore_malformed_pattern_still_denies_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        // First line: bad glob (unclosed character class). Second line: real deny.
+        std::fs::write(dir.path().join(".tilthignore"), "[invalid\nsecret.env\n").unwrap();
+        let secret = dir.path().join("secret.env");
+        std::fs::write(&secret, "API_KEY=abc\n").unwrap();
+
+        assert!(
+            tilthignore_denies(&secret),
+            "secret.env must be denied even when .tilthignore contains a malformed pattern"
         );
     }
 }
