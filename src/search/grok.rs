@@ -2242,13 +2242,10 @@ pub fn target_fn() {
 
     #[test]
     fn type_method_regression_real_impl_block() {
-        // Regression for commit 2f7c448 (fix #61): tilth_grok with a
-        // `Type::method` target used to return NotFound because the literal
-        // spec (e.g. `OutlineCache::get_or_parse`) never matches a bare
-        // tree-sitter definition name (`get_or_parse`).  The fix retries
-        // with the trailing segment plus the qualifier.  This test uses an
-        // impl-block structure that mirrors the real OutlineCache type so the
-        // regression cannot be masked by a synthetic one-method fixture.
+        // Regression for commit 2f7c448 (fix #61): `Type::method` targets
+        // must resolve to the method, not return NotFound. Uses a two-method
+        // impl block so the resolver must pick `get_or_parse` over its sibling
+        // `new`; the `start_line` assertion confirms placement inside the impl.
         let tmp = tempfile::tempdir().unwrap();
         let body = "\
 pub struct OutlineCache;
