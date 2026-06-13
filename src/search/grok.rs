@@ -2239,4 +2239,52 @@ pub fn target_fn() {
             "file header should appear once, not duplicated"
         );
     }
+
+    #[test]
+    fn type_method_regression_real_impl_block() {
+        // Regression for commit 2f7c448 (fix #61): tilth_grok with a
+        // `Type::method` target used to return NotFound because the literal
+        // spec (e.g. `OutlineCache::get_or_parse`) never matches a bare
+        // tree-sitter definition name (`get_or_parse`).  The fix retries
+        // with the trailing segment plus the qualifier.  This test uses an
+        // impl-block structure that mirrors the real OutlineCache type so the
+        // regression cannot be masked by a synthetic one-method fixture.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub struct OutlineCache;
+
+pub struct ParsedFile;
+
+impl OutlineCache {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn get_or_parse(&self, _path: &str) -> Option<ParsedFile> {
+        None
+    }
+}
+";
+        write_fixture(tmp.path(), "src/cache.rs", body);
+
+        for spec in ["OutlineCache::get_or_parse", "OutlineCache.get_or_parse"] {
+            let (target, _, _) = resolve_with_source(spec, tmp.path())
+                .unwrap_or_else(|e| panic!("`{spec}` must resolve, got: {e}"));
+            assert_eq!(
+                target.name, "get_or_parse",
+                "`{spec}` must resolve to method `get_or_parse`, not the qualified form"
+            );
+            // The definition must land inside the impl block, not on a stray
+            // line; start_line > 1 rules out a degenerate 0-line resolution.
+            assert!(
+                target.start_line > 1,
+                "`{spec}` resolved to line {} — expected inside the impl block",
+                target.start_line
+            );
+            assert_eq!(
+                target.other_def_count, 0,
+                "exactly one `get_or_parse` definition in the fixture"
+            );
+        }
+    }
 }
