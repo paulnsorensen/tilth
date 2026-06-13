@@ -166,8 +166,8 @@ fn parse_hunk_header(rest: &str) -> Option<(u32, u32, u32, u32)> {
     };
 
     let mut parts = range_part.split_whitespace();
-    let old_spec = parts.next().unwrap_or("-0");
-    let new_spec = parts.next().unwrap_or("+0");
+    let old_spec = parts.next()?;
+    let new_spec = parts.next()?;
 
     let (old_start, old_count) = parse_range_spec(old_spec.trim_start_matches('-'))?;
     let (new_start, new_count) = parse_range_spec(new_spec.trim_start_matches('+'))?;

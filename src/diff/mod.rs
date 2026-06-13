@@ -317,15 +317,13 @@ pub fn diff(
             }
         }
         if !all_conflicts.is_empty() {
-            let mut conflict_output = String::new();
-            conflict_output.push('\n');
             for (path, conflicts) in &all_conflicts {
-                conflict_output.push_str(&format::format_conflicts(conflicts, path));
+                output.push('\n');
+                output.push_str(&format::format_conflicts(conflicts, path));
             }
             if let Some(b) = budget {
-                conflict_output = crate::budget::apply(&conflict_output, b);
+                output = crate::budget::apply(&output, b);
             }
-            output.push_str(&conflict_output);
         }
     }
 

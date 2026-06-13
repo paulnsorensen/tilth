@@ -204,7 +204,13 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
             attributed_hunks: Vec::new(),
         };
     };
-    let new_content = get_new_content(path, source).unwrap_or_default();
+    let Ok(new_content) = get_new_content(path, source) else {
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
+    };
 
     let ft = detect_file_type(path);
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
@@ -235,7 +241,13 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let new_content = get_new_content(path, source).unwrap_or_default();
+    let Ok(new_content) = get_new_content(path, source) else {
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
+    };
 
     let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
 
@@ -248,8 +260,13 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 
 fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let old_content =
-        get_old_content(path, file_diff.old_path.as_deref(), source).unwrap_or_default();
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
+    };
 
     let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
 
@@ -269,7 +286,13 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
             attributed_hunks: Vec::new(),
         };
     };
-    let new_content = get_new_content(path, source).unwrap_or_default();
+    let Ok(new_content) = get_new_content(path, source) else {
+        return FileOverlay {
+            path: path.clone(),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        };
+    };
 
     let ft = detect_file_type(path);
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
@@ -298,9 +321,7 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 /// Fetch the old-side content for a file diff.
 ///
 /// Returns `Ok(content)` on success (including legitimately empty for new files).
-/// Returns `Err(reason)` when the git command itself fails — the caller should
-/// treat this as "content unavailable" and skip symbol analysis rather than
-/// emitting a confidently-wrong all-Added overlay.
+/// Returns `Err(reason)` when the git command OR a filesystem read fails — the caller should
 fn get_old_content(
     path: &Path,
     old_path: Option<&Path>,
@@ -614,7 +635,7 @@ mod tests {
     fn git_show_error_skips_symbol_analysis() {
         // When get_old_content returns Err, compute_modified must return an
         // empty overlay rather than a confidently-wrong all-Added result.
-        // Simulate with Files source pointing at a missing file.
+        // Simulate with Files source pointing at a missing old-side file.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("foo.rs");
         std::fs::write(&file, "fn new_fn() {}\n").unwrap();
@@ -626,5 +647,23 @@ mod tests {
             &DiffSource::Files(missing.clone(), file.clone()),
         );
         assert!(result.is_err(), "missing file path must yield Err, got Ok");
+
+        // Confirm that compute_modified skips symbol analysis when old side is unavailable.
+        let file_diff = FileDiff {
+            path: file.clone(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: Vec::new(),
+            is_generated: false,
+            is_binary: false,
+        };
+        let overlay = compute_modified(
+            &file_diff,
+            &DiffSource::Files(missing.clone(), file.clone()),
+        );
+        assert!(
+            overlay.symbol_changes.is_empty(),
+            "overlay must be empty when old side is unavailable"
+        );
     }
 }
