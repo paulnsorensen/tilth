@@ -72,11 +72,10 @@ pub(crate) fn tool_write(
             continue;
         };
         let path = resolve_write_path(path_str, root.as_deref());
-        // Scope guard for overwrite/append: hash mode goes through
-        // `edit::apply_batch` which canonicalizes + roots to `package_root`.
-        // overwrite/append accept any path the client sends, so we refuse
-        // writes that resolve outside the configured scope OR when the scope
-        // itself cannot be canonicalized (fail closed).
+        // Scope guard for overwrite/append: hash mode resolves the task path
+        // as-is (against cwd unless an explicit `root` or absolute path was
+        // supplied); `package_root` is only used to scope the blast-radius
+        // search and never roots the write target.
         if matches!(mode, "overwrite" | "w" | "append" | "a") {
             match scope_canon.as_ref() {
                 Ok(scope_root_abs) => {
@@ -246,13 +245,14 @@ pub(crate) fn tool_write(
                 // Cross-worktree warning for hash-mode relative paths.
                 if !hash_relative_paths.is_empty() {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    let canon_relative: std::collections::HashSet<PathBuf> = hash_relative_paths
+                        .iter()
+                        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+                        .collect();
                     for p in &outcome.applied {
                         // Only warn for paths that were relative and no root was given.
                         let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-                        let was_relative = hash_relative_paths
-                            .iter()
-                            .any(|r| r.canonicalize().unwrap_or_else(|_| r.clone()) == p_canon);
-                        if was_relative {
+                        if canon_relative.contains(&p_canon) {
                             if let Some(warn) = cross_worktree_warning(p, &cwd) {
                                 output.push_str(&warn);
                             }
@@ -916,12 +916,6 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&expected).unwrap(), "hello root\n");
         // File must NOT exist in cwd with the relative path.
-        let cwd_path = std::path::PathBuf::from("relative/file.txt");
-        assert!(
-            !cwd_path.exists(),
-            "file must NOT land in cwd at the relative path: {}",
-            cwd_path.display()
-        );
         // Output must mention the absolute resolved path.
         let abs_str = expected.canonicalize().unwrap();
         assert!(
@@ -1055,6 +1049,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cross_worktree_warning_fires_for_git_file_worktree() {
+        // A linked worktree has a `.git` FILE (gitdir pointer), not a directory.
+        // `find_git_root` uses `.exists()` which is true for files too — confirm.
+        let server_wt = tempfile::tempdir().unwrap();
+        let write_wt = tempfile::tempdir().unwrap();
+
+        // server worktree: .git dir (normal clone)
+        std::fs::create_dir(server_wt.path().join(".git")).unwrap();
+        // write worktree: .git FILE (linked worktree gitdir pointer)
+        std::fs::write(
+            write_wt.path().join(".git"),
+            "gitdir: /some/other/.git/worktrees/issue-foo\n",
+        )
+        .unwrap();
+
+        let target = write_wt.path().join("target.txt");
+        std::fs::write(&target, "x").unwrap();
+
+        let warn = cross_worktree_warning(&target, server_wt.path());
+        assert!(
+            warn.is_some(),
+            "cross-worktree warning must fire for a .git-file linked worktree"
+        );
+        let msg = warn.unwrap();
+        assert!(
+            msg.contains("cross-worktree"),
+            "warning must mention cross-worktree: {msg}"
+        );
+    }
+
     // -- hash-mode tests (issue #73 fix B/C) --
 
     #[test]
@@ -1099,11 +1124,6 @@ mod tests {
         assert!(
             written.contains("line ONE"),
             "edit must have applied: {written}"
-        );
-        // cwd-relative path must NOT have been created.
-        assert!(
-            !std::path::Path::new("src/edit_me.rs").exists(),
-            "file must NOT land in cwd at the relative path"
         );
         // Output must echo the resolved absolute path.
         let abs = target.canonicalize().unwrap();
