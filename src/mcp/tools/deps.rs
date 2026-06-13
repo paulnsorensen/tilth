@@ -17,10 +17,12 @@ pub(in crate::mcp) fn tool_deps(
         .ok_or("missing required parameter: path")?;
     let path = PathBuf::from(path_str);
     let (scope, scope_warning) = resolve_scope(args);
-    let budget = args
-        .get("budget")
-        .and_then(serde_json::Value::as_u64)
-        .map(|b| b as usize);
+    let budget = usize::try_from(
+        args.get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET),
+    )
+    .unwrap_or(usize::MAX);
 
     let deps_result =
         crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
@@ -28,7 +30,7 @@ pub(in crate::mcp) fn tool_deps(
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,
         &scope,
-        budget,
+        Some(budget),
     ));
     Ok(output)
 }

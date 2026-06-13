@@ -10,8 +10,12 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
     let search = args.get("search").and_then(|v| v.as_str());
     let blast = args.get("blast").and_then(Value::as_bool).unwrap_or(false);
     let expand = args.get("expand").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let budget = args.get("budget").and_then(Value::as_u64);
+    let budget = args
+        .get("budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
 
     let diff_source = crate::diff::resolve_source(source, a, b, patch, log)?;
-    crate::diff::diff(&diff_source, scope, search, blast, expand, budget)
+    let result = crate::diff::diff(&diff_source, scope, search, blast, expand, Some(budget))?;
+    Ok(crate::budget::apply(&result, budget))
 }
