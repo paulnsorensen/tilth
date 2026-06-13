@@ -2242,10 +2242,9 @@ pub fn target_fn() {
 
     #[test]
     fn type_method_regression_real_impl_block() {
-        // Regression for commit 2f7c448 (fix #61): `Type::method` targets
-        // must resolve to the method, not return NotFound. Uses a two-method
-        // impl block so the resolver must pick `get_or_parse` over its sibling
-        // `new`; the `start_line` assertion confirms placement inside the impl.
+        // Regression for commit 2f7c448 (fix #61): `Type::method` qualified targets
+        // must resolve to the method itself, not return NotFound. The `start_line`
+        // assertion confirms the resolver lands on the method inside the impl block.
         let tmp = tempfile::tempdir().unwrap();
         let body = "\
 pub struct OutlineCache;
@@ -2271,11 +2270,11 @@ impl OutlineCache {
                 target.name, "get_or_parse",
                 "`{spec}` must resolve to method `get_or_parse`, not the qualified form"
             );
-            // The definition must land inside the impl block, not on a stray
-            // line; start_line > 1 rules out a degenerate 0-line resolution.
-            assert!(
-                target.start_line > 1,
-                "`{spec}` resolved to line {} — expected inside the impl block",
+            // get_or_parse is the 10th line of the fixture (new() occupies lines 6-8);
+            // assert the exact line so a wrong resolution to `new` or a stub would fail.
+            assert_eq!(
+                target.start_line, 10,
+                "`{spec}` resolved to line {} — expected get_or_parse at line 10",
                 target.start_line
             );
             assert_eq!(
