@@ -444,7 +444,7 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 /// This is the subset of definition keywords handled uniformly (extract function
 /// name from arguments). Container keywords (`defmodule`, `defprotocol`, `defimpl`,
 /// `defstruct`, `defexception`) have their own match arms in `elixir_call_to_entry`.
-/// See also `ELIXIR_DEFINITION_TARGETS` in `treesitter.rs` for the complete set.
+/// See also `ELIXIR_DEFINITION_TARGETS` in `elixir.rs` for the complete set.
 const ELIXIR_DEF_KEYWORDS: &[&str] = &[
     "def",
     "defp",
