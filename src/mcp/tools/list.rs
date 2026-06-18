@@ -9,7 +9,11 @@ use serde_json::Value;
 
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
-    let (scope, scope_warning) = super::resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = super::resolve_scope(args, root);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns_arr = args

@@ -73,7 +73,7 @@ pub(in crate::mcp) fn tool_search(
         if let Some(kind) = kind {
             sub.insert("kind".into(), Value::String(kind.to_string()));
         }
-        for k in ["expand", "scope", "if_modified_since", "context"] {
+        for k in ["expand", "scope", "root", "if_modified_since", "context"] {
             if let Some(v) = args.get(k) {
                 sub.insert(k.into(), v.clone());
             }
@@ -84,7 +84,11 @@ pub(in crate::mcp) fn tool_search(
         parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
     let combined = parts.join("\n\n---\n\n");
-    let (scope, _) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, _) = resolve_scope(args, root);
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
@@ -110,7 +114,11 @@ fn tool_search_single(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query (or queries array)")?;
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = resolve_scope(args, root);
     let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")

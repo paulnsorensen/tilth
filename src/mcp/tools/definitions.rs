@@ -55,6 +55,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "if_modified_since": {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, a RELATIVE `scope` is anchored under `root` instead of the server's process cwd; an absolute scope is used as-is. Use this when the server was launched from a different directory than the worktree you are working in."
                     }
                 }
             }
@@ -82,6 +86,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "if_modified_since": {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's process cwd. Absolute file paths are used as-is. Use this when the server was launched from a different directory than the worktree you are editing."
                     },
                     "budget": {
                         "type": "number",
@@ -115,6 +123,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, a RELATIVE `scope` (the tree root) is anchored under `root` instead of the server's process cwd; an absolute scope is used as-is. Use this when the server was launched from a different directory than the worktree you are working in."
                     }
                 }
             }
@@ -137,6 +149,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's process cwd. Absolute file paths are used as-is. Use this when the server was launched from a different directory than the worktree you are editing."
                     }
                 }
             }

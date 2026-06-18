@@ -59,7 +59,7 @@ pub(crate) fn tool_write(
     let mut hash_relative_paths: Vec<PathBuf> = Vec::new();
     let mut direct_results: Vec<String> = Vec::new();
     let mut direct_applied: Vec<PathBuf> = Vec::new();
-    let (scope_root, _scope_warn) = super::resolve_scope(args);
+    let (scope_root, _scope_warn) = super::resolve_scope(args, None);
     // resolve_scope returns `.` (PathBuf) when scope == cwd; canonicalize for
     // the containment check below. Fail closed on canonicalize failure: an
     // unresolvable scope must refuse overwrite/append rather than silently

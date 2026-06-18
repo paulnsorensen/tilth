@@ -70,10 +70,17 @@ pub(in crate::mcp) fn tool_read(
         .and_then(|v| v.as_str())
         .and_then(crate::mcp::iso::parse_iso_utc);
 
+    // Extract optional root for anchoring relative paths (mirrors tilth_write.root).
+    let root_str = args.get("root").and_then(|v| v.as_str());
+    let root = root_str.map(std::path::Path::new);
+
     // Resolve suffix grammar on each path spec into (PathBuf, Suffix)
     let parsed: Vec<(PathBuf, PathSuffix)> = raw_paths
         .iter()
-        .map(|s| crate::mcp::path_suffix::parse_path_with_suffix(s))
+        .map(|s| {
+            let (p, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(s);
+            (super::resolve_read_path(&p, root), suffix)
+        })
         .collect();
     let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
     let suffixes: Vec<&PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
@@ -640,4 +647,79 @@ fn read_stripped_file(
         total_lines,
         stripped,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::OutlineCache;
+    use crate::session::Session;
+
+    fn services() -> (Session, OutlineCache) {
+        (Session::new(), OutlineCache::new())
+    }
+
+    #[test]
+    fn root_param_anchors_relative_path_under_root() {
+        // Guards #78: tilth_read with a relative path + root must read from
+        // <root>/<path>, not from <cwd>/<path>. Prevents worktree agents from
+        // silently reading the wrong checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("hello.rs"), "fn hello() {}").unwrap();
+
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": ["hello.rs"],
+            "mode": "full",
+            "root": root.to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn hello()"),
+            "expected file content via root-anchored path, got: {result}"
+        );
+    }
+
+    #[test]
+    fn root_param_absolute_path_unaffected() {
+        // Absolute paths must be used as-is even when root is set.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs_file = root.join("abs.rs");
+        std::fs::write(&abs_file, "fn abs() {}").unwrap();
+
+        let unrelated_root = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full",
+            "root": unrelated_root.path().to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn abs()"),
+            "absolute path must resolve independently of root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn no_root_reads_absolute_path_unchanged() {
+        // Omitting root must behave identically to before #78: absolute paths
+        // resolve as-is regardless of whether root is set or not.
+        let tmp = tempfile::tempdir().unwrap();
+        let abs_file = tmp.path().join("check.rs");
+        std::fs::write(&abs_file, "fn check() {}").unwrap();
+
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full"
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn check()"),
+            "no-root regression: absolute path must be readable without root, got: {result}"
+        );
+    }
 }

@@ -15,8 +15,12 @@ pub(in crate::mcp) fn tool_deps(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path")?;
-    let path = PathBuf::from(path_str);
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let path = super::resolve_read_path(&PathBuf::from(path_str), root);
+    let (scope, scope_warning) = resolve_scope(args, root);
     let budget = usize::try_from(
         args.get("budget")
             .and_then(serde_json::Value::as_u64)
