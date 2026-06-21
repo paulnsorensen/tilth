@@ -600,7 +600,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            4443,
+            5460,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -612,6 +612,11 @@ mod tests {
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
         assert!(SERVER_INSTRUCTIONS.contains("Comma-OR is for kind any/symbol/callers"));
+        assert!(
+            SERVER_INSTRUCTIONS
+                .contains("DO NOT pass a relative path/scope without an absolute `root`"),
+            "require-root path discipline must lead the file-I/O guidance"
+        );
         assert!(SERVER_INSTRUCTIONS
             .contains("Re-expanding a previously shown definition returns [shown earlier]"));
         assert!(
@@ -632,7 +637,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2881,
+            2906,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
@@ -1922,7 +1927,7 @@ mod tests {
                     "path": good.to_str().unwrap(),
                     "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
                 },
-                { "path": "malformed.txt" }, // parse error: missing 'edits'
+                { "path": dir.path().join("malformed.txt").to_str().unwrap() }, // parse error: missing 'edits'
             ]
         });
 
@@ -2387,12 +2392,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            4443,
+            5460,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            7324,
+            8366,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2438,7 +2443,8 @@ mod tests {
     /// `tilth_list` empty patterns rejected.
     #[test]
     fn tool_list_empty_patterns_rejected() {
-        let args = serde_json::json!({ "patterns": [] });
+        let cwd = std::env::current_dir().unwrap();
+        let args = serde_json::json!({ "patterns": [], "scope": cwd.to_str().unwrap() });
         let err = tool_list(&args).expect_err("empty must error");
         assert!(err.contains("at least one"), "unexpected: {err}");
     }
@@ -2450,7 +2456,8 @@ mod tests {
         for _ in 0..21 {
             ps.push(serde_json::json!("*.rs"));
         }
-        let args = serde_json::json!({ "patterns": ps });
+        let cwd = std::env::current_dir().unwrap();
+        let args = serde_json::json!({ "patterns": ps, "scope": cwd.to_str().unwrap() });
         let err = tool_list(&args).expect_err(">20 must error");
         assert!(err.contains("limited to 20"), "unexpected: {err}");
     }
@@ -2533,9 +2540,11 @@ mod tests {
     /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
     #[test]
     fn tool_search_queries_array_form() {
+        let scope = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
         let args = serde_json::json!({
             "queries": [{ "query": "build_instructions" }],
-            "expand": 0
+            "expand": 0,
+            "scope": scope.to_str().unwrap()
         });
         let cache = OutlineCache::new();
         let session = Session::new();
@@ -2570,9 +2579,16 @@ mod tests {
                 "expected budget validation error for {bad}, got: {err}"
             );
         }
-        // A valid budget still dispatches.
-        let ok =
-            serde_json::json!({ "queries": [{ "query": "foo" }], "budget": 5000, "expand": 0 });
+        // A valid budget still dispatches. Use CARGO_MANIFEST_DIR (compile-time-baked)
+        // rather than current_dir() (process-global runtime state): parallel diff tests
+        // call set_current_dir() and can race with this test, handing us a deleted
+        // tmpdir path that fails canonicalize and then is_dir().
+        let ok = serde_json::json!({
+            "queries": [{ "query": "foo" }],
+            "budget": 5000,
+            "expand": 0,
+            "scope": env!("CARGO_MANIFEST_DIR")
+        });
         assert!(
             dispatch_tool("tilth_search", &ok, &services).is_ok(),
             "a valid budget must still dispatch"

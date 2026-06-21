@@ -8,7 +8,7 @@ under `.cheese/`.
 
 ## Topics
 
-_(none yet — add pages below as cross-session knowledge accrues)_
+- [MCP cwd / workspace-root binding](mcp-cwd-root-binding.md) — why tilth uses a per-call `root` param (not the MCP `roots` capability) to resolve paths to the right git-worktree checkout; the silent worktree gotcha; 8-harness client survey.
 
 ## How to use this index
 
