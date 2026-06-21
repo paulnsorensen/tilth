@@ -88,7 +88,7 @@ pub(in crate::mcp) fn tool_search(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, _) = resolve_scope(args, root);
+    let (scope, _) = resolve_scope(args, root)?;
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
@@ -118,7 +118,7 @@ fn tool_search_single(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root);
+    let (scope, scope_warning) = resolve_scope(args, root)?;
     let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")
@@ -371,6 +371,21 @@ mod tests {
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
 
+    /// WHY: a bare `tilth_search` defaults `scope` to "." and silently searched
+    /// the server's frozen cwd — the worktree bug. No scope + no root must now
+    /// refuse with an actionable message naming the root option.
+    #[test]
+    fn no_scope_no_root_errors() {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "queries": [{"query": "anything"}] });
+        let err = tool_search(&args, &cache, &session, &bloom, false).unwrap_err();
+        assert!(
+            err.contains("relative scope") && err.contains("root"),
+            "bare search must refuse without a root: {err}"
+        );
+    }
     /// Regression for P0-3: `kind=callers` with a comma query must search each
     /// target separately, not for a literal symbol named "alpha,beta". Before
     /// the fix this returned an empty no-callers message ~70% of real sessions.

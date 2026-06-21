@@ -13,7 +13,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = super::resolve_scope(args, root);
+    let (scope, scope_warning) = super::resolve_scope(args, root)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns_arr = args
@@ -99,4 +99,43 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&super::apply_budget(&tree, budget));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_scope_no_root_errors() {
+        // WHY: tilth_list defaults `scope` to "." — relative. Before this spec it
+        // silently walked the server's frozen cwd (the worktree bug). The `?` on
+        // resolve_scope must propagate the refusal out of tool_list, not swallow it.
+        let args = serde_json::json!({ "patterns": ["*.rs"] });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("relative scope") && err.contains("root"),
+            "bare list must refuse without a root: {err}"
+        );
+    }
+
+    #[test]
+    fn relative_scope_absolute_root_resolves() {
+        // Regression guard: a relative scope anchored to an absolute root must
+        // resolve under root (not error), so the refusal above is scoped to the
+        // unresolvable case only.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.rs"), "fn a() {}\n").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": "sub",
+            "root": tmp.path().to_str().unwrap(),
+        });
+        let out = tool_list(&args).expect("relative scope + absolute root resolves");
+        assert!(
+            out.contains("a.rs"),
+            "expected listing under anchored root: {out}"
+        );
+    }
 }

@@ -74,14 +74,16 @@ pub(in crate::mcp) fn tool_read(
     let root_str = args.get("root").and_then(|v| v.as_str());
     let root = root_str.map(std::path::Path::new);
 
-    // Resolve suffix grammar on each path spec into (PathBuf, Suffix)
+    // Resolve suffix grammar on each path spec into (PathBuf, Suffix). A
+    // relative path without an absolute `root` is unresolvable (the server
+    // cannot see the caller's shell cwd) — propagate that refusal.
     let parsed: Vec<(PathBuf, PathSuffix)> = raw_paths
         .iter()
         .map(|s| {
             let (p, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(s);
-            (super::resolve_read_path(&p, root), suffix)
+            Ok((super::resolve_read_path(&p, root)?, suffix))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
     let suffixes: Vec<&PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
 
@@ -720,6 +722,20 @@ mod tests {
         assert!(
             result.contains("fn check()"),
             "no-root regression: absolute path must be readable without root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn relative_path_no_root_errors() {
+        // WHY: a relative path + no root silently resolved against the frozen
+        // server cwd before this spec — the worktree bug. It must now refuse
+        // with a message naming the path and the absolute-root escape hatch.
+        let (session, cache) = services();
+        let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
+        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        assert!(
+            err.contains("src/foo.rs") && err.contains("root"),
+            "relative path without root must refuse with an actionable message: {err}"
         );
     }
 }

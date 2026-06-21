@@ -59,11 +59,20 @@ pub(crate) fn tool_write(
     let mut hash_relative_paths: Vec<PathBuf> = Vec::new();
     let mut direct_results: Vec<String> = Vec::new();
     let mut direct_applied: Vec<PathBuf> = Vec::new();
-    let (scope_root, _scope_warn) = super::resolve_scope(args, None);
-    // resolve_scope returns `.` (PathBuf) when scope == cwd; canonicalize for
-    // the containment check below. Fail closed on canonicalize failure: an
-    // unresolvable scope must refuse overwrite/append rather than silently
-    // disabling the guard (the symmetric behavior in `path_within_scope`).
+    // Containment root for the overwrite/append scope guard. This is the write
+    // sandbox boundary, NOT the path-resolution channel (that is `root` +
+    // `resolve_write_path`): an explicit `scope` anchors it, otherwise it falls
+    // back to the server cwd. Kept cwd-defaulting on purpose — the require-root
+    // discipline governs where writes LAND (`resolve_write_path`), and a bare
+    // hash-mode write with an absolute path must not be refused just because it
+    // omitted `scope`.
+    let scope_root: PathBuf = match args.get("scope").and_then(|v| v.as_str()) {
+        Some(s) => PathBuf::from(s),
+        None => std::env::current_dir().unwrap_or_else(|_| ".".into()),
+    };
+    // Canonicalize for the containment check below. Fail closed on canonicalize
+    // failure: an unresolvable scope must refuse overwrite/append rather than
+    // silently disabling the guard (the symmetric behavior in `path_within_scope`).
     let scope_canon: Result<PathBuf, std::io::Error> = scope_root.canonicalize();
     for (i, f) in files_val.iter().enumerate() {
         let mode = f.get("mode").and_then(|v| v.as_str()).unwrap_or("hash");
@@ -71,11 +80,20 @@ pub(crate) fn tool_write(
             direct_results.push(format!("## files[{i}]\nerror: missing 'path'"));
             continue;
         };
-        let path = resolve_write_path(path_str, root.as_deref());
+        // Per-file resolution under the absolute-path discipline: a relative
+        // path with no absolute `root` is unresolvable. Report it per file
+        // (best-effort) rather than aborting the batch.
+        let path = match resolve_write_path(path_str, root.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                direct_results.push(format!("## files[{i}]\nerror: {e}"));
+                continue;
+            }
+        };
         // Scope guard for overwrite/append: hash mode resolves the task path
-        // as-is (against cwd unless an explicit `root` or absolute path was
-        // supplied); `package_root` is only used to scope the blast-radius
-        // search and never roots the write target.
+        // as-is (absolute, or relative anchored to an absolute `root`);
+        // `package_root` is only used to scope the blast-radius search and
+        // never roots the write target.
         if matches!(mode, "overwrite" | "w" | "append" | "a") {
             match scope_canon.as_ref() {
                 Ok(scope_root_abs) => {
@@ -288,18 +306,12 @@ pub(crate) fn tool_write(
     Ok(output)
 }
 
-/// Resolve a write path: if the given path string is relative and a `root` is
-/// provided, anchor it under `root`. Absolute paths are used as-is regardless
-/// of `root`.
-fn resolve_write_path(path_str: &str, root: Option<&Path>) -> PathBuf {
-    let p = PathBuf::from(path_str);
-    if p.is_absolute() {
-        return p;
-    }
-    match root {
-        Some(r) => r.join(&p),
-        None => p,
-    }
+/// Resolve a write path under the same absolute-path discipline as reads
+/// (`super::resolve_read_path`): absolute paths are used as-is; a relative path
+/// requires an absolute `root`, otherwise it is unresolvable (the server cannot
+/// see the caller's shell cwd).
+fn resolve_write_path(path_str: &str, root: Option<&Path>) -> Result<PathBuf, String> {
+    super::resolve_read_path(&PathBuf::from(path_str), root)
 }
 
 /// Walk up from `path` to find the nearest `.git` file or directory.
@@ -627,9 +639,12 @@ fn parse_file_edit(index: usize, val: &Value, root: Option<&Path>) -> crate::edi
         }
     }
 
-    FileEditTask::Ready {
-        path: resolve_write_path(path_str, root),
-        edits,
+    match resolve_write_path(path_str, root) {
+        Ok(path) => FileEditTask::Ready { path, edits },
+        Err(msg) => FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg,
+        },
     }
 }
 
@@ -999,6 +1014,30 @@ mod tests {
         assert!(
             err.contains("must be an absolute path"),
             "error must mention absolute path requirement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn relative_path_no_root_reported_per_file() {
+        // WHY: writes are now consistent with reads — a relative path with no
+        // absolute `root` silently resolved against the frozen server cwd, which
+        // could write the wrong worktree. It must refuse, per file (best-effort).
+        let (session, bloom) = services();
+        let args = serde_json::json!({
+            "files": [{
+                "path": "relative/file.txt",
+                "mode": "overwrite",
+                "content": "x",
+            }],
+        });
+        let out = tool_write(&args, &session, &bloom).expect("per-file error returns Ok");
+        assert!(
+            out.contains("relative/file.txt") && out.contains("root"),
+            "relative write path without root must refuse with an actionable message: {out}"
+        );
+        assert!(
+            !std::path::Path::new("relative/file.txt").exists(),
+            "no file may be created when the path is unresolvable"
         );
     }
 
