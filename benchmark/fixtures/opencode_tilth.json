@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "tilth": {
+      "type": "local",
+      "enabled": true,
+      "command": ["tilth", "--mcp", "--edit"]
+    }
+  }
+}
