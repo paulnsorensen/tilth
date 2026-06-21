@@ -79,7 +79,7 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
 
 ## Version bumps
 
-Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main.
+Do **not** bump the version on this fork. Leave `version` in `Cargo.toml` and `npm/package.json` untouched; do not tag releases. Version bumps are owned upstream and synced in via the upstream-merge commits — a fork-side bump diverges from upstream and conflicts on the next sync.
 
 ## Benchmarks
 
