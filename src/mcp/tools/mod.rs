@@ -58,9 +58,13 @@ fn anchor_path(
 
 /// Resolve the `scope` arg under the absolute-path discipline (`anchor_path`).
 /// An omitted scope defaults to `"."`, which is relative — so a bare repo-wide
-/// search now requires an absolute `root` (or an absolute `scope`). The
-/// successfully-anchored-but-missing-dir case keeps its soft cwd fallback +
-/// warning; only the unresolvable-relative case is a hard error.
+/// search now requires an absolute `root` (or an absolute `scope`). When the
+/// anchored path does not resolve to an existing directory:
+///
+/// - If an absolute `root` is available, fall back to `root` with a soft warning
+///   (the caller's checkout exists; the scope subdir simply does not).
+/// - If no absolute `root` is available, return `Err` — there is no safe anchor
+///   to fall back to, and silently searching the server cwd is the worktree hazard.
 pub(super) fn resolve_scope(
     args: &Value,
     root: Option<&std::path::Path>,
@@ -70,12 +74,22 @@ pub(super) fn resolve_scope(
     let anchored = anchor_path(&raw, root, "scope")?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
     if !resolved.is_dir() {
-        return Ok((
-            ".".into(),
-            Some(format!(
-                "scope \"{raw_str}\" is not a valid directory, searching current directory instead.\n\n"
+        // A missing-dir fallback to "." (server cwd) is the exact worktree hazard
+        // this PR closes: the server cwd is frozen at spawn and may point at the
+        // wrong checkout. Use root when available (that IS the caller's checkout);
+        // error when there is no safe anchor.
+        return match root {
+            Some(r) if r.is_absolute() => Ok((
+                r.to_path_buf(),
+                Some(format!(
+                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead.\n\n"
+                )),
             )),
-        ));
+            _ => Err(format!(
+                "scope \"{raw_str}\" is not a valid directory and no absolute root was provided to fall back to. \
+                 Pass an absolute scope or set \"root\" to an absolute checkout directory."
+            )),
+        };
     }
     Ok((resolved, None))
 }
@@ -144,14 +158,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scope_invalid_dir_warns() {
-        // An anchored-but-missing dir keeps the soft cwd fallback + warning.
-        // Absolute path so it passes the anchor gate and reaches the dir check.
+    fn resolve_scope_missing_dir_with_root_warns_and_returns_root() {
+        // WHY: a missing anchored scope must fall back to the caller's root, NOT
+        // to "." (server cwd). "." is the server's frozen process-cwd — in a
+        // worktree setup this is the wrong checkout. root IS the caller's checkout
+        // and is safe to use as the fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let (scope, warning) = resolve_scope(&args, None).unwrap();
-        assert_eq!(scope, PathBuf::from("."));
-        assert!(warning.is_some());
-        assert!(warning.unwrap().contains("not a valid directory"));
+        let (scope, warning) = resolve_scope(&args, Some(root)).unwrap();
+        assert_eq!(scope, root, "fallback must be root, not server cwd");
+        assert!(
+            warning.is_some() && warning.unwrap().contains("not a valid directory"),
+            "a soft warning must be present naming the issue"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_missing_dir_no_root_errors() {
+        // WHY: with no root there is no safe fallback — falling back to server cwd
+        // is the worktree wrong-checkout hazard this PR closes. Must be a hard error.
+        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
+        let err = resolve_scope(&args, None).unwrap_err();
+        assert!(
+            err.contains("/nonexistent/directory/zzz") && err.contains("not a valid directory"),
+            "error must name the missing scope: {err}"
+        );
     }
 
     #[test]

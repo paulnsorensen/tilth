@@ -2579,13 +2579,15 @@ mod tests {
                 "expected budget validation error for {bad}, got: {err}"
             );
         }
-        // A valid budget still dispatches.
-        let cwd = std::env::current_dir().unwrap();
+        // A valid budget still dispatches. Use CARGO_MANIFEST_DIR (compile-time-baked)
+        // rather than current_dir() (process-global runtime state): parallel diff tests
+        // call set_current_dir() and can race with this test, handing us a deleted
+        // tmpdir path that fails canonicalize and then is_dir().
         let ok = serde_json::json!({
             "queries": [{ "query": "foo" }],
             "budget": 5000,
             "expand": 0,
-            "scope": cwd.to_str().unwrap()
+            "scope": env!("CARGO_MANIFEST_DIR")
         });
         assert!(
             dispatch_tool("tilth_search", &ok, &services).is_ok(),
