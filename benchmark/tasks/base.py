@@ -15,6 +15,7 @@ class Mutation:
 @dataclass
 class GroundTruth:
     """Expected elements for correctness validation."""
+    # Each entry is AND-matched; use "a|b" within an entry for OR alternation.
     required_strings: list[str] = field(default_factory=list)
     forbidden_strings: list[str] = field(default_factory=lambda: [
         "I cannot", "I don't have access", "no such file",
@@ -22,6 +23,14 @@ class GroundTruth:
     # For forward-edit tasks only (no mutations):
     file_path: str = ""
     expected_diff_contains: list[str] = field(default_factory=list)
+
+
+def required_matches(required: str, text_lower: str) -> bool:
+    """True if `required` is satisfied in `text_lower`. A "|" makes the entry an
+    alternation: OR within the entry, so "foo|bar" matches when either substring
+    is present. An entry with no "|" is a plain substring match (backward-compatible).
+    """
+    return any(alt.lower() in text_lower for alt in required.split("|"))
 
 
 class Task(ABC):
@@ -155,7 +164,7 @@ class Task(ABC):
         text_lower = combined.lower()
 
         for required in gt.required_strings:
-            if required.lower() not in text_lower:
+            if not required_matches(required, text_lower):
                 return False, f"Missing: {required}"
 
         for forbidden in gt.forbidden_strings:

@@ -14,6 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from statistics import median, mean, stdev
 
+sys.path.insert(0, str(Path(__file__).parent))
+
+import stats
+from paired import pair_ab
+
 
 # Anthropic Claude pricing (per million tokens)
 PRICING = {
@@ -159,6 +164,39 @@ def correctness_pct(runs: list[dict]) -> float:
     if not runs:
         return 0.0
     return (sum(1 for r in runs if r["correct"]) / len(runs)) * 100
+
+
+def correctness_with_ci(runs: list[dict]) -> tuple[float, float, float]:
+    """Accuracy with a Wilson 95% CI, all in 0-100. Matches correctness_pct's
+    convention (error records are excluded upstream)."""
+    if not runs:
+        return (0.0, 0.0, 0.0)
+    successes = sum(1 for r in runs if r["correct"])
+    lo, hi = stats.wilson_interval(successes, len(runs))
+    return (successes / len(runs) * 100, lo * 100, hi * 100)
+
+
+def _fmt_usd(value: float) -> str:
+    return "∞" if value == float("inf") else f"${value:.4f}"
+
+
+def cost_per_correct(runs: list[dict]) -> tuple[float, float, float]:
+    """Cost per correct answer (total cost / correct count) with a bootstrap CI.
+
+    The expected cost under retry (the README metric). The CI is a ratio-of-sums
+    bootstrap (sum(cost)/sum(correct)) via stats.ratio_bootstrap_ci. value is inf
+    when no run is correct.
+    """
+    if not runs:
+        return (float("inf"), float("inf"), float("inf"))
+    costs = [float(r.get("total_cost_usd", 0.0)) for r in runs]
+    correct = [1.0 if r.get("correct") else 0.0 for r in runs]
+    total_correct = sum(correct)
+    if total_correct == 0:
+        return (float("inf"), float("inf"), float("inf"))
+    value = sum(costs) / total_correct
+    lo, hi = stats.ratio_bootstrap_ci(costs, correct)
+    return (value, lo, hi)
 
 
 def find_median_run(runs: list[dict], metric: str) -> dict:
@@ -430,7 +468,122 @@ def generate_report(results: list[dict]) -> str:
 
         lines.append("")
 
+    lines.append("")
+    lines.extend(statistical_analysis_section(valid_results, results))
+
     return "\n".join(lines)
+
+
+def statistical_analysis_section(valid_results: list[dict], all_results: list[dict]) -> list[str]:
+    """Build the '## Statistical Analysis' section: accuracy CIs, cost-per-correct,
+    per-repo clustering, synthetic-vs-real split, and the paired A/B power readout."""
+    modes = ordered_modes(set(r["mode"] for r in valid_results))
+    runs_by_mode = {m: [r for r in valid_results if r["mode"] == m] for m in modes}
+    present = [m for m in modes if runs_by_mode[m]]
+
+    lines = ["## Statistical Analysis", ""]
+    if not present:
+        lines.append("_No valid results to analyze._")
+        return lines
+
+    def acc_cell(runs):
+        if not runs:
+            return "—"
+        pct, lo, hi = correctness_with_ci(runs)
+        return f"{pct:.0f}% [{lo:.0f}–{hi:.0f}] (n={len(runs)})"
+
+    divider = "|" + "|".join(["---"] * (len(present) + 1)) + "|"
+
+    lines.append("**Accuracy with 95% Wilson CIs (all tasks pooled):**")
+    lines.append("")
+    lines.append("| Mode | Accuracy [95% CI] |")
+    lines.append("|---|---|")
+    for m in present:
+        lines.append(f"| {mode_label(m)} | " + acc_cell(runs_by_mode[m]) + " |")
+    lines.append("")
+
+    lines.append("**Cost per correct answer (total cost / correct, expected cost under retry):**")
+    lines.append("")
+    lines.append("| Mode | Cost/correct | 95% bootstrap CI |")
+    lines.append("|---|---|---|")
+    for m in present:
+        value, lo, hi = cost_per_correct(runs_by_mode[m])
+        lines.append(f"| {mode_label(m)} | {_fmt_usd(value)} | [{_fmt_usd(lo)}, {_fmt_usd(hi)}] |")
+    lines.append("")
+
+    repos = sorted(set(r.get("repo", "synthetic") for r in valid_results))
+    lines.append("**Accuracy clustered by repo:**")
+    lines.append("")
+    lines.append("| Repo | " + " | ".join(mode_label(m) for m in present) + " |")
+    lines.append(divider)
+    for repo in repos:
+        cells = [acc_cell([r for r in runs_by_mode[m] if r.get("repo", "synthetic") == repo]) for m in present]
+        lines.append(f"| {repo} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    lines.append("**Synthetic vs real-repo split:**")
+    lines.append("")
+    lines.append("| Bucket | " + " | ".join(mode_label(m) for m in present) + " |")
+    lines.append(divider)
+    buckets = [
+        ("synthetic", lambda r: r.get("repo", "synthetic") == "synthetic"),
+        ("real", lambda r: r.get("repo", "synthetic") != "synthetic"),
+    ]
+    for name, pred in buckets:
+        cells = [acc_cell([r for r in runs_by_mode[m] if pred(r)]) for m in present]
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    lines.extend(_power_readout(all_results))
+    return lines
+
+
+def _power_readout(all_results: list[dict]) -> list[str]:
+    """Per-model paired-A/B power line: MDE at current N tasks + significance.
+
+    Uses ALL records (errored reps count as incorrect, per the pairing contract).
+    Insufficient power for the observed effect is the explicit Phase 4 trigger.
+    """
+    lines = [
+        "**Power readout (paired A/B, baseline vs tilth):**",
+        "_Errored reps count as incorrect here, so the baseline % may differ from the pooled accuracy above._",
+        "_McNemar uses the per-rep (task, model, repetition) join, so p can be anti-conservative under rep correlation; MDE and N are at the task level._",
+        "",
+    ]
+    pairs = pair_ab(all_results)
+    if not pairs:
+        lines.append("_No paired baseline/tilth runs; power readout unavailable._")
+        return lines
+    by_model = defaultdict(lambda: {"tasks": set(), "tuples": []})
+    for (task, model), tuples in pairs.items():
+        by_model[model]["tasks"].add(task)
+        by_model[model]["tuples"].extend(tuples)
+    for model in sorted(by_model):
+        tasks = by_model[model]["tasks"]
+        tuples = by_model[model]["tuples"]
+        n_tasks = len(tasks)
+        n = len(tuples)
+        base_correct = sum(1 for (_r, bc, _tc, _bk, _tk) in tuples if bc)
+        tilth_correct = sum(1 for (_r, _bc, tc, _bk, _tk) in tuples if tc)
+        b = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if bc and not tc)
+        c = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if tc and not bc)
+        base_rate = base_correct / n
+        delta = (tilth_correct - base_correct) / n
+        mde = stats.min_detectable_effect(n_tasks, base_rate)
+        p_value, _direction = stats.mcnemar_exact(b, c)
+        if p_value < 0.05:
+            verdict = "effect SIGNIFICANT — N sufficient to detect it"
+        elif abs(delta) < mde:
+            verdict = "N INSUFFICIENT for observed effect — grow TASK pool (Phase 4 trigger)"
+        else:
+            verdict = "not significant though observed ≥ MDE — more data advised"
+        lines.append(
+            f"- **{model}**: N={n_tasks} tasks, baseline {base_rate * 100:.0f}%, "
+            f"observed Δ {delta * 100:+.0f}pp, MDE@N≈{mde * 100:.0f}pp, "
+            f"McNemar p={p_value:.3f} → {verdict}"
+        )
+    lines.append("")
+    return lines
 
 
 def main():
