@@ -33,8 +33,9 @@ from config import (
     DEFAULT_REPS,
     TILTH_MCP_CODEX_ARGS,
     TILTH_BIN,
+    OPENCODE_CONFIGS,
 )
-from parse import parse_stream_json, parse_codex_json, tool_call_counts
+from parse import parse_stream_json, parse_codex_json, parse_opencode_json, tool_call_counts
 from tasks import TASKS
 from fixtures.reset import reset_repo, ensure_repo_clean
 
@@ -117,6 +118,7 @@ def run_single(
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
+    opencode_config: Optional[str] = None
 
     # Build command based on runner
     if runner == "codex":
@@ -135,6 +137,26 @@ def run_single(
         # Codex has no --system-prompt, prepend to prompt
         full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
         cmd += ["--", full_prompt]
+
+    elif runner == "opencode":
+        opencode_config = OPENCODE_CONFIGS.get(mode_name)
+        if opencode_config is None:
+            raise RuntimeError(
+                f"opencode runner has no config for mode '{mode_name}'. "
+                f"Supported modes: {', '.join(sorted(OPENCODE_CONFIGS))}."
+            )
+        # opencode has no --system-prompt; prepend like codex. OPENCODE_CONFIG
+        # (set below) selects the MCP servers; --dangerously-skip-permissions
+        # keeps the headless run from blocking on tool-permission prompts.
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
+        cmd = [
+            "opencode", "run",
+            "--format", "json",
+            "--dir", str(repo_path),
+            "--model", model_id,
+            "--dangerously-skip-permissions",
+            full_prompt,
+        ]
 
     else:  # claude
         cmd = [
@@ -174,6 +196,17 @@ def run_single(
 
     # Run subprocess (unset CLAUDECODE to allow nested claude -p)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    # Prepend the TILTH_BIN directory to PATH so every runner can spawn the
+    # tilth MCP server. The claude and opencode fixtures use a bare
+    # "command": "tilth"; only codex interpolates the resolved {TILTH_BIN}.
+    # An off-PATH absolute TILTH_BIN therefore breaks those two lanes unless
+    # we extend PATH here, in the shared env-building path before any runner
+    # branch.
+    _tilth_dir = os.path.dirname(TILTH_BIN)
+    if _tilth_dir:
+        env["PATH"] = _tilth_dir + os.pathsep + env.get("PATH", "")
+    if opencode_config is not None:
+        env["OPENCODE_CONFIG"] = opencode_config
     start_time = time.time()
 
     if runner == "claude" and stream_log_path is not None:
@@ -242,7 +275,7 @@ def run_single(
     elapsed_ms = int((time.time() - start_time) * 1000)
 
     if result.returncode != 0:
-        runner_name = "codex exec" if runner == "codex" else "claude -p"
+        runner_name = {"codex": "codex exec", "opencode": "opencode run"}.get(runner, "claude -p")
         raise RuntimeError(
             f"{runner_name} failed with code {result.returncode}\n"
             f"stderr: {result.stderr}\n"
@@ -252,6 +285,8 @@ def run_single(
     # Parse output based on runner
     if runner == "codex":
         run_result = parse_codex_json(result.stdout, model_id)
+    elif runner == "opencode":
+        run_result = parse_opencode_json(result.stdout)
     else:
         run_result = parse_stream_json(result.stdout)
     run_result.task_name = task_name

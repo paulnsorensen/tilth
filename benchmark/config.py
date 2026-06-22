@@ -26,6 +26,11 @@ MODELS = {
     "opus": "claude-opus-4-6",
     "gpt5": "gpt-5-codex",
     "o3": "o3",
+    # opencode + OpenRouter lane. Add more OpenRouter models here as one-liners
+    # (short name -> "openrouter/<provider>/<model>"); mirror in RUNNERS.
+    # gpt-5-mini: cheapest model with frontier-family tool-calling fidelity, so it
+    # stays representative of real coding agents (the thing this tool-use A/B measures).
+    "gpt5mini": "openrouter/openai/gpt-5-mini",
 }
 
 # Maps model short name -> runner type
@@ -35,6 +40,7 @@ RUNNERS = {
     "opus": "claude",
     "gpt5": "codex",
     "o3": "codex",
+    "gpt5mini": "opencode",
 }
 
 # MCP config arguments for codex (tilth server)
@@ -59,6 +65,14 @@ FIXTURES_DIR = BENCHMARK_DIR / "fixtures"
 SYNTHETIC_REPO = FIXTURES_DIR / "repo"
 RESULTS_DIR = BENCHMARK_DIR / "results"
 TILTH_MCP_CONFIG = FIXTURES_DIR / "tilth_mcp.json"
+
+# opencode runner: per-mode opencode.json (OPENCODE_CONFIG env) selecting which
+# MCP servers are exposed. opencode has no built-in-tool allowlist, so it covers
+# baseline (no MCP) and tilth (tilth MCP); tilth_forced has no opencode analog.
+OPENCODE_CONFIGS = {
+    "baseline": str(FIXTURES_DIR / "opencode_baseline.json"),
+    "tilth": str(FIXTURES_DIR / "opencode_tilth.json"),
+}
 REPOS_DIR = Path("/tmp/tilth_bench/repos")
 
 

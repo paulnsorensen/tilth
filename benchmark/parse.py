@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -242,6 +243,110 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
         total_output_tokens=total_output,
         total_cache_creation_tokens=0,
         total_cache_read_tokens=total_cached,
+        result_text=result_text,
+    )
+
+
+def _parse_opencode_events(raw_output: str) -> list[dict]:
+    """opencode `run --format json` emits NDJSON; tolerate a JSON array too."""
+    raw_output = raw_output.strip()
+    if not raw_output:
+        return []
+    try:
+        parsed = json.loads(raw_output)
+        return parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        pass
+    events = []
+    skipped = 0
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            skipped += 1
+    if skipped:
+        # Fail loud, not silent: a truncated run (e.g. killed at the timeout)
+        # would otherwise parse as a clean cell with undercounted cost/tokens.
+        print(
+            f"[parse_opencode] WARNING: skipped {skipped} malformed JSON "
+            f"line(s); cost/token totals may be undercounted (truncated run?).",
+            file=sys.stderr,
+        )
+    return events
+
+
+def parse_opencode_json(raw_output: str) -> RunResult:
+    """Parse NDJSON from `opencode run --format json` (OpenRouter-backed).
+
+    Schema (one event per line): {type, part, sessionID, timestamp}. A step is
+    bracketed by step_start/step_finish; tool_use and text events fall between.
+    `step-finish` parts carry PER-STEP `cost` and `tokens` — summing them is the
+    whole point. A last-write-wins read under-reports cost by the step count.
+    Cost is the real OpenRouter charge, so no local pricing table is needed.
+    """
+    events = _parse_opencode_events(raw_output)
+
+    session_id = ""
+    result_text = ""
+    turns: list[Turn] = []
+    pending_calls: list[ToolCall] = []
+    turn_index = 0
+
+    for event in events:
+        if not session_id:
+            session_id = event.get("sessionID", "")
+        event_type = event.get("type")
+        part = event.get("part", {})
+
+        if event_type == "tool_use":
+            # opencode namespaces MCP tools as "<server>_<tool>" -> "tilth_tilth_search";
+            # strip the duplicate server prefix so it aggregates with the claude/codex key.
+            tool_name = part.get("tool", "unknown")
+            if tool_name.startswith("tilth_tilth_"):
+                tool_name = tool_name[len("tilth_"):]
+            pending_calls.append(ToolCall(
+                name=tool_name,
+                input=part.get("state", {}).get("input", {}),
+                tool_use_id=part.get("callID", part.get("id", "")),
+                turn_index=turn_index,
+            ))
+
+        elif event_type == "text":
+            text = part.get("text", "")
+            if isinstance(text, str) and text:
+                result_text = text  # last assistant text wins
+
+        elif event_type == "step_finish":
+            tokens = part.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            turns.append(Turn(
+                index=turn_index,
+                input_tokens=tokens.get("input") or 0,
+                output_tokens=tokens.get("output") or 0,
+                cache_creation_tokens=cache.get("write") or 0,
+                cache_read_tokens=cache.get("read") or 0,
+                tool_calls=pending_calls,
+            ))
+            pending_calls = []
+            turn_index += 1
+
+    return RunResult(
+        session_id=session_id,
+        turns=turns,
+        num_turns=len(turns),
+        total_cost_usd=sum(
+            (e.get("part", {}).get("cost") or 0.0)
+            for e in events if e.get("type") == "step_finish"
+        ),
+        duration_ms=0,  # set by caller from subprocess timing
+        duration_api_ms=0,
+        total_input_tokens=sum(t.input_tokens for t in turns),
+        total_output_tokens=sum(t.output_tokens for t in turns),
+        total_cache_creation_tokens=sum(t.cache_creation_tokens for t in turns),
+        total_cache_read_tokens=sum(t.cache_read_tokens for t in turns),
         result_text=result_text,
     )
 
