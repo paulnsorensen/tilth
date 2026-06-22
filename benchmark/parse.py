@@ -1,7 +1,7 @@
 import json
 import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -358,3 +358,29 @@ def tool_call_counts(result: RunResult) -> dict[str, int]:
         for tool_call in turn.tool_calls:
             counts[tool_call.name] = counts.get(tool_call.name, 0) + 1
     return counts
+
+
+def extract_stream_error(stdout: str) -> Optional[str]:
+    """Pull the human-readable error out of a codex/opencode JSON event stream.
+
+    The real cause (e.g. a provider ContentFilterError) is emitted as a late
+    ``{"type": "error", ...}`` event, often after many step events — a
+    head-truncated stdout dump hides it. Returns "Name: message" for the last
+    such event, or None if the stream carries no error event.
+    """
+    found: Optional[str] = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or '"error"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "error":
+            continue
+        err = obj.get("error") or {}
+        name = err.get("name") or "error"
+        msg = (err.get("data") or {}).get("message") or err.get("message") or ""
+        found = f"{name}: {msg}".rstrip(": ").strip()
+    return found

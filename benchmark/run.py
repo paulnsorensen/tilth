@@ -34,8 +34,9 @@ from config import (
     TILTH_MCP_CODEX_ARGS,
     TILTH_BIN,
     OPENCODE_CONFIGS,
+    OPENCODE_BARE_XDG,
 )
-from parse import parse_stream_json, parse_codex_json, parse_opencode_json, tool_call_counts
+from parse import parse_stream_json, parse_codex_json, parse_opencode_json, tool_call_counts, extract_stream_error
 from tasks import TASKS
 from fixtures.reset import reset_repo, ensure_repo_clean
 
@@ -155,8 +156,10 @@ def run_single(
             "--dir", str(repo_path),
             "--model", model_id,
             "--dangerously-skip-permissions",
-            full_prompt,
         ]
+        if bare:
+            cmd.append("--pure")  # strip external plugins (claude --bare parity)
+        cmd.append(full_prompt)
 
     else:  # claude
         cmd = [
@@ -207,6 +210,20 @@ def run_single(
         env["PATH"] = _tilth_dir + os.pathsep + env.get("PATH", "")
     if opencode_config is not None:
         env["OPENCODE_CONFIG"] = opencode_config
+        if bare:
+            # --bare parity with the claude runner. opencode has no
+            # --strict-mcp-config: OPENCODE_CONFIG MERGES onto the user's global
+            # ~/.config/opencode/opencode.json, so without isolation the global
+            # MCP servers (tilth included!) and skills leak into the baseline.
+            # Redirect XDG_CONFIG_HOME to a hermetic dir (drops global config +
+            # its MCP/skills/agents) and disable the remaining global instruction
+            # sources. Auth lives in XDG_DATA_HOME and is untouched.
+            OPENCODE_BARE_XDG.mkdir(parents=True, exist_ok=True)
+            env["XDG_CONFIG_HOME"] = str(OPENCODE_BARE_XDG)
+            env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] = "1"
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+            env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+            env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
     start_time = time.time()
 
     if runner == "claude" and stream_log_path is not None:
@@ -276,10 +293,13 @@ def run_single(
 
     if result.returncode != 0:
         runner_name = {"codex": "codex exec", "opencode": "opencode run"}.get(runner, "claude -p")
+        # The real cause (e.g. a provider ContentFilterError) streams as a late
+        # {"type":"error",...} event; a head-truncated dump hides it. Surface it.
+        detail = extract_stream_error(result.stdout) or f"stdout tail: {result.stdout[-600:]}"
         raise RuntimeError(
             f"{runner_name} failed with code {result.returncode}\n"
             f"stderr: {result.stderr}\n"
-            f"stdout: {result.stdout[:500]}"
+            f"{detail}"
         )
 
     # Parse output based on runner
@@ -401,10 +421,12 @@ Examples:
     parser.add_argument(
         "--bare",
         action="store_true",
-        help="Pass --bare to `claude -p`. Strips slash commands, hooks, "
-             "plugins, agents, and skills. Note: also drops Grep/Glob from "
-             "baseline's tool set, so use with care when comparing modes. "
-             "Claude runner only; ignored for codex.",
+        help="Strip the harness to built-in tools + the per-mode MCP config. "
+             "claude: passes --bare (drops slash commands, hooks, plugins, "
+             "agents, skills; also drops Grep/Glob from baseline's tool set). "
+             "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_* so "
+             "the user's global opencode config (MCP servers, skills) can't "
+             "leak into the baseline. Ignored for codex.",
     )
 
     args = parser.parse_args()
