@@ -16,6 +16,11 @@ matched beyond that point is invisible here. This can only make re-grading
 stricter, so it never invents a recovery; it could in theory show a spurious
 regression (reported separately).
 
+Caveat: re-grading compares stored answers against the CURRENT ground truths, so a
+recovery (incorrect -> correct) is only attributable to alternation when the ground
+truth changed *only* by gaining alternations since the run. An unrelated edit to a
+required string between the run and now can masquerade as a recovery.
+
     python benchmark/regrade.py <results.jsonl>
 """
 

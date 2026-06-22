@@ -547,28 +547,36 @@ def _power_readout(all_results: list[dict]) -> list[str]:
     lines = [
         "**Power readout (paired A/B, baseline vs tilth):**",
         "_Errored reps count as incorrect here, so the baseline % may differ from the pooled accuracy above._",
-        "_McNemar uses the per-rep (task, model, repetition) join, so p can be anti-conservative under rep correlation; MDE and N are at the task level._",
+        "_McNemar uses the per-rep (task, model, repetition) join, so p can be anti-conservative under rep correlation; MDE and N are at the task level. MDE is an optimistic single-proportion bound — the true paired MDE is larger._",
         "",
     ]
     pairs = pair_ab(all_results)
     if not pairs:
         lines.append("_No paired baseline/tilth runs; power readout unavailable._")
         return lines
-    by_model = defaultdict(lambda: {"tasks": set(), "tuples": []})
+    by_model = defaultdict(lambda: defaultdict(list))
     for (task, model), tuples in pairs.items():
-        by_model[model]["tasks"].add(task)
-        by_model[model]["tuples"].extend(tuples)
+        by_model[model][task].extend(tuples)
     for model in sorted(by_model):
-        tasks = by_model[model]["tasks"]
-        tuples = by_model[model]["tuples"]
-        n_tasks = len(tasks)
-        n = len(tuples)
-        base_correct = sum(1 for (_r, bc, _tc, _bk, _tk) in tuples if bc)
-        tilth_correct = sum(1 for (_r, _bc, tc, _bk, _tk) in tuples if tc)
-        b = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if bc and not tc)
-        c = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if tc and not bc)
-        base_rate = base_correct / n
-        delta = (tilth_correct - base_correct) / n
+        by_task = by_model[model]
+        n_tasks = len(by_task)
+        all_tuples = [t for tuples in by_task.values() for t in tuples]
+        # base_rate/delta are TASK-weighted to match the task-level MDE: average
+        # correctness within each task first, then across tasks, so tasks with
+        # more paired reps don't dominate when rep counts are uneven.
+        base_per_task = [
+            sum(1 for (_r, bc, _tc, _bk, _tk) in tuples if bc) / len(tuples)
+            for tuples in by_task.values()
+        ]
+        tilth_per_task = [
+            sum(1 for (_r, _bc, tc, _bk, _tk) in tuples if tc) / len(tuples)
+            for tuples in by_task.values()
+        ]
+        base_rate = sum(base_per_task) / n_tasks
+        delta = sum(tilth_per_task) / n_tasks - base_rate
+        # McNemar stays at the per-rep level (disclosed in the readout header).
+        b = sum(1 for (_r, bc, tc, _bk, _tk) in all_tuples if bc and not tc)
+        c = sum(1 for (_r, bc, tc, _bk, _tk) in all_tuples if tc and not bc)
         mde = stats.min_detectable_effect(n_tasks, base_rate)
         p_value, _direction = stats.mcnemar_exact(b, c)
         if p_value < 0.05:

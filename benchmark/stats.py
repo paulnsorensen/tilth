@@ -123,6 +123,12 @@ def min_detectable_effect(n: int, baseline_rate: float, power: float = 0.80,
     with probability `power`. n <= 0 returns 1.0 (nothing detectable); the result
     is capped at 1.0. The normal approximation degrades when `baseline_rate` is
     near 0 or 1 (variance collapses) — read those readouts with that caveat.
+
+    This is a SINGLE-proportion bound, but the power readout consumes it to gate a
+    PAIRED baseline-vs-tilth comparison, whose true MDE is larger (a two-proportion
+    bound is ~1.41x this). Treat it as an optimistic lower bound: an observed paired
+    delta below even this MDE is definitely under-powered (the Phase 4 trigger holds
+    in that direction); a delta above it does not guarantee adequate paired power.
     """
     if n <= 0:
         return 1.0

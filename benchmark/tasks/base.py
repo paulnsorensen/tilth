@@ -15,7 +15,7 @@ class Mutation:
 @dataclass
 class GroundTruth:
     """Expected elements for correctness validation."""
-    # Each entry is AND-matched; use "a|b" within an entry for OR alternation.
+    # Each entry is AND-matched; use "a|b" within an entry for OR alternation ("|" is reserved).
     required_strings: list[str] = field(default_factory=list)
     forbidden_strings: list[str] = field(default_factory=lambda: [
         "I cannot", "I don't have access", "no such file",
@@ -29,8 +29,14 @@ def required_matches(required: str, text_lower: str) -> bool:
     """True if `required` is satisfied in `text_lower`. A "|" makes the entry an
     alternation: OR within the entry, so "foo|bar" matches when either substring
     is present. An entry with no "|" is a plain substring match (backward-compatible).
+
+    Alternates are whitespace-stripped, so "foo | bar" behaves like "foo|bar". Empty
+    alternates are ignored, so a leading/trailing/doubled "|" cannot turn the entry
+    into an unconditional pass; an all-empty required string never matches. Literal
+    "|" is therefore reserved in required_strings.
     """
-    return any(alt.lower() in text_lower for alt in required.split("|"))
+    alternates = [alt for alt in (a.strip() for a in required.split("|")) if alt]
+    return any(alt.lower() in text_lower for alt in alternates)
 
 
 class Task(ABC):
