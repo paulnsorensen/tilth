@@ -177,6 +177,7 @@ v0.5.0 MCP instructions with top-weighted DO NOT rules reduced host tool usage t
 Each run invokes `claude -p` (Claude Code headless mode) with a code navigation question.
 
 **Three modes:**
+
 - **Baseline** — Claude Code built-in tools: Read, Edit, Grep, Glob, Bash
 - **tilth** — Built-in tools + tilth MCP server (hybrid mode)
 - **tilth_forced** — tilth MCP + Read/Edit only (Bash, Grep, Glob removed)
@@ -193,6 +194,7 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | Rust | Line-oriented search |
 
 **Difficulty tiers (7 tasks each, Sonnet only):**
+
 - **Easy** — Single-file lookups, finding definitions, tracing short paths
 - **Medium** — Cross-file tracing, understanding data flow, 2-3 hop chains
 - **Hard** — Deep call chains, multi-file architecture, complex dispatch
@@ -200,16 +202,21 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 ### Running benchmarks
 
 **Prerequisites:**
+
 - Python 3.9+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (`claude`) installed and authenticated
 - tilth installed (`cargo install tilth` or `npx tilth`)
 - Git (for cloning benchmark repos)
+- Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy + numpy)
 
 **Setup:**
 
 ```bash
 # Clone repos at pinned commits (~100MB total)
 python benchmark/fixtures/setup_repos.py
+
+# Install the analysis stats deps (scipy, numpy) used by analyze.py / paired.py / stats.py
+pip install -r benchmark/requirements.txt
 ```
 
 **Run:**
@@ -234,8 +241,16 @@ python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models
 **Analyze:**
 
 ```bash
-# Summarize results from a run
+# Summarize a run: per-task tables PLUS a Statistical Analysis section
+# (Wilson CIs, cost-per-correct, per-repo clustering, synthetic-vs-real split,
+# and a paired-A/B power readout that flags when N is too small)
 python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
+
+# Paired A/B significance: exact McNemar + paired cost-delta bootstrap CI
+python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
+
+# Offline re-grade under grader alternation (recovers historical false negatives)
+python benchmark/regrade.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 
 # Compare two runs (e.g. different versions)
 python benchmark/compare_versions.py benchmark/results/old.jsonl benchmark/results/new.jsonl
@@ -254,6 +269,7 @@ We welcome benchmark contributions — more data makes the results more reliable
 **Adding results:** Run the benchmark suite on your machine and share the `.jsonl` file in a GitHub issue or PR. Different hardware, API regions, and model versions can all affect results.
 
 **Adding tasks:** Create a new task class in `benchmark/tasks/` following the existing pattern. Each task needs:
+
 - `repo`: which benchmark repo to use
 - `prompt`: the code navigation question
 - `ground_truth`: list of strings that must appear in a correct answer

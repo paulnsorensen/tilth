@@ -1,0 +1,5 @@
+# Benchmark statistics layer (analyze.py, stats.py, paired.py, regrade.py).
+# The benchmark runner itself is stdlib-only; these are needed only to analyze
+# results. Manual install: pip install -r benchmark/requirements.txt
+scipy>=1.11
+numpy>=1.24
