@@ -28,7 +28,9 @@ MODELS = {
     "o3": "o3",
     # opencode + OpenRouter lane. Add more OpenRouter models here as one-liners
     # (short name -> "openrouter/<provider>/<model>"); mirror in RUNNERS.
-    "deepseek": "openrouter/deepseek/deepseek-chat-v3.1",
+    # gpt-5-mini: cheapest model with frontier-family tool-calling fidelity, so it
+    # stays representative of real coding agents (the thing this tool-use A/B measures).
+    "gpt5mini": "openrouter/openai/gpt-5-mini",
 }
 
 # Maps model short name -> runner type
@@ -38,7 +40,7 @@ RUNNERS = {
     "opus": "claude",
     "gpt5": "codex",
     "o3": "codex",
-    "deepseek": "opencode",
+    "gpt5mini": "opencode",
 }
 
 # MCP config arguments for codex (tilth server)

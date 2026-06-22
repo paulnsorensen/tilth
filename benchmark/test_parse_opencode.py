@@ -65,7 +65,7 @@ def test_turns_tools_and_result_text():
     assert r.result_text == "final answer", repr(r.result_text)
     assert r.session_id == "ses_x", r.session_id
     counts = tool_call_counts(r)
-    assert counts == {"tilth_tilth_search": 1}, counts
+    assert counts == {"tilth_search": 1}, counts
     # The tool call is attributed to the turn it preceded (turn 0).
     assert r.turns[0].tool_calls[0].turn_index == 0
     assert r.turns[0].tool_calls[0].input == {"queries": [{"query": "foo"}]}
@@ -141,6 +141,26 @@ def test_missing_token_fields_default_to_zero():
     assert r.total_cache_read_tokens == 0
 
 
+def test_null_fields_do_not_crash():
+    """Explicit null (not absent key) in step_finish must not raise AttributeError/TypeError.
+
+    The `or {}` / `or 0` coercions fire for null values; `dict.get(key, default)`
+    only fires when the key is ABSENT — so explicit null was a crash before this fix.
+    """
+    # step 1: cost null, tokens null -> everything degrades to 0
+    step1 = json.dumps({"type": "step_finish", "sessionID": "s",
+                        "part": {"type": "step-finish", "cost": None, "tokens": None}})
+    # step 2: cost present, tokens dict with null sub-fields
+    step2 = json.dumps({"type": "step_finish", "sessionID": "s",
+                        "part": {"type": "step-finish", "cost": 0.007,
+                                  "tokens": {"input": None, "output": None, "cache": None}}})
+    r = parse_opencode_json("\n".join([step1, step2]))
+    assert r.num_turns == 2, r.num_turns
+    assert _approx(r.total_cost_usd, 0.007), r.total_cost_usd
+    assert r.total_input_tokens == 0, r.total_input_tokens
+    assert r.total_output_tokens == 0, r.total_output_tokens
+
+
 def test_opencode_rejects_unsupported_mode():
     """opencode has no built-in-tool allowlist, so tilth_forced has no analog.
 
@@ -149,7 +169,7 @@ def test_opencode_rejects_unsupported_mode():
     """
     import run
     try:
-        run.run_single("find_definition", "tilth_forced", "deepseek", 0)
+        run.run_single("find_definition", "tilth_forced", "gpt5mini", 0)
     except RuntimeError as e:
         assert "tilth_forced" in str(e), str(e)
     else:

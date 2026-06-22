@@ -302,8 +302,13 @@ def parse_opencode_json(raw_output: str) -> RunResult:
         part = event.get("part", {})
 
         if event_type == "tool_use":
+            # opencode namespaces MCP tools as "<server>_<tool>" -> "tilth_tilth_search";
+            # strip the duplicate server prefix so it aggregates with the claude/codex key.
+            tool_name = part.get("tool", "unknown")
+            if tool_name.startswith("tilth_tilth_"):
+                tool_name = tool_name[len("tilth_"):]
             pending_calls.append(ToolCall(
-                name=part.get("tool", "unknown"),
+                name=tool_name,
                 input=part.get("state", {}).get("input", {}),
                 tool_use_id=part.get("callID", part.get("id", "")),
                 turn_index=turn_index,
@@ -315,14 +320,14 @@ def parse_opencode_json(raw_output: str) -> RunResult:
                 result_text = text  # last assistant text wins
 
         elif event_type == "step_finish":
-            tokens = part.get("tokens", {})
-            cache = tokens.get("cache", {})
+            tokens = part.get("tokens") or {}
+            cache = tokens.get("cache") or {}
             turns.append(Turn(
                 index=turn_index,
-                input_tokens=tokens.get("input", 0),
-                output_tokens=tokens.get("output", 0),
-                cache_creation_tokens=cache.get("write", 0),
-                cache_read_tokens=cache.get("read", 0),
+                input_tokens=tokens.get("input") or 0,
+                output_tokens=tokens.get("output") or 0,
+                cache_creation_tokens=cache.get("write") or 0,
+                cache_read_tokens=cache.get("read") or 0,
                 tool_calls=pending_calls,
             ))
             pending_calls = []
@@ -333,7 +338,7 @@ def parse_opencode_json(raw_output: str) -> RunResult:
         turns=turns,
         num_turns=len(turns),
         total_cost_usd=sum(
-            e.get("part", {}).get("cost", 0.0)
+            (e.get("part", {}).get("cost") or 0.0)
             for e in events if e.get("type") == "step_finish"
         ),
         duration_ms=0,  # set by caller from subprocess timing
