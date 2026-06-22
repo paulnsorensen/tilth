@@ -196,6 +196,15 @@ def run_single(
 
     # Run subprocess (unset CLAUDECODE to allow nested claude -p)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    # Prepend the TILTH_BIN directory to PATH so every runner can spawn the
+    # tilth MCP server. The claude and opencode fixtures use a bare
+    # "command": "tilth"; only codex interpolates the resolved {TILTH_BIN}.
+    # An off-PATH absolute TILTH_BIN therefore breaks those two lanes unless
+    # we extend PATH here, in the shared env-building path before any runner
+    # branch.
+    _tilth_dir = os.path.dirname(TILTH_BIN)
+    if _tilth_dir:
+        env["PATH"] = _tilth_dir + os.pathsep + env.get("PATH", "")
     if opencode_config is not None:
         env["OPENCODE_CONFIG"] = opencode_config
     start_time = time.time()
