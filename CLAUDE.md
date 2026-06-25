@@ -88,6 +88,8 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
 
 Do **not** bump the version on this fork. Leave `version` in `Cargo.toml` and `npm/package.json` untouched; do not tag releases. Version bumps are owned upstream and synced in via the upstream-merge commits — a fork-side bump diverges from upstream and conflicts on the next sync.
 
+Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both publishes authenticate with `NPM_TOKEN` (`NODE_AUTH_TOKEN`); the `@plotplot/tilth` step is `continue-on-error` (best-effort) so a scope-setup failure never fails the release.
+
 ## Benchmarks
 
 51 tasks across a synthetic repo and 4 real repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust), spanning code navigation, multi-file edits, diff comprehension, and symbol "grok" understanding. Navigation/grok tasks run headless `claude -p` and check the answer against ground-truth strings; edit/diff tasks inject mutations and pass only when the task's `test_command` goes green.
