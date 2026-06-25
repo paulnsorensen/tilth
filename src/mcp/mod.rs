@@ -16,8 +16,8 @@ mod tools;
 mod tree;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
-    tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_savings,
+    tool_search, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -382,6 +382,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
+        "tilth_savings" => tool_savings(args, services.session()),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }

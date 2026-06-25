@@ -4,6 +4,7 @@ mod diff;
 mod grok;
 mod list;
 mod read;
+mod savings;
 mod search;
 mod write;
 
@@ -13,6 +14,7 @@ pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
 pub(super) use read::tool_read;
+pub(super) use savings::tool_savings;
 pub(super) use search::tool_search;
 pub(super) use write::tool_write;
 
