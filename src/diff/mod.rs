@@ -473,7 +473,7 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         // Run diff for this commit.
         let ref_str = format!("{hash}^..{hash}");
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source).unwrap_or_default();
+        let raw = run_git_diff(&commit_source)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs

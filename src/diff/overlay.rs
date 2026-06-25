@@ -344,6 +344,7 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
 ///
 /// Returns `Ok(content)` on success (including legitimately empty for new files).
 /// Returns `Err(reason)` when the git command OR a filesystem read fails — the caller should
+/// treat this as a signal that old-side content is unavailable and handle accordingly.
 fn get_old_content(
     path: &Path,
     old_path: Option<&Path>,
