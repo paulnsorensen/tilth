@@ -272,4 +272,16 @@ mod tests {
         assert_eq!(scope, sub.canonicalize().unwrap());
         assert!(warning.is_none());
     }
+
+    #[test]
+    fn anchor_path_dotdot_not_normalized() {
+        // WHY: anchor_path uses root.join(raw) without normalizing `..` components.
+        // A path like "../../y" with root "/x" produces "/x/../../y", not "/y".
+        // This pins the current behavior so any future traversal normalization is
+        // a deliberate, reviewed change — not an accidental side-effect.
+        let root = std::path::Path::new("/x");
+        let raw = std::path::Path::new("../../y");
+        let result = anchor_path(raw, Some(root), "path").unwrap();
+        assert_eq!(result, std::path::PathBuf::from("/x/../../y"));
+    }
 }

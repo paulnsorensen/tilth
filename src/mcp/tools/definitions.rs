@@ -71,7 +71,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative file path to read."
+                        "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                     },
                     "paths": {
                         "type": "array",
@@ -272,7 +272,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path."
+                                    "description": "Absolute or relative file path. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                                 },
                                 "mode": {
                                     "type": "string",
