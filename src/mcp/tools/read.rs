@@ -824,11 +824,17 @@ mod tests {
         let root = dir.path();
         let p = root.join("big.md");
         let mut content = String::new();
-        for i in 1..=2000 {
-            let _ = writeln!(
-                content,
-                "# Section {i} with enough padding text to bloat bytes"
-            );
+        // Few headings, large plain-text bodies: the markdown outline (headings
+        // only) is a small fraction of the full-file token cost, so OGATE does
+        // not fire and the read genuinely returns an outline (not full content).
+        for i in 1..=40 {
+            let _ = writeln!(content, "# Section {i}");
+            for j in 0..60 {
+                let _ = writeln!(
+                    content,
+                    "Body paragraph line {j} of section {i} with padding text to bloat bytes."
+                );
+            }
         }
         std::fs::write(&p, &content).unwrap();
         assert!(
