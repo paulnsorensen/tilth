@@ -4,6 +4,7 @@ pub mod treesitter;
 
 pub(crate) mod spec;
 
+pub(crate) mod bash;
 pub(crate) mod c;
 pub(crate) mod cpp;
 pub(crate) mod csharp;
@@ -48,6 +49,7 @@ const ALL_LANGS: &[Lang] = &[
     Lang::Elixir,
     Lang::Dockerfile,
     Lang::Make,
+    Lang::Bash,
 ];
 
 /// Test-only accessor for the full `Lang` set, so `spec`'s table-invariant

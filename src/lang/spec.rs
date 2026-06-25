@@ -87,6 +87,7 @@ pub(crate) enum StripFamily {
     JsTs,
     JavaKotlinCSharp,
     CppC,
+    Bash,
 }
 
 /// Definition-name extraction + semantic weight for a language. The default
@@ -143,6 +144,7 @@ pub(crate) fn spec(lang: Lang) -> &'static LangSpec {
         Lang::Elixir => &lang::elixir::SPEC,
         Lang::Dockerfile => &lang::dockerfile::SPEC,
         Lang::Make => &lang::make::SPEC,
+        Lang::Bash => &lang::bash::SPEC,
     }
 }
 

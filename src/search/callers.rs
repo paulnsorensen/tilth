@@ -365,66 +365,19 @@ pub fn search_callers_expanded(
         }
     }
 
-    // ── Adaptive 2nd-hop impact analysis ──
-    // Use all_caller_names (pre-truncation) for the fan-out threshold check,
-    // but search for callers of the full set to capture transitive impact.
-    if !all_caller_names.is_empty() && all_caller_names.len() <= IMPACT_FANOUT_THRESHOLD {
-        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob, batch_quit) {
-            // Filter out hop-1 matches (same file+line = same call site)
-            let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
-                .iter()
-                .map(|c| (c.path.clone(), c.line))
-                .collect();
-
-            let hop2_filtered: Vec<_> = hop2
-                .into_iter()
-                .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
-                .collect();
-
-            if !hop2_filtered.is_empty() {
-                output.push_str("\n── impact (2nd hop) ──\n");
-
-                let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
-                let mut count = 0;
-                for (via, m) in &hop2_filtered {
-                    let key = (m.calling_function.clone(), m.path.clone());
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    if count >= IMPACT_MAX_RESULTS {
-                        break;
-                    }
-
-                    let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
-                    let _ = writeln!(
-                        output,
-                        "  {:<20} {}:{}  \u{2192} {}",
-                        m.calling_function, rel_path, m.line, via
-                    );
-                    count += 1;
-                }
-
-                let unique_total = hop2_filtered
-                    .iter()
-                    .map(|(_, m)| (&m.calling_function, &m.path))
-                    .collect::<HashSet<_>>()
-                    .len();
-                if unique_total > IMPACT_MAX_RESULTS {
-                    let _ = writeln!(
-                        output,
-                        "  ... and {} more",
-                        unique_total - IMPACT_MAX_RESULTS
-                    );
-                }
-
-                let _ = writeln!(output, "\n{} functions affected across 2 hops.", {
-                    // Use pre-truncation distinct-caller count so footer is
-                    // accurate even when >max_matches hop-1 callers exist.
-                    all_caller_names.len() + unique_total
-                });
-            }
-        }
-    }
+    let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
+        .iter()
+        .map(|c| (c.path.clone(), c.line))
+        .collect();
+    append_impact_analysis(
+        &mut output,
+        &all_caller_names,
+        &hop1_locations,
+        scope,
+        bloom,
+        glob,
+        batch_quit,
+    );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
     let _ = write!(
@@ -433,6 +386,78 @@ pub fn search_callers_expanded(
         crate::search::format_token_count(tokens)
     );
     Ok(output)
+}
+
+/// Append a "── impact (2nd hop) ──" section listing functions that call any
+/// of `all_caller_names`, filtered to exclude 2nd-hop matches that are
+/// actually the same call site as a 1st-hop match. Shared between the
+/// single-target and multi-target (`kind=callers` comma path) renderers so
+/// multi-target output keeps the same fan-out analysis as single-target.
+fn append_impact_analysis(
+    output: &mut String,
+    all_caller_names: &HashSet<String>,
+    hop1_locations: &HashSet<(PathBuf, u32)>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    batch_quit: usize,
+) {
+    if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
+        return;
+    }
+    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
+        return;
+    };
+
+    let hop2_filtered: Vec<_> = hop2
+        .into_iter()
+        .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
+        .collect();
+
+    if hop2_filtered.is_empty() {
+        return;
+    }
+
+    output.push_str("\n── impact (2nd hop) ──\n");
+
+    let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
+    let mut count = 0;
+    for (via, m) in &hop2_filtered {
+        let key = (m.calling_function.clone(), m.path.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        if count >= IMPACT_MAX_RESULTS {
+            break;
+        }
+
+        let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
+        let _ = writeln!(
+            output,
+            "  {:<20} {}:{}  \u{2192} {}",
+            m.calling_function, rel_path, m.line, via
+        );
+        count += 1;
+    }
+
+    let unique_total = hop2_filtered
+        .iter()
+        .map(|(_, m)| (&m.calling_function, &m.path))
+        .collect::<HashSet<_>>()
+        .len();
+    if unique_total > IMPACT_MAX_RESULTS {
+        let _ = writeln!(
+            output,
+            "  ... and {} more",
+            unique_total - IMPACT_MAX_RESULTS
+        );
+    }
+
+    let _ = writeln!(output, "\n{} functions affected across 2 hops.", {
+        // Use pre-truncation distinct-caller count so footer is accurate even
+        // when >max_matches hop-1 callers exist.
+        all_caller_names.len() + unique_total
+    });
 }
 
 /// Multi-target caller search: find call sites of 2..=5 symbols in a single
@@ -464,6 +489,12 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
+    // Scale the early-quit threshold by target count: a fixed threshold sized
+    // for one target starves later targets' buckets on the same walk.
+    let batch_quit = batch_quit
+        .saturating_mul(ordered.len())
+        .min(FULL_BATCH_EARLY_QUIT);
+
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
     let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
 
@@ -479,8 +510,6 @@ pub fn search_callers_multi_expanded(
     for target in &ordered {
         let mut callers = by_target.remove(*target).unwrap_or_default();
 
-        let _ = write!(output, "## callers of \"{target}\"\n\n");
-
         if callers.is_empty() {
             let target_seen = target_seen_in_scope(target, scope, glob);
             output.push_str(&no_callers_message(target, scope, target_seen, glob));
@@ -489,13 +518,21 @@ pub fn search_callers_multi_expanded(
         }
 
         rank_callers(&mut callers, scope, context);
+
+        // Collect unique caller names BEFORE truncation for accurate fan-out threshold
+        let all_caller_names: HashSet<String> = callers
+            .iter()
+            .filter(|c| c.calling_function != "<top-level>")
+            .map(|c| c.calling_function.clone())
+            .collect();
+
         let total = callers.len();
         callers.truncate(max_matches);
 
-        let _ = writeln!(
+        let _ = write!(
             output,
-            "{} call site{}",
-            total,
+            "## Callers of \"{target}\" in {} — {total} call site{}\n",
+            scope.display(),
             if total == 1 { "" } else { "s" }
         );
 
@@ -534,6 +571,21 @@ pub fn search_callers_multi_expanded(
                 }
             }
         }
+
+        let hop1_locations: HashSet<(PathBuf, u32)> = callers
+            .iter()
+            .map(|c| (c.path.clone(), c.line))
+            .collect();
+        append_impact_analysis(
+            &mut output,
+            &all_caller_names,
+            &hop1_locations,
+            scope,
+            bloom,
+            glob,
+            batch_quit,
+        );
+
         output.push('\n');
     }
 

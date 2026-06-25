@@ -69,7 +69,7 @@ AGENTS.md              User-facing copy of the MCP instructions. Generated from 
 
 ## Languages supported
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift, Kotlin, Scala, Elixir.
+Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift, Kotlin, Scala, Elixir, Bash.
 Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
 
 ## Build, test, install
