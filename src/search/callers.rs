@@ -418,13 +418,9 @@ pub fn search_callers_expanded(
                 }
 
                 let _ = writeln!(output, "\n{} functions affected across 2 hops.", {
-                    // Dedup hop-1 by calling_function for a distinct-function count.
-                    let hop1_fns: std::collections::HashSet<&str> = sorted_callers
-                        .iter()
-                        .filter(|c| c.calling_function != "<top-level>")
-                        .map(|c| c.calling_function.as_str())
-                        .collect();
-                    hop1_fns.len() + unique_total
+                    // Use pre-truncation distinct-caller count so footer is
+                    // accurate even when >max_matches hop-1 callers exist.
+                    all_caller_names.len() + unique_total
                 });
             }
         }
@@ -690,6 +686,46 @@ mod tests {
         assert!(
             msg.contains("test files"),
             "glob-driven hint should appear when glob is Some: {msg}"
+        );
+    }
+
+    #[test]
+    fn footer_count_uses_pre_truncation_caller_set() {
+        // >MAX_MATCHES (10) hop-1 call sites but <= IMPACT_FANOUT_THRESHOLD unique
+        // callers: the "N functions affected across 2 hops" footer must use the
+        // pre-truncation distinct-caller count (all_caller_names), not the
+        // post-truncation rebuild. 8 funcs x 2 call sites = 16 sites; truncate(10)
+        // keeps ~5 funcs (old undercount), pre-truncation set is 8; +1 hop-2 = 9.
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        for i in 0..8usize {
+            let content = format!(
+                "fn target_fn() {{}}\
+                \nfn caller_a_{i}() {{ target_fn(); target_fn(); }}\
+                \n"
+            );
+            std::fs::write(dir.path().join(format!("f{i}.rs")), content).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("hop2.rs"),
+            "fn hop2_fn() { caller_a_0(); }\n",
+        )
+        .unwrap();
+        let result =
+            search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let footer_line = result
+            .lines()
+            .find(|l| l.contains("functions affected across 2 hops"))
+            .unwrap_or_else(|| panic!("footer line missing from output:\n{result}"));
+        let reported: usize = footer_line
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("footer count not a number: {footer_line}"));
+        assert_eq!(
+            reported, 9,
+            "footer reported {reported} but expected exactly 9 (8 hop-1 + 1 hop-2): {footer_line}"
         );
     }
 }

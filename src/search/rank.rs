@@ -408,12 +408,14 @@ fn non_code_penalty(path: &Path) -> i32 {
 
     let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst" || has_docs_component;
 
-    let path_str = path.to_string_lossy();
-    let is_config_example = (path_str.contains("example")
-        || path_str.contains("sample")
-        || path_str.contains("template"))
-        && (ext == "md" || ext == "txt" || ext == "rst");
+    let is_config_example = path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("example" | "examples" | "sample" | "samples" | "template" | "templates")
+        )
+    }) && (ext == "md" || ext == "txt" || ext == "rst");
 
+    let path_str = path.to_string_lossy();
     let is_generated = path_str.contains("generated");
 
     let mut penalty = 0;
@@ -684,6 +686,23 @@ mod tests {
     fn non_code_penalty_normal_code_zero() {
         let path = PathBuf::from("/repo/src/auth.rs");
         assert_eq!(super::non_code_penalty(&path), 0);
+    }
+
+    #[test]
+    fn non_code_penalty_example_component_penalized() {
+        // A path whose 'examples' segment is a component should be penalized.
+        let path = PathBuf::from("/repo/examples/guide.md");
+        assert!(super::non_code_penalty(&path) > 0);
+    }
+
+    #[test]
+    fn non_code_penalty_examples_substring_not_penalized() {
+        // "examples" appearing only as a substring (not a component) must NOT
+        // trigger the is_config_example penalty — only the md/txt/rst guard fires here.
+        let path = PathBuf::from("/repo/src/examples_parser.md");
+        // is_docs fires (md ext), but is_config_example must NOT add extra penalty.
+        // The test verifies penalty equals the docs-only value (250), not docs+example.
+        assert_eq!(super::non_code_penalty(&path), 250);
     }
 
     #[test]
