@@ -423,7 +423,7 @@ Examples:
         action="store_true",
         help="Strip the harness to built-in tools + the per-mode MCP config. "
              "claude: passes --bare (drops slash commands, hooks, plugins, "
-             "agents, skills; also drops Grep/Glob from baseline's tool set). "
+             "agents, skills). "
              "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_* so "
              "the user's global opencode config (MCP servers, skills) can't "
              "leak into the baseline. Ignored for codex.",

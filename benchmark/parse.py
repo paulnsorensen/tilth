@@ -377,6 +377,8 @@ def extract_stream_error(stdout: str) -> Optional[str]:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(obj, dict):
+            continue
         if obj.get("type") != "error":
             continue
         err = obj.get("error") or {}
