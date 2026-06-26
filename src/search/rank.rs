@@ -408,12 +408,14 @@ fn non_code_penalty(path: &Path) -> i32 {
 
     let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst" || has_docs_component;
 
-    let path_str = path.to_string_lossy();
-    let is_config_example = (path_str.contains("example")
-        || path_str.contains("sample")
-        || path_str.contains("template"))
-        && (ext == "md" || ext == "txt" || ext == "rst");
+    let is_config_example = path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("example" | "examples" | "sample" | "samples" | "template" | "templates")
+        )
+    }) && (ext == "md" || ext == "txt" || ext == "rst");
 
+    let path_str = path.to_string_lossy();
     let is_generated = path_str.contains("generated");
 
     let mut penalty = 0;
@@ -684,6 +686,28 @@ mod tests {
     fn non_code_penalty_normal_code_zero() {
         let path = PathBuf::from("/repo/src/auth.rs");
         assert_eq!(super::non_code_penalty(&path), 0);
+    }
+
+    #[test]
+    fn non_code_penalty_example_component_penalized() {
+        // A path whose 'examples' segment is a component should be penalized.
+        let path = PathBuf::from("/repo/examples/guide.md");
+        assert!(super::non_code_penalty(&path) > 0);
+    }
+
+    #[test]
+    fn non_code_penalty_examples_substring_not_penalized() {
+        // "examples" appearing only as a substring (not a component) must NOT
+        // trigger the is_config_example penalty. Anchor to the docs-only baseline
+        // (a plain .md path) instead of a literal, so the test survives a future
+        // docs-penalty re-tune: the substring path must score exactly the same as
+        // a plain docs file, proving no config-example penalty is added.
+        let docs_only = super::non_code_penalty(&PathBuf::from("/repo/src/plain.md"));
+        let substring = super::non_code_penalty(&PathBuf::from("/repo/src/examples_parser.md"));
+        assert_eq!(
+            substring, docs_only,
+            "substring 'examples' must not add the config-example penalty (docs-only baseline)"
+        );
     }
 
     #[test]

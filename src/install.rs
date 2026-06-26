@@ -202,7 +202,7 @@ fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
 /// comments). Returns `rest.len()` when no following header exists.
 fn toml_section_end(rest: &str) -> usize {
     let bytes = rest.as_bytes();
-    let mut depth: i32 = 0;
+    let mut depth: u32 = 0;
     let mut in_str: Option<u8> = None;
     let mut escaped = false;
     let mut at_line_start = true;
@@ -245,7 +245,7 @@ fn toml_section_end(rest: &str) -> usize {
                 at_line_start = false;
             }
             b']' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 at_line_start = false;
             }
             _ if c.is_ascii_whitespace() => {}
@@ -669,6 +669,23 @@ mod tests {
         assert_eq!(
             out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
             "section end was truncated by a value line starting with '[': {out:?}"
+        );
+    }
+
+    #[test]
+    fn toml_section_end_unmatched_bracket_does_not_truncate_following_table() {
+        // An unmatched ']' (e.g. a malformed or unconventional value) must NOT
+        // drive depth negative and cause the next table header to be missed.
+        // u32 + saturating_sub floors at 0 so the depth==0 check still fires.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert_eq!(
+            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
+            "unmatched ']' must not prevent the following [other] table from being preserved: {out:?}"
         );
     }
 
