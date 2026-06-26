@@ -691,11 +691,12 @@ mod tests {
 
     #[test]
     fn footer_count_uses_pre_truncation_caller_set() {
-        // >MAX_MATCHES (10) hop-1 call sites but <= IMPACT_FANOUT_THRESHOLD unique
+        // >MAX_MATCHES hop-1 call sites but <= IMPACT_FANOUT_THRESHOLD unique
         // callers: the "N functions affected across 2 hops" footer must use the
         // pre-truncation distinct-caller count (all_caller_names), not the
-        // post-truncation rebuild. 8 funcs x 2 call sites = 16 sites; truncate(10)
-        // keeps ~5 funcs (old undercount), pre-truncation set is 8; +1 hop-2 = 9.
+        // post-truncation rebuild. With MAX_MATCHES == 10: 8 funcs x 2 call sites
+        // = 16 sites; truncate(MAX_MATCHES) keeps ~5 funcs (old undercount),
+        // pre-truncation set is 8; +1 hop-2 = 9.
         let dir = tempfile::tempdir().unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         for i in 0..8usize {

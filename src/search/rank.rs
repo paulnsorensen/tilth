@@ -698,11 +698,16 @@ mod tests {
     #[test]
     fn non_code_penalty_examples_substring_not_penalized() {
         // "examples" appearing only as a substring (not a component) must NOT
-        // trigger the is_config_example penalty — only the md/txt/rst guard fires here.
-        let path = PathBuf::from("/repo/src/examples_parser.md");
-        // is_docs fires (md ext), but is_config_example must NOT add extra penalty.
-        // The test verifies penalty equals the docs-only value (250), not docs+example.
-        assert_eq!(super::non_code_penalty(&path), 250);
+        // trigger the is_config_example penalty. Anchor to the docs-only baseline
+        // (a plain .md path) instead of a literal, so the test survives a future
+        // docs-penalty re-tune: the substring path must score exactly the same as
+        // a plain docs file, proving no config-example penalty is added.
+        let docs_only = super::non_code_penalty(&PathBuf::from("/repo/src/plain.md"));
+        let substring = super::non_code_penalty(&PathBuf::from("/repo/src/examples_parser.md"));
+        assert_eq!(
+            substring, docs_only,
+            "substring 'examples' must not add the config-example penalty (docs-only baseline)"
+        );
     }
 
     #[test]
