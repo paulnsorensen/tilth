@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from parse import parse_opencode_json, tool_call_counts  # noqa: E402
+from parse import parse_opencode_json, tool_call_counts, extract_stream_error  # noqa: E402
 
 # Minimal NDJSON mirroring the real opencode `run --format json` schema:
 # {type, part, sessionID, timestamp} per line; step-finish carries cost+tokens.
@@ -174,6 +174,27 @@ def test_opencode_rejects_unsupported_mode():
         assert "tilth_forced" in str(e), str(e)
     else:
         raise AssertionError("expected RuntimeError for unsupported opencode mode")
+
+
+def test_extract_stream_error_surfaces_content_filter():
+    """A late {"type":"error"} event (e.g. a provider content filter) must be
+    surfaced, not buried — this is what a head-truncated stdout dump hid.
+    """
+    stream = "\n".join([
+        '{"type":"step_start","part":{"type":"step-start"}}',
+        '{"type":"text","part":{"type":"text","text":"I cannot assist."}}',
+        '{"type":"error","error":{"name":"ContentFilterError",'
+        '"data":{"message":"blocked by the provider content filter"}}}',
+    ])
+    msg = extract_stream_error(stream)
+    assert msg is not None and "ContentFilterError" in msg, msg
+    assert "content filter" in msg, msg
+
+
+def test_extract_stream_error_none_on_clean_stream():
+    """No error event -> None, so callers fall back to the stdout tail."""
+    stream = '{"type":"text","part":{"type":"text","text":"ok"}}'
+    assert extract_stream_error(stream) is None
 
 
 def main() -> int:
