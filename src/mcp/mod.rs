@@ -600,7 +600,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            5460,
+            6107,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -1725,15 +1725,17 @@ mod tests {
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
 
+        // Non-seed anchor (line 2): a line-1 anchor on a missing file now seeds
+        // it (issue #93), so use line 2 to still exercise the NotFound path.
         let args = serde_json::json!({
             "files": [
                 {
                     "path": p1.to_str().unwrap(),
-                    "edits": [{ "start": "1:000", "content": "x" }]
+                    "edits": [{ "start": "2:000", "content": "x" }]
                 },
                 {
                     "path": p2.to_str().unwrap(),
-                    "edits": [{ "start": "1:000", "content": "x" }]
+                    "edits": [{ "start": "2:000", "content": "x" }]
                 }
             ]
         });
@@ -1753,6 +1755,36 @@ mod tests {
             session.reads_count(),
             0,
             "no file committed, so nothing is recorded as read"
+        );
+    }
+
+    /// Issue #93: the default `mode:"hash"` must create a non-existent file
+    /// from a single line-1 anchored edit, end-to-end through `tool_write`
+    /// (not just `apply_edits`). The wire path is where the user-facing
+    /// contract lives.
+    #[test]
+    fn hash_mode_seeds_nonexistent_file_via_tool_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.rs");
+        assert!(!path.exists(), "precondition: file must not exist");
+
+        let args = serde_json::json!({
+            "files": [{
+                "path": path.to_str().unwrap(),
+                // default mode is "hash"; line-1 anchor seeds, hash ignored.
+                "edits": [{ "start": "1:0", "content": "fn main() {}\n" }],
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("hash-mode seed succeeds");
+        assert!(
+            !out.contains("not found") && !out.contains("out of bounds"),
+            "seed must not report a read/bounds failure: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {}\n",
+            "default-mode write must create the file with exactly the content"
         );
     }
 
@@ -1866,8 +1898,10 @@ mod tests {
                 },
                 {
                     "path": missing.to_str().unwrap(),
-                    // Hash value is irrelevant — the file read fails first.
-                    "edits": [{ "start": "1:000", "content": "X" }],
+                    // Non-seed anchor (line 2): a line-1 anchor on a missing
+                    // file now seeds it (issue #93). Line 2 keeps the read
+                    // failing first, exercising the IO-failure path.
+                    "edits": [{ "start": "2:000", "content": "X" }],
                 },
             ]
         });
@@ -2392,12 +2426,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            5460,
+            6107,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            8366,
+            9013,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
