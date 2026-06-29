@@ -75,23 +75,42 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         });
     }
 
-    // Read file
-    let content = fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
+    // Read file. A new (NotFound) or empty (0-line) file has no anchorable
+    // line, so the hash-anchor protocol has no valid start anchor. In that case
+    // a single edit anchored at line 1 seeds/creates the file with its content
+    // (see `is_seed_insert`). Any other edit shape on a missing file still errors.
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound if is_seed_insert(edits) => String::new(),
+            std::io::ErrorKind::NotFound => {
+                return Err(TilthError::NotFound {
+                    path: path.to_path_buf(),
+                    suggestion: None,
+                })
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                return Err(TilthError::PermissionDenied {
+                    path: path.to_path_buf(),
+                })
+            }
+            _ => {
+                return Err(TilthError::IoError {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
         },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
+    };
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+
+    // Seed an empty/new file: no anchorable line exists, so write the single
+    // line-1 edit's content verbatim and return.
+    if total == 0 && is_seed_insert(edits) {
+        return seed_file(path, &edits[0].content);
+    }
 
     // Phase 1: Verify all hashes
     let mut mismatches: Vec<String> = Vec::new();
@@ -272,6 +291,42 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
     let parse = crate::edit_parse_check::check(path, &content, &output)
+        .as_ref()
+        .map(crate::edit_parse_check::format_report);
+
+    Ok(EditResult::Applied {
+        diff,
+        context,
+        parse,
+    })
+}
+
+/// A "seed" edit creates or fills a new/empty file. A 0-line file has no
+/// anchorable line, so the hash-anchor protocol has no valid start anchor; the
+/// agreed sentinel is a single edit anchored at line 1 (e.g. `start: "1:0"` —
+/// the hash is ignored since there is no existing line to fingerprint).
+fn is_seed_insert(edits: &[Edit]) -> bool {
+    edits.len() == 1 && edits[0].start_line == 1 && edits[0].end_line == 1
+}
+
+/// Write `content` as the entire contents of a new or empty file and return an
+/// `Applied` result mirroring the normal edit path (added-only diff + hashlined
+/// context) so callers can chain anchored edits without a re-read.
+fn seed_file(path: &Path, content: &str) -> Result<EditResult, TilthError> {
+    crate::util::atomic_write_bytes(path, content.as_bytes()).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    let new_lines: Vec<String> = content.lines().map(String::from).collect();
+    let diff = format_diffs(&[EditDiff {
+        old_start: 1,
+        new_start: 1,
+        old_lines: Vec::new(),
+        new_lines,
+    }]);
+    let context = format::hashlines(content, 1);
+    let parse = crate::edit_parse_check::check(path, "", content)
         .as_ref()
         .map(crate::edit_parse_check::format_report);
 
@@ -756,6 +811,91 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seed_nonexistent_file_creates_it() {
+        // A line-1 anchored edit on a path that does not exist must create the
+        // file with the edit's content (hash mode, the default). Regression for
+        // issue #93 — previously this returned NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brand_new.rs");
+        assert!(!path.exists(), "precondition: file must not exist");
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: 0, // ignored on seed — no existing line to fingerprint
+            end_line: 1,
+            end_hash: 0,
+            content: "fn seeded() {}\n".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).expect("seed must succeed, not NotFound");
+        assert!(
+            matches!(result, EditResult::Applied { .. }),
+            "seed should report Applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn seeded() {}\n",
+            "new file must contain exactly the seeded content"
+        );
+    }
+
+    #[test]
+    fn seed_empty_file_fills_it() {
+        // A 0-line (empty) file has no anchorable line. A line-1 anchored edit
+        // must seed it rather than fail the bounds check. Regression for #93.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.rs");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            0,
+            "precondition: file must be 0 lines"
+        );
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: 0,
+            end_line: 1,
+            end_hash: 0,
+            content: "first line\nsecond line\n".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).expect("seed must succeed on empty file");
+        assert!(
+            matches!(result, EditResult::Applied { .. }),
+            "seed should report Applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first line\nsecond line\n",
+            "empty file must be seeded with exactly the edit content"
+        );
+    }
+
+    #[test]
+    fn nonexistent_file_non_seed_edit_still_errors() {
+        // Guard: a missing file with an edit that is NOT seed-shaped (start_line
+        // != 1) must still surface NotFound, not silently create the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.rs");
+
+        let edits = vec![Edit {
+            start_line: 5,
+            start_hash: 0,
+            end_line: 5,
+            end_hash: 0,
+            content: "x".into(),
+        }];
+
+        let err = apply_edits(&path, &edits).expect_err("non-seed edit on missing file must error");
+        assert!(
+            matches!(err, TilthError::NotFound { .. }),
+            "expected NotFound, got: {err:?}"
+        );
+        assert!(!path.exists(), "no file may be created for a non-seed edit");
     }
 
     #[test]
