@@ -351,16 +351,19 @@ pub(crate) fn read_single_with_suffix(
             (body, SeenSpec::Ranges(vec![(cast(*n), cast(end))]))
         }
         PathSuffix::Heading(h) => {
-            let body =
-                crate::read::read_ranges(path, &[h.as_str()], edit_mode).unwrap_or_else(render_err);
-            // Resolve the heading span so seen-lines cover only the displayed
-            // section, not the whole file. Absent heading → the read errored;
-            // fall back to Whole (nothing to gate against).
-            let spec = match crate::read::resolve_heading_span(path, h) {
-                Some((s, e)) => SeenSpec::Ranges(vec![(s, e)]),
-                None => SeenSpec::Whole,
-            };
-            (body, spec)
+            // Resolve the heading span once (like the symbol path) so the read
+            // and the seen-lines spec share a single resolution. Absent heading →
+            // read the raw anchor to surface the error and fall back to Whole.
+            if let Some((s, e)) = crate::read::resolve_heading_span(path, h) {
+                let range = format!("{s}-{e}");
+                let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                    .unwrap_or_else(render_err);
+                (body, SeenSpec::Ranges(vec![(s, e)]))
+            } else {
+                let body = crate::read::read_ranges(path, &[h.as_str()], edit_mode)
+                    .unwrap_or_else(render_err);
+                (body, SeenSpec::Whole)
+            }
         }
         PathSuffix::Symbol(name) => {
             // Resolve symbol via outline → range once, reused for read + spec.

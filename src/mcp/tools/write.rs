@@ -261,7 +261,10 @@ fn recover_edit(
     live: &str,
 ) -> Result<(String, Option<FileOp>), TilthError> {
     // Provenance gate: if the read's snapshot survives, an edit anchored on a
-    // never-displayed line is rejected here exactly as on the no-drift path.
+    // never-displayed line is rejected here exactly as on the no-drift path. A
+    // missing snapshot means the tag was never recorded this session (fabricated,
+    // cross-session replay, or LRU-evicted) — it earns no short-circuit below.
+    let tag_known = store.by_tag(key, tag).is_some();
     if let Some(snapshot) = store.by_tag(key, tag) {
         check_seen_lines(&snapshot, path, &section.ops).map_err(EditError::from)?;
     }
@@ -271,8 +274,10 @@ fn recover_edit(
         .iter()
         .any(|o| !matches!(o, Op::Rem | Op::Mv { .. }));
     // A pure file op carries no content edit — file-level intent is independent
-    // of content drift, so proceed without recovery.
-    if file_op.is_some() && !has_content {
+    // of content drift, so proceed without recovery, but ONLY for a session-known
+    // tag. An unknown/fabricated tag falls through to try_recover, which rejects
+    // it as Fabricated rather than silently deleting/moving on unverified intent.
+    if tag_known && file_op.is_some() && !has_content {
         return Ok((live.to_string(), file_op));
     }
     let text = try_recover(store, path, tag, &section.ops, live)?;
@@ -1001,6 +1006,73 @@ mod tests {
         assert!(
             !root.join("other.rs").exists(),
             "rejected conflict must not move the file"
+        );
+    }
+
+    /// A pure `REM` carrying a tag that was never recorded this session (never
+    /// read) must be rejected as Fabricated — the provenance contract — and must
+    /// not delete the file. The pure-file-op short-circuit only applies to a
+    /// session-known tag.
+    #[test]
+    fn pure_rem_with_fabricated_tag_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("neverread.rs");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        let (session, bloom) = services();
+        // No read → the tag was never recorded this session; ^0x1 so tag ≠ live
+        // (the drift egress) rather than the tagless synthetic path.
+        let bogus = format!(
+            "{:04X}",
+            crate::edit::tag::compute_file_hash("alpha\nbeta\n") ^ 0x1
+        );
+        let blob = format!("[{}#{bogus}]\nREM\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("not from this session"),
+            "pure REM with a never-recorded tag must be Fabricated, got:\n{out}"
+        );
+        assert!(p.exists(), "fabricated-tag REM must not delete the file");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "alpha\nbeta\n",
+            "fabricated-tag REM must leave the file untouched"
+        );
+    }
+
+    /// A pure `MV` carrying a never-recorded tag must be rejected as Fabricated
+    /// and must not move the file.
+    #[test]
+    fn pure_mv_with_fabricated_tag_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("nevermoved.rs");
+        std::fs::write(&p, "one\ntwo\n").unwrap();
+        let (session, bloom) = services();
+        let bogus = format!(
+            "{:04X}",
+            crate::edit::tag::compute_file_hash("one\ntwo\n") ^ 0x1
+        );
+        let blob = format!("[{}#{bogus}]\nMV \"stolen.rs\"\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("not from this session"),
+            "pure MV with a never-recorded tag must be Fabricated, got:\n{out}"
+        );
+        assert!(p.exists(), "fabricated-tag MV must not move the source");
+        assert!(
+            !root.join("stolen.rs").exists(),
+            "fabricated-tag MV must not create the destination"
         );
     }
 
