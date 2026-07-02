@@ -268,9 +268,58 @@ mod tests {
         store.record("a.rs", "3\n", []).unwrap();
         store.record("a.rs", "4\n", []).unwrap();
         // Fifth distinct version evicts the oldest (t1).
-        store.record("a.rs", "5\n", []).unwrap();
+        let t5 = store.record("a.rs", "5\n", []).unwrap();
         assert!(store.by_tag("a.rs", t1).is_none(), "oldest version dropped");
-        assert!(store.head("a.rs").is_some());
+        let head = store.head("a.rs").expect("head retained");
+        assert_eq!(head.tag, t5, "head is the newest version");
+        assert_eq!(head.text, "5\n");
+    }
+
+    #[test]
+    fn ring_retains_exactly_the_newest_four() {
+        let mut store = SnapshotStore::new();
+        let t1 = store.record("a.rs", "1\n", []).unwrap();
+        let t2 = store.record("a.rs", "2\n", []).unwrap();
+        let t3 = store.record("a.rs", "3\n", []).unwrap();
+        let t4 = store.record("a.rs", "4\n", []).unwrap();
+        // At exactly 4 versions, all are retained.
+        for t in [t1, t2, t3, t4] {
+            assert!(
+                store.by_tag("a.rs", t).is_some(),
+                "4-version boundary: {t:04X}"
+            );
+        }
+        // The 5th evicts only the oldest; the newest four remain.
+        let t5 = store.record("a.rs", "5\n", []).unwrap();
+        assert!(store.by_tag("a.rs", t1).is_none(), "oldest evicted");
+        for t in [t2, t3, t4, t5] {
+            assert!(
+                store.by_tag("a.rs", t).is_some(),
+                "newest four kept: {t:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_file_cap_boundary_at_and_over() {
+        // Cap of exactly 10 bytes: len == cap records, len == cap + 1 does not.
+        let mut store = SnapshotStore::with_limits(64 * 1024 * 1024, 30, 4, 10);
+        let at_cap = "x".repeat(10);
+        let tag = store
+            .record("at.rs", &at_cap, [])
+            .expect("len == cap records");
+        assert_eq!(store.by_tag("at.rs", tag).unwrap().text, at_cap);
+
+        let over_cap = "x".repeat(11);
+        assert_eq!(
+            store.record("over.rs", &over_cap, []),
+            None,
+            "len == cap + 1 mints no tag"
+        );
+        assert!(
+            store.head("over.rs").is_none(),
+            "over-cap file not retained"
+        );
     }
 
     #[test]
@@ -317,6 +366,15 @@ mod tests {
             "total weight {} exceeds ceiling",
             store.total_weight()
         );
+        // The ceiling forced eviction: not all 10 paths fit, and the most
+        // recently recorded path is retained while an early one is gone.
+        assert!(
+            store.len() < 10,
+            "ceiling evicted paths, len = {}",
+            store.len()
+        );
+        assert!(store.head("f9.rs").is_some(), "newest path retained");
+        assert!(store.head("f0.rs").is_none(), "coldest path evicted");
     }
 
     #[test]

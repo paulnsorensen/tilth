@@ -20,6 +20,9 @@ pub mod recovery;
 pub mod snapshots;
 pub mod tag;
 
+#[cfg(test)]
+mod integration_tests;
+
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
 pub struct Edit {

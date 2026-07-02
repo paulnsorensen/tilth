@@ -518,4 +518,136 @@ mod tests {
         let err = apply("a\nb\n", &[Op::Rem, Op::Del { start: 1, end: 1 }]).unwrap_err();
         assert_eq!(err, ApplyError::FileOpConflict);
     }
+
+    #[test]
+    fn mv_leaves_text_untouched() {
+        let r = apply(
+            "a\nb\n",
+            &[Op::Mv {
+                dest: "b.rs".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(r.text, "a\nb\n", "MV is a file op — text is unchanged");
+        assert_eq!(r.first_changed_line, None);
+    }
+
+    // --- boundary coverage ---
+
+    #[test]
+    fn ins_head_into_empty_file() {
+        let r = apply(
+            "",
+            &[Op::Ins {
+                cursor: Cursor::Head,
+                payload: vec!["x".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(r.text, "x\n");
+        assert_eq!(r.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn single_line_file_swap_and_delete() {
+        // A file with no trailing newline is one row.
+        let swapped = apply(
+            "abc",
+            &[Op::Swap {
+                start: 1,
+                end: 1,
+                payload: vec!["X".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(swapped.text, "X");
+        assert_eq!(swapped.first_changed_line, Some(1));
+
+        let deleted = apply("abc", &[Op::Del { start: 1, end: 1 }]).unwrap();
+        assert_eq!(deleted.text, "");
+        assert_eq!(deleted.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn swap_first_and_last_content_line() {
+        // "a\nb\nc\n" splits to [a, b, c, ""]; line 3 is the last content line.
+        let r = apply(
+            "a\nb\nc\n",
+            &[
+                Op::Swap {
+                    start: 1,
+                    end: 1,
+                    payload: vec!["A".into()],
+                },
+                Op::Swap {
+                    start: 3,
+                    end: 3,
+                    payload: vec!["C".into()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.text, "A\nb\nC\n");
+        assert_eq!(r.first_changed_line, Some(1));
+    }
+
+    #[test]
+    fn adjacent_ranges_are_allowed() {
+        // (1,2) and (3,4) touch but do not overlap — both must apply.
+        let r = apply(
+            "a\nb\nc\nd\ne\n",
+            &[
+                Op::Swap {
+                    start: 1,
+                    end: 2,
+                    payload: vec!["X".into()],
+                },
+                Op::Swap {
+                    start: 3,
+                    end: 4,
+                    payload: vec!["Y".into()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.text, "X\nY\ne\n");
+    }
+
+    #[test]
+    fn touching_shared_line_ranges_are_rejected() {
+        // (2,3) and (3,4) share line 3 → genuine overlap.
+        let err = apply(
+            "a\nb\nc\nd\ne\n",
+            &[
+                Op::Swap {
+                    start: 2,
+                    end: 3,
+                    payload: vec!["X".into()],
+                },
+                Op::Swap {
+                    start: 3,
+                    end: 4,
+                    payload: vec!["Y".into()],
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::Overlap { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn crlf_line_endings_survive_untouched_rows() {
+        // apply operates on raw text; a swap rewrites its own row while other
+        // rows keep their CRLF verbatim.
+        let r = apply(
+            "a\r\nb\r\nc\r\n",
+            &[Op::Swap {
+                start: 2,
+                end: 2,
+                payload: vec!["B".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(r.text, "a\r\nB\nc\r\n");
+    }
 }

@@ -103,6 +103,17 @@ mod tests {
     }
 
     #[test]
+    fn interior_carriage_return_is_significant() {
+        // A `\r` NOT immediately before `\n` is interior content, not a line
+        // ending, so it must change the tag — unlike the CRLF case above.
+        assert_ne!(
+            compute_file_hash("a\rb\n"),
+            compute_file_hash("ab\n"),
+            "interior carriage return is content, not a stripped line ending"
+        );
+    }
+
+    #[test]
     fn interior_whitespace_is_significant() {
         // Whitespace that is NOT line-trailing must still affect the tag.
         assert_ne!(
