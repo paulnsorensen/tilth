@@ -1105,13 +1105,12 @@ mod tests {
             out.contains("[signature]"),
             "signature header missing: {out}"
         );
+        // Exact-match locks the whole-file-tag `N:content` format: a
+        // reintroduced per-line hash (`1:abc|fn ...`) or a 0-indexed number
+        // (`0:fn ...`) both fail this equality.
         assert!(
-            out.lines().any(|l| l
-                .split_once(':')
-                .and_then(|(n, _)| n.trim().parse::<u32>().ok())
-                .is_some()
-                && l.contains("fn signature_target")),
-            "numbered signature line missing: {out}"
+            out.lines().any(|l| l == "1:fn signature_target() {"),
+            "expected exact numbered signature line `1:fn signature_target() {{`, got: {out}"
         );
         assert!(
             !out.contains("body_marker"),
@@ -1135,12 +1134,10 @@ mod tests {
             out.contains("[signature]"),
             "signature header missing: {out}"
         );
+        // Exact-match locks the `N:content` format (no per-line hash, 1-indexed).
         assert!(
-            out.lines().any(|l| l.contains("large_signature_target")
-                && l.split_once(':')
-                    .and_then(|(n, _)| n.trim().parse::<u32>().ok())
-                    .is_some()),
-            "numbered signature line missing: {out}"
+            out.lines().any(|l| l == "1:fn large_signature_target() {"),
+            "expected exact numbered signature line `1:fn large_signature_target() {{`, got: {out}"
         );
         assert!(
             !out.contains("body_marker"),
@@ -2305,21 +2302,20 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, true).expect("edit-mode search ok");
-        // Expected: a line of the form `1:fn unique_symbol_for_hashline_test() {`.
-        let has_numbered_anchor = out
-            .lines()
-            .any(|l| l.starts_with("1:") && l.contains("fn unique_symbol_for_hashline_test"));
+        // Exact-match locks the whole-file-tag `N:content` format. A reintroduced
+        // per-line hash (`1:abc|fn ...`) or a 0-indexed anchor (`0:fn ...`) both
+        // fail this equality — `starts_with("1:")` alone would accept the hash form.
         assert!(
-            has_numbered_anchor,
-            "expected <line>:<content> numbered anchor in expanded source: {out}"
+            out.lines()
+                .any(|l| l == "1:fn unique_symbol_for_hashline_test() {"),
+            "expected exact numbered anchor `1:fn unique_symbol_for_hashline_test() {{`: {out}"
         );
         // The marker is on source line 5; its anchor must read `5:` despite the
         // collapsed blank run above it. Proves stripping preserves absolute line
         // numbers (anchors stay valid for round-tripping into tilth_write).
         assert!(
-            out.lines()
-                .any(|l| l.starts_with("5:") && l.contains("marker_xyz")),
-            "expected marker line to keep absolute anchor 5: {out}"
+            out.lines().any(|l| l == "5:    let marker_xyz = a + 1;"),
+            "expected marker line to keep exact absolute anchor `5:...`: {out}"
         );
         // The gutter form must NOT appear when edit_mode is set.
         assert!(

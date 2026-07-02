@@ -1707,17 +1707,42 @@ mod tests {
         );
         assert!(filtered.contains("│ c"), "{filtered}");
 
-        // Edit-mode hashline format: "N:hash|content". Regression for the bug
-        // where filter_code_lines only recognized the │ gutter, so stripping
-        // silently no-opped in edit mode.
-        let edit = "```src/x.rs:1-3\n1:001|a\n2:002|b\n3:003|c\n```";
+        // Edit-mode whole-file-tag format: "N:content" (no per-line hash).
+        // Regression for the bug where filter_code_lines only recognized the │
+        // gutter, so stripping silently no-opped in edit mode.
+        let edit = "```src/x.rs:1-3\n1:a\n2:b\n3:c\n```";
         let filtered = filter_code_lines(edit, &skip);
-        assert!(filtered.contains("1:001|a"), "{filtered}");
+        assert!(filtered.contains("1:a"), "{filtered}");
         assert!(
-            !filtered.contains("2:002|b"),
+            !filtered.contains("2:b"),
             "edit-mode line 2 should be stripped: {filtered}"
         );
-        assert!(filtered.contains("3:003|c"), "{filtered}");
+        assert!(filtered.contains("3:c"), "{filtered}");
+    }
+
+    /// Boundary: the `N:content` parser splits on the FIRST colon, so a content
+    /// line that itself contains a colon (or starts with a digit + colon) must
+    /// have its number resolved from the line-number prefix, never from a colon
+    /// inside the content. Locks the `split_once(':')` choice against a
+    /// last-colon / inner-colon regression.
+    #[test]
+    fn filter_code_lines_uses_prefix_colon_not_content_colon() {
+        let mut skip = HashSet::new();
+        skip.insert(3u32);
+
+        // Line 3 is the strip target and its content contains a colon.
+        // Line 10's content is `3: decoy` — if the parser mistook the inner
+        // `3:` for the line number, it would wrongly strip line 10.
+        let edit = "```src/x.rs:3-10\n3:let m: i32 = 0;\n10:3: decoy\n```";
+        let filtered = filter_code_lines(edit, &skip);
+        assert!(
+            !filtered.contains("3:let m: i32 = 0;"),
+            "line 3 (colon in content) should be stripped by its prefix number: {filtered}"
+        );
+        assert!(
+            filtered.contains("10:3: decoy"),
+            "line 10 must be kept — inner `3:` is content, not the line number: {filtered}"
+        );
     }
 
     // ── walker unit tests ──
