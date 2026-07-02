@@ -9,6 +9,17 @@ use crate::error::TilthError;
 use crate::format;
 use crate::index::bloom::BloomFilterCache;
 
+// Whole-file-tag edit subsystem (PR1: core + tests, not yet wired to the MCP).
+// A faithful Rust port of oh-my-pi's hashline model. Unreferenced until PR2
+// swaps the MCP over, so the surface is `#[allow(dead_code)]` per-module.
+pub mod apply;
+pub mod block;
+pub mod mismatch;
+pub mod parser;
+pub mod recovery;
+pub mod snapshots;
+pub mod tag;
+
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
 pub struct Edit {
