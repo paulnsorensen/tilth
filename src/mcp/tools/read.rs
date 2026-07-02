@@ -149,8 +149,15 @@ pub(in crate::mcp) fn tool_read(
                 };
                 // Record the whole-file-tag snapshot so a follow-up tilth_write
                 // can verify the tag. Signature/stripped views are non-editable
-                // (no tag emitted), so they record nothing.
-                if edit_mode && !signature && !force_stripped {
+                // (no tag emitted), so they record nothing. A whole-file read
+                // that outlines (large file, no suffix, not force_full) likewise
+                // emits no tag or numbered lines — recording whole-file seenLines
+                // there would poison the snapshot for a later range read and
+                // defeat the unseen-anchor gate, so it records nothing too.
+                let outlined = matches!(suffix, PathSuffix::None)
+                    && !force_full
+                    && crate::read::would_outline(path);
+                if edit_mode && !signature && !force_stripped && !outlined {
                     crate::read::record_edit_snapshot(
                         session,
                         path,
@@ -275,7 +282,11 @@ pub(in crate::mcp) fn tool_read(
     let mut output =
         crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, Path::new("."))
             .map_err(|e| e.to_string())?;
-    if edit_mode {
+    // An outlined view emits no `[path#TAG]` and no numbered lines, so it
+    // displayed nothing to anchor an edit against — recording whole-file
+    // seenLines here would poison the snapshot for a later range read of the
+    // same content and defeat the unseen-anchor gate. Record nothing.
+    if edit_mode && (force_full || !crate::read::would_outline(&path)) {
         crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
     }
 
@@ -771,6 +782,136 @@ mod tests {
         assert!(
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
+        );
+    }
+
+    /// A large non-code file reads as an OUTLINE in `mode:auto` — no
+    /// `[path#TAG]` and no numbered `N:content` rows are displayed. Recording
+    /// whole-file seenLines here poisons the snapshot so a later range read of
+    /// the same content inherits an all-lines seen set, defeating the
+    /// unseen-anchor gate. The outline read must record nothing.
+    #[test]
+    fn single_path_auto_outline_read_grants_no_whole_file_seen_lines() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("big.md");
+        let mut content = String::new();
+        for i in 1..=2000 {
+            let _ = writeln!(
+                content,
+                "# Section {i} with enough padding text to bloat bytes"
+            );
+        }
+        std::fs::write(&p, &content).unwrap();
+        assert!(
+            crate::read::would_outline(&p),
+            "fixture must be large enough to outline"
+        );
+
+        let (session, cache) = services();
+
+        // Edit-mode auto read → outline (the path under test).
+        tool_read(
+            &serde_json::json!({"paths": [p.to_str().unwrap()]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode auto read");
+
+        // Range read of the same content records only lines 1-3.
+        let range = format!("{}#1-3", p.to_str().unwrap());
+        tool_read(
+            &serde_json::json!({"paths": [range]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode range read");
+
+        // An edit anchored on line 50 (never displayed) must be rejected.
+        let header = crate::edit::tag::format_header(
+            &p.display().to_string(),
+            crate::edit::tag::compute_file_hash(&content),
+        );
+        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "outline read must not grant whole-file seenLines; line-50 edit must be rejected, got:\n{out}"
+        );
+        assert!(
+            !out.contains("applied"),
+            "edit on an unseen line must not apply, got:\n{out}"
+        );
+    }
+
+    /// Same defect on the multi-path branch: an outlined file in a batch read
+    /// must not record whole-file seenLines either.
+    #[test]
+    fn multi_path_auto_outline_read_grants_no_whole_file_seen_lines() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let big = root.join("big.md");
+        let small = root.join("small.md");
+        let mut content = String::new();
+        for i in 1..=2000 {
+            let _ = writeln!(
+                content,
+                "# Section {i} with enough padding text to bloat bytes"
+            );
+        }
+        std::fs::write(&big, &content).unwrap();
+        std::fs::write(&small, "# small\n").unwrap();
+        assert!(crate::read::would_outline(&big), "fixture must outline");
+
+        let (session, cache) = services();
+
+        // Multi-path edit-mode auto read → big.md outlines.
+        tool_read(
+            &serde_json::json!({"paths": [big.to_str().unwrap(), small.to_str().unwrap()]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode multi read");
+
+        let range = format!("{}#1-3", big.to_str().unwrap());
+        tool_read(
+            &serde_json::json!({"paths": [range]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode range read");
+
+        let header = crate::edit::tag::format_header(
+            &big.display().to_string(),
+            crate::edit::tag::compute_file_hash(&content),
+        );
+        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "multi-path outline read must not grant whole-file seenLines, got:\n{out}"
         );
     }
 }
