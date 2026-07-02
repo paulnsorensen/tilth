@@ -999,4 +999,212 @@ mod tests {
             .expect_err("parse error is top-level");
         assert!(err.contains("parse error"), "got: {err}");
     }
+
+    #[test]
+    fn multi_section_write_lands_edits_in_both_files() {
+        // Wiring seam: the section loop must apply every [path#TAG] section in
+        // one blob, landing independent edits in independent files.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = root.join("one.rs");
+        let b = root.join("two.rs");
+        std::fs::write(&a, "fn one() {}\n").unwrap();
+        std::fs::write(&b, "fn two() {}\n").unwrap();
+        let (session, bloom) = services();
+        let tag_a = read_for_tag(&session, &a);
+        let tag_b = read_for_tag(&session, &b);
+        let blob = format!(
+            "[{}#{tag_a}]\nSWAP 1:\n+fn ONE() {{}}\n\n[{}#{tag_b}]\nSWAP 1:\n+fn TWO() {{}}\n",
+            a.display(),
+            b.display()
+        );
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert_eq!(
+            out.matches("applied").count(),
+            2,
+            "both sections must apply, got:\n{out}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn ONE() {}\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "fn TWO() {}\n");
+    }
+
+    #[test]
+    fn duplicate_path_in_one_call_is_rejected_second_section_only() {
+        // Two sections for the same file must be refused on the second: the
+        // seen_paths dedup guards against split, conflicting op groups.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("dup.rs");
+        std::fs::write(&p, "fn a() {}\nfn b() {}\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let blob = format!(
+            "[{}#{tag}]\nSWAP 1:\n+fn A() {{}}\n\n[{}#{tag}]\nSWAP 2:\n+fn B() {{}}\n",
+            p.display(),
+            p.display()
+        );
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("duplicate path"),
+            "second section on same path must be a duplicate-path error, got:\n{out}"
+        );
+        // The first section applied; the second was dropped, so the file shows
+        // only the first edit's effect.
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn A() {}\nfn b() {}\n",
+            "only the first section's edit lands; the duplicate is dropped"
+        );
+    }
+
+    /// A `#symbol` edit-mode read records only the symbol's span as seen, so a
+    /// tag-matched edit anchored INSIDE that span applies but one anchored on a
+    /// never-displayed line is rejected. Locks the `find_entry_by_name` hoist +
+    /// `seen_spec` parity through the real read→write path.
+    #[test]
+    fn symbol_read_gates_edit_to_displayed_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("sym.rs");
+        let content = "fn outer() {\n    let x = 1;\n}\nfn other() {\n    let y = 2;\n}\n";
+        std::fs::write(&p, content).unwrap();
+        let (session, bloom) = services();
+
+        // Symbol read records the span of `outer` (lines 1-3) as seen.
+        let cache = OutlineCache::new();
+        let sym_out = crate::mcp::tools::tool_read(
+            &json!({"paths": [format!("{}#outer", p.display())]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("symbol read");
+        assert!(
+            sym_out.lines().any(|l| l == "2:    let x = 1;"),
+            "symbol read must display line 2 of the span, got:\n{sym_out}"
+        );
+        let tag = format!("{:04X}", compute_file_hash(content));
+
+        // An edit anchored on line 5 (inside `other`, never displayed) is rejected.
+        let reject = tool_write(
+            &json!({
+                "edits": format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display()),
+                "root": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            reject.contains("never displayed"),
+            "edit on a line outside the read symbol span must be rejected, got:\n{reject}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            content,
+            "rejected edit must not touch the file"
+        );
+
+        // An edit anchored on line 2 (inside the displayed span) applies.
+        let ok = tool_write(
+            &json!({
+                "edits": format!("[{}#{tag}]\nSWAP 2:\n+    let x = 42;\n", p.display()),
+                "root": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            ok.contains("applied"),
+            "in-span edit must apply, got:\n{ok}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn outer() {\n    let x = 42;\n}\nfn other() {\n    let y = 2;\n}\n"
+        );
+    }
+
+    /// A `mode:signature` read records nothing, so it must not grant seen-lines
+    /// that would poison a later range read's unseen-anchor gate.
+    #[test]
+    fn signature_read_grants_no_seen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("sig.rs");
+        let content = "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n";
+        std::fs::write(&p, content).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+
+        // Signature read (records nothing).
+        crate::mcp::tools::tool_read(
+            &json!({"paths": [p.to_str().unwrap()], "mode": "signature"}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("signature read");
+        // Range read of line 1 only (records seen = {1}).
+        crate::mcp::tools::tool_read(
+            &json!({"paths": [format!("{}#1-1", p.display())]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("range read");
+
+        // Line 3 was never displayed by either read → edit must be rejected.
+        let tag = format!("{:04X}", compute_file_hash(content));
+        let out = tool_write(
+            &json!({
+                "edits": format!("[{}#{tag}]\nSWAP 3:\n+fn C() {{}}\n", p.display()),
+                "root": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("never displayed"),
+            "signature read must not grant seen-lines; line-3 edit must be rejected, got:\n{out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+    }
+
+    /// A file with no trailing newline round-trips: the read mints a tag, and a
+    /// tag-matched SWAP lands on the intended line without corrupting the
+    /// missing-final-newline shape.
+    #[test]
+    fn no_trailing_newline_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("nonl.rs");
+        std::fs::write(&p, "fn a() {}\nfn b() {}").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let blob = format!("[{}#{tag}]\nSWAP 2:\n+fn B() {{}}\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {}\nfn B() {}",
+            "SWAP 2 replaces line 2 and preserves the no-trailing-newline shape"
+        );
+    }
 }
