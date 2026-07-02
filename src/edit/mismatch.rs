@@ -8,10 +8,15 @@
 #![allow(dead_code)]
 
 /// A tag/content mismatch that recovery could not resolve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MismatchError {
     /// The expected tag was recorded this session, but the live file hashes to
     /// something else and recovery declined the merge.
+    #[error(
+        "Edit rejected for {path}: file changed between read and edit. \
+             Section is bound to #{expected_tag:04X}, but the current file hashes to \
+             #{actual_tag:04X}. Re-read to refresh the tag before retrying."
+    )]
     Drift {
         path: String,
         expected_tag: u16,
@@ -19,39 +24,18 @@ pub enum MismatchError {
     },
     /// The expected tag was never recorded — likely a hallucinated tag or one
     /// reused from a prior session.
+    #[error(
+        "Edit rejected for {path}: tag #{expected_tag:04X} is not from this session. \
+             Re-read the file to copy a current [path#tag] header — never invent a tag."
+    )]
     Fabricated { path: String, expected_tag: u16 },
     /// An edit anchored on a line the read never displayed under this tag.
+    #[error(
+        "Edit rejected for {path}: line {line} was never displayed under this tag. \
+             Re-read the region you intend to edit."
+    )]
     UnseenAnchor { path: String, line: u32 },
 }
-
-impl std::fmt::Display for MismatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MismatchError::Drift {
-                path,
-                expected_tag,
-                actual_tag,
-            } => write!(
-                f,
-                "Edit rejected for {path}: file changed between read and edit. \
-                 Section is bound to #{expected_tag:04X}, but the current file hashes to \
-                 #{actual_tag:04X}. Re-read to refresh the tag before retrying."
-            ),
-            MismatchError::Fabricated { path, expected_tag } => write!(
-                f,
-                "Edit rejected for {path}: tag #{expected_tag:04X} is not from this session. \
-                 Re-read the file to copy a current [path#tag] header — never invent a tag."
-            ),
-            MismatchError::UnseenAnchor { path, line } => write!(
-                f,
-                "Edit rejected for {path}: line {line} was never displayed under this tag. \
-                 Re-read the region you intend to edit."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MismatchError {}
 
 #[cfg(test)]
 mod tests {

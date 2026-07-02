@@ -90,20 +90,13 @@ pub struct Section {
 }
 
 /// Structured parse failure — never a panic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("line {line}: {msg}")]
 pub struct ParseError {
     /// 1-based line number the error was detected on.
     pub line: usize,
     pub msg: String,
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.msg)
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 /// A parsed section header `[path#TAG]` or `[path]`.
 fn parse_file_header(line: &str) -> Option<(String, Option<u16>)> {
@@ -199,6 +192,32 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
+/// Parse a `*.BLK` op body: strip the trailing payload colon, then resolve the
+/// line/`#symbol` anchor. `keyword` names the op for error messages.
+fn block_payload_anchor(rest: &str, keyword: &str, mode: BlockMode) -> Result<Proto, String> {
+    let body = rest
+        .trim()
+        .strip_suffix(':')
+        .ok_or_else(|| format!("{keyword} needs a trailing colon before the payload"))?;
+    let anchor = parse_block_anchor(body).ok_or_else(|| {
+        format!("{keyword} anchor must be a line number or #symbol, got {body:?}")
+    })?;
+    Ok(Proto::Block { anchor, mode })
+}
+
+/// Parse an `INS.PRE`/`INS.POST` op body: strip the trailing colon, parse the
+/// line number, and build the cursor via `mk`. `keyword` names the op.
+fn ins_cursor(rest: &str, keyword: &str, mk: impl Fn(u32) -> Cursor) -> Result<Proto, String> {
+    let body = rest
+        .trim()
+        .strip_suffix(':')
+        .ok_or_else(|| format!("{keyword} needs a trailing colon"))?;
+    let n: u32 = body
+        .trim()
+        .parse()
+        .map_err(|_| format!("{keyword} anchor must be a line number, got {body:?}"))?;
+    Ok(Proto::Ins { cursor: mk(n) })
+}
 /// Try to parse `line` as an op header. `Ok(None)` = not a header;
 /// `Ok(Some)` = header; `Err` = a header-shaped line that is malformed.
 fn parse_op_header(line: &str) -> Result<Option<Proto>, String> {
@@ -221,30 +240,18 @@ fn parse_op_header(line: &str) -> Result<Option<Proto>, String> {
 
     // Block ops — check the more specific keywords before their prefixes.
     if let Some(rest) = t.strip_prefix("INS.BLK.POST") {
-        let body = rest
-            .trim()
-            .strip_suffix(':')
-            .ok_or_else(|| "INS.BLK.POST needs a trailing colon before the payload".to_string())?;
-        let anchor = parse_block_anchor(body).ok_or_else(|| {
-            format!("INS.BLK.POST anchor must be a line number or #symbol, got {body:?}")
-        })?;
-        return Ok(Some(Proto::Block {
-            anchor,
-            mode: BlockMode::InsPost,
-        }));
+        return Ok(Some(block_payload_anchor(
+            rest,
+            "INS.BLK.POST",
+            BlockMode::InsPost,
+        )?));
     }
     if let Some(rest) = t.strip_prefix("SWAP.BLK") {
-        let body = rest
-            .trim()
-            .strip_suffix(':')
-            .ok_or_else(|| "SWAP.BLK needs a trailing colon before the payload".to_string())?;
-        let anchor = parse_block_anchor(body).ok_or_else(|| {
-            format!("SWAP.BLK anchor must be a line number or #symbol, got {body:?}")
-        })?;
-        return Ok(Some(Proto::Block {
-            anchor,
-            mode: BlockMode::Swap,
-        }));
+        return Ok(Some(block_payload_anchor(
+            rest,
+            "SWAP.BLK",
+            BlockMode::Swap,
+        )?));
     }
     if let Some(rest) = t.strip_prefix("DEL.BLK") {
         let body = rest.trim();
@@ -269,30 +276,10 @@ fn parse_op_header(line: &str) -> Result<Option<Proto>, String> {
         }));
     }
     if let Some(rest) = t.strip_prefix("INS.PRE ") {
-        let body = rest
-            .trim()
-            .strip_suffix(':')
-            .ok_or_else(|| "INS.PRE needs a trailing colon".to_string())?;
-        let n: u32 = body
-            .trim()
-            .parse()
-            .map_err(|_| format!("INS.PRE anchor must be a line number, got {body:?}"))?;
-        return Ok(Some(Proto::Ins {
-            cursor: Cursor::Pre(n),
-        }));
+        return Ok(Some(ins_cursor(rest, "INS.PRE", Cursor::Pre)?));
     }
     if let Some(rest) = t.strip_prefix("INS.POST ") {
-        let body = rest
-            .trim()
-            .strip_suffix(':')
-            .ok_or_else(|| "INS.POST needs a trailing colon".to_string())?;
-        let n: u32 = body
-            .trim()
-            .parse()
-            .map_err(|_| format!("INS.POST anchor must be a line number, got {body:?}"))?;
-        return Ok(Some(Proto::Ins {
-            cursor: Cursor::Post(n),
-        }));
+        return Ok(Some(ins_cursor(rest, "INS.POST", Cursor::Post)?));
     }
 
     // Concrete range ops.
@@ -324,21 +311,63 @@ fn parse_op_header(line: &str) -> Result<Option<Proto>, String> {
     Ok(None)
 }
 
-/// A bare payload row is a copy-pasted read gutter only when every non-empty
-/// row carries a `N:` prefix. Strip one such prefix from each in that case.
-fn strip_uniform_gutter(rows: &mut [String]) {
-    let non_empty: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
-    if non_empty.is_empty() {
+/// Strip a single `N:` read-gutter prefix from every *bare* (non-`+`-authored)
+/// non-empty row, but only when they all carry one — a mixed set means the `N:`
+/// is genuine content. A body whose every stripped remainder is a lone
+/// quoted/numeric literal is a numeric-keyed dict/YAML mapping, not read-output
+/// paste, and is left untouched. Rows authored with an explicit `+` are never
+/// bare and are never touched (mirrors oh-my-pi `parser.ts:329-355`).
+fn strip_uniform_gutter(rows: &mut [String], bare: &[bool]) {
+    let mut saw_bare = false;
+    let mut all_literal_values = true;
+    for (row, &is_bare) in rows.iter().zip(bare) {
+        if !is_bare || row.trim().is_empty() {
+            continue;
+        }
+        saw_bare = true;
+        let Some(n) = gutter_prefix_len(row) else {
+            return; // a bare row without a prefix → mixed → strip nothing
+        };
+        all_literal_values &= is_bare_literal_value(&row[n..]);
+    }
+    if !saw_bare || all_literal_values {
         return;
     }
-    let all_prefixed = non_empty.iter().all(|r| gutter_prefix_len(r).is_some());
-    if !all_prefixed {
-        return;
-    }
-    for row in rows.iter_mut() {
+    for (row, &is_bare) in rows.iter_mut().zip(bare) {
+        if !is_bare || row.trim().is_empty() {
+            continue;
+        }
         if let Some(n) = gutter_prefix_len(row) {
             *row = row[n..].to_string();
         }
+    }
+}
+
+/// Whether `s` is a lone quoted or numeric literal (optionally comma-
+/// terminated) — the shape of a numeric-keyed dict value. Ports
+/// oh-my-pi `BARE_LITERAL_VALUE_RE`.
+fn is_bare_literal_value(s: &str) -> bool {
+    let core = s.trim();
+    let core = core.strip_suffix(',').map_or(core, str::trim_end);
+    if core.is_empty() {
+        return false;
+    }
+    let bytes = core.as_bytes();
+    if (bytes[0] == b'"' || bytes[0] == b'\'') && core.len() >= 2 {
+        let q = bytes[0];
+        return bytes[core.len() - 1] == q && !core.as_bytes()[1..core.len() - 1].contains(&q);
+    }
+    let num = core.strip_prefix(['-', '+']).unwrap_or(core);
+    let (int_part, frac_part) = match num.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (num, None),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match frac_part {
+        Some(f) => !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()),
+        None => true,
     }
 }
 
@@ -363,18 +392,25 @@ fn gutter_prefix_len(row: &str) -> Option<usize> {
 }
 
 /// Normalize a collected payload: strip a single leading `+` sigil per row,
-/// strip a uniform read gutter, then drop trailing blank rows.
-fn finalize_payload(mut rows: Vec<String>) -> Vec<String> {
-    for row in &mut rows {
+/// strip a uniform read gutter from bare rows only, then drop trailing blanks.
+/// A row authored with an explicit `+` is not bare and is never gutter-stripped.
+fn finalize_payload(rows: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(rows.len());
+    let mut bare: Vec<bool> = Vec::with_capacity(rows.len());
+    for row in rows {
         if let Some(stripped) = row.strip_prefix('+') {
-            *row = stripped.to_string();
+            out.push(stripped.to_string());
+            bare.push(false);
+        } else {
+            out.push(row);
+            bare.push(true);
         }
     }
-    strip_uniform_gutter(&mut rows);
-    while rows.last().is_some_and(|r| r.trim().is_empty()) {
-        rows.pop();
+    strip_uniform_gutter(&mut out, &bare);
+    while out.last().is_some_and(|r| r.trim().is_empty()) {
+        out.pop();
     }
-    rows
+    out
 }
 
 struct Pending {
@@ -705,6 +741,52 @@ mod tests {
                 start: 1,
                 end: 1,
                 payload: vec!["time: 12:30".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn plus_authored_numeric_gutter_survives_verbatim() {
+        // `+`-authored rows are never bare: the `+` is stripped but a `N:`-shaped
+        // payload (int-keyed map) is preserved verbatim, never gutter-stripped.
+        let sec = single("[a#0000]\nSWAP 2.=3:\n+0: red\n+1: green\n");
+        assert_eq!(
+            sec.ops,
+            vec![Op::Swap {
+                start: 2,
+                end: 3,
+                payload: vec!["0: red".into(), "1: green".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn bare_numeric_keyed_dict_not_stripped() {
+        // Every stripped remainder is a lone quoted literal → numeric-keyed dict
+        // shape, not read-output paste → the `N:` keys are left untouched
+        // (matches oh-my-pi's allLiteralValues guard).
+        let sec = single("[a#0000]\nSWAP 1.=2:\n0: \"one\"\n1: \"two\"\n");
+        assert_eq!(
+            sec.ops,
+            vec![Op::Swap {
+                start: 1,
+                end: 2,
+                payload: vec!["0: \"one\"".into(), "1: \"two\"".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn bare_uniform_nonliteral_gutter_stripped() {
+        // Bare rows all carry a `N:` gutter and the remainders are not lone
+        // literals → read-output paste → strip the gutter (matches reference).
+        let sec = single("[a#0000]\nSWAP 1.=2:\n0: red\n1: green\n");
+        assert_eq!(
+            sec.ops,
+            vec![Op::Swap {
+                start: 1,
+                end: 2,
+                payload: vec![" red".into(), " green".into()],
             }]
         );
     }

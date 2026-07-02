@@ -16,7 +16,9 @@
 
 use std::path::Path;
 
-use super::apply::{anchor_lines, apply_ops, lower_ops};
+use thiserror::Error;
+
+use super::apply::{anchor_lines, apply_ops, lower_ops, ApplyError, ApplyResult};
 use super::mismatch::MismatchError;
 use super::parser::Op;
 use super::snapshots::{Snapshot, SnapshotStore};
@@ -31,7 +33,10 @@ pub fn try_recover(
     ops: &[Op],
     live: &str,
 ) -> Result<String, MismatchError> {
-    let key = path.to_string_lossy().into_owned();
+    // Derive the store key through the crate's single canonical-key owner so a
+    // tag recorded under a canonical realpath is found here regardless of the
+    // raw path spelling (e.g. macOS case divergence).
+    let key = super::normalize_path_key(path);
     let Some(snapshot) = store.by_tag(&key, tag) else {
         return Err(if store.find_by_tag(tag).is_empty() {
             MismatchError::Fabricated {
@@ -47,7 +52,7 @@ pub fn try_recover(
         });
     };
 
-    let is_head = store.head(&key).map(|h| h.tag) == Some(tag);
+    let is_head = store.head_tag(&key) == Some(tag);
 
     // Strategy 1: replay on snapshot, 3-way-merge the delta onto live.
     if let Some(merged) = merge_onto_live(path, &snapshot.text, live, ops) {
@@ -83,13 +88,13 @@ fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Optio
 }
 
 fn replay_session_chain(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<String> {
-    if snapshot.split('\n').count() != live.split('\n').count() {
+    let prev: Vec<&str> = snapshot.split('\n').collect();
+    let curr: Vec<&str> = live.split('\n').collect();
+    if prev.len() != curr.len() {
         return None;
     }
     let (line_ops, _) = lower_ops(path, live, ops).ok()?;
     let anchors = anchor_lines(&line_ops);
-    let prev: Vec<&str> = snapshot.split('\n').collect();
-    let curr: Vec<&str> = live.split('\n').collect();
     for a in anchors {
         let idx = (a as usize).checked_sub(1)?;
         if idx >= prev.len() || idx >= curr.len() || prev[idx] != curr[idx] {
@@ -124,6 +129,25 @@ pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<
         }
     }
     Ok(())
+}
+
+/// Failure from the composed edit egress: either the provenance gate rejected
+/// the edit, or applying the ops to the gated snapshot failed.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EditError {
+    #[error(transparent)]
+    Mismatch(#[from] MismatchError),
+    #[error(transparent)]
+    Apply(#[from] ApplyError),
+}
+
+/// The composed no-drift edit egress: enforce the seenLines provenance gate on
+/// `snapshot`, then apply `ops` to the snapshot text. This is the single
+/// entrypoint PR2 wires; raw `apply_ops` stays module-internal so no caller can
+/// apply edits while skipping the gate.
+pub fn gated_apply(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<ApplyResult, EditError> {
+    check_seen_lines(snapshot, path, ops)?;
+    Ok(apply_ops(path, &snapshot.text, ops)?)
 }
 
 #[cfg(test)]
@@ -254,5 +278,52 @@ mod tests {
         let snap = store.by_tag(&key, tag).unwrap();
         // No provenance recorded → gate is skipped.
         assert!(check_seen_lines(&snap, &p(), &swap(2, "x")).is_ok());
+    }
+
+    #[test]
+    fn recovery_key_is_canonical_not_raw_spelling() {
+        let mut store = SnapshotStore::new();
+        // Record under the canonical key, exactly as the recording path does.
+        let canonical = super::super::normalize_path_key(&p());
+        let snapshot = "line1\nTARGET\nline3\n";
+        let tag = store.record(&canonical, snapshot, []).unwrap();
+
+        // Recover using a differently-spelled path that canonicalizes to the
+        // same key. A raw `to_string_lossy` key ("./recovery_fixture.rs") would
+        // miss the recorded canonical key and fail recovery.
+        let raw_spelling = PathBuf::from("./recovery_fixture.rs");
+        assert_ne!(
+            raw_spelling.to_string_lossy(),
+            canonical,
+            "raw spelling must differ from the canonical key for this test to bite"
+        );
+        let recovered = try_recover(&store, &raw_spelling, tag, &swap(2, "CHANGED"), snapshot)
+            .expect("canonical key lookup recovers despite raw path spelling");
+        assert_eq!(recovered, "line1\nCHANGED\nline3\n");
+    }
+
+    #[test]
+    fn gated_apply_enforces_seen_lines_then_applies() {
+        let snap = Snapshot {
+            path: "g.rs".into(),
+            text: "l1\nl2\nl3\n".into(),
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: [1, 2].into_iter().collect(),
+        };
+
+        // An edit on an unseen line is rejected by the composed gate.
+        let err = gated_apply(&snap, &p(), &swap(3, "x")).unwrap_err();
+        assert_eq!(
+            err,
+            EditError::Mismatch(MismatchError::UnseenAnchor {
+                path: "g.rs".into(),
+                line: 3,
+            })
+        );
+
+        // An edit on a seen line passes the gate and applies to snapshot text.
+        let result = gated_apply(&snap, &p(), &swap(2, "CHANGED")).unwrap();
+        assert_eq!(result.text, "l1\nCHANGED\nl3\n");
     }
 }

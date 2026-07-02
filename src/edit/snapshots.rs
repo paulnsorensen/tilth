@@ -152,6 +152,14 @@ impl SnapshotStore {
         self.versions.peek(path).and_then(|h| h.first().cloned())
     }
 
+    /// Tag of the most-recently recorded version for `path`, without cloning
+    /// the (up to 4 MiB) snapshot text.
+    pub fn head_tag(&self, path: &str) -> Option<u16> {
+        self.versions
+            .peek(path)
+            .and_then(|h| h.first().map(|s| s.tag))
+    }
+
     /// Retained version for `path` whose tag equals `tag`.
     pub fn by_tag(&self, path: &str, tag: u16) -> Option<Snapshot> {
         self.versions
@@ -413,5 +421,36 @@ mod tests {
         let tag = store.record("a.rs", "x\n", []).unwrap();
         store.invalidate("a.rs");
         assert!(store.by_tag("a.rs", tag).is_none());
+    }
+
+    #[test]
+    fn same_content_rerecord_merges_seen_and_keeps_ring() {
+        let mut store = SnapshotStore::new();
+        let t1 = store.record("a.rs", "v1\n", []).unwrap();
+        store.record("a.rs", "v2\n", []).unwrap();
+        store.record("a.rs", "v3\n", []).unwrap();
+        let t4 = store.record("a.rs", "v4\n", [1]).unwrap();
+
+        // Re-recording identical content refreshes the SAME version in place
+        // rather than inserting a duplicate.
+        let again = store.record("a.rs", "v4\n", [2]).unwrap();
+        assert_eq!(again, t4, "identical content mints the same tag");
+
+        let snap = store.by_tag("a.rs", t4).unwrap();
+        assert_eq!(
+            snap.seen_lines,
+            HashSet::from([1, 2]),
+            "seen lines merged, not replaced"
+        );
+        assert_eq!(
+            store.head("a.rs").unwrap().tag,
+            t4,
+            "re-record promotes to head"
+        );
+        // No ring slot consumed: the oldest distinct version is NOT evicted.
+        assert!(
+            store.by_tag("a.rs", t1).is_some(),
+            "no duplicate inserted → v1 retained"
+        );
     }
 }

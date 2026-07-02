@@ -10,9 +10,10 @@
 
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::path::Path;
 
-use super::block::resolve_block;
+use super::block::{outline_for, resolve_block_in};
 use super::parser::{BlockMode, Cursor, Op};
 
 /// File-level operation surfaced separately from the text edit.
@@ -34,41 +35,21 @@ pub struct ApplyResult {
 }
 
 /// Why an apply failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
     /// Two ranged ops touch overlapping lines.
+    #[error("overlapping edit ranges: {}.={} and {}.={}", a.0, a.1, b.0, b.1)]
     Overlap { a: (u32, u32), b: (u32, u32) },
     /// A line anchor is outside `1..=total`.
+    #[error("line {line} out of bounds (file has {total} lines)")]
     OutOfBounds { line: u32, total: usize },
     /// A block anchor could not be resolved to a span.
+    #[error("could not resolve block anchor: {0}")]
     BlockUnresolved(String),
     /// `REM` combined with other ops, or more than one file op.
+    #[error("REM cannot combine with other ops; only one file op per section")]
     FileOpConflict,
 }
-
-impl std::fmt::Display for ApplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApplyError::Overlap { a, b } => write!(
-                f,
-                "overlapping edit ranges: {}.={} and {}.={}",
-                a.0, a.1, b.0, b.1
-            ),
-            ApplyError::OutOfBounds { line, total } => {
-                write!(f, "line {line} out of bounds (file has {total} lines)")
-            }
-            ApplyError::BlockUnresolved(s) => write!(f, "could not resolve block anchor: {s}"),
-            ApplyError::FileOpConflict => {
-                write!(
-                    f,
-                    "REM cannot combine with other ops; only one file op per section"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ApplyError {}
 
 /// A lowered, concrete line op — no blocks, no file ops.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +71,7 @@ pub enum LineOp {
 
 /// Lower `ops` into concrete [`LineOp`]s by resolving block anchors against
 /// `text` (language inferred from `path`). File ops are returned separately.
-pub fn lower_ops(
+pub(super) fn lower_ops(
     path: &Path,
     text: &str,
     ops: &[Op],
@@ -99,6 +80,14 @@ pub fn lower_ops(
     let mut file_op: Option<FileOp> = None;
     let mut has_content = false;
 
+    // Parse the outline once when any block ops need span resolution: each
+    // `get_outline_entries` call re-parses the whole file, so resolving K block
+    // anchors must not trigger K parses.
+    let outline = if ops.iter().any(|o| matches!(o, Op::Block { .. })) {
+        outline_for(path, text)
+    } else {
+        None
+    };
     for op in ops {
         match op {
             Op::Swap {
@@ -133,7 +122,9 @@ pub fn lower_ops(
                 payload,
             } => {
                 has_content = true;
-                let span = resolve_block(path, text, anchor)
+                let span = outline
+                    .as_deref()
+                    .and_then(|entries| resolve_block_in(entries, anchor))
                     .ok_or_else(|| ApplyError::BlockUnresolved(format!("{anchor:?}")))?;
                 match mode {
                     BlockMode::Swap => line_ops.push(LineOp::Swap {
@@ -175,7 +166,7 @@ pub fn lower_ops(
 }
 
 /// The anchor lines an op set reads, for recovery's session-chain content check.
-pub fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
+pub(super) fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
     let mut lines = Vec::new();
     for op in ops {
         match op {
@@ -194,7 +185,7 @@ pub fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
 }
 
 /// Apply `ops` to `text`, resolving block anchors against `path`.
-pub fn apply_ops(path: &Path, text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
+pub(super) fn apply_ops(path: &Path, text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
     let (line_ops, file_op) = lower_ops(path, text, ops)?;
     let mut result = apply_line_ops(text, &line_ops)?;
     result.file_op = file_op;
@@ -213,8 +204,8 @@ struct Splice {
 
 /// Splice `line_ops` into `text`, treating it as `split('\n')` rows with 1-based
 /// line numbers (self-consistent with the whole-file-tag numbered-line render).
-pub fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyResult, ApplyError> {
-    let rows: Vec<String> = text.split('\n').map(str::to_string).collect();
+pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyResult, ApplyError> {
+    let rows: Vec<Cow<str>> = text.split('\n').map(Cow::Borrowed).collect();
     let total = rows.len();
 
     let mut splices: Vec<Splice> = Vec::with_capacity(line_ops.len());
@@ -274,13 +265,21 @@ pub fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyResult, Ap
     // Apply in descending index order so earlier splices don't invalidate the
     // indices of later ones.
     let mut order: Vec<usize> = (0..splices.len()).collect();
-    order.sort_by(|&a, &b| splices[b].idx.cmp(&splices[a].idx));
+    order.sort_by(|&a, &b| {
+        splices[b].idx.cmp(&splices[a].idx).then_with(|| {
+            // At the same index, apply the ranged splice before a zero-width
+            // insert so the insert lands relative to the post-splice rows rather
+            // than mid-range (e.g. `INS.PRE 2` + `SWAP 2.=3`, order-independent).
+            let rank = |s: &Splice| usize::from(s.range.is_none());
+            rank(&splices[a]).cmp(&rank(&splices[b]))
+        })
+    });
 
     let mut owned = rows;
     for &i in &order {
         let s = &splices[i];
         let end = (s.idx + s.len).min(owned.len());
-        owned.splice(s.idx..end, s.new.iter().cloned());
+        owned.splice(s.idx..end, s.new.iter().map(|l| Cow::Owned(l.clone())));
     }
 
     let out = owned.join("\n");
@@ -485,13 +484,19 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(matches!(err, ApplyError::Overlap { .. }), "{err:?}");
+        assert_eq!(
+            err,
+            ApplyError::Overlap {
+                a: (1, 3),
+                b: (2, 2)
+            }
+        );
     }
 
     #[test]
     fn out_of_bounds_rejected() {
         let err = apply("a\nb\n", &[Op::Del { start: 9, end: 9 }]).unwrap_err();
-        assert!(matches!(err, ApplyError::OutOfBounds { .. }), "{err:?}");
+        assert_eq!(err, ApplyError::OutOfBounds { line: 9, total: 3 });
     }
 
     #[test]
@@ -649,5 +654,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.text, "a\r\nB\nc\r\n");
+    }
+
+    #[test]
+    fn insert_at_range_top_boundary_is_order_independent() {
+        // `INS.PRE 2` (insert before line 2) + `SWAP 2.=3` share 0-based idx 1.
+        // The result must not depend on op-list order: the ranged swap applies
+        // first, then the insert lands before the swapped rows.
+        let ins = Op::Ins {
+            cursor: Cursor::Pre(2),
+            payload: vec!["mid".into()],
+        };
+        let swap = Op::Swap {
+            start: 2,
+            end: 3,
+            payload: vec!["X".into()],
+        };
+
+        let insert_first = apply("a\nb\nc\nd\n", &[ins.clone(), swap.clone()]).unwrap();
+        assert_eq!(insert_first.text, "a\nmid\nX\nd\n");
+
+        let swap_first = apply("a\nb\nc\nd\n", &[swap, ins]).unwrap();
+        assert_eq!(swap_first.text, "a\nmid\nX\nd\n");
+
+        assert_eq!(insert_first.text, swap_first.text);
     }
 }

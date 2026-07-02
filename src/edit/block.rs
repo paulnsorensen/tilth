@@ -23,16 +23,28 @@ pub struct BlockSpan {
 /// `path`). Returns `None` for an unknown language, an out-of-range or blank
 /// line, or a symbol/line that resolves to no block.
 pub fn resolve_block(path: &Path, text: &str, anchor: &BlockAnchor) -> Option<BlockSpan> {
+    resolve_block_in(&outline_for(path, text)?, anchor)
+}
+
+/// Outline entries for `text` under the language inferred from `path`, or
+/// `None` for a non-code file. Parsing the whole file is the expensive step, so
+/// callers resolving several anchors should compute this once and reuse it via
+/// [`resolve_block_in`].
+pub fn outline_for(path: &Path, text: &str) -> Option<Vec<OutlineEntry>> {
     let FileType::Code(lang) = crate::lang::detect_file_type(path) else {
         return None;
     };
-    let entries = get_outline_entries(text, lang);
+    Some(get_outline_entries(text, lang))
+}
+
+/// Resolve `anchor` against pre-computed outline `entries`.
+pub fn resolve_block_in(entries: &[OutlineEntry], anchor: &BlockAnchor) -> Option<BlockSpan> {
     match anchor {
         BlockAnchor::Symbol(name) => {
-            find_by_name(&entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
+            find_by_name(entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
         }
         BlockAnchor::Line(line) => {
-            resolve_line(&entries, *line).map(|(s, e)| BlockSpan { start: s, end: e })
+            resolve_line(entries, *line).map(|(s, e)| BlockSpan { start: s, end: e })
         }
     }
 }
