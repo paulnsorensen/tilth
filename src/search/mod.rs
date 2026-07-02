@@ -1,4 +1,3 @@
-pub mod blast;
 pub mod callees;
 pub mod callers;
 pub mod content;
@@ -1392,8 +1391,7 @@ fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, Str
             }
 
             if edit_mode {
-                let hash = crate::format::line_hash(line.as_bytes());
-                let _ = write!(out, "\n{i}:{hash:03x}|{line}");
+                let _ = write!(out, "\n{i}:{line}");
             } else {
                 let _ = write!(out, "\n{i:>4} │ {line}");
             }
@@ -1421,16 +1419,15 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
 
         // Extract the line number from a formatted content line. Two gutter
         // formats exist: the default `"  42 │ content"` (number before the `│`
-        // gutter) and edit-mode hashlines `"42:a3f|content"` (number is the
-        // `line:` prefix before the `|` delimiter). Parse both so noise
-        // stripping/truncation works in edit mode too.
+        // gutter) and edit-mode numbered lines `"42:content"` (number is the
+        // `line:` prefix). Parse both so noise stripping/truncation works in
+        // edit mode too.
         let line_num = if let Some(pos) = segment.find('│') {
             segment[..pos].trim().parse::<u32>().ok()
         } else {
             segment
-                .find('|')
-                .and_then(|pos| segment[..pos].split(':').next())
-                .and_then(|n| n.trim().parse::<u32>().ok())
+                .split_once(':')
+                .and_then(|(n, _)| n.trim().parse::<u32>().ok())
         };
 
         if let Some(num) = line_num {

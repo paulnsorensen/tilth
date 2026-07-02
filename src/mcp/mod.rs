@@ -14,7 +14,6 @@ mod iso;
 mod path_suffix;
 mod tools;
 mod tree;
-mod write;
 
 use tools::{
     tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
@@ -1085,9 +1084,9 @@ mod tests {
         assert!(!out.contains("l1"), "line 1 must be excluded: {out}");
     }
 
-    /// `mode: signature` emits hash-prefixed signature lines, not full bodies.
+    /// `mode: signature` emits numbered signature lines, not full bodies.
     #[test]
-    fn tool_read_signature_mode_emits_hash_prefixed_signatures() {
+    fn tool_read_signature_mode_emits_numbered_signature_lines() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("lib.rs");
         std::fs::write(
@@ -1107,11 +1106,12 @@ mod tests {
             "signature header missing: {out}"
         );
         assert!(
-            out.lines().any(
-                |l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()
-                    && l.contains("fn signature_target")
-            ),
-            "hash-prefixed signature line missing: {out}"
+            out.lines().any(|l| l
+                .split_once(':')
+                .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+                .is_some()
+                && l.contains("fn signature_target")),
+            "numbered signature line missing: {out}"
         );
         assert!(
             !out.contains("body_marker"),
@@ -1119,9 +1119,9 @@ mod tests {
         );
     }
 
-    /// Auto mode uses the same hash-prefixed signature output for large code.
+    /// Auto mode uses the same numbered signature output for large code.
     #[test]
-    fn tool_read_auto_large_code_emits_hash_prefixed_signatures() {
+    fn tool_read_auto_large_code_emits_numbered_signature_lines() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("large.rs");
         let mut src = String::from("fn large_signature_target() {\n    let body_marker = 42;\n}\n");
@@ -1137,8 +1137,10 @@ mod tests {
         );
         assert!(
             out.lines().any(|l| l.contains("large_signature_target")
-                && crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()),
-            "hash-prefixed signature line missing: {out}"
+                && l.split_once(':')
+                    .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+                    .is_some()),
+            "numbered signature line missing: {out}"
         );
         assert!(
             !out.contains("body_marker"),
@@ -1340,11 +1342,11 @@ mod tests {
         );
     }
 
-    /// Hashlines must NOT appear in stripped output even when the server is
-    /// in edit mode — the line set is non-contiguous with the file on disk
+    /// Editable `<line>:<content>` anchors must NOT appear in stripped output
+    /// even when the server is in edit mode — the line set is non-contiguous with the file on disk
     /// and would mislead the agent into trying to anchor a write.
     #[test]
-    fn tool_read_stripped_suppresses_hashlines_in_edit_mode() {
+    fn tool_read_stripped_suppresses_editable_anchors_in_edit_mode() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nohash.rs");
         std::fs::write(&p, "fn keep() {}\n// stripped\nfn also() {}\n").unwrap();
@@ -1354,16 +1356,16 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        // edit_mode = true intentionally — stripped MUST still suppress hashlines.
+        // edit_mode = true intentionally — stripped MUST still suppress editable anchors.
         let out = tool_read(&args, &cache, &session, true).expect("stripped+edit ok");
-        // Hashline format is `<line>:<3-hex>|<content>`. Check the body has
-        // no such anchored line for our `fn keep()` content.
+        // Stripped output is non-contiguous with disk, so it must NOT present
+        // editable `<line>:<content>` numbered anchors for the `fn keep()` line.
         assert!(
-            !out.lines().any(
-                |l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()
-                    && l.contains("fn keep()")
-            ),
-            "no hashline anchors in stripped output: {out}"
+            !out.lines().any(|l| l.contains("fn keep()")
+                && l.split_once(':')
+                    .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+                    .is_some()),
+            "stripped output must not present editable numbered anchors: {out}"
         );
         assert!(
             out.contains("non-editable view"),
@@ -2279,11 +2281,11 @@ mod tests {
         );
     }
 
-    /// Spec criterion 4: in `edit_mode`, expanded search source lines carry
-    /// `<line>:<hash>` prefixes (no leading gutter), ready to round-trip
-    /// through `tilth_write` hash anchors.
+    /// In `edit_mode`, expanded search source lines carry `<line>:<content>`
+    /// numbered prefixes (no leading gutter), matching the whole-file-tag read
+    /// format.
     #[test]
-    fn tool_search_expand_emits_hashlines_in_edit_mode() {
+    fn tool_search_expand_emits_numbered_anchors_in_edit_mode() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("hello.rs");
         // Consecutive blank lines (3, 4) exercise the blank-line collapse /
@@ -2303,13 +2305,13 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, true).expect("edit-mode search ok");
-        // Expected: a line of the form `1:xxx|fn unique_symbol_for_hashline_test() {`.
-        let has_hash_anchor = out
+        // Expected: a line of the form `1:fn unique_symbol_for_hashline_test() {`.
+        let has_numbered_anchor = out
             .lines()
-            .any(|l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some());
+            .any(|l| l.starts_with("1:") && l.contains("fn unique_symbol_for_hashline_test"));
         assert!(
-            has_hash_anchor,
-            "expected <line>:<hash>| anchor in expanded source: {out}"
+            has_numbered_anchor,
+            "expected <line>:<content> numbered anchor in expanded source: {out}"
         );
         // The marker is on source line 5; its anchor must read `5:` despite the
         // collapsed blank run above it. Proves stripping preserves absolute line
