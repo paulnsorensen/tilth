@@ -420,6 +420,15 @@ struct Pending {
 }
 
 /// Parse a full op-grammar blob into sections.
+///
+/// Bare payload rows that look like a `[path#TAG]` header or an op keyword
+/// (`REM`, `DEL n`, `MV dest`, …) are read as directives, not payload — author
+/// such rows with a `+` prefix to keep them literal.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] naming the offending line when the blob does not
+/// conform to the grammar.
 pub fn parse_sections(input: &str) -> Result<Vec<Section>, ParseError> {
     let mut sections: Vec<Section> = Vec::new();
     let mut current: Option<Section> = None;

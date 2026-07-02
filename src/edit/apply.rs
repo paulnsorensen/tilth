@@ -185,6 +185,11 @@ pub(super) fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
 }
 
 /// Apply `ops` to `text`, resolving block anchors against `path`.
+///
+/// # Errors
+///
+/// Returns [`ApplyError`] when ops overlap, an anchor is out of bounds or
+/// unresolved, or file ops conflict.
 pub(super) fn apply_ops(path: &Path, text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
     let (line_ops, file_op) = lower_ops(path, text, ops)?;
     let mut result = apply_line_ops(text, &line_ops)?;
@@ -536,8 +541,6 @@ mod tests {
         assert_eq!(r.text, "a\nb\n", "MV is a file op — text is unchanged");
         assert_eq!(r.first_changed_line, None);
     }
-
-    // --- boundary coverage ---
 
     #[test]
     fn ins_head_into_empty_file() {

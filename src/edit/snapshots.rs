@@ -103,7 +103,10 @@ impl SnapshotStore {
         let seen: HashSet<u32> = seen_lines.into_iter().collect();
 
         let mut history = self.versions.pop(path).unwrap_or_default();
-        if let Some(pos) = history.iter().position(|s| s.tag == tag) {
+        if let Some(pos) = history
+            .iter()
+            .position(|s| s.tag == tag && s.text == full_text)
+        {
             // Same content observed again: refresh recency, merge seen lines,
             // promote to head.
             let mut existing = history.remove(pos);
@@ -256,6 +259,30 @@ mod tests {
         assert_eq!(snap.text, "hello\nworld\n");
         assert_eq!(snap.tag, tag);
         assert_eq!(snap.seen_lines, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn tag_collision_with_different_content_stores_both_versions() {
+        let base = "line one\n";
+        let base_tag = compute_file_hash(base);
+        let mut colliding = None;
+        for i in 0..200_000u32 {
+            let cand = format!("candidate {i}\n");
+            if compute_file_hash(&cand) == base_tag {
+                colliding = Some(cand);
+                break;
+            }
+        }
+        let colliding = colliding.expect("16-bit collision found within search budget");
+
+        let mut store = SnapshotStore::new();
+        let t1 = store.record("a.rs", base, [1]).unwrap();
+        let t2 = store.record("a.rs", &colliding, [1]).unwrap();
+        assert_eq!(t1, t2, "both versions mint the same colliding tag");
+
+        // The colliding-but-different version must be stored distinctly; by_tag
+        // returns the latest content, not the stale first version.
+        assert_eq!(store.by_tag("a.rs", t2).unwrap().text, colliding);
     }
 
     #[test]

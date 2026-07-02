@@ -26,6 +26,12 @@ use super::tag::compute_file_hash;
 
 /// Attempt recovery for a stale-tag incident. Returns the recovered text or a
 /// [`MismatchError`] describing why recovery failed.
+///
+/// # Errors
+///
+/// Returns [`MismatchError::Fabricated`] when `tag` was never recorded this
+/// session, or [`MismatchError::Drift`] when the ops cannot be replayed onto
+/// the live text.
 pub fn try_recover(
     store: &SnapshotStore,
     path: &Path,
@@ -115,11 +121,12 @@ pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<
     if snapshot.seen_lines.is_empty() {
         return Ok(());
     }
-    let (line_ops, _) =
-        lower_ops(path, &snapshot.text, ops).map_err(|_| MismatchError::UnseenAnchor {
-            path: snapshot.path.clone(),
-            line: 0,
-        })?;
+    // If lowering fails (unresolved block anchor, file-op conflict, bad range),
+    // skip the gate rather than misreport it as an unseen-line violation —
+    // apply_ops re-runs the lowering and surfaces the real ApplyError.
+    let Ok((line_ops, _)) = lower_ops(path, &snapshot.text, ops) else {
+        return Ok(());
+    };
     for line in anchor_lines(&line_ops) {
         if !snapshot.seen_lines.contains(&line) {
             return Err(MismatchError::UnseenAnchor {
@@ -145,6 +152,11 @@ pub enum EditError {
 /// `snapshot`, then apply `ops` to the snapshot text. This is the single
 /// entrypoint PR2 wires; raw `apply_ops` stays module-internal so no caller can
 /// apply edits while skipping the gate.
+///
+/// # Errors
+///
+/// Returns [`EditError::Mismatch`] when the provenance gate rejects the edit,
+/// or [`EditError::Apply`] when applying the ops fails.
 pub fn gated_apply(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<ApplyResult, EditError> {
     check_seen_lines(snapshot, path, ops)?;
     Ok(apply_ops(path, &snapshot.text, ops)?)
@@ -325,5 +337,24 @@ mod tests {
         // An edit on a seen line passes the gate and applies to snapshot text.
         let result = gated_apply(&snap, &p(), &swap(2, "CHANGED")).unwrap();
         assert_eq!(result.text, "l1\nCHANGED\nl3\n");
+    }
+
+    #[test]
+    fn gate_skips_on_lowering_failure_so_apply_surfaces_real_error() {
+        let snap = Snapshot {
+            path: "g.rs".into(),
+            text: "l1\nl2\n".into(),
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: [1].into_iter().collect(),
+        };
+        // REM combined with another op fails lowering (FileOpConflict). The
+        // gate must not misreport that as UnseenAnchor { line: 0 }.
+        let mut ops = vec![Op::Rem];
+        ops.extend(swap(1, "x"));
+
+        assert!(check_seen_lines(&snap, &p(), &ops).is_ok());
+        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
+        assert_eq!(err, EditError::Apply(ApplyError::FileOpConflict));
     }
 }
