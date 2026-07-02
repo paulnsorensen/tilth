@@ -117,7 +117,7 @@ fn current_dir_or_log() -> PathBuf {
 }
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
-/// switches `tilth_read` to hashline output format.
+/// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.

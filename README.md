@@ -22,8 +22,8 @@ $ tilth src/auth.ts
 Small files come back whole. Large files get an outline. Drill in with `--section`:
 
 ```bash
-$ tilth src/auth.ts --section 44-89
-$ tilth docs/guide.md --section "## Installation"
+tilth src/auth.ts --section 44-89
+tilth docs/guide.md --section "## Installation"
 ```
 
 ## Search finds definitions first
@@ -60,8 +60,8 @@ Expanded definitions include a **callee footer** (`── calls ──`) showing
 CLI search returns compact results by default. Use `--expand` to inline source for the top matches:
 
 ```bash
-$ tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
-$ tilth handleAuth --scope src/ --expand=5     # top 5
+tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
+tilth handleAuth --scope src/ --expand=5     # top 5
 ```
 
 In MCP mode, `expand` defaults to 2 — no flag needed.
@@ -71,7 +71,7 @@ In MCP mode, `expand` defaults to 2 — no flag needed.
 Trace across files in one call:
 
 ```bash
-$ tilth "ServeHTTP, HandlersChain, Next" --scope .
+tilth "ServeHTTP, HandlersChain, Next" --scope .
 ```
 
 Each symbol gets its own result block with definitions and expansions. The expand budget is shared — at least one expansion per symbol, deduped across files.
@@ -222,26 +222,24 @@ Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-li
 
 ## Edit mode
 
-Install with `--edit` to add `tilth_edit` and switch `tilth_read` to hashline output:
+Install with `--edit` to add `tilth_write` and switch `tilth_read` to whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
 
 ```
-42:a3f|  let x = compute();
-43:f1b|  return x;
+[src/auth.ts#1A2B]
+42:  let x = compute();
+43:  return x;
 ```
 
-`tilth_edit` uses these hashes as anchors. If the file changed since the last read, hashes won't match and the edit is rejected with current content shown:
+`tilth_write` takes an op-grammar blob: `[path#TAG]` sections with op lines (`SWAP`, `DEL`, `INS.PRE`/`INS.POST`, block ops) that reference those line numbers. Copy the `[path#TAG]` header verbatim — it binds the edit to the content you read. If the file changed since, tilth 3-way-merges your ops onto the live file and rejects the section only when the merge conflicts:
 
-```json
-{
-  "path": "src/auth.ts",
-  "edits": [
-    { "start": "42:a3f", "content": "  let x = recompute();" },
-    { "start": "44:b2c", "end": "46:e1d", "content": "" }
-  ]
-}
+```
+[src/auth.ts#1A2B]
+SWAP 42:
+  let x = recompute();
+DEL 44.=46
 ```
 
-Large files still outline first — use `section` to get hashlined content for the part you need.
+Large files still outline first — use `section` to get numbered content for the part you need.
 
 Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/).
 

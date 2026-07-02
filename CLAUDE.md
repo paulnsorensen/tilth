@@ -50,7 +50,7 @@ src/
     mod.rs             Path-key normalization; re-exports the whole-file-tag edit modules below.
     tag.rs             Whole-file content tag (`[path#TAG]`) mint/verify + numbered-line rendering.
     parser.rs          Op-grammar parser: `[path#TAG]` sections into ops.
-    block.rs           Block/op model shared by parser and apply.
+    block.rs           Resolves a `#symbol`/line block anchor to a concrete line span (wires to `lang/outline`).
     apply.rs           Applies parsed ops to file content (line-op splicing).
     recovery.rs        3-way-merge recovery when the live file drifted since the tagged read.
     snapshots.rs       Per-session file snapshots keyed by tag for edit verification.
