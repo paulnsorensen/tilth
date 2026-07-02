@@ -527,15 +527,6 @@ struct Block {
     text: String,
 }
 
-/// Read one or more line ranges from a file. Each range is "start-end"
-/// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
-/// markdown files. Mmaps the file once and emits a single `[section]`
-/// header followed by the formatted blocks; when more than one range is
-/// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
-///
-/// Ranges are emitted in the order supplied — overlapping or out-of-order
-/// ranges are honored verbatim, not coalesced or sorted. Any invalid
-/// range fails the whole call.
 /// Edit-mode whole-file view: tilth's `# path (...) [full]` header, then the
 /// whole-file-tag section header `[path#TAG]` and `N:content` numbered lines
 /// (`split('\n')`, phantom trailing row included). Files over the per-file
@@ -579,9 +570,30 @@ pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec
         SeenSpec::Ranges(ranges) => ranges.iter().flat_map(|&(s, e)| s..=e.max(s)).collect(),
     };
     let key = crate::edit::normalize_path_key(path);
-    session.snapshots().record(&key, &text, seen);
+    session.record_snapshot(&key, &text, seen);
 }
 
+/// Resolve a markdown `#heading` anchor to its 1-based inclusive line span,
+/// for the seen-lines provenance of an edit-mode heading read. Returns `None`
+/// when the file is unreadable or the heading is absent (caller falls back).
+pub fn resolve_heading_span(path: &Path, heading: &str) -> Option<(u32, u32)> {
+    let bytes = fs::read(path).ok()?;
+    let (start, end) = resolve_heading(&bytes, heading)?;
+    Some((
+        u32::try_from(start).unwrap_or(u32::MAX),
+        u32::try_from(end).unwrap_or(u32::MAX),
+    ))
+}
+
+/// Read one or more line ranges from a file. Each range is "start-end"
+/// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
+/// markdown files. Mmaps the file once and emits a single `[section]`
+/// header followed by the formatted blocks; when more than one range is
+/// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
+///
+/// Ranges are emitted in the order supplied — overlapping or out-of-order
+/// ranges are honored verbatim, not coalesced or sorted. Any invalid
+/// range fails the whole call.
 pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<String, TilthError> {
     if ranges.is_empty() {
         return Err(TilthError::InvalidQuery {

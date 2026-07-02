@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use crate::edit::apply::FileOp;
 use crate::edit::parser::{parse_sections, Op, Section};
-use crate::edit::recovery::{gated_apply, try_recover};
-use crate::edit::snapshots::Snapshot;
+use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
+use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header, render_numbered_whole};
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
@@ -72,45 +72,48 @@ pub(crate) fn tool_write(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    let ctx = SectionCtx {
+        root: root.as_deref(),
+        confine_root: &confine_root,
+        session,
+        show_diff,
+    };
     let mut results: Vec<String> = Vec::with_capacity(sections.len());
-    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
     for section in &sections {
-        results.push(apply_section(
-            section,
-            root.as_deref(),
-            &confine_root,
-            session,
-            show_diff,
-            &mut seen_paths,
-        ));
+        results.push(apply_section(section, &ctx, &mut seen_paths));
     }
     Ok(results.join("\n\n---\n\n"))
+}
+
+/// Shared per-call context threaded through the section pipeline: the anchor
+/// root, the confinement boundary, the session store, and the diff flag.
+struct SectionCtx<'a> {
+    root: Option<&'a Path>,
+    confine_root: &'a Path,
+    session: &'a Session,
+    show_diff: bool,
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
 /// returns a `## <path>` Markdown block (success or error) — one failed section
 /// never aborts the others.
-fn apply_section(
-    section: &Section,
-    root: Option<&Path>,
-    confine_root: &Path,
-    session: &Session,
-    show_diff: bool,
-    seen_paths: &mut HashSet<PathBuf>,
-) -> String {
+fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<String>) -> String {
     let raw = &section.path;
-    let path = match resolve_confined(raw, root, confine_root) {
+    let path = match resolve_confined(raw, ctx.root, ctx.confine_root) {
         Ok(p) => p,
         Err(e) => return format!("## {raw}\nerror: {e}"),
     };
-    if !seen_paths.insert(path.clone()) {
+    // Key the duplicate-path guard on the canonical key so `src/a.rs` and
+    // `src/./a.rs` collide, preserving the one-section-per-file invariant.
+    if !seen_paths.insert(crate::edit::normalize_path_key(&path)) {
         return format!(
             "## {}\nerror: duplicate path in this call — group all ops for a file under one [path#TAG] section",
             path.display()
         );
     }
 
-    match commit_section(section, &path, root, confine_root, session, show_diff) {
+    match commit_section(section, &path, ctx) {
         Ok(block) => block,
         Err(e) => format!("## {}\nerror: {e}", path.display()),
     }
@@ -118,14 +121,8 @@ fn apply_section(
 
 /// The per-section egress: read live content, verify/recover against the tag,
 /// carry out any file op, write, and record the fresh snapshot.
-fn commit_section(
-    section: &Section,
-    path: &Path,
-    root: Option<&Path>,
-    confine_root: &Path,
-    session: &Session,
-    show_diff: bool,
-) -> Result<String, TilthError> {
+fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<String, TilthError> {
+    let session = ctx.session;
     // Read live content (missing file is allowed only for a tagless seed).
     let live = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -155,7 +152,7 @@ fn commit_section(
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
-        return commit_file_op(&op, path, &new_text, &live, root, confine_root, session);
+        return commit_file_op(&op, path, &new_text, &live, ctx);
     }
 
     // No-op guard: nothing changed.
@@ -177,23 +174,34 @@ fn commit_section(
     // Record the fresh snapshot so a chained edit in a later call verifies.
     let key = crate::edit::normalize_path_key(path);
     let line_count = u32::try_from(new_text.split('\n').count()).unwrap_or(u32::MAX);
-    let new_tag = session.snapshots().record(&key, &new_text, 1..=line_count);
+    let new_tag = session.record_snapshot(&key, &new_text, 1..=line_count);
 
     let mut block = format!("## {}\napplied", path.display());
-    if let Some(tag) = new_tag {
-        let header = format_header(&path.display().to_string(), tag);
-        let _ = write!(block, "\n{header}\n{}", render_numbered_whole(&new_text));
+    match new_tag {
+        Some(tag) => {
+            let header = format_header(&path.display().to_string(), tag);
+            let _ = write!(block, "\n{header}\n{}", render_numbered_whole(&new_text));
+        }
+        // Over the per-file snapshot cap: no tag minted. Mirror the read side's
+        // note so the model knows why it cannot re-anchor a follow-up edit.
+        None => {
+            let _ = write!(
+                block,
+                "\n# {} (too large to tag; edits cannot be tag-verified)",
+                path.display()
+            );
+        }
     }
-    if show_diff {
+    if ctx.show_diff {
         block.push_str(&render_text_diff(Some(&live), &new_text));
     }
     Ok(block)
 }
 
 /// Verify the section's tag against live content and produce the edited text
-/// plus any file op. On a matched tag, the seen-lines-gated apply runs; on a
-/// drifted tag, 3-way-merge recovery runs; a tagless section seeds/edits
-/// against live directly (gate skipped).
+/// plus any file op. On a matched tag with intact content, the seen-lines-gated
+/// apply runs; on a drifted (or tag-collided) tag, [`recover_edit`] runs; a
+/// tagless section seeds/edits against live directly (gate skipped).
 fn resolve_edit(
     section: &Section,
     path: &Path,
@@ -210,27 +218,65 @@ fn resolve_edit(
             let r = gated_apply(&snap, path, &section.ops)?;
             Ok((r.text, r.file_op))
         }
-        // Tag matches live → no drift. Run the seen-lines gate over the recorded
-        // snapshot (or a synthetic one if the read's snapshot was evicted).
+        // Tag matches live → no drift (or a 16-bit tag collision). Run the
+        // seen-lines gate over the recorded snapshot and apply — but only when
+        // the recorded content actually equals live; a colliding-tag snapshot
+        // whose text differs would silently overwrite the live drift, so route
+        // it through recovery instead.
         Some(tag) if tag == live_tag => {
-            let snap = session
-                .snapshots()
-                .by_tag(&key, tag)
-                .unwrap_or_else(|| synthetic_snapshot(&key, live, tag));
+            let store = session.snapshots();
+            if let Some(snap) = store.by_tag(&key, tag) {
+                if snap.text == live {
+                    let r = gated_apply(&snap, path, &section.ops)?;
+                    return Ok((r.text, r.file_op));
+                }
+                return recover_edit(&store, section, path, &key, tag, live);
+            }
+            // The read's snapshot was evicted: synthetic over live (tag guards
+            // content; empty provenance skips the seen-lines gate).
+            let snap = synthetic_snapshot(&key, live, tag);
             let r = gated_apply(&snap, path, &section.ops)?;
             Ok((r.text, r.file_op))
         }
         // Tag ≠ live → the file drifted since the read. Recover via 3-way merge.
         Some(tag) => {
-            let text = try_recover(&session.snapshots(), path, tag, &section.ops, live)?;
-            let file_op = section.ops.iter().find_map(|o| match o {
-                Op::Rem => Some(FileOp::Remove),
-                Op::Mv { dest } => Some(FileOp::Move(dest.clone())),
-                _ => None,
-            });
-            Ok((text, file_op))
+            let store = session.snapshots();
+            recover_edit(&store, section, path, &key, tag, live)
         }
     }
+}
+
+/// The drift/collision egress: the recorded snapshot (if any) no longer matches
+/// live content. Honor the seen-lines gate against the recorded snapshot, carry
+/// a pure file op (`REM`/`MV`) through regardless of content drift, and
+/// otherwise 3-way-merge the content edit onto live. The file op is derived
+/// through the canonical [`FileOp::from_ops`] guard so this path rejects the
+/// same op combinations the matched/tagless paths do.
+fn recover_edit(
+    store: &SnapshotStore,
+    section: &Section,
+    path: &Path,
+    key: &str,
+    tag: u16,
+    live: &str,
+) -> Result<(String, Option<FileOp>), TilthError> {
+    // Provenance gate: if the read's snapshot survives, an edit anchored on a
+    // never-displayed line is rejected here exactly as on the no-drift path.
+    if let Some(snapshot) = store.by_tag(key, tag) {
+        check_seen_lines(&snapshot, path, &section.ops).map_err(EditError::from)?;
+    }
+    let file_op = FileOp::from_ops(&section.ops).map_err(EditError::Apply)?;
+    let has_content = section
+        .ops
+        .iter()
+        .any(|o| !matches!(o, Op::Rem | Op::Mv { .. }));
+    // A pure file op carries no content edit — file-level intent is independent
+    // of content drift, so proceed without recovery.
+    if file_op.is_some() && !has_content {
+        return Ok((live.to_string(), file_op));
+    }
+    let text = try_recover(store, path, tag, &section.ops, live)?;
+    Ok((text, file_op))
 }
 
 /// Carry out a `REM`/`MV` file op with confinement, then reconcile the snapshot
@@ -240,10 +286,9 @@ fn commit_file_op(
     path: &Path,
     new_text: &str,
     live: &str,
-    root: Option<&Path>,
-    confine_root: &Path,
-    session: &Session,
+    ctx: &SectionCtx,
 ) -> Result<String, TilthError> {
+    let session = ctx.session;
     let key = crate::edit::normalize_path_key(path);
     match op {
         FileOp::Remove => {
@@ -251,12 +296,12 @@ fn commit_file_op(
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            session.snapshots().invalidate(&key);
+            session.invalidate_snapshot(&key);
             Ok(format!("## {}\nremoved", path.display()))
         }
         FileOp::Move(dest_raw) => {
-            let dest =
-                resolve_confined(dest_raw, root, confine_root).map_err(TilthError::EditRejected)?;
+            let dest = resolve_confined(dest_raw, ctx.root, ctx.confine_root)
+                .map_err(TilthError::EditRejected)?;
             // If the move also carried content edits, land them before renaming.
             if new_text != live {
                 crate::util::atomic_write_bytes(path, new_text.as_bytes()).map_err(|e| {
@@ -277,7 +322,7 @@ fn commit_file_op(
                 source: e,
             })?;
             let dest_key = crate::edit::normalize_path_key(&dest);
-            session.snapshots().relocate(&key, &dest_key);
+            session.relocate_snapshot(&key, &dest_key);
             Ok(format!("## {}\nmoved → {}", path.display(), dest.display()))
         }
     }
@@ -418,17 +463,12 @@ fn path_within_scope(path: &Path, scope: &Path) -> bool {
     full.starts_with(&scope_canon)
 }
 
+/// Render a real minimal unified diff for the `diff:true` branch via `diffy`
+/// (already the recovery layer's merge engine), rather than a degenerate
+/// all-removed-then-all-added block.
 fn render_text_diff(before: Option<&str>, after: &str) -> String {
-    let mut out = String::from("── diff ──\n--- before\n+++ after\n");
-    if let Some(before) = before {
-        for line in before.lines() {
-            let _ = writeln!(out, "- {line}");
-        }
-    }
-    for line in after.lines() {
-        let _ = writeln!(out, "+ {line}");
-    }
-    out
+    let patch = diffy::create_patch(before.unwrap_or(""), after);
+    format!("\n── diff ──\n{patch}")
 }
 
 #[derive(Clone)]
@@ -826,6 +866,193 @@ mod tests {
         );
     }
 
+    /// The drift branch must run the seen-lines gate exactly like the no-drift
+    /// path: a symbol read displays only the symbol span, so after external
+    /// drift an edit anchored on a never-displayed line is rejected — not
+    /// silently recovered against the full snapshot.
+    #[test]
+    fn drift_branch_enforces_seen_lines_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("driftgate.rs");
+        let content = "fn outer() {\n    let x = 1;\n}\nfn other() {\n    let y = 2;\n}\n";
+        std::fs::write(&p, content).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+
+        // Symbol read records only `outer`'s span (lines 1-3) as seen.
+        crate::mcp::tools::tool_read(
+            &json!({"paths": [format!("{}#outer", p.display())]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("symbol read");
+        let tag = format!("{:04X}", compute_file_hash(content));
+
+        // External drift: prepend a line so the tag no longer matches live.
+        let drifted = format!("// prepended\n{content}");
+        std::fs::write(&p, &drifted).unwrap();
+
+        // Edit anchored on line 5 (inside `other`, never displayed) — on the
+        // drift path this must still be rejected by the seen-lines gate.
+        let blob = format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("never displayed"),
+            "drift branch must enforce seen-lines; unseen-line edit must be rejected, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            drifted,
+            "rejected edit must not touch the file"
+        );
+    }
+
+    /// A pure `REM` against an externally-drifted file must succeed: file-level
+    /// intent is independent of content drift. (Previously hard-rejected as
+    /// Drift because `apply_ops` left a file-op-only section's text unchanged.)
+    #[test]
+    fn pure_rem_on_drifted_file_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("remdrift.rs");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        // External drift.
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let blob = format!("[{}#{tag}]\nREM\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            out.contains("removed"),
+            "pure REM on a drifted file must remove, not reject, got:\n{out}"
+        );
+        assert!(!p.exists(), "file must be deleted despite content drift");
+    }
+
+    /// A pure `MV` against an externally-drifted file must move the (drifted)
+    /// file rather than hard-reject.
+    #[test]
+    fn pure_mv_on_drifted_file_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("mvdrift.rs");
+        std::fs::write(&p, "one\ntwo\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        let blob = format!("[{}#{tag}]\nMV \"moved.rs\"\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            out.contains("moved"),
+            "pure MV on a drifted file must move, not reject, got:\n{out}"
+        );
+        assert!(!p.exists(), "source must be gone after move");
+        assert_eq!(
+            std::fs::read_to_string(root.join("moved.rs")).unwrap(),
+            "one\ntwo\nthree\n",
+            "the drifted live content is what moves"
+        );
+    }
+
+    /// The drift path derives its file op through the canonical `FileOp::from_ops`
+    /// guard, so two file ops in one drifted section are rejected as a conflict
+    /// (not silently reduced to the first op and applied).
+    #[test]
+    fn conflicting_file_ops_on_drift_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("conflictops.rs");
+        std::fs::write(&p, "x\ny\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        std::fs::write(&p, "x\ny\nz\n").unwrap();
+        let blob = format!("[{}#{tag}]\nREM\nMV \"other.rs\"\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("only one file op"),
+            "REM + MV in one drifted section must be a FileOpConflict, got:\n{out}"
+        );
+        assert!(p.exists(), "rejected conflict must not remove the file");
+        assert!(
+            !root.join("other.rs").exists(),
+            "rejected conflict must not move the file"
+        );
+    }
+
+    /// A 16-bit tag collision after external drift must not silently overwrite
+    /// the live drift: when the recorded snapshot's content differs from live
+    /// despite equal tags, the edit routes through recovery and is rejected
+    /// rather than applied against the stale snapshot text.
+    #[test]
+    fn tag_collision_after_drift_does_not_silently_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("collide.rs");
+        let original = "line one\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+
+        // Read records the snapshot for `original` under its tag.
+        let tag = read_for_tag(&session, &p);
+
+        // Brute-force a different content that hashes to the same 16-bit tag.
+        let base_tag = compute_file_hash(original);
+        let mut colliding = None;
+        for i in 0..500_000u32 {
+            let cand = format!("candidate {i}\n");
+            if compute_file_hash(&cand) == base_tag {
+                colliding = Some(cand);
+                break;
+            }
+        }
+        let colliding = colliding.expect("16-bit collision found within search budget");
+        assert_ne!(colliding, original, "collision must be different content");
+
+        // External drift swaps in the colliding content: live_tag == recorded tag.
+        std::fs::write(&p, &colliding).unwrap();
+        let blob = format!("[{}#{tag}]\nSWAP 1:\n+overwrite\n", p.display());
+        let out = tool_write(
+            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("error:"),
+            "colliding-tag edit over drifted content must be rejected, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            colliding,
+            "rejected edit must leave the live (drifted) content intact"
+        );
+    }
+
     #[test]
     fn fabricated_tag_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -925,9 +1152,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let p = root.join("src.rs");
-        std::fs::write(&p, "keep\n").unwrap();
+        std::fs::write(&p, "a\nb\nc\nd\n").unwrap();
         let (session, bloom) = services();
-        let tag = read_for_tag(&session, &p);
+        let cache = OutlineCache::new();
+        // Range read records seen-lines {1,2} under the whole-file tag.
+        crate::mcp::tools::tool_read(
+            &json!({"paths": [format!("{}#1-2", p.display())]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("range read");
+        let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
         let blob = format!("[{}#{tag}]\nMV \"dest.rs\"\n", p.display());
         let out = tool_write(
             &json!({"edits": blob, "root": root.to_str().unwrap()}),
@@ -937,9 +1173,28 @@ mod tests {
         .expect("write ok");
         assert!(out.contains("moved"), "expected moved, got:\n{out}");
         assert!(!p.exists(), "source removed after move");
+        let dest = root.join("dest.rs");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "a\nb\nc\nd\n");
+
+        // The relocated snapshot must carry src's seen-lines {1,2}: an edit on
+        // the never-displayed line 4 of dest is rejected by the seen-lines gate.
+        // Without relocation, by_tag(dest) would miss and a synthetic
+        // empty-provenance snapshot would skip the gate and let it apply.
+        let edit = format!("[{}#{tag}]\nSWAP 4:\n+D\n", dest.display());
+        let rej = tool_write(
+            &json!({"edits": edit, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            rej.contains("never displayed"),
+            "relocated snapshot must gate an unseen line at dest, got:\n{rej}"
+        );
         assert_eq!(
-            std::fs::read_to_string(root.join("dest.rs")).unwrap(),
-            "keep\n"
+            std::fs::read_to_string(&dest).unwrap(),
+            "a\nb\nc\nd\n",
+            "rejected edit must not touch dest"
         );
     }
 
@@ -960,6 +1215,28 @@ mod tests {
         .expect("write ok");
         assert!(out.contains("removed"), "expected removed, got:\n{out}");
         assert!(!p.exists(), "file must be deleted by REM");
+
+        // Recreate the path with fresh content. The pre-REM snapshot must have
+        // been invalidated: the old tag is no longer known to the store, so a
+        // stale-tag edit is a Fabricated rejection ("not from this session"). A
+        // lingering snapshot under the key would instead surface as Drift.
+        std::fs::write(&p, "fresh content here\n").unwrap();
+        let stale = format!("[{}#{tag}]\nSWAP 1:\n+X\n", p.display());
+        let out2 = tool_write(
+            &json!({"edits": stale, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out2.contains("not from this session"),
+            "post-REM edit with the old tag must be Fabricated (snapshot invalidated), got:\n{out2}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fresh content here\n",
+            "rejected stale edit must not touch the recreated file"
+        );
     }
 
     #[test]

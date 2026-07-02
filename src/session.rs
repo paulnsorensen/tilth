@@ -38,11 +38,36 @@ impl Session {
     }
 
     /// Lock the per-session snapshot store. Callers hold the guard for the
-    /// duration of a record-or-recover operation.
+    /// duration of a record-or-recover operation. Prefer the narrow
+    /// `record_snapshot` / `invalidate_snapshot` / `relocate_snapshot` methods
+    /// for single operations; the raw guard is for the drift-recovery path,
+    /// which needs `by_tag` and `try_recover` under one lock.
     pub fn snapshots(&self) -> MutexGuard<'_, SnapshotStore> {
         self.snapshots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a whole-file-tag snapshot, returning the minted tag (`None` when
+    /// the file exceeds the per-file cap). Narrow read/emitter-side entrypoint —
+    /// hands out no other store surface.
+    pub fn record_snapshot(
+        &self,
+        key: &str,
+        text: &str,
+        seen_lines: impl IntoIterator<Item = u32>,
+    ) -> Option<u16> {
+        self.snapshots().record(key, text, seen_lines)
+    }
+
+    /// Drop the snapshot history for `key` (a removed file).
+    pub fn invalidate_snapshot(&self, key: &str) {
+        self.snapshots().invalidate(key);
+    }
+
+    /// Move the snapshot history from `from` to `to` (a renamed file).
+    pub fn relocate_snapshot(&self, from: &str, to: &str) {
+        self.snapshots().relocate(from, to);
     }
 
     pub fn record_read(&self, path: &Path) {

@@ -134,9 +134,10 @@ pub(in crate::mcp) fn tool_read(
                         && mode_str == "auto"
                         && matches!(suffix, PathSuffix::None)
                         && should_auto_signature(path));
-                let body = if force_full && matches!(suffix, PathSuffix::None) {
-                    crate::read::read_file(path, None, true, cache, edit_mode)
-                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
+                let (body, spec) = if force_full && matches!(suffix, PathSuffix::None) {
+                    let b = crate::read::read_file(path, None, true, cache, edit_mode)
+                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e));
+                    (b, crate::read::SeenSpec::Whole)
                 } else {
                     read_single_with_suffix(
                         path,
@@ -148,21 +149,17 @@ pub(in crate::mcp) fn tool_read(
                     )
                 };
                 // Record the whole-file-tag snapshot so a follow-up tilth_write
-                // can verify the tag. Signature/stripped views are non-editable
-                // (no tag emitted), so they record nothing. A whole-file read
-                // that outlines (large file, no suffix, not force_full) likewise
-                // emits no tag or numbered lines — recording whole-file seenLines
-                // there would poison the snapshot for a later range read and
-                // defeat the unseen-anchor gate, so it records nothing too.
-                let outlined = matches!(suffix, PathSuffix::None)
-                    && !force_full
-                    && crate::read::would_outline(path);
-                if edit_mode && !signature && !force_stripped && !outlined {
-                    crate::read::record_edit_snapshot(
-                        session,
+                // can verify the tag, using the seen-lines the view displayed.
+                if edit_mode
+                    && should_record_edit_snapshot(
                         path,
-                        &seen_spec_for_suffix(path, suffix),
-                    );
+                        suffix,
+                        signature,
+                        force_stripped,
+                        force_full,
+                    )
+                {
+                    crate::read::record_edit_snapshot(session, path, &spec);
                 }
                 PerPath::Content(body)
             })
@@ -242,14 +239,12 @@ pub(in crate::mcp) fn tool_read(
     // mode flags are dropped here in favor of the explicit slice the LLM asked for.
     if !matches!(suffix, PathSuffix::None) {
         session.record_read(&path);
-        let body =
+        let (body, spec) =
             read_single_with_suffix(&path, &suffix, force_signature, false, edit_mode, cache);
-        if edit_mode && !force_signature {
-            crate::read::record_edit_snapshot(
-                session,
-                &path,
-                &seen_spec_for_suffix(&path, &suffix),
-            );
+        if edit_mode
+            && should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full)
+        {
+            crate::read::record_edit_snapshot(session, &path, &spec);
         }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
         // Cache token still rides along when if_modified_since was supplied.
@@ -286,7 +281,7 @@ pub(in crate::mcp) fn tool_read(
     // displayed nothing to anchor an edit against — recording whole-file
     // seenLines here would poison the snapshot for a later range read of the
     // same content and defeat the unseen-anchor gate. Record nothing.
-    if edit_mode && (force_full || !crate::read::would_outline(&path)) {
+    if edit_mode && should_record_edit_snapshot(&path, &suffix, false, false, force_full) {
         crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
     }
 
@@ -319,10 +314,15 @@ pub(in crate::mcp) fn tool_read(
     Ok(finalize_response(None, meta, &output, budget))
 }
 
-/// Resolve a single path+suffix to its read output. `signature` and
-/// `stripped` are whole-file shape modes; both are honored only for
-/// `PathSuffix::None` (any explicit suffix wins). They are mutually
-/// exclusive — `signature` takes precedence if both happen to be set.
+/// Resolve a single path+suffix to its read output plus the [`SeenSpec`] the
+/// view displayed (for the whole-file-tag snapshot's seen-lines provenance).
+/// Symbol and heading spans are resolved exactly once here and reused for the
+/// spec, so no caller re-parses to recover the same span. `signature` and
+/// `stripped` are whole-file shape modes honored only for `PathSuffix::None`
+/// (any explicit suffix wins); they are mutually exclusive — `signature` takes
+/// precedence if both happen to be set. The returned spec for signature/stripped
+/// views is `Whole`, but those views never record (see
+/// [`should_record_edit_snapshot`]).
 pub(crate) fn read_single_with_suffix(
     path: &Path,
     suffix: &PathSuffix,
@@ -330,37 +330,55 @@ pub(crate) fn read_single_with_suffix(
     stripped: bool,
     edit_mode: bool,
     cache: &OutlineCache,
-) -> String {
+) -> (String, crate::read::SeenSpec) {
+    use crate::read::SeenSpec;
+    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let render_err = |e: crate::error::TilthError| format!("# {}\nerror: {}", path.display(), e);
     match suffix {
         PathSuffix::LineRange(s, e) => {
             let range = format!("{s}-{e}");
-            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Ranges(vec![(cast(*s), cast(*e))]))
         }
         PathSuffix::FromLine(n) => {
             // Resolve total lines via metadata + count; cheap & avoids full read.
             let total = count_lines(path).map_or(*n, |t| t as usize);
-            let range = format!("{n}-{}", total.max(*n));
-            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+            let end = total.max(*n);
+            let range = format!("{n}-{end}");
+            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Ranges(vec![(cast(*n), cast(end))]))
         }
         PathSuffix::Heading(h) => {
-            crate::read::read_ranges(path, &[h.as_str()], edit_mode).unwrap_or_else(render_err)
+            let body =
+                crate::read::read_ranges(path, &[h.as_str()], edit_mode).unwrap_or_else(render_err);
+            // Resolve the heading span so seen-lines cover only the displayed
+            // section, not the whole file. Absent heading → the read errored;
+            // fall back to Whole (nothing to gate against).
+            let spec = match crate::read::resolve_heading_span(path, h) {
+                Some((s, e)) => SeenSpec::Ranges(vec![(s, e)]),
+                None => SeenSpec::Whole,
+            };
+            (body, spec)
         }
         PathSuffix::Symbol(name) => {
-            // Resolve symbol via outline → range, then read that range.
+            // Resolve symbol via outline → range once, reused for read + spec.
             match resolve_symbol_range(path, name) {
                 Some((s, e)) => {
                     let range = format!("{s}-{e}");
-                    crate::read::read_ranges(path, &[range.as_str()], edit_mode)
-                        .unwrap_or_else(render_err)
+                    let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                        .unwrap_or_else(render_err);
+                    (body, SeenSpec::Ranges(vec![(cast(s), cast(e))]))
                 }
-                None => {
+                None => (
                     format!(
                         "# {}\nerror: symbol '{}' not found in outline",
                         path.display(),
                         name
-                    )
-                }
+                    ),
+                    SeenSpec::Whole,
+                ),
             }
         }
         PathSuffix::None => {
@@ -371,38 +389,43 @@ pub(crate) fn read_single_with_suffix(
             if signature {
                 // Multi-file batch path: discard the line count — view-meta is
                 // not emitted for multi-file responses.
-                return read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
+                let body =
+                    read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
+                return (body, SeenSpec::Whole);
             }
             if stripped {
-                return read_stripped_file(path, cache)
-                    .map_or_else(render_err, |(body, _, _)| body);
+                let body =
+                    read_stripped_file(path, cache).map_or_else(render_err, |(body, _, _)| body);
+                return (body, SeenSpec::Whole);
             }
-            crate::read::read_file(path, None, false, cache, edit_mode).unwrap_or_else(render_err)
+            let body = crate::read::read_file(path, None, false, cache, edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Whole)
         }
     }
 }
 
-/// Which file lines an edit-mode read of `path` with `suffix` displayed, for
-/// the whole-file-tag snapshot's seen-lines provenance. A whole-file read sees
-/// every line; a range/symbol read sees only its span. Heading reads fall back
-/// to whole-file (resolving the heading span cheaply here would duplicate the
-/// read-side resolver) — the tag still guards content; only the unseen-anchor
-/// gate is relaxed for markdown-heading reads.
-fn seen_spec_for_suffix(path: &Path, suffix: &PathSuffix) -> crate::read::SeenSpec {
-    use crate::read::SeenSpec;
-    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    match suffix {
-        PathSuffix::None | PathSuffix::Heading(_) => SeenSpec::Whole,
-        PathSuffix::LineRange(s, e) => SeenSpec::Ranges(vec![(cast(*s), cast(*e))]),
-        PathSuffix::FromLine(n) => {
-            let total = count_lines(path).unwrap_or_else(|| cast(*n));
-            SeenSpec::Ranges(vec![(cast(*n), total.max(cast(*n)))])
-        }
-        PathSuffix::Symbol(name) => match resolve_symbol_range(path, name) {
-            Some((s, e)) => SeenSpec::Ranges(vec![(cast(s), cast(e))]),
-            None => SeenSpec::Whole,
-        },
+/// Whether an edit-mode read of `path` with `suffix` should record a
+/// whole-file-tag snapshot (callers gate on `edit_mode` first). Returns `false`
+/// for signature and stripped views (non-editable, no tag emitted), and an
+/// outlined whole-file
+/// view (no numbered lines shown — recording whole-file seen-lines would poison
+/// the snapshot for a later range read and defeat the unseen-anchor gate). The
+/// single predicate the three `tool_read` dispatch sites share.
+fn should_record_edit_snapshot(
+    path: &Path,
+    suffix: &PathSuffix,
+    signature: bool,
+    stripped: bool,
+    force_full: bool,
+) -> bool {
+    if signature || stripped {
+        return false;
     }
+    if matches!(suffix, PathSuffix::None) && !force_full && crate::read::would_outline(path) {
+        return false;
+    }
+    true
 }
 
 fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
@@ -852,6 +875,77 @@ mod tests {
         assert!(
             !out.contains("applied"),
             "edit on an unseen line must not apply, got:\n{out}"
+        );
+    }
+
+    /// A markdown `#heading` edit-mode read records only the heading's section
+    /// as seen (not the whole file): a tag-matched edit inside that section
+    /// applies, but one anchored on a line in a different, never-displayed
+    /// section is rejected by the seen-lines gate.
+    #[test]
+    fn heading_read_gates_edit_to_displayed_section() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("doc.md");
+        let content = "# Section A\nalpha\nmore a\n\n# Section B\nbeta\nmore b\n";
+        std::fs::write(&p, content).unwrap();
+        let (session, cache) = services();
+
+        // Heading read displays only Section A (lines 1-4).
+        let out = tool_read(
+            &serde_json::json!({"paths": [format!("{}#{}", p.display(), "# Section A")]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("heading read");
+        assert!(
+            out.contains("alpha"),
+            "heading read must display Section A, got:\n{out}"
+        );
+
+        let tag = crate::edit::tag::format_header(
+            &p.display().to_string(),
+            crate::edit::tag::compute_file_hash(content),
+        );
+        let bloom = Arc::new(BloomFilterCache::new());
+
+        // Edit on line 6 (inside Section B, never displayed) is rejected.
+        let reject = format!("{tag}\nSWAP 6:\n+BETA\n");
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": reject, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "heading read must not grant whole-file seenLines; a Section-B edit must be rejected, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            content,
+            "rejected edit must not touch the file"
+        );
+
+        // Edit on line 2 (inside the displayed Section A) applies.
+        let ok = format!("{tag}\nSWAP 2:\n+ALPHA\n");
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": ok, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("applied"),
+            "in-section edit must apply, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "# Section A\nALPHA\nmore a\n\n# Section B\nbeta\nmore b\n"
         );
     }
 
