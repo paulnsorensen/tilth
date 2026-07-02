@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
+
+use crate::edit::snapshots::SnapshotStore;
 
 /// Tracks MCP activity across calls.
 /// Stored alongside `OutlineCache` in server state.
@@ -16,6 +18,11 @@ pub struct Session {
     /// `is_expanded` detect stale records when the file has been edited
     /// since the expansion was first shown.
     expanded: Mutex<HashMap<String, SystemTime>>,
+    /// Whole-file-tag snapshots bound to the content each edit-mode read
+    /// displayed. Persists across `tilth_read`→`tilth_write` within a session
+    /// so a follow-up edit can verify its tag and, on drift, 3-way-merge
+    /// recover. Keyed by canonical realpath.
+    snapshots: Mutex<SnapshotStore>,
 }
 
 impl Session {
@@ -26,7 +33,16 @@ impl Session {
             symbols: Mutex::new(HashMap::new()),
             dir_hits: Mutex::new(HashMap::new()),
             expanded: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(SnapshotStore::new()),
         }
+    }
+
+    /// Lock the per-session snapshot store. Callers hold the guard for the
+    /// duration of a record-or-recover operation.
+    pub fn snapshots(&self) -> MutexGuard<'_, SnapshotStore> {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn record_read(&self, path: &Path) {
@@ -120,6 +136,7 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.snapshots().clear();
     }
 
     /// Return true only when this `(path, line)` was previously expanded

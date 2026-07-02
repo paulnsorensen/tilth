@@ -147,6 +147,16 @@ pub(in crate::mcp) fn tool_read(
                         cache,
                     )
                 };
+                // Record the whole-file-tag snapshot so a follow-up tilth_write
+                // can verify the tag. Signature/stripped views are non-editable
+                // (no tag emitted), so they record nothing.
+                if edit_mode && !signature && !force_stripped {
+                    crate::read::record_edit_snapshot(
+                        session,
+                        path,
+                        &seen_spec_for_suffix(path, suffix),
+                    );
+                }
                 PerPath::Content(body)
             })
             .collect();
@@ -227,6 +237,13 @@ pub(in crate::mcp) fn tool_read(
         session.record_read(&path);
         let body =
             read_single_with_suffix(&path, &suffix, force_signature, false, edit_mode, cache);
+        if edit_mode && !force_signature {
+            crate::read::record_edit_snapshot(
+                session,
+                &path,
+                &seen_spec_for_suffix(&path, &suffix),
+            );
+        }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
         // Cache token still rides along when if_modified_since was supplied.
         return Ok(finalize_response(
@@ -258,6 +275,9 @@ pub(in crate::mcp) fn tool_read(
     let mut output =
         crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, Path::new("."))
             .map_err(|e| e.to_string())?;
+    if edit_mode {
+        crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
+    }
 
     // Append related-file hint for outlined code files.
     if crate::read::would_outline(&path) {
@@ -351,16 +371,31 @@ pub(crate) fn read_single_with_suffix(
     }
 }
 
-fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
-    for e in entries {
-        if e.name == name {
-            return Some((e.start_line as usize, e.end_line as usize));
+/// Which file lines an edit-mode read of `path` with `suffix` displayed, for
+/// the whole-file-tag snapshot's seen-lines provenance. A whole-file read sees
+/// every line; a range/symbol read sees only its span. Heading reads fall back
+/// to whole-file (resolving the heading span cheaply here would duplicate the
+/// read-side resolver) — the tag still guards content; only the unseen-anchor
+/// gate is relaxed for markdown-heading reads.
+fn seen_spec_for_suffix(path: &Path, suffix: &PathSuffix) -> crate::read::SeenSpec {
+    use crate::read::SeenSpec;
+    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match suffix {
+        PathSuffix::None | PathSuffix::Heading(_) => SeenSpec::Whole,
+        PathSuffix::LineRange(s, e) => SeenSpec::Ranges(vec![(cast(*s), cast(*e))]),
+        PathSuffix::FromLine(n) => {
+            let total = count_lines(path).unwrap_or_else(|| cast(*n));
+            SeenSpec::Ranges(vec![(cast(*n), total.max(cast(*n)))])
         }
-        if let Some(hit) = find_symbol_entry(&e.children, name) {
-            return Some(hit);
-        }
+        PathSuffix::Symbol(name) => match resolve_symbol_range(path, name) {
+            Some((s, e)) => SeenSpec::Ranges(vec![(cast(s), cast(e))]),
+            None => SeenSpec::Whole,
+        },
     }
-    None
+}
+
+fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
+    crate::lang::outline::find_entry_by_name(entries, name).map(|(s, e)| (s as usize, e as usize))
 }
 
 /// Outcome of looking up `name` in `path`'s outline. Distinguishes a
