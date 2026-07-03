@@ -183,6 +183,8 @@ Each run invokes `claude -p` (Claude Code headless mode) with a code navigation 
 
 All modes use the same system prompt, $1.00 budget cap, and model. The agent explores the codebase and returns a natural-language answer. Correctness is checked against ground-truth strings that must appear in the response.
 
+**Grading semantics**: correctness is a case-insensitive, backtick-stripped substring match — every `required_strings` entry for a task must appear somewhere in the graded text (`benchmark/tasks/base.py`'s `check_correctness`). The graded text is the agent's text output *accumulated across every assistant turn in the run*, not just the final one — a short wrap-up turn at the end of a run adds to, rather than replaces, the substantive answer from an earlier turn (`benchmark/parse.py`'s `parse_stream_json`).
+
 **Repos (pinned commits):**
 
 | Repo | Language | Description |
