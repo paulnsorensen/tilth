@@ -112,6 +112,14 @@ mod tests {
     /// session and must keep working exactly as it does on main — refusing
     /// here would break every session's default search. This inverts the PR's
     /// original (too strict) assertion.
+    ///
+    /// Asserts only `is_ok()`, not the response body: the body is real search
+    /// output over whatever tree the test runs in (including this very source
+    /// file), so substring-matching it is not a reliable way to detect a
+    /// require-root refusal. `resolve_scope`'s own unit tests in
+    /// `mcp::tools::tests` already pin the exact refusal-vs-default-cwd
+    /// behavior directly; this test only pins that `tool_search` propagates
+    /// success through to its caller instead of swallowing it into an error.
     #[test]
     fn no_scope_no_root_defaults_to_cwd() {
         let cache = OutlineCache::new();
@@ -122,10 +130,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "bare search must default to cwd, not refuse: {result:?}"
-        );
-        assert!(
-            !result.unwrap().contains("cannot be resolved"),
-            "unexpected refusal routed through require-root discipline"
         );
     }
 

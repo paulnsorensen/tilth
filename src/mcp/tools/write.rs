@@ -276,13 +276,19 @@ pub(in crate::mcp) fn tool_write(
 
     // Containment root for the overwrite/append scope guard. This is the write
     // sandbox boundary, NOT a path-resolution channel: an explicit `scope`
-    // anchors it, otherwise it falls back to the server cwd. Kept cwd-defaulting
-    // on purpose — the read-side require-root discipline (resolve_scope) governs
-    // where reads resolve; a bare hash-mode write with an absolute path must not
-    // be refused just because it omitted `scope`.
+    // anchors it. When `scope` is absent, default to `root` if one was
+    // supplied — `root` names the caller's actual checkout, so it is the
+    // correct containment boundary for a root-anchored write; falling back to
+    // the server's process cwd here would refuse a legitimate root-only write
+    // whenever the server was launched from a different directory than
+    // `root` (the headline cross-worktree scenario `root` exists to solve).
+    // Only when BOTH `scope` and `root` are absent does this fall back to the
+    // server cwd, exactly as before.
     let scope_root: PathBuf = match args.get("scope").and_then(|v| v.as_str()) {
         Some(s) => PathBuf::from(s),
-        None => std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        None => root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())),
     };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
@@ -843,6 +849,65 @@ mod tests {
         assert!(
             err.contains("must be an absolute path"),
             "error must mention absolute path requirement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn root_only_no_scope_write_succeeds_into_root() {
+        // KNOWN HIGH (review on #158): `root` reaches path resolution
+        // (resolve_write_path) but NOT the containment guard — `scope_root`
+        // fell back to `current_dir()` whenever `scope` was omitted, ignoring
+        // `root` entirely. Headline scenario: server process cwd is one
+        // directory (call it dirA — here, whatever `current_dir()` naturally
+        // is under `cargo test`), the caller passes `root` = a DIFFERENT
+        // directory (dirB) plus a relative path under dirB, and supplies NO
+        // `scope`. Before the fix, `scope_root` defaulted to dirA, the write
+        // resolved into dirB (correctly, via resolve_write_path), and
+        // `path_within_scope(dirB_path, dirA)` refused it — a false-positive
+        // containment failure for a legitimate root-anchored write.
+        //
+        // No `set_current_dir` here — the codebase's own tests document that
+        // mutating process cwd inside a test races other parallel tests (see
+        // edit.rs's `normalize_path_key_is_cwd_independent` comment). Using
+        // the ambient `current_dir()` as the implicit "dirA" and a fresh
+        // tempdir as "dirB" reproduces the divergence without mutating global
+        // state.
+        let dir_a = std::env::current_dir().expect("ambient cwd (\"dirA\") must be readable");
+        let dir_b = tempfile::tempdir().expect("dirB tempdir");
+        assert_ne!(
+            dir_a.canonicalize().unwrap(),
+            dir_b.path().canonicalize().unwrap(),
+            "test setup requires dirA (ambient cwd) and dirB (tempdir) to differ"
+        );
+
+        let args = serde_json::json!({
+            "root": dir_b.path().to_str().unwrap(),
+            "files": [{
+                "path": "nested/file.txt",
+                "mode": "overwrite",
+                "content": "root-only write\n",
+            }],
+        });
+        let out = tool_write(&args, &Session::new(), &fresh_bloom())
+            .expect("root-only write (no scope) must succeed into root, not refuse");
+        assert!(
+            !out.contains("error: refusing write outside scope"),
+            "root-only write must not be refused by the containment guard: {out}"
+        );
+        assert!(
+            !out.contains("error: scope unresolvable"),
+            "root-only write must not hit the scope-unresolvable branch: {out}"
+        );
+
+        let expected = dir_b.path().join("nested/file.txt");
+        assert!(
+            expected.exists(),
+            "file must land under root (dirB), not under the server's cwd (dirA): {}",
+            expected.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "root-only write\n"
         );
     }
 
