@@ -1,5 +1,7 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
+PATHS: DO NOT pass a relative path or scope without also setting root (absolute) — the server cannot see your shell cwd, so bare relative paths are refused. Absolute paths always work; omitting path/scope searches the project the server was launched in.
+
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(query: "handleRequest").
 tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.

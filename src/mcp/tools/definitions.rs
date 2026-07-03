@@ -56,6 +56,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
@@ -69,7 +73,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative file path to read."
+                        "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                     },
                     "paths": {
                         "type": "array",
@@ -99,6 +103,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
@@ -126,6 +134,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
@@ -149,6 +161,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
@@ -173,6 +189,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
@@ -260,7 +280,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path."
+                                    "description": "Absolute or relative file path. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                                 },
                                 "mode": {
                                     "type": "string",
