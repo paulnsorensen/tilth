@@ -118,7 +118,7 @@ Hard tasks take 2-5 min each. Run in background for multi-task suites. Do NOT pi
 
 ```bash
 python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
-python benchmark/compare_versions.py old.jsonl new.jsonl
+python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 
 # Quick check of a results file:
 jq -r '[.task, (.correct|tostring), (.total_cost_usd|tostring), (.tool_calls.tilth_search // 0 | tostring)] | join("\t")' benchmark/results/<file>.jsonl

@@ -251,9 +251,6 @@ python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 
 # Offline re-grade under grader alternation (recovers historical false negatives)
 python benchmark/regrade.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
-
-# Compare two runs (e.g. different versions)
-python benchmark/compare_versions.py benchmark/results/old.jsonl benchmark/results/new.jsonl
 ```
 
 Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line is a JSON object with task name, mode, cost, token counts, correctness, and tool sequence.
