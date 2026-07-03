@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
-// Whole-file-tag edit subsystem: a Rust port of oh-my-pi's hashline model,
-// wired into the MCP through `crate::mcp::tools::write`.
+// Whole-file-tag edit subsystem: a Rust port of oh-my-pi's whole-file-tag edit
+// model (upstream name: hashline), wired into the MCP through `crate::mcp::tools::write`.
 pub mod apply;
 pub mod block;
 pub mod mismatch;

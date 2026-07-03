@@ -1422,12 +1422,21 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
         // gutter) and edit-mode numbered lines `"42:content"` (number is the
         // `line:` prefix). Parse both so noise stripping/truncation works in
         // edit mode too.
-        let line_num = if let Some(pos) = segment.find('│') {
-            segment[..pos].trim().parse::<u32>().ok()
-        } else {
+        let prefix_num = || {
             segment
                 .split_once(':')
                 .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+        };
+        let line_num = match segment.find('│') {
+            // Gutter format `"  42 │ content"`. The `│` may also appear inside
+            // edit-mode content (a box-drawing char in a string), so when the
+            // pre-gutter text isn't a number, fall back to the `N:` prefix.
+            Some(pos) => segment[..pos]
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .or_else(prefix_num),
+            None => prefix_num(),
         };
 
         if let Some(num) = line_num {
@@ -1742,6 +1751,29 @@ mod tests {
         assert!(
             filtered.contains("10:3: decoy"),
             "line 10 must be kept — inner `3:` is content, not the line number: {filtered}"
+        );
+    }
+
+    /// Boundary: in edit mode the content itself may contain a `│` (U+2502) — a
+    /// box-drawing char in a string literal. The gutter branch keys on `find('│')`,
+    /// so it fires on the content `│` and tries to parse the whole `N:...` prefix as
+    /// a number, which fails. The parser must fall back to the `N:` prefix so a
+    /// skip-listed edit-mode line is still stripped. Locks the gutter→prefix fallback.
+    #[test]
+    fn filter_code_lines_edit_mode_content_bar_falls_back_to_prefix() {
+        let mut skip = HashSet::new();
+        skip.insert(42u32);
+
+        // Line 42's content contains a `│`; line 43 is a plain kept line.
+        let edit = "```src/x.rs:42-43\n42:let g = \"│\";\n43:let h = 1;\n```";
+        let filtered = filter_code_lines(edit, &skip);
+        assert!(
+            !filtered.contains("42:let g"),
+            "line 42 (│ in content) should be stripped via prefix fallback: {filtered}"
+        );
+        assert!(
+            filtered.contains("43:let h = 1;"),
+            "line 43 must be kept: {filtered}"
         );
     }
 
