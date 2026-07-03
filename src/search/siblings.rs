@@ -295,3 +295,131 @@ pub fn find_parent_entry(entries: &[OutlineEntry], method_line: u32) -> Option<&
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(kind: OutlineKind, name: &str, sig: Option<&str>, line: u32) -> OutlineEntry {
+        OutlineEntry {
+            kind,
+            name: name.to_string(),
+            start_line: line,
+            end_line: line,
+            signature: sig.map(str::to_string),
+            children: Vec::new(),
+            doc: None,
+        }
+    }
+
+    fn parent(name: &str, children: Vec<OutlineEntry>) -> OutlineEntry {
+        OutlineEntry {
+            kind: OutlineKind::Struct,
+            name: name.to_string(),
+            start_line: 1,
+            end_line: 100,
+            signature: None,
+            children,
+            doc: None,
+        }
+    }
+
+    #[test]
+    fn resolve_siblings_copies_matched_child_fields() {
+        let children = vec![child(
+            OutlineKind::Function,
+            "helper",
+            Some("fn helper(&self)"),
+            42,
+        )];
+        let resolved = resolve_siblings(&["helper".to_string()], &children);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "helper");
+        assert_eq!(resolved[0].kind, OutlineKind::Function);
+        assert_eq!(resolved[0].signature, "fn helper(&self)");
+        assert_eq!(resolved[0].start_line, 42);
+        assert_eq!(resolved[0].end_line, 42);
+    }
+
+    #[test]
+    fn resolve_siblings_falls_back_to_name_when_signature_missing() {
+        let children = vec![child(OutlineKind::Property, "count", None, 10)];
+        let resolved = resolve_siblings(&["count".to_string()], &children);
+        assert_eq!(resolved[0].signature, "count");
+    }
+
+    #[test]
+    fn resolve_siblings_skips_names_with_no_matching_child() {
+        let children = vec![child(OutlineKind::Function, "known", None, 5)];
+        let resolved = resolve_siblings(&["known".to_string(), "unknown".to_string()], &children);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "unmatched name must not appear: {resolved:?}"
+        );
+        assert_eq!(resolved[0].name, "known");
+    }
+
+    #[test]
+    fn resolve_siblings_orders_functions_before_fields() {
+        // Fields listed first in the input; functions must still sort first.
+        let children = vec![
+            child(OutlineKind::Property, "z_field", None, 1),
+            child(OutlineKind::Function, "a_method", None, 2),
+        ];
+        let resolved =
+            resolve_siblings(&["z_field".to_string(), "a_method".to_string()], &children);
+        let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a_method", "z_field"]);
+    }
+
+    #[test]
+    fn resolve_siblings_breaks_ties_alphabetically_within_kind() {
+        let children = vec![
+            child(OutlineKind::Function, "zeta", None, 1),
+            child(OutlineKind::Function, "alpha", None, 2),
+            child(OutlineKind::Function, "mid", None, 3),
+        ];
+        let resolved = resolve_siblings(
+            &["zeta".to_string(), "alpha".to_string(), "mid".to_string()],
+            &children,
+        );
+        let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn resolve_siblings_truncates_at_max_siblings() {
+        let children: Vec<OutlineEntry> = (0..MAX_SIBLINGS + 3)
+            .map(|i| child(OutlineKind::Function, &format!("m{i}"), None, i as u32))
+            .collect();
+        let names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
+        let resolved = resolve_siblings(&names, &children);
+        assert_eq!(resolved.len(), MAX_SIBLINGS);
+    }
+
+    #[test]
+    fn find_parent_entry_locates_entry_owning_the_line() {
+        let entries = vec![
+            parent(
+                "Other",
+                vec![child(OutlineKind::Function, "unrelated", None, 5)],
+            ),
+            parent(
+                "Target",
+                vec![child(OutlineKind::Function, "method", None, 20)],
+            ),
+        ];
+        let found = find_parent_entry(&entries, 20).expect("parent must be found");
+        assert_eq!(found.name, "Target");
+    }
+
+    #[test]
+    fn find_parent_entry_returns_none_when_no_child_matches() {
+        let entries = vec![parent(
+            "Solo",
+            vec![child(OutlineKind::Function, "method", None, 20)],
+        )];
+        assert!(find_parent_entry(&entries, 999).is_none());
+    }
+}
