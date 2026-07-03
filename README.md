@@ -190,7 +190,7 @@ tilth install crush            # ~/.config/crush/crush.json
 tilth install pi               # ~/.pi/agent/mcp.json
 ```
 
-Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
+Add `--edit` to enable tag-anchored file editing (see [Edit mode](#edit-mode)):
 
 ```bash
 tilth install claude-code --edit

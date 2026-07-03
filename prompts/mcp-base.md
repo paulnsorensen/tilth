@@ -36,7 +36,7 @@ Batch-only: ALWAYS pass paths: [...] as an array, even for one file. DO NOT use 
 Suffix grammar per path: path#n-m (line range), path#n (from line n), path### Heading (markdown heading), path#symbol (code symbol).
 mode: auto (default) | full (force full content) | signature (outline, no bodies) | stripped (comments/logs/blank lines removed).
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
-Output: <line>:<hash>|<content> per line.
+Output: N:content numbered lines (in edit mode, under a [path#TAG] header).
 root: absolute checkout dir. Required if any path in `paths` is relative; absolute paths need no root and are used as-is. The server cannot see your shell cwd.
 
 tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, tree, and the host Glob tool.

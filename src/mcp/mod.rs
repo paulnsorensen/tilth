@@ -599,7 +599,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            6107,
+            6141,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -1711,12 +1711,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            6107,
+            6141,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            8585,
+            8619,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
