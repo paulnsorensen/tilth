@@ -509,25 +509,6 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
     Ok(format::format_log(&summaries, range, budget))
 }
 
-/// Format a duration as a relative time string.
-#[allow(dead_code)]
-pub(crate) fn relative_time(secs: i64) -> String {
-    let secs = secs.max(0) as u64;
-    if secs < 60 {
-        return format!("{secs}s ago");
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m ago");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
-    let days = hours / 24;
-    format!("{days}d ago")
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
