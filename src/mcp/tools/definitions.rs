@@ -256,7 +256,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "root": {
                         "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless every section path is absolute. Must be an absolute path. RELATIVE section paths (and MV destinations) are anchored under `root` and confined to it; `..` traversal and paths outside the root are refused. The server cannot see your shell cwd."
+                        "description": "Absolute path to your checkout directory. REQUIRED unless every section path is absolute. Must be an absolute path. RELATIVE section paths (and MV destinations) are anchored under `root` and confined to it; ABSOLUTE section paths are also confined to `root` (or to the server's startup directory when `root` is omitted); `..` traversal and paths outside the confinement root are refused. The server cannot see your shell cwd."
                     }
                 }
             }

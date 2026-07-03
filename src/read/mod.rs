@@ -559,6 +559,13 @@ pub enum SeenSpec {
 /// call) records nothing. Keyed by canonical realpath so a later `tilth_write`
 /// finds the snapshot regardless of path spelling.
 pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec: &SeenSpec) {
+    // `SnapshotStore::record` drops anything over the per-file cap — skip
+    // the full-file read and seen materialization entirely for those.
+    let over_cap = fs::metadata(path)
+        .is_ok_and(|m| m.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP as u64);
+    if over_cap {
+        return;
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };

@@ -95,6 +95,6 @@ Drift: the TAG binds the section to the content you read. If the file changed si
 New file: a tagless `[path]` header (no #TAG) seeds a NEW file — use INS.HEAD for its content.
 Append cleanly: prefer `INS.POST <last-content-line>` over `INS.TAIL:` — INS.TAIL inserts after the file's trailing empty row, adding a blank line for newline-terminated files.
 Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
-root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and MV destinations are anchored under root and confined to it — `..` traversal or paths outside root are refused. The server cannot see your shell cwd.
+root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and MV destinations are anchored under root and confined to it; ABSOLUTE section paths are also confined to root (or to the server's startup directory when root is omitted) — `..` traversal or paths outside the confinement root are refused. The server cannot see your shell cwd.
 Pass diff: true for a compact before/after diff per section.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
