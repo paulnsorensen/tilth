@@ -79,7 +79,7 @@ pub(in crate::mcp) fn tool_search(
             }
         }
         let sub_val = Value::Object(sub);
-        let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
+        let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode, Some(per_query))?;
         let headed = format!("## query: {qstr}\n\n{body}");
         parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
@@ -109,6 +109,7 @@ fn tool_search_single(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, String> {
     let query = args
         .get("query")
@@ -147,7 +148,8 @@ fn tool_search_single(
                 1 => {
                     session.record_search(symbols[0]);
                     search_merged_default(
-                        symbols[0], &scope, cache, session, bloom, expand, context, glob, edit_mode,
+                        symbols[0], &scope, cache, session, bloom, expand, context, glob,
+                        edit_mode, budget,
                     )
                 }
                 2..=5 => {
@@ -156,7 +158,7 @@ fn tool_search_single(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &symbols, &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 _ => {
@@ -179,7 +181,7 @@ fn tool_search_single(
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 2..=5 => {
@@ -188,7 +190,7 @@ fn tool_search_single(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &queries, &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 _ => {
@@ -202,13 +204,13 @@ fn tool_search_single(
         Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false, edit_mode,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
         }
         Some("regex") => {
             session.record_search(query);
             crate::search::search_regex_expanded(
-                query, &scope, cache, session, expand, context, glob, false, edit_mode,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
         }
         Some("callers") => {
@@ -265,6 +267,7 @@ fn search_merged_default(
     context: Option<&Path>,
     glob: Option<&str>,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, crate::error::TilthError> {
     // Path-like miss auto-open: the default search returns an empty-result
     // header on a miss, so a slightly-off path (`src/serch/symbol.rs`) would
@@ -286,13 +289,13 @@ fn search_merged_default(
     sections.push(format!(
         "## symbol results\n\n{}",
         crate::search::search_symbol_expanded(
-            query, scope, cache, session, bloom, expand, context, glob, false, edit_mode,
+            query, scope, cache, session, bloom, expand, context, glob, false, edit_mode, budget,
         )?
     ));
     sections.push(format!(
         "## content results\n\n{}",
         crate::search::search_content_expanded(
-            query, scope, cache, session, expand, context, glob, false, edit_mode,
+            query, scope, cache, session, expand, context, glob, false, edit_mode, budget,
         )?
     ));
     if crate::classify::is_identifier(query) {
