@@ -273,3 +273,127 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::outline::outline_language;
+    use crate::types::Lang;
+
+    #[test]
+    fn definition_weight_covers_every_tier() {
+        // 100 — primary declarations, one per source language shape
+        // (Rust function_item/enum_item, TS class_declaration/interface_declaration, Python decorated_definition).
+        assert_eq!(definition_weight("function_item"), 100);
+        assert_eq!(definition_weight("class_declaration"), 100);
+        assert_eq!(definition_weight("interface_declaration"), 100);
+        assert_eq!(definition_weight("enum_item"), 100);
+        assert_eq!(definition_weight("decorated_definition"), 100);
+        // 90 — impls / object-like declarations (Rust impl_item, Kotlin object_declaration).
+        assert_eq!(definition_weight("impl_item"), 90);
+        assert_eq!(definition_weight("object_declaration"), 90);
+        // 80 — const/static.
+        assert_eq!(definition_weight("const_item"), 80);
+        assert_eq!(definition_weight("static_item"), 80);
+        // 70 — module/namespace/property.
+        assert_eq!(definition_weight("mod_item"), 70);
+        assert_eq!(definition_weight("property_declaration"), 70);
+        // 60 — Bash top-level assignment (special-cased above the 40 tier).
+        assert_eq!(definition_weight("variable_assignment"), 60);
+        // 40 — plain variable declarations (JS/TS lexical_declaration, C#/Kotlin variable_declaration).
+        assert_eq!(definition_weight("lexical_declaration"), 40);
+        assert_eq!(definition_weight("variable_declaration"), 40);
+        // 30 — export wrapper (unwrapped recursively by extract_definition_name).
+        assert_eq!(definition_weight("export_statement"), 30);
+        // 50 — unrecognized kind falls to the default tier, not 0.
+        assert_eq!(definition_weight("comment"), 50);
+    }
+
+    /// Parse `src` with `lang`'s grammar and return the owned tree.
+    fn parse(src: &str, lang: Lang) -> tree_sitter::Tree {
+        let language = outline_language(lang).expect("grammar available for test language");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        parser.parse(src, None).expect("parse succeeds")
+    }
+
+    /// Depth-first search for the first descendant node of the given kind.
+    fn find_by_kind<'a>(root: tree_sitter::Node<'a>, kind: &str) -> tree_sitter::Node<'a> {
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind {
+                return node;
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        panic!("no {kind} node found in parsed tree");
+    }
+
+    #[test]
+    fn extract_definition_name_rust_function_item() {
+        let src = "fn greet(name: &str) -> String { name.to_string() }\n";
+        let tree = parse(src, Lang::Rust);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "function_item");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("greet".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_python_class_definition() {
+        let src = "class Widget:\n    pass\n";
+        let tree = parse(src, Lang::Python);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "class_definition");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("Widget".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_unwraps_export_statement() {
+        // export_statement has no "name"/"identifier"/"declarator" field of its
+        // own — extract_definition_name must recurse into the wrapped
+        // function_declaration to find the name (the node.kind() == "export_statement"
+        // branch).
+        let src = "export function handler() {}\n";
+        let tree = parse(src, Lang::TypeScript);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "export_statement");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("handler".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_walks_lexical_declaration_declarator() {
+        // lexical_declaration stores its identifier inside a child
+        // variable_declarator, not as a direct field on the declaration node —
+        // exercises the dedicated child-walk branch.
+        let src = "const total = 42;\n";
+        let tree = parse(src, Lang::TypeScript);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "lexical_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("total".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_returns_none_when_no_name_field_present() {
+        // impl_item has no "name"/"identifier"/"declarator" field and isn't
+        // handled by any of the special-cased branches — must fall through to
+        // None rather than panic or return an empty string.
+        let src = "impl Widget {}\n";
+        let tree = parse(src, Lang::Rust);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "impl_item");
+        assert_eq!(extract_definition_name(node, &lines), None);
+    }
+}
