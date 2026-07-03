@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -17,10 +18,15 @@ def ensure_repo_clean(repo_path: Path, pinned_sha: str | None = None) -> None:
     """
     # Restore `.git` if a no-git task (hide_git) moved it aside. Idempotent and
     # crash-safe: runs before every reset, so a timed-out/crashed no-git run is
-    # recovered on the next task's pre-reset.
+    # recovered on the next task's pre-reset. `.git_hidden` is only ever created
+    # by hide_git, so when it exists it IS the real repo — any `.git` sitting
+    # next to it is an impostor created mid-run (observed: a fresh sha256-format
+    # repo) and is discarded.
     git_dir = Path(repo_path) / ".git"
     hidden = Path(repo_path) / ".git_hidden"
-    if hidden.exists() and not git_dir.exists():
+    if hidden.exists():
+        if git_dir.exists():
+            shutil.rmtree(git_dir)
         hidden.rename(git_dir)
 
     needs_reset = False
