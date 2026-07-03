@@ -627,7 +627,7 @@ fn read_signature_file(
     let mut body = String::new();
     render_signature_entries(&entries, &lines, &mut body);
     if body.is_empty() {
-        body = crate::format::hashlines(&content, 1);
+        body = crate::edit::tag::render_numbered_slice(&content, 1);
     }
     Ok((format!("{header}\n\n{}", body.trim_end()), line_count))
 }
@@ -640,8 +640,7 @@ fn render_signature_entries(
     for entry in entries {
         let idx = entry.start_line.saturating_sub(1) as usize;
         if let Some(line) = lines.get(idx) {
-            let hash = crate::format::line_hash(line.as_bytes());
-            let _ = writeln!(out, "{}:{hash:03x}|{line}", entry.start_line);
+            let _ = writeln!(out, "{}:{line}", entry.start_line);
         }
         render_signature_entries(&entry.children, lines, out);
     }

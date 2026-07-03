@@ -1,4 +1,3 @@
-pub mod blast;
 pub mod callees;
 pub mod callers;
 pub mod content;
@@ -1392,8 +1391,7 @@ fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, Str
             }
 
             if edit_mode {
-                let hash = crate::format::line_hash(line.as_bytes());
-                let _ = write!(out, "\n{i}:{hash:03x}|{line}");
+                let _ = write!(out, "\n{i}:{line}");
             } else {
                 let _ = write!(out, "\n{i:>4} │ {line}");
             }
@@ -1421,16 +1419,24 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
 
         // Extract the line number from a formatted content line. Two gutter
         // formats exist: the default `"  42 │ content"` (number before the `│`
-        // gutter) and edit-mode hashlines `"42:a3f|content"` (number is the
-        // `line:` prefix before the `|` delimiter). Parse both so noise
-        // stripping/truncation works in edit mode too.
-        let line_num = if let Some(pos) = segment.find('│') {
-            segment[..pos].trim().parse::<u32>().ok()
-        } else {
+        // gutter) and edit-mode numbered lines `"42:content"` (number is the
+        // `line:` prefix). Parse both so noise stripping/truncation works in
+        // edit mode too.
+        let prefix_num = || {
             segment
-                .find('|')
-                .and_then(|pos| segment[..pos].split(':').next())
-                .and_then(|n| n.trim().parse::<u32>().ok())
+                .split_once(':')
+                .and_then(|(n, _)| n.trim().parse::<u32>().ok())
+        };
+        let line_num = match segment.find('│') {
+            // Gutter format `"  42 │ content"`. The `│` may also appear inside
+            // edit-mode content (a box-drawing char in a string), so when the
+            // pre-gutter text isn't a number, fall back to the `N:` prefix.
+            Some(pos) => segment[..pos]
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .or_else(prefix_num),
+            None => prefix_num(),
         };
 
         if let Some(num) = line_num {
@@ -1710,17 +1716,65 @@ mod tests {
         );
         assert!(filtered.contains("│ c"), "{filtered}");
 
-        // Edit-mode hashline format: "N:hash|content". Regression for the bug
-        // where filter_code_lines only recognized the │ gutter, so stripping
-        // silently no-opped in edit mode.
-        let edit = "```src/x.rs:1-3\n1:001|a\n2:002|b\n3:003|c\n```";
+        // Edit-mode whole-file-tag format: "N:content" (no per-line hash).
+        // Regression for the bug where filter_code_lines only recognized the │
+        // gutter, so stripping silently no-opped in edit mode.
+        let edit = "```src/x.rs:1-3\n1:a\n2:b\n3:c\n```";
         let filtered = filter_code_lines(edit, &skip);
-        assert!(filtered.contains("1:001|a"), "{filtered}");
+        assert!(filtered.contains("1:a"), "{filtered}");
         assert!(
-            !filtered.contains("2:002|b"),
+            !filtered.contains("2:b"),
             "edit-mode line 2 should be stripped: {filtered}"
         );
-        assert!(filtered.contains("3:003|c"), "{filtered}");
+        assert!(filtered.contains("3:c"), "{filtered}");
+    }
+
+    /// Boundary: the `N:content` parser splits on the FIRST colon, so a content
+    /// line that itself contains a colon (or starts with a digit + colon) must
+    /// have its number resolved from the line-number prefix, never from a colon
+    /// inside the content. Locks the `split_once(':')` choice against a
+    /// last-colon / inner-colon regression.
+    #[test]
+    fn filter_code_lines_uses_prefix_colon_not_content_colon() {
+        let mut skip = HashSet::new();
+        skip.insert(3u32);
+
+        // Line 3 is the strip target and its content contains a colon.
+        // Line 10's content is `3: decoy` — if the parser mistook the inner
+        // `3:` for the line number, it would wrongly strip line 10.
+        let edit = "```src/x.rs:3-10\n3:let m: i32 = 0;\n10:3: decoy\n```";
+        let filtered = filter_code_lines(edit, &skip);
+        assert!(
+            !filtered.contains("3:let m: i32 = 0;"),
+            "line 3 (colon in content) should be stripped by its prefix number: {filtered}"
+        );
+        assert!(
+            filtered.contains("10:3: decoy"),
+            "line 10 must be kept — inner `3:` is content, not the line number: {filtered}"
+        );
+    }
+
+    /// Boundary: in edit mode the content itself may contain a `│` (U+2502) — a
+    /// box-drawing char in a string literal. The gutter branch keys on `find('│')`,
+    /// so it fires on the content `│` and tries to parse the whole `N:...` prefix as
+    /// a number, which fails. The parser must fall back to the `N:` prefix so a
+    /// skip-listed edit-mode line is still stripped. Locks the gutter→prefix fallback.
+    #[test]
+    fn filter_code_lines_edit_mode_content_bar_falls_back_to_prefix() {
+        let mut skip = HashSet::new();
+        skip.insert(42u32);
+
+        // Line 42's content contains a `│`; line 43 is a plain kept line.
+        let edit = "```src/x.rs:42-43\n42:let g = \"│\";\n43:let h = 1;\n```";
+        let filtered = filter_code_lines(edit, &skip);
+        assert!(
+            !filtered.contains("42:let g"),
+            "line 42 (│ in content) should be stripped via prefix fallback: {filtered}"
+        );
+        assert!(
+            filtered.contains("43:let h = 1;"),
+            "line 43 must be kept: {filtered}"
+        );
     }
 
     // ── walker unit tests ──

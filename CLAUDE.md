@@ -42,12 +42,19 @@ src/
     strip.rs           Cognitive load stripping (comments, blank lines in expanded code).
     truncate.rs        Smart truncation to fit budget constraints.
     glob.rs            File glob search.
-    blast.rs           Blast radius — find callers of definitions touched by edits.
   index/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
   cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
-  edit.rs              Hash-anchored editing (tilth_edit). Hashline verification + atomic apply.
+  edit/
+    mod.rs             Path-key normalization; re-exports the whole-file-tag edit modules below.
+    tag.rs             Whole-file content tag (`[path#TAG]`) mint/verify + numbered-line rendering.
+    parser.rs          Op-grammar parser: `[path#TAG]` sections into ops.
+    block.rs           Resolves a `#symbol`/line block anchor to a concrete line span (wires to `lang/outline`).
+    apply.rs           Applies parsed ops to file content (line-op splicing).
+    recovery.rs        3-way-merge recovery when the live file drifted since the tagged read.
+    snapshots.rs       Per-session file snapshots keyed by tag for edit verification.
+    mismatch.rs        Tag-mismatch classification (drift vs fabricated).
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
