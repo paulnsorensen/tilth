@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-
 use crate::cache::OutlineCache;
 use crate::lang::detect_file_type;
 use crate::read::outline;
+use crate::search::base_walk_builder;
 use crate::types::{estimate_tokens, FileType};
 
 /// Generate a structural codebase map.
@@ -16,25 +15,7 @@ use crate::types::{estimate_tokens, FileType};
 pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &OutlineCache) -> String {
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
-    let walker = WalkBuilder::new(scope)
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .add_custom_ignore_filename(crate::search::TILTHIGNORE_FILE)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !crate::search::SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        })
-        .max_depth(Some(depth + 1))
-        .build();
+    let walker = base_walk_builder(scope).max_depth(Some(depth + 1)).build();
 
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {

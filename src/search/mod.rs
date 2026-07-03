@@ -97,6 +97,33 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// honors — a repo can hard-deny secret or noisy files from search/list/map
 /// even though `.gitignore` is intentionally not consulted.
 pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
+/// Shared walker policy: searches ALL files except known junk directories.
+/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files
+/// are found. Used by both the parallel search walker (`walker()`) and the
+/// sequential map walker (`crate::map::generate`), which each apply their own
+/// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(scope);
+    builder
+        .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .add_custom_ignore_filename(TILTHIGNORE_FILE)
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !SKIP_DIRS.contains(&name);
+                }
+            }
+            true
+        });
+    builder
+}
 
 /// Build a parallel directory walker that searches ALL files except known junk
 /// directories and anything a repo's `.tilthignore` excludes. `.gitignore` is
@@ -111,26 +138,8 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let mut builder = WalkBuilder::new(scope);
-    builder
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .threads(threads)
-        .add_custom_ignore_filename(TILTHIGNORE_FILE)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        });
+    let mut builder = base_walk_builder(scope);
+    builder.threads(threads);
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
