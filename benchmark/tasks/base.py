@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 import subprocess
 from pathlib import Path
 
+from fixtures.reset import restore_git
+
 
 @dataclass
 class Mutation:
@@ -131,13 +133,9 @@ class Task(ABC):
 
         # Restore .git if a hide_git task moved it aside, so the test command (and the
         # git-diff correctness path below) see a real repo rather than the agent-run
-        # state. Reset restores it later too; doing it here avoids a latent footgun for
+        # state. Reset restores it later too; doing it here avoids a latent bug for
         # any hide_git task whose test_command shells out to git.
-        hidden = Path(repo_path) / ".git_hidden"
-        if hidden.exists():
-            git_dir = Path(repo_path) / ".git"
-            if not git_dir.exists():
-                hidden.rename(git_dir)
+        restore_git(Path(repo_path))
 
         # Mutation tasks with a test command: run the test. That's the source of truth.
         if self.mutations and self.test_command:

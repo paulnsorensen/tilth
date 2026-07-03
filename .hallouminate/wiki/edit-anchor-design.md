@@ -1,6 +1,8 @@
 # Edit-anchor design: per-line hash vs whole-file tag (tilth vs oh-my-pi)
 
-Why tilth anchors edits with a per-line content hash, what that costs in tokens, and the open strategic question of whether to switch to oh-my-pi's whole-file-tag model. Full comparison in `.cheese/notes/oh-my-pi-comparison.md` (§3, §9); hash research in `.cheese/research/{hash-anchor-collision-design,fnv1a-line-hash-anchor,xxhash32-vs-fnv1a-truncation}/` (local, gitignored). Related: [[mcp-cwd-root-binding]].
+> **Historical.** This analysis informed the decision and has since been acted on: tilth migrated from the per-line hash model to the whole-file-tag model (PRs #96-#99; `src/edit/tag.rs` et al.). Code referents below describe the *pre-migration* tree and no longer resolve against `main`. The analysis is kept as the record of *why* the switch was made.
+
+Why tilth originally anchored edits with a per-line content hash, what that cost in tokens, and the strategic question of whether to switch to oh-my-pi's whole-file-tag model -- the question this analysis fed, since decided in favour of the switch. Full comparison in `.cheese/notes/oh-my-pi-comparison.md` (§3, §9); hash research in `.cheese/research/{hash-anchor-collision-design,fnv1a-line-hash-anchor,xxhash32-vs-fnv1a-truncation}/` (local, gitignored). Related: [[mcp-cwd-root-binding]].
 
 ## Two opposite structural bets
 
@@ -55,11 +57,13 @@ A natural worry is "you must read before you edit, so do you read twice — once
 
 The flip side sharpens the cost: because the flag is global, **every** read in an editing session pays the ~25% tax, including pure-comprehension reads that never lead to an edit. There is no hash-free read in an edit-mode server (`read_ranges`, signature mode all take `edit_mode` — `src/read/mod.rs:228-232`, `:540`). oh-my-pi's O(1) tag stays cheap on comprehension reads.
 
-## Open strategic question (for a future /mold)
+## The strategic question (since decided: switched to whole-file tag)
 
-If tilth's design point is token efficiency for AI agents, per-line anchoring works *against* that on every edit-mode read (~25% tax), while oh-my-pi's whole-file tag avoids it. The counterweight is tilth's localized staleness + snapshot-free recovery. This is unresolved and worth a dedicated `/mold`: keep per-line (and pursue the scoped hash-hygiene fixes: xor-fold + a 32-bit range checksum for multi-line interiors), or switch to the whole-file-tag model and rework the edit protocol. The scoped hash-hygiene spec is on hold pending that decision — see `.cheese/notes/oh-my-pi-steal-shortlist.md` and the wheypoint note that supersedes it.
+If tilth's design point is token efficiency for AI agents, per-line anchoring worked *against* that on every edit-mode read (~25% tax), while oh-my-pi's whole-file tag avoids it. The counterweight was tilth's localized staleness + snapshot-free recovery. **Resolved:** tilth switched to the whole-file-tag model (PRs #96-#99) and reworked the edit protocol; the scoped hash-hygiene fixes (xor-fold + 32-bit range checksum) were mooted by the switch. Retained for context: `.cheese/notes/oh-my-pi-steal-shortlist.md` and the wheypoint note that supersedes it.
 
-## Source referents
+## Source referents (pre-migration tree)
+
+As of the pre-migration tree (before PR #99 / commit 77259ba); `src/edit.rs` and the `line_hash`/`hashlines` symbols no longer exist on `main`.
 
 - `src/format.rs:122-131` — `line_hash`, the `& 0xFFF` low-bit mask (the bug).
 - `src/format.rs:135-144` — `hashlines`, the `N:hash|content` render.

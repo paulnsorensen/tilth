@@ -62,6 +62,8 @@ def install_deps(repo_config) -> None:
     """
     if repo_config.name != "express":
         return
+    if (repo_config.path / "node_modules").exists():
+        return
     env = dict(os.environ)
     # A broken (nonexistent) SSL_CERT_FILE poisons node's CA store and fails
     # every registry fetch; drop it like uv does rather than fail the setup.
@@ -69,13 +71,20 @@ def install_deps(repo_config) -> None:
     if cert and not Path(cert).exists():
         env.pop("SSL_CERT_FILE")
     print(f"  {repo_config.name}: npm install (dev deps for mocha)...")
-    subprocess.run(
-        ["npm", "install", "--no-audit", "--no-fund"],
-        cwd=str(repo_config.path),
-        check=True,
-        capture_output=True,
-        env=env,
-    )
+    try:
+        subprocess.run(
+            ["npm", "install", "--no-audit", "--no-fund"],
+            cwd=str(repo_config.path),
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        print(stderr)
+        raise
     print(f"  {repo_config.name}: dev deps installed")
 
 
