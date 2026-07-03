@@ -20,6 +20,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
+            "annotations": { "readOnlyHint": true },
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
@@ -61,6 +62,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_read",
+            "annotations": { "readOnlyHint": true },
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
@@ -103,6 +105,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
+            "annotations": { "readOnlyHint": true },
             "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
             "inputSchema": {
                 "type": "object",
@@ -129,6 +132,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_deps",
+            "annotations": { "readOnlyHint": true },
             "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
                 "type": "object",
@@ -151,6 +155,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_grok",
+            "annotations": { "readOnlyHint": true },
             "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
             "inputSchema": {
                 "type": "object",
@@ -174,6 +179,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_diff",
+            "annotations": { "readOnlyHint": true },
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
             "inputSchema": {
                 "type": "object",
@@ -225,6 +231,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_savings",
+            "annotations": { "readOnlyHint": true },
             "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
             "inputSchema": {
                 "type": "object",
@@ -236,6 +243,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
+            "annotations": { "readOnlyHint": false },
             "description": "Batch write one or more files in one call. Replaces the host Edit and Write tools — DO NOT use those. Three per-file modes: `hash` (default — replace lines at hash anchors from tilth_read), `overwrite` (whole file; create-only by default — pass `overwrite: true` to replace an existing file), `append` (append `content`, creates if absent). overwrite/append responses echo the file's hashlines so you can chain anchored edits in the next call without re-reading. ALWAYS group writes to multiple files into a single tilth_write call — never call tilth_write twice in a row. Each file is processed independently (best-effort): a failure on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.",
             "inputSchema": {
                 "type": "object",
