@@ -116,6 +116,15 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
+/// The startup warning emitted when the Claude Code cwd-injection hook is
+/// expected (`TILTH_MCP_CWD_HOOK_INJECTED=1`) so an operator without the hook
+/// installed has a grep-able stderr line. `None` for any other env value.
+fn hook_injection_warning(env_value: Option<&str>) -> Option<&'static str> {
+    (env_value == Some("1")).then_some(
+        "tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed",
+    )
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
@@ -138,6 +147,11 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
+    if let Some(msg) =
+        hook_injection_warning(std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").ok().as_deref())
+    {
+        eprintln!("{msg}");
+    }
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -425,6 +439,17 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
+    #[test]
+    fn hook_injection_warning_fires_only_on_one() {
+        assert_eq!(
+            hook_injection_warning(Some("1")),
+            Some("tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed")
+        );
+        assert_eq!(hook_injection_warning(Some("0")), None);
+        assert_eq!(hook_injection_warning(Some("true")), None);
+        assert_eq!(hook_injection_warning(None), None);
+    }
+
     /// Tool handlers now require an absolute `cwd`. Injects a default so the
     /// behavior tests below can focus on the handler under test: absolute paths
     /// in the fixtures pass through unchanged; relative names anchor under this
@@ -443,7 +468,7 @@ mod tests {
     /// per-handler unit helpers. Each tool is given its other required params so
     /// the refusal is specifically the cwd teaching error, not a different
     /// missing-param error. Guards against a future tool being wired into
-    /// dispatch without the require_cwd gate.
+    /// dispatch without the `require_cwd` gate.
     #[test]
     fn dispatch_refuses_missing_cwd_for_every_path_tool() {
         let services = Services::new(true); // edit_mode=true so tilth_write dispatches

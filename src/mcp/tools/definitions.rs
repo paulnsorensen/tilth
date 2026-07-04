@@ -467,7 +467,7 @@ mod tests {
 
     /// Every advertised tool must carry a required `cwd` property, and the old
     /// `root` property must be gone from all of them. Covers all seven
-    /// path-taking tools in edit mode (tilth_diff included).
+    /// path-taking tools in edit mode (`tilth_diff` included).
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
