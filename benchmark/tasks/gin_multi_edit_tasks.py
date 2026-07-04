@@ -28,9 +28,9 @@ class GinMultiContextTask(Task):
     @property
     def mutations(self) -> list[Mutation]:
         return [
-            # Next(): flip the handler-loop bound (< -> >) so the chain never
-            # advances past the first handler. Novel shape — gin_edit_middleware_skip
-            # mutates `c.index++`, not the loop bound, so this can't be recalled.
+            # Next(): flip the handler-loop bound (< -> >) so no handlers in the
+            # chain execute. Novel shape — gin_edit_middleware_skip mutates
+            # `c.index++`, not the loop bound, so this can't be recalled.
             Mutation(
                 file_path="context.go",
                 original="c.index < safeInt8(len(c.handlers))",
