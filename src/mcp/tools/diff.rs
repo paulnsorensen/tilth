@@ -23,3 +23,33 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
     let result = crate::diff::diff(&diff_source, scope, search, blast, expand, Some(budget))?;
     Ok(crate::budget::apply(&result, budget))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_cwd_refused() {
+        // tilth_diff gained cwd for schema consistency only — git diff runs in
+        // the server dir. But the value is still validated: a call with no cwd
+        // must refuse with the teaching error before any diff work.
+        let args = serde_json::json!({});
+        let err = tool_diff(&args).unwrap_err();
+        assert!(
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "diff without cwd must refuse with the teaching error: {err}"
+        );
+    }
+
+    #[test]
+    fn relative_cwd_refused() {
+        // The validated-but-unused seam still enforces absoluteness: a relative
+        // cwd is refused even though the value is not otherwise consumed.
+        let args = serde_json::json!({ "cwd": "relative/dir", "source": "working" });
+        let err = tool_diff(&args).unwrap_err();
+        assert!(
+            err.contains("relative") && err.contains("absolute checkout directory"),
+            "diff with a relative cwd must refuse: {err}"
+        );
+    }
+}

@@ -438,6 +438,40 @@ mod tests {
         a
     }
 
+    /// Integration seam: the real JSON-RPC dispatch path (`dispatch_tool`) must
+    /// refuse a missing `cwd` for EVERY advertised path-taking tool, not just the
+    /// per-handler unit helpers. Each tool is given its other required params so
+    /// the refusal is specifically the cwd teaching error, not a different
+    /// missing-param error. Guards against a future tool being wired into
+    /// dispatch without the require_cwd gate.
+    #[test]
+    fn dispatch_refuses_missing_cwd_for_every_path_tool() {
+        let services = Services::new(true); // edit_mode=true so tilth_write dispatches
+        let cases = [
+            ("tilth_read", serde_json::json!({ "paths": ["x.rs"] })),
+            (
+                "tilth_search",
+                serde_json::json!({ "queries": [{ "query": "x" }] }),
+            ),
+            ("tilth_list", serde_json::json!({ "patterns": ["*.rs"] })),
+            ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
+            ("tilth_grok", serde_json::json!({ "target": "x" })),
+            ("tilth_diff", serde_json::json!({})),
+            (
+                "tilth_write",
+                serde_json::json!({ "edits": "[a#0000]\nDEL 1\n" }),
+            ),
+        ];
+        for (tool, args) in cases {
+            let err = dispatch_tool(tool, &args, &services)
+                .expect_err(&format!("{tool} must refuse a missing cwd, got Ok"));
+            assert!(
+                err.contains("cwd") && err.contains("absolute checkout directory"),
+                "{tool} dispatch must refuse missing cwd with the teaching error: {err}"
+            );
+        }
+    }
+
     // -- serve: no unsolicited roots/list handshake ---------------------------
 
     /// After the roots removal, `serve` must never emit a request of its own.
