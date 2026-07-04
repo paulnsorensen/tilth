@@ -249,14 +249,6 @@ pub fn read_file(
     Ok(format!("{header}\n\n{outline}"))
 }
 
-/// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
-///
-/// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
-/// relative) query against the gitignore-pruned tree. `Suggestions` enrich the
-/// `NotFound` with a ranked "did you mean" list and `None` returns the
-/// unchanged `NotFound` — tilth never auto-opens a different file than was
-/// asked for. A successful read never walks — it returns `read_file`'s result
-/// untouched.
 /// Reduce `path` to a scope-relative query string for fuzzy matching.
 ///
 /// Candidates from the walker are relative to `scope`, so the query must be too.
@@ -278,6 +270,14 @@ fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a
     stripped.to_string_lossy()
 }
 
+/// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
+///
+/// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
+/// relative) query against the `.tilthignore`-pruned tree. `Suggestions` enrich
+/// the `NotFound` with a ranked "did you mean" list and `None` returns the
+/// unchanged `NotFound` — tilth never auto-opens a different file than was
+/// asked for. A successful read never walks — it returns `read_file`'s result
+/// untouched.
 pub fn read_file_resolving(
     path: &Path,
     section: Option<&str>,

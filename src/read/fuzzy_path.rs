@@ -9,9 +9,10 @@
 //! for is a confidently-wrong failure mode, and the round-trip a suggestion
 //! costs is cheap by comparison.
 //!
-//! Cold path only — never invoked on a successful read or search. Walk honors
-//! gitignore rules, skips hidden files, and does not follow symlinks — a
-//! misdirected query cannot surface secrets that were never named by the agent.
+//! Cold path only — never invoked on a successful read or search. The walk is
+//! pruned by `.tilthignore` (not `.gitignore`), includes hidden and gitignored
+//! files, and follows symlinks — but only path names ever surface as
+//! suggestions, never file contents.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -45,7 +46,7 @@ pub enum GateProfile {
     Search,
 }
 
-/// Resolve `query` against the gitignore-pruned file tree rooted at `scope`.
+/// Resolve `query` against the `.tilthignore`-pruned file tree rooted at `scope`.
 ///
 /// Walks `search::walker(scope, None)`, scores every file's scope-relative path
 /// against `query` with `nucleo-matcher`'s path-aware matcher, and returns the
@@ -80,14 +81,17 @@ pub fn resolve_fuzzy_path(scope: &Path, query: &str, _gate: GateProfile) -> Fuzz
 
 /// Search-miss suggestions for the MCP `tilth_search` default path, which
 /// returns an empty-result header on a miss and so never reaches the basic-path
-/// `fuzzy_path_fallback`. Callers pre-check [`is_path_like`] (so a normal empty
-/// symbol search never walks the tree) and confirm the search produced no
-/// matches before invoking this. Returns the ranked "did you mean" list for a
-/// path-like miss, or `None` when nothing subsequence-matches (the caller keeps
-/// its own empty-result output unchanged). Never opens a file the agent didn't
-/// name.
+/// `fuzzy_path_fallback`. Non-path-like queries return `None` before any walk
+/// (guarded here via [`is_path_like`], so a normal empty symbol search never
+/// walks the tree); callers confirm the search produced no matches before
+/// invoking this. Returns the ranked "did you mean" list for a path-like miss,
+/// or `None` when nothing subsequence-matches (the caller keeps its own
+/// empty-result output unchanged). Never opens a file the agent didn't name.
 #[must_use]
 pub fn search_miss_suggestions(scope: &Path, query: &str) -> Option<Vec<String>> {
+    if !is_path_like(query) {
+        return None;
+    }
     match resolve_fuzzy_path(scope, query, GateProfile::Search) {
         FuzzyResolution::Suggestions(s) => Some(s),
         FuzzyResolution::None => None,
@@ -125,9 +129,9 @@ pub fn is_path_like(query: &str) -> bool {
     query.contains('/') && Path::new(query).extension().is_some()
 }
 
-/// Walk the gitignore-pruned tree under `scope`, collecting scope-relative path
-/// strings for files only. Returns `(candidates, truncated)`; `truncated` is
-/// true when the walk stopped at `MAX_FUZZY_CANDIDATES`.
+/// Walk the `.tilthignore`-pruned tree under `scope`, collecting scope-relative
+/// path strings for files only. Returns `(candidates, truncated)`; `truncated`
+/// is true when the walk stopped at `MAX_FUZZY_CANDIDATES`.
 fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
     let Ok(walker) = crate::search::walker(scope, None) else {
         return (Vec::new(), false);
@@ -310,6 +314,27 @@ mod tests {
             top_suggestion(&res).as_deref(),
             Some("src/search/symbol.rs"),
             "path-like single-winner query should suggest the real file first under Search"
+        );
+    }
+
+    #[test]
+    fn search_miss_suggestions_guards_non_path_like() {
+        // `symbol` subsequence-matches src/search/symbol.rs, but a bare-concept
+        // query must return None before any tree walk — the internal
+        // `is_path_like` guard keeps the pub API safe without relying on
+        // caller pre-checks.
+        let dir = fixture(&["src/search/symbol.rs"]);
+        assert!(
+            search_miss_suggestions(dir.path(), "symbol").is_none(),
+            "non-path-like query must be guarded to None"
+        );
+        assert_eq!(
+            search_miss_suggestions(dir.path(), "serch/symbol.rs")
+                .unwrap()
+                .first()
+                .map(String::as_str),
+            Some("src/search/symbol.rs"),
+            "path-like miss must still return the did-you-mean list"
         );
     }
 
