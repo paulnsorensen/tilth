@@ -140,8 +140,8 @@ fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
     Ok(())
 }
 
-/// Writes a `[mcp_servers.tilth]` section into a TOML config file.
-fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
+/// Renders the `[mcp_servers.tilth]` TOML table for `write_toml_config`.
+fn toml_server_section(edit: bool, hook_injected: &str) -> String {
     let (command, args) = tilth_command_and_args(edit);
 
     // Escape backslashes for TOML basic strings (Windows paths like C:\Users\...).
@@ -150,10 +150,15 @@ fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
         .iter()
         .map(|a| format!("\"{}\"", a.replace('\\', "\\\\")))
         .collect();
-    let section = format!(
+    format!(
         "[mcp_servers.tilth]\ncommand = \"{command_escaped}\"\nargs = [{}]\nenv = {{ TILTH_MCP_CWD_HOOK_INJECTED = \"{hook_injected}\" }}\n",
         args_toml.join(", ")
-    );
+    )
+}
+
+/// Writes a `[mcp_servers.tilth]` section into a TOML config file.
+fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
+    let section = toml_server_section(edit, hook_injected);
 
     let existing = if host_info.path.exists() {
         fs::read_to_string(&host_info.path)
@@ -1184,5 +1189,25 @@ mod tests {
             local["environment"]["TILTH_MCP_CWD_HOOK_INJECTED"],
             json!("0")
         );
+    }
+
+    /// The TOML config path (codex — the host that most depends on the
+    /// explicit-cwd posture) emits the hook-injected env var as an inline
+    /// table that parses as valid TOML with the right value.
+    #[test]
+    fn toml_section_carries_hook_injected_env() {
+        for hook_injected in ["0", "1"] {
+            let section = toml_server_section(false, hook_injected);
+            let parsed: toml::Table = section
+                .parse()
+                .expect("generated [mcp_servers.tilth] section must be valid TOML");
+            assert_eq!(
+                parsed["mcp_servers"]["tilth"]["env"]["TILTH_MCP_CWD_HOOK_INJECTED"]
+                    .as_str()
+                    .expect("env var must be a TOML string"),
+                hook_injected,
+                "TOML env emission must carry the hook-injected flag"
+            );
+        }
     }
 }
