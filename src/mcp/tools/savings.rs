@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_savings(_args: &Value, session: &Session) -> Result<S
     if baseline == 0 {
         return Ok("No measured reads yet this session.".to_string());
     }
-    let pct = saved * 100 / baseline;
+    let pct = (u128::from(saved) * 100 / u128::from(baseline)) as u64;
     Ok(format!(
         "Saved ~{saved} tokens this session (~{pct}% of {baseline} baseline tokens) \
          vs naive read/grep. Conservative lower bound — re-reads and some paths aren't counted."
