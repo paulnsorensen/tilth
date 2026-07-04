@@ -252,11 +252,11 @@ pub fn read_file(
 /// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
 ///
 /// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
-/// relative) query against the gitignore-pruned tree. A confident `Resolved`
-/// auto-opens the winning file with a `# <real-path> (corrected from "<query>")`
-/// header; `Suggestions` enrich the `NotFound` with a ranked "did you mean"
-/// list; `None` returns the unchanged `NotFound` (today's behaviour). A
-/// successful read never walks — it returns `read_file`'s result untouched.
+/// relative) query against the gitignore-pruned tree. `Suggestions` enrich the
+/// `NotFound` with a ranked "did you mean" list and `None` returns the
+/// unchanged `NotFound` — tilth never auto-opens a different file than was
+/// asked for. A successful read never walks — it returns `read_file`'s result
+/// untouched.
 /// Reduce `path` to a scope-relative query string for fuzzy matching.
 ///
 /// Candidates from the walker are relative to `scope`, so the query must be too.
@@ -296,15 +296,6 @@ pub fn read_file_resolving(
     // The query is the scope-relative path the caller asked for.
     let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
-        fuzzy_path::FuzzyResolution::Resolved(hit) => {
-            hit.log_auto_open(&query);
-            let real = scope.join(&hit.path);
-            let body = read_file(&real, section, full, cache, edit_mode)?;
-            Ok(format!(
-                "# {} (corrected from \"{query}\")\n\n{body}",
-                hit.path.display()
-            ))
-        }
         fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
             path: missing,
             suggestion: Some(s.join(", ")),
@@ -1011,7 +1002,9 @@ mod tests {
     }
 
     #[test]
-    fn read_file_resolving_auto_opens_with_correction_header() {
+    fn read_file_resolving_suggests_real_file_first() {
+        // A basename-only miss must NOT auto-open; it errors with the real file
+        // surfaced as the top-ranked "did you mean" suggestion.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
         std::fs::write(
@@ -1022,17 +1015,16 @@ mod tests {
         std::fs::write(dir.path().join("src/lib.rs"), "pub mod search;\n").unwrap();
 
         let cache = OutlineCache::new();
-        // Basename-only miss resolves to the unique real file.
         let missing = dir.path().join("symbol.rs");
-        let out = read_file_resolving(&missing, None, false, &cache, false, dir.path()).unwrap();
-
+        let err = read_file_resolving(&missing, None, false, &cache, false, dir.path())
+            .expect_err("near-miss must not auto-open — suggest-only");
+        let TilthError::NotFound { suggestion, .. } = err else {
+            panic!("expected NotFound, got: {err:?}");
+        };
+        let suggestion = suggestion.expect("near-miss must carry a suggestion");
         assert!(
-            out.contains("src/search/symbol.rs (corrected from \"symbol.rs\")"),
-            "expected correction header, got: {out}"
-        );
-        assert!(
-            out.contains("pub fn find"),
-            "expected resolved file body: {out}"
+            suggestion.starts_with("src/search/symbol.rs"),
+            "real file must be the top-ranked suggestion: {suggestion}"
         );
     }
 
