@@ -2319,7 +2319,7 @@ mod tests {
         );
         // The gutter form must NOT appear when edit_mode is set.
         assert!(
-            !out.contains("│ fn unique_symbol_for_hashline_test"),
+            !out.contains("| fn unique_symbol_for_hashline_test"),
             "gutter form must be suppressed under edit_mode: {out}"
         );
     }

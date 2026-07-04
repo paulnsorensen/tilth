@@ -337,7 +337,7 @@ pub fn search_callers_expanded(
         );
 
         // Show the call text
-        let _ = writeln!(output, "→ {}", caller.call_text);
+        let _ = writeln!(output, "-> {}", caller.call_text);
 
         // Expand if requested and we have the range
         if i < expand {
@@ -353,11 +353,11 @@ pub fn search_callers_expanded(
                 for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
                     let line_num = start_idx + idx + 1;
                     let prefix = if line_num == caller.line as usize {
-                        "► "
+                        "> "
                     } else {
                         "  "
                     };
-                    let _ = writeln!(output, "{prefix}{line_num:4} │ {line}");
+                    let _ = writeln!(output, "{prefix}{line_num:4} | {line}");
                 }
 
                 output.push_str("```\n");
@@ -382,7 +382,7 @@ pub fn search_callers_expanded(
                 .collect();
 
             if !hop2_filtered.is_empty() {
-                output.push_str("\n── impact (2nd hop) ──\n");
+                output.push_str("\n-- impact (2nd hop) --\n");
 
                 let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
                 let mut count = 0;
@@ -398,7 +398,7 @@ pub fn search_callers_expanded(
                     let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
                     let _ = writeln!(
                         output,
-                        "  {:<20} {}:{}  \u{2192} {}",
+                        "  {:<20} {}:{}  -> {}",
                         m.calling_function, rel_path, m.line, via
                     );
                     count += 1;
@@ -511,7 +511,7 @@ pub fn search_callers_multi_expanded(
                 caller.line,
                 caller.calling_function
             );
-            let _ = writeln!(output, "→ {}", caller.call_text);
+            let _ = writeln!(output, "-> {}", caller.call_text);
 
             if i < expand {
                 if let Some((start, end)) = caller.caller_range {
@@ -524,11 +524,11 @@ pub fn search_callers_multi_expanded(
                     for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
                         let line_num = start_idx + idx + 1;
                         let prefix = if line_num == caller.line as usize {
-                            "► "
+                            "> "
                         } else {
                             "  "
                         };
-                        let _ = writeln!(output, "{prefix}{line_num:4} │ {line}");
+                        let _ = writeln!(output, "{prefix}{line_num:4} | {line}");
                     }
                     output.push_str("```\n");
                 }
