@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -9,19 +10,34 @@ def reset_repo():
     subprocess.run(["git", "checkout", "--", "."], cwd=REPO_PATH, check=True, capture_output=True)
     subprocess.run(["git", "clean", "-fd"], cwd=REPO_PATH, check=True, capture_output=True)
 
+def restore_git(repo_path: Path) -> None:
+    """Restore `.git` if a hide_git task moved it aside to `.git_hidden`.
+
+    Idempotent and crash-safe. `.git_hidden` is only ever created by hide_git,
+    so when it exists it IS the real repo -- any `.git` next to it is an impostor
+    created mid-run (observed: a fresh sha256-format repo) and is discarded. A
+    symlink or plain-file impostor is unlinked; a real directory is removed.
+    """
+    git_dir = Path(repo_path) / ".git"
+    hidden = Path(repo_path) / ".git_hidden"
+    if not hidden.exists():
+        return
+    if git_dir.is_symlink() or git_dir.is_file():
+        git_dir.unlink()
+    elif git_dir.exists():
+        shutil.rmtree(git_dir)
+    hidden.rename(git_dir)
+
 def ensure_repo_clean(repo_path: Path, pinned_sha: str | None = None) -> None:
     """Reset a real-world repo to its pinned commit.
 
     Handles both uncommitted changes (dirty working tree) and committed
     mutations (extra commits on top of the pinned SHA).
     """
-    # Restore `.git` if a no-git task (hide_git) moved it aside. Idempotent and
-    # crash-safe: runs before every reset, so a timed-out/crashed no-git run is
-    # recovered on the next task's pre-reset.
-    git_dir = Path(repo_path) / ".git"
-    hidden = Path(repo_path) / ".git_hidden"
-    if hidden.exists() and not git_dir.exists():
-        hidden.rename(git_dir)
+    # Restore `.git` if a no-git task (hide_git) moved it aside. Runs before
+    # every reset, so a timed-out/crashed no-git run is recovered on the next
+    # task's pre-reset.
+    restore_git(Path(repo_path))
 
     needs_reset = False
 

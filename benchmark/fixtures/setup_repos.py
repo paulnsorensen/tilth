@@ -2,6 +2,7 @@
 """Clone and pin real-world repositories for benchmarking."""
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ def setup_repo(repo_config) -> None:
         current_sha = result.stdout.strip()
         if current_sha == repo_config.commit_sha:
             print(f"  {repo_config.name}: already at {repo_config.commit_sha[:8]}")
+            install_deps(repo_config)
             return
 
         print(f"  {repo_config.name}: at {current_sha[:8]}, need {repo_config.commit_sha[:8]}, re-cloning...")
@@ -47,6 +49,43 @@ def setup_repo(repo_config) -> None:
         capture_output=True,
     )
     print(f"  {repo_config.name}: checked out {repo_config.commit_sha[:8]}")
+
+    install_deps(repo_config)
+
+
+def install_deps(repo_config) -> None:
+    """Install per-repo dev dependencies needed by task test_commands.
+
+    Only express needs this: `npx mocha` in a bare checkout hangs on an
+    interactive install prompt, which times out every edit rep. Go (`go test`)
+    and Python (`uv run pytest`) fetch their own dependencies.
+    """
+    if repo_config.name != "express":
+        return
+    if (repo_config.path / "node_modules").exists():
+        return
+    env = dict(os.environ)
+    # A broken (nonexistent) SSL_CERT_FILE poisons node's CA store and fails
+    # every registry fetch; drop it like uv does rather than fail the setup.
+    cert = env.get("SSL_CERT_FILE")
+    if cert and not Path(cert).exists():
+        env.pop("SSL_CERT_FILE")
+    print(f"  {repo_config.name}: npm install (dev deps for mocha)...")
+    try:
+        subprocess.run(
+            ["npm", "install", "--no-audit", "--no-fund"],
+            cwd=str(repo_config.path),
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        print(stderr)
+        raise
+    print(f"  {repo_config.name}: dev deps installed")
 
 
 def setup_all(repo_names: Optional[list[str]] = None) -> None:
