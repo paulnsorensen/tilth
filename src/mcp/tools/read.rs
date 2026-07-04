@@ -258,12 +258,36 @@ pub(in crate::mcp) fn tool_read(
 
     session.record_read(&path);
 
+    // Only genuine AUTO reads are credited with savings — where tilth transparently
+    // returns an outline instead of the full file a naive `cat` would dump. An
+    // explicit signature/stripped/full read asked for a specific view, so crediting
+    // "saved vs the whole file" would overstate. Suffix reads already returned above.
+    let auto_read = !force_signature && !force_stripped && !force_full;
+    // Capture the file size up front, close to `read_file`'s own read. Statting
+    // after the read+format pipeline would let an external append in that window
+    // inflate the baseline and overstate savings; statting here means a concurrent
+    // grow can only *understate* it, keeping the number a conservative lower bound.
+    let savings_baseline = if auto_read {
+        std::fs::metadata(&path).map(|m| m.len()).ok()
+    } else {
+        None
+    };
+
     let auto_signature_promotion =
         !force_full && !force_stripped && mode_str == "auto" && should_auto_signature(&path);
 
     // `mode: signature` (explicit or auto-promoted) is an outline-style read.
     if force_signature || auto_signature_promotion {
-        return respond_signature(&path, cache, auto_signature_promotion, budget);
+        let response = respond_signature(&path, cache, auto_signature_promotion, budget)?;
+        // Auto-promotion is a transparent outline of a large code file — the fork's
+        // equivalent of returning less than the full file, so credit the savings.
+        if let Some(file_byte_len) = savings_baseline {
+            session.record_savings(
+                crate::types::estimate_tokens(file_byte_len),
+                crate::types::estimate_tokens(response.len() as u64),
+            );
+        }
+        return Ok(response);
     }
 
     // `mode: stripped` is comment/log-stripped; explicit only (no auto path).
@@ -302,8 +326,16 @@ pub(in crate::mcp) fn tool_read(
     // `mode=auto` on a large non-code file routes through `read_file` and
     // emits an outline (markdown headings, JSON keys). Signal that the LLM
     // got less than the full content so it can escalate to `mode=full`.
+    // Keyed off the view marker in the emitted header, not `would_outline`'s
+    // prediction — the never-worse outline gate (OGATE) can return full
+    // content for a file that *would* outline, and labeling that body
+    // `view: "outline"` would tell the LLM to re-read for content it has.
+    let actually_outlined = output
+        .lines()
+        .next()
+        .is_some_and(|l| l.ends_with("[keys]") || l.ends_with("[outline]"));
     let mut meta = serde_json::Map::new();
-    if !force_full && crate::read::would_outline(&path) {
+    if !force_full && actually_outlined {
         meta.insert("view".into(), Value::String("outline".into()));
         if let Some(total) = count_lines(&path) {
             meta.insert("original_line_count".into(), Value::from(total));
@@ -311,7 +343,15 @@ pub(in crate::mcp) fn tool_read(
         meta.insert("next_view".into(), Value::String("full".into()));
     }
 
-    Ok(finalize_response(None, meta, &output, budget))
+    let response = finalize_response(None, meta, &output, budget);
+    // Credit savings vs the full file using the baseline captured before the read.
+    if let Some(file_byte_len) = savings_baseline {
+        session.record_savings(
+            crate::types::estimate_tokens(file_byte_len),
+            crate::types::estimate_tokens(response.len() as u64),
+        );
+    }
+    Ok(response)
 }
 
 /// Resolve a single path+suffix to its read output plus the [`SeenSpec`] the
@@ -824,11 +864,17 @@ mod tests {
         let root = dir.path();
         let p = root.join("big.md");
         let mut content = String::new();
-        for i in 1..=2000 {
-            let _ = writeln!(
-                content,
-                "# Section {i} with enough padding text to bloat bytes"
-            );
+        // Few headings, large plain-text bodies: the markdown outline (headings
+        // only) is a small fraction of the full-file token cost, so OGATE does
+        // not fire and the read genuinely returns an outline (not full content).
+        for i in 1..=40 {
+            let _ = writeln!(content, "# Section {i}");
+            for j in 0..60 {
+                let _ = writeln!(
+                    content,
+                    "Body paragraph line {j} of section {i} with padding text to bloat bytes."
+                );
+            }
         }
         std::fs::write(&p, &content).unwrap();
         assert!(
@@ -1009,5 +1055,95 @@ mod tests {
             out.contains("never displayed"),
             "multi-path outline read must not grant whole-file seenLines, got:\n{out}"
         );
+    }
+
+    // -- savings recording tests ------------------------------------------
+
+    /// A large file with large function bodies read in auto mode (outline) must record
+    /// saved > 0 and baseline > 0 on the session.
+    #[test]
+    fn tool_read_large_file_records_positive_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        // Build a file large enough to exceed TOKEN_THRESHOLD (6 000 tokens ≈ 24 KB)
+        // with functions that have substantial bodies so the outline compresses well.
+        let mut src = String::from("// header\n");
+        for i in 0..200 {
+            let _ = writeln!(src, "fn func_{i}() {{");
+            // 20 lines of body per function so outline is much smaller than full content
+            for j in 0..20 {
+                let _ = writeln!(src, "    let v_{i}_{j}: u64 = {j} * {i} + 42;");
+            }
+            src.push_str("}\n");
+        }
+        std::fs::write(&path, &src).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            file_size > 24_000,
+            "test file must be large enough to trigger outline: {file_size} bytes"
+        );
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+
+        tool_read(&args, &cache, &session, false).expect("large file read");
+
+        let (baseline, saved) = session.savings();
+        assert!(
+            baseline > 0,
+            "baseline must be > 0 for a non-empty file: baseline={baseline}"
+        );
+        assert!(
+            saved > 0,
+            "large outlined file must record positive savings: saved={saved}, baseline={baseline}"
+        );
+    }
+
+    /// A small file read in auto mode (full content) must record baseline > 0
+    /// but saved == 0 (no reduction applied).
+    #[test]
+    fn tool_read_small_file_records_zero_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.rs");
+        std::fs::write(&path, "fn small() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+
+        tool_read(&args, &cache, &session, false).expect("small file read");
+
+        let (baseline, saved) = session.savings();
+        assert!(baseline > 0, "baseline must be > 0 for a non-empty file");
+        assert_eq!(
+            saved, 0,
+            "small file returned in full must record zero savings"
+        );
+    }
+
+    /// A single-section read requested an explicit range — the naive baseline is
+    /// that range, not the whole file — so it must NOT record a (bogus) full-file
+    /// saving. Guards against over-counting explicit sub-view reads.
+    #[test]
+    fn tool_read_section_records_no_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sectioned.rs");
+        // Large file: a full-file baseline would book a big (bogus) "saving".
+        let mut src = String::new();
+        for i in 0..500 {
+            let _ = writeln!(src, "fn f_{i}() {{ let v = {i}; }}");
+        }
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())] });
+
+        tool_read(&args, &cache, &session, false).expect("section read");
+
+        let (baseline, saved) = session.savings();
+        assert_eq!(
+            baseline, 0,
+            "section reads must not record a full-file baseline"
+        );
+        assert_eq!(saved, 0, "section reads must not record savings");
     }
 }

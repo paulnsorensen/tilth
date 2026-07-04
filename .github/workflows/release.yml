@@ -129,6 +129,21 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      # Primary package: unscoped `tilth`
       - run: npm publish ./npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Anchor the @plotplot org: dual-publish the SAME artifact as `@plotplot/tilth`.
+      # Best-effort: the unscoped `tilth` publish above is the canonical release, so a
+      # failure here (e.g. the @plotplot scope isn't set up yet) must not fail the release.
+      # continue-on-error keeps the job green; if it fails, publish the scope manually when
+      # ready — `cd npm && npm pkg set name=@plotplot/tilth && npm publish --access public`.
+      - name: Dual-publish under the @plotplot scope
+        continue-on-error: true
+        working-directory: ./npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm pkg set name=@plotplot/tilth
+          npm publish --access public

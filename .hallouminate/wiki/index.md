@@ -8,6 +8,7 @@ under `.cheese/`.
 
 ## Topics
 
+- [Edit-anchor design: per-line hash vs whole-file tag](edit-anchor-design.md) — why tilth originally anchored edits with a per-line content hash, the FNV low-bit-mask bug, the measured ~25% per-read token tax vs oh-my-pi's O(1) whole-file tag, and the analysis behind the since-shipped switch to the whole-file-tag model.
 - [MCP cwd / workspace-root binding](mcp-cwd-root-binding.md) — why tilth uses a per-call `root` param (not the MCP `roots` capability) to resolve paths to the right git-worktree checkout; the silent worktree gotcha; 8-harness client survey.
 
 ## How to use this index
