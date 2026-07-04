@@ -1915,7 +1915,7 @@ mod tests {
         );
     }
 
-    /// tilth_write and tilth_list don't consume budget; passing budget:0 must
+    /// `tilth_write` and `tilth_list` don't consume budget; passing budget:0 must
     /// not produce a budget error — the error should come from their own
     /// parameter validation, not the budget gate.
     #[test]
@@ -1946,9 +1946,10 @@ mod tests {
     #[test]
     fn batch_budget_represents_every_query() {
         let tmp = tempfile::tempdir().unwrap();
-        let body: String = (0..400)
-            .map(|i| format!("fn f_{i}() {{ let u_{i} = use_it({i}); }}\n"))
-            .collect();
+        let body: String = (0..400).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "fn f_{i}() {{ let u_{i} = use_it({i}); }}");
+            acc
+        });
         std::fs::write(tmp.path().join("lib.rs"), body).unwrap();
         let args = serde_json::json!({
             "queries": [
@@ -1988,7 +1989,10 @@ mod tests {
         let mut paths = Vec::new();
         for name in names {
             let p = tmp.path().join(name);
-            let body: String = (0..400).map(|i| format!("let x_{i} = {i};\n")).collect();
+            let body: String = (0..400).fold(String::new(), |mut acc, i| {
+                let _ = writeln!(acc, "let x_{i} = {i};");
+                acc
+            });
             std::fs::write(&p, format!("fn main() {{\n{body}}}\n")).unwrap();
             paths.push(p.to_str().unwrap().to_string());
         }

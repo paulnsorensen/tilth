@@ -272,11 +272,7 @@ mod tests {
             format!("{}...", &first_line[..77])
         );
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
     use crate::lang::outline::outline_language;
     use crate::types::Lang;
 

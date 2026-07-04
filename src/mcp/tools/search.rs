@@ -513,7 +513,7 @@ mod tests {
     /// Regression: a comma query under the default (merged/`any`) kind must be
     /// treated as a multi-symbol lookup, not searched as a literal "a,b" string.
     /// Before the fix `search_merged_default` passed the raw comma string to
-    /// symbol + content search, so e.g. "Planner,planning_agent" found nothing
+    /// symbol + content search, so e.g. "`Planner,planning_agent`" found nothing
     /// even though `Planner` existed.
     #[test]
     fn default_comma_query_finds_both_symbols() {

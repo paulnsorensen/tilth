@@ -1061,10 +1061,10 @@ mod tests {
         // with functions that have substantial bodies so the outline compresses well.
         let mut src = String::from("// header\n");
         for i in 0..200 {
-            src.push_str(&format!("fn func_{i}() {{\n"));
+            let _ = writeln!(src, "fn func_{i}() {{");
             // 20 lines of body per function so outline is much smaller than full content
             for j in 0..20 {
-                src.push_str(&format!("    let v_{i}_{j}: u64 = {j} * {i} + 42;\n"));
+                let _ = writeln!(src, "    let v_{i}_{j}: u64 = {j} * {i} + 42;");
             }
             src.push_str("}\n");
         }
@@ -1122,7 +1122,7 @@ mod tests {
         // Large file: a full-file baseline would book a big (bogus) "saving".
         let mut src = String::new();
         for i in 0..500 {
-            src.push_str(&format!("fn f_{i}() {{ let v = {i}; }}\n"));
+            let _ = writeln!(src, "fn f_{i}() {{ let v = {i}; }}");
         }
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();

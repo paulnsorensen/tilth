@@ -2393,7 +2393,7 @@ pub fn target_fn() {
         let tmp = tempfile::tempdir().unwrap();
         // `do_work` is the real implementation with its own distinct logic.
         // `wrapper` just delegates to it — a classic thin wrapper.
-        let lib = r#"pub fn do_work(x: u32) -> u32 {
+        let lib = r"pub fn do_work(x: u32) -> u32 {
     let step1 = x * 2;
     let step2 = step1 + 7;
     step2
@@ -2402,7 +2402,7 @@ pub fn target_fn() {
 pub fn wrapper(x: u32) -> u32 {
     do_work(x)
 }
-"#;
+";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
@@ -2450,14 +2450,14 @@ pub fn wrapper(x: u32) -> u32 {
         );
     }
 
-    /// A non-wrapper function: body > WRAPPER_MAX_BODY_LINES. Must NOT expand.
+    /// A non-wrapper function: body > `WRAPPER_MAX_BODY_LINES`. Must NOT expand.
     #[test]
     fn thinwrap_non_wrapper_does_not_expand() {
         let tmp = tempfile::tempdir().unwrap();
         // Substantial function body (> 10 lines).
         let mut lib = String::from("pub fn helper() -> u32 { 42 }\n\npub fn big_fn() {\n");
         for i in 0..12u32 {
-            lib.push_str(&format!("    let v{i} = {i};\n"));
+            let _ = writeln!(lib, "    let v{i} = {i};");
         }
         lib.push_str("    let _ = helper();\n}\n");
         write_fixture(tmp.path(), "src/lib.rs", &lib);
@@ -2481,13 +2481,13 @@ pub fn wrapper(x: u32) -> u32 {
     #[test]
     fn thinwrap_multiple_callees_does_not_expand() {
         let tmp = tempfile::tempdir().unwrap();
-        let lib = r#"pub fn a() -> u32 { 1 }
+        let lib = r"pub fn a() -> u32 { 1 }
 pub fn b() -> u32 { 2 }
 
 pub fn multi(x: u32) -> u32 {
     a() + b()
 }
-"#;
+";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
@@ -2512,7 +2512,7 @@ pub fn multi(x: u32) -> u32 {
         // inner_impl is the real work; mid delegates to inner_impl (a wrapper);
         // outer delegates to mid (another wrapper). We grok outer.
         // Only mid's body should appear in the delegate body — not inner_impl's.
-        let lib = r#"pub fn inner_impl(x: u32) -> u32 {
+        let lib = r"pub fn inner_impl(x: u32) -> u32 {
     let result = x * x + 1;
     result
 }
@@ -2524,7 +2524,7 @@ pub fn mid(x: u32) -> u32 {
 pub fn outer(x: u32) -> u32 {
     mid(x)
 }
-"#;
+";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
@@ -2556,7 +2556,7 @@ pub fn outer(x: u32) -> u32 {
         );
     }
 
-    /// A large function (definition span > WRAPPER_MAX_BODY_LINES) that happens to
+    /// A large function (definition span > `WRAPPER_MAX_BODY_LINES`) that happens to
     /// call exactly one internal helper must NOT be treated as a wrapper — even on a
     /// re-grok where the body is dedup-degraded to a short preview. Guards against
     /// measuring the degradable body instead of the true definition span.
@@ -2568,7 +2568,7 @@ pub fn outer(x: u32) -> u32 {
         // 18 trivial bindings push the span past BODY_DEGRADE_THRESHOLD so the body
         // degrades on re-grok; the lone call is the single internal callee.
         for i in 0..18 {
-            lib.push_str(&format!("    let v{i} = x;\n"));
+            let _ = writeln!(lib, "    let v{i} = x;");
         }
         lib.push_str("    helper(v17)\n}\n");
 
@@ -2690,7 +2690,7 @@ impl OutlineCache {
         );
     }
 
-    /// A short body (at or below BODY_DEGRADE_THRESHOLD) never degrades,
+    /// A short body (at or below `BODY_DEGRADE_THRESHOLD`) never degrades,
     /// so savings remain zero across repeated calls.
     #[test]
     fn grok_short_body_degradation_records_no_savings() {

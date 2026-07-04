@@ -3017,7 +3017,7 @@ mod tests {
         // Build a function body >= 80 lines so select_diverse_lines fires.
         let mut src = String::from("pub fn big_fn() {\n");
         for i in 0..85 {
-            src.push_str(&format!("    let v{i} = {i};\n"));
+            let _ = writeln!(src, "    let v{i} = {i};");
         }
         src.push_str("}\n");
         std::fs::write(&p, &src).unwrap();
@@ -3069,7 +3069,7 @@ mod tests {
     }
 
     /// A search on a small definition (body < 80 lines) goes through
-    /// expand_match but never hits the truncation branch, so savings
+    /// `expand_match` but never hits the truncation branch, so savings
     /// remain zero.
     #[test]
     fn search_no_truncation_records_no_savings() {
@@ -3122,7 +3122,7 @@ mod tests {
 
     /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must
     /// receive the caller's real `budget` instead of always being called with
-    /// `crate::budget::DEFAULT_BUDGET` (24_000). Fixture: one real definition
+    /// `crate::budget::DEFAULT_BUDGET` (`24_000`). Fixture: one real definition
     /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named
     /// after the query, so `rank::sort`'s `basename_boost` (+500) renders the
     /// usage FIRST despite it being lower-value — this decouples render order
@@ -3148,7 +3148,7 @@ mod tests {
         // the lower-value one, regardless of render order).
         let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
         for i in 0..60 {
-            usage_body.push_str(&format!("    let filler_{i} = {i};\n"));
+            let _ = writeln!(usage_body, "    let filler_{i} = {i};");
         }
         usage_body.push_str("}\n");
         std::fs::write(tmp.path().join("budget_probe_target.rs"), &usage_body).unwrap();
