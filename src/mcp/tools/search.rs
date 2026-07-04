@@ -607,6 +607,7 @@ mod tests {
         let single_args = serde_json::json!({
             "queries": [{"query": "alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
         assert!(
@@ -620,6 +621,7 @@ mod tests {
         let multi_args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
         assert!(
@@ -657,12 +659,14 @@ mod tests {
         let single_args = serde_json::json!({
             "queries": [{"query": "alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
 
         let multi_args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
 
@@ -737,6 +741,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();

@@ -1101,7 +1101,7 @@ mod tests {
         );
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("large file read");
 
@@ -1125,7 +1125,7 @@ mod tests {
         std::fs::write(&path, "fn small() {}\n").unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("small file read");
 
@@ -1152,7 +1152,7 @@ mod tests {
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())] });
+        let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("section read");
 
