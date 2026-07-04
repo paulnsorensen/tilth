@@ -58,7 +58,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
 
     session_id = ""
     turns: list[Turn] = []
-    result_text = ""
+    result_text_parts: list[str] = []
     final_summary = {}
     turn_index = 0
 
@@ -99,7 +99,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
             turn_index += 1
 
             if text_blocks:
-                result_text = "\n".join(text_blocks)
+                result_text_parts.append("\n".join(text_blocks))
 
         elif event_type == "result":
             final_summary = event
@@ -115,7 +115,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
         total_output_tokens=final_summary.get("usage", {}).get("output_tokens", 0),
         total_cache_creation_tokens=final_summary.get("usage", {}).get("cache_creation_input_tokens", 0),
         total_cache_read_tokens=final_summary.get("usage", {}).get("cache_read_input_tokens", 0),
-        result_text=result_text,
+        result_text="\n".join(result_text_parts),
     )
 
 
@@ -132,7 +132,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
     rates = pricing.get(model_id, pricing["gpt-5-codex"])
 
     session_id = ""
-    result_text = ""
+    result_text_parts: list[str] = []
     turn_items: dict[int, list] = {}  # turn_index -> items in that turn
     current_turn = -1
     turn_usages: list[dict] = []
@@ -155,7 +155,9 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
 
             # Extract final message text
             if item.get("type") == "agent_message":
-                result_text = item.get("text", "")
+                text = item.get("text", "")
+                if text:
+                    result_text_parts.append(text)
 
         elif event_type == "turn.completed":
             usage = event.get("usage", {})
@@ -243,7 +245,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
         total_output_tokens=total_output,
         total_cache_creation_tokens=0,
         total_cache_read_tokens=total_cached,
-        result_text=result_text,
+        result_text="\n".join(result_text_parts),
     )
 
 
@@ -290,7 +292,7 @@ def parse_opencode_json(raw_output: str) -> RunResult:
     events = _parse_opencode_events(raw_output)
 
     session_id = ""
-    result_text = ""
+    result_text_parts: list[str] = []
     turns: list[Turn] = []
     pending_calls: list[ToolCall] = []
     turn_index = 0
@@ -317,7 +319,7 @@ def parse_opencode_json(raw_output: str) -> RunResult:
         elif event_type == "text":
             text = part.get("text", "")
             if isinstance(text, str) and text:
-                result_text = text  # last assistant text wins
+                result_text_parts.append(text)
 
         elif event_type == "step_finish":
             tokens = part.get("tokens") or {}
@@ -347,7 +349,7 @@ def parse_opencode_json(raw_output: str) -> RunResult:
         total_output_tokens=sum(t.output_tokens for t in turns),
         total_cache_creation_tokens=sum(t.cache_creation_tokens for t in turns),
         total_cache_read_tokens=sum(t.cache_read_tokens for t in turns),
-        result_text=result_text,
+        result_text="\n".join(result_text_parts),
     )
 
 
