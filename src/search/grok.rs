@@ -470,29 +470,6 @@ fn read_delegate_content(
     }
 }
 
-/// Read a thin-wrapper's single delegate callee for inline expansion.
-///
-/// Reuses the already-loaded `target_content` when the callee lives in the
-/// target's own file. For a cross-file callee it reads the file, but only when
-/// it is at or below `cap` bytes — a delegating wrapper should point at an
-/// ordinary function, not pull a huge or generated file into the bundle. Returns
-/// `None` on an oversized, missing, or unreadable file (expansion is silently
-/// skipped). `cap` is a parameter so the bound is exercisable in tests.
-fn read_delegate_content(
-    callee_file: &Path,
-    target_path: &Path,
-    target_content: &str,
-    cap: u64,
-) -> Option<String> {
-    if callee_file == target_path {
-        Some(target_content.to_string())
-    } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        fs::read_to_string(callee_file).ok()
-    } else {
-        None
-    }
-}
-
 // ---------------------------------------------------------------------------
 // A2: bundle assembly
 // ---------------------------------------------------------------------------
