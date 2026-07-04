@@ -2847,6 +2847,7 @@ mod tests {
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            false,
             &mut segments,
         );
 
