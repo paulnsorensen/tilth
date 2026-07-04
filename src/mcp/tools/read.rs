@@ -326,8 +326,16 @@ pub(in crate::mcp) fn tool_read(
     // `mode=auto` on a large non-code file routes through `read_file` and
     // emits an outline (markdown headings, JSON keys). Signal that the LLM
     // got less than the full content so it can escalate to `mode=full`.
+    // Keyed off the view marker in the emitted header, not `would_outline`'s
+    // prediction — the never-worse outline gate (OGATE) can return full
+    // content for a file that *would* outline, and labeling that body
+    // `view: "outline"` would tell the LLM to re-read for content it has.
+    let actually_outlined = output
+        .lines()
+        .next()
+        .is_some_and(|l| l.ends_with("[keys]") || l.ends_with("[outline]"));
     let mut meta = serde_json::Map::new();
-    if !force_full && crate::read::would_outline(&path) {
+    if !force_full && actually_outlined {
         meta.insert("view".into(), Value::String("outline".into()));
         if let Some(total) = count_lines(&path) {
             meta.insert("original_line_count".into(), Value::from(total));

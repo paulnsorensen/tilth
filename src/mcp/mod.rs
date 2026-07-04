@@ -1215,12 +1215,14 @@ mod tests {
     fn tool_read_auto_large_structured_returns_keys() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.json");
+        // Values must exceed the outline's 40-char value-preview cap so the
+        // keys outline compresses well below the never-worse gate's 80% floor —
+        // with short values OGATE correctly returns full content and there is
+        // no `[keys]` view to observe.
         let mut src = String::from("{\n  \"top_level_marker\": {\n");
-        for i in 0..2_000 {
-            let _ = writeln!(
-                src,
-                "    \"padding_key_{i}\": \"value-value-value-value-value-{i}\","
-            );
+        let long_value = "value-".repeat(40);
+        for i in 0..500 {
+            let _ = writeln!(src, "    \"padding_key_{i}\": \"{long_value}{i}\",");
         }
         src.push_str("    \"trailing_key\": null\n  }\n}\n");
         std::fs::write(&p, src).unwrap();
