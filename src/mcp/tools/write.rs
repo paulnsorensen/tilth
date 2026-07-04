@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -40,18 +40,8 @@ pub(crate) fn tool_write(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    // Optional per-call anchor root. When provided it must be absolute; relative
-    // section paths are anchored to it, and it is the confinement boundary.
-    let root: Option<PathBuf> = match args.get("root").and_then(|v| v.as_str()) {
-        Some(r) => {
-            let p = PathBuf::from(r);
-            if !p.is_absolute() {
-                return Err(format!("'root' must be an absolute path (got: {r})"));
-            }
-            Some(p)
-        }
-        None => None,
-    };
+    // The absolute checkout directory anchors every relative section path.
+    let cwd = super::require_cwd(args)?;
 
     let sections = parse_sections(blob).map_err(|e| format!("parse error at {e}"))?;
     if sections.is_empty() {
@@ -64,17 +54,8 @@ pub(crate) fn tool_write(
         ));
     }
 
-    // Confinement boundary: the `root` when given, else the server cwd. `MV`
-    // destinations and section paths must resolve under it — the fs::rename /
-    // fs::remove_file sink first appears in this wiring, so `..` traversal and
-    // absolute-path escapes are rejected here.
-    let confine_root = root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
     let ctx = SectionCtx {
-        root: root.as_deref(),
-        confine_root: &confine_root,
+        cwd,
         session,
         show_diff,
     };
@@ -86,11 +67,11 @@ pub(crate) fn tool_write(
     Ok(results.join("\n\n---\n\n"))
 }
 
-/// Shared per-call context threaded through the section pipeline: the anchor
-/// root, the confinement boundary, the session store, and the diff flag.
+/// Shared per-call context threaded through the section pipeline: the absolute
+/// checkout directory (anchors relative paths), the session store, and the diff
+/// flag.
 struct SectionCtx<'a> {
-    root: Option<&'a Path>,
-    confine_root: &'a Path,
+    cwd: &'a Path,
     session: &'a Session,
     show_diff: bool,
 }
@@ -100,7 +81,7 @@ struct SectionCtx<'a> {
 /// never aborts the others.
 fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<String>) -> String {
     let raw = &section.path;
-    let path = match resolve_confined(raw, ctx.root, ctx.confine_root) {
+    let path = match super::resolve_anchored(std::path::Path::new(raw), ctx.cwd) {
         Ok(p) => p,
         Err(e) => return format!("## {raw}\nerror: {e}"),
     };
@@ -305,7 +286,7 @@ fn commit_file_op(
             Ok(format!("## {}\nremoved", path.display()))
         }
         FileOp::Move(dest_raw) => {
-            let dest = resolve_confined(dest_raw, ctx.root, ctx.confine_root)
+            let dest = super::resolve_anchored(std::path::Path::new(dest_raw), ctx.cwd)
                 .map_err(TilthError::EditRejected)?;
             // If the move also carried content edits, land them before renaming.
             if new_text != live {
@@ -345,71 +326,6 @@ fn synthetic_snapshot(key: &str, text: &str, tag: u16) -> Snapshot {
     }
 }
 
-/// Resolve `raw` under the absolute-path discipline, then confine it to
-/// `confine_root`. Rejects `..` traversal in the raw spelling and any resolved
-/// path that escapes the workspace root — the first place `MV`/section paths
-/// reach `fs::rename`/`fs::remove_file`.
-fn resolve_confined(
-    raw: &str,
-    root: Option<&Path>,
-    confine_root: &Path,
-) -> Result<PathBuf, String> {
-    if raw.split(['/', '\\']).any(|c| c == "..") {
-        return Err(format!(
-            "path escapes the workspace root via `..`: {raw:?} — use a path inside the checkout"
-        ));
-    }
-    let path = resolve_write_path(raw, root)?;
-    if !path_within_scope(&path, confine_root) {
-        return Err(format!(
-            "path resolves outside the workspace root ({}): {raw:?}",
-            confine_root.display()
-        ));
-    }
-    Ok(path)
-}
-
-/// Resolve a write path under the same absolute-path discipline as reads
-/// (`super::resolve_read_path`): absolute paths are used as-is; a relative path
-/// requires an absolute `root`, otherwise it is unresolvable (the server cannot
-/// see the caller's shell cwd).
-fn resolve_write_path(path_str: &str, root: Option<&Path>) -> Result<PathBuf, String> {
-    super::resolve_read_path(&PathBuf::from(path_str), root)
-}
-
-/// Returns true if `path` resolves under `scope` (canonical path containment).
-/// For paths that don't yet exist, canonicalize the nearest existing ancestor
-/// and append the remaining components.
-fn path_within_scope(path: &Path, scope: &Path) -> bool {
-    let Ok(scope_canon) = scope.canonicalize() else {
-        return false;
-    };
-    // Walk up until a component canonicalizes.
-    let mut cursor: PathBuf = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        scope_canon.join(path)
-    };
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let resolved = loop {
-        if let Ok(p) = cursor.canonicalize() {
-            break p;
-        }
-        match (cursor.file_name(), cursor.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name.to_os_string());
-                cursor = parent.to_path_buf();
-            }
-            _ => return false,
-        }
-    };
-    let mut full = resolved;
-    for component in tail.into_iter().rev() {
-        full.push(component);
-    }
-    full.starts_with(&scope_canon)
-}
-
 /// Render a real minimal unified diff for the `diff:true` branch via `diffy`
 /// (already the recovery layer's merge engine), rather than a degenerate
 /// all-removed-then-all-added block.
@@ -436,7 +352,11 @@ mod tests {
     fn read_for_tag(session: &Session, path: &Path) -> String {
         let cache = OutlineCache::new();
         let out = crate::mcp::tools::tool_read(
-            &json!({"paths": [path.to_str().unwrap()], "mode": "full"}),
+            &json!({
+                "paths": [path.to_str().unwrap()],
+                "mode": "full",
+                "cwd": path.parent().unwrap().to_str().unwrap()
+            }),
             &cache,
             session,
             true,
@@ -463,7 +383,7 @@ mod tests {
         let tag = read_for_tag(&session, &p);
         let blob = format!("[{}#{tag}]\nSWAP 1:\n+fn A() {{}}\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -489,7 +409,7 @@ mod tests {
 
         let blob = format!("[{}#{tag}]\nSWAP 3:\n+RECOVERED\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -517,7 +437,7 @@ mod tests {
         std::fs::write(&p, "totally\ndifferent\ncontent\nhere\n").unwrap();
         let blob = format!("[{}#{tag}]\nSWAP 3:\n+NEW\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -549,7 +469,7 @@ mod tests {
 
         // Symbol read records only `outer`'s span (lines 1-3) as seen.
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#outer", p.display())]}),
+            &json!({"paths": [format!("{}#outer", p.display())], "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -565,7 +485,7 @@ mod tests {
         // drift path this must still be rejected by the seen-lines gate.
         let blob = format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -597,7 +517,7 @@ mod tests {
         std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
         let blob = format!("[{}#{tag}]\nREM\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -623,7 +543,7 @@ mod tests {
         std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
         let blob = format!("[{}#{tag}]\nMV \"moved.rs\"\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -655,7 +575,7 @@ mod tests {
         std::fs::write(&p, "x\ny\nz\n").unwrap();
         let blob = format!("[{}#{tag}]\nREM\nMV \"other.rs\"\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -690,7 +610,7 @@ mod tests {
         );
         let blob = format!("[{}#{bogus}]\nREM\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -722,7 +642,7 @@ mod tests {
         );
         let blob = format!("[{}#{bogus}]\nMV \"stolen.rs\"\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -771,7 +691,7 @@ mod tests {
         std::fs::write(&p, &colliding).unwrap();
         let blob = format!("[{}#{tag}]\nSWAP 1:\n+overwrite\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -798,7 +718,7 @@ mod tests {
         let bogus = format!("{:04X}", live_tag ^ 0x1);
         let blob = format!("[{}#{bogus}]\nSWAP 1:\n+X\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -811,50 +731,53 @@ mod tests {
     }
 
     #[test]
-    fn path_escape_via_dotdot_rejected() {
+    fn relative_dotdot_section_path_refused() {
+        // A relative section path with `..` must not climb out of cwd.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (session, bloom) = services();
         let blob = "[../evil.rs#0000]\nSWAP 1:\n+x\n".to_string();
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
-            out.contains("escapes the workspace root"),
+            out.contains("escapes") && out.contains(".."),
             "`..` traversal in a section path must be rejected, got:\n{out}"
         );
         assert!(
             !root.parent().unwrap().join("evil.rs").exists(),
-            "no file may be created outside the root"
+            "no file may be created outside cwd"
         );
     }
 
     #[test]
-    fn absolute_path_outside_root_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+    fn absolute_path_outside_cwd_succeeds() {
+        // Trust-absolute posture: an absolute section path OUTSIDE cwd (e.g. a
+        // linked worktree) is written, not refused.
+        let checkout = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("out.rs");
         std::fs::write(&target, "a\n").unwrap();
         let (session, bloom) = services();
-        let blob = format!("[{}#0000]\nSWAP 1:\n+X\n", target.display());
+        let tag = read_for_tag(&session, &target);
+        let blob = format!("[{}#{tag}]\nSWAP 1:\n+X\n", target.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": checkout.path().to_str().unwrap()}),
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect("write ok");
         assert!(
-            out.contains("outside the workspace root"),
-            "absolute path outside root must be rejected, got:\n{out}"
+            out.contains("applied"),
+            "absolute path outside cwd must be written (trust-absolute), got:\n{out}"
         );
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
-            "a\n",
-            "rejected edit must not touch a file outside the root"
+            "X\n",
+            "the edit must land in the file outside cwd"
         );
     }
 
@@ -868,13 +791,13 @@ mod tests {
         let tag = read_for_tag(&session, &p);
         let blob = format!("[{}#{tag}]\nMV \"../escaped.rs\"\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
-            out.contains("escapes the workspace root"),
+            out.contains("escapes") && out.contains(".."),
             "MV dest with `..` must be rejected, got:\n{out}"
         );
         assert!(p.exists(), "source file must remain after a rejected MV");
@@ -891,7 +814,7 @@ mod tests {
         let cache = OutlineCache::new();
         // Range read records seen-lines {1,2} under the whole-file tag.
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#1-2", p.display())]}),
+            &json!({"paths": [format!("{}#1-2", p.display())], "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -900,7 +823,7 @@ mod tests {
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
         let blob = format!("[{}#{tag}]\nMV \"dest.rs\"\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -916,7 +839,7 @@ mod tests {
         // empty-provenance snapshot would skip the gate and let it apply.
         let edit = format!("[{}#{tag}]\nSWAP 4:\n+D\n", dest.display());
         let rej = tool_write(
-            &json!({"edits": edit, "root": root.to_str().unwrap()}),
+            &json!({"edits": edit, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -942,7 +865,7 @@ mod tests {
         let tag = read_for_tag(&session, &p);
         let blob = format!("[{}#{tag}]\nREM\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -957,7 +880,7 @@ mod tests {
         std::fs::write(&p, "fresh content here\n").unwrap();
         let stale = format!("[{}#{tag}]\nSWAP 1:\n+X\n", p.display());
         let out2 = tool_write(
-            &json!({"edits": stale, "root": root.to_str().unwrap()}),
+            &json!({"edits": stale, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -980,7 +903,7 @@ mod tests {
         let (session, bloom) = services();
         let blob = "[new.rs]\nINS.HEAD:\n+fn seeded() {}\n".to_string();
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1006,9 +929,25 @@ mod tests {
     #[test]
     fn parse_error_is_top_level() {
         let (session, bloom) = services();
-        let err = tool_write(&json!({"edits": "[a#0000]\n+orphan\n"}), &session, &bloom)
-            .expect_err("parse error is top-level");
+        let err = tool_write(
+            &json!({"edits": "[a#0000]\n+orphan\n", "cwd": "/abs"}),
+            &session,
+            &bloom,
+        )
+        .expect_err("parse error is top-level");
         assert!(err.contains("parse error"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_cwd_rejected() {
+        // A write with an edits blob but no cwd is refused with the teaching error.
+        let (session, bloom) = services();
+        let err = tool_write(&json!({"edits": "[a#0000]\nDEL 1\n"}), &session, &bloom)
+            .expect_err("no cwd → top-level error");
+        assert!(
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "missing cwd must refuse with the teaching error: {err}"
+        );
     }
 
     #[test]
@@ -1030,7 +969,7 @@ mod tests {
             b.display()
         );
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1060,7 +999,7 @@ mod tests {
             p.display()
         );
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1094,7 +1033,7 @@ mod tests {
         // Symbol read records the span of `outer` (lines 1-3) as seen.
         let cache = OutlineCache::new();
         let sym_out = crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#outer", p.display())]}),
+            &json!({"paths": [format!("{}#outer", p.display())], "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -1110,7 +1049,7 @@ mod tests {
         let reject = tool_write(
             &json!({
                 "edits": format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display()),
-                "root": root.to_str().unwrap()
+                "cwd": root.to_str().unwrap()
             }),
             &session,
             &bloom,
@@ -1130,7 +1069,7 @@ mod tests {
         let ok = tool_write(
             &json!({
                 "edits": format!("[{}#{tag}]\nSWAP 2:\n+    let x = 42;\n", p.display()),
-                "root": root.to_str().unwrap()
+                "cwd": root.to_str().unwrap()
             }),
             &session,
             &bloom,
@@ -1160,7 +1099,7 @@ mod tests {
 
         // Signature read (records nothing).
         crate::mcp::tools::tool_read(
-            &json!({"paths": [p.to_str().unwrap()], "mode": "signature"}),
+            &json!({"paths": [p.to_str().unwrap()], "mode": "signature", "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -1168,7 +1107,7 @@ mod tests {
         .expect("signature read");
         // Range read of line 1 only (records seen = {1}).
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#1-1", p.display())]}),
+            &json!({"paths": [format!("{}#1-1", p.display())], "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -1180,7 +1119,7 @@ mod tests {
         let out = tool_write(
             &json!({
                 "edits": format!("[{}#{tag}]\nSWAP 3:\n+fn C() {{}}\n", p.display()),
-                "root": root.to_str().unwrap()
+                "cwd": root.to_str().unwrap()
             }),
             &session,
             &bloom,
@@ -1206,7 +1145,7 @@ mod tests {
         let tag = read_for_tag(&session, &p);
         let blob = format!("[{}#{tag}]\nSWAP 2:\n+fn B() {{}}\n", p.display());
         let out = tool_write(
-            &json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )

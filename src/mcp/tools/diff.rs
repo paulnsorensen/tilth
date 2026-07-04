@@ -1,6 +1,10 @@
 use serde_json::Value;
 
 pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
+    // cwd is required on every path-taking tool for schema consistency; git
+    // diff runs in the server's project directory, so the value is validated
+    // (absolute, present) but not otherwise consumed here.
+    super::require_cwd(args)?;
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());
