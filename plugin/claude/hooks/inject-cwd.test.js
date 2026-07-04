@@ -1,5 +1,5 @@
 // Unit tests for the cwd-injection PreToolUse hook. Run with:
-//   node --test plugin/claude/hooks/
+//   node --test plugin/claude/hooks/*.test.js
 // Exercises the pure `decide` core AND the real stdin→stdout process path so a
 // regression in the wiring (not just the logic) is caught.
 'use strict';

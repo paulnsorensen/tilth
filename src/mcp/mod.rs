@@ -1493,7 +1493,7 @@ mod tests {
 
     // -- tilth_write tool: whole-file-tag op-grammar dispatch --------------
     // PR2 swapped tilth_write to the op-grammar blob surface; the deep
-    // behaviour (round-trip, drift recovery, confinement, file ops) is covered
+    // behaviour (round-trip, drift recovery, anchoring, file ops) is covered
     // in `mcp::tools::write::tests`. These lock the dispatch seam.
 
     fn edit_services() -> (Session, Arc<BloomFilterCache>) {

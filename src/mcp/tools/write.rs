@@ -2,7 +2,7 @@
 //!
 //! The tool takes a single `edits` text blob of `[path#TAG]` sections in
 //! oh-my-pi's hashline op grammar (parsed by [`crate::edit::parser`]). Each
-//! section is resolved to a confined path, verified against the whole-file tag
+//! section is resolved to an anchored path, verified against the whole-file tag
 //! recorded by the read that displayed it, and applied — with 3-way-merge
 //! recovery when the live file has drifted since that read. `REM`/`MV` file ops
 //! and tagless `[path]` seed-creates are handled here; egress always flows
@@ -76,7 +76,7 @@ struct SectionCtx<'a> {
     show_diff: bool,
 }
 
-/// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
+/// Resolve, anchor, verify, apply, and commit one `[path#TAG]` section. Always
 /// returns a `## <path>` Markdown block (success or error) — one failed section
 /// never aborts the others.
 fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<String>) -> String {
@@ -265,7 +265,7 @@ fn recover_edit(
     Ok((text, file_op))
 }
 
-/// Carry out a `REM`/`MV` file op with confinement, then reconcile the snapshot
+/// Carry out a `REM`/`MV` file op on the anchored path, then reconcile the snapshot
 /// store (invalidate on remove, relocate on move).
 fn commit_file_op(
     op: &FileOp,
