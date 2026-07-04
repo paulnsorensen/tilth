@@ -72,7 +72,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
 const SECRET_REDACTION_NOTICE: &str =
-    "\n→ contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
+    "\n-> contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
 
 fn path_is_secret_file(path: &Path) -> bool {
     path.file_name()
