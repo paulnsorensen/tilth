@@ -153,7 +153,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
             if current_turn >= 0:
                 turn_items[current_turn].append(item)
 
-            # Extract final message text
+            # Accumulate assistant message text across turns
             if item.get("type") == "agent_message":
                 text = item.get("text", "")
                 if text:
