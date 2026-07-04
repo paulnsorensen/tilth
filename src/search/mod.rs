@@ -1,3 +1,4 @@
+mod alloc;
 pub mod callees;
 pub mod callers;
 pub mod content;
@@ -96,6 +97,33 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// honors — a repo can hard-deny secret or noisy files from search/list/map
 /// even though `.gitignore` is intentionally not consulted.
 pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
+/// Shared walker policy: searches ALL files except known junk directories.
+/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files
+/// are found. Used by both the parallel search walker (`walker()`) and the
+/// sequential map walker (`crate::map::generate`), which each apply their own
+/// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(scope);
+    builder
+        .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .add_custom_ignore_filename(TILTHIGNORE_FILE)
+        .filter_entry(|entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return !SKIP_DIRS.contains(&name);
+                }
+            }
+            true
+        });
+    builder
+}
 
 /// Build a parallel directory walker that searches ALL files except known junk
 /// directories and anything a repo's `.tilthignore` excludes. `.gitignore` is
@@ -110,26 +138,8 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let mut builder = WalkBuilder::new(scope);
-    builder
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .threads(threads)
-        .add_custom_ignore_filename(TILTHIGNORE_FILE)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        });
+    let mut builder = base_walk_builder(scope);
+    builder.threads(threads);
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
@@ -252,6 +262,7 @@ pub fn search_symbol(
         false,
         format::EmptyHint::Symbol,
         glob,
+        None,
     )
 }
 
@@ -266,6 +277,7 @@ pub fn search_symbol_expanded(
     glob: Option<&str>,
     full: bool,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, context, glob, full)?;
     format_search_result(
@@ -277,6 +289,7 @@ pub fn search_symbol_expanded(
         edit_mode,
         format::EmptyHint::Symbol,
         glob,
+        budget,
     )
 }
 
@@ -291,6 +304,7 @@ pub fn search_multi_symbol_expanded(
     glob: Option<&str>,
     full: bool,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
@@ -323,6 +337,7 @@ pub fn search_multi_symbol_expanded(
             result.definitions,
             result.usages,
         );
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
@@ -333,6 +348,7 @@ pub fn search_multi_symbol_expanded(
             &mut expanded_files,
             &mut out,
             edit_mode,
+            &mut segments,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -341,6 +357,10 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
+        // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
+        // identical to before this fix (see format_search_result's own comment).
+        let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
         sections.push(out);
     }
 
@@ -361,7 +381,7 @@ pub fn search_content(
     } else {
         format::EmptyHint::Content
     };
-    format_search_result(&result, cache, None, &bloom, 0, false, kind, glob)
+    format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)
 }
 
 pub fn search_regex(
@@ -381,6 +401,7 @@ pub fn search_regex(
         false,
         format::EmptyHint::Regex,
         glob,
+        None,
     )
 }
 
@@ -394,6 +415,7 @@ pub fn search_content_expanded(
     glob: Option<&str>,
     full: bool,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, context, glob, full)?;
@@ -412,6 +434,7 @@ pub fn search_content_expanded(
         edit_mode,
         kind,
         glob,
+        budget,
     )
 }
 
@@ -426,6 +449,7 @@ pub fn search_regex_expanded(
     glob: Option<&str>,
     full: bool,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
@@ -438,6 +462,7 @@ pub fn search_regex_expanded(
         edit_mode,
         format::EmptyHint::Regex,
         glob,
+        budget,
     )
 }
 
@@ -484,6 +509,7 @@ pub fn format_raw_result(
         false,
         format::EmptyHint::Merged,
         None,
+        None,
     )
 }
 
@@ -527,6 +553,7 @@ fn format_matches(
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
     edit_mode: bool,
+    segments: &mut Vec<(i64, usize, usize)>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -541,6 +568,7 @@ fn format_matches(
     for group in &groups {
         if group.len() == 1 {
             // Single match — format as before
+            let start = out.len();
             format_single_match(
                 group[0],
                 scope,
@@ -553,9 +581,17 @@ fn format_matches(
                 out,
                 edit_mode,
             );
+            segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
             // Multiple usages collapsed into one entry
+            let start = out.len();
             format_grouped_usages(group, scope, cache, out);
+            let value = group
+                .iter()
+                .map(|m| i64::from(m.def_weight))
+                .max()
+                .unwrap_or(0);
+            segments.push((value, start, out.len()));
         }
     }
 }
@@ -681,6 +717,19 @@ fn format_line_list(lines: &[u32]) -> String {
     parts.join(",")
 }
 
+/// The symbol to feed query-aware truncation when expanding a match's body.
+///
+/// For `impl`/`implements` matches the user searched for the trait or interface,
+/// which is held in `impl_target` — `def_name` is the rendered label
+/// (`"impl Trait for Type"` / `"Type implements Trait"`) and never appears
+/// verbatim in the body, so boosting on it is a no-op. For plain definitions
+/// `impl_target` is `None` and the searched token is the symbol name in
+/// `def_name`. Preferring `impl_target` routes the real query into the boost for
+/// both shapes.
+fn boost_query(m: &Match) -> Option<&str> {
+    m.impl_target.as_deref().or(m.def_name.as_deref())
+}
+
 /// Format a single match entry (unchanged from original behavior).
 fn format_single_match(
     m: &Match,
@@ -780,33 +829,43 @@ fn format_single_match(
         }
     }
 
+    // Check session dedup for definitions with def_range. The mtime
+    // check ensures a post-edit search re-inlines the body rather than
+    // pointing at stale line numbers. Only stat() when the match is
+    // actually dedup-eligible — non-definition / no-def_range / no-session
+    // matches never consult the session, so they skip the syscall.
+    let dedup_eligible = m.is_definition && m.def_range.is_some() && session.is_some();
+    let current_mtime = if dedup_eligible {
+        std::fs::metadata(&m.path)
+            .ok()
+            .and_then(|md| md.modified().ok())
+    } else {
+        None
+    };
+    let deduped = dedup_eligible
+        && session
+            .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
+    // expand_match always prints a range containing m.line (def_range starts
+    // at m.line for definitions; the ±10 fallback for def_range: None / usages
+    // trivially contains it), so the raw "→ [line] text" preview would
+    // reprint m.text byte-for-byte inside the fence below. Only the
+    // structural outline_context (neighboring entries' signatures, not the
+    // matched line's own source) survives alongside an expansion.
+    let fence_will_follow =
+        *expand_remaining > 0 && !deduped && !(multi_file && expanded_files.contains(&m.path));
+
     // Skip outline for small files — the expanded code speaks for itself
     if m.file_lines < 50 {
-        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        if !fence_will_follow {
+            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
-    } else {
+    } else if !fence_will_follow {
         let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
     }
 
     if *expand_remaining > 0 {
-        // Check session dedup for definitions with def_range. The mtime
-        // check ensures a post-edit search re-inlines the body rather than
-        // pointing at stale line numbers. Only stat() when the match is
-        // actually dedup-eligible — non-definition / no-def_range / no-session
-        // matches never consult the session, so they skip the syscall.
-        let dedup_eligible = m.is_definition && m.def_range.is_some() && session.is_some();
-        let current_mtime = if dedup_eligible {
-            std::fs::metadata(&m.path)
-                .ok()
-                .and_then(|md| md.modified().ok())
-        } else {
-            None
-        };
-        let deduped = dedup_eligible
-            && session
-                .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
-
         if deduped {
             if let Some((start, end)) = m.def_range {
                 let _ = write!(
@@ -832,15 +891,54 @@ fn format_single_match(
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
-                        if let crate::types::FileType::Code(lang) = file_type {
-                            if let Some(keep) =
-                                truncate::select_diverse_lines(&content, def_start, def_end, lang)
-                            {
+                        if let crate::types::FileType::Code(_) = file_type {
+                            if let Some(keep) = truncate::select_diverse_lines(
+                                &content,
+                                def_start,
+                                def_end,
+                                boost_query(m),
+                            ) {
                                 let keep_set: HashSet<u32> = keep.into_iter().collect();
                                 for ln in def_start..=def_end {
                                     if !keep_set.contains(&ln) {
                                         skip_lines.insert(ln);
                                     }
+                                }
+
+                                // Record token savings: full def body vs kept lines.
+                                // Measure raw line content (bytes + 1 for newline each),
+                                // independent of any surrounding formatting.
+                                if let Some(sess) = session {
+                                    let body_lines: Vec<&str> = content
+                                        .lines()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = (i as u32) + 1;
+                                            if ln >= def_start && ln <= def_end {
+                                                Some(l)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let full_bytes: u64 =
+                                        body_lines.iter().map(|l| l.len() as u64 + 1).sum();
+                                    let kept_bytes: u64 = body_lines
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = def_start + i as u32;
+                                            if keep_set.contains(&ln) {
+                                                Some(l.len() as u64 + 1)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .sum();
+                                    sess.record_savings(
+                                        crate::types::estimate_tokens(full_bytes),
+                                        crate::types::estimate_tokens(kept_bytes),
+                                    );
                                 }
                             }
                         }
@@ -1134,6 +1232,7 @@ fn format_search_result(
     edit_mode: bool,
     kind: format::EmptyHint,
     glob: Option<&str>,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     if result.matches.is_empty() {
         let (files_matched_glob, files_searched) = count_files_for_empty(&result.scope, glob);
@@ -1156,6 +1255,7 @@ fn format_search_result(
     let mut out = header;
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
+    let mut segments: Vec<(i64, usize, usize)> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -1191,6 +1291,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 edit_mode,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1216,6 +1317,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 edit_mode,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1260,6 +1362,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 edit_mode,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1285,6 +1388,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 edit_mode,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1305,6 +1409,7 @@ fn format_search_result(
             &mut expanded_files,
             &mut out,
             edit_mode,
+            &mut segments,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1318,6 +1423,14 @@ fn format_search_result(
             );
         }
     }
+
+    // Apply value-based budget allocation before appending the token footer.
+    // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
+    // budget.unwrap_or(DEFAULT_BUDGET) keeps the no-budget path byte-identical
+    // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
+    // longer a hardcode that shadows a real caller-supplied budget.
+    let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
@@ -1886,6 +1999,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .expect("search failed");
 
@@ -1927,6 +2041,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .expect("search failed");
 
@@ -1961,6 +2076,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .expect("search failed");
         assert!(out2.contains(".env"), "path should still be listed: {out2}");
@@ -2396,6 +2512,100 @@ mod tests {
     }
 
     #[test]
+    fn format_single_match_does_not_duplicate_expanded_line() {
+        use crate::types::Match;
+
+        // Small file (<50 lines) with no doc comment above the definition —
+        // the outline-context preview at line 627 prints `m.text` verbatim,
+        // and expand_match's whole-file expansion (small files expand fully,
+        // see EXPAND_FULL_FILE_THRESHOLD) includes that same source line
+        // again in the fence right below it.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("small.rs");
+        let src = "pub struct Thing;\n\nimpl Thing {\n    pub fn exit_code(&self) -> i32 {\n        0\n    }\n}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 4,
+            text: "    pub fn exit_code(&self) -> i32 {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 7,
+            mtime: SystemTime::now(),
+            def_range: Some((4, 6)),
+            def_name: Some("exit_code".to_string()),
+            def_weight: 100,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 1usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+            false,
+        );
+
+        let needle = "pub fn exit_code(&self) -> i32 {";
+        let occurrences = out.matches(needle).count();
+        assert_eq!(
+            occurrences, 1,
+            "expanded line must appear exactly once, got {occurrences} in: {out}"
+        );
+    }
+
+    #[test]
+    fn boost_query_routes_impl_target_into_truncation() {
+        use crate::types::Match;
+
+        let base = Match {
+            path: PathBuf::from("x.rs"),
+            line: 1,
+            text: String::new(),
+            is_definition: true,
+            exact: true,
+            file_lines: 200,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 200)),
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        // Plain definition: the searched token is the symbol name in def_name.
+        let plain = Match {
+            def_name: Some("handle_request".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&plain), Some("handle_request"));
+
+        // impl match: def_name is the rendered label ("impl Iterator for Counter")
+        // which never appears in the body — the searched trait lives in
+        // impl_target. Regression guard for the dead-boost bug where def_name was
+        // passed and the boost matched nothing.
+        let impl_match = Match {
+            def_name: Some("impl Iterator for Counter".to_string()),
+            impl_target: Some("Iterator".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&impl_match), Some("Iterator"));
+
+        // No names: no boost.
+        assert_eq!(boost_query(&base), None);
+    }
+
+    #[test]
     fn write_hidden_tail_emits_only_when_truncated() {
         let mut out = String::new();
         write_hidden_tail(&mut out, 3, 3, "definitions");
@@ -2722,6 +2932,319 @@ mod tests {
         assert!(
             !out.contains("TOPSECRET_value_999"),
             "secret value must never appear: {out:?}"
+        );
+    }
+
+    // Verify that format_matches records segment byte ranges correctly.
+    // Each push must cover non-empty, non-overlapping ranges that index into `out`.
+    #[test]
+    fn format_matches_segments_record_correct_byte_ranges() {
+        use crate::index::bloom::BloomFilterCache;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        std::fs::write(&p, "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n").unwrap();
+
+        let mk = |line: u32, weight: u16, name: &str| Match {
+            path: p.clone(),
+            line,
+            text: format!("fn {name}()"),
+            is_definition: true,
+            exact: true,
+            file_lines: 3,
+            mtime: SystemTime::now(),
+            def_range: Some((line, line)),
+            def_name: Some(name.to_string()),
+            def_weight: weight,
+            impl_target: None,
+        };
+
+        let matches = vec![mk(1, 30, "alpha"), mk(2, 10, "beta"), mk(3, 50, "gamma")];
+        let cache = OutlineCache::new();
+        let bloom = BloomFilterCache::new();
+        let mut out = String::from("HEADER");
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files = HashSet::new();
+
+        format_matches(
+            &matches,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            &mut out,
+            false,
+            &mut segments,
+        );
+
+        // One segment per match (all singletons — definitions are never grouped).
+        assert_eq!(segments.len(), 3, "expected one segment per match");
+
+        // Values must match def_weight casts.
+        assert_eq!(segments[0].0, 30i64);
+        assert_eq!(segments[1].0, 10i64);
+        assert_eq!(segments[2].0, 50i64);
+
+        // Ranges must be valid, non-empty, and non-overlapping.
+        let mut cursor = "HEADER".len();
+        for (i, &(_, start, end)) in segments.iter().enumerate() {
+            assert!(start >= cursor, "segment {i} start < cursor");
+            assert!(end > start, "segment {i} is empty");
+            assert!(end <= out.len(), "segment {i} end out of bounds");
+            // Slice must not panic (validates char-boundary alignment).
+            let _ = &out[start..end];
+            cursor = end;
+        }
+    }
+
+    // ── SAVINGS tests ───────────────────────────────────────────
+
+    /// A search that expands a definition large enough to trigger
+    /// `select_diverse_lines` (>= 80-line body) must record savings.
+    /// A search whose body is short records nothing extra from truncation.
+    #[test]
+    fn search_truncation_records_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.rs");
+
+        // Build a function body >= 80 lines so select_diverse_lines fires.
+        let mut src = String::from("pub fn big_fn() {\n");
+        for i in 0..85 {
+            let _ = writeln!(src, "    let v{i} = {i};");
+        }
+        src.push_str("}\n");
+        std::fs::write(&p, &src).unwrap();
+
+        let total_lines = src.lines().count() as u32;
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn big_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: total_lines,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, total_lines)),
+            def_name: Some("big_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+            false,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert!(
+            baseline > 0,
+            "truncation path must record a non-zero baseline, got baseline={baseline}"
+        );
+        assert!(
+            saved > 0,
+            "truncation must save tokens vs full body, got saved={saved}"
+        );
+    }
+
+    /// A search on a small definition (body < 80 lines) goes through
+    /// `expand_match` but never hits the truncation branch, so savings
+    /// remain zero.
+    #[test]
+    fn search_no_truncation_records_no_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("small.rs");
+        let src = "pub fn small_fn() {\n    let x = 1;\n    x\n}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn small_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 4,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, 4)),
+            def_name: Some("small_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+            false,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert_eq!(baseline, 0, "no truncation => no savings recorded");
+        assert_eq!(saved, 0, "no truncation => no savings recorded");
+    }
+
+    /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must
+    /// receive the caller's real `budget` instead of always being called with
+    /// `crate::budget::DEFAULT_BUDGET` (`24_000`). Fixture: one real definition
+    /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named
+    /// after the query, so `rank::sort`'s `basename_boost` (+500) renders the
+    /// usage FIRST despite it being lower-value — this decouples render order
+    /// from value order exactly like the audit's live repro. At a small
+    /// explicit budget, the positional tail-cut (`budget::apply`) keeps
+    /// whatever rendered first (the low-value usage) and severs the
+    /// definition; value-based selection (`fit_to_budget`) keeps the
+    /// definition (highest value) and drops the usage instead.
+    #[test]
+    fn search_symbol_expanded_threads_real_budget_into_value_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("definition.rs"),
+            "pub fn budget_probe_target() {\n    let _ = 1;\n}\n",
+        )
+        .unwrap();
+        // File stem == query triggers basename_boost(+500), outscoring the
+        // definition's own boosts (def_weight*10 + definition_name_boost) so
+        // this usage renders FIRST in the linear (<=5 match) format path.
+        // Padded with filler lines so its expanded block is large enough that
+        // budget 400 must drop ONE of the two blocks — proving which one a
+        // real budget drops (positional: whichever renders last; value-based:
+        // the lower-value one, regardless of render order).
+        let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
+        for i in 0..60 {
+            let _ = writeln!(usage_body, "    let filler_{i} = {i};");
+        }
+        usage_body.push_str("}\n");
+        std::fs::write(tmp.path().join("budget_probe_target.rs"), &usage_body).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let out = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            false,
+            Some(400),
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("fn budget_probe_target"),
+            "value-based selection must keep the highest-value block (the \
+             definition) even though it rendered last: {out}"
+        );
+        assert!(
+            out.contains("lower-value match(es) omitted to fit budget"),
+            "must show fit_to_budget's value-based omission marker, not \
+             budget::apply's positional \"... truncated\" marker: {out}"
+        );
+        assert!(
+            !out.contains("... truncated ("),
+            "positional tail-cut marker must not appear — the real budget \
+             was supposed to reach fit_to_budget directly: {out}"
+        );
+    }
+
+    /// Regression guard: omitting the budget (`None`) must produce byte-
+    /// identical output to before this fix — `DEFAULT_BUDGET` remains the
+    /// default, it is simply no longer a hardcode that shadows a real
+    /// caller-supplied budget.
+    #[test]
+    fn search_symbol_expanded_no_budget_matches_default_budget_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("definition.rs"),
+            "pub fn budget_probe_target() {\n    let _ = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("budget_probe_target.rs"),
+            "fn calls_it() {\n    budget_probe_target();\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let with_none = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let session2 = Session::new();
+        let with_explicit_default = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session2,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            false,
+            Some(crate::budget::DEFAULT_BUDGET),
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_none, with_explicit_default,
+            "omitting budget must be identical to explicitly passing DEFAULT_BUDGET"
         );
     }
 }
