@@ -92,7 +92,7 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 
 **Keep-ours fork features** (take the fork side on any sync conflict):
 
-- The whole-file-tag edit model (`[path#TAG]` op grammar, seen-lines gate, 3-way-merge recovery) — the fork's `tilth_write` surface, not upstream's.
+- The whole-file-tag edit model — JSON `edits` array of `{path, tag?, ops}` sections lowered onto the tag/seen-lines-gate/3-way-merge-recovery machinery (per #116) — the fork's `tilth_write` surface, not upstream's.
 - cwd anchoring and the trust-absolute posture: every path-taking MCP tool takes a required `cwd` (renamed from upstream's optional `root`); relative paths anchor under `cwd` with `..` refused, absolute paths are trusted as-is. The MCP roots one-shot handshake is removed. The `root`→`cwd` rename and the trust-absolute posture are permanent fork patches — expect them to conflict on every upstream sync and always resolve to the fork side.
 
 **Never-merge upstream commits:** `399721c9` and `10bec56a` must never land on this fork. Skip them when syncing.

@@ -244,14 +244,42 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit files by sending a text blob of `[path#TAG]` sections in tilth's op grammar. Replaces the host Edit and Write tools — DO NOT use those. Copy the `[path#TAG]` header and `N:content` numbered lines from a tilth_read/tilth_search edit-mode view, then write ops beneath the header. One op per line; multi-line payloads follow their op header, one payload line each (prefix `+` to force a line literal). Ops: `SWAP a.=b:` then payload (replace line range), `DEL n` / `DEL a.=b` (delete), `INS.PRE n:` / `INS.POST n:` then payload (insert before/after line n), `INS.HEAD:` / `INS.TAIL:` then payload (start/end of file), `SWAP.BLK n:` / `SWAP.BLK #symbol:` then payload (replace the tree-sitter block at a line or named symbol), `DEL.BLK n` / `DEL.BLK #symbol`, `INS.BLK.POST n:` / `INS.BLK.POST #symbol:` then payload, `REM` (delete file), `MV dest` (move/rename). Line numbers are 1-based inclusive and come from the numbered read. The TAG binds the section to the exact content you read: if the file drifted, tilth 3-way-merges your ops onto the live file; if it can't, the section is rejected — re-read and retry that file. A tagless `[path]` header seeds a NEW file (use INS.HEAD). Each section is independent (best-effort); results report per `## <path>`. Max 20 sections. Example: `tilth_write(edits: \"[src/x.rs#1A2B]\\nSWAP 2:\\n+    let y = 1;\\n\")`.",
+            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (the leading `#` is optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
                 "properties": {
                     "edits": {
-                        "type": "string",
-                        "description": "Op-grammar blob: one or more `[path#TAG]` sections, each followed by op lines. Copy the `[path#TAG]` header verbatim from the edit-mode read; never invent a TAG. To append cleanly to a newline-terminated file, prefer `INS.POST <last-content-line>` over `INS.TAIL:` (INS.TAIL inserts after the file's trailing empty row)."
+                        "type": "array",
+                        "description": "Array of {path, tag?, ops} section objects. Copy the 4-hex TAG from the edit-mode read into `tag`; omit `tag` to seed a new file. Max 20 sections.",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "ops"],
+                            "properties": {
+                                "path": { "type": "string", "description": "File path, absolute or relative to `cwd`." },
+                                "tag": { "type": "string", "description": "4-hex whole-file tag from the edit-mode read. Omit to seed a new file." },
+                                "ops": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["op"],
+                                        "oneOf": [
+                                            { "required": ["op", "start", "end", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "start", "end"], "additionalProperties": false, "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
+                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
                     },
                     "diff": {
                         "type": "boolean",
@@ -291,29 +319,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tilth_write_schema_requires_edits_blob() {
+    fn tilth_write_schema_requires_edits_array_of_sections() {
         let tools = tool_definitions(true);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present in edit mode");
         let schema = &write["inputSchema"];
-        assert_eq!(schema["required"][0], "edits", "edits blob is required");
+        assert_eq!(schema["required"][0], "edits", "edits array is required");
         assert_eq!(
-            schema["properties"]["edits"]["type"], "string",
-            "edits is a single op-grammar text blob"
+            schema["properties"]["edits"]["type"], "array",
+            "edits is now a JSON array of section objects, not a text blob"
         );
-        // The old per-file `files` array surface is gone.
+        // Section items require path + ops.
+        let item_required: Vec<&str> = schema["properties"]["edits"]["items"]["required"]
+            .as_array()
+            .expect("section item required list present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            item_required.contains(&"path") && item_required.contains(&"ops"),
+            "each section must require path and ops: {item_required:?}"
+        );
+        // The ops oneOf must name every one of the 11 verbs via `op` const.
+        let ops_item = &schema["properties"]["edits"]["items"]["properties"]["ops"]["items"];
+        let branches = ops_item["oneOf"].as_array().expect("ops oneOf present");
+        let verbs: Vec<&str> = branches
+            .iter()
+            .filter_map(|b| b["properties"]["op"]["const"].as_str())
+            .collect();
+        for verb in [
+            "replace",
+            "delete",
+            "insert_before",
+            "insert_after",
+            "prepend",
+            "append",
+            "replace_block",
+            "delete_block",
+            "insert_after_block",
+            "delete_file",
+            "move_file",
+        ] {
+            assert!(
+                verbs.contains(&verb),
+                "ops oneOf must name '{verb}': {verbs:?}"
+            );
+        }
+        // The old per-file `files` array surface stays gone.
         assert!(
             schema["properties"].get("files").is_none(),
-            "the per-file `files` array must be replaced by the `edits` blob"
+            "the per-file `files` array must not reappear"
         );
     }
 
-    /// Compile the full inputSchema and exercise the required-blob rule
-    /// end-to-end: `{}` fails (edits missing), a bare blob passes.
+    /// Compile the full inputSchema and exercise it end-to-end: `{}` fails
+    /// (edits missing), a valid section array passes, and an op object missing a
+    /// required field is rejected at the schema layer before any file work.
     #[test]
-    fn tilth_write_schema_enforces_required_edits() {
+    fn tilth_write_schema_validates_ops_and_rejects_bad_op() {
         let tools = tool_definitions(true);
         let write = tools
             .iter()
@@ -326,15 +391,61 @@ mod tests {
             !compiled.is_valid(&serde_json::json!({})),
             "empty args must fail: edits is required"
         );
+        let valid = serde_json::json!({
+            "edits": [{
+                "path": "a.rs",
+                "tag": "1A2B",
+                "ops": [{ "op": "replace", "start": 1, "end": 2, "content": "x" }]
+            }],
+            "cwd": "/abs",
+            "diff": true
+        });
         assert!(
-            !compiled.is_valid(&serde_json::json!({"edits": "[a#0000]\nDEL 1\n"})),
-            "edits without cwd must fail: cwd is required"
+            compiled.is_valid(&valid),
+            "a valid section array must validate"
         );
+        // `replace` missing its `content` field must be rejected by the oneOf.
+        let bad = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": 1, "end": 2 }] }]
+        });
         assert!(
-            compiled.is_valid(
-                &serde_json::json!({"edits": "[a#0000]\nDEL 1\n", "cwd": "/abs", "diff": true})
-            ),
-            "edits + cwd + diff must validate"
+            !compiled.is_valid(&bad),
+            "a replace op missing `content` must fail schema validation"
+        );
+        // Boundary: a negative line number must be rejected by `minimum: 1`.
+        let negative = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": -1, "end": 2, "content": "x" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&negative),
+            "a negative start must fail schema validation (minimum: 1)"
+        );
+        // Boundary: line 0 is 1-based-invalid at runtime (`check_bounds` rejects
+        // `line < 1`), so the schema must reject it too — not defer to a late error.
+        let zero = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": 0, "end": 2, "content": "x" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&zero),
+            "start 0 must fail schema validation (minimum: 1, matching runtime check_bounds)"
+        );
+        // An op carrying a field foreign to its variant must fail the schema, so a
+        // client validating client-side sees the same rejection `deny_unknown_fields`
+        // gives server-side (no schema-valid-but-runtime-rejected round-trip).
+        let extra_field = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 2, "content": "oops" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&extra_field),
+            "a delete op with a stray `content` must fail schema validation (additionalProperties: false)"
+        );
+        // Boundary: a line number above u32::MAX must be rejected by `maximum`.
+        let too_big = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 4_294_967_296_u64 }] }]
+        });
+        assert!(
+            !compiled.is_valid(&too_big),
+            "an end above u32::MAX must fail schema validation (maximum: 4294967295)"
         );
     }
 

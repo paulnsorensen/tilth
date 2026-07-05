@@ -1,8 +1,9 @@
-//! `tilth_write` — apply a whole-file-tag op-grammar blob.
+//! `tilth_write` — apply a JSON `edits` array of whole-file-tag sections.
 //!
-//! The tool takes a single `edits` text blob of `[path#TAG]` sections in
-//! oh-my-pi's hashline op grammar (parsed by [`crate::edit::parser`]). Each
-//! section is resolved to an anchored path, verified against the whole-file tag
+//! The tool takes an `edits` JSON array of `{path, tag?, ops}` section objects
+//! ([`crate::edit::json`] lowers them into the grammar-independent
+//! [`crate::edit::parser`] `Section`/`Op` types). Each
+//! section is resolved to a confined path, verified against the whole-file tag
 //! recorded by the read that displayed it, and applied — with 3-way-merge
 //! recovery when the live file has drifted since that read. `REM`/`MV` file ops
 //! and tagless `[path]` seed-creates are handled here; egress always flows
@@ -17,7 +18,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::edit::apply::FileOp;
-use crate::edit::parser::{parse_sections, Op, Section};
+use crate::edit::json::{lower_edits, teaching_error_for_string};
+use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header, render_numbered_whole};
@@ -30,28 +32,27 @@ pub(crate) fn tool_write(
     session: &Session,
     _bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
-    let blob = args
-        .get("edits")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: edits (op-grammar text blob of [path#TAG] sections)")?;
+    // `edits` is a JSON array of {path, tag?, ops} section objects. A string
+    // (legacy `[path#TAG]` blob or a double-encoded array) is rejected with a
+    // teaching error that shows the corrected JSON form.
+    let edits_val = args.get("edits").ok_or(
+        "missing required parameter: edits (JSON array of {path, tag?, ops} section objects)",
+    )?;
+    if let Some(s) = edits_val.as_str() {
+        return Err(teaching_error_for_string(s));
+    }
 
     let show_diff = args
         .get("diff")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    // The absolute checkout directory anchors every relative section path.
     let cwd = super::require_cwd(args)?;
 
-    let sections = parse_sections(blob).map_err(|e| format!("parse error at {e}"))?;
+    // `lower_edits` enforces the 20-section batch cap up front (before lowering).
+    let sections = lower_edits(edits_val)?;
     if sections.is_empty() {
-        return Err("edits contained no [path#TAG] sections".into());
-    }
-    if sections.len() > 20 {
-        return Err(format!(
-            "batch write limited to 20 sections (got {})",
-            sections.len()
-        ));
+        return Err("edits array contained no sections".into());
     }
 
     let ctx = SectionCtx {
@@ -67,16 +68,15 @@ pub(crate) fn tool_write(
     Ok(results.join("\n\n---\n\n"))
 }
 
-/// Shared per-call context threaded through the section pipeline: the absolute
-/// checkout directory (anchors relative paths), the session store, and the diff
-/// flag.
+/// Shared per-call context threaded through the section pipeline: the caller's
+/// cwd (anchor root for relative paths), the session store, and the diff flag.
 struct SectionCtx<'a> {
     cwd: &'a Path,
     session: &'a Session,
     show_diff: bool,
 }
 
-/// Resolve, anchor, verify, apply, and commit one `[path#TAG]` section. Always
+/// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
 /// returns a `## <path>` Markdown block (success or error) — one failed section
 /// never aborts the others.
 fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<String>) -> String {
@@ -89,7 +89,7 @@ fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<S
     // `src/./a.rs` collide, preserving the one-section-per-file invariant.
     if !seen_paths.insert(crate::edit::normalize_path_key(&path)) {
         return format!(
-            "## {}\nerror: duplicate path in this call — group all ops for a file under one [path#TAG] section",
+            "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
             path.display()
         );
     }
@@ -265,7 +265,7 @@ fn recover_edit(
     Ok((text, file_op))
 }
 
-/// Carry out a `REM`/`MV` file op on the anchored path, then reconcile the snapshot
+/// Carry out a `REM`/`MV` file op with confinement, then reconcile the snapshot
 /// store (invalidate on remove, relocate on move).
 fn commit_file_op(
     op: &FileOp,
@@ -346,17 +346,24 @@ mod tests {
         (Session::new(), Arc::new(BloomFilterCache::new()))
     }
 
+    /// Build a one-section `edits` array Value. `ops` is the JSON ops array.
+    fn edits(path: &Path, tag: Option<&str>, ops: Value) -> Value {
+        let mut sec = serde_json::Map::new();
+        sec.insert("path".into(), json!(path.to_str().unwrap()));
+        if let Some(t) = tag {
+            sec.insert("tag".into(), json!(t));
+        }
+        sec.insert("ops".into(), ops);
+        json!([Value::Object(sec)])
+    }
+
     /// Read a file in edit mode so the session records its whole-file-tag
     /// snapshot, and return the tag hex the read emitted in the `[path#TAG]`
     /// header. Fails the test if the header is absent.
     fn read_for_tag(session: &Session, path: &Path) -> String {
         let cache = OutlineCache::new();
         let out = crate::mcp::tools::tool_read(
-            &json!({
-                "paths": [path.to_str().unwrap()],
-                "mode": "full",
-                "cwd": path.parent().unwrap().to_str().unwrap()
-            }),
+            &json!({"paths": [path.to_str().unwrap()], "mode": "full", "cwd": path.parent().unwrap().to_str().unwrap()}),
             &cache,
             session,
             true,
@@ -381,9 +388,9 @@ mod tests {
         let (session, bloom) = services();
 
         let tag = read_for_tag(&session, &p);
-        let blob = format!("[{}#{tag}]\nSWAP 1:\n+fn A() {{}}\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -392,7 +399,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "fn A() {}\nfn b() {}\n",
-            "SWAP 1 must replace only line 1"
+            "replace 1 must replace only line 1"
+        );
+    }
+
+    #[test]
+    fn replace_content_ending_in_newline_adds_no_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.rs");
+        std::fs::write(&p, "fn a() {}\nfn b() {}\n").unwrap();
+        let (session, bloom) = services();
+
+        let tag = read_for_tag(&session, &p);
+        // content ends in "\n" — must not splice an extra blank line, matching
+        // the old grammar's finalize_payload trailing-blank strip.
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}\n" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn A() {}\nfn b() {}\n",
+            "trailing newline in content must not add a blank line"
         );
     }
 
@@ -407,9 +440,9 @@ mod tests {
         let tag = read_for_tag(&session, &p);
         std::fs::write(&p, "NEW1\nNEW2\nalpha\nbeta\nTARGET\ndelta\n").unwrap();
 
-        let blob = format!("[{}#{tag}]\nSWAP 3:\n+RECOVERED\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "RECOVERED" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -435,9 +468,9 @@ mod tests {
         let tag = read_for_tag(&session, &p);
 
         std::fs::write(&p, "totally\ndifferent\ncontent\nhere\n").unwrap();
-        let blob = format!("[{}#{tag}]\nSWAP 3:\n+NEW\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "NEW" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -469,7 +502,7 @@ mod tests {
 
         // Symbol read records only `outer`'s span (lines 1-3) as seen.
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#outer", p.display())], "cwd": root.to_str().unwrap()}),
+            &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -483,9 +516,9 @@ mod tests {
 
         // Edit anchored on line 5 (inside `other`, never displayed) — on the
         // drift path this must still be rejected by the seen-lines gate.
-        let blob = format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 5, "end": 5, "content": "    let y = 9;" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -501,9 +534,8 @@ mod tests {
         );
     }
 
-    /// A pure `REM` against an externally-drifted file must succeed: file-level
-    /// intent is independent of content drift. (Previously hard-rejected as
-    /// Drift because `apply_ops` left a file-op-only section's text unchanged.)
+    /// A pure `delete_file` against an externally-drifted file must succeed:
+    /// file-level intent is independent of content drift.
     #[test]
     fn pure_rem_on_drifted_file_removes() {
         let dir = tempfile::tempdir().unwrap();
@@ -515,22 +547,22 @@ mod tests {
 
         // External drift.
         std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
-        let blob = format!("[{}#{tag}]\nREM\n", p.display());
+        let ops = json!([{ "op": "delete_file" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("write ok");
         assert!(
             out.contains("removed"),
-            "pure REM on a drifted file must remove, not reject, got:\n{out}"
+            "pure delete_file on a drifted file must remove, not reject, got:\n{out}"
         );
         assert!(!p.exists(), "file must be deleted despite content drift");
     }
 
-    /// A pure `MV` against an externally-drifted file must move the (drifted)
-    /// file rather than hard-reject.
+    /// A pure `move_file` against an externally-drifted file must move the
+    /// (drifted) file rather than hard-reject.
     #[test]
     fn pure_mv_on_drifted_file_moves() {
         let dir = tempfile::tempdir().unwrap();
@@ -541,16 +573,16 @@ mod tests {
         let tag = read_for_tag(&session, &p);
 
         std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
-        let blob = format!("[{}#{tag}]\nMV \"moved.rs\"\n", p.display());
+        let ops = json!([{ "op": "move_file", "dest": "moved.rs" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("write ok");
         assert!(
             out.contains("moved"),
-            "pure MV on a drifted file must move, not reject, got:\n{out}"
+            "pure move_file on a drifted file must move, not reject, got:\n{out}"
         );
         assert!(!p.exists(), "source must be gone after move");
         assert_eq!(
@@ -561,8 +593,7 @@ mod tests {
     }
 
     /// The drift path derives its file op through the canonical `FileOp::from_ops`
-    /// guard, so two file ops in one drifted section are rejected as a conflict
-    /// (not silently reduced to the first op and applied).
+    /// guard, so two file ops in one drifted section are rejected as a conflict.
     #[test]
     fn conflicting_file_ops_on_drift_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -573,16 +604,16 @@ mod tests {
         let tag = read_for_tag(&session, &p);
 
         std::fs::write(&p, "x\ny\nz\n").unwrap();
-        let blob = format!("[{}#{tag}]\nREM\nMV \"other.rs\"\n", p.display());
+        let ops = json!([{ "op": "delete_file" }, { "op": "move_file", "dest": "other.rs" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
             out.contains("only one file op"),
-            "REM + MV in one drifted section must be a FileOpConflict, got:\n{out}"
+            "delete_file + move_file in one drifted section must be a FileOpConflict, got:\n{out}"
         );
         assert!(p.exists(), "rejected conflict must not remove the file");
         assert!(
@@ -591,10 +622,8 @@ mod tests {
         );
     }
 
-    /// A pure `REM` carrying a tag that was never recorded this session (never
-    /// read) must be rejected as Fabricated — the provenance contract — and must
-    /// not delete the file. The pure-file-op short-circuit only applies to a
-    /// session-known tag.
+    /// A pure `delete_file` carrying a tag that was never recorded this session
+    /// must be rejected as Fabricated and must not delete the file.
     #[test]
     fn pure_rem_with_fabricated_tag_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -602,33 +631,34 @@ mod tests {
         let p = root.join("neverread.rs");
         std::fs::write(&p, "alpha\nbeta\n").unwrap();
         let (session, bloom) = services();
-        // No read → the tag was never recorded this session; ^0x1 so tag ≠ live
-        // (the drift egress) rather than the tagless synthetic path.
         let bogus = format!(
             "{:04X}",
             crate::edit::tag::compute_file_hash("alpha\nbeta\n") ^ 0x1
         );
-        let blob = format!("[{}#{bogus}]\nREM\n", p.display());
+        let ops = json!([{ "op": "delete_file" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
             out.contains("not from this session"),
-            "pure REM with a never-recorded tag must be Fabricated, got:\n{out}"
+            "pure delete_file with a never-recorded tag must be Fabricated, got:\n{out}"
         );
-        assert!(p.exists(), "fabricated-tag REM must not delete the file");
+        assert!(
+            p.exists(),
+            "fabricated-tag delete_file must not delete the file"
+        );
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "alpha\nbeta\n",
-            "fabricated-tag REM must leave the file untouched"
+            "fabricated-tag delete_file must leave the file untouched"
         );
     }
 
-    /// A pure `MV` carrying a never-recorded tag must be rejected as Fabricated
-    /// and must not move the file.
+    /// A pure `move_file` carrying a never-recorded tag must be rejected as
+    /// Fabricated and must not move the file.
     #[test]
     fn pure_mv_with_fabricated_tag_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -640,28 +670,30 @@ mod tests {
             "{:04X}",
             crate::edit::tag::compute_file_hash("one\ntwo\n") ^ 0x1
         );
-        let blob = format!("[{}#{bogus}]\nMV \"stolen.rs\"\n", p.display());
+        let ops = json!([{ "op": "move_file", "dest": "stolen.rs" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
             out.contains("not from this session"),
-            "pure MV with a never-recorded tag must be Fabricated, got:\n{out}"
+            "pure move_file with a never-recorded tag must be Fabricated, got:\n{out}"
         );
-        assert!(p.exists(), "fabricated-tag MV must not move the source");
+        assert!(
+            p.exists(),
+            "fabricated-tag move_file must not move the source"
+        );
         assert!(
             !root.join("stolen.rs").exists(),
-            "fabricated-tag MV must not create the destination"
+            "fabricated-tag move_file must not create the destination"
         );
     }
 
     /// A 16-bit tag collision after external drift must not silently overwrite
     /// the live drift: when the recorded snapshot's content differs from live
-    /// despite equal tags, the edit routes through recovery and is rejected
-    /// rather than applied against the stale snapshot text.
+    /// despite equal tags, the edit routes through recovery and is rejected.
     #[test]
     fn tag_collision_after_drift_does_not_silently_overwrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -671,7 +703,6 @@ mod tests {
         std::fs::write(&p, original).unwrap();
         let (session, bloom) = services();
 
-        // Read records the snapshot for `original` under its tag.
         let tag = read_for_tag(&session, &p);
 
         // Brute-force a different content that hashes to the same 16-bit tag.
@@ -687,11 +718,10 @@ mod tests {
         let colliding = colliding.expect("16-bit collision found within search budget");
         assert_ne!(colliding, original, "collision must be different content");
 
-        // External drift swaps in the colliding content: live_tag == recorded tag.
         std::fs::write(&p, &colliding).unwrap();
-        let blob = format!("[{}#{tag}]\nSWAP 1:\n+overwrite\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "overwrite" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -716,9 +746,9 @@ mod tests {
         let (session, bloom) = services();
         let live_tag = crate::edit::tag::compute_file_hash("x\ny\n");
         let bogus = format!("{:04X}", live_tag ^ 0x1);
-        let blob = format!("[{}#{bogus}]\nSWAP 1:\n+X\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -731,14 +761,14 @@ mod tests {
     }
 
     #[test]
-    fn relative_dotdot_section_path_refused() {
-        // A relative section path with `..` must not climb out of cwd.
+    fn path_escape_via_dotdot_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (session, bloom) = services();
-        let blob = "[../evil.rs#0000]\nSWAP 1:\n+x\n".to_string();
+        let evil = Path::new("../evil.rs");
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "x" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(evil, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -749,7 +779,7 @@ mod tests {
         );
         assert!(
             !root.parent().unwrap().join("evil.rs").exists(),
-            "no file may be created outside cwd"
+            "no file may be created outside the root"
         );
     }
 
@@ -763,9 +793,9 @@ mod tests {
         std::fs::write(&target, "a\n").unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &target);
-        let blob = format!("[{}#{tag}]\nSWAP 1:\n+X\n", target.display());
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": checkout.path().to_str().unwrap()}),
+            &json!({"edits": edits(&target, Some(&tag), ops), "cwd": checkout.path().to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -789,18 +819,18 @@ mod tests {
         std::fs::write(&p, "content\n").unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let blob = format!("[{}#{tag}]\nMV \"../escaped.rs\"\n", p.display());
+        let ops = json!([{ "op": "move_file", "dest": "../escaped.rs" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
             out.contains("escapes") && out.contains(".."),
-            "MV dest with `..` must be rejected, got:\n{out}"
+            "move_file dest with `..` must be rejected, got:\n{out}"
         );
-        assert!(p.exists(), "source file must remain after a rejected MV");
+        assert!(p.exists(), "source file must remain after a rejected move");
         assert!(!root.parent().unwrap().join("escaped.rs").exists());
     }
 
@@ -814,16 +844,16 @@ mod tests {
         let cache = OutlineCache::new();
         // Range read records seen-lines {1,2} under the whole-file tag.
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#1-2", p.display())], "cwd": root.to_str().unwrap()}),
+            &json!({"paths": [format!("{}#1-2", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
             true,
         )
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
-        let blob = format!("[{}#{tag}]\nMV \"dest.rs\"\n", p.display());
+        let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -835,11 +865,9 @@ mod tests {
 
         // The relocated snapshot must carry src's seen-lines {1,2}: an edit on
         // the never-displayed line 4 of dest is rejected by the seen-lines gate.
-        // Without relocation, by_tag(dest) would miss and a synthetic
-        // empty-provenance snapshot would skip the gate and let it apply.
-        let edit = format!("[{}#{tag}]\nSWAP 4:\n+D\n", dest.display());
+        let ops2 = json!([{ "op": "replace", "start": 4, "end": 4, "content": "D" }]);
         let rej = tool_write(
-            &json!({"edits": edit, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&dest, Some(&tag), ops2), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -863,31 +891,30 @@ mod tests {
         std::fs::write(&p, "bye\n").unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let blob = format!("[{}#{tag}]\nREM\n", p.display());
+        let ops = json!([{ "op": "delete_file" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("write ok");
         assert!(out.contains("removed"), "expected removed, got:\n{out}");
-        assert!(!p.exists(), "file must be deleted by REM");
+        assert!(!p.exists(), "file must be deleted by delete_file");
 
-        // Recreate the path with fresh content. The pre-REM snapshot must have
-        // been invalidated: the old tag is no longer known to the store, so a
-        // stale-tag edit is a Fabricated rejection ("not from this session"). A
-        // lingering snapshot under the key would instead surface as Drift.
+        // Recreate the path with fresh content. The pre-delete snapshot must have
+        // been invalidated: the old tag is no longer known, so a stale-tag edit
+        // is a Fabricated rejection ("not from this session").
         std::fs::write(&p, "fresh content here\n").unwrap();
-        let stale = format!("[{}#{tag}]\nSWAP 1:\n+X\n", p.display());
+        let stale = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
         let out2 = tool_write(
-            &json!({"edits": stale, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), stale), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("per-section error returns Ok");
         assert!(
             out2.contains("not from this session"),
-            "post-REM edit with the old tag must be Fabricated (snapshot invalidated), got:\n{out2}"
+            "post-delete edit with the old tag must be Fabricated, got:\n{out2}"
         );
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
@@ -901,16 +928,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (session, bloom) = services();
-        let blob = "[new.rs]\nINS.HEAD:\n+fn seeded() {}\n".to_string();
+        let p = root.join("new.rs");
+        let ops = json!([{ "op": "prepend", "content": "fn seeded() {}" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect("write ok");
         assert!(out.contains("applied"), "expected applied, got:\n{out}");
         assert_eq!(
-            std::fs::read_to_string(root.join("new.rs")).unwrap(),
+            std::fs::read_to_string(&p).unwrap(),
             "fn seeded() {}\n",
             "tagless section seeds the file with the inserted content"
         );
@@ -926,34 +954,95 @@ mod tests {
         );
     }
 
+    /// A string `edits` (the legacy `[path#TAG]` grammar) is rejected with a
+    /// teaching error that shows the JSON translation — before any file work.
     #[test]
-    fn parse_error_is_top_level() {
+    fn legacy_blob_string_yields_teaching_error() {
         let (session, bloom) = services();
+        let err = tool_write(&json!({"edits": "[a.rs#0000]\nDEL 1\n"}), &session, &bloom)
+            .expect_err("legacy blob string must be a teaching error");
+        assert!(
+            err.contains("JSON array"),
+            "must teach the new shape: {err}"
+        );
+        assert!(
+            err.contains("\"op\": \"delete\""),
+            "must render the DEL as a delete op: {err}"
+        );
+    }
+
+    /// A double-encoded array (JSON payload wrapped in a string) is rejected
+    /// with an error naming the double-encoding and showing the unwrapped form.
+    #[test]
+    fn double_encoded_string_yields_teaching_error() {
+        let (session, bloom) = services();
+        let encoded = "[{\"path\":\"a.rs\",\"tag\":\"0000\",\"ops\":[]}]";
+        let err = tool_write(&json!({"edits": encoded}), &session, &bloom)
+            .expect_err("double-encoded array must be a teaching error");
+        assert!(
+            err.contains("double-encoded"),
+            "must name the mistake: {err}"
+        );
+        assert!(
+            err.contains("\"path\": \"a.rs\""),
+            "must show the unwrapped form: {err}"
+        );
+    }
+
+    /// An op that fails validation is rejected at the deserialize layer, naming
+    /// the op and the offending field, before any file is touched.
+    #[test]
+    fn schema_rejection_names_op_and_field_before_file_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("keep.rs");
+        std::fs::write(&p, "untouched\n").unwrap();
+        let (session, bloom) = services();
+        // `replace` missing its `content` field.
+        let ops = json!([{ "op": "replace", "start": 1, "end": 2 }]);
         let err = tool_write(
-            &json!({"edits": "[a#0000]\n+orphan\n", "cwd": "/abs"}),
+            &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
-        .expect_err("parse error is top-level");
-        assert!(err.contains("parse error"), "got: {err}");
+        .expect_err("invalid op must be a top-level deserialize error");
+        assert!(err.contains("replace"), "must name the op: {err}");
+        assert!(err.contains("content"), "must name the field: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "untouched\n",
+            "no file may be touched when the op fails validation"
+        );
     }
 
+    /// More than 20 sections is rejected at the batch cap before any apply.
     #[test]
-    fn missing_cwd_rejected() {
-        // A write with an edits blob but no cwd is refused with the teaching error.
+    fn batch_over_twenty_sections_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let (session, bloom) = services();
-        let err = tool_write(&json!({"edits": "[a#0000]\nDEL 1\n"}), &session, &bloom)
-            .expect_err("no cwd → top-level error");
-        assert!(
-            err.contains("cwd") && err.contains("absolute checkout directory"),
-            "missing cwd must refuse with the teaching error: {err}"
-        );
+        let sections: Vec<Value> = (0..21)
+            .map(|i| {
+                json!({
+                    "path": format!("f{i}.rs"),
+                    "tag": "0000",
+                    "ops": [{ "op": "delete_file" }]
+                })
+            })
+            .collect();
+        let err = tool_write(
+            &json!({"edits": Value::Array(sections), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("21 sections must exceed the cap");
+        assert!(err.contains("20 sections"), "must name the cap: {err}");
     }
 
     #[test]
     fn multi_section_write_lands_edits_in_both_files() {
-        // Wiring seam: the section loop must apply every [path#TAG] section in
-        // one blob, landing independent edits in independent files.
+        // Wiring seam: the section loop must apply every section in one array,
+        // landing independent edits in independent files.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let a = root.join("one.rs");
@@ -963,13 +1052,20 @@ mod tests {
         let (session, bloom) = services();
         let tag_a = read_for_tag(&session, &a);
         let tag_b = read_for_tag(&session, &b);
-        let blob = format!(
-            "[{}#{tag_a}]\nSWAP 1:\n+fn ONE() {{}}\n\n[{}#{tag_b}]\nSWAP 1:\n+fn TWO() {{}}\n",
-            a.display(),
-            b.display()
-        );
+        let edits_val = json!([
+            {
+                "path": a.to_str().unwrap(),
+                "tag": tag_a,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn ONE() {}" }]
+            },
+            {
+                "path": b.to_str().unwrap(),
+                "tag": tag_b,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn TWO() {}" }]
+            }
+        ]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -979,6 +1075,8 @@ mod tests {
             2,
             "both sections must apply, got:\n{out}"
         );
+        assert!(out.contains(&format!("## {}", a.display())));
+        assert!(out.contains(&format!("## {}", b.display())));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn ONE() {}\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "fn TWO() {}\n");
     }
@@ -993,13 +1091,20 @@ mod tests {
         std::fs::write(&p, "fn a() {}\nfn b() {}\n").unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let blob = format!(
-            "[{}#{tag}]\nSWAP 1:\n+fn A() {{}}\n\n[{}#{tag}]\nSWAP 2:\n+fn B() {{}}\n",
-            p.display(),
-            p.display()
-        );
+        let edits_val = json!([
+            {
+                "path": p.to_str().unwrap(),
+                "tag": tag,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}" }]
+            },
+            {
+                "path": p.to_str().unwrap(),
+                "tag": tag,
+                "ops": [{ "op": "replace", "start": 2, "end": 2, "content": "fn B() {}" }]
+            }
+        ]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1008,8 +1113,6 @@ mod tests {
             out.contains("duplicate path"),
             "second section on same path must be a duplicate-path error, got:\n{out}"
         );
-        // The first section applied; the second was dropped, so the file shows
-        // only the first edit's effect.
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "fn A() {}\nfn b() {}\n",
@@ -1019,8 +1122,7 @@ mod tests {
 
     /// A `#symbol` edit-mode read records only the symbol's span as seen, so a
     /// tag-matched edit anchored INSIDE that span applies but one anchored on a
-    /// never-displayed line is rejected. Locks the `find_entry_by_name` hoist +
-    /// `seen_spec` parity through the real read→write path.
+    /// never-displayed line is rejected.
     #[test]
     fn symbol_read_gates_edit_to_displayed_span() {
         let dir = tempfile::tempdir().unwrap();
@@ -1030,10 +1132,9 @@ mod tests {
         std::fs::write(&p, content).unwrap();
         let (session, bloom) = services();
 
-        // Symbol read records the span of `outer` (lines 1-3) as seen.
         let cache = OutlineCache::new();
         let sym_out = crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#outer", p.display())], "cwd": root.to_str().unwrap()}),
+            &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -1046,11 +1147,10 @@ mod tests {
         let tag = format!("{:04X}", compute_file_hash(content));
 
         // An edit anchored on line 5 (inside `other`, never displayed) is rejected.
+        let reject_ops =
+            json!([{ "op": "replace", "start": 5, "end": 5, "content": "    let y = 9;" }]);
         let reject = tool_write(
-            &json!({
-                "edits": format!("[{}#{tag}]\nSWAP 5:\n+    let y = 9;\n", p.display()),
-                "cwd": root.to_str().unwrap()
-            }),
+            &json!({"edits": edits(&p, Some(&tag), reject_ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1066,11 +1166,10 @@ mod tests {
         );
 
         // An edit anchored on line 2 (inside the displayed span) applies.
+        let ok_ops =
+            json!([{ "op": "replace", "start": 2, "end": 2, "content": "    let x = 42;" }]);
         let ok = tool_write(
-            &json!({
-                "edits": format!("[{}#{tag}]\nSWAP 2:\n+    let x = 42;\n", p.display()),
-                "cwd": root.to_str().unwrap()
-            }),
+            &json!({"edits": edits(&p, Some(&tag), ok_ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1097,30 +1196,25 @@ mod tests {
         let (session, bloom) = services();
         let cache = OutlineCache::new();
 
-        // Signature read (records nothing).
         crate::mcp::tools::tool_read(
-            &json!({"paths": [p.to_str().unwrap()], "mode": "signature", "cwd": root.to_str().unwrap()}),
+            &json!({"paths": [p.to_str().unwrap()], "mode": "signature", "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
             true,
         )
         .expect("signature read");
-        // Range read of line 1 only (records seen = {1}).
         crate::mcp::tools::tool_read(
-            &json!({"paths": [format!("{}#1-1", p.display())], "cwd": root.to_str().unwrap()}),
+            &json!({"paths": [format!("{}#1-1", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
             true,
         )
         .expect("range read");
 
-        // Line 3 was never displayed by either read → edit must be rejected.
         let tag = format!("{:04X}", compute_file_hash(content));
+        let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "fn C() {}" }]);
         let out = tool_write(
-            &json!({
-                "edits": format!("[{}#{tag}]\nSWAP 3:\n+fn C() {{}}\n", p.display()),
-                "cwd": root.to_str().unwrap()
-            }),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1133,7 +1227,7 @@ mod tests {
     }
 
     /// A file with no trailing newline round-trips: the read mints a tag, and a
-    /// tag-matched SWAP lands on the intended line without corrupting the
+    /// tag-matched replace lands on the intended line without corrupting the
     /// missing-final-newline shape.
     #[test]
     fn no_trailing_newline_round_trip() {
@@ -1143,9 +1237,9 @@ mod tests {
         std::fs::write(&p, "fn a() {}\nfn b() {}").unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let blob = format!("[{}#{tag}]\nSWAP 2:\n+fn B() {{}}\n", p.display());
+        let ops = json!([{ "op": "replace", "start": 2, "end": 2, "content": "fn B() {}" }]);
         let out = tool_write(
-            &json!({"edits": blob, "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1154,7 +1248,102 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "fn a() {}\nfn B() {}",
-            "SWAP 2 replaces line 2 and preserves the no-trailing-newline shape"
+            "replace 2 replaces line 2 and preserves the no-trailing-newline shape"
+        );
+    }
+
+    /// An integer op field beyond u32 range is rejected at the deserialize
+    /// layer — naming the op — before any file is touched. Locks the numeric
+    /// bound of the "reject before any file work" acceptance criterion.
+    #[test]
+    fn u32_out_of_range_op_field_rejected_before_file_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("bounds.rs");
+        std::fs::write(&p, "untouched\n").unwrap();
+        let (session, bloom) = services();
+        // start = u32::MAX + 1 — out of range for the wire field.
+        let ops = json!([{ "op": "replace", "start": 4_294_967_296i64, "end": 1, "content": "x" }]);
+        let err = tool_write(
+            &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("out-of-range integer must be a top-level deserialize error");
+        assert!(err.contains("replace"), "must name the op: {err}");
+        assert!(err.contains("u32"), "must name the expected type: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "untouched\n",
+            "no file may be touched when an op field is out of range"
+        );
+    }
+
+    /// An unrecognized `op` verb is rejected at the deserialize layer, echoing
+    /// the offending verb, before any file is touched.
+    #[test]
+    fn unknown_op_verb_rejected_naming_the_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("keepverb.rs");
+        std::fs::write(&p, "stable\n").unwrap();
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "frobnicate", "start": 1, "end": 1 }]);
+        let err = tool_write(
+            &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("unknown verb must be a top-level deserialize error");
+        assert!(err.contains("frobnicate"), "must echo the bad verb: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "stable\n",
+            "no file may be touched when the op verb is unknown"
+        );
+    }
+
+    /// Deserialize is all-or-nothing: an invalid op in a LATER section aborts
+    /// the whole call before the apply loop, so a valid earlier section's file
+    /// is left untouched. Best-effort per-section reporting begins only at the
+    /// apply stage, never at the deserialize gate.
+    #[test]
+    fn deserialize_failure_in_later_section_leaves_earlier_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = root.join("first.rs");
+        let b = root.join("second.rs");
+        std::fs::write(&a, "fn keep() {}\n").unwrap();
+        std::fs::write(&b, "fn other() {}\n").unwrap();
+        let (session, bloom) = services();
+        let tag_a = read_for_tag(&session, &a);
+        // Section 0 is valid and would apply; section 1 carries an invalid op.
+        let edits_val = json!([
+            {
+                "path": a.to_str().unwrap(),
+                "tag": tag_a,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn KEEP() {}" }]
+            },
+            {
+                "path": b.to_str().unwrap(),
+                "tag": "0000",
+                "ops": [{ "op": "replace", "start": 1, "end": 1 }]
+            }
+        ]);
+        let err = tool_write(
+            &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("invalid op in a later section must abort the whole call");
+        assert!(
+            err.contains("content"),
+            "must name the missing field: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "fn keep() {}\n",
+            "the valid earlier section's file must be untouched when a later section fails to deserialize"
         );
     }
 }

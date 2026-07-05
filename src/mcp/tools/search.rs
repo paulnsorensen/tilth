@@ -263,18 +263,23 @@ fn search_merged_default(
     edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, crate::error::TilthError> {
-    // Path-like miss auto-open: the default search returns an empty-result
+    // Path-like miss suggestions: the default search returns an empty-result
     // header on a miss, so a slightly-off path (`src/serch/symbol.rs`) would
     // never reach the basic-path fuzzy fallback. For a path-like query with no
-    // symbol/content match anywhere, resolve it to the closest real file and
-    // auto-open. Gated on `is_path_like` so a normal empty search never walks.
+    // symbol/content match anywhere, error with the closest real file(s) as a
+    // "did you mean" list — tilth never auto-opens a file the agent didn't name.
+    // Gated on `is_path_like` so a normal empty search never walks the tree.
     if crate::read::fuzzy_path::is_path_like(query) {
         let sym_hits = crate::search::search_symbol_raw(query, scope, glob)?.total_found;
         let content_hits = crate::search::search_content_raw(query, scope, glob)?.total_found;
         if sym_hits == 0 && content_hits == 0 {
-            if let Some(body) = crate::read::fuzzy_path::auto_open_search_miss(scope, query, cache)
+            if let Some(suggestions) =
+                crate::read::fuzzy_path::search_miss_suggestions(scope, query)
             {
-                return Ok(body);
+                return Err(crate::error::TilthError::NotFound {
+                    path: scope.join(query),
+                    suggestion: Some(suggestions.join(", ")),
+                });
             }
         }
     }
@@ -434,9 +439,10 @@ mod tests {
     /// The default MCP search path returns an empty-result header on a miss, so
     /// a path-like query that does not resolve to a real file would never reach
     /// the basic-path fuzzy fallback. A slightly-off path with no search matches
-    /// must auto-open the closest real file under the distinct search header.
+    /// must error with the closest real file surfaced as a "did you mean"
+    /// suggestion — never auto-opening a file the agent didn't name.
     #[test]
-    fn merged_default_auto_opens_path_like_miss() {
+    fn merged_default_path_like_miss_suggests_real_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
         std::fs::write(
@@ -456,23 +462,18 @@ mod tests {
             "cwd": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
-
+        let err = tool_search(&args, &cache, &session, &bloom, false)
+            .expect_err("path-like miss must not auto-open — suggest-only");
         assert!(
-            out.contains("resolved from path-like query \"serch/symbol.rs\""),
-            "expected distinct search auto-open header on the MCP path: {out}"
+            err.contains("did you mean") && err.contains("src/search/symbol.rs"),
+            "expected a did-you-mean suggestion for the real file: {err}"
         );
-        assert!(
-            out.contains("no search matches; closest file auto-opened"),
-            "header must announce the search→file switch: {out}"
-        );
-        assert!(out.contains("pub fn find"), "expected resolved body: {out}");
     }
 
-    /// A non-path-like miss on the default MCP path must NOT auto-open — it stays
-    /// the normal empty-result response, never a surprise file body.
+    /// A non-path-like miss on the default MCP path must NOT walk the tree — it
+    /// stays the normal empty-result response, never an error or a suggestion.
     #[test]
-    fn merged_default_non_path_like_miss_does_not_auto_open() {
+    fn merged_default_non_path_like_miss_stays_empty_result() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
         std::fs::write(
@@ -495,11 +496,6 @@ mod tests {
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
-
-        assert!(
-            !out.contains("closest file auto-opened"),
-            "non-path-like subsequence miss must not auto-open: {out}"
-        );
         assert!(
             out.contains("0 matches"),
             "expected the normal empty-result response: {out}"
