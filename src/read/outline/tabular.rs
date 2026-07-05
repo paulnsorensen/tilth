@@ -54,6 +54,7 @@ pub fn outline(content: &str, _max_lines: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     /// Regression: trailing-newline CSV must not inflate the data row count.
     /// `a,b\n1,2\n3,4\n` has 2 data rows, not 3.
@@ -90,7 +91,7 @@ mod tests {
     fn rows_omitted_count_trailing_newline() {
         let mut csv = String::from("a,b\n");
         for i in 1..=12 {
-            csv.push_str(&format!("{i},{i}\n"));
+            let _ = writeln!(csv, "{i},{i}");
         }
         let (result, _) = outline(&csv, 100);
         assert!(

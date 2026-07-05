@@ -164,7 +164,7 @@ mod tests {
     fn header_format_is_bracketed_uppercase() {
         let tag = compute_file_hash("x\n");
         let header = format_header("src/foo.rs", tag);
-        assert_eq!(header, format!("[src/foo.rs#{:04X}]", tag));
+        assert_eq!(header, format!("[src/foo.rs#{tag:04X}]"));
         assert!(header.starts_with("[src/foo.rs#"));
         assert!(header.ends_with(']'));
     }

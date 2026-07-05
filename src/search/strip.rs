@@ -135,6 +135,10 @@ fn is_debug_log(trimmed: &str, lang: StripFamily) -> bool {
                 || trimmed.starts_with("cout ")
                 || trimmed.starts_with("cout<<")
         }
+        // Only strip echo lines explicitly labelled DEBUG — plain echo is functional output.
+        StripFamily::Bash => {
+            trimmed.starts_with("echo \"DEBUG") || trimmed.starts_with("echo 'DEBUG")
+        }
     }
 }
 
@@ -187,6 +191,13 @@ fn is_strippable_comment(trimmed: &str, lang: StripFamily) -> bool {
                 return false;
             }
             trimmed.starts_with("//")
+        }
+        StripFamily::Bash => {
+            // Keep shebangs (`#!`) and any line-comment starting with `#!`.
+            if trimmed.starts_with("#!") {
+                return false;
+            }
+            trimmed.starts_with('#')
         }
     };
 

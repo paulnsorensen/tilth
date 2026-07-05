@@ -16,8 +16,8 @@ mod tools;
 mod tree;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
-    tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_savings,
+    tool_search, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -382,6 +382,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
+        "tilth_savings" => tool_savings(args, services.session()),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }
@@ -1214,12 +1215,14 @@ mod tests {
     fn tool_read_auto_large_structured_returns_keys() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.json");
+        // Values must exceed the outline's 40-char value-preview cap so the
+        // keys outline compresses well below the never-worse gate's 80% floor —
+        // with short values OGATE correctly returns full content and there is
+        // no `[keys]` view to observe.
         let mut src = String::from("{\n  \"top_level_marker\": {\n");
-        for i in 0..2_000 {
-            let _ = writeln!(
-                src,
-                "    \"padding_key_{i}\": \"value-value-value-value-value-{i}\","
-            );
+        let long_value = "value-".repeat(40);
+        for i in 0..500 {
+            let _ = writeln!(src, "    \"padding_key_{i}\": \"{long_value}{i}\",");
         }
         src.push_str("    \"trailing_key\": null\n  }\n}\n");
         std::fs::write(&p, src).unwrap();
@@ -1914,7 +1917,7 @@ mod tests {
         );
     }
 
-    /// tilth_write and tilth_list don't consume budget; passing budget:0 must
+    /// `tilth_write` and `tilth_list` don't consume budget; passing budget:0 must
     /// not produce a budget error — the error should come from their own
     /// parameter validation, not the budget gate.
     #[test]
@@ -1945,9 +1948,10 @@ mod tests {
     #[test]
     fn batch_budget_represents_every_query() {
         let tmp = tempfile::tempdir().unwrap();
-        let body: String = (0..400)
-            .map(|i| format!("fn f_{i}() {{ let u_{i} = use_it({i}); }}\n"))
-            .collect();
+        let body: String = (0..400).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "fn f_{i}() {{ let u_{i} = use_it({i}); }}");
+            acc
+        });
         std::fs::write(tmp.path().join("lib.rs"), body).unwrap();
         let args = serde_json::json!({
             "queries": [
@@ -1987,7 +1991,10 @@ mod tests {
         let mut paths = Vec::new();
         for name in names {
             let p = tmp.path().join(name);
-            let body: String = (0..400).map(|i| format!("let x_{i} = {i};\n")).collect();
+            let body: String = (0..400).fold(String::new(), |mut acc, i| {
+                let _ = writeln!(acc, "let x_{i} = {i};");
+                acc
+            });
             std::fs::write(&p, format!("fn main() {{\n{body}}}\n")).unwrap();
             paths.push(p.to_str().unwrap().to_string());
         }
@@ -2319,7 +2326,7 @@ mod tests {
         );
         // The gutter form must NOT appear when edit_mode is set.
         assert!(
-            !out.contains("│ fn unique_symbol_for_hashline_test"),
+            !out.contains("| fn unique_symbol_for_hashline_test"),
             "gutter form must be suppressed under edit_mode: {out}"
         );
     }

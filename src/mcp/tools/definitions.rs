@@ -5,6 +5,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
+            "annotations": { "readOnlyHint": true },
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Omitting `kind` runs a merged default search — symbol, content, and caller results in one call (`## symbol/content/caller results`); set `kind` to narrow to a single mode.",
             "inputSchema": {
                 "type": "object",
@@ -65,6 +66,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_read",
+            "annotations": { "readOnlyHint": true },
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
@@ -100,6 +102,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_list",
+            "annotations": { "readOnlyHint": true },
             "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
                 "type": "object",
@@ -133,6 +136,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_deps",
+            "annotations": { "readOnlyHint": true },
             "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
                 "type": "object",
@@ -159,6 +163,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_grok",
+            "annotations": { "readOnlyHint": true },
             "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
             "inputSchema": {
                 "type": "object",
@@ -186,6 +191,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_diff",
+            "annotations": { "readOnlyHint": true },
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
             "inputSchema": {
                 "type": "object",
@@ -235,11 +241,21 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "name": "tilth_savings",
+            "annotations": { "readOnlyHint": true },
+            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ];
 
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
+            "annotations": { "readOnlyHint": false },
             "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string, delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
             "inputSchema": {
                 "type": "object",

@@ -77,6 +77,10 @@ struct ExpandedCtx {
     /// concise outline — see the `piped_invocation_does_not_auto_expand`
     /// pin in `main.rs` for the larger design rule this enforces.
     full_search: bool,
+    /// Caller's real token budget, threaded into `fit_to_budget` so
+    /// value-based match selection engages at the caller's actual cap
+    /// instead of only above `DEFAULT_BUDGET`.
+    budget: Option<u64>,
 }
 
 /// The single public API. Everything flows through here:
@@ -244,8 +248,21 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob, cli_full, false,
+                &parts,
+                scope,
+                cache,
+                &session,
+                &bloom,
+                expand,
+                None,
+                glob,
+                cli_full,
+                false,
+                budget_tokens,
             )?;
+            // fit_to_budget (inside search_multi_symbol_expanded) already applied
+            // the real budget_tokens with value-based selection; budget::apply's
+            // own fast path is a no-op once output is already under budget.
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
                 None => Ok(output),
@@ -281,12 +298,17 @@ fn run_inner(
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
                 full_search: cli_full,
+                budget: budget_tokens,
             };
             run_query_expanded(&query_type, scope, cache, &ctx, glob)?
         }
         _ => run_query_basic(&query_type, scope, cache, glob)?,
     };
 
+    // For the expanded-search branch, fit_to_budget already applied
+    // budget_tokens with value-based selection — this pass is then a no-op
+    // (already under budget). For FilePath/Glob (no fit_to_budget path),
+    // this remains the only enforcement, unchanged from before this fix.
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -314,6 +336,7 @@ fn run_query_expanded(
             glob,
             ctx.full_search,
             false,
+            ctx.budget,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -325,6 +348,7 @@ fn run_query_expanded(
             glob,
             ctx.full_search,
             false,
+            ctx.budget,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
@@ -341,6 +365,7 @@ fn run_query_expanded(
             glob,
             ctx.full_search,
             false,
+            ctx.budget,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,
@@ -352,6 +377,7 @@ fn run_query_expanded(
             glob,
             ctx.full_search,
             false,
+            ctx.budget,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
             pattern,
@@ -363,6 +389,7 @@ fn run_query_expanded(
             glob,
             ctx.full_search,
             false,
+            ctx.budget,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
@@ -437,22 +464,19 @@ fn single_query_search(
     fuzzy_path_fallback(scope, text, text, cache)
 }
 
-/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Attempts to
-/// resolve a path-like miss to a real file and auto-open it with a distinct
-/// header; otherwise enriches the `NotFound` with ranked suggestions, falling
-/// back to today's basename suggestion (`legacy_suggest_query`) when nothing
-/// subsequence-matches.
+/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Never
+/// auto-opens a different file than was asked for — enriches the `NotFound`
+/// with ranked "did you mean" suggestions when a path-like miss has
+/// subsequence candidates, falling back to today's basename suggestion
+/// (`legacy_suggest_query`) when nothing subsequence-matches.
 fn fuzzy_path_fallback(
     scope: &Path,
     query: &str,
     legacy_suggest_query: &str,
-    cache: &cache::OutlineCache,
+    _cache: &cache::OutlineCache,
 ) -> Result<String, error::TilthError> {
-    use read::fuzzy_path::{
-        resolve_fuzzy_path, search_auto_open_body, FuzzyResolution, GateProfile,
-    };
+    use read::fuzzy_path::{resolve_fuzzy_path, FuzzyResolution, GateProfile};
     match resolve_fuzzy_path(scope, query, GateProfile::Search) {
-        FuzzyResolution::Resolved(hit) => search_auto_open_body(scope, &hit, query, cache),
         FuzzyResolution::Suggestions(s) => Err(error::TilthError::NotFound {
             path: scope.join(query),
             suggestion: Some(s.join(", ")),
@@ -511,10 +535,11 @@ fn multi_word_concept_search(
 mod fuzzy_search_tests {
     use super::*;
 
-    /// A path-like Fallthrough miss with no search hits auto-opens the closest
-    /// real file under a distinct, self-explaining header.
+    /// A path-like Fallthrough miss with no search hits errors with the closest
+    /// real file surfaced as the top-ranked "did you mean" suggestion — never
+    /// auto-opening a file the agent didn't name.
     #[test]
-    fn search_fallthrough_auto_opens_path_like_query() {
+    fn search_fallthrough_path_like_miss_suggests_real_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
         std::fs::write(
@@ -526,23 +551,22 @@ mod fuzzy_search_tests {
 
         let cache = cache::OutlineCache::new();
         // `serch/symbol.rs` — deletion typo, path-like, single winner.
-        let out = single_query_search("serch/symbol.rs", dir.path(), &cache, false, None).unwrap();
-
+        let err = single_query_search("serch/symbol.rs", dir.path(), &cache, false, None)
+            .expect_err("path-like miss must not auto-open — suggest-only");
+        let error::TilthError::NotFound { suggestion, .. } = err else {
+            panic!("expected NotFound, got: {err:?}");
+        };
+        let suggestion = suggestion.expect("path-like miss must carry a suggestion");
         assert!(
-            out.contains("resolved from path-like query \"serch/symbol.rs\""),
-            "expected distinct search auto-open header, got: {out}"
+            suggestion.contains("src/search/symbol.rs"),
+            "real file must be surfaced as a suggestion: {suggestion}"
         );
-        assert!(
-            out.contains("no search matches; closest file auto-opened"),
-            "header must announce the search→file switch: {out}"
-        );
-        assert!(out.contains("pub fn find"), "expected resolved body: {out}");
     }
 
-    /// A non-path-like concept miss must NOT auto-open — it stays a `NotFound`
-    /// (optionally with suggestions), never a surprise file body.
+    /// A non-path-like concept miss stays a `NotFound` (optionally with
+    /// suggestions), never a resolved file body.
     #[test]
-    fn search_non_path_like_query_does_not_auto_open() {
+    fn search_non_path_like_query_stays_not_found() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
         std::fs::write(
@@ -554,7 +578,7 @@ mod fuzzy_search_tests {
         let cache = cache::OutlineCache::new();
         // `symbol` is a subsequence of the file path but is not path-like.
         let err = single_query_search("symbol", dir.path(), &cache, false, None)
-            .expect_err("non-path-like miss must not auto-open");
+            .expect_err("non-path-like miss must stay NotFound");
         assert!(
             matches!(err, error::TilthError::NotFound { .. }),
             "expected NotFound, got: {err:?}"

@@ -79,7 +79,7 @@ pub(in crate::mcp) fn tool_search(
             }
         }
         let sub_val = Value::Object(sub);
-        let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
+        let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode, Some(per_query))?;
         let headed = format!("## query: {qstr}\n\n{body}");
         parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
@@ -109,6 +109,7 @@ fn tool_search_single(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, String> {
     let query = args
         .get("query")
@@ -147,7 +148,8 @@ fn tool_search_single(
                 1 => {
                     session.record_search(symbols[0]);
                     search_merged_default(
-                        symbols[0], &scope, cache, session, bloom, expand, context, glob, edit_mode,
+                        symbols[0], &scope, cache, session, bloom, expand, context, glob,
+                        edit_mode, budget,
                     )
                 }
                 2..=5 => {
@@ -156,7 +158,7 @@ fn tool_search_single(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &symbols, &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 _ => {
@@ -179,7 +181,7 @@ fn tool_search_single(
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 2..=5 => {
@@ -188,7 +190,7 @@ fn tool_search_single(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &queries, &scope, cache, session, bloom, expand, context, glob, false,
-                        edit_mode,
+                        edit_mode, budget,
                     )
                 }
                 _ => {
@@ -202,13 +204,13 @@ fn tool_search_single(
         Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false, edit_mode,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
         }
         Some("regex") => {
             session.record_search(query);
             crate::search::search_regex_expanded(
-                query, &scope, cache, session, expand, context, glob, false, edit_mode,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
         }
         Some("callers") => {
@@ -265,19 +267,25 @@ fn search_merged_default(
     context: Option<&Path>,
     glob: Option<&str>,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, crate::error::TilthError> {
-    // Path-like miss auto-open: the default search returns an empty-result
+    // Path-like miss suggestions: the default search returns an empty-result
     // header on a miss, so a slightly-off path (`src/serch/symbol.rs`) would
     // never reach the basic-path fuzzy fallback. For a path-like query with no
-    // symbol/content match anywhere, resolve it to the closest real file and
-    // auto-open. Gated on `is_path_like` so a normal empty search never walks.
+    // symbol/content match anywhere, error with the closest real file(s) as a
+    // "did you mean" list — tilth never auto-opens a file the agent didn't name.
+    // Gated on `is_path_like` so a normal empty search never walks the tree.
     if crate::read::fuzzy_path::is_path_like(query) {
         let sym_hits = crate::search::search_symbol_raw(query, scope, glob)?.total_found;
         let content_hits = crate::search::search_content_raw(query, scope, glob)?.total_found;
         if sym_hits == 0 && content_hits == 0 {
-            if let Some(body) = crate::read::fuzzy_path::auto_open_search_miss(scope, query, cache)
+            if let Some(suggestions) =
+                crate::read::fuzzy_path::search_miss_suggestions(scope, query)
             {
-                return Ok(body);
+                return Err(crate::error::TilthError::NotFound {
+                    path: scope.join(query),
+                    suggestion: Some(suggestions.join(", ")),
+                });
             }
         }
     }
@@ -286,13 +294,13 @@ fn search_merged_default(
     sections.push(format!(
         "## symbol results\n\n{}",
         crate::search::search_symbol_expanded(
-            query, scope, cache, session, bloom, expand, context, glob, false, edit_mode,
+            query, scope, cache, session, bloom, expand, context, glob, false, edit_mode, budget,
         )?
     ));
     sections.push(format!(
         "## content results\n\n{}",
         crate::search::search_content_expanded(
-            query, scope, cache, session, expand, context, glob, false, edit_mode,
+            query, scope, cache, session, expand, context, glob, false, edit_mode, budget,
         )?
     ));
     if crate::classify::is_identifier(query) {
@@ -412,13 +420,14 @@ mod tests {
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
 
         // Both targets must be reported with a real call site, not a single
-        // literal "alpha,beta" lookup that finds nothing.
+        // literal "alpha,beta" lookup that finds nothing. Header uses the
+        // unified single-target shape: `# Callers of "<target>" in <scope>`.
         assert!(
-            out.contains("callers of \"alpha\""),
+            out.contains("Callers of \"alpha\""),
             "missing alpha section: {out}"
         );
         assert!(
-            out.contains("callers of \"beta\""),
+            out.contains("Callers of \"beta\""),
             "missing beta section: {out}"
         );
         assert!(
@@ -436,9 +445,10 @@ mod tests {
     /// The default MCP search path returns an empty-result header on a miss, so
     /// a path-like query that does not resolve to a real file would never reach
     /// the basic-path fuzzy fallback. A slightly-off path with no search matches
-    /// must auto-open the closest real file under the distinct search header.
+    /// must error with the closest real file surfaced as a "did you mean"
+    /// suggestion — never auto-opening a file the agent didn't name.
     #[test]
-    fn merged_default_auto_opens_path_like_miss() {
+    fn merged_default_path_like_miss_suggests_real_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
         std::fs::write(
@@ -457,23 +467,18 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
-
+        let err = tool_search(&args, &cache, &session, &bloom, false)
+            .expect_err("path-like miss must not auto-open — suggest-only");
         assert!(
-            out.contains("resolved from path-like query \"serch/symbol.rs\""),
-            "expected distinct search auto-open header on the MCP path: {out}"
+            err.contains("did you mean") && err.contains("src/search/symbol.rs"),
+            "expected a did-you-mean suggestion for the real file: {err}"
         );
-        assert!(
-            out.contains("no search matches; closest file auto-opened"),
-            "header must announce the search→file switch: {out}"
-        );
-        assert!(out.contains("pub fn find"), "expected resolved body: {out}");
     }
 
-    /// A non-path-like miss on the default MCP path must NOT auto-open — it stays
-    /// the normal empty-result response, never a surprise file body.
+    /// A non-path-like miss on the default MCP path must NOT walk the tree — it
+    /// stays the normal empty-result response, never an error or a suggestion.
     #[test]
-    fn merged_default_non_path_like_miss_does_not_auto_open() {
+    fn merged_default_non_path_like_miss_stays_empty_result() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
         std::fs::write(
@@ -495,11 +500,6 @@ mod tests {
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
-
-        assert!(
-            !out.contains("closest file auto-opened"),
-            "non-path-like subsequence miss must not auto-open: {out}"
-        );
         assert!(
             out.contains("0 matches"),
             "expected the normal empty-result response: {out}"
@@ -509,7 +509,7 @@ mod tests {
     /// Regression: a comma query under the default (merged/`any`) kind must be
     /// treated as a multi-symbol lookup, not searched as a literal "a,b" string.
     /// Before the fix `search_merged_default` passed the raw comma string to
-    /// symbol + content search, so e.g. "Planner,planning_agent" found nothing
+    /// symbol + content search, so e.g. "`Planner,planning_agent`" found nothing
     /// even though `Planner` existed.
     #[test]
     fn default_comma_query_finds_both_symbols() {
@@ -575,6 +575,174 @@ mod tests {
         assert!(
             !out.contains("no call sites") && !out.contains("no direct call sites"),
             "duplicate target rendered a false no-callers section: {out}"
+        );
+    }
+
+    /// HIGH finding from PR review: the multi-target path must not silently
+    /// drop the single-target path's "Adaptive 2nd-hop impact analysis".
+    /// `alpha` is called by exactly `IMPACT_FANOUT_THRESHOLD`-or-fewer unique
+    /// functions (one: `uses_alpha`), which are themselves called by
+    /// `hop2_alpha` — so the 2-target search "alpha,beta" must show a 2nd-hop
+    /// section for the alpha bucket, same as a lone `callers("alpha")` would.
+    #[test]
+    fn callers_multi_target_includes_second_hop_impact_per_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn uses_alpha() { alpha(); }\n\
+             fn hop2_alpha() { uses_alpha(); }\n\
+             fn uses_beta() { beta(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+
+        // Single-target baseline: what callers("alpha") alone produces.
+        let single_args = serde_json::json!({
+            "queries": [{"query": "alpha", "kind": "callers"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
+        assert!(
+            single_out.contains("impact (2nd hop)"),
+            "single-target baseline should show 2nd-hop impact: {single_out}"
+        );
+        assert!(single_out.contains("hop2_alpha"));
+
+        // Multi-target: "alpha,beta" must not omit what a lone "alpha" search
+        // would show for the alpha bucket.
+        let multi_args = serde_json::json!({
+            "queries": [{"query": "alpha,beta", "kind": "callers"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
+        assert!(
+            multi_out.contains("impact (2nd hop)"),
+            "multi-target alpha bucket dropped the 2nd-hop impact section: {multi_out}"
+        );
+        assert!(
+            multi_out.contains("hop2_alpha"),
+            "multi-target alpha bucket missing the hop-2 caller: {multi_out}"
+        );
+    }
+
+    /// MED finding from PR review: single- and multi-target output must use
+    /// the same header shape for the same target — the review found multi
+    /// diverging into a `## callers of "foo"` / `### path:line` style while
+    /// single used `# Callers of "foo" in <scope> — N call site(s)` /
+    /// `## path:line`. A caller diffing single vs. one bucket of multi should
+    /// see the identical shape (same target, same scope, same one hit).
+    #[test]
+    fn callers_multi_target_header_matches_single_target_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn uses_alpha() { alpha(); }\n\
+             fn uses_beta() { beta(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+
+        let single_args = serde_json::json!({
+            "queries": [{"query": "alpha", "kind": "callers"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
+
+        let multi_args = serde_json::json!({
+            "queries": [{"query": "alpha,beta", "kind": "callers"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
+
+        // Top-level bucket header: same "# Callers of ... — N call site(s)" shape.
+        assert!(
+            single_out.contains("# Callers of \"alpha\""),
+            "single-target header shape missing: {single_out}"
+        );
+        assert!(
+            multi_out.contains("# Callers of \"alpha\""),
+            "multi-target alpha bucket must render the single-target header shape, \
+             not a divergent '## callers of' shape: {multi_out}"
+        );
+        assert!(
+            single_out.contains("1 call site"),
+            "single-target count phrase missing: {single_out}"
+        );
+        assert!(
+            multi_out.contains("1 call site"),
+            "multi-target alpha bucket must render the same count phrase: {multi_out}"
+        );
+
+        // Call-site sub-header: same "## path:line [caller: name]" shape,
+        // not multi's divergent "### path:line [caller: name]".
+        assert!(
+            single_out.contains("[caller: uses_alpha]"),
+            "single-target caller label missing: {single_out}"
+        );
+        assert!(
+            multi_out.contains("[caller: uses_alpha]"),
+            "multi-target alpha bucket must render the same caller label: {multi_out}"
+        );
+        assert!(
+            !multi_out.contains("### lib.rs"),
+            "multi-target must use single-target's '##' sub-header level, not '###': {multi_out}"
+        );
+    }
+
+    /// MED finding from PR review: `BATCH_EARLY_QUIT` (50 raw matches) is a
+    /// walk-wide budget shared by every target in a batch search. The walker
+    /// (`find_callers_batch`) checks this budget once per **file** visited
+    /// (an `AtomicUsize` compared before each file read — see
+    /// `src/search/callers.rs`'s `found_count.load(..) >= early_quit_threshold`
+    /// gate), so it only starves later files, not later matches within one
+    /// already-open file. To reproduce real starvation this test spreads 60
+    /// `alpha` call sites across 60 separate files (one call site per file:
+    /// `a_00.rs`..`a_59.rs`) — comfortably above the un-scaled 50-match
+    /// walk-wide budget — and puts `beta`'s lone call site in a file that
+    /// sorts after all of them (`z_beta.rs`). With an unscaled budget the
+    /// walk can quit after visiting ~50 of the `a_*.rs` files, before
+    /// `z_beta.rs` is ever read, starving beta entirely. Scaling the budget
+    /// by target count (2x for 2 targets = 100) gives the walk enough
+    /// headroom to reach `z_beta.rs`.
+    #[test]
+    fn callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("defs.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        for i in 0..60 {
+            std::fs::write(
+                tmp.path().join(format!("a_{i:02}.rs")),
+                format!("fn uses_alpha_{i}() {{ alpha(); }}\n"),
+            )
+            .unwrap();
+        }
+        // Sorts after every "a_*.rs" file — only reached if the walk's
+        // early-quit budget has enough headroom to visit all 61 prior files.
+        std::fs::write(tmp.path().join("z_beta.rs"), "fn uses_beta() { beta(); }\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "alpha,beta", "kind": "callers"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("uses_beta"),
+            "beta call site starved by alpha's hit-rich budget consumption \
+             (early-quit budget was not scaled by target count): {out}"
         );
     }
 }

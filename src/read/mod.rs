@@ -16,6 +16,11 @@ use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+/// Minimum compression ratio required to prefer the outline over full content.
+/// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
+/// outline saves too few tokens to be worth the information loss, so the full
+/// file is returned instead. Integer arithmetic: 80 means 80%.
+const OUTLINE_MIN_COMPRESSION: u64 = 80;
 const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
@@ -222,13 +227,19 @@ pub fn read_file(
         ));
     }
 
-    // Full mode or small file → return full content (skip smart view)
-    if full || tokens <= TOKEN_THRESHOLD {
+    // Canonical full-content view — shared by the small-file gate and OGATE below.
+    let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
-            return Ok(edit_whole_view(path, &content, &header));
+            edit_whole_view(path, &content, &header)
+        } else {
+            format!("{header}\n\n{content}")
         }
-        return Ok(format!("{header}\n\n{content}"));
+    };
+
+    // Full mode or small file → return full content (skip smart view)
+    if full || tokens <= TOKEN_THRESHOLD {
+        return Ok(full_view());
     }
 
     // Large file → smart view by file type
@@ -241,6 +252,14 @@ pub fn read_file(
         outline::generate(path, file_type, &content, buf, capped)
     });
 
+    // OGATE: if the outline is not meaningfully smaller than the full file,
+    // return the full file — same token cost with less information is strictly
+    // worse and forces the caller to do a second read.
+    let outline_tokens = estimate_tokens(outline.len() as u64);
+    if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
+        return Ok(full_view());
+    }
+
     let mode = match file_type {
         FileType::StructuredData => ViewMode::Keys,
         _ => ViewMode::Outline,
@@ -249,14 +268,6 @@ pub fn read_file(
     Ok(format!("{header}\n\n{outline}"))
 }
 
-/// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
-///
-/// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
-/// relative) query against the gitignore-pruned tree. A confident `Resolved`
-/// auto-opens the winning file with a `# <real-path> (corrected from "<query>")`
-/// header; `Suggestions` enrich the `NotFound` with a ranked "did you mean"
-/// list; `None` returns the unchanged `NotFound` (today's behaviour). A
-/// successful read never walks — it returns `read_file`'s result untouched.
 /// Reduce `path` to a scope-relative query string for fuzzy matching.
 ///
 /// Candidates from the walker are relative to `scope`, so the query must be too.
@@ -278,6 +289,14 @@ fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a
     stripped.to_string_lossy()
 }
 
+/// Read `path`, and on a missing path attempt fuzzy resolution against `scope`.
+///
+/// Cold-path wrapper around [`read_file`]: on `NotFound`, scores the (scope-
+/// relative) query against the `.tilthignore`-pruned tree. `Suggestions` enrich
+/// the `NotFound` with a ranked "did you mean" list and `None` returns the
+/// unchanged `NotFound` — tilth never auto-opens a different file than was
+/// asked for. A successful read never walks — it returns `read_file`'s result
+/// untouched.
 pub fn read_file_resolving(
     path: &Path,
     section: Option<&str>,
@@ -296,15 +315,6 @@ pub fn read_file_resolving(
     // The query is the scope-relative path the caller asked for.
     let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
-        fuzzy_path::FuzzyResolution::Resolved(hit) => {
-            hit.log_auto_open(&query);
-            let real = scope.join(&hit.path);
-            let body = read_file(&real, section, full, cache, edit_mode)?;
-            Ok(format!(
-                "# {} (corrected from \"{query}\")\n\n{body}",
-                hit.path.display()
-            ))
-        }
         fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
             path: missing,
             suggestion: Some(s.join(", ")),
@@ -1011,7 +1021,9 @@ mod tests {
     }
 
     #[test]
-    fn read_file_resolving_auto_opens_with_correction_header() {
+    fn read_file_resolving_suggests_real_file_first() {
+        // A basename-only miss must NOT auto-open; it errors with the real file
+        // surfaced as the top-ranked "did you mean" suggestion.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/search")).unwrap();
         std::fs::write(
@@ -1022,17 +1034,16 @@ mod tests {
         std::fs::write(dir.path().join("src/lib.rs"), "pub mod search;\n").unwrap();
 
         let cache = OutlineCache::new();
-        // Basename-only miss resolves to the unique real file.
         let missing = dir.path().join("symbol.rs");
-        let out = read_file_resolving(&missing, None, false, &cache, false, dir.path()).unwrap();
-
+        let err = read_file_resolving(&missing, None, false, &cache, false, dir.path())
+            .expect_err("near-miss must not auto-open — suggest-only");
+        let TilthError::NotFound { suggestion, .. } = err else {
+            panic!("expected NotFound, got: {err:?}");
+        };
+        let suggestion = suggestion.expect("near-miss must carry a suggestion");
         assert!(
-            out.contains("src/search/symbol.rs (corrected from \"symbol.rs\")"),
-            "expected correction header, got: {out}"
-        );
-        assert!(
-            out.contains("pub fn find"),
-            "expected resolved file body: {out}"
+            suggestion.starts_with("src/search/symbol.rs"),
+            "real file must be the top-ranked suggestion: {suggestion}"
         );
     }
 
@@ -1383,5 +1394,93 @@ mod tests {
             tilthignore_denies(&secret),
             "secret.env must be denied even when .tilthignore contains a malformed pattern"
         );
+    }
+
+    // OGATE: "never-worse outline gate" — if the outline barely compresses
+    // (outline_tokens >= 80% of full-file tokens), return full content instead.
+    #[test]
+    fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
+        use std::fmt::Write as _;
+        // A file of empty-body one-liner fns. The signature IS essentially the
+        // whole source line (only ` {}` is dropped), so any signature-bearing
+        // outline is ≥80% of the full-file tokens and OGATE must fire. This holds
+        // regardless of the outline's per-entry formatting overhead, so the test
+        // does not silently break if that format is ever tightened. Enough lines
+        // to clear TOKEN_THRESHOLD (6k) — otherwise the small-file gate returns
+        // full before OGATE is even consulted, passing for the wrong reason.
+        let mut src = String::new();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
+        }
+        // ~2000 * ~21 bytes ≈ 43 KB ≈ 10.7k tokens (> TOKEN_THRESHOLD = 6k).
+        // Assert it so the test provably exercises OGATE rather than the
+        // small-file gate (which would also return `[full]`).
+        assert!(
+            estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD,
+            "fixture must exceed TOKEN_THRESHOLD so OGATE, not the small-file gate, returns full"
+        );
+        let path = write_temp("tilth_ogate_flat.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate fired → full view. The header tag records the decision directly
+        // (an outline would read `[outline]`), and the trailing fn's body braces
+        // `() {}` only appear in verbatim full content — an outline renders the
+        // signature without the body.
+        assert!(
+            result.contains("[full]"),
+            "OGATE must return the full view; header was: {}",
+            result.lines().next().unwrap_or("")
+        );
+        assert!(
+            result.contains("flat_1999() {}"),
+            "expected verbatim full content (last fn body present)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contrasting test: a large file with big function bodies compresses well
+    /// and must still return the OUTLINE (gate must NOT fire).
+    #[test]
+    fn ogate_large_compressible_file_returns_outline() {
+        use std::fmt::Write as _;
+        // Each function has a large body (many comment lines) so the outline
+        // (which only shows the `fn` signature) is a tiny fraction of the
+        // full-file token count.
+        let mut src = String::new();
+        for i in 0..40 {
+            writeln!(src, "pub fn heavy_{i}() {{").unwrap();
+            // 200 lines of body per function → ~200 * 30 = 6 000 bytes each
+            for j in 0..200 {
+                writeln!(
+                    src,
+                    "    let _x_{j}: u64 = {j}_{i}_padding_value_that_fills_space;"
+                )
+                .unwrap();
+            }
+            writeln!(src, "}}").unwrap();
+        }
+        // Total ≈ 40 * 202 lines * ~50 bytes = ~400 KB → well over TOKEN_THRESHOLD
+        let path = write_temp("tilth_ogate_heavy.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate must NOT have fired: the output should be an outline, not full content.
+        // An outline shows signatures but omits the body.
+        assert!(
+            result.contains("heavy_0"),
+            "expected outline to mention function name heavy_0: {}",
+            &result[..result.len().min(400)]
+        );
+        // Body variable lines are only in the full file, not in an outline
+        assert!(
+            !result.contains("_x_0: u64"),
+            "outline must not contain body variables; got full content instead"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

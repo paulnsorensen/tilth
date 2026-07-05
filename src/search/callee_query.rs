@@ -80,6 +80,7 @@ mod tests {
             ("swift", tree_sitter_swift::LANGUAGE.into()),
             ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
             ("elixir", tree_sitter_elixir::LANGUAGE.into()),
+            ("bash", tree_sitter_bash::LANGUAGE.into()),
         ];
         let mut seen = std::collections::HashMap::new();
         for (name, lang) in &grammars {
@@ -102,5 +103,12 @@ mod tests {
         let lang: tree_sitter::Language = tree_sitter_elixir::LANGUAGE.into();
         let query_str = callee_query_str(Lang::Elixir).unwrap();
         tree_sitter::Query::new(&lang, query_str).expect("elixir callee query should compile");
+    }
+
+    #[test]
+    fn bash_callee_query_compiles() {
+        let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
+        let query_str = callee_query_str(Lang::Bash).unwrap();
+        tree_sitter::Query::new(&lang, query_str).expect("bash callee query should compile");
     }
 }
