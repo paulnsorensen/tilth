@@ -178,7 +178,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview. git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd.",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],

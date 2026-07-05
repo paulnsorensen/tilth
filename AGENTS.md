@@ -63,7 +63,7 @@ scope: "file.rs" or "file.rs:fn_name". log: "HEAD~5..HEAD" for per-commit summar
 search: filter to lines matching a term. blast: true to show callers of changed signatures.
 Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
-cwd: your absolute checkout dir (REQUIRED).
+cwd: your absolute checkout dir (REQUIRED). git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd.
 
 DO NOT `cat`/`head`/`tail`/`sed -n` a file via the shell → use tilth_read.
 DO NOT `grep`/`rg`/`ls`/`find`/`fd` on repo files via the shell → use tilth_search or tilth_list.
