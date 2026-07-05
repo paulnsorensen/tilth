@@ -60,15 +60,10 @@ pub(crate) fn tool_write(
         None => None,
     };
 
+    // `lower_edits` enforces the 20-section batch cap up front (before lowering).
     let sections = lower_edits(edits_val)?;
     if sections.is_empty() {
         return Err("edits array contained no sections".into());
-    }
-    if sections.len() > 20 {
-        return Err(format!(
-            "batch write limited to 20 sections (got {})",
-            sections.len()
-        ));
     }
 
     // Confinement boundary: the `root` when given, else the server cwd. `MV`

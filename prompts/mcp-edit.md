@@ -12,7 +12,7 @@ delete_block {at} — delete that block
 insert_after_block {at, content} — insert after that block
 delete_file — delete the file
 move_file {dest} — move/rename the file
-`content` is a single string with embedded newlines (use \n). `at` is an integer line number or a "#symbol" name string.
+`content` is a single string with embedded newlines (use \n). `at` is an integer line number or a "#symbol" name string (the leading `#` is optional — a bare `symbol` name is also accepted).
 Example:
 tilth_write(edits: [{"path": "src/x.rs", "tag": "1A2B", "ops": [
   {"op": "replace", "start": 2, "end": 2, "content": "let y = 1;"},

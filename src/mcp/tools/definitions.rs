@@ -256,7 +256,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string, delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
+            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (the leading `#` is optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits"],
@@ -276,17 +276,17 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                         "type": "object",
                                         "required": ["op"],
                                         "oneOf": [
-                                            { "required": ["op", "start", "end", "content"], "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "start", "end"], "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 } } },
-                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "content"], "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "content"], "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at"], "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 } } },
-                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op"], "properties": { "op": { "const": "delete_file" } } },
-                                            { "required": ["op", "dest"], "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
+                                            { "required": ["op", "start", "end", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "start", "end"], "additionalProperties": false, "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
+                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
                                         ]
                                     }
                                 }
@@ -408,13 +408,32 @@ mod tests {
             !compiled.is_valid(&bad),
             "a replace op missing `content` must fail schema validation"
         );
-        // Boundary: a negative line number must be rejected by `minimum: 0`.
+        // Boundary: a negative line number must be rejected by `minimum: 1`.
         let negative = serde_json::json!({
             "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": -1, "end": 2, "content": "x" }] }]
         });
         assert!(
             !compiled.is_valid(&negative),
-            "a negative start must fail schema validation (minimum: 0)"
+            "a negative start must fail schema validation (minimum: 1)"
+        );
+        // Boundary: line 0 is 1-based-invalid at runtime (`check_bounds` rejects
+        // `line < 1`), so the schema must reject it too — not defer to a late error.
+        let zero = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": 0, "end": 2, "content": "x" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&zero),
+            "start 0 must fail schema validation (minimum: 1, matching runtime check_bounds)"
+        );
+        // An op carrying a field foreign to its variant must fail the schema, so a
+        // client validating client-side sees the same rejection `deny_unknown_fields`
+        // gives server-side (no schema-valid-but-runtime-rejected round-trip).
+        let extra_field = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 2, "content": "oops" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&extra_field),
+            "a delete op with a stray `content` must fail schema validation (additionalProperties: false)"
         );
         // Boundary: a line number above u32::MAX must be rejected by `maximum`.
         let too_big = serde_json::json!({

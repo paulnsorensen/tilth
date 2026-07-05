@@ -637,7 +637,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2620,
+            2692,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
@@ -1719,7 +1719,7 @@ mod tests {
         );
         assert_eq!(
             edit.len(),
-            8761,
+            8833,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }

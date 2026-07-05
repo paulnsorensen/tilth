@@ -198,6 +198,14 @@ pub fn lower_edits(edits: &Value) -> Result<Vec<Section>, String> {
     let arr = edits
         .as_array()
         .ok_or("`edits` must be a JSON array of {path, tag?, ops} section objects")?;
+    // Enforce the batch cap up front, before allocating or deserializing any
+    // section — an oversized array is rejected without paying to lower it.
+    if arr.len() > 20 {
+        return Err(format!(
+            "batch write limited to 20 sections (got {})",
+            arr.len()
+        ));
+    }
     let mut sections = Vec::with_capacity(arr.len());
     for (i, sv) in arr.iter().enumerate() {
         let raw: RawSection =
