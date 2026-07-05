@@ -21,7 +21,7 @@ Comma-OR is for kind any/symbol/callers: "symbol1,symbol2" (max 5). DO NOT comma
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
 glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude).
-cwd: your absolute checkout dir (REQUIRED). A RELATIVE `scope` anchors under it; an absolute `scope` is used as-is.
+cwd: required (see PATHS).
 Output per match:
 ## <path>:<start>-<end> [definition|usage|impl]
 <outline context>
@@ -38,22 +38,22 @@ Suffix grammar per path: path#n-m (line range), path#n (from line n), path### He
 mode: auto (default) | full (force full content) | signature (outline, no bodies) | stripped (comments/logs/blank lines removed).
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
 Output: N:content numbered lines (in edit mode, under a [path#TAG] header).
-cwd: your absolute checkout dir (REQUIRED). RELATIVE paths anchor under it; absolute paths are used as-is.
+cwd: required (see PATHS).
 
 tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, tree, and the host Glob tool.
 Batch-only: ALWAYS pass patterns: [...] as an array, even for one glob (e.g. patterns: ["*.rs"] or ["*.rs", "*.toml"]). A singular `pattern` is not accepted.
 depth: cap directory depth (1 = top-level only).
-cwd: your absolute checkout dir (REQUIRED). A RELATIVE `scope` anchors under it; an absolute `scope` is used as-is.
+cwd: required (see PATHS).
 Output: tree with per-file (~<token_count> tokens) and per-directory rollups.
 
 tilth_deps: Blast-radius check — what imports this file and what it imports.
 Use ONLY before renaming, removing, or changing an export's signature.
-cwd: your absolute checkout dir (REQUIRED). RELATIVE `path`/`scope` anchor under it; absolute ones are used as-is.
+cwd: required (see PATHS).
 
 tilth_grok: Everything structural about a symbol in one call — def + body + signature + doc + callees + callers + siblings + tests.
 Usage: tilth_grok(target: "parse_unified_diff"). Also accepts "src/file.rs:7" or "Type::method".
 scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.
-cwd: your absolute checkout dir (REQUIRED). A RELATIVE `scope` anchors under it; an absolute `scope` is used as-is.
+cwd: required (see PATHS).
 Use ONLY for "understand this symbol" questions — replaces the search → expand → callers chain.
 DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).
 
@@ -94,6 +94,6 @@ Drift: the TAG binds the section to the content you read. If the file changed si
 New file: OMIT `tag` to seed a NEW file — use prepend for its content.
 Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
 DO NOT pass `edits` as a string (the old `[path#TAG]` text grammar or a JSON-encoded string) — it is rejected. Pass the array itself.
-cwd: your absolute checkout dir (REQUIRED). RELATIVE section paths and MV destinations anchor under `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused. The server cannot see your shell cwd.
+cwd: your absolute checkout dir (REQUIRED). RELATIVE section paths and move_file destinations anchor under `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.
 Pass diff: true for a compact before/after diff per section.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
