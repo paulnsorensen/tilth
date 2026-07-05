@@ -858,14 +858,11 @@ mod tests {
         .expect("edit-mode range read");
 
         // An edit anchored on line 50 (never displayed) must be rejected.
-        let header = crate::edit::tag::format_header(
-            &p.display().to_string(),
-            crate::edit::tag::compute_file_hash(&content),
-        );
-        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(&content));
+        let edits = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 50, "end": 50, "content": "# edited line 50" }] }]);
         let bloom = Arc::new(BloomFilterCache::new());
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": edits, "root": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -909,14 +906,11 @@ mod tests {
             "heading read must display Section A, got:\n{out}"
         );
 
-        let tag = crate::edit::tag::format_header(
-            &p.display().to_string(),
-            crate::edit::tag::compute_file_hash(content),
-        );
+        let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(content));
         let bloom = Arc::new(BloomFilterCache::new());
 
         // Edit on line 6 (inside Section B, never displayed) is rejected.
-        let reject = format!("{tag}\nSWAP 6:\n+BETA\n");
+        let reject = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 6, "end": 6, "content": "BETA" }] }]);
         let out = crate::mcp::tools::tool_write(
             &serde_json::json!({"edits": reject, "root": root.to_str().unwrap()}),
             &session,
@@ -934,7 +928,7 @@ mod tests {
         );
 
         // Edit on line 2 (inside the displayed Section A) applies.
-        let ok = format!("{tag}\nSWAP 2:\n+ALPHA\n");
+        let ok = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 2, "end": 2, "content": "ALPHA" }] }]);
         let out = crate::mcp::tools::tool_write(
             &serde_json::json!({"edits": ok, "root": root.to_str().unwrap()}),
             &session,
@@ -993,14 +987,11 @@ mod tests {
         )
         .expect("edit-mode range read");
 
-        let header = crate::edit::tag::format_header(
-            &big.display().to_string(),
-            crate::edit::tag::compute_file_hash(&content),
-        );
-        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(&content));
+        let edits = serde_json::json!([{ "path": big.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 50, "end": 50, "content": "# edited line 50" }] }]);
         let bloom = Arc::new(BloomFilterCache::new());
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": edits, "root": root.to_str().unwrap()}),
             &session,
             &bloom,
         )

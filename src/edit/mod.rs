@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 // model (upstream name: hashline), wired into the MCP through `crate::mcp::tools::write`.
 pub mod apply;
 pub mod block;
+pub mod json;
 pub mod mismatch;
 pub mod parser;
 pub mod recovery;
