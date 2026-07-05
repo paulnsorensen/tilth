@@ -70,31 +70,29 @@ To check what changed, use tilth_diff instead of Bash(git diff/git log).
 Shell out only for tests, builds, and non-file-IO commands.
 DO NOT re-read files already shown in expanded search results.
 
-tilth_write: Batch edit files with an op-grammar text blob (the `edits` string). Replaces the host Edit and Write tools.
-Read first (edit mode): tilth_read / tilth_search show a `[path#TAG]` header then `N:content` numbered lines. Copy the `[path#TAG]` header VERBATIM and reference the line numbers you see. NEVER invent a TAG.
-Send edits as ONE `edits` string of `[path#TAG]` sections, with op lines beneath each header. Line numbers are 1-based inclusive, from the numbered read:
-SWAP a.=b:  then payload — replace lines a..b (SWAP n: for a single line)
-DEL n | DEL a.=b — delete a line or range
-INS.PRE n: | INS.POST n:  then payload — insert before/after line n
-INS.HEAD: | INS.TAIL:  then payload — insert at start/end of file
-SWAP.BLK n: | SWAP.BLK #symbol:  then payload — replace the tree-sitter block at line n or named symbol
-DEL.BLK n | DEL.BLK #symbol — delete that block
-INS.BLK.POST n: | INS.BLK.POST #symbol:  then payload — insert after that block
-REM — delete the file
-MV dest — move/rename the file
-Payload: one row per line after the op header; prefix a row with `+` to force it literal (e.g. a row that itself looks like an op or a `[header]`).
+tilth_write: Batch edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools.
+Read first (edit mode): tilth_read / tilth_search show a `[path#TAG]` header then `N:content` numbered lines. Copy the 4-hex TAG into the section's `tag` and reference the line numbers you see. NEVER invent a TAG.
+Send `edits` as an ARRAY of section objects, each `{path, tag?, ops}`. Each op is an object tagged by `op`. Line numbers are 1-based inclusive, from the numbered read:
+replace {start, end, content} — replace lines start..end (start==end for one line)
+delete {start, end} — delete a line or range
+insert_before {line, content} | insert_after {line, content} — insert before/after line
+prepend {content} | append {content} — insert at start/end of file
+replace_block {at, content} — replace the tree-sitter block at `at` (a line number or a "#symbol" string)
+delete_block {at} — delete that block
+insert_after_block {at, content} — insert after that block
+delete_file — delete the file
+move_file {dest} — move/rename the file
+`content` is a single string with embedded newlines (use \n). `at` is an integer line number or a "#symbol" name string (the leading `#` is optional — a bare `symbol` name is also accepted).
 Example:
-[src/x.rs#1A2B]
-SWAP 2:
-
-+ let y = 1;
-DEL 5
-INS.POST 8:
-+// trailing note
+tilth_write(edits: [{"path": "src/x.rs", "tag": "1A2B", "ops": [
+  {"op": "replace", "start": 2, "end": 2, "content": "let y = 1;"},
+  {"op": "delete", "start": 5, "end": 5},
+  {"op": "insert_after", "line": 8, "content": "// trailing note"}
+]}])
 Drift: the TAG binds the section to the content you read. If the file changed since, tilth 3-way-merges your ops onto the live file; if the merge conflicts the section is REJECTED — re-read THAT file and retry it. A tag not from this session is rejected (never invent one).
-New file: a tagless `[path]` header (no #TAG) seeds a NEW file — use INS.HEAD for its content.
-Append cleanly: prefer `INS.POST <last-content-line>` over `INS.TAIL:` — INS.TAIL inserts after the file's trailing empty row, adding a blank line for newline-terminated files.
+New file: OMIT `tag` to seed a NEW file — use prepend for its content.
 Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
-root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and MV destinations are anchored under root and confined to it; ABSOLUTE section paths are also confined to root (or to the server's startup directory when root is omitted) — `..` traversal or paths outside the confinement root are refused. The server cannot see your shell cwd.
+DO NOT pass `edits` as a string (the old `[path#TAG]` text grammar or a JSON-encoded string) — it is rejected. Pass the array itself.
+root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and move_file destinations are anchored under root and confined to it; ABSOLUTE section paths are also confined to root (or to the server's startup directory when root is omitted) — `..` traversal or paths outside the confinement root are refused. The server cannot see your shell cwd.
 Pass diff: true for a compact before/after diff per section.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.

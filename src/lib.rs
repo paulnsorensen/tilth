@@ -1,3 +1,6 @@
+// The tilth_write tool schema is one deeply-nested `serde_json::json!` literal;
+// its per-op `oneOf` branches exceed the default 128-frame macro recursion limit.
+#![recursion_limit = "256"]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit
