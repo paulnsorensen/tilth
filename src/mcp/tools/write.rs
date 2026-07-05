@@ -1314,4 +1314,99 @@ mod tests {
             "replace 2 replaces line 2 and preserves the no-trailing-newline shape"
         );
     }
+
+    /// An integer op field beyond u32 range is rejected at the deserialize
+    /// layer — naming the op — before any file is touched. Locks the numeric
+    /// bound of the "reject before any file work" acceptance criterion.
+    #[test]
+    fn u32_out_of_range_op_field_rejected_before_file_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("bounds.rs");
+        std::fs::write(&p, "untouched\n").unwrap();
+        let (session, bloom) = services();
+        // start = u32::MAX + 1 — out of range for the wire field.
+        let ops = json!([{ "op": "replace", "start": 4_294_967_296i64, "end": 1, "content": "x" }]);
+        let err = tool_write(
+            &json!({"edits": edits(&p, Some("0000"), ops), "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("out-of-range integer must be a top-level deserialize error");
+        assert!(err.contains("replace"), "must name the op: {err}");
+        assert!(err.contains("u32"), "must name the expected type: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "untouched\n",
+            "no file may be touched when an op field is out of range"
+        );
+    }
+
+    /// An unrecognized `op` verb is rejected at the deserialize layer, echoing
+    /// the offending verb, before any file is touched.
+    #[test]
+    fn unknown_op_verb_rejected_naming_the_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("keepverb.rs");
+        std::fs::write(&p, "stable\n").unwrap();
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "frobnicate", "start": 1, "end": 1 }]);
+        let err = tool_write(
+            &json!({"edits": edits(&p, Some("0000"), ops), "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("unknown verb must be a top-level deserialize error");
+        assert!(err.contains("frobnicate"), "must echo the bad verb: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "stable\n",
+            "no file may be touched when the op verb is unknown"
+        );
+    }
+
+    /// Deserialize is all-or-nothing: an invalid op in a LATER section aborts
+    /// the whole call before the apply loop, so a valid earlier section's file
+    /// is left untouched. Best-effort per-section reporting begins only at the
+    /// apply stage, never at the deserialize gate.
+    #[test]
+    fn deserialize_failure_in_later_section_leaves_earlier_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = root.join("first.rs");
+        let b = root.join("second.rs");
+        std::fs::write(&a, "fn keep() {}\n").unwrap();
+        std::fs::write(&b, "fn other() {}\n").unwrap();
+        let (session, bloom) = services();
+        let tag_a = read_for_tag(&session, &a);
+        // Section 0 is valid and would apply; section 1 carries an invalid op.
+        let edits_val = json!([
+            {
+                "path": a.to_str().unwrap(),
+                "tag": tag_a,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn KEEP() {}" }]
+            },
+            {
+                "path": b.to_str().unwrap(),
+                "tag": "0000",
+                "ops": [{ "op": "replace", "start": 1, "end": 1 }]
+            }
+        ]);
+        let err = tool_write(
+            &json!({"edits": edits_val, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("invalid op in a later section must abort the whole call");
+        assert!(
+            err.contains("content"),
+            "must name the missing field: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "fn keep() {}\n",
+            "the valid earlier section's file must be untouched when a later section fails to deserialize"
+        );
+    }
 }
