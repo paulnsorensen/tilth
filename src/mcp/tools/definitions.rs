@@ -260,15 +260,15 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                         "type": "object",
                                         "required": ["op"],
                                         "oneOf": [
-                                            { "required": ["op", "start", "end", "content"], "properties": { "op": { "const": "replace" }, "start": { "type": "integer" }, "end": { "type": "integer" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "start", "end"], "properties": { "op": { "const": "delete" }, "start": { "type": "integer" }, "end": { "type": "integer" } } },
-                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer" }, "content": { "type": "string" } } },
+                                            { "required": ["op", "start", "end", "content"], "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "start", "end"], "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "line", "content"], "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op", "content"], "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
                                             { "required": ["op", "content"], "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"] }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at"], "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"] } } },
-                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"] }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                            { "required": ["op", "at"], "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 } } },
+                                            { "required": ["op", "at", "content"], "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 0, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op"], "properties": { "op": { "const": "delete_file" } } },
                                             { "required": ["op", "dest"], "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
                                         ]
@@ -391,6 +391,22 @@ mod tests {
         assert!(
             !compiled.is_valid(&bad),
             "a replace op missing `content` must fail schema validation"
+        );
+        // Boundary: a negative line number must be rejected by `minimum: 0`.
+        let negative = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "replace", "start": -1, "end": 2, "content": "x" }] }]
+        });
+        assert!(
+            !compiled.is_valid(&negative),
+            "a negative start must fail schema validation (minimum: 0)"
+        );
+        // Boundary: a line number above u32::MAX must be rejected by `maximum`.
+        let too_big = serde_json::json!({
+            "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 4_294_967_296_u64 }] }]
+        });
+        assert!(
+            !compiled.is_valid(&too_big),
+            "an end above u32::MAX must fail schema validation (maximum: 4294967295)"
         );
     }
 

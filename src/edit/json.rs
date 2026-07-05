@@ -35,6 +35,7 @@ struct RawSection {
 /// grammar verbs (see [`lower_op`]).
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 enum JsonOp {
     Replace {
         start: u32,
@@ -103,7 +104,13 @@ impl LineOrSymbol {
 
 /// Split a `content` string into the payload line vector the parser produces.
 fn split_content(content: &str) -> Vec<String> {
-    content.split('\n').map(str::to_string).collect()
+    let mut rows: Vec<String> = content.split('\n').map(str::to_string).collect();
+    // A trailing "" row (content ending in "\n") would splice an extra blank
+    // line; the old grammar's finalize_payload stripped a trailing blank too.
+    if rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
 }
 
 fn lower_op(op: JsonOp) -> Result<Op, String> {
@@ -401,6 +408,22 @@ mod tests {
     fn non_array_edits_rejected() {
         let err = lower_edits(&json!({"path": "a.rs"})).expect_err("object is not an array");
         assert!(err.contains("must be a JSON array"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_field_on_op_is_rejected() {
+        // A stray `content` on a `delete` op (or a typo'd key) must surface a
+        // named deserialize error, not be silently dropped.
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "delete", "start": 1, "end": 1, "content": "oops" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown field must fail");
+        assert!(err.contains("delete"), "must name the op: {err}");
+        assert!(
+            err.contains("content"),
+            "must name the offending field: {err}"
+        );
     }
 
     #[test]

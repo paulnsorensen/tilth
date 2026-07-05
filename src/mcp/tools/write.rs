@@ -495,6 +495,32 @@ mod tests {
     }
 
     #[test]
+    fn replace_content_ending_in_newline_adds_no_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.rs");
+        std::fs::write(&p, "fn a() {}\nfn b() {}\n").unwrap();
+        let (session, bloom) = services();
+
+        let tag = read_for_tag(&session, &p);
+        // content ends in "\n" — must not splice an extra blank line, matching
+        // the old grammar's finalize_payload trailing-blank strip.
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}\n" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn A() {}\nfn b() {}\n",
+            "trailing newline in content must not add a blank line"
+        );
+    }
+
+    #[test]
     fn edit_after_external_drift_recovers_not_rejects() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
