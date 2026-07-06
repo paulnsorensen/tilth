@@ -53,6 +53,14 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "pi",
 ];
 
+/// The tilth cwd-injection `PreToolUse` hook script, embedded from the
+/// standalone plugin so `tilth install claude-code` can write it directly
+/// instead of requiring a manual `plugin/claude/` install step.
+const INJECT_CWD_JS: &str = include_str!("../plugin/claude/hooks/inject-cwd.js");
+
+/// Matcher for the tilth `PreToolUse` hook entry — mirrors `plugin/claude/hooks/hooks.json`.
+const TILTH_HOOK_MATCHER: &str = "mcp__tilth__.*";
+
 /// The tilth server entry as JSON. Format depends on the host's [`ConfigFormat`] variant.
 fn tilth_server_entry(edit: bool, format: &ConfigFormat, hook_injected: &str) -> Value {
     let (command, args) = tilth_command_and_args(edit);
@@ -77,10 +85,16 @@ fn tilth_server_entry(edit: bool, format: &ConfigFormat, hook_injected: &str) ->
 }
 
 /// Write MCP config for the given host, preserving existing config.
-pub fn run(host: &str, edit: bool) -> Result<(), String> {
+///
+/// For claude-code (unless `no_hook`), also writes the cwd-injection hook
+/// script to `~/.claude/tilth/inject-cwd.js` and upserts a `PreToolUse` entry
+/// into `~/.claude/settings.json` — a different file from `~/.claude.json`
+/// (the MCP server config written above).
+pub fn run(host: &str, edit: bool, no_hook: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
-    // Claude Code ships the cwd-injection hook (plugin/claude/), so its schema
-    // tells the model NOT to set cwd; every other host sets it explicitly.
+    // Claude Code ships the cwd-injection hook (auto-installed below unless
+    // --no-hook), so its schema tells the model NOT to set cwd; every other
+    // host sets it explicitly.
     let hook_injected = if host == "claude-code" { "1" } else { "0" };
 
     if let Some(parent) = host_info.path.parent() {
@@ -100,9 +114,23 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     } else {
         eprintln!("✓ tilth added to {}", host_info.path.display());
     }
-    if let Some(note) = host_info.note {
+
+    if host == "claude-code" {
+        if no_hook {
+            eprintln!(
+                "  Hook not installed (--no-hook). Install manually from plugin/claude/, or via the Claude Code plugin marketplace."
+            );
+        } else {
+            let home = home_dir()?;
+            let (script_path, settings_path) = install_claude_code_hook(&home)?;
+            eprintln!("✓ cwd-injection hook installed");
+            eprintln!("  script:   {}", script_path.display());
+            eprintln!("  settings: {}", settings_path.display());
+        }
+    } else if let Some(note) = host_info.note {
         eprintln!("  {note}");
     }
+
     Ok(())
 }
 
@@ -319,7 +347,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
-            note: Some("User scope. Install the cwd-injection hook from plugin/claude/ so cwd is set automatically."),
+            note: None, // hook install / --no-hook messaging is handled inline in `run`
         }),
 
         // Cursor global: ~/.cursor/mcp.json → mcpServers
@@ -542,6 +570,80 @@ fn upsert_json_server(config: &mut Value, servers_key: &str, entry: Value) -> Re
         .ok_or_else(|| format!("{servers_key} is not a JSON object"))?
         .insert("tilth".into(), entry);
     Ok(())
+}
+
+/// Idempotently upsert the tilth cwd-injection `PreToolUse` hook entry into a
+/// claude-code `settings.json` [`Value`]. Replaces any existing entry whose
+/// matcher equals [`TILTH_HOOK_MATCHER`]; appends when none exists. Preserves
+/// every other `PreToolUse` entry, every other hook event, and every
+/// unrelated top-level settings key. Extracted for testability — used by
+/// `install_claude_code_hook` and unit tests.
+fn upsert_pretooluse_hook(settings: &mut Value, script_path: &str) -> Result<(), String> {
+    let entry = json!({
+        "matcher": TILTH_HOOK_MATCHER,
+        "hooks": [
+            { "type": "command", "command": format!("node \"{script_path}\"") }
+        ]
+    });
+
+    let root = settings
+        .as_object_mut()
+        .ok_or("settings root is not a JSON object")?;
+    let pre_tool_use = root
+        .entry("hooks")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or("hooks is not a JSON object")?
+        .entry("PreToolUse")
+        .or_insert(json!([]));
+    let entries = pre_tool_use
+        .as_array_mut()
+        .ok_or("hooks.PreToolUse is not a JSON array")?;
+
+    match entries
+        .iter_mut()
+        .find(|e| e.get("matcher").and_then(Value::as_str) == Some(TILTH_HOOK_MATCHER))
+    {
+        Some(existing) => *existing = entry,
+        None => entries.push(entry),
+    }
+    Ok(())
+}
+
+/// Writes the cwd-injection hook script to `~/.claude/tilth/inject-cwd.js`
+/// and upserts its `PreToolUse` entry into `~/.claude/settings.json` — a
+/// different file from `~/.claude.json` (the MCP server config). Returns the
+/// (script path, settings path) written, for the success message in `run`.
+fn install_claude_code_hook(home: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
+    let script_dir = home.join(".claude/tilth");
+    fs::create_dir_all(&script_dir)
+        .map_err(|e| format!("failed to create {}: {e}", script_dir.display()))?;
+    let script_path = script_dir.join("inject-cwd.js");
+    atomic_write(&script_path, INJECT_CWD_JS)?;
+
+    let settings_path = home.join(".claude/settings.json");
+    let mut settings: Value = if settings_path.exists() {
+        let raw = fs::read_to_string(&settings_path)
+            .map_err(|e| format!("failed to read {}: {e}", settings_path.display()))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid JSON in {}: {e}", settings_path.display()))?
+    } else {
+        json!({})
+    };
+
+    let script_str = script_path.to_str().ok_or_else(|| {
+        format!(
+            "hook script path is not valid UTF-8: {}",
+            script_path.display()
+        )
+    })?;
+    upsert_pretooluse_hook(&mut settings, script_str)?;
+
+    let out =
+        serde_json::to_string_pretty(&settings).expect("serde_json::Value is always serializable");
+    atomic_write(&settings_path, &out)?;
+
+    Ok((script_path, settings_path))
 }
 
 /// Returns the VS Code globalStorage path for a given extension and settings filename.
@@ -1209,5 +1311,74 @@ mod tests {
                 "TOML env emission must carry the hook-injected flag"
             );
         }
+    }
+
+    /// Upserting the hook twice must yield exactly one `mcp__tilth__.*`
+    /// `PreToolUse` entry — `tilth install claude-code` run twice should not
+    /// duplicate the hook.
+    #[test]
+    fn pretooluse_hook_upsert_is_idempotent() {
+        let mut settings = json!({});
+        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
+        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
+
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        let tilth_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e["matcher"] == json!(TILTH_HOOK_MATCHER))
+            .collect();
+        assert_eq!(
+            tilth_entries.len(),
+            1,
+            "expected exactly one tilth PreToolUse entry, got: {entries:?}"
+        );
+    }
+
+    /// An existing unrelated `PreToolUse` entry and an unrelated top-level
+    /// settings key must both survive the upsert.
+    #[test]
+    fn pretooluse_hook_upsert_preserves_unrelated_entries() {
+        let mut settings = json!({
+            "otherTopLevelSetting": true,
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo hi" }] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Edit", "hooks": [{ "type": "command", "command": "echo bye" }] }
+                ]
+            }
+        });
+        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
+
+        assert_eq!(settings["otherTopLevelSetting"], json!(true));
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            entries.iter().any(|e| e["matcher"] == json!("Bash")),
+            "unrelated PreToolUse entry was dropped: {entries:?}"
+        );
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["matcher"],
+            json!("Edit"),
+            "unrelated hook event was dropped"
+        );
+    }
+
+    /// The upserted entry has the right matcher, command type, and a `node`
+    /// invocation of the written script path.
+    #[test]
+    fn pretooluse_hook_entry_shape() {
+        let mut settings = json!({});
+        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
+
+        let entry = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(entry["matcher"], json!(TILTH_HOOK_MATCHER));
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(entry["hooks"][0]["type"], json!("command"));
+        assert!(command.starts_with("node "), "command: {command}");
+        assert!(
+            command.contains("/home/x/.claude/tilth/inject-cwd.js"),
+            "command should contain the script path: {command}"
+        );
     }
 }
