@@ -229,15 +229,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_savings",
-            "annotations": { "readOnlyHint": true },
-            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
     ];
 
     if edit_mode {
@@ -577,21 +568,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. The seven path-taking tools
-    /// in edit mode (`tilth_diff` included) require cwd; the no-path
-    /// `tilth_savings` counter is exempt from cwd but still carries no `root`.
+    /// `root` property must be gone from every tool. All seven tools in edit mode
+    /// (`tilth_diff` included) take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
-        let path_taking: Vec<_> = tools
-            .iter()
-            .filter(|t| t["name"].as_str() != Some("tilth_savings"))
-            .collect();
-        assert_eq!(
-            path_taking.len(),
-            7,
-            "edit mode advertises 7 path-taking tools"
-        );
+        assert_eq!(tools.len(), 7, "edit mode advertises 7 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];
@@ -599,13 +581,6 @@ mod tests {
                 schema["properties"].get("root").is_none(),
                 "{name}: root property must be gone (renamed to cwd)"
             );
-            if name == "tilth_savings" {
-                assert!(
-                    schema["properties"].get("cwd").is_none(),
-                    "tilth_savings takes no paths — cwd must be absent"
-                );
-                continue;
-            }
             assert!(
                 schema["properties"].get("cwd").is_some(),
                 "{name}: cwd property must be present"
