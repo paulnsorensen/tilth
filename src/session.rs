@@ -115,6 +115,10 @@ impl Session {
     }
 
     /// Returns `(baseline_tokens, saved_tokens)` accumulated this session.
+    /// The `tilth_savings` MCP tool that surfaced this was cut (see
+    /// paulnsorensen/tilth ticket); the counters and `record_savings` plumbing
+    /// stay for a future CLI/reporting decision.
+    #[allow(dead_code)]
     pub fn savings(&self) -> (u64, u64) {
         (
             self.baseline_tokens.load(Ordering::Relaxed),
