@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     /// Upserting the hook twice must yield exactly one `mcp__tilth__.*`
-    /// PreToolUse entry — `tilth install claude-code` run twice should not
+    /// `PreToolUse` entry — `tilth install claude-code` run twice should not
     /// duplicate the hook.
     #[test]
     fn pretooluse_hook_upsert_is_idempotent() {
@@ -1334,7 +1334,7 @@ mod tests {
         );
     }
 
-    /// An existing unrelated PreToolUse entry and an unrelated top-level
+    /// An existing unrelated `PreToolUse` entry and an unrelated top-level
     /// settings key must both survive the upsert.
     #[test]
     fn pretooluse_hook_upsert_preserves_unrelated_entries() {
