@@ -3,7 +3,6 @@
 "use strict";
 
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
@@ -41,11 +40,22 @@ fs.mkdirSync(binDir, { recursive: true });
 
 console.log(`tilth: downloading ${target} nightly binary...`);
 
-function follow(url, callback) {
-  const mod = url.startsWith("https") ? https : http;
-  mod.get(url, { headers: { "User-Agent": "tilth-npm" } }, (res) => {
+const MAX_REDIRECTS = 5;
+
+// HTTPS-only, depth-capped: this binary is executed after download, so never
+// let a redirect downgrade to plaintext or loop.
+function follow(url, depth, callback) {
+  if (!url.startsWith("https:")) {
+    console.error(`tilth: refusing non-HTTPS download URL: ${url}`);
+    process.exit(1);
+  }
+  if (depth > MAX_REDIRECTS) {
+    console.error(`tilth: too many redirects (>${MAX_REDIRECTS})`);
+    process.exit(1);
+  }
+  https.get(url, { headers: { "User-Agent": "tilth-npm" } }, (res) => {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-      follow(res.headers.location, callback);
+      follow(res.headers.location, depth + 1, callback);
     } else if (res.statusCode !== 200) {
       console.error(`tilth: download failed (HTTP ${res.statusCode})`);
       console.error(`URL: ${url}`);
@@ -61,7 +71,7 @@ function follow(url, callback) {
   });
 }
 
-follow(url, (res) => {
+follow(url, 0, (res) => {
   if (isWindows) {
     const tmpZip = path.join(binDir, "tilth.zip");
     const out = fs.createWriteStream(tmpZip);

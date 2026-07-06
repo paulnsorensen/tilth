@@ -112,7 +112,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "$NIGHTLY_TAG" tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip --clobber
+          # Each runner produces exactly one artifact (unix → tar.gz, windows → zip);
+          # upload whichever exists so the missing one doesn't fail the step.
+          for f in tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip; do
+            [ -f "$f" ] && gh release upload "$NIGHTLY_TAG" "$f" --clobber
+          done
 
   publish-npm:
     needs: build
@@ -135,5 +139,5 @@ jobs:
       - name: Stamp version and publish
         working-directory: ./npm-nightly
         run: |
-          npm pkg set version="0.0.0-experimental.${{ github.run_number }}"
+          npm pkg set version="0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}"
           npm publish --access public
