@@ -631,7 +631,13 @@ fn install_claude_code_hook(home: &std::path::Path) -> Result<(PathBuf, PathBuf)
         json!({})
     };
 
-    upsert_pretooluse_hook(&mut settings, &script_path.to_string_lossy())?;
+    let script_str = script_path.to_str().ok_or_else(|| {
+        format!(
+            "hook script path is not valid UTF-8: {}",
+            script_path.display()
+        )
+    })?;
+    upsert_pretooluse_hook(&mut settings, script_str)?;
 
     let out =
         serde_json::to_string_pretty(&settings).expect("serde_json::Value is always serializable");
