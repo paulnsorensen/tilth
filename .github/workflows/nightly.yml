@@ -117,18 +117,23 @@ jobs:
   publish-npm:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing — no NPM_TOKEN secret needed
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # ratchet:actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22 # OIDC requires Node >= 22.14.0
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1 — newer than Node 22's bundled npm.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
       # Stamp a unique experimental prerelease version per run (run_number is
       # monotonic). Decoupled from Cargo.toml — fork law keeps that at 0.8.4.
+      # OIDC injects auth automatically; provenance is attached on publish.
       - name: Stamp version and publish
         working-directory: ./npm-nightly
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           npm pkg set version="0.0.0-experimental.${{ github.run_number }}"
           npm publish --access public
