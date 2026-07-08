@@ -26,11 +26,12 @@ if (!target) {
   process.exit(1);
 }
 
-const version = require("./package.json").version;
 const isWindows = process.platform === "win32";
 const ext = isWindows ? "zip" : "tar.gz";
 const binName = isWindows ? "tilth.exe" : "tilth";
-const url = `https://github.com/jahala/tilth/releases/download/v${version}/tilth-${target}.${ext}`;
+// Fork rolling build: assets live on the fixed `nightly` prerelease, not a
+// per-version tag, so this URL is version-independent.
+const url = `https://github.com/paulnsorensen/tilth/releases/download/nightly/tilth-${target}.${ext}`;
 
 const binDir = path.join(__dirname, "bin");
 const binPath = path.join(binDir, binName);
