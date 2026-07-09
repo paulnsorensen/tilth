@@ -11,10 +11,13 @@ const bin = path.join(__dirname, "bin", binName);
 
 const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
 
-for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-  process.on(sig, () => {
+const SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+const forwarders = {};
+for (const sig of SIGNALS) {
+  forwarders[sig] = () => {
     if (!child.killed) child.kill(sig);
-  });
+  };
+  process.on(sig, forwarders[sig]);
 }
 
 child.on("error", (err) => {
@@ -25,9 +28,9 @@ child.on("error", (err) => {
 
 child.on("exit", (code, signal) => {
   if (signal) {
-    // Restore default disposition before re-raising, else the still-registered
-    // handler swallows the signal and Node would exit 0 instead of dying with it.
-    for (const s of ["SIGTERM", "SIGINT", "SIGHUP"]) process.removeAllListeners(s);
+    // Remove only our own forwarders before re-raising, so the signal takes the
+    // default terminate action instead of being swallowed by a live handler.
+    for (const sig of SIGNALS) process.removeListener(sig, forwarders[sig]);
     process.kill(process.pid, signal);
   } else {
     process.exit(code ?? 0);

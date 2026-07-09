@@ -57,7 +57,8 @@ function follow(url, depth, callback) {
   const req = https.get(url, { headers: { "User-Agent": "tilth-npm" } }, (res) => {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
       res.resume();
-      follow(res.headers.location, depth + 1, callback);
+      // Location may be relative; resolve against the current URL before recursing.
+      follow(new URL(res.headers.location, url).href, depth + 1, callback);
     } else if (res.statusCode !== 200) {
       console.error(`tilth: download failed (HTTP ${res.statusCode})`);
       console.error(`URL: ${url}`);
