@@ -167,6 +167,19 @@ pub fn resolve_source(
     Ok(DiffSource::GitUncommitted)
 }
 
+/// Reject a git ref/range whose first character is `-`, guarding against
+/// argument injection (e.g. `--output=/path` overwriting an arbitrary file
+/// via `git diff`/`git log`).
+fn reject_leading_dash(s: &str) -> Result<(), String> {
+    if s.starts_with('-') {
+        Err(format!(
+            "diff ref/range may not begin with '-' (arg-injection guard): {s}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Execute a git diff command and return raw unified diff output.
 fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     use std::process::Command;
@@ -196,6 +209,7 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
             cmd.arg("--staged");
         }
         DiffSource::GitRef(r) => {
+            reject_leading_dash(r)?;
             cmd.arg(r);
         }
         DiffSource::Files(fa, fb) => {
@@ -435,6 +449,8 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
 fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
+    reject_leading_dash(range)?;
+
     // Get commit list.
     let output = Command::new("git")
         .args(["log", "--format=%H %at %s%x00%an", range])
@@ -1087,6 +1103,47 @@ diff --git a/src/main.rs b/src/main.rs
             resolve_source(Some("staged"), None, None, Some("x.patch"), None).unwrap(),
             DiffSource::Patch(_)
         ));
+    }
+
+    // 19. test_git_ref_rejects_leading_dash
+    #[test]
+    fn test_git_ref_rejects_leading_dash() {
+        let dir = setup_test_repo();
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("--output=/tmp/pwned".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err(), "expected leading-dash ref to be rejected");
+        assert!(
+            result.unwrap_err().contains("arg-injection guard"),
+            "expected arg-injection guard message"
+        );
+    }
+
+    // 20. test_log_rejects_leading_dash
+    #[test]
+    fn test_log_rejects_leading_dash() {
+        let dir = setup_test_repo();
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("--output=/tmp/pwned".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected leading-dash range to be rejected"
+        );
+        assert!(
+            result.unwrap_err().contains("arg-injection guard"),
+            "expected arg-injection guard message"
+        );
     }
 }
 // test

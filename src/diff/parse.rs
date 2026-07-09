@@ -86,19 +86,24 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             continue;
         }
 
-        // ── `--- a/` / `+++ b/` ──────────────────────────────────────────────
-        if let Some(src) = line.strip_prefix("--- ") {
-            if src == "/dev/null" {
-                status = FileStatus::Added;
+        // ── `--- a/` / `+++ b/` ─────────────────────────────────────────────
+        // Only outside a hunk: a removed/added line whose own content starts
+        // with `-- `/`++ ` (e.g. deleting a `-- comment`) renders as `--- `/
+        // `+++ ` and must not be mistaken for these file headers.
+        if current_hunk.is_none() {
+            if let Some(src) = line.strip_prefix("--- ") {
+                if src == "/dev/null" {
+                    status = FileStatus::Added;
+                }
+                // Otherwise it's just the old path header — already captured from diff --git.
+                continue;
             }
-            // Otherwise it's just the old path header — already captured from diff --git.
-            continue;
-        }
-        if let Some(dst) = line.strip_prefix("+++ ") {
-            if dst == "/dev/null" {
-                status = FileStatus::Deleted;
+            if let Some(dst) = line.strip_prefix("+++ ") {
+                if dst == "/dev/null" {
+                    status = FileStatus::Deleted;
+                }
+                continue;
             }
-            continue;
         }
 
         // ── Hunk header ──────────────────────────────────────────────────────
@@ -504,5 +509,34 @@ diff --git a/z.rs b/z.rs
             "malformed hunk header must be skipped, got {:?}",
             diffs[0].hunks
         );
+    }
+
+    // ── 15. Hunk-internal `-- `/`++ ` line not mistaken for a header ────────
+    #[test]
+    fn test_hunk_internal_dash_dash_line_retained() {
+        // Deleting a source line that itself begins with `-- ` (e.g. a SQL/Lua
+        // comment) renders in the diff as `--- a comment`, which must be kept
+        // as a removed hunk line, not swallowed as a `--- ` file header.
+        let raw = "\
+diff --git a/query.sql b/query.sql
+--- a/query.sql
++++ b/query.sql
+@@ -1,2 +1,1 @@
+--- a comment
+-select 1;
++select 2;
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        let f = &diffs[0];
+        assert_eq!(f.status, FileStatus::Modified);
+        let lines = &f.hunks[0].lines;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].kind, DiffLineKind::Removed);
+        assert_eq!(lines[0].content, "-- a comment");
+        assert_eq!(lines[1].kind, DiffLineKind::Removed);
+        assert_eq!(lines[1].content, "select 1;");
+        assert_eq!(lines[2].kind, DiffLineKind::Added);
+        assert_eq!(lines[2].content, "select 2;");
     }
 }
