@@ -7,10 +7,13 @@
 //! Identifier extraction uses a simple byte-level state machine -- no
 //! tree-sitter needed -- making it fast enough to run on every uncached file.
 
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
-use dashmap::DashMap;
+use clru::CLruCache;
 use fastbloom::BloomFilter;
 
 use crate::lang::detect_file_type;
@@ -20,10 +23,20 @@ use crate::types::{FileType, Lang};
 // BloomFilterCache
 // ---------------------------------------------------------------------------
 
+/// Count cap for the filter cache. Each filter is small relative to the
+/// outline/parsed caches, but an unbounded map still grows for the whole
+/// server lifetime on a large repo -- a count cap in the low thousands
+/// bounds it, mirroring `OutlineCache` (`src/cache.rs`).
+const MAX_BLOOM_ENTRIES: usize = 2000;
+
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
 /// by mtime. Stale entries are automatically rebuilt on access.
+///
+/// `clru::CLruCache` is not thread-safe (unlike the `DashMap` this replaces),
+/// so it is wrapped in a `Mutex` while keeping the external `&self` API
+/// unchanged.
 pub struct BloomFilterCache {
-    filters: DashMap<PathBuf, (BloomFilter, SystemTime)>,
+    filters: Mutex<CLruCache<PathBuf, (BloomFilter, SystemTime)>>,
 }
 
 impl Default for BloomFilterCache {
@@ -37,7 +50,9 @@ impl BloomFilterCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            filters: DashMap::new(),
+            filters: Mutex::new(CLruCache::new(
+                NonZeroUsize::new(MAX_BLOOM_ENTRIES).unwrap(),
+            )),
         }
     }
 
@@ -51,17 +66,26 @@ impl BloomFilterCache {
     #[must_use]
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
         // Fast path: check existing cached entry
-        if let Some(entry) = self.filters.get(path) {
-            let (ref filter, cached_mtime) = *entry;
-            if cached_mtime == mtime {
-                return filter.contains(symbol);
+        {
+            let mut filters = self
+                .filters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((filter, cached_mtime)) = filters.get(path) {
+                if *cached_mtime == mtime {
+                    return filter.contains(symbol);
+                }
             }
         }
 
         // Cache miss or stale: build and cache a new filter
         let filter = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
-        self.filters.insert(path.to_path_buf(), (filter, mtime));
+        let mut filters = self
+            .filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        filters.put(path.to_path_buf(), (filter, mtime));
         result
     }
 }
@@ -80,9 +104,9 @@ fn code_lang(path: &Path) -> Option<Lang> {
 
 /// Build a Bloom filter from file content by extracting all identifiers.
 fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
-    let idents: Vec<&str> = extract_identifiers(content, lang).collect();
-    // Sized for total token count, not unique identifiers -- duplicates over-allocate
-    // the filter, so the achieved FPR is well below the 0.01 target in practice.
+    let idents: HashSet<&str> = extract_identifiers(content, lang).collect();
+    // Sized for unique identifiers, so the filter isn't over-allocated by
+    // duplicate tokens (e.g. a variable name used 50 times).
     let expected = idents.len().max(1);
 
     let mut filter = BloomFilter::with_false_pos(0.01).expected_items(expected);
@@ -481,6 +505,20 @@ mod tests {
         // Different mtime: should rebuild from new content
         assert!(cache.contains(path, mtime_new, new_content, "new_function"));
         assert!(!cache.contains(path, mtime_new, new_content, "old_function"));
+    }
+
+    #[test]
+    fn bloom_cache_bounds_entry_count() {
+        let cache = BloomFilterCache::new();
+        for i in 0..MAX_BLOOM_ENTRIES + 50 {
+            let path = PathBuf::from(format!("/tmp/fake{i}.rs"));
+            let _ = cache.contains(&path, SystemTime::UNIX_EPOCH, "fn foo() {}", "foo");
+        }
+        let len = cache.filters.lock().unwrap().len();
+        assert!(
+            len <= MAX_BLOOM_ENTRIES,
+            "cache grew unbounded: {len} entries"
+        );
     }
 
     #[test]

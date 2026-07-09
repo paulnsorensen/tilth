@@ -20,6 +20,45 @@ const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 /// `super::count_files_for_empty` stay aligned.
 pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
+/// Shared file-walk entry filter for the content and symbol search walkers:
+/// unwraps the walker result, keeps only files, skips filenames that look
+/// minified (`.min.js`, `app-min.css`), and skips files over
+/// `MAX_SEARCH_FILE_SIZE`. Returns the path and its stat'd size on
+/// acceptance. Each caller still does its own read (byte vs string), its own
+/// minified-by-content check (needs the read buffer), and its own match
+/// building — those differ per caller.
+pub(crate) fn accept_walk_entry(
+    entry: Result<ignore::DirEntry, ignore::Error>,
+) -> Option<(std::path::PathBuf, u64)> {
+    let entry = entry.ok()?;
+
+    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        return None;
+    }
+
+    let path = entry.path();
+
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::lang::detection::is_minified_by_name)
+    {
+        return None;
+    }
+
+    let file_size = match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.len() > MAX_SEARCH_FILE_SIZE {
+                return None;
+            }
+            meta.len()
+        }
+        Err(_) => 0,
+    };
+
+    Some((path.to_path_buf(), file_size))
+}
+
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
@@ -61,35 +100,10 @@ pub fn search(
                 return ignore::WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
+            let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > MAX_SEARCH_FILE_SIZE {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
+            let path = path.as_path();
 
             // Read the file once. Use `search_slice` instead of `search_path`
             // so the minified-check (when triggered) and the actual search
