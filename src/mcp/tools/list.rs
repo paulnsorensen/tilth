@@ -41,12 +41,10 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         .map(|d| d as usize);
 
     // Walk the scope directory and collect all files matching any pattern.
-    let matchers: Vec<_> = patterns
-        .iter()
-        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
-        .collect();
-    if matchers.is_empty() {
-        return Err("no valid globs provided".into());
+    let mut matchers = Vec::with_capacity(patterns.len());
+    for p in &patterns {
+        let glob = Glob::new(p).map_err(|e| format!("invalid glob pattern {p:?}: {e}"))?;
+        matchers.push(glob.compile_matcher());
     }
 
     let mut entries: Vec<(PathBuf, u64)> = Vec::new();
@@ -131,6 +129,22 @@ mod tests {
         assert!(
             out.contains("a.rs"),
             "expected listing under anchored cwd: {out}"
+        );
+    }
+
+    #[test]
+    fn invalid_glob_pattern_returns_error() {
+        // An invalid glob must surface a specific error, not be silently
+        // dropped from the matcher set.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "patterns": ["["],
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("invalid glob pattern") && err.contains('['),
+            "expected invalid-glob error naming the pattern: {err}"
         );
     }
 }
