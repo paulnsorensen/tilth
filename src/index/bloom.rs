@@ -506,7 +506,7 @@ mod tests {
         let cache = BloomFilterCache::new();
         for i in 0..MAX_BLOOM_ENTRIES + 50 {
             let path = PathBuf::from(format!("/tmp/fake{i}.rs"));
-            cache.contains(&path, SystemTime::UNIX_EPOCH, "fn foo() {}", "foo");
+            let _ = cache.contains(&path, SystemTime::UNIX_EPOCH, "fn foo() {}", "foo");
         }
         let len = cache.filters.lock().unwrap().len();
         assert!(
