@@ -234,7 +234,8 @@ fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
         .parse()
         .map_err(|e| format!("invalid TOML in {}: {e}", host_info.path.display()))?;
 
-    upsert_toml_tilth_table(&mut doc, edit, hook_injected)?;
+    upsert_toml_tilth_table(&mut doc, edit, hook_injected)
+        .map_err(|e| format!("{}: {e}", host_info.path.display()))?;
 
     atomic_write(&host_info.path, &doc.to_string())?;
     Ok(())
@@ -721,6 +722,23 @@ mod tests {
         assert_eq!(
             via_toml["mcp_servers"]["tilth"]["command"].as_str(),
             Some(command)
+        );
+    }
+
+    #[test]
+    fn write_toml_config_error_includes_path_when_mcp_servers_not_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "mcp_servers = 1\n").unwrap();
+        let host_info = HostInfo {
+            path: path.clone(),
+            format: ConfigFormat::Toml,
+            note: None,
+        };
+        let err = write_toml_config(&host_info, false, "0").unwrap_err();
+        assert!(
+            err.contains(&path.display().to_string()),
+            "error must include config path, got: {err:?}"
         );
     }
 
