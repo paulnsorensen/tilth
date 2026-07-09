@@ -13,8 +13,12 @@ pub fn iso_ts(ts: SystemTime) -> String {
     format_iso_utc(secs)
 }
 
-/// Parse an RFC-3339-ish timestamp `YYYY-MM-DDTHH:MM:SSZ` back to `SystemTime`.
-/// Returns None when malformed.
+/// Parse an RFC-3339-ish timestamp back to `SystemTime`. Accepts the bare
+/// `YYYY-MM-DDTHH:MM:SSZ` form, optional fractional seconds (`SS.sss` — the
+/// fraction is parsed but discarded), and a trailing numeric UTC offset
+/// (`+HH:MM`, `-HH:MM`, `+HHMM`, `-HHMM`) in place of `Z`. A timestamp with
+/// no `Z`/offset suffix at all is also accepted and treated as UTC, and the
+/// seconds field is optional (defaults to `:00`).
 pub fn parse_iso_utc(s: &str) -> Option<SystemTime> {
     let s = s.trim();
     let (date, time) = s.split_once('T')?;
@@ -22,22 +26,56 @@ pub fn parse_iso_utc(s: &str) -> Option<SystemTime> {
     let y: i64 = dparts.next()?.parse().ok()?;
     let mo: u32 = dparts.next()?.parse().ok()?;
     let d: u32 = dparts.next()?.parse().ok()?;
-    let time = time.trim_end_matches('Z');
+    let (time, offset_secs) = split_utc_offset(time)?;
     let mut tparts = time.split(':');
     let hh: u32 = tparts.next()?.parse().ok()?;
     let mm: u32 = tparts.next()?.parse().ok()?;
-    let ss: u32 = tparts.next().unwrap_or("0").parse().ok()?;
+    let ss_field = tparts.next().unwrap_or("0");
+    let ss_str = ss_field.split('.').next()?;
+    let ss: u32 = ss_str.parse().ok()?;
     if mo == 0 || mo > 12 || d == 0 || d > days_in_month(y, mo) || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
     let secs = days_from_civil(y, mo, d) * 86_400
         + i64::from(hh) * 3600
         + i64::from(mm) * 60
-        + i64::from(ss);
+        + i64::from(ss)
+        - offset_secs;
     if secs < 0 {
         return None;
     }
     Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+/// Split a trailing `Z` or numeric UTC offset off the time-of-day portion.
+/// Returns `(bare_time, offset_seconds)` where `offset_seconds` is what to
+/// subtract from the local wall-clock seconds to get UTC (i.e. local time is
+/// `UTC + offset`, per RFC-3339 sign convention). `Z` or no suffix at all
+/// yields an offset of 0.
+fn split_utc_offset(time: &str) -> Option<(&str, i64)> {
+    if let Some(bare) = time.strip_suffix('Z') {
+        return Some((bare, 0));
+    }
+    let Some(idx) = time.find(['+', '-']) else {
+        return Some((time, 0));
+    };
+    if idx == 0 {
+        return None;
+    }
+    let (bare, off) = time.split_at(idx);
+    let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
+    let off = &off[1..];
+    let (oh, om): (u32, u32) = if let Some((h, m)) = off.split_once(':') {
+        (h.parse().ok()?, m.parse().ok()?)
+    } else if off.len() == 4 {
+        (off[0..2].parse().ok()?, off[2..4].parse().ok()?)
+    } else {
+        return None;
+    };
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some((bare, sign * (i64::from(oh) * 3600 + i64::from(om) * 60)))
 }
 
 // Howard Hinnant's days_from_civil for proleptic Gregorian dates.
@@ -170,6 +208,41 @@ mod tests {
         assert!(
             parse_iso_utc("2026-04-31T00:00:00Z").is_none(),
             "April 31 must return None"
+        );
+    }
+
+    #[test]
+    fn parse_iso_fractional_seconds_and_offsets() {
+        let reference = parse_iso_utc("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            parse_iso_utc("2026-01-01T00:00:00.000Z").unwrap(),
+            reference,
+            "fractional seconds must be parsed (integer part) and ignored, not rejected"
+        );
+        assert_eq!(
+            parse_iso_utc("2026-01-01T00:00:00+00:00").unwrap(),
+            reference,
+            "a zero UTC offset must parse to the same instant as Z"
+        );
+        // A positive offset moves local wall-clock time ahead of UTC: local
+        // 05:00 at +05:00 is UTC 00:00 (local - offset).
+        assert_eq!(
+            parse_iso_utc("2026-01-01T05:00:00+05:00").unwrap(),
+            reference,
+            "+05:00 offset must convert local 05:00 to UTC 00:00"
+        );
+        // +HHMM compact form.
+        assert_eq!(
+            parse_iso_utc("2026-01-01T05:00:00+0500").unwrap(),
+            reference,
+            "compact +HHMM offset must parse the same as +HH:MM"
+        );
+        // A negative offset moves local time behind UTC: local 00:00 at
+        // -05:00 is UTC 05:00 (local - offset = 0 - (-5h) = 5h).
+        assert_eq!(
+            parse_iso_utc("2026-01-01T00:00:00-05:00").unwrap(),
+            parse_iso_utc("2026-01-01T05:00:00Z").unwrap(),
+            "-05:00 offset must convert local 00:00 to UTC 05:00"
         );
     }
 

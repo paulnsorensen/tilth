@@ -18,6 +18,10 @@ pub(in crate::mcp) fn tool_grok(
         .ok_or("missing required parameter: target")?;
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = resolve_scope(args, cwd)?;
+    let budget = args
+        .get("budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
         crate::search::grok::GrokCaps::full()
@@ -29,7 +33,7 @@ pub(in crate::mcp) fn tool_grok(
         .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::grok::format_grok(&result, &scope));
-    Ok(output)
+    Ok(crate::budget::apply(&output, budget))
 }
 
 #[cfg(test)]
@@ -61,6 +65,26 @@ mod tests {
         assert!(
             err.contains("relative") && err.contains("absolute checkout directory"),
             "grok with a relative cwd must refuse: {err}"
+        );
+    }
+
+    #[test]
+    fn budget_truncates_output() {
+        // A tiny budget must shrink the response relative to the default;
+        // grok previously ignored `budget` entirely and always returned the
+        // full result.
+        let args_full = serde_json::json!({ "target": "grok", "cwd": env!("CARGO_MANIFEST_DIR") });
+        let args_small = serde_json::json!({
+            "target": "grok",
+            "cwd": env!("CARGO_MANIFEST_DIR"),
+            "budget": 50
+        });
+        let full = tool_grok(&args_full, &bloom(), &Session::new()).expect("full grok succeeds");
+        let small =
+            tool_grok(&args_small, &bloom(), &Session::new()).expect("budgeted grok succeeds");
+        assert!(
+            small.contains("... truncated — raise `budget`"),
+            "budget=50 output should hit the truncation marker: {small}"
         );
     }
 }
