@@ -1,10 +1,23 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use dashmap::DashMap;
+use clru::CLruCache;
 
 use crate::types::Lang;
+
+/// Count cap for the outline-string cache. Entries are small (rendered
+/// outline text), so a count cap in the low thousands bounds memory without
+/// needing byte-weighting.
+const MAX_OUTLINE_ENTRIES: usize = 2000;
+
+/// Count cap for the parsed-file cache. Each entry pins up to 500 KB of
+/// source plus a tree-sitter `Tree`; capping at 500 entries bounds retained
+/// memory to roughly 250 MB in the worst case, comparable in spirit to
+/// snapshots' 64 MiB ceiling (`src/edit/snapshots.rs`) scaled for the larger
+/// per-entry cost here.
+const MAX_PARSED_ENTRIES: usize = 500;
 
 /// Cached outline entry keyed by path. `mtime` is stored in the value so a
 /// stale entry is detected and evicted in O(1) (one map lookup, no `retain`).
@@ -28,23 +41,32 @@ struct ParsedEntry {
     file: Arc<ParsedFile>,
 }
 
-/// Outline cache keyed by canonical path. Eviction is O(1): on every access
-/// the stored `mtime` is compared to the caller-supplied value; a mismatch
-/// replaces the entry without scanning the whole map.
+/// Outline cache keyed by canonical path. Eviction is O(1) for staleness (the
+/// stored `mtime` is compared to the caller-supplied value; a mismatch
+/// replaces the entry) and bounded by an LRU count cap so a long-lived server
+/// can't grow these caches without limit.
 ///
 /// Stores two derived analyses: rendered outline strings (used by search
 /// formatting) and parsed tree-sitter trees (used by AST scope queries).
 /// Both share the same key + invalidation; nothing else is shared.
+///
+/// `clru::CLruCache` is not thread-safe (unlike the `DashMap` this replaces),
+/// so each cache is wrapped in a `Mutex` while keeping the external `&self`
+/// API unchanged.
 pub struct OutlineCache {
-    entries: DashMap<PathBuf, CacheEntry>,
-    parsed: DashMap<PathBuf, ParsedEntry>,
+    entries: Mutex<CLruCache<PathBuf, CacheEntry>>,
+    parsed: Mutex<CLruCache<PathBuf, ParsedEntry>>,
 }
 
 impl Default for OutlineCache {
     fn default() -> Self {
         Self {
-            entries: DashMap::new(),
-            parsed: DashMap::new(),
+            entries: Mutex::new(CLruCache::new(
+                NonZeroUsize::new(MAX_OUTLINE_ENTRIES).unwrap(),
+            )),
+            parsed: Mutex::new(CLruCache::new(
+                NonZeroUsize::new(MAX_PARSED_ENTRIES).unwrap(),
+            )),
         }
     }
 }
@@ -64,14 +86,18 @@ impl OutlineCache {
     ) -> Arc<str> {
         let key = path.to_path_buf();
         // Fast path: entry exists and mtime matches.
-        if let Some(e) = self.entries.get(&key) {
-            if e.mtime == mtime {
-                return Arc::clone(&e.outline);
+        {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(e) = entries.get(&key) {
+                if e.mtime == mtime {
+                    return Arc::clone(&e.outline);
+                }
             }
         }
         // Stale or absent — compute and insert, replacing any stale entry.
         let outline: Arc<str> = compute().into();
-        self.entries.insert(
+        let mut entries = self.entries.lock().unwrap();
+        entries.put(
             key,
             CacheEntry {
                 mtime,
@@ -93,9 +119,12 @@ impl OutlineCache {
         }
         let key = path.to_path_buf();
         // Fast path: entry exists and mtime matches.
-        if let Some(e) = self.parsed.get(&key) {
-            if e.mtime == mtime {
-                return Some(Arc::clone(&e.file));
+        {
+            let mut parsed = self.parsed.lock().unwrap();
+            if let Some(e) = parsed.get(&key) {
+                if e.mtime == mtime {
+                    return Some(Arc::clone(&e.file));
+                }
             }
         }
         // Stale or absent — parse and insert.
@@ -112,7 +141,8 @@ impl OutlineCache {
             tree,
             lang,
         });
-        self.parsed.insert(
+        let mut parsed = self.parsed.lock().unwrap();
+        parsed.put(
             key,
             ParsedEntry {
                 mtime,
@@ -137,14 +167,33 @@ mod tests {
 
         // Insert with t0.
         cache.get_or_compute(path, t0, || "outline v0".to_string());
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries.lock().unwrap().len(), 1);
 
         // Re-insert with t1 — stale t0 entry must be evicted.
         cache.get_or_compute(path, t1, || "outline v1".to_string());
-        assert_eq!(cache.entries.len(), 1, "stale entry was not evicted");
+        assert_eq!(
+            cache.entries.lock().unwrap().len(),
+            1,
+            "stale entry was not evicted"
+        );
 
         // Confirm only the new entry survives.
         let hit = cache.get_or_compute(path, t1, || panic!("should hit cache"));
         assert_eq!(&*hit, "outline v1");
+    }
+
+    #[test]
+    fn outline_cache_bounds_entry_count() {
+        let cache = OutlineCache::new();
+        // Insert more than the cap; the cache must never exceed it.
+        for i in 0..MAX_OUTLINE_ENTRIES + 50 {
+            let path = PathBuf::from(format!("fake/path{i}.rs"));
+            cache.get_or_compute(&path, SystemTime::UNIX_EPOCH, || format!("outline {i}"));
+        }
+        let len = cache.entries.lock().unwrap().len();
+        assert!(
+            len <= MAX_OUTLINE_ENTRIES,
+            "cache grew unbounded: {len} entries"
+        );
     }
 }

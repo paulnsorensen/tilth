@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use super::content::accept_walk_entry;
 use super::file_metadata;
 use crate::lang::elixir::is_elixir_definition;
 use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
@@ -176,35 +177,10 @@ fn find_definitions(
                 return ignore::WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
+            let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
+            let path = path.as_path();
 
             // Single read: read file once, use buffer for both check and parse
             let Ok(content) = fs::read_to_string(path) else {
@@ -558,35 +534,10 @@ fn find_usages(
                 return ignore::WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
+            let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
+            let path = path.as_path();
 
             // Read once and dispatch via `search_slice` so the minified
             // heuristic and the search share a single kernel read.
