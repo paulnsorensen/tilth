@@ -87,7 +87,10 @@ impl OutlineCache {
         let key = path.to_path_buf();
         // Fast path: entry exists and mtime matches.
         {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(e) = entries.get(&key) {
                 if e.mtime == mtime {
                     return Arc::clone(&e.outline);
@@ -96,7 +99,10 @@ impl OutlineCache {
         }
         // Stale or absent — compute and insert, replacing any stale entry.
         let outline: Arc<str> = compute().into();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.put(
             key,
             CacheEntry {
@@ -120,7 +126,10 @@ impl OutlineCache {
         let key = path.to_path_buf();
         // Fast path: entry exists and mtime matches.
         {
-            let mut parsed = self.parsed.lock().unwrap();
+            let mut parsed = self
+                .parsed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(e) = parsed.get(&key) {
                 if e.mtime == mtime {
                     return Some(Arc::clone(&e.file));
@@ -141,7 +150,10 @@ impl OutlineCache {
             tree,
             lang,
         });
-        let mut parsed = self.parsed.lock().unwrap();
+        let mut parsed = self
+            .parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         parsed.put(
             key,
             ParsedEntry {

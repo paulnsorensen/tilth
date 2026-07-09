@@ -5,8 +5,8 @@
 //! Backed by a byte-weighted `clru` LRU: a 64 MiB total ceiling across all
 //! paths, at most 30 tracked paths (LRU eviction), a 4-version ring per path
 //! (oldest dropped), and a 4 MiB per-file cap — a file over the cap mints no
-//! tag (`record` returns `None`). Keys are canonical realpaths — `record`,
-//! `invalidate`, and `relocate` normalize internally via
+//! tag (`record` returns `None`). Keys are canonical realpaths — every
+//! path-taking method normalizes internally via
 //! `crate::edit::normalize_path_key`.
 
 #![allow(dead_code)]
@@ -143,36 +143,40 @@ impl SnapshotStore {
     /// Merge `lines` into the seen-line set of the version tagged `tag`.
     pub fn record_seen_lines(
         &mut self,
-        path: &str,
+        path: impl AsRef<Path>,
         tag: u16,
         lines: impl IntoIterator<Item = u32>,
     ) {
-        let Some(mut history) = self.versions.pop(path) else {
+        let key = crate::edit::normalize_path_key(path.as_ref());
+        let Some(mut history) = self.versions.pop(&key) else {
             return;
         };
         if let Some(v) = history.iter_mut().find(|s| s.tag == tag) {
             v.seen_lines.extend(lines);
         }
-        let _ = self.versions.put_with_weight(path.to_string(), history);
+        let _ = self.versions.put_with_weight(key, history);
     }
 
     /// Most-recently recorded version for `path`.
-    pub fn head(&self, path: &str) -> Option<Snapshot> {
-        self.versions.peek(path).and_then(|h| h.first().cloned())
+    pub fn head(&self, path: impl AsRef<Path>) -> Option<Snapshot> {
+        let key = crate::edit::normalize_path_key(path.as_ref());
+        self.versions.peek(&key).and_then(|h| h.first().cloned())
     }
 
     /// Tag of the most-recently recorded version for `path`, without cloning
     /// the (up to 4 MiB) snapshot text.
-    pub fn head_tag(&self, path: &str) -> Option<u16> {
+    pub fn head_tag(&self, path: impl AsRef<Path>) -> Option<u16> {
+        let key = crate::edit::normalize_path_key(path.as_ref());
         self.versions
-            .peek(path)
+            .peek(&key)
             .and_then(|h| h.first().map(|s| s.tag))
     }
 
     /// Retained version for `path` whose tag equals `tag`.
-    pub fn by_tag(&self, path: &str, tag: u16) -> Option<Snapshot> {
+    pub fn by_tag(&self, path: impl AsRef<Path>, tag: u16) -> Option<Snapshot> {
+        let key = crate::edit::normalize_path_key(path.as_ref());
         self.versions
-            .peek(path)
+            .peek(&key)
             .and_then(|h| h.iter().find(|s| s.tag == tag).cloned())
     }
 

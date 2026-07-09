@@ -67,7 +67,10 @@ impl BloomFilterCache {
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
         // Fast path: check existing cached entry
         {
-            let mut filters = self.filters.lock().unwrap();
+            let mut filters = self
+                .filters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((filter, cached_mtime)) = filters.get(path) {
                 if *cached_mtime == mtime {
                     return filter.contains(symbol);
@@ -78,7 +81,10 @@ impl BloomFilterCache {
         // Cache miss or stale: build and cache a new filter
         let filter = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
-        let mut filters = self.filters.lock().unwrap();
+        let mut filters = self
+            .filters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         filters.put(path.to_path_buf(), (filter, mtime));
         result
     }
