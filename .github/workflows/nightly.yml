@@ -173,7 +173,23 @@ jobs:
           node-version: 24
       - name: Smoke test nightly npx package
         shell: bash
+        # Stream lifecycle-script (postinstall) output to the foreground instead
+        # of npm's hidden debug log, so an install failure is visible in the log.
+        env:
+          npm_config_foreground_scripts: "true"
         run: |
-          output=$(npx --yes @paulnsorensen/tilth-nightly@latest --version)
+          # Capture exit code + both streams instead of letting `set -e` abort
+          # silently on `output=$(...)`, which would swallow all diagnostics.
+          set +e
+          output=$(npx --yes @paulnsorensen/tilth-nightly@latest --version 2>stderr.txt)
+          code=$?
+          set -e
+          echo "npx exit code: $code"
+          echo "--- stdout ---"
           echo "$output"
-          test -n "$output"
+          echo "--- stderr ---"
+          cat stderr.txt || true
+          if [ "$code" -ne 0 ] || [ -z "$output" ]; then
+            echo "smoke test FAILED (exit=$code, stdout empty=$([ -z "$output" ] && echo yes || echo no))"
+            exit 1
+          fi

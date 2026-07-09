@@ -101,13 +101,20 @@ function parseChecksum(text, sidecarUrl) {
 
 function extract(buf) {
   if (isWindows) {
+    // Extract with PowerShell's Expand-Archive, not `tar`: the `tar` resolved on
+    // a Windows PATH may be GNU tar (shipped by Git for Windows), which cannot
+    // read the zip format and fails. Expand-Archive is built into Windows
+    // PowerShell and handles zip natively.
     const tmpZip = path.join(binDir, "tilth.zip");
     fs.writeFileSync(tmpZip, buf);
     try {
-      execSync(`tar -xf "${tmpZip}" -C "${binDir}"`, { stdio: "ignore" });
+      execSync(
+        `powershell -NoProfile -NonInteractive -Command "Expand-Archive -LiteralPath '${tmpZip}' -DestinationPath '${binDir}' -Force"`,
+        { stdio: "inherit" },
+      );
       fs.unlinkSync(tmpZip);
-    } catch {
-      console.error("tilth: failed to extract.");
+    } catch (err) {
+      console.error(`tilth: failed to extract: ${err.message}`);
       process.exit(1);
     }
   } else {
