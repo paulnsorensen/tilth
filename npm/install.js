@@ -3,11 +3,10 @@
 "use strict";
 
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { execSync } = require("child_process");
-const zlib = require("zlib");
 
 const PLATFORM_MAP = {
   "linux-x64": "x86_64-unknown-linux-musl",
@@ -45,11 +44,24 @@ fs.mkdirSync(binDir, { recursive: true });
 
 console.log(`tilth: downloading ${target} binary...`);
 
-function follow(url, callback) {
-  const mod = url.startsWith("https") ? https : http;
-  mod.get(url, { headers: { "User-Agent": "tilth-npm" } }, (res) => {
+const MAX_REDIRECTS = 5;
+
+// HTTPS-only, depth-capped: this binary is executed after download, so never
+// let a redirect downgrade to plaintext or loop.
+function follow(url, depth, callback) {
+  if (!url.startsWith("https:")) {
+    console.error(`tilth: refusing non-HTTPS download URL: ${url}`);
+    process.exit(1);
+  }
+  if (depth > MAX_REDIRECTS) {
+    console.error(`tilth: too many redirects (>${MAX_REDIRECTS})`);
+    process.exit(1);
+  }
+  const req = https.get(url, { headers: { "User-Agent": "tilth-npm" } }, (res) => {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-      follow(res.headers.location, callback);
+      res.resume();
+      // Location may be relative; resolve against the current URL before recursing.
+      follow(new URL(res.headers.location, url).href, depth + 1, callback);
     } else if (res.statusCode !== 200) {
       console.error(`tilth: download failed (HTTP ${res.statusCode})`);
       console.error(`URL: ${url}`);
@@ -58,35 +70,56 @@ function follow(url, callback) {
     } else {
       callback(res);
     }
-  }).on("error", (err) => {
+  });
+  req.on("error", (err) => {
+    console.error(`tilth: download failed: ${err.message}`);
+    console.error("Install manually: cargo install tilth");
+    process.exit(1);
+  });
+  req.setTimeout(30000, () => {
+    req.destroy(new Error("timeout after 30s"));
+  });
+}
+
+function buffer(res, callback) {
+  const chunks = [];
+  res.on("data", (chunk) => chunks.push(chunk));
+  res.on("end", () => callback(Buffer.concat(chunks)));
+  res.on("error", (err) => {
     console.error(`tilth: download failed: ${err.message}`);
     console.error("Install manually: cargo install tilth");
     process.exit(1);
   });
 }
 
-follow(url, (res) => {
+function parseChecksum(text, sidecarUrl) {
+  const match = /^([0-9a-fA-F]{64})\s/.exec(text);
+  if (!match) {
+    console.error(`tilth: malformed checksum sidecar at ${sidecarUrl}`);
+    console.error("Install manually: cargo install tilth");
+    process.exit(1);
+  }
+  return match[1].toLowerCase();
+}
+
+function extract(buf) {
   if (isWindows) {
     // For Windows, save zip and extract with tar (available on modern Windows)
     const tmpZip = path.join(binDir, "tilth.zip");
-    const out = fs.createWriteStream(tmpZip);
-    res.pipe(out);
-    out.on("finish", () => {
-      out.close();
-      try {
-        execSync(`tar -xf "${tmpZip}" -C "${binDir}"`, { stdio: "ignore" });
-        fs.unlinkSync(tmpZip);
-      } catch {
-        console.error("tilth: failed to extract. Install manually: cargo install tilth");
-        process.exit(1);
-      }
-    });
+    fs.writeFileSync(tmpZip, buf);
+    try {
+      execSync(`tar -xf "${tmpZip}" -C "${binDir}"`, { stdio: "ignore" });
+      fs.unlinkSync(tmpZip);
+    } catch {
+      console.error("tilth: failed to extract. Install manually: cargo install tilth");
+      process.exit(1);
+    }
   } else {
     // Unix: pipe through gunzip and tar
     const tar = require("child_process").spawn("tar", ["xz", "-C", binDir], {
       stdio: ["pipe", "inherit", "inherit"],
     });
-    res.pipe(tar.stdin);
+    tar.stdin.end(buf);
     tar.on("close", (code) => {
       if (code !== 0) {
         console.error("tilth: failed to extract. Install manually: cargo install tilth");
@@ -96,4 +129,26 @@ follow(url, (res) => {
       console.log("tilth: installed successfully");
     });
   }
+}
+
+const sidecarUrl = `${url}.sha256`;
+
+follow(sidecarUrl, 0, (sidecarRes) => {
+  buffer(sidecarRes, (sidecarBuf) => {
+    const expected = parseChecksum(sidecarBuf.toString("utf8"), sidecarUrl);
+
+    follow(url, 0, (archiveRes) => {
+      buffer(archiveRes, (archiveBuf) => {
+        const actual = crypto.createHash("sha256").update(archiveBuf).digest("hex");
+        if (actual !== expected) {
+          console.error("tilth: checksum mismatch — refusing to install");
+          console.error(`Expected: ${expected}`);
+          console.error(`Actual:   ${actual}`);
+          console.error("Install manually: cargo install tilth");
+          process.exit(1);
+        }
+        extract(archiveBuf);
+      });
+    });
+  });
 });
