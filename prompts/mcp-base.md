@@ -4,7 +4,7 @@ Call tools by their full MCP name — prefix `mcp__tilth__`, e.g. `mcp__tilth__t
 
 PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.
 
-REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. tilth_write takes edits: "..." — a single op-grammar string, NOT an array. Every tool also REQUIRES `cwd` — your absolute checkout directory.
+REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]; tilth_write → edits: [...] — a JSON ARRAY of {path, tag?, ops} section objects, NOT a string. Every tool also REQUIRES `cwd` — your absolute checkout directory.
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(queries: [{query: "handleRequest"}]).

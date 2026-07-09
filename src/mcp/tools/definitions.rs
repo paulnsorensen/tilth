@@ -171,6 +171,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": false,
                         "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
                     },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max tokens in response."
+                    },
                     "cwd": cwd_prop.clone()
                 }
             }
@@ -235,7 +239,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (the leading `#` is optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
+            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read emits a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (the leading `#` is optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],

@@ -5,7 +5,7 @@ Call tools by their full MCP name — prefix `mcp__tilth__`, e.g. `mcp__tilth__t
 
 PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.
 
-REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. tilth_write takes edits: "..." — a single op-grammar string, NOT an array. Every tool also REQUIRES `cwd` — your absolute checkout directory.
+REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]; tilth_write → edits: [...] — a JSON ARRAY of {path, tag?, ops} section objects, NOT a string. Every tool also REQUIRES `cwd` — your absolute checkout directory.
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(queries: [{query: "handleRequest"}]).
@@ -72,7 +72,7 @@ Shell out only for tests, builds, and non-file-IO commands.
 DO NOT re-read files already shown in expanded search results.
 
 tilth_write: Batch edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools.
-Read first (edit mode): tilth_read / tilth_search show a `[path#TAG]` header then `N:content` numbered lines. Copy the 4-hex TAG into the section's `tag` and reference the line numbers you see. NEVER invent a TAG.
+Read first (edit mode): tilth_read shows a `[path#TAG]` header then `N:content` numbered lines. Copy the 4-hex TAG into the section's `tag` and reference the line numbers you see. NEVER invent a TAG.
 Send `edits` as an ARRAY of section objects, each `{path, tag?, ops}`. Each op is an object tagged by `op`. Line numbers are 1-based inclusive, from the numbered read:
 replace {start, end, content} — replace lines start..end (start==end for one line)
 delete {start, end} — delete a line or range
