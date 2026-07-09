@@ -173,28 +173,23 @@ jobs:
           node-version: 24
       - name: Smoke test nightly npx package
         shell: bash
+        # Stream lifecycle-script (postinstall) output to the foreground instead
+        # of npm's hidden debug log, so an install failure is visible in the log.
         env:
-          # Stream lifecycle-script (postinstall/install.js) output to the
-          # foreground instead of npm's hidden debug log, so a Windows install
-          # failure is visible. Verbose surfaces npm's own resolution steps.
           npm_config_foreground_scripts: "true"
-          npm_config_loglevel: verbose
         run: |
+          # Capture exit code + both streams instead of letting `set -e` abort
+          # silently on `output=$(...)`, which would swallow all diagnostics.
           set +e
-          echo "=== install phase ==="
-          npm install -g "@paulnsorensen/tilth-nightly@latest"
-          install_code=$?
-          echo "install exit code: $install_code"
-          echo "=== run phase ==="
-          output=$(tilth --version 2>run-stderr.txt)
-          run_code=$?
-          echo "tilth --version exit code: $run_code"
+          output=$(npx --yes @paulnsorensen/tilth-nightly@latest --version 2>stderr.txt)
+          code=$?
+          set -e
+          echo "npx exit code: $code"
           echo "--- stdout ---"
           echo "$output"
-          echo "--- run stderr ---"
-          cat run-stderr.txt || true
-          set -e
-          if [ "$install_code" -ne 0 ] || [ "$run_code" -ne 0 ] || [ -z "$output" ]; then
-            echo "smoke test FAILED (install=$install_code, run=$run_code, stdout empty=$([ -z "$output" ] && echo yes || echo no))"
+          echo "--- stderr ---"
+          cat stderr.txt || true
+          if [ "$code" -ne 0 ] || [ -z "$output" ]; then
+            echo "smoke test FAILED (exit=$code, stdout empty=$([ -z "$output" ] && echo yes || echo no))"
             exit 1
           fi
