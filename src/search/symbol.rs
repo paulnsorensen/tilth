@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use super::content::accept_walk_entry;
+use super::accept_walk_entry;
 use super::file_metadata;
 use crate::lang::elixir::is_elixir_definition;
 use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};

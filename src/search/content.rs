@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use super::file_metadata;
+use super::{accept_walk_entry, file_metadata};
 
 use crate::error::TilthError;
 use crate::search::rank;
@@ -15,49 +15,6 @@ const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
 const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
-/// Upper bound on file size searched by content/regex walkers. Files larger
-/// than this skip on stat alone. Shared so `content::search` and
-/// `super::count_files_for_empty` stay aligned.
-pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
-
-/// Shared file-walk entry filter for the content and symbol search walkers:
-/// unwraps the walker result, keeps only files, skips filenames that look
-/// minified (`.min.js`, `app-min.css`), and skips files over
-/// `MAX_SEARCH_FILE_SIZE`. Returns the path and its stat'd size on
-/// acceptance. Each caller still does its own read (byte vs string), its own
-/// minified-by-content check (needs the read buffer), and its own match
-/// building — those differ per caller.
-pub(crate) fn accept_walk_entry(
-    entry: Result<ignore::DirEntry, ignore::Error>,
-) -> Option<(std::path::PathBuf, u64)> {
-    let entry = entry.ok()?;
-
-    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-        return None;
-    }
-
-    let path = entry.path();
-
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(crate::lang::detection::is_minified_by_name)
-    {
-        return None;
-    }
-
-    let file_size = match std::fs::metadata(path) {
-        Ok(meta) => {
-            if meta.len() > MAX_SEARCH_FILE_SIZE {
-                return None;
-            }
-            meta.len()
-        }
-        Err(_) => 0,
-    };
-
-    Some((path.to_path_buf(), file_size))
-}
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(

@@ -160,6 +160,50 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     Ok(builder.build_parallel())
 }
 
+/// Upper bound on file size searched by content/regex walkers. Files larger
+/// than this skip on stat alone. Shared so `content::search` and
+/// `count_files_for_empty` stay aligned.
+pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+
+/// Shared file-walk entry filter for the content and symbol search walkers:
+/// unwraps the walker result, keeps only files, skips filenames that look
+/// minified (`.min.js`, `app-min.css`), and skips files over
+/// `MAX_SEARCH_FILE_SIZE`. Returns the path and its stat'd size on
+/// acceptance. Each caller still does its own read (byte vs string), its own
+/// minified-by-content check (needs the read buffer), and its own match
+/// building — those differ per caller.
+pub(crate) fn accept_walk_entry(
+    entry: Result<ignore::DirEntry, ignore::Error>,
+) -> Option<(std::path::PathBuf, u64)> {
+    let entry = entry.ok()?;
+
+    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        return None;
+    }
+
+    let path = entry.path();
+
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::lang::detection::is_minified_by_name)
+    {
+        return None;
+    }
+
+    let file_size = match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.len() > MAX_SEARCH_FILE_SIZE {
+                return None;
+            }
+            meta.len()
+        }
+        Err(_) => 0,
+    };
+
+    Some((entry.into_path(), file_size))
+}
+
 /// Stat-only file filter used before searching: drop files whose names mark
 /// them as minified (`.min.js`, `app-min.css`) or whose size exceeds the
 /// search cap. `content::search` layers a heavier byte-content minified
@@ -174,7 +218,7 @@ fn passes_stat_filter(path: &Path) -> bool {
         return false;
     }
     if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > content::MAX_SEARCH_FILE_SIZE {
+        if meta.len() > MAX_SEARCH_FILE_SIZE {
             return false;
         }
     }
