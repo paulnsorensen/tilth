@@ -276,11 +276,17 @@ fn commit_file_op(
     let session = ctx.session;
     match op {
         FileOp::Remove => {
+            // Capture the canonical key before the fs op: once the file is gone,
+            // `normalize_path_key` falls back to a lexical (non-symlink-resolving)
+            // spelling that can diverge from the canonical key `record` minted.
+            // The already-canonical spelling survives that lexical fallback
+            // unchanged, so invalidation still finds the recorded history.
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             std::fs::remove_file(path).map_err(|e| TilthError::IoError {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            session.invalidate_snapshot(path);
+            session.invalidate_snapshot(&canonical);
             Ok(format!("## {}\nremoved", path.display()))
         }
         FileOp::Move(dest_raw) => {
@@ -294,6 +300,10 @@ fn commit_file_op(
                     dest.display()
                 )));
             }
+            // Capture the canonical source key before the fs op — see the
+            // Remove arm above for why this must happen while the file still
+            // exists at `path`.
+            let canonical_src = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             // If the move also carried content edits, land them before renaming.
             if new_text != live {
                 crate::util::atomic_write_bytes(path, new_text.as_bytes()).map_err(|e| {
@@ -313,7 +323,7 @@ fn commit_file_op(
                 path: dest.clone(),
                 source: e,
             })?;
-            session.relocate_snapshot(path, &dest);
+            session.relocate_snapshot(&canonical_src, &dest);
             Ok(format!("## {}\nmoved → {}", path.display(), dest.display()))
         }
     }
@@ -888,6 +898,73 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mv_moves_file_and_relocates_snapshot_through_symlinked_dir() {
+        // `link/` is a directory symlink to `real/`; every path passed to the
+        // tools uses the `link/...` spelling so the canonical key minted at
+        // record time (`real/...`, via canonicalize) diverges from the lexical
+        // spelling. Only the parent dir is symlinked, so the fs ops still hit
+        // the real file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = link.join("src.rs");
+        std::fs::write(real.join("src.rs"), "a\nb\nc\nd\n").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        // Range read via the `link/` spelling records seen-lines {1,2} under
+        // the canonical `real/src.rs` key.
+        crate::mcp::tools::tool_read(
+            &json!({"paths": [format!("{}#1-2", p.display())], "cwd": link.to_str().unwrap()}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("range read");
+        let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
+        let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": link.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("moved"), "expected moved, got:\n{out}");
+        let dest_link = link.join("dest.rs");
+        assert_eq!(
+            std::fs::read_to_string(real.join("dest.rs")).unwrap(),
+            "a\nb\nc\nd\n"
+        );
+
+        // The relocated snapshot must carry src's seen-lines {1,2} even though
+        // src and dest were only ever addressed via the `link/` spelling: an
+        // edit on the never-displayed line 4 of dest is rejected by the
+        // seen-lines gate. Pre-fix, canonicalizing after the rename falls back
+        // to the unresolved `link/src.rs` lexical spelling, misses the
+        // `real/src.rs` canonical key `record()` used, and the gate is
+        // silently skipped.
+        let ops2 = json!([{ "op": "replace", "start": 4, "end": 4, "content": "D" }]);
+        let rej = tool_write(
+            &json!({"edits": edits(&dest_link, Some(&tag), ops2), "cwd": link.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            rej.contains("never displayed"),
+            "relocated snapshot must gate an unseen line at dest, got:\n{rej}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("dest.rs")).unwrap(),
+            "a\nb\nc\nd\n",
+            "rejected edit must not touch dest"
+        );
+    }
+
     #[test]
     fn mv_onto_existing_different_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -952,6 +1029,64 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
+            "fresh content here\n",
+            "rejected stale edit must not touch the recreated file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rem_removes_file_and_invalidates_snapshot_through_symlinked_dir() {
+        // `link/` is a directory symlink to `real/`; every path passed to the
+        // tools uses the `link/...` spelling so the canonical key minted at
+        // record time (`real/...`, via canonicalize) diverges from the lexical
+        // spelling. Only the parent dir is symlinked, so the fs op still hits
+        // the real file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = link.join("gone.rs");
+        std::fs::write(real.join("gone.rs"), "bye\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "delete_file" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": link.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("removed"), "expected removed, got:\n{out}");
+        assert!(
+            !real.join("gone.rs").exists(),
+            "file must be deleted by delete_file"
+        );
+
+        // Recreate the path (via `real/`, since `link/` still resolves there)
+        // with fresh content. The pre-delete snapshot must have been
+        // invalidated: the old tag is no longer known, so a stale-tag edit is
+        // a Fabricated rejection ("not from this session"). Pre-fix,
+        // canonicalizing after the remove falls back to the unresolved
+        // `link/gone.rs` lexical spelling, misses the `real/gone.rs` canonical
+        // key `record()` used, so invalidation misses and the stale edit is
+        // wrongly recovered instead.
+        std::fs::write(real.join("gone.rs"), "fresh content here\n").unwrap();
+        let stale = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
+        let out2 = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), stale), "cwd": link.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out2.contains("not from this session"),
+            "post-delete edit with the old tag must be Fabricated, got:\n{out2}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("gone.rs")).unwrap(),
             "fresh content here\n",
             "rejected stale edit must not touch the recreated file"
         );
