@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use super::file_metadata;
+use super::{accept_walk_entry, file_metadata};
 
 use crate::error::TilthError;
 use crate::search::rank;
@@ -15,10 +15,6 @@ const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
 const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
-/// Upper bound on file size searched by content/regex walkers. Files larger
-/// than this skip on stat alone. Shared so `content::search` and
-/// `super::count_files_for_empty` stay aligned.
-pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -61,35 +57,10 @@ pub fn search(
                 return ignore::WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
+            let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > MAX_SEARCH_FILE_SIZE {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
+            let path = path.as_path();
 
             // Read the file once. Use `search_slice` instead of `search_path`
             // so the minified-check (when triggered) and the actual search
