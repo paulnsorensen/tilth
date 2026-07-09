@@ -16,8 +16,9 @@ pub fn iso_ts(ts: SystemTime) -> String {
 /// Parse an RFC-3339-ish timestamp back to `SystemTime`. Accepts the bare
 /// `YYYY-MM-DDTHH:MM:SSZ` form, optional fractional seconds (`SS.sss` — the
 /// fraction is parsed but discarded), and a trailing numeric UTC offset
-/// (`+HH:MM`, `-HH:MM`, `+HHMM`, `-HHMM`) in place of `Z`. Returns None when
-/// malformed.
+/// (`+HH:MM`, `-HH:MM`, `+HHMM`, `-HHMM`) in place of `Z`. A timestamp with
+/// no `Z`/offset suffix at all is also accepted and treated as UTC, and the
+/// seconds field is optional (defaults to `:00`).
 pub fn parse_iso_utc(s: &str) -> Option<SystemTime> {
     let s = s.trim();
     let (date, time) = s.split_once('T')?;

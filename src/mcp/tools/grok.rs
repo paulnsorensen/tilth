@@ -83,10 +83,8 @@ mod tests {
         let small =
             tool_grok(&args_small, &bloom(), &Session::new()).expect("budgeted grok succeeds");
         assert!(
-            small.len() < full.len(),
-            "budget=50 output ({}) should be shorter than default ({})",
-            small.len(),
-            full.len()
+            small.contains("... truncated — raise `budget`"),
+            "budget=50 output should hit the truncation marker: {small}"
         );
     }
 }
