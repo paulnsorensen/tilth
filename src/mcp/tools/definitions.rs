@@ -621,7 +621,7 @@ mod tests {
     }
 
     /// `tilth_list` relaxed `patterns` to optional: a bare `{cwd}` call must
-    /// validate client-side (the ["*"] default is applied at runtime), while
+    /// validate client-side (the `["*"]` default is applied at runtime), while
     /// `cwd` stays required and a wrong-shape `patterns` is still rejected by
     /// the schema before it reaches the server.
     #[test]

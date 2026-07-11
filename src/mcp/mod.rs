@@ -1966,11 +1966,20 @@ mod tests {
     /// parameter validation, not the budget gate.
     #[test]
     fn budget_validation_skipped_for_non_budget_tools() {
-        // tilth_write in edit_mode=true, budget:0 → own files-array error, not budget error.
+        // tilth_write in edit_mode=true, budget:0 → own empty-edits error, not budget error.
         let services = Services::new(true);
-        let args = serde_json::json!({ "budget": 0, "files": [] });
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "budget": 0,
+            "edits": [],
+            "cwd": tmp.path().to_str().unwrap()
+        });
         let err = dispatch_tool("tilth_write", &args, &services)
-            .expect_err("empty files array must be rejected");
+            .expect_err("empty edits array must be rejected");
+        assert!(
+            err.contains("no sections"),
+            "error must come from the empty-edits check: {err}"
+        );
         assert!(
             !err.contains("positive integer"),
             "budget gate must not fire for tilth_write: {err}"
