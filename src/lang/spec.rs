@@ -103,11 +103,6 @@ pub(crate) struct DefinitionOps {
 /// Shared default definition kinds — used by every language except Elixir.
 pub(crate) const DEFAULT_DEF_KINDS: &[&str] = DEFINITION_KINDS;
 
-/// Default name extractor adapter (ignores nothing; delegates to the shared fn).
-fn default_defs_extract_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    default_extract_definition_name(node, lines)
-}
-
 /// Default weight adapter: weight is keyed on the node kind, so the node's
 /// `lines` argument is unused. Kept in the `(node, lines)` shape so every
 /// `DefinitionOps.weight` has one uniform signature.
@@ -117,7 +112,7 @@ fn default_defs_weight(node: tree_sitter::Node, _lines: &[&str]) -> u16 {
 
 /// Shared default `DefinitionOps` — referenced by every non-Elixir spec.
 pub(crate) const DEFAULT_DEFS: DefinitionOps = DefinitionOps {
-    extract_name: default_defs_extract_name,
+    extract_name: default_extract_definition_name,
     weight: default_defs_weight,
 };
 
