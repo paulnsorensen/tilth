@@ -257,4 +257,21 @@ mod tests {
             "expected teaching error naming the expected shape: {err}"
         );
     }
+
+    #[test]
+    fn null_patterns_returns_teaching_error() {
+        // JSON null is present-but-invalid, not omission — only a truly
+        // absent `patterns` key gets the ["*"] default. The error must teach
+        // both the shape and the omit path.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "patterns": null,
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("array of glob strings") && err.contains("omit"),
+            "null patterns must get the shape-teaching error, not the default: {err}"
+        );
+    }
 }

@@ -619,4 +619,57 @@ mod tests {
         );
         assert_ne!(cwd_description(true), cwd_description(false));
     }
+
+    /// `tilth_list` relaxed `patterns` to optional: a bare `{cwd}` call must
+    /// validate client-side (the ["*"] default is applied at runtime), while
+    /// `cwd` stays required and a wrong-shape `patterns` is still rejected by
+    /// the schema before it reaches the server.
+    #[test]
+    fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
+        let tools = tool_definitions(false);
+        let list = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_list"))
+            .expect("tilth_list tool definition present");
+        let schema = &list["inputSchema"];
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            vec!["cwd"],
+            "tilth_list must require only cwd — patterns is optional"
+        );
+        assert!(
+            schema["properties"]["patterns"]["description"]
+                .as_str()
+                .expect("patterns description present")
+                .contains("Optional"),
+            "patterns description must advertise the omission default"
+        );
+
+        let compiled = jsonschema::JSONSchema::compile(schema)
+            .expect("tilth_list inputSchema must be a valid JSON Schema");
+        assert!(
+            compiled.is_valid(&serde_json::json!({"cwd": "/abs"})),
+            "a bare cwd-only call must validate: patterns is optional"
+        );
+        assert!(
+            !compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"]})),
+            "cwd stays required"
+        );
+        assert!(
+            !compiled.is_valid(&serde_json::json!({"patterns": "*.rs", "cwd": "/abs"})),
+            "non-array patterns must fail schema validation client-side"
+        );
+        assert!(
+            !compiled.is_valid(&serde_json::json!({"patterns": [], "cwd": "/abs"})),
+            "empty patterns must fail schema validation (minItems: 1)"
+        );
+        assert!(compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"], "cwd": "/abs"})));
+    }
 }
