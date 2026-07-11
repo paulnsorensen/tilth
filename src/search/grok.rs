@@ -276,7 +276,7 @@ fn go_receiver_type(path: &Path, start_line: u32, cache: &OutlineCache) -> Optio
     let ts_lang = crate::lang::outline::outline_language(parsed.lang)?;
     let bytes = parsed.content.as_bytes();
 
-    crate::search::siblings::with_query(&ts_lang, GO_RECV_TYPE_QUERY, |query| {
+    crate::lang::treesitter::with_query(&ts_lang, GO_RECV_TYPE_QUERY, |query| {
         let ty_idx = query.capture_index_for_name("ty")?;
         let method_idx = query.capture_index_for_name("method")?;
         let mut cursor = tree_sitter::QueryCursor::new();

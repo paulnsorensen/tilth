@@ -94,7 +94,7 @@ pub(crate) fn extract_go_receiver_name(
     let bytes = content.as_bytes();
 
     // `with_query` returns `Option<Option<String>>`; flatten to `Option<String>`.
-    crate::search::siblings::with_query(ts_lang, GO_RECV_QUERY, |query| {
+    crate::lang::treesitter::with_query(ts_lang, GO_RECV_QUERY, |query| {
         let recv_idx = query.capture_index_for_name("recv")?;
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(query, tree.root_node(), bytes);

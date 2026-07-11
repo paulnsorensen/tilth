@@ -18,9 +18,11 @@ use crate::types::FileType;
 /// non-code), so they are mapped to the JS/TS family here to preserve the
 /// historical strip behavior for those files.
 fn detect_lang(path: &Path) -> Option<StripFamily> {
-    if let FileType::Code(lang) = detect_file_type(path) {
-        if let Some(family) = spec(lang).strip_family {
-            return Some(family);
+    if path.extension().is_some() {
+        if let FileType::Code(lang) = detect_file_type(path) {
+            if let Some(family) = spec(lang).strip_family {
+                return Some(family);
+            }
         }
     }
     match path.extension()?.to_str()? {
@@ -301,6 +303,13 @@ mod tests {
         assert!(!skip.contains(&3)); // * JSDoc continuation
         assert!(!skip.contains(&4)); // */
         assert!(skip.contains(&5)); // plain comment
+    }
+
+    #[test]
+    fn extensionless_bash_dotfile_not_stripped() {
+        let content = "# just a comment\necho hi\n";
+        let skip = strip_noise(content, &PathBuf::from(".bashrc"), Some((1, 2)));
+        assert!(skip.is_empty());
     }
 
     #[test]
