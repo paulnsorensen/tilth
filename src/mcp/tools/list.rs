@@ -8,33 +8,40 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+const PATTERNS_SHAPE: &str = "\"patterns\" must be an array of glob strings: \
+     pass patterns: [\"*.rs\"], or omit it for the full tree.";
+
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = super::resolve_scope(args, cwd)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let patterns_arr = args
-        .get("patterns")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: patterns (array of globs)")?;
-    if patterns_arr.is_empty() {
-        return Err("patterns must contain at least one glob".into());
-    }
-    if patterns_arr.len() > 20 {
-        return Err(format!(
-            "patterns limited to 20 per call (got {})",
-            patterns_arr.len()
-        ));
-    }
-    let patterns: Vec<String> = patterns_arr
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .ok_or("patterns must be an array of strings")
-                .map(String::from)
-        })
-        .collect::<Result<_, _>>()?;
+    let patterns: Vec<String> = match args.get("patterns") {
+        None => vec!["*".to_string()],
+        Some(value) => {
+            let Some(arr) = value.as_array() else {
+                return Err(PATTERNS_SHAPE.to_string());
+            };
+            if arr.is_empty() {
+                return Err("patterns must contain at least one glob".into());
+            }
+            if arr.len() > 20 {
+                return Err(format!(
+                    "patterns limited to 20 per call (got {})",
+                    arr.len()
+                ));
+            }
+            let mut patterns = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(pattern) = item.as_str() else {
+                    return Err(PATTERNS_SHAPE.to_string());
+                };
+                patterns.push(pattern.to_string());
+            }
+            patterns
+        }
+    };
 
     let depth = args.get("depth").and_then(|v| {
         v.as_u64()
@@ -192,6 +199,62 @@ mod tests {
         assert!(
             out.contains("no matches; found extensions:") && out.contains("rs"),
             "expected no-match extension hint: {out}"
+        );
+    }
+
+    #[test]
+    fn omitted_patterns_defaults_to_full_tree() {
+        // Omitting `patterns` must behave exactly like patterns: ["*"] — the
+        // zero-ceremony layout-tree call — not error as a missing parameter.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(sub.join("b.md"), "# b\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let omitted =
+            tool_list(&serde_json::json!({ "cwd": cwd })).expect("omitted patterns defaults");
+        let explicit = tool_list(&serde_json::json!({ "patterns": ["*"], "cwd": cwd }))
+            .expect("explicit [\"*\"] lists");
+        assert_eq!(
+            omitted, explicit,
+            "omitted patterns must be byte-identical to explicit [\"*\"]"
+        );
+        assert!(
+            omitted.contains("a.rs") && omitted.contains("b.md"),
+            "default tree must include all files: {omitted}"
+        );
+    }
+
+    #[test]
+    fn non_array_patterns_returns_teaching_error() {
+        // A present-but-wrong-shape `patterns` is a caller mistake, not an
+        // omission — the error must teach the expected shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "patterns": "not-an-array",
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("array of glob strings"),
+            "expected teaching error naming the expected shape: {err}"
+        );
+    }
+
+    #[test]
+    fn non_string_pattern_element_returns_teaching_error() {
+        // Array with non-string elements is invalid too, with the same
+        // shape-teaching error.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "patterns": [42],
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("array of glob strings"),
+            "expected teaching error naming the expected shape: {err}"
         );
     }
 }

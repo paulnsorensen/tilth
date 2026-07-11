@@ -101,14 +101,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
                 "type": "object",
-                "required": ["patterns", "cwd"],
+                "required": ["cwd"],
                 "properties": {
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Glob patterns rendered into one tree, e.g. ['*.rs'] or ['*.rs', '*.toml']. Capped at 20."
+                        "description": "Glob patterns rendered into one tree, e.g. ['*.rs'] or ['*.rs', '*.toml']. Capped at 20. Optional — omit for the full layout tree (default [\"*\"])."
                     },
                     "depth": {
                         "type": "number",
