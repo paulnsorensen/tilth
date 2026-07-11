@@ -1978,9 +1978,18 @@ mod tests {
 
         // tilth_list, budget:0 → own patterns error, not budget error.
         let services = Services::new(false);
-        let args = serde_json::json!({ "budget": 0, "patterns": [] });
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "budget": 0,
+            "patterns": [],
+            "cwd": tmp.path().to_str().unwrap()
+        });
         let err = dispatch_tool("tilth_list", &args, &services)
             .expect_err("empty patterns must be rejected");
+        assert!(
+            err.contains("at least one glob"),
+            "error must come from the empty-patterns check: {err}"
+        );
         assert!(
             !err.contains("positive integer"),
             "budget gate must not fire for tilth_list: {err}"
