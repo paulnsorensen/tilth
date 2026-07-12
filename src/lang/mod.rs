@@ -24,7 +24,9 @@ pub(crate) mod swift;
 pub(crate) mod tsx;
 pub(crate) mod typescript;
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::types::{FileType, Lang};
 
@@ -59,15 +61,24 @@ pub(crate) fn mod_all_langs_for_test() -> &'static [Lang] {
     ALL_LANGS
 }
 
+/// Extension → language lookup, built once from every `LangSpec.extensions`.
+/// Replaces a per-call linear scan over `ALL_LANGS` with an O(1) hash lookup.
+static EXT_TO_LANG: LazyLock<HashMap<&'static str, Lang>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for &lang in ALL_LANGS {
+        for &ext in spec::spec(lang).extensions {
+            map.entry(ext).or_insert(lang);
+        }
+    }
+    map
+});
+
 /// Detect file type by extension, then by name.
 pub fn detect_file_type(path: &Path) -> FileType {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => {
-            // Code extensions come from each language's `spec.extensions`.
-            for &lang in ALL_LANGS {
-                if spec::spec(lang).extensions.contains(&ext) {
-                    return FileType::Code(lang);
-                }
+            if let Some(&lang) = EXT_TO_LANG.get(ext) {
+                return FileType::Code(lang);
             }
             // Non-code extensions stay enumerated here.
             match ext {
