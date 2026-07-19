@@ -1,9 +1,8 @@
 {
   "name": "tilth",
   "owner": {
-    "name": "Paul Sorensen",
-    "email": "paulnsorensen@gmail.com"
-  },
+    "name": "Paul Sorensen"
+  }
   "description": "Marketplace for tilth's Claude Code plugin(s).",
   "plugins": [
     {
