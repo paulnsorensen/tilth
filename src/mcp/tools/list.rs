@@ -90,13 +90,12 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let rel = path.strip_prefix(&scope).unwrap_or(path);
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            extensions.insert(ext.to_string());
-        }
         let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
         if matched {
             let bytes = entry.metadata().map_or(0, |m| m.len());
             entries.push((path.to_path_buf(), bytes));
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            extensions.insert(ext.to_string());
         }
     }
 
@@ -116,6 +115,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         }
     }
     Ok(super::apply_budget(&result, budget))
+}
 
 #[cfg(test)]
 mod tests {

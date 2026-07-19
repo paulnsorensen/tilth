@@ -123,17 +123,17 @@ mod tests {
     }
 
     #[test]
-    fn render_tree_dir_rollup_equals_sum_of_child_tokens() {
+    fn render_tree_dir_rollup_uses_total_bytes() {
         let scope = PathBuf::from("/tmp/proj2");
         let files = vec![
             (scope.join("src/a.rs"), 4000),
             (scope.join("src/b.rs"), 8000),
         ];
         let out = render_tree(&scope, &files);
-        let expected = fmt_tokens(estimate_tokens(4000) + estimate_tokens(8000));
+        let expected = fmt_tokens(estimate_tokens(4000 + 8000));
         assert!(
             out.contains(&format!("src/      {expected}")),
-            "dir rollup should equal sum of child tokens: {out}"
+            "dir rollup should equal estimate_tokens of total bytes: {out}"
         );
     }
 }
