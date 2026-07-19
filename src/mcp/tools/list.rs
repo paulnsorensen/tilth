@@ -102,7 +102,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
 
     let tree = crate::mcp::tree::render_tree(&scope, &entries);
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&super::apply_budget(&tree, budget));
+    result.push_str(&tree);
     if entries.is_empty() {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
@@ -115,8 +115,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
             );
         }
     }
-    Ok(result)
-}
+    Ok(super::apply_budget(&result, budget))
 
 #[cfg(test)]
 mod tests {
