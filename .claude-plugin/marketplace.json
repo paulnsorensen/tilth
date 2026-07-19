@@ -2,7 +2,7 @@
   "name": "tilth",
   "owner": {
     "name": "Paul Sorensen"
-  }
+  },
   "description": "Marketplace for tilth's Claude Code plugin(s).",
   "plugins": [
     {
