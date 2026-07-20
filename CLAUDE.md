@@ -99,10 +99,11 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 
 **Sync mechanics:** pull upstream onto a `sync/upstream-<date>` branch (never straight onto the working branch), resolve the known conflicts to the fork side per the rules above, and verify the gates before merging.
 
-**Upstream contribution (contribute-back).** The `tilth-upstream` cloud routine (`agents/tilth-upstream/routine.md`, weekly) automates sending fork changes *out* to `jahala/tilth`: one PR per easy self-contained fork commit, a sync-back PR when the fork falls behind, and a roadmap at `.hallouminate/wiki/roadmaps/upstream-contrib/`. Two local ergonomics:
+**Upstream contribution (contribute-back).** A weekly Claude Code cloud routine (registered out-of-repo — its prompt is *not* committed here) sends fork changes *out* to `jahala/tilth` and opens a sync-back PR when the fork falls behind. The **workflow** — what it PRs, how the maintainer is notified — lives in the routine's own prompt, not this repo. What lives here is the fork-specific, code-level machinery it drives:
 
-- **Roadmap state via hallouminate.** To see the contribute-back state, ground or read the roadmap dir (`.hallouminate/wiki/roadmaps/upstream-contrib/`) — one goal file per candidate, lifecycle `pending` / `pr-open` / `merged`. The *routine* owns advancing that state (it reconciles from `gh` PR state each run); don't hand-edit goal lifecycle locally.
-- **Flagging a PR for Jan.** To tell Jan a PR is ready to merge, **approve it on `jahala/tilth`** — `gh pr review <n> --repo jahala/tilth --approve` (or the GitHub UI). The weekly routine batches every open PR you've approved into a single email to Jan and won't re-email one it has already sent. No local git action, no roadmap edit — your GitHub approval is the whole signal.
+- **Detection.** `scripts/tilth-upstream-scan` computes the ahead/behind/clean-apply math and emits the candidate JSON; the manifest is `agents/tilth-upstream/sources.yaml` (`sync_branch`, keys, label). Edit these to change *how* changes are detected and pushed up — the routine acts only on the scanner's JSON, never on guesses.
+- **Sync-back mechanics.** How upstream is pulled back down is the fork-law keep-ours rules above — see the **Fork law** / **Sync mechanics** blocks and `.hallouminate/wiki/`.
+- **Roadmap.** Contribute-back state is a wiki roadmap at `.hallouminate/wiki/roadmaps/upstream-contrib/` (ground or read it to see status); the routine owns advancing it.
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both publishes authenticate with `NPM_TOKEN` (`NODE_AUTH_TOKEN`); the `@plotplot/tilth` step is `continue-on-error` (best-effort) so a scope-setup failure never fails the release.
 
