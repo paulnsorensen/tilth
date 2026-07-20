@@ -4,10 +4,10 @@ You are the orchestrator for tilth's upstream-contribution routine. `tilth`
 lives as a fork (`paulnsorensen/tilth`, working dir `origin`) of
 `jahala/tilth` (`upstream`). This routine finds easy, self-contained changes
 already sitting in the fork that are ready to send upstream, opens a PR per
-candidate against `jahala/tilth`, tells the upstream maintainer (Jan /
-`jahala`) they're ready, opens a PR to pull the fork's own branch back into
-sync when upstream has moved ahead, and keeps a persisted roadmap of the
-contribute-back work.
+candidate against `jahala/tilth`, batch-emails the upstream maintainer (Jan /
+`jahala`) the PRs **Paul** has approved as ready to merge, opens a PR to pull
+the fork's own branch back into sync when upstream has moved ahead, and keeps
+a persisted roadmap of the contribute-back work.
 
 ## Environment
 
@@ -25,9 +25,17 @@ contribute-back work.
   hardcode a casing guess as final (see the dotfiles `routine-scaffold`
   skill's connector-casing note if this routine is ever re-authored).
 - milknado plugin — available for roadmap state. Use its `load-roadmap`
-  skill (`milknado_roadmap_import`) to pull the current roadmap state from
-  `.hallouminate/wiki/roadmaps/upstream-contrib/` before deciding what
-  changed, if the roadmap directory already exists.
+  skill (`milknado_roadmap_import`) to seed goal nodes from the roadmap at
+  `.hallouminate/wiki/roadmaps/upstream-contrib/`, if the directory exists.
+  Note: import reads only each goal's `Intent`/`Acceptance` and never returns
+  lifecycle state — the goal-file lifecycle field (`pending` / `pr-open` /
+  `merged`) is written and read by this routine directly, not via import.
+- Approval email ledger — the batch email to Jan (step 5) is gated on the PRs
+  **Paul** has approved on `jahala/tilth`, deduped against a ledger this
+  routine reads and writes by direct file access (never via
+  `milknado_roadmap_import`). The ledger is `emailed.md` under the roadmap
+  dir, carried on a routine-owned `routine/state` branch that is never merged
+  to `main`. See step 5.
 - Repo root: this checkout of `paulnsorensen/tilth`, remotes `origin` (the
   fork) and `upstream` (`jahala/tilth`), default branch `main` on both.
 
@@ -41,7 +49,8 @@ context.
    upstream >/dev/null 2>&1 || git remote add upstream https://github.com/jahala/tilth`.
    Then run `git fetch origin main && git fetch upstream main`. Never push
    to a default branch (`main`) on either remote; this routine only pushes
-   to `contrib/<key>` and `sync/upstream` feature branches (steps 4b, 6).
+   to `contrib/<key>` (step 4b), `sync/upstream` (step 6), and `routine/state`
+   (step 5, the dedup ledger) feature branches.
 
 2. **Scan.** Run `scripts/tilth-upstream-scan` from the repo root and parse
    its stdout as JSON with `jq`. The scanner is deterministic and read-only —
@@ -57,9 +66,11 @@ context.
    ```
 
 3. **Exit quietly on nothing to do.** If `.candidates` is empty AND
-   `sync_needed` is `false` AND the roadmap has no state to update, produce
-   no PR, no email, no roadmap edit, and no other output beyond a one-line
-   "nothing to do" note. Do not manufacture busywork.
+   `sync_needed` is `false` AND the roadmap has no state to update AND step
+   5's approved-PR queue has nothing new to email (no approved-and-open PR
+   absent from the ledger), produce no PR, no email, no roadmap edit, and no
+   other output beyond a one-line "nothing to do" note. Do not manufacture
+   busywork.
 
 4. **Per easy candidate — open an upstream PR.** For each item in
    `.candidates` where `.easy == true`:
@@ -90,15 +101,45 @@ context.
         still works next run.
       - Collect the resulting PR URL.
 
-5. **Email Jan — once, only if something new landed.** If at least one new
-   PR was opened in step 4 AND `JAN_EMAIL` is set, send exactly ONE Gmail
-   message to `JAN_EMAIL` summarizing every PR opened this run (not a
-   separate email per PR): each candidate's subject and its PR link. If no
-   new PR was opened this run, or `JAN_EMAIL` is unset, do not send email —
-   in the unset case, log that step as skipped in the final summary. If the
-   send errors for any reason (connector not granted, auth failure,
-   transport error), log `email: skipped-error` in the final summary and
-   continue — never fail the run, never retry in a loop.
+5. **Email Jan — a batch of the PRs Paul has approved upstream.** The email
+   is gated on Paul's own GitHub review, not on this routine opening a PR.
+   Paul approves the PRs he judges ready (`gh pr review <n> --repo
+   jahala/tilth --approve`, or the GitHub UI); this step forwards that batch
+   to Jan once per PR.
+
+   a. **Find the queue.** Query the open PRs on `jahala/tilth` that Paul has
+      approved:
+
+      ```
+      gh search prs --repo jahala/tilth --reviewed-by paulnsorensen \
+        --review approved --state open --json number,title,url
+      ```
+
+      Known v1 limitation (do not add reconciliation logic): `--review
+      approved` filters on the PR's overall review **decision**, which can
+      differ from Paul's individual verdict when another reviewer has
+      requested changes. Treat this result as the candidate set.
+
+   b. **Dedup against the ledger.** Fetch the `routine/state` branch (create
+      it from `origin/main` if it does not exist yet) and read
+      `.hallouminate/wiki/roadmaps/upstream-contrib/emailed.md` from it —
+      by direct file access, never via `milknado_roadmap_import`. Drop every
+      candidate whose PR number already appears in the ledger.
+
+   c. **Send once, only if there is something new and a recipient.** If the
+      deduped set is non-empty AND `JAN_EMAIL` is set, send exactly ONE Gmail
+      message to `JAN_EMAIL` listing each PR's title and link, framed
+      "approved and ready to merge" — not a separate email per PR. Only after
+      a successful send, append one line per emailed PR to the ledger
+      (`- PR #<n> — <YYYY-MM-DD>`), commit, and push the `routine/state`
+      branch (a feature branch, never `main` — this respects the
+      never-push-to-default invariant). If `JAN_EMAIL` is unset, skip the
+      send and the ledger append and log `skipped-no-recipient`. If the
+      deduped set is empty, send nothing and log `skipped-none-approved`. If
+      the send errors for any reason (connector not granted, auth failure,
+      transport error), log `email: skipped-error`, do **not** append to the
+      ledger (so the PR is retried next run), and continue — never fail the
+      run, never retry in a loop.
 
 6. **Sync-back PR — only if behind.** If `sync_needed` is `true`:
    - Dedup first: check `gh pr list --repo paulnsorensen/tilth --search "head:sync/upstream"`
@@ -128,9 +169,9 @@ context.
 8. **Summarize.** Print a plain-text summary table: one row per candidate
    acted on this run (key, action taken — `pr-opened` / `dup-skipped` /
    `conflict-skipped`), whether the sync PR was opened/skipped/deduped,
-   whether the roadmap PR was opened/skipped, and whether the Jan email was
-   sent/skipped-no-recipient/skipped-nothing-new. Merge nothing. Push
-   nothing to a default branch. Stop.
+   whether the roadmap PR was opened/skipped, and the Jan email result
+   (`emailed:<n>` / `skipped-none-approved` / `skipped-no-recipient` /
+   `skipped-error`). Merge nothing. Push nothing to a default branch. Stop.
 
 ## Hard invariants
 
@@ -142,9 +183,9 @@ context.
   contribution, the sync-back, the roadmap) advances only inside a PR
   branch. `main` on both `origin` and `upstream` is read-only to this
   routine.
-- **Exit quietly on nothing to do.** No candidates, not behind, and no
-  roadmap change → no PR, no email, no roadmap edit, no other output beyond
-  a one-line "nothing to do."
+- **Exit quietly on nothing to do.** No candidates, not behind, no roadmap
+  change, and no un-emailed approved PR → no PR, no email, no roadmap edit,
+  no other output beyond a one-line "nothing to do."
 - **One PR per candidate; dedup before acting.** Before opening any PR or
   branch, check both open PRs on the target repo and existing branch names
   for the same key. Never open a second PR/branch for a candidate already in
