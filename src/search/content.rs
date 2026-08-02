@@ -33,27 +33,24 @@ pub fn search(
     } else {
         (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
     };
+    let invalid_query = |reason: String| TilthError::InvalidQuery {
+        query: pattern.to_string(),
+        reason,
+    };
     let (matcher, fallback_reason) = if is_regex {
         match RegexMatcher::new(pattern) {
             Ok(m) => (m, None),
             Err(e) => {
                 let reason = e.to_string();
                 let literal = RegexMatcher::new(&regex_syntax::escape(pattern)).map_err(|e2| {
-                    TilthError::InvalidQuery {
-                        query: pattern.to_string(),
-                        reason: e2.to_string(),
-                    }
+                    invalid_query(format!("{reason}; escaped-literal retry also failed: {e2}"))
                 })?;
                 (literal, Some(reason))
             }
         }
     } else {
-        let m = RegexMatcher::new(&regex_syntax::escape(pattern)).map_err(|e| {
-            TilthError::InvalidQuery {
-                query: pattern.to_string(),
-                reason: e.to_string(),
-            }
-        })?;
+        let m = RegexMatcher::new(&regex_syntax::escape(pattern))
+            .map_err(|e| invalid_query(e.to_string()))?;
         (m, None)
     };
 

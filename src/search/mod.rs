@@ -412,11 +412,19 @@ pub fn search_multi_symbol_expanded(
 }
 
 /// Formats the leading disclosure note when a regex pattern failed to
-/// compile and was retried as an escaped literal.
+/// compile and was retried as an escaped literal. The reason is collapsed
+/// to its terse `error: <cause>` tail so the note stays one line — the raw
+/// `regex_syntax` message echoes an internal, re-wrapped pattern the caller
+/// never typed.
 fn with_regex_fallback_note(body: String, fallback_reason: Option<String>) -> String {
     match fallback_reason {
         Some(reason) => {
-            format!("pattern failed to parse as regex ({reason}); treated as literal\n\n{body}")
+            let cause = reason
+                .lines()
+                .rev()
+                .find(|line| line.trim_start().starts_with("error:"))
+                .map_or(reason.as_str(), str::trim);
+            format!("pattern failed to parse as regex ({cause}); treated as literal\n\n{body}")
         }
         None => body,
     }
@@ -431,7 +439,7 @@ pub fn search_content(
     let (pattern, is_regex) = parse_pattern(query);
     let (result, fallback_reason) = content::search(pattern, scope, is_regex, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    let kind = if is_regex {
+    let kind = if is_regex && fallback_reason.is_none() {
         format::EmptyHint::Regex
     } else {
         format::EmptyHint::Content
@@ -448,17 +456,12 @@ pub fn search_regex(
 ) -> Result<String, TilthError> {
     let (result, fallback_reason) = content::search(pattern, scope, true, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    let body = format_search_result(
-        &result,
-        cache,
-        None,
-        &bloom,
-        0,
-        false,
-        format::EmptyHint::Regex,
-        glob,
-        None,
-    )?;
+    let kind = if fallback_reason.is_some() {
+        format::EmptyHint::Content
+    } else {
+        format::EmptyHint::Regex
+    };
+    let body = format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)?;
     Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
@@ -477,7 +480,7 @@ pub fn search_content_expanded(
     let (pattern, is_regex) = parse_pattern(query);
     let (result, fallback_reason) = content::search(pattern, scope, is_regex, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    let kind = if is_regex {
+    let kind = if is_regex && fallback_reason.is_none() {
         format::EmptyHint::Regex
     } else {
         format::EmptyHint::Content
@@ -511,6 +514,11 @@ pub fn search_regex_expanded(
 ) -> Result<String, TilthError> {
     let (result, fallback_reason) = content::search(pattern, scope, true, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
+    let kind = if fallback_reason.is_some() {
+        format::EmptyHint::Content
+    } else {
+        format::EmptyHint::Regex
+    };
     let body = format_search_result(
         &result,
         cache,
@@ -518,7 +526,7 @@ pub fn search_regex_expanded(
         &bloom,
         expand,
         edit_mode,
-        format::EmptyHint::Regex,
+        kind,
         glob,
         budget,
     )?;
@@ -3333,7 +3341,11 @@ mod tests {
             "missing leading fallback note: {out}"
         );
         assert!(
-            out.contains("#[tool("),
+            out.contains("— 1 matches"),
+            "expected the escaped-literal fallback to find exactly one match: {out}"
+        );
+        assert!(
+            out.contains("lib.rs:1"),
             "literal match for the failed pattern missing: {out}"
         );
     }
@@ -3373,8 +3385,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        // The same text that fails as a regex must still be found, byte-identically,
-        // as a plain kind:content literal search — no fallback note ever applies here.
+        // The same text that fails as a regex must still be found as a plain
+        // kind:content literal search — no fallback note ever applies here.
         let out = search_content_expanded(
             "#[tool(",
             tmp.path(),
@@ -3393,6 +3405,69 @@ mod tests {
             !out.contains("treated as literal"),
             "the literal content path must never emit the regex-fallback note: {out}"
         );
-        assert!(out.contains("#[tool("), "literal match missing: {out}");
+        assert!(
+            out.contains("— 1 matches"),
+            "expected exactly one literal match: {out}"
+        );
+        assert!(out.contains("lib.rs:1"), "literal match missing: {out}");
+    }
+
+    #[test]
+    fn regex_fallback_note_is_single_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "// #[tool(\nfn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = search_regex_expanded(
+            "#[tool(",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let note = out.split("\n\n").next().unwrap();
+        assert!(
+            !note.contains('\n'),
+            "fallback note must collapse to a single line: {note:?}"
+        );
+    }
+
+    #[test]
+    fn regex_fallback_zero_matches_does_not_claim_regex_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = search_regex_expanded(
+            "#[tool(",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("0 matches"),
+            "expected a zero-match header: {out}"
+        );
+        assert!(
+            !out.contains("regex matched zero content"),
+            "escaped-literal fallback with zero matches must not blame a regex: {out}"
+        );
     }
 }
