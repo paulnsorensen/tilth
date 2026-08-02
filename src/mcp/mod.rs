@@ -63,12 +63,13 @@ impl Services {
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
-// The strings live in prompts/mcp-base.md and prompts/mcp-edit.md so they can
-// be versioned and rendered as Markdown. AGENTS.md is regenerated from the
-// same files via scripts/regen-agents-md.sh, keeping the human-facing copy in
-// lockstep with what MCP hosts receive in the `instructions` field.
+// One complete file is served per mode — no concatenation. The strings live
+// in prompts/mcp-base.md and prompts/mcp-edit.md so they can be versioned and
+// rendered as Markdown. AGENTS.md is regenerated from the same files via
+// scripts/regen-agents-md.sh, keeping the human-facing copy in lockstep with
+// what MCP hosts receive in the `instructions` field.
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
-const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
+const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
 
 /// True when the Claude Code cwd-injection hook is active
 /// (`TILTH_MCP_CWD_HOOK_INJECTED=1`, written per-host by `tilth install`). The
@@ -79,46 +80,32 @@ fn cwd_hook_injected() -> bool {
     std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").as_deref() == Ok("1")
 }
 
-/// The cwd-guidance spans in prompts/mcp-base.md, and their hook-aware
-/// replacements. When the hook injects `cwd` the model must NOT set it, so the
-/// built `instructions` swap these two spans. They are exact substrings of
-/// `SERVER_INSTRUCTIONS` (guarded by `cwd_guidance_spans_present`, so a markdown
-/// edit that drifts them fails loudly instead of silently no-op'ing the swap).
+/// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md, and
+/// its hook-aware replacement. When the hook injects `cwd` the model must NOT
+/// set it, so the served instructions swap this span. It is an exact
+/// substring of both files (guarded by `cwd_guidance_spans_present`, so a
+/// markdown edit that drifts it fails loudly instead of silently no-op'ing
+/// the swap).
 const CWD_PATHS_DEFAULT: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
 const CWD_PATHS_HOOKED: &str = "PATHS: `cwd` is injected automatically by the Claude Code hook — do NOT set it. Relative paths/scopes anchor under the injected `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.";
-const CWD_REQ_DEFAULT: &str = "Every tool also REQUIRES `cwd` — your absolute checkout directory.";
-const CWD_REQ_HOOKED: &str =
-    "Every tool takes `cwd`, but the Claude Code hook injects it — do NOT set it.";
 
-/// Compose the MCP `instructions` field: optional overview, the base prompt,
-/// and (in edit mode) the edit-mode addendum, separated by single blank lines
-/// with no trailing whitespace. When `cwd_injected`, the cwd guidance is
-/// rewritten to tell the model the hook supplies `cwd` — matching the per-tool
-/// schema description so the two surfaces never contradict.
-fn build_instructions(edit_mode: bool, overview: &str, cwd_injected: bool) -> String {
-    let trimmed = SERVER_INSTRUCTIONS.trim_end();
-    let base: std::borrow::Cow<str> = if cwd_injected {
-        std::borrow::Cow::Owned(
-            trimmed
-                .replace(CWD_PATHS_DEFAULT, CWD_PATHS_HOOKED)
-                .replace(CWD_REQ_DEFAULT, CWD_REQ_HOOKED),
-        )
+/// Select and return the complete MCP `instructions` string for the given
+/// mode: the standalone base file, or the standalone edit-mode file — never
+/// both. When `cwd_injected`, the cwd guidance in the selected file is
+/// rewritten to tell the model the hook supplies `cwd` — matching the
+/// per-tool schema description so the two surfaces never contradict.
+fn build_instructions(edit_mode: bool, cwd_injected: bool) -> String {
+    let source = if edit_mode {
+        EDIT_MODE_INSTRUCTIONS
     } else {
-        std::borrow::Cow::Borrowed(trimmed)
+        SERVER_INSTRUCTIONS
     };
-    let mut out = String::with_capacity(base.len() + EDIT_MODE_EXTRA.len() + overview.len() + 64);
-    if !overview.is_empty() {
-        out.push_str(overview);
-        out.push_str("\n\n");
+    let trimmed = source.trim_end();
+    if cwd_injected {
+        trimmed.replace(CWD_PATHS_DEFAULT, CWD_PATHS_HOOKED)
+    } else {
+        trimmed.to_string()
     }
-    out.push_str(&base);
-    if edit_mode {
-        // EDIT_MODE_EXTRA owns the separator: it opens with "\n\n" (locked by
-        // edit_mode_extra_byte_lock), so appending it directly yields exactly
-        // one blank line between sections. A manual "\n\n" here doubles it.
-        out.push_str(EDIT_MODE_EXTRA.trim_end());
-    }
-    out
 }
 
 /// Change the process working directory, logging failures to stderr.
@@ -275,13 +262,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
-                String::new()
-            } else {
-                let cwd = current_dir_or_log();
-                crate::overview::fingerprint(&cwd)
-            };
-            let instructions = build_instructions(edit_mode, &overview, cwd_hook_injected());
+            let instructions = build_instructions(edit_mode, cwd_hook_injected());
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -590,40 +571,33 @@ mod tests {
 
     // -- prompt extraction byte locks ------------------------------------------
     //
-    // These tests pin the MCP `instructions` strings to their pre-refactor byte
-    // shapes so the prompts/*.md extraction is provably a no-op. They flag
-    // future drift loudly: any prompt edit must update both the markdown source
-    // and the assertions below.
+    // These tests pin the per-mode MCP `instructions` strings to their byte
+    // shapes so drift is flagged loudly: any prompt edit must update the
+    // assertions below.
 
     #[test]
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            5708,
+            1952,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
             .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
         assert!(SERVER_INSTRUCTIONS
-            .ends_with("DO NOT re-read files already shown in expanded search results."));
+            .ends_with("DO NOT re-read content already shown in expanded results."));
         assert!(
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
-        assert!(SERVER_INSTRUCTIONS.contains("Comma-OR is for kind any/symbol/callers"));
         assert!(
             SERVER_INSTRUCTIONS.contains("DO NOT pass a relative path/scope without `cwd`"),
-            "require-cwd path discipline must lead the file-I/O guidance"
+            "require-cwd path discipline must remain in SERVER_INSTRUCTIONS"
         );
-        assert!(SERVER_INSTRUCTIONS
-            .contains("Re-expanding a previously shown definition returns [shown earlier]"));
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
-            "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_unified_diff\")"),
+            "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
         );
-        // Regression guard for #58: the instructions must advertise the
-        // MCP-qualified tool names so models stop calling bare `tilth_read`
-        // (rejected as "No such tool available").
         assert!(
             SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_search")
                 && SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_read"),
@@ -632,33 +606,37 @@ mod tests {
     }
 
     #[test]
-    fn edit_mode_extra_byte_lock() {
+    fn edit_mode_instructions_byte_lock() {
         assert_eq!(
-            EDIT_MODE_EXTRA.len(),
-            2491,
-            "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
+            EDIT_MODE_INSTRUCTIONS.len(),
+            2011,
+            "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
+        assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
+            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools"
+        ));
+        assert!(EDIT_MODE_INSTRUCTIONS
+            .ends_with("DO NOT re-read content already shown in expanded results."));
         assert!(
-            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write: Batch edit files"),
-            "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
+            !EDIT_MODE_INSTRUCTIONS.contains("\n\n\n"),
+            "EDIT_MODE_INSTRUCTIONS must not introduce triple newlines"
         );
-        assert!(EDIT_MODE_EXTRA
-            .ends_with("DO NOT use the host Edit or Write tool. Use tilth_write for all writes."));
+        assert!(EDIT_MODE_INSTRUCTIONS.contains("tilth_write(edits: [{path, tag, ops}])"));
         assert!(
-            !EDIT_MODE_EXTRA.contains("\n\n\n"),
-            "EDIT_MODE_EXTRA must not introduce triple newlines"
+            EDIT_MODE_INSTRUCTIONS.contains("Ops are line-addressed"),
+            "op grammar pointer must remain in EDIT_MODE_INSTRUCTIONS"
         );
-        assert!(EDIT_MODE_EXTRA.contains("replace {start, end, content}"));
     }
 
-    /// AGENTS.md is the human-facing copy of the embedded prompts, generated by
-    /// scripts/regen-agents-md.sh. Reproduce the regen composition here and fail
-    /// on drift so an edit to prompts/ without a regen (or vice versa) is caught.
+    /// AGENTS.md is the human-facing copy of the two embedded prompt files,
+    /// generated by scripts/regen-agents-md.sh. Reproduce the regen composition
+    /// here and fail on drift so an edit to prompts/ without a regen (or vice
+    /// versa) is caught.
     #[test]
     fn agents_md_matches_prompt_sources() {
         const AGENTS_MD: &str = include_str!("../../AGENTS.md");
         let expected = format!(
-            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}\n"
+            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n"
         );
         assert_eq!(
             AGENTS_MD, expected,
@@ -667,14 +645,18 @@ mod tests {
     }
 
     #[test]
-    fn instructions_compose_with_single_blank_line_between_sections() {
-        // Pre-refactor: format!("{S}{E}") relied on EDIT_MODE_EXTRA's leading
-        // "\n\n" to produce one blank line between the base and edit sections.
-        // This asserts the composition still has that shape.
-        let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
-        assert!(combined.contains(
-            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch edit files"
-        ));
+    fn build_instructions_selects_one_complete_file_per_mode() {
+        // build_instructions selects exactly one standalone file — never both,
+        // never concatenated.
+        let base = build_instructions(false, false);
+        let edit = build_instructions(true, false);
+        assert_eq!(base, SERVER_INSTRUCTIONS.trim_end());
+        assert_eq!(edit, EDIT_MODE_INSTRUCTIONS.trim_end());
+        assert!(
+            !base.contains("tilth_write"),
+            "tilth_write must not leak into base mode"
+        );
+        assert!(edit.contains("tilth_write"));
     }
 
     // -- tilth_read tool: batch reads, suffix grammar, view modes ----------
@@ -1632,60 +1614,30 @@ mod tests {
         assert!(err.contains("edits"), "error must name the param: {err}");
     }
 
-    // -- tilth_search / tilth_list / build_instructions: restored from pre-merge 3801a4c (dropped by #35)
+    // -- build_instructions: mode-select and cwd-hook guidance -------------
 
     #[test]
     fn build_instructions_base_has_expected_anchors() {
-        let s = build_instructions(false, "", false);
-        // Adapted: pre-merge opening anchor was "tilth — AST-aware code
-        // intelligence MCP server."; current prompts/mcp-base.md opens with
-        // "tilth — code intelligence MCP server. Replaces grep, cat, find, ls".
+        let s = build_instructions(false, false);
         assert!(
             s.starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"),
             "missing opening anchor: {:?}",
             &s[..60.min(s.len())]
         );
         assert!(
-            s.contains("[+] added, [-] deleted, [~] body changed, [~:sig] signature changed"),
+            s.ends_with("DO NOT re-read content already shown in expanded results."),
             "missing closing anchor"
         );
-        // Adapted: pre-merge edit-mode marker was "tilth_write is exposed";
-        // current EDIT_MODE_EXTRA opens with "tilth_write: Batch write".
         assert!(
-            !s.contains("tilth_write: Batch write"),
-            "edit-mode pointer leaked into base"
-        );
-    }
-
-    #[test]
-    fn build_instructions_edit_appends_thin_pointer() {
-        let s = build_instructions(true, "", false);
-        // Adapted: pre-merge asserted the marker "tilth_write is exposed";
-        // current EDIT_MODE_EXTRA opens with "tilth_write: Batch write".
-        assert!(
-            s.contains("tilth_write: Batch edit files"),
-            "expected tilth_write addendum in edit-mode instructions"
-        );
-        assert!(
-            !s.contains("Legacy alias: tilth_edit"),
-            "tilth_edit must not be advertised"
-        );
-        // The edit-mode prompt embeds the op grammar and the drift/tag model,
-        // so the edit-mode build must contain them.
-        assert!(
-            s.contains("[path#TAG]"),
-            "tag-header grammar missing from edit-mode prompt: {s}"
-        );
-        assert!(
-            s.contains("replace {start, end, content}"),
-            "op grammar missing from edit-mode prompt: {s}"
+            !s.contains("tilth_write"),
+            "edit-mode tool must not leak into base mode"
         );
     }
 
     #[test]
     fn build_instructions_no_trailing_whitespace() {
         for &edit in &[false, true] {
-            let s = build_instructions(edit, "", false);
+            let s = build_instructions(edit, false);
             assert!(
                 !s.ends_with('\n') && !s.ends_with(' '),
                 "wire output must not end with whitespace (edit={edit})"
@@ -1693,50 +1645,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_instructions_edit_single_blank_line_and_byte_lock() {
-        // Regression guard for the composed edit-mode string. A prior manual
-        // "\n\n" was pushed on top of EDIT_MODE_EXTRA's own leading "\n\n",
-        // producing a four-newline (double blank) junction that broke the
-        // byte-identical invariant the revival claimed. The piece-wise locks
-        // (edit_mode_extra_byte_lock, SERVER_INSTRUCTIONS checks) do not guard
-        // the *composed* output, so lock it here.
-        let edit = build_instructions(true, "", false);
-        assert!(
-            edit.contains(
-                "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch edit files"
-            ),
-            "edit-mode section junction must be a single blank line"
-        );
-        assert!(
-            !edit.contains("\n\n\n"),
-            "edit-mode composition must not contain a triple newline (double blank line)"
-        );
-        assert_eq!(
-            build_instructions(false, "", false).len(),
-            5708,
-            "non-edit composed instructions byte count drifted"
-        );
-        assert_eq!(
-            edit.len(),
-            8199,
-            "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
-        );
-    }
-
-    #[test]
-    fn build_instructions_overview_prepends_with_blank_line() {
-        let s = build_instructions(false, "OVERVIEW", false);
-        assert!(
-            s.starts_with("OVERVIEW\n\ntilth — "),
-            "overview should be followed by blank line then base"
-        );
-    }
-
-    /// The hook-aware swap targets exact substrings of the base prompt. If a
-    /// markdown edit drifts either span, `.replace` would silently no-op and the
-    /// prompt would keep telling the model to set `cwd` under the hook — the
-    /// exact contradiction this feature removes. Guard both spans here.
+    /// The hook-aware swap targets an exact substring of the served prompt. If
+    /// a markdown edit drifts the span, `.replace` would silently no-op and
+    /// the prompt would keep telling the model to set `cwd` under the hook —
+    /// the exact contradiction this feature removes. Guard it in both modes.
     #[test]
     fn cwd_guidance_spans_present() {
         assert!(
@@ -1744,31 +1656,73 @@ mod tests {
             "PATHS cwd span drifted from prompts/mcp-base.md — hook swap would no-op"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_REQ_DEFAULT),
-            "REQUIRES cwd span drifted from prompts/mcp-base.md — hook swap would no-op"
+            EDIT_MODE_INSTRUCTIONS.contains(CWD_PATHS_DEFAULT),
+            "PATHS cwd span drifted from prompts/mcp-edit.md — hook swap would no-op"
         );
     }
 
     #[test]
     fn build_instructions_flips_cwd_guidance_under_hook() {
-        let default = build_instructions(false, "", false);
-        let hooked = build_instructions(false, "", true);
+        let default = build_instructions(false, false);
+        let hooked = build_instructions(false, true);
 
         // Default keeps the explicit-cwd directive; hooked drops it.
         assert!(default.contains(CWD_PATHS_DEFAULT));
-        assert!(default.contains(CWD_REQ_DEFAULT));
         assert!(!default.contains("injected automatically by the Claude Code hook"));
 
         // Hooked tells the model NOT to set cwd, matching the schema description.
         assert!(!hooked.contains(CWD_PATHS_DEFAULT));
-        assert!(!hooked.contains(CWD_REQ_DEFAULT));
         assert!(hooked
             .contains("`cwd` is injected automatically by the Claude Code hook — do NOT set it"));
-        assert!(hooked.contains("the Claude Code hook injects it — do NOT set it"));
-        // The "do NOT set it" phrasing mirrors the per-tool cwd schema
-        // description (mcp::tools::definitions::cwd_description), keeping the two
-        // model-facing surfaces consistent.
+        // Mirrors the per-tool cwd schema description (mcp::tools::definitions),
+        // keeping the two model-facing surfaces consistent.
         assert!(hooked.contains("do NOT set it"));
+    }
+
+    /// Both modes must fit Claude Code's 2KB `instructions`-field truncation
+    /// (per-mode root cause: an 8.7KB composed prompt was truncated below the
+    /// fold, so agents never saw the per-tool routing section) and must still
+    /// carry the full routing surface: the cwd PATHS guidance, every tool the
+    /// mode offers, and the shell DO NOT lines.
+    #[test]
+    fn build_instructions_fit_2kb_and_carry_critical_spans() {
+        let shared_tools = [
+            "tilth_search",
+            "tilth_read",
+            "tilth_list",
+            "tilth_deps",
+            "tilth_grok",
+            "tilth_diff",
+        ];
+        for &edit in &[false, true] {
+            let s = build_instructions(edit, false);
+            assert!(
+                s.len() <= 2048,
+                "instructions (edit={edit}) must fit the 2KB field: {} bytes",
+                s.len()
+            );
+            assert!(
+                s.contains(CWD_PATHS_DEFAULT),
+                "missing PATHS span (edit={edit})"
+            );
+            for tool in shared_tools {
+                assert!(s.contains(tool), "missing tool {tool} (edit={edit})");
+            }
+            if edit {
+                assert!(
+                    s.contains("tilth_write"),
+                    "edit mode must advertise tilth_write"
+                );
+            }
+            assert!(
+                s.contains("DO NOT cat/head/tail/sed repo files via shell"),
+                "missing shell DO NOT line (edit={edit})"
+            );
+            assert!(
+                s.contains("DO NOT grep/rg/ls/find via shell"),
+                "missing shell DO NOT line (edit={edit})"
+            );
+        }
     }
 
     /// Tightened tree-shape assertion: the rendered tree carries the box-
