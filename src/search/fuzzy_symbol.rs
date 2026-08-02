@@ -25,10 +25,11 @@ use crate::types::{FileType, OutlineEntry, OutlineKind};
 
 /// Upper bound on distinct definition names scored.
 const MAX_FUZZY_CANDIDATES: usize = 20_000;
-/// Upper bound on files read and parsed. Independent of
-/// [`MAX_FUZZY_CANDIDATES`] — a scope of large files with few or repeated
+/// Upper bound on the count of files entering the read+parse step. Independent
+/// of [`MAX_FUZZY_CANDIDATES`] — a scope of large files with few or repeated
 /// definition names would otherwise never trip the name cap and read+parse
-/// the entire scope.
+/// the entire scope. Counted before the read succeeds or the minified-content
+/// gate runs, so it bounds read+parse attempts, not confirmed reads.
 const MAX_FUZZY_FILES: usize = 20_000;
 const SUGGESTION_K: usize = 3;
 
@@ -43,7 +44,9 @@ static TRUNCATION_WARNED: AtomicBool = AtomicBool::new(false);
 /// resolve. Returns up to [`SUGGESTION_K`] definition names ranked by fuzzy
 /// match against `query`, plus whether the candidate pool was truncated by a
 /// cap (so the caller can tell the agent the miss may hide a better match).
-/// Returns `None` when nothing in `scope` scores against `query`.
+/// Returns `None` when nothing in `scope` scores against `query` and the pool
+/// was not truncated; when a cap truncated the pool, returns `Some((vec![], true))`
+/// even with no scored matches, so the caller can still surface the signal.
 pub(crate) fn suggestions(scope: &Path, query: &str) -> Option<(Vec<String>, bool)> {
     let (mut candidates, truncated) = collect_candidates(scope);
     if truncated && !TRUNCATION_WARNED.swap(true, Ordering::Relaxed) {
@@ -67,7 +70,7 @@ pub(crate) fn suggestions(scope: &Path, query: &str) -> Option<(Vec<String>, boo
     );
     let scored = atom.match_list(candidates, &mut matcher);
     if scored.is_empty() {
-        return None;
+        return truncated.then_some((Vec::new(), true));
     }
     Some((
         scored
@@ -87,16 +90,27 @@ pub(crate) fn suggestions(scope: &Path, query: &str) -> Option<(Vec<String>, boo
 /// [`MAX_FUZZY_FILES`] — was hit (no separate flag needed: the walk state
 /// after `Quit` already carries that signal).
 fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
+    collect_candidates_capped(scope, MAX_FUZZY_CANDIDATES, MAX_FUZZY_FILES)
+}
+
+/// `collect_candidates` with the two caps as parameters — a test seam so unit
+/// tests can exercise cap-triggered truncation without walking real
+/// [`MAX_FUZZY_CANDIDATES`]/[`MAX_FUZZY_FILES`]-sized fixtures.
+fn collect_candidates_capped(
+    scope: &Path,
+    max_names: usize,
+    max_files: usize,
+) -> (Vec<String>, bool) {
     let Ok(walker) = crate::search::walker(scope, None) else {
         return (Vec::new(), false);
     };
 
     let candidates = Mutex::new(HashSet::new());
-    let files_visited = AtomicUsize::new(0);
+    let code_files_attempted = AtomicUsize::new(0);
 
     walker.run(|| {
         let candidates = &candidates;
-        let files_visited = &files_visited;
+        let code_files_attempted = &code_files_attempted;
         Box::new(move |entry| {
             let Some((path, file_size)) = crate::search::accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
@@ -108,7 +122,7 @@ fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
             let FileType::Code(lang) = detect_file_type(path) else {
                 return ignore::WalkState::Continue;
             };
-            if files_visited.fetch_add(1, Ordering::Relaxed) >= MAX_FUZZY_FILES {
+            if code_files_attempted.fetch_add(1, Ordering::Relaxed) >= max_files {
                 return ignore::WalkState::Quit;
             }
             let Ok(content) = fs::read_to_string(path) else {
@@ -127,7 +141,7 @@ fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for name in names {
-                if candidates.len() >= MAX_FUZZY_CANDIDATES {
+                if candidates.len() >= max_names {
                     return ignore::WalkState::Quit;
                 }
                 candidates.insert(name);
@@ -139,8 +153,8 @@ fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
     let candidates = candidates
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let truncated = candidates.len() >= MAX_FUZZY_CANDIDATES
-        || files_visited.load(Ordering::Relaxed) >= MAX_FUZZY_FILES;
+    let truncated =
+        candidates.len() >= max_names || code_files_attempted.load(Ordering::Relaxed) > max_files;
     (candidates.into_iter().collect(), truncated)
 }
 
@@ -165,29 +179,43 @@ mod tests {
 
     #[test]
     fn candidate_collection_hard_caps_at_max_candidates() {
-        let entries: Vec<_> = (0..=MAX_FUZZY_CANDIDATES)
-            .map(|i| OutlineEntry {
-                kind: OutlineKind::Function,
-                name: format!("candidate_{i}"),
-                start_line: 1,
-                end_line: 1,
-                signature: None,
-                children: Vec::new(),
-                doc: None,
-            })
-            .collect();
-        let mut names = Vec::new();
-        collect_entry_names(&entries, &mut names);
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n",
+        )
+        .unwrap();
 
-        let mut candidates = HashSet::new();
-        for name in names {
-            if candidates.len() >= MAX_FUZZY_CANDIDATES {
-                break;
-            }
-            candidates.insert(name);
-        }
+        let (candidates, truncated) = collect_candidates_capped(tmp.path(), 2, 1000);
 
-        assert_eq!(candidates.len(), MAX_FUZZY_CANDIDATES);
+        assert_eq!(candidates.len(), 2);
+        assert!(truncated, "hitting the name cap must report truncated");
+    }
+
+    #[test]
+    fn candidate_collection_hard_caps_at_max_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn beta() {}\n").unwrap();
+
+        let (_, truncated) = collect_candidates_capped(tmp.path(), 1000, 1);
+
+        assert!(truncated, "hitting the file cap must report truncated");
+    }
+
+    #[test]
+    fn candidate_collection_reports_untruncated_at_exact_cap_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(tmp.path().join("b.rs"), "fn beta() {}\n").unwrap();
+
+        let (candidates, truncated) = collect_candidates_capped(tmp.path(), 1000, 2);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            !truncated,
+            "a scope that exactly fills the file cap without overflowing is complete, not truncated"
+        );
     }
 
     #[test]
@@ -240,6 +268,15 @@ mod tests {
             OutlineEntry {
                 kind: OutlineKind::Function,
                 name: "real_symbol".to_string(),
+                start_line: 1,
+                end_line: 1,
+                signature: None,
+                children: Vec::new(),
+                doc: None,
+            },
+            OutlineEntry {
+                kind: OutlineKind::Function,
+                name: "x".to_string(),
                 start_line: 1,
                 end_line: 1,
                 signature: None,

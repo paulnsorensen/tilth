@@ -103,11 +103,13 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
         .then(|| crate::search::fuzzy_symbol::suggestions(scope, name))
         .flatten()
         .map(|(names, truncated)| {
-            let mut s = names.join(", ");
-            if truncated {
-                s.push_str(" (scope too large to fully search — narrow scope for a better match)");
+            let list = names.join(", ");
+            let note = "Scope too large to fully search — narrow scope for a better match.";
+            match (list.is_empty(), truncated) {
+                (_, false) => list,
+                (true, true) => note.to_string(),
+                (false, true) => format!("{list}. {note}"),
             }
-            s
         });
     Err(TilthError::NotFound {
         path: PathBuf::from(name),
