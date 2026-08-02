@@ -411,6 +411,17 @@ pub fn search_multi_symbol_expanded(
     Ok(sections.join("\n\n---\n"))
 }
 
+/// Formats the leading disclosure note when a regex pattern failed to
+/// compile and was retried as an escaped literal.
+fn with_regex_fallback_note(body: String, fallback_reason: Option<String>) -> String {
+    match fallback_reason {
+        Some(reason) => {
+            format!("pattern failed to parse as regex ({reason}); treated as literal\n\n{body}")
+        }
+        None => body,
+    }
+}
+
 pub fn search_content(
     query: &str,
     scope: &Path,
@@ -418,14 +429,15 @@ pub fn search_content(
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, false)?;
+    let (result, fallback_reason) = content::search(pattern, scope, is_regex, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     let kind = if is_regex {
         format::EmptyHint::Regex
     } else {
         format::EmptyHint::Content
     };
-    format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)
+    let body = format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)?;
+    Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
 pub fn search_regex(
@@ -434,9 +446,9 @@ pub fn search_regex(
     cache: &OutlineCache,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, false)?;
+    let (result, fallback_reason) = content::search(pattern, scope, true, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
+    let body = format_search_result(
         &result,
         cache,
         None,
@@ -446,7 +458,8 @@ pub fn search_regex(
         format::EmptyHint::Regex,
         glob,
         None,
-    )
+    )?;
+    Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
 pub fn search_content_expanded(
@@ -462,14 +475,14 @@ pub fn search_content_expanded(
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, glob, full)?;
+    let (result, fallback_reason) = content::search(pattern, scope, is_regex, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     let kind = if is_regex {
         format::EmptyHint::Regex
     } else {
         format::EmptyHint::Content
     };
-    format_search_result(
+    let body = format_search_result(
         &result,
         cache,
         Some(session),
@@ -479,7 +492,8 @@ pub fn search_content_expanded(
         kind,
         glob,
         budget,
-    )
+    )?;
+    Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
@@ -495,9 +509,9 @@ pub fn search_regex_expanded(
     edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, glob, full)?;
+    let (result, fallback_reason) = content::search(pattern, scope, true, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
+    let body = format_search_result(
         &result,
         cache,
         Some(session),
@@ -507,7 +521,8 @@ pub fn search_regex_expanded(
         format::EmptyHint::Regex,
         glob,
         budget,
-    )
+    )?;
+    Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
@@ -526,7 +541,7 @@ pub fn search_content_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, false)
+    content::search(pattern, scope, is_regex, None, glob, false).map(|(result, _)| result)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
@@ -535,7 +550,7 @@ pub fn search_regex_raw(
     scope: &Path,
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, false)
+    content::search(pattern, scope, true, None, glob, false).map(|(result, _)| result)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -2201,12 +2216,13 @@ mod tests {
     #[test]
     fn content_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all =
+        let (all, _) =
             content::search("TilthError", &scope, false, None, None, false).expect("search failed");
-        let rs_only = content::search("TilthError", &scope, false, None, Some("*.rs"), false)
+        let (rs_only, _) = content::search("TilthError", &scope, false, None, Some("*.rs"), false)
             .expect("search with glob failed");
-        let toml_only = content::search("TilthError", &scope, false, None, Some("*.toml"), false)
-            .expect("search with toml glob failed");
+        let (toml_only, _) =
+            content::search("TilthError", &scope, false, None, Some("*.toml"), false)
+                .expect("search with toml glob failed");
 
         assert!(all.total_found > 0, "unfiltered should find TilthError");
         assert!(rs_only.total_found > 0, "*.rs should find TilthError");
@@ -2380,7 +2396,7 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("linked")).unwrap();
 
-        let result = content::search(
+        let (result, _) = content::search(
             "unique_symlink_test_symbol",
             tmp.path(),
             false,
@@ -3288,5 +3304,95 @@ mod tests {
             with_none, with_explicit_default,
             "omitting budget must be identical to explicitly passing DEFAULT_BUDGET"
         );
+    }
+
+    #[test]
+    fn regex_invalid_pattern_falls_back_to_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "// #[tool(\nfn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = search_regex_expanded(
+            "#[tool(",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            out.starts_with("pattern failed to parse as regex (")
+                && out.contains("); treated as literal"),
+            "missing leading fallback note: {out}"
+        );
+        assert!(
+            out.contains("#[tool("),
+            "literal match for the failed pattern missing: {out}"
+        );
+    }
+
+    #[test]
+    fn regex_valid_pattern_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = search_regex_expanded(
+            "fn \\w+",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !out.contains("treated as literal"),
+            "a valid regex must not trigger the fallback note: {out}"
+        );
+        assert!(out.contains("fn f"), "valid regex match missing: {out}");
+    }
+
+    #[test]
+    fn content_literal_search_unaffected_by_regex_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "// #[tool(\nfn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        // The same text that fails as a regex must still be found, byte-identically,
+        // as a plain kind:content literal search — no fallback note ever applies here.
+        let out = search_content_expanded(
+            "#[tool(",
+            tmp.path(),
+            &cache,
+            &session,
+            2,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !out.contains("treated as literal"),
+            "the literal content path must never emit the regex-fallback note: {out}"
+        );
+        assert!(out.contains("#[tool("), "literal match missing: {out}");
     }
 }
