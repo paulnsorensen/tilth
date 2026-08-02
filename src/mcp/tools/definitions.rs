@@ -75,7 +75,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Pass every file you need in one call; for a single file use a one-element array. Singular `path` is not accepted."
+                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Pass every file you need in one call; for a single file use a one-element array. Singular `path` is not accepted, and schema-validating hosts reject a bare string — always send an array."
                     },
                     "mode": {
                         "type": "string",
@@ -194,7 +194,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Restrict diff output to a specific file or directory path."
+                        "description": "Restrict diff output to a file (suffix-matched, e.g. 'a.rs'). In overview mode only, also accepts a repo-root-relative directory prefix (e.g. 'src/fanout'); log mode takes a file scope only."
                     },
                     "a": {
                         "type": "string",
@@ -290,15 +290,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     tools
 }
 
-/// The description for the shared `cwd` property: the model must always set
-/// it explicitly.
-fn cwd_description() -> &'static str {
-    "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd."
-}
-
-/// The shared `cwd` schema property.
+/// The shared `cwd` schema property. The description text is model-facing
+/// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    serde_json::json!({ "type": "string", "description": cwd_description() })
+    serde_json::json!({ "type": "string", "description": "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd." })
 }
 
 #[cfg(test)]
@@ -595,11 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn cwd_description_tells_model_to_set_explicitly() {
+    fn cwd_property_description_tells_model_to_set_explicitly() {
+        let property = cwd_property();
+        let description = property["description"]
+            .as_str()
+            .expect("cwd property description is a string");
         assert!(
-            cwd_description().contains("always set this explicitly"),
-            "cwd description must tell the model to set cwd: {}",
-            cwd_description()
+            description.contains("always set this explicitly"),
+            "cwd description must tell the model to set cwd: {description}"
         );
     }
 

@@ -73,6 +73,16 @@ fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
     }
 }
 
+/// Returns a migration warning when a pre-#144 Claude Code hook install is still
+/// on disk. tilth no longer ships the `PreToolUse` cwd-injection hook; leaving it
+/// wired means an omitted `cwd` gets silently filled with the session root instead
+/// of tilth's teaching refusal.
+fn stale_hook_warning(script_exists: bool) -> Option<&'static str> {
+    script_exists.then_some(
+        "tilth: found a stale Claude Code cwd-injection hook. Delete ~/.claude/tilth/inject-cwd.js and remove the mcp__tilth__.* PreToolUse entry from ~/.claude/settings.json — tilth no longer ships this hook, and leaving it wired means an omitted cwd is silently filled with the session root instead of tilth's teaching refusal.",
+    )
+}
+
 /// Write MCP config for the given host, preserving existing config.
 pub fn run(host: &str, edit: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
@@ -87,6 +97,14 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
             write_json_config(&host_info, edit)?;
         }
         ConfigFormat::Toml => write_toml_config(&host_info, edit)?,
+    }
+
+    if host == "claude-code" {
+        if let Some(msg) =
+            stale_hook_warning(home_dir()?.join(".claude/tilth/inject-cwd.js").exists())
+        {
+            eprintln!("{msg}");
+        }
     }
 
     if edit {
@@ -690,6 +708,26 @@ mod tests {
     }
 
     #[test]
+    fn amp_overwrite_drops_stale_env_key() {
+        let mut config = json!({
+            "amp.mcpServers": {
+                "tilth": {"command": "old", "args": ["--old"], "env": {"TILTH_MCP_CWD_HOOK_INJECTED": "1"}}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
+
+        // Asserting the whole entry, not just `env`'s absence: indexing a missing
+        // key yields `Value::Null`, whose `.get("env")` is also `None`, so an
+        // absence-only check would pass even if the upsert dropped `tilth` entirely.
+        assert_eq!(
+            config["amp.mcpServers"]["tilth"],
+            json!({"command": "tilth", "args": ["--mcp"]}),
+            "upsert must replace the whole entry, dropping the stale env key: {config:?}"
+        );
+    }
+
+    #[test]
     fn amp_error_when_servers_key_not_object() {
         let mut config = json!({"amp.mcpServers": []});
         let entry = json!({"command": "tilth", "args": ["--mcp"]});
@@ -1082,5 +1120,24 @@ mod tests {
         assert!(config.get("mcpServers").is_none());
         assert_eq!(config["mcp"]["tilth"]["type"], json!("local"));
         assert!(config["mcp"]["tilth"]["command"].is_array());
+    }
+
+    /// The message is this function's entire product, and it names two operator-facing
+    /// paths plus the hook matcher. Pin the full text so drifting it — or drifting the
+    /// path `run` actually probes — fails here instead of telling an operator to delete
+    /// a file tilth never looked for.
+    #[test]
+    fn stale_hook_warning_present_when_script_exists() {
+        assert_eq!(
+            stale_hook_warning(true),
+            Some(
+                "tilth: found a stale Claude Code cwd-injection hook. Delete ~/.claude/tilth/inject-cwd.js and remove the mcp__tilth__.* PreToolUse entry from ~/.claude/settings.json — tilth no longer ships this hook, and leaving it wired means an omitted cwd is silently filled with the session root instead of tilth's teaching refusal."
+            )
+        );
+    }
+
+    #[test]
+    fn stale_hook_warning_absent_when_script_missing() {
+        assert_eq!(stale_hook_warning(false), None);
     }
 }
