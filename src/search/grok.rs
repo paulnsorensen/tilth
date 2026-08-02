@@ -102,7 +102,15 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
     let suggestion = (bare == name)
         .then(|| crate::search::fuzzy_symbol::suggestions(scope, name))
         .flatten()
-        .map(|names| names.join(", "));
+        .map(|(names, truncated)| {
+            let list = names.join(", ");
+            let note = "Scope too large to fully search — narrow scope for a better match.";
+            match (list.is_empty(), truncated) {
+                (_, false) => list,
+                (true, true) => note.to_string(),
+                (false, true) => format!("{list}. {note}"),
+            }
+        });
     Err(TilthError::NotFound {
         path: PathBuf::from(name),
         suggestion,
@@ -1631,8 +1639,54 @@ impl<T> Foo<T> {
         );
         assert!(
             !suggestion.contains("outside"),
-            "symbols outside the requested scope must not be suggested: {suggestion}"
+            "sibling directories outside the requested scope must not be suggested: {suggestion}"
         );
+    }
+
+    #[test]
+    fn resolve_plain_name_suggestions_ranked_best_match_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["handle_request", "handle_request_two"] {
+            write_fixture(
+                tmp.path(),
+                &format!("src/{name}.rs"),
+                &format!("fn {name}() {{}}\n"),
+            );
+        }
+        write_fixture(tmp.path(), "src/unrelated.rs", "fn unrelated_thing() {}\n");
+        write_fixture(tmp.path(), "src/other.rs", "fn zzz_other() {}\n");
+
+        let err = resolve_with_source("handle_requst", tmp.path()).unwrap_err();
+        let suggestion = match err {
+            TilthError::NotFound { suggestion, .. } => {
+                suggestion.expect("a close typo should suggest real symbols")
+            }
+            other => panic!("expected NotFound with a suggestion, got {other:?}"),
+        };
+        assert_eq!(
+            suggestion, "handle_request, handle_request_two",
+            "best match must sort first, in exact rank order: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn resolve_plain_name_poor_subsequence_match_still_suggests() {
+        // Nucleo's fuzzy match has no score floor: it returns `Some` for ANY
+        // query that is a subsequence of a candidate, however poor the match.
+        // Mirrors the contract documented at `read/fuzzy_path.rs`'s
+        // `resolve_fuzzy_path`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/requests.rs", "fn handle_request() {}\n");
+
+        let err = resolve_with_source("her", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => assert_eq!(
+                suggestion.as_deref(),
+                Some("handle_request"),
+                "a subsequence match, however poor, must still suggest"
+            ),
+            other => panic!("expected NotFound with a suggestion, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1658,6 +1712,25 @@ impl<T> Foo<T> {
                 );
             }
             other => panic!("expected NotFound with suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_bare_name_absent_everywhere_404s_without_suggestion() {
+        // `dispatch` doesn't exist anywhere in scope, under any owner, so
+        // `resolve_by_name`'s `(bare == name)` gate at grok.rs:102 must suppress
+        // fuzzy suggestions here (they only fire for genuinely bare targets),
+        // not fuzz-match the full qualified spec against unrelated symbols.
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/other.rs", "fn distributed_patch() {}\n");
+
+        let err = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => assert_eq!(
+                suggestion, None,
+                "a qualified target whose bare name doesn't exist anywhere must not fuzz-suggest"
+            ),
+            other => panic!("expected NotFound without a suggestion, got {other:?}"),
         }
     }
 

@@ -16,7 +16,7 @@ pub(in crate::mcp) fn tool_grok(
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or(
-            "missing required parameter: target — grok explains ONE symbol or location.\nExample:\n  tilth_grok({\"target\": \"handle_request\", \"cwd\": \"/abs/checkout\",\n    \"scope\": \"src\", \"full\": false, \"budget\": 6000})\ntarget = symbol name (\"handle_request\", \"Foo::bar\") or path:line (\"src/lib.rs:42\").\nFor area-level exploration use tilth_search or tilth_list instead.",
+            "missing required parameter: target (symbol name or \"path:line\", e.g. \"Type::method\" or \"src/file.rs:7\")",
         )?;
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = resolve_scope(args, cwd)?;
@@ -62,11 +62,10 @@ mod tests {
     fn missing_target_teaches_grok_target_grammar() {
         let err = tool_grok(&serde_json::json!({}), &bloom(), &Session::new()).unwrap_err();
         assert!(
-            err.contains("tilth_grok({\"target\": \"handle_request\", \"cwd\": \"/abs/checkout\",")
-                && err.contains("    \"scope\": \"src\", \"full\": false, \"budget\": 6000})")
-                && err.contains("target = symbol name (\"handle_request\", \"Foo::bar\") or path:line (\"src/lib.rs:42\").")
-                && err.contains("For area-level exploration use tilth_search or tilth_list instead."),
-            "missing target should teach the complete grok call and target grammar: {err}"
+            err.contains("missing required parameter: target")
+                && err.contains("\"Type::method\"")
+                && err.contains("\"src/file.rs:7\""),
+            "missing target should teach the target grammar: {err}"
         );
     }
 
