@@ -71,41 +71,23 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
 
-/// True when the Claude Code cwd-injection hook is active
-/// (`TILTH_MCP_CWD_HOOK_INJECTED=1`, written per-host by `tilth install`). The
-/// per-tool `cwd` schema description reads the same var in
-/// `mcp::tools::definitions::cwd_property`; both surfaces must agree, so the
-/// hook-aware prompt swap below keys off the identical check.
-fn cwd_hook_injected() -> bool {
-    std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").as_deref() == Ok("1")
-}
-
-/// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md, and
-/// its hook-aware replacement. When the hook injects `cwd` the model must NOT
-/// set it, so the served instructions swap this span. It is an exact
-/// substring of both files (guarded by `cwd_guidance_spans_present`, so a
-/// markdown edit that drifts it fails loudly instead of silently no-op'ing
-/// the swap).
-const CWD_PATHS_DEFAULT: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
-const CWD_PATHS_HOOKED: &str = "PATHS: `cwd` is injected automatically by the Claude Code hook — do NOT set it. Relative paths/scopes anchor under the injected `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.";
+/// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md. Exact
+/// substring of both files, guarded by `cwd_guidance_spans_present` so an edit
+/// that drops or reworks the explicit-cwd directive fails the test rather than
+/// silently changing the model-facing cwd contract.
+#[cfg(test)]
+const CWD_PATHS_SPAN: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
 
 /// Select and return the complete MCP `instructions` string for the given
 /// mode: the standalone base file, or the standalone edit-mode file — never
-/// both. When `cwd_injected`, the cwd guidance in the selected file is
-/// rewritten to tell the model the hook supplies `cwd` — matching the
-/// per-tool schema description so the two surfaces never contradict.
-fn build_instructions(edit_mode: bool, cwd_injected: bool) -> String {
+/// both.
+fn build_instructions(edit_mode: bool) -> String {
     let source = if edit_mode {
         EDIT_MODE_INSTRUCTIONS
     } else {
         SERVER_INSTRUCTIONS
     };
-    let trimmed = source.trim_end();
-    if cwd_injected {
-        trimmed.replace(CWD_PATHS_DEFAULT, CWD_PATHS_HOOKED)
-    } else {
-        trimmed.to_string()
-    }
+    source.trim_end().to_string()
 }
 
 /// Change the process working directory, logging failures to stderr.
@@ -134,15 +116,6 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
-/// The startup warning emitted when the Claude Code cwd-injection hook is
-/// expected (`TILTH_MCP_CWD_HOOK_INJECTED=1`) so an operator without the hook
-/// installed has a grep-able stderr line. `None` for any other env value.
-fn hook_injection_warning(env_value: Option<&str>) -> Option<&'static str> {
-    (env_value == Some("1")).then_some(
-        "tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed",
-    )
-}
-
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
@@ -163,12 +136,6 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         if let Some(root) = crate::lang::package_root(&cwd) {
             chdir_or_log(root);
         }
-    }
-
-    if let Some(msg) =
-        hook_injection_warning(std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").ok().as_deref())
-    {
-        eprintln!("{msg}");
     }
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
@@ -262,7 +229,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let instructions = build_instructions(edit_mode, cwd_hook_injected());
+            let instructions = build_instructions(edit_mode);
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -449,17 +416,6 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 mod tests {
     use super::*;
     use std::fmt::Write as _;
-
-    #[test]
-    fn hook_injection_warning_fires_only_on_one() {
-        assert_eq!(
-            hook_injection_warning(Some("1")),
-            Some("tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed")
-        );
-        assert_eq!(hook_injection_warning(Some("0")), None);
-        assert_eq!(hook_injection_warning(Some("true")), None);
-        assert_eq!(hook_injection_warning(None), None);
-    }
 
     /// Tool handlers now require an absolute `cwd`. Injects a default so the
     /// behavior tests below can focus on the handler under test: absolute paths
@@ -648,8 +604,8 @@ mod tests {
     fn build_instructions_selects_one_complete_file_per_mode() {
         // build_instructions selects exactly one standalone file — never both,
         // never concatenated.
-        let base = build_instructions(false, false);
-        let edit = build_instructions(true, false);
+        let base = build_instructions(false);
+        let edit = build_instructions(true);
         assert_eq!(base, SERVER_INSTRUCTIONS.trim_end());
         assert_eq!(edit, EDIT_MODE_INSTRUCTIONS.trim_end());
         assert!(
@@ -672,21 +628,39 @@ mod tests {
     }
 
     #[test]
-    fn tool_read_paths_wrong_type_reports_type_error() {
-        // A scalar (or any non-array) value for `paths` should produce a
-        // type-specific error, not the generic "missing" message.
-        let args = serde_json::json!({ "paths": "a.rs" });
+    fn tool_read_paths_bare_string_coerces_and_nudges() {
+        // A bare-string `paths` coerces to a single-element array and reads
+        // the file; the response teaches batching via a nudge note.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.rs");
+        std::fs::write(&p, "fn a() {}\n").unwrap();
+        let args = serde_json::json!({ "paths": p.to_str().unwrap() });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&tc(&args), &cache, &session, false)
+            .expect("bare-string paths must coerce and read, not error");
+        assert!(
+            out.contains("fn a()"),
+            "coerced read must return file content: {out}"
+        );
+        assert!(
+            out.contains("paths: [\"a.rs\", \"b.rs\"]"),
+            "response must teach batching via a nudge note: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_paths_non_string_element_shows_corrected_shape() {
+        // Arrays with non-string elements still error, but now the error
+        // shows the corrected shape rather than a bare type complaint.
+        let args = serde_json::json!({ "paths": [{"bad": true}] });
         let cache = OutlineCache::new();
         let session = Session::new();
         let err = tool_read(&tc(&args), &cache, &session, false)
-            .expect_err("scalar `paths` must be rejected as wrong type");
+            .expect_err("non-string array element must still error");
         assert!(
-            err.contains("paths must be an array"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !err.contains("missing required parameter"),
-            "wrong-type error must not claim the param is missing: {err}"
+            err.contains("paths: [\"a.rs\", \"b.rs\"]"),
+            "error must show the corrected shape: {err}"
         );
     }
 
@@ -701,6 +675,37 @@ mod tests {
         let err = tool_read(&tc(&args), &cache, &session, false)
             .expect_err("unknown mode must be rejected");
         assert!(err.contains("unknown read mode"), "unexpected error: {err}");
+        assert!(
+            err.contains("auto, full, signature, stripped"),
+            "error must name all valid modes: {err}"
+        );
+        assert!(
+            err.contains("edit mode"),
+            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+        );
+    }
+
+    /// `mode: "edit"` was never a valid mode value — tagged/editable reads
+    /// happen automatically when the server runs in edit mode, so the error
+    /// must redirect the caller rather than just name it "unknown".
+    #[test]
+    fn tool_read_mode_edit_teaches_server_mode() {
+        let args = serde_json::json!({
+            "paths": ["a.rs"],
+            "mode": "edit"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&tc(&args), &cache, &session, false)
+            .expect_err("mode: edit must still be rejected");
+        assert!(
+            err.contains("auto, full, signature, stripped"),
+            "error must name valid modes: {err}"
+        );
+        assert!(
+            err.contains("\"edit\" is not a mode"),
+            "error must redirect \"edit\" to the mode-only clause, not just call it unknown: {err}"
+        );
     }
 
     /// Batch reads must return the content of every submitted path — no file
@@ -736,6 +741,11 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+
+        assert!(
+            !result.contains("> Note: paths accepts an array"),
+            "well-formed array paths must not carry the coercion nudge: {result}"
+        );
     }
 
     #[test]
@@ -1397,6 +1407,10 @@ mod tests {
         let err =
             tool_read(&tc(&args), &cache, &session, false).expect_err("unknown mode rejected");
         assert!(err.contains("stripped"), "error must list new mode: {err}");
+        assert!(
+            err.contains("edit mode"),
+            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+        );
     }
 
     /// Auto-signature on large code emits `view: "signature"` and the
@@ -1618,7 +1632,10 @@ mod tests {
 
     #[test]
     fn build_instructions_base_has_expected_anchors() {
-        let s = build_instructions(false, false);
+        let s = build_instructions(false);
+        // Adapted: pre-merge opening anchor was "tilth — AST-aware code
+        // intelligence MCP server."; current prompts/mcp-base.md opens with
+        // "tilth — code intelligence MCP server. Replaces grep, cat, find, ls".
         assert!(
             s.starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"),
             "missing opening anchor: {:?}",
@@ -1637,7 +1654,7 @@ mod tests {
     #[test]
     fn build_instructions_no_trailing_whitespace() {
         for &edit in &[false, true] {
-            let s = build_instructions(edit, false);
+            let s = build_instructions(edit);
             assert!(
                 !s.ends_with('\n') && !s.ends_with(' '),
                 "wire output must not end with whitespace (edit={edit})"
@@ -1645,38 +1662,17 @@ mod tests {
         }
     }
 
-    /// The hook-aware swap targets an exact substring of the served prompt. If
-    /// a markdown edit drifts the span, `.replace` would silently no-op and
-    /// the prompt would keep telling the model to set `cwd` under the hook —
-    /// the exact contradiction this feature removes. Guard it in both modes.
+    /// Guard the cwd-guidance span against markdown drift in both prompt files.
     #[test]
     fn cwd_guidance_spans_present() {
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_PATHS_DEFAULT),
-            "PATHS cwd span drifted from prompts/mcp-base.md — hook swap would no-op"
+            SERVER_INSTRUCTIONS.contains(CWD_PATHS_SPAN),
+            "PATHS cwd span drifted from prompts/mcp-base.md"
         );
         assert!(
-            EDIT_MODE_INSTRUCTIONS.contains(CWD_PATHS_DEFAULT),
-            "PATHS cwd span drifted from prompts/mcp-edit.md — hook swap would no-op"
+            EDIT_MODE_INSTRUCTIONS.contains(CWD_PATHS_SPAN),
+            "PATHS cwd span drifted from prompts/mcp-edit.md"
         );
-    }
-
-    #[test]
-    fn build_instructions_flips_cwd_guidance_under_hook() {
-        let default = build_instructions(false, false);
-        let hooked = build_instructions(false, true);
-
-        // Default keeps the explicit-cwd directive; hooked drops it.
-        assert!(default.contains(CWD_PATHS_DEFAULT));
-        assert!(!default.contains("injected automatically by the Claude Code hook"));
-
-        // Hooked tells the model NOT to set cwd, matching the schema description.
-        assert!(!hooked.contains(CWD_PATHS_DEFAULT));
-        assert!(hooked
-            .contains("`cwd` is injected automatically by the Claude Code hook — do NOT set it"));
-        // Mirrors the per-tool cwd schema description (mcp::tools::definitions),
-        // keeping the two model-facing surfaces consistent.
-        assert!(hooked.contains("do NOT set it"));
     }
 
     /// Both modes must fit Claude Code's 2KB `instructions`-field truncation
@@ -1695,14 +1691,14 @@ mod tests {
             "tilth_diff",
         ];
         for &edit in &[false, true] {
-            let s = build_instructions(edit, false);
+            let s = build_instructions(edit);
             assert!(
                 s.len() <= 2048,
                 "instructions (edit={edit}) must fit the 2KB field: {} bytes",
                 s.len()
             );
             assert!(
-                s.contains(CWD_PATHS_DEFAULT),
+                s.contains(CWD_PATHS_SPAN),
                 "missing PATHS span (edit={edit})"
             );
             for tool in shared_tools {
