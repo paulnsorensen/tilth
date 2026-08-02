@@ -12,7 +12,43 @@ use crate::cache::OutlineCache;
 use crate::mcp::path_suffix::PathSuffix;
 use crate::session::Session;
 
+const PATHS_SHAPE_EXAMPLE: &str = "paths: [\"a.rs\", \"b.rs\"]";
+
 pub(in crate::mcp) fn tool_read(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+) -> Result<String, String> {
+    // A bare-string `paths` coerces to a single-element array — the caller
+    // asked for one file, not the wrong shape — and the response teaches
+    // batching so the next call can request several files at once.
+    let coerced_str = args.get("paths").and_then(Value::as_str).map(String::from);
+    let patched;
+    let dispatch_args = if let Some(s) = &coerced_str {
+        let mut clone = args.clone();
+        clone["paths"] = Value::Array(vec![Value::String(s.clone())]);
+        patched = clone;
+        &patched
+    } else {
+        args
+    };
+
+    let result = tool_read_paths(dispatch_args, cache, session, edit_mode);
+    if coerced_str.is_some() {
+        result.map(|mut body| {
+            let _ = write!(
+                body,
+                "\n\n> Note: paths accepts an array — batch related files in one call, e.g. {PATHS_SHAPE_EXAMPLE}."
+            );
+            body
+        })
+    } else {
+        result
+    }
+}
+
+fn tool_read_paths(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
@@ -48,7 +84,9 @@ pub(in crate::mcp) fn tool_read(
         .iter()
         .map(|p| {
             p.as_str()
-                .ok_or("paths must be an array of strings")
+                .ok_or_else(|| {
+                    format!("paths must be an array of strings, e.g. {PATHS_SHAPE_EXAMPLE}")
+                })
                 .map(String::from)
         })
         .collect::<Result<_, _>>()?;
@@ -57,7 +95,9 @@ pub(in crate::mcp) fn tool_read(
     let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
     if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
         return Err(format!(
-            "unknown read mode: {mode_str}. Use: auto, full, signature, stripped"
+            "unknown read mode: {mode_str}. Valid modes: auto, full, signature, stripped. \
+            \"edit\" is not a mode — mode only controls the view; tagged, editable reads happen \
+            automatically when the server runs in edit mode."
         ));
     }
     let force_full = mode_str == "full";
