@@ -290,15 +290,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     tools
 }
 
-/// The description for the shared `cwd` property: the model must always set
-/// it explicitly.
-fn cwd_description() -> &'static str {
-    "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd."
-}
-
-/// The shared `cwd` schema property.
+/// The shared `cwd` schema property. The description text is model-facing
+/// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    serde_json::json!({ "type": "string", "description": cwd_description() })
+    serde_json::json!({ "type": "string", "description": "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd." })
 }
 
 #[cfg(test)]
@@ -595,11 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn cwd_description_tells_model_to_set_explicitly() {
+    fn cwd_property_description_tells_model_to_set_explicitly() {
+        let property = cwd_property();
+        let description = property["description"]
+            .as_str()
+            .expect("cwd property description is a string");
         assert!(
-            cwd_description().contains("always set this explicitly"),
-            "cwd description must tell the model to set cwd: {}",
-            cwd_description()
+            description.contains("always set this explicitly"),
+            "cwd description must tell the model to set cwd: {description}"
         );
     }
 

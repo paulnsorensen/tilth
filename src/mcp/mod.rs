@@ -71,12 +71,13 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
 /// The cwd-guidance spans in prompts/mcp-base.md. Exact substrings of
-/// `SERVER_INSTRUCTIONS`, guarded by `cwd_guidance_spans_present` so a
-/// markdown edit that drifts them fails loudly instead of silently drifting.
+/// `SERVER_INSTRUCTIONS`, guarded by `cwd_guidance_spans_present` so an edit
+/// that drops or reworks the explicit-cwd directive fails the test rather
+/// than silently changing the model-facing cwd contract.
 #[cfg(test)]
-const CWD_PATHS_DEFAULT: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
+const CWD_PATHS_SPAN: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
 #[cfg(test)]
-const CWD_REQ_DEFAULT: &str = "Every tool also REQUIRES `cwd` — your absolute checkout directory.";
+const CWD_REQ_SPAN: &str = "Every tool also REQUIRES `cwd` — your absolute checkout directory.";
 
 /// Compose the MCP `instructions` field: optional overview, the base prompt,
 /// and (in edit mode) the edit-mode addendum, separated by single blank lines
@@ -1688,11 +1689,11 @@ mod tests {
     #[test]
     fn cwd_guidance_spans_present() {
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_PATHS_DEFAULT),
+            SERVER_INSTRUCTIONS.contains(CWD_PATHS_SPAN),
             "PATHS cwd span drifted from prompts/mcp-base.md"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_REQ_DEFAULT),
+            SERVER_INSTRUCTIONS.contains(CWD_REQ_SPAN),
             "REQUIRES cwd span drifted from prompts/mcp-base.md"
         );
     }
