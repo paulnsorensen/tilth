@@ -15,7 +15,9 @@ pub(in crate::mcp) fn tool_grok(
     let target = args
         .get("target")
         .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: target")?;
+        .ok_or(
+            "missing required parameter: target — grok explains ONE symbol or location.\nExample:\n  tilth_grok({\"target\": \"handle_request\", \"cwd\": \"/abs/checkout\",\n    \"scope\": \"src\", \"full\": false, \"budget\": 6000})\ntarget = symbol name (\"handle_request\", \"Foo::bar\") or path:line (\"src/lib.rs:42\").\nFor area-level exploration use tilth_search or tilth_list instead.",
+        )?;
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = resolve_scope(args, cwd)?;
     let budget = args
@@ -54,6 +56,39 @@ mod tests {
             err.contains("cwd") && err.contains("absolute checkout directory"),
             "grok without cwd must refuse with the teaching error: {err}"
         );
+    }
+
+    #[test]
+    fn missing_target_teaches_grok_target_grammar() {
+        let err = tool_grok(&serde_json::json!({}), &bloom(), &Session::new()).unwrap_err();
+        assert!(
+            err.contains("tilth_grok({\"target\": \"handle_request\", \"cwd\": \"/abs/checkout\",")
+                && err.contains("    \"scope\": \"src\", \"full\": false, \"budget\": 6000})")
+                && err.contains("target = symbol name (\"handle_request\", \"Foo::bar\") or path:line (\"src/lib.rs:42\").")
+                && err.contains("For area-level exploration use tilth_search or tilth_list instead."),
+            "missing target should teach the complete grok call and target grammar: {err}"
+        );
+    }
+
+    #[test]
+    fn non_string_target_uses_same_teaching_error() {
+        let expected = tool_grok(&serde_json::json!({}), &bloom(), &Session::new()).unwrap_err();
+        for target in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let err = tool_grok(
+                &serde_json::json!({ "target": target }),
+                &bloom(),
+                &Session::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err, expected,
+                "invalid target {target} should teach the same call"
+            );
+        }
     }
 
     #[test]
