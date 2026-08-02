@@ -738,10 +738,7 @@ mod tests {
             .expect_err("unknown mode must be rejected");
         assert!(err.contains("unknown read mode"), "unexpected error: {err}");
         assert!(
-            err.contains("auto")
-                && err.contains("full")
-                && err.contains("signature")
-                && err.contains("stripped"),
+            err.contains("auto, full, signature, stripped"),
             "error must name all valid modes: {err}"
         );
         assert!(
@@ -764,15 +761,12 @@ mod tests {
         let err = tool_read(&tc(&args), &cache, &session, false)
             .expect_err("mode: edit must still be rejected");
         assert!(
-            err.contains("auto")
-                && err.contains("full")
-                && err.contains("signature")
-                && err.contains("stripped"),
+            err.contains("auto, full, signature, stripped"),
             "error must name valid modes: {err}"
         );
         assert!(
-            err.contains("edit mode"),
-            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+            err.contains("\"edit\" is not a mode"),
+            "error must redirect \"edit\" to the mode-only clause, not just call it unknown: {err}"
         );
     }
 
@@ -809,6 +803,11 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+
+        assert!(
+            !result.contains("> Note: paths accepts an array"),
+            "well-formed array paths must not carry the coercion nudge: {result}"
+        );
     }
 
     #[test]
