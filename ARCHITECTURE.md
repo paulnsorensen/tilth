@@ -187,7 +187,7 @@ process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
 Edit mode (`--edit`) selects the standalone `EDIT_MODE_INSTRUCTIONS`
-file describing `tilth_write` and unlocks the `tilth_edit` dispatch arm.
+file describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
 
 ## Query pipeline
 

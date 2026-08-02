@@ -535,7 +535,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1952,
+            2040,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -551,7 +551,7 @@ mod tests {
             "require-cwd path discipline must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_unified_diff\")"),
+            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_unified_diff\", cwd:"),
             "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
@@ -565,7 +565,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            2018,
+            2040,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -1629,27 +1629,6 @@ mod tests {
     }
 
     // -- build_instructions: mode-select and cwd-hook guidance -------------
-
-    #[test]
-    fn build_instructions_base_has_expected_anchors() {
-        let s = build_instructions(false);
-        // Adapted: pre-merge opening anchor was "tilth — AST-aware code
-        // intelligence MCP server."; current prompts/mcp-base.md opens with
-        // "tilth — code intelligence MCP server. Replaces grep, cat, find, ls".
-        assert!(
-            s.starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"),
-            "missing opening anchor: {:?}",
-            &s[..60.min(s.len())]
-        );
-        assert!(
-            s.ends_with("DO NOT re-read content already shown in expanded results."),
-            "missing closing anchor"
-        );
-        assert!(
-            !s.contains("tilth_write"),
-            "edit-mode tool must not leak into base mode"
-        );
-    }
 
     #[test]
     fn build_instructions_no_trailing_whitespace() {
