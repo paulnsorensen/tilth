@@ -1,6 +1,6 @@
 ALWAYS group every file you need into ONE tilth_read call via paths: [...]. Never call tilth_read twice in a row.
 
-Read files with smart auto-sizing (omit `mode` unless you need to override it — see the `mode` schema field for the size options). Use for reading a known file, symbol, or range; do NOT use if the content is already shown in expanded search results. Example: `tilth_read(paths: ["src/lib.rs", "src/mcp.rs#tool_search"])`.
+Read files with smart auto-sizing (omit `mode` unless you need to override it — see the `mode` schema field for the size options). Use for reading a known file, symbol, or range; do NOT use if the content is already shown in expanded search results. Example: `tilth_read(paths: ["src/lib.rs", "src/mcp.rs#tool_search"], cwd: "/abs/checkout")`.
 
 Output format: each line is `N:content` — a 1-based line number, a colon, then the line's text (e.g. `42:let x = 1;`). Ignore the `N:` prefix; resume after the colon. In edit mode the numbered lines are preceded by a `[path#TAG]` header binding them to the file's current content — copy that header VERBATIM into a `tilth_write` `edits` section and reference the line numbers beneath it (NEVER invent a TAG). Exception: `mode=stripped` is a non-editable survey view and cannot round-trip through `tilth_write`.
 

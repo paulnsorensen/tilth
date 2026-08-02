@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search code — finds definitions, usages, and text. Replaces grep/rg and the host Grep tool for all code search. Use to explore or locate any symbol/text/regex; do NOT use to read a known file or symbol (use tilth_read) or to check a file's dependents (use tilth_deps). Example: tilth_search(queries: [{query: \"handleRequest\"}]).",
+            "description": "Search code — finds definitions, usages, and text. Replaces grep/rg and the host Grep tool for all code search. Use to explore or locate any symbol/text/regex; do NOT use to read a known file or symbol (use tilth_read) or to check a file's dependents (use tilth_deps). Example: tilth_search(queries: [{query: \"handleRequest\"}], cwd: \"/abs/checkout\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -98,7 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "List files as a directory tree with token-size rollups per directory. Replaces `ls -R`/`tree`. Use ONLY when you have no symbol or text to search for; do NOT use to find a symbol or file content (use tilth_search). Example: tilth_list(patterns: [\"*.rs\"]).",
+            "description": "List files as a directory tree with token-size rollups per directory. Replaces `ls -R`/`tree`. Use ONLY when you have no symbol or text to search for; for searching use tilth_search, for reading a known file use tilth_read. Example: tilth_list(patterns: [\"*.rs\"], cwd: \"/abs/checkout\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -129,7 +129,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
-            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead. Example: tilth_deps(path: \"src/cache.rs\").",
+            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/checkout\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "cwd"],
@@ -153,7 +153,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_grok",
             "annotations": { "readOnlyHint": true },
-            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read). Example: tilth_grok(target: \"parse_unified_diff\").",
+            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read). Example: tilth_grok(target: \"parse_unified_diff\", cwd: \"/abs/checkout\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["target", "cwd"],
@@ -182,7 +182,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff — use for 'what changed' questions; do NOT use Bash(git diff) or git log --patch. git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd. Example: tilth_diff() for uncommitted changes; tilth_diff(source: \"HEAD~1\") for a commit.",
+            "description": "Structural diff showing function-level changes. Replaces git diff — use for 'what changed' questions; do NOT use Bash(git diff) or git log --patch. git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd. Example: tilth_diff(cwd: \"/abs/checkout\") for uncommitted changes; tilth_diff(source: \"HEAD~1\", cwd: \"/abs/checkout\") for a commit.",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -239,7 +239,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read emits a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (leading `#` optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted, tilth 3-way-merges your ops onto it; if it can't, the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections. Example: tilth_write(edits: [{path: \"src/x.rs\", tag: \"1A2B\", ops: [{op: \"replace\", start: 2, end: 2, content: \"let y = 1;\"}]}]).",
+            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read emits a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (leading `#` optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted, tilth 3-way-merges your ops onto it; if it can't, the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections. Example: tilth_write(edits: [{path: \"src/x.rs\", tag: \"1A2B\", ops: [{op: \"replace\", start: 2, end: 2, content: \"let y = 1;\"}]}], cwd: \"/abs/checkout\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],

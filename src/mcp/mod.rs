@@ -565,7 +565,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            2011,
+            2018,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(

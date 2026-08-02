@@ -8,7 +8,7 @@ Arrays are REQUIRED: tilth_read → paths: [...]; tilth_list → patterns: [...]
 
 ROUTE BY QUESTION:
 - Find or explore anything → tilth_search(queries: [{query: "handleRequest"}]). Omit kind to explore (merged defs+usages+callers); set kind (symbol|content|regex|callers) when you know the shape.
-- Read a file, symbol, or range → tilth_read(paths: ["src/x.rs#parse_config"]). Reads mint a [path#TAG] header over numbered lines; smart-sized.
+- Read a file, symbol, or range → tilth_read(paths: ["src/x.rs#parse_config"]). tilth_read prints a [path#TAG] header over numbered lines; smart-sized.
 - Edit files → tilth_write(edits: [{path, tag, ops}]). Copy the TAG from an edit-mode read — NEVER invent one. Ops are line-addressed ({op:"replace", start, end, content}), NOT find/replace. DO NOT use the host Edit or Write tools.
 - Who uses this file / who imports it → tilth_deps(path: "src/cache.rs"). One call. DO NOT assemble it from import-greps or repeated callers searches.
 - Understand ONE symbol deeply → tilth_grok(target: "parse_unified_diff"). Replaces the search → expand → callers chain.
