@@ -75,11 +75,10 @@ OPENCODE_CONFIGS = {
 }
 REPOS_DIR = Path("/tmp/tilth_bench/repos")
 
-# Hermetic XDG_CONFIG_HOME for --bare opencode runs, so the user's global
-# ~/.config/opencode (MCP servers incl. tilth, skills, agents) can't merge in.
-# Stable + reused: opencode bootstraps a node_modules plugin host here on first
-# use, so a per-run temp dir would re-install it every cell.
-OPENCODE_BARE_XDG = REPOS_DIR.parent / "opencode_bare_home"
+# Hermetic XDG_CONFIG_HOME for OpenCode runs, so the user's global config,
+# MCP servers, skills, and agents cannot merge into benchmark modes. The stable
+# directory lets OpenCode reuse its bootstrapped plugin host between cells.
+OPENCODE_CONFIG_HOME = REPOS_DIR.parent / "opencode_config_home"
 
 
 @dataclass
@@ -90,6 +89,7 @@ class RepoConfig:
     commit_sha: str
     language: str
     description: str
+    license: str = "MIT"
 
     @property
     def path(self) -> Path:
@@ -103,6 +103,7 @@ REPOS = {
         commit_sha="0a88cccd5188074de96f54a4b6b44a63971ac157",
         language="rust",
         description="ripgrep line-oriented search tool",
+        license="MIT OR Unlicense",
     ),
     "fastapi": RepoConfig(
         name="fastapi",
