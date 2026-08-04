@@ -56,6 +56,14 @@ def test_headline_delta_has_direction_and_deterministic_paired_ci():
     assert "MDE@N" in report
     assert "## Control-task delta" in report
 
+def test_report_header_keeps_error_count_with_run_metadata():
+    valid = _run(task="one", mode="baseline", cost=1.0, correct=True)
+    failed = {**valid, "error": "boom"}
+
+    report = analyze.generate_report([valid, failed])
+
+    assert "**Runs:** 1 valid (1 errors) | **Models:**" in report
+
 
 def test_headline_reports_baseline_zero_correct_without_dividing():
     records = [

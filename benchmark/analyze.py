@@ -449,22 +449,19 @@ def generate_report(results: list[dict]) -> str:
     max_rep = max(int(r.get("repetition", 0)) for r in valid_results)
     num_reps = max_rep + 1
 
-    # Build header
+    run_summary = f"**Runs:** {len(valid_results)} valid"
+    if error_count > 0:
+        run_summary += f" ({error_count} errors)"
+
     lines = [
         "# tilth Benchmark Results",
         "",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"**Runs:** {len(valid_results)} valid",
-    ]
-
-    if error_count > 0:
-        lines.append(f" ({error_count} errors)")
-
-    lines.extend([
-        f" | **Models:** {', '.join(models)} | **Repos:** {', '.join(repos)} | **Reps:** {num_reps}",
+        f"{run_summary} | **Models:** {', '.join(models)} | "
+        f"**Repos:** {', '.join(repos)} | **Reps:** {num_reps}",
         "",
-    ])
+    ]
     warning = pricing_staleness_warning(PRICING_DATA["as_of"])
     if warning:
         lines.extend([warning, ""])

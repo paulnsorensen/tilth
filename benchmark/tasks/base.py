@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -152,7 +153,7 @@ class Task(ABC):
                 timeout=300,
             )
             if result.returncode != 0:
-                return False, f"Test failed: {self.test_command[-1]}"
+                return False, f"Test failed: {shlex.join(self.test_command)}"
             return True, "Test passed"
 
         # Forward-edit tasks: check git diff for expected patterns.
