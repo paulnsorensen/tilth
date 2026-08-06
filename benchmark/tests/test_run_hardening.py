@@ -182,7 +182,17 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
 
     parsed = RunResult(
         session_id="session",
-        turns=[Turn(index=0, input_tokens=3, output_tokens=17, cache_creation_tokens=2, cache_read_tokens=1)],
+        turns=[
+            Turn(
+                index=0,
+                input_tokens=3,
+                output_tokens=17,
+                cache_creation_tokens=2,
+                cache_read_tokens=1,
+                cache_creation_5m_tokens=1,
+                cache_creation_1h_tokens=1,
+            ),
+        ],
         num_turns=1,
         total_cost_usd=0.01,
         duration_ms=12,
@@ -248,10 +258,14 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         "transformation": "test-only",
     }
     assert result["per_turn_output_tokens"] == [17]
+    assert result["cache_creation_5m_tokens"] == 1
+    assert result["cache_creation_1h_tokens"] == 1
     assert result["per_turn_token_usage"] == [
         {
             "input_tokens": 3,
             "cache_creation_tokens": 2,
+            "cache_creation_5m_tokens": 1,
+            "cache_creation_1h_tokens": 1,
             "cache_read_tokens": 1,
             "output_tokens": 17,
         }

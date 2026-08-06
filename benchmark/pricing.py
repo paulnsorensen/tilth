@@ -51,6 +51,11 @@ def _usage_costs(usage: dict, rates: dict[str, Any]) -> dict[str, float]:
         "cache_creation_tokens",
         "total_cache_creation_tokens",
     )
+    cache_creation_5m_tokens = _token_value(usage, "cache_creation_5m_tokens")
+    cache_creation_1h_tokens = _token_value(usage, "cache_creation_1h_tokens")
+    classified_cache_creation_tokens = (
+        cache_creation_5m_tokens + cache_creation_1h_tokens
+    )
     cache_read_tokens = _token_value(
         usage,
         "cache_read_tokens",
@@ -59,13 +64,28 @@ def _usage_costs(usage: dict, rates: dict[str, Any]) -> dict[str, float]:
     output_tokens = _token_value(usage, "output_tokens", "total_output_tokens")
 
     threshold = rates.get("long_context_threshold")
-    context_tokens = input_tokens + cache_creation_tokens + cache_read_tokens
+    context_tokens = (
+        input_tokens
+        + max(cache_creation_tokens, classified_cache_creation_tokens)
+        + cache_read_tokens
+    )
     if threshold is not None and context_tokens > threshold:
         rates = rates["long_context"]
 
     cache_creation_rate = rates.get("cache_creation", rates.get("cache_write", 0.0))
+    cache_creation_5m_rate = rates.get("cache_creation_5m", cache_creation_rate)
+    cache_creation_1h_rate = rates.get("cache_creation_1h", cache_creation_rate)
+    unclassified_cache_creation_tokens = max(
+        cache_creation_tokens - classified_cache_creation_tokens,
+        0.0,
+    )
+    cache_creation_cost = (
+        unclassified_cache_creation_tokens * cache_creation_rate
+        + cache_creation_5m_tokens * cache_creation_5m_rate
+        + cache_creation_1h_tokens * cache_creation_1h_rate
+    ) / 1_000_000
     return {
-        "cache_creation_cost": cache_creation_tokens * cache_creation_rate / 1_000_000,
+        "cache_creation_cost": cache_creation_cost,
         "cache_read_cost": cache_read_tokens * rates["cache_read"] / 1_000_000,
         "output_cost": output_tokens * rates["output"] / 1_000_000,
         "input_cost": input_tokens * rates["input"] / 1_000_000,
@@ -76,7 +96,7 @@ def compute_cost_breakdown(run: dict) -> dict[str, float]:
     """Compute model-specific cost by input/cache-write/cache-read/output."""
     rates = _pricing_rates(run)
     per_turn_usage = run.get("per_turn_token_usage")
-    if not isinstance(per_turn_usage, list):
+    if not isinstance(per_turn_usage, list) or "long_context_threshold" not in rates:
         return _usage_costs(run, rates)
 
     totals = {

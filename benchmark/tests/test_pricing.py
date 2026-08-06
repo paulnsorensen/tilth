@@ -35,13 +35,14 @@ def test_model_specific_breakdown_uses_all_token_categories():
         "cache_creation_tokens": 1_000_000,
         "cache_read_tokens": 1_000_000,
         "output_tokens": 1_000_000,
+        "per_turn_token_usage": [{"output_tokens": 1}],
     }
 
     costs = pricing.compute_cost_breakdown(run)
 
     assert costs == {
         "input_cost": 1.0,
-        "cache_creation_cost": 1.25,
+        "cache_creation_cost": 2.0,
         "cache_read_cost": 0.10,
         "output_cost": 5.0,
     }
@@ -52,7 +53,14 @@ def test_model_specific_breakdown_uses_all_token_categories():
     [
         (
             "claude-opus-5",
-            {"input": 5.0, "cache_creation": 6.25, "cache_read": 0.5, "output": 25.0},
+            {
+                "input": 5.0,
+                "cache_creation": 10.0,
+                "cache_creation_5m": 6.25,
+                "cache_creation_1h": 10.0,
+                "cache_read": 0.5,
+                "output": 25.0,
+            },
         ),
         (
             "gpt-5.6-sol",
@@ -94,6 +102,19 @@ def test_gpt_5_6_long_context_pricing_is_applied_per_turn() -> None:
     }
 
 
+def test_claude_cache_creation_uses_reported_ttl() -> None:
+    run = {
+        "model": "claude-opus-5",
+        "input_tokens": 0,
+        "cache_creation_tokens": 2_000_000,
+        "cache_creation_5m_tokens": 1_000_000,
+        "cache_creation_1h_tokens": 1_000_000,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+    }
+    assert pricing.compute_cost_breakdown(run)["cache_creation_cost"] == 16.25
+
+
 def test_alias_pricing_resolves_when_actual_model_id_is_absent():
     costs = pricing.compute_cost_breakdown({
         "model_alias": "haiku",
@@ -105,7 +126,7 @@ def test_alias_pricing_resolves_when_actual_model_id_is_absent():
 
     assert costs == {
         "input_cost": 1.0,
-        "cache_creation_cost": 1.25,
+        "cache_creation_cost": 2.0,
         "cache_read_cost": 0.10,
         "output_cost": 5.0,
     }
