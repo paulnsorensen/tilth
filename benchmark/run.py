@@ -429,6 +429,15 @@ def _run_single_in_repo(
         "cache_read_tokens": run_result.total_cache_read_tokens,
         "per_turn_context_tokens": per_turn_context,
         "per_turn_output_tokens": per_turn_output,
+        "per_turn_token_usage": [
+            {
+                "input_tokens": turn.input_tokens,
+                "cache_creation_tokens": turn.cache_creation_tokens,
+                "cache_read_tokens": turn.cache_read_tokens,
+                "output_tokens": turn.output_tokens,
+            }
+            for turn in run_result.turns
+        ],
         "correct": correct,
         "correctness_reason": reason,
         "result_text": run_result.result_text[:5000],

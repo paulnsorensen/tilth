@@ -248,6 +248,14 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         "transformation": "test-only",
     }
     assert result["per_turn_output_tokens"] == [17]
+    assert result["per_turn_token_usage"] == [
+        {
+            "input_tokens": 3,
+            "cache_creation_tokens": 2,
+            "cache_read_tokens": 1,
+            "output_tokens": 17,
+        }
+    ]
 
 
 

@@ -3,6 +3,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from pricing import compute_cost_breakdown
+
 
 @dataclass
 class ToolCall:
@@ -124,12 +126,6 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
     events = [json.loads(line) for line in lines]
 
-    # Pricing per 1M tokens (approximate)
-    pricing = {
-        "gpt-5-codex": {"input": 2.00, "cached": 0.50, "output": 8.00},
-        "o3": {"input": 2.00, "cached": 0.50, "output": 8.00},
-    }
-    rates = pricing.get(model_id, pricing["gpt-5-codex"])
 
     session_id = ""
     result_text_parts: list[str] = []
@@ -227,11 +223,20 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
     total_cached = sum(u.get("cached_input_tokens", 0) for u in turn_usages)
     total_output = sum(u.get("output_tokens", 0) for u in turn_usages)
 
-    # Calculate cost
-    cost_usd = (
-        (total_input * rates["input"] / 1_000_000) +
-        (total_cached * rates["cached"] / 1_000_000) +
-        (total_output * rates["output"] / 1_000_000)
+    per_turn_usage = [
+        {
+            "input_tokens": turn.input_tokens,
+            "cache_creation_tokens": turn.cache_creation_tokens,
+            "cache_read_tokens": turn.cache_read_tokens,
+            "output_tokens": turn.output_tokens,
+        }
+        for turn in turns
+    ]
+    cost_usd = sum(
+        compute_cost_breakdown({
+            "model": model_id,
+            "per_turn_token_usage": per_turn_usage,
+        }).values()
     )
 
     return RunResult(

@@ -23,8 +23,8 @@ TILTH_BIN = resolve_tilth_bin()
 MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-    "gpt5": "gpt-5-codex",
+    "opus": "claude-opus-5",
+    "gpt5": "gpt-5.6-sol",
     "o3": "o3",
     # opencode + OpenRouter lane. Add more OpenRouter models here as one-liners
     # (short name -> "openrouter/<provider>/<model>"); mirror in RUNNERS.

@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import analyze
+import pricing
 
 
 def _report_run():
@@ -36,7 +37,7 @@ def test_model_specific_breakdown_uses_all_token_categories():
         "output_tokens": 1_000_000,
     }
 
-    costs = analyze.compute_cost_breakdown(run)
+    costs = pricing.compute_cost_breakdown(run)
 
     assert costs == {
         "input_cost": 1.0,
@@ -45,8 +46,56 @@ def test_model_specific_breakdown_uses_all_token_categories():
         "output_cost": 5.0,
     }
 
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (
+            "claude-opus-5",
+            {"input": 5.0, "cache_creation": 6.25, "cache_read": 0.5, "output": 25.0},
+        ),
+        (
+            "gpt-5.6-sol",
+            {"input": 5.0, "cache_creation": 6.25, "cache_read": 0.5, "output": 30.0},
+        ),
+    ],
+)
+def test_current_frontier_model_short_context_pricing(
+    model: str,
+    expected: dict[str, float],
+) -> None:
+    assert {key: pricing.PRICING[model][key] for key in expected} == expected
+
+
+def test_gpt_5_6_long_context_pricing_is_applied_per_turn() -> None:
+    run = {
+        "model": "gpt-5.6-sol",
+        "per_turn_token_usage": [
+            {
+                "input_tokens": 100_000,
+                "cache_creation_tokens": 100_000,
+                "cache_read_tokens": 100_000,
+                "output_tokens": 100_000,
+            },
+            {
+                "input_tokens": 100_000,
+                "cache_creation_tokens": 100_000,
+                "cache_read_tokens": 0,
+                "output_tokens": 100_000,
+            },
+        ],
+    }
+
+    assert pricing.compute_cost_breakdown(run) == {
+        "cache_creation_cost": 1.875,
+        "cache_read_cost": 0.1,
+        "output_cost": 7.5,
+        "input_cost": 1.5,
+    }
+
+
 def test_alias_pricing_resolves_when_actual_model_id_is_absent():
-    costs = analyze.compute_cost_breakdown({
+    costs = pricing.compute_cost_breakdown({
         "model_alias": "haiku",
         "input_tokens": 1_000_000,
         "cache_creation_tokens": 1_000_000,
@@ -64,7 +113,7 @@ def test_alias_pricing_resolves_when_actual_model_id_is_absent():
 
 def test_actual_model_does_not_fall_back_to_alias_pricing():
     with pytest.raises(ValueError, match="no pricing entry"):
-        analyze.compute_cost_breakdown({
+        pricing.compute_cost_breakdown({
             "model": "unpriced-model",
             "model_alias": "haiku",
             "input_tokens": 1,
@@ -72,8 +121,8 @@ def test_actual_model_does_not_fall_back_to_alias_pricing():
 
 
 def test_stale_pricing_warns_only_after_thirty_days():
-    assert analyze.pricing_staleness_warning("2026-06-01", today=date(2026, 8, 4))
-    assert not analyze.pricing_staleness_warning("2026-07-05", today=date(2026, 8, 4))
+    assert pricing.pricing_staleness_warning("2026-06-01", today=date(2026, 8, 4))
+    assert not pricing.pricing_staleness_warning("2026-07-05", today=date(2026, 8, 4))
 
 
 def test_generated_report_renders_stale_pricing_warning(monkeypatch):

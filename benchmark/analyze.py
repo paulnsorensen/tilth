@@ -11,85 +11,17 @@ import json
 import math
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from statistics import median, mean, stdev
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import stats
 from flags import detect_flags
 from paired import pair_ab, paired_cpc_delta as paired_cpc_delta_impl
+from pricing import PRICING_DATA, compute_cost_breakdown, pricing_staleness_warning
 from tasks import TASKS
-
-
-# Prices are USD per million tokens. The .yaml file is deliberately JSON-shaped
-# so the benchmark stays stdlib-only.
-PRICING_PATH = Path(__file__).with_name("pricing.yaml")
-
-
-def load_pricing(path: Path | str = PRICING_PATH) -> dict[str, Any]:
-    """Load and lightly validate the versioned pricing table."""
-    path = Path(path)
-    table = json.loads(path.read_text())
-    if not isinstance(table, dict) or not isinstance(table.get("models"), dict):
-        raise ValueError(f"invalid pricing table: {path}")
-    if not isinstance(table.get("as_of"), str):
-        raise ValueError(f"pricing table has no as_of date: {path}")
-    table.setdefault("aliases", {})
-    return table
-
-
-PRICING_DATA = load_pricing()
-PRICING = PRICING_DATA["models"]
-
-
-def _token_value(run: dict, *keys: str) -> float:
-    for key in keys:
-        value = run.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-    return 0.0
-
-
-def _pricing_rates(run: dict) -> tuple[str, dict[str, float]]:
-    models = PRICING_DATA["models"]
-    aliases = PRICING_DATA.get("aliases", {})
-    candidate = run.get("model") or run.get("model_alias")
-    model_id = aliases.get(candidate, candidate)
-    if model_id not in models:
-        raise ValueError(f"no pricing entry for model {candidate!r}")
-    return model_id, models[model_id]
-
-
-def compute_cost_breakdown(run: dict) -> dict[str, float]:
-    """Compute model-specific cost by input/cache-write/cache-read/output."""
-    _model_id, rates = _pricing_rates(run)
-    cache_creation = rates.get("cache_creation", rates.get("cache_write", 0.0))
-    return {
-        "cache_creation_cost": _token_value(
-            run, "cache_write_tokens", "cache_creation_tokens", "total_cache_creation_tokens"
-        ) * cache_creation / 1_000_000,
-        "cache_read_cost": _token_value(
-            run, "cache_read_tokens", "total_cache_read_tokens"
-        ) * rates["cache_read"] / 1_000_000,
-        "output_cost": _token_value(
-            run, "output_tokens", "total_output_tokens"
-        ) * rates["output"] / 1_000_000,
-        "input_cost": _token_value(
-            run, "input_tokens", "total_input_tokens"
-        ) * rates["input"] / 1_000_000,
-    }
-
-
-def pricing_staleness_warning(as_of: str, today: date | None = None) -> str | None:
-    """Return a report warning when pricing is more than 30 days old."""
-    published = date.fromisoformat(as_of)
-    age = ((today or date.today()) - published).days
-    if age > 30:
-        return f"WARNING: pricing table as_of {as_of} is {age} days old (>30 days)."
-    return None
 
 
 def format_cost_breakdown(costs: dict[str, float], indent: str = "  ") -> str:

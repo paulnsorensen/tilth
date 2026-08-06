@@ -119,6 +119,34 @@ def test_codex_result_text_single_turn_unchanged():
     assert result.result_text == "The answer is 42."
 
 
+def test_codex_gpt_5_6_cost_uses_short_and_long_context_rates_per_turn():
+    events = [
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "turn.started"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 100_000,
+                "output_tokens": 100_000,
+            },
+        },
+        {"type": "turn.started"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 200_000,
+                "output_tokens": 100_000,
+            },
+        },
+    ]
+
+    result = parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
+
+    assert result.total_cost_usd == 9.25
+
+
 # --- opencode run --format json ---------------------------------------------
 
 
