@@ -205,6 +205,8 @@ def test_template_has_exact_corpus_fixture_mappings() -> None:
         path.relative_to(TEMPLATE_PATH).as_posix(): path.read_text(encoding="utf-8")
         for path in TEMPLATE_PATH.rglob("*")
         if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
     }
     expected_markers = {
         "src/typescript/express_middleware.ts": (

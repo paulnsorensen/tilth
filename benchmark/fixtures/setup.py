@@ -20,7 +20,11 @@ def setup_repo():
         shutil.rmtree(REPO_PATH)
 
     print(f"Creating repo at {REPO_PATH}")
-    shutil.copytree(TEMPLATE_PATH, REPO_PATH)
+    shutil.copytree(
+        TEMPLATE_PATH,
+        REPO_PATH,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
 
     file_stats = []
     for path in sorted(path for path in REPO_PATH.rglob("*") if path.is_file()):
