@@ -175,10 +175,7 @@ def randomized_arm_order(
     repetition: int,
 ) -> list[str]:
     """Return a stable pseudorandom arm order for one matched run block."""
-    material = f"{seed}\0{task}\0{model}\0{repetition}".encode()
-    block_seed = int.from_bytes(hashlib.sha256(material).digest())
-    ordered = list(arms)
-    random.Random(block_seed).shuffle(ordered)
+    block_seed = int.from_bytes(hashlib.sha256(material).digest(), "big")
     return ordered
 
 
