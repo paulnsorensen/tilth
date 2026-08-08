@@ -112,6 +112,38 @@ def test_stream_json_counts_each_message_usage_once():
     assert result.turns[0].output_tokens == 10
 
 
+def test_stream_json_captures_init_tools_and_mcp_servers():
+    """The init event's tool list and MCP status are the only record of what
+    the session could actually call — a tilth arm whose init lacks
+    mcp__tilth__ tools ran native-only and must be detectable from the row."""
+    init = {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "abc123",
+        "tools": ["Bash", "Read", "mcp__tilth__tilth_search"],
+        "mcp_servers": [{"name": "tilth", "status": "connected"}],
+    }
+    events = [init, _assistant_event("ok"), _result_event()]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.available_tools == ["Bash", "Read", "mcp__tilth__tilth_search"]
+    assert result.mcp_servers == [{"name": "tilth", "status": "connected"}]
+
+
+def test_stream_json_without_init_leaves_availability_empty():
+    events = [
+        {"type": "system", "session_id": "abc123"},
+        _assistant_event("ok"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.available_tools == []
+    assert result.mcp_servers == []
+
+
 # --- codex exec --json ------------------------------------------------------
 
 

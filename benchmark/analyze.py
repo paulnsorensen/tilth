@@ -437,6 +437,87 @@ def _tilth_tool_call_count(result: dict) -> int:
     )
 
 
+def _is_tilth_tool(name: str) -> bool:
+    # Call records may carry the bare server-side name (e.g. "tilth_search")
+    # instead of the registered "mcp__tilth__tilth_search" alias, so match by
+    # substring like _tilth_tool_call_count does.
+    return "tilth" in str(name).lower()
+
+
+def _tool_usage_section(valid_results: list[dict]) -> list[str]:
+    """Per-arm tool call totals: every native and tilth tool, with rollups."""
+    modes = ordered_modes({str(r.get("mode", "unknown")) for r in valid_results})
+    calls_by_mode: dict[str, Counter] = {mode: Counter() for mode in modes}
+    cells_by_mode: Counter = Counter()
+    tilth_cells_by_mode: Counter = Counter()
+    tilth_available_by_mode: Counter = Counter()
+    availability_known_by_mode: Counter = Counter()
+
+    for result in valid_results:
+        mode = str(result.get("mode", "unknown"))
+        cells_by_mode[mode] += 1
+        tool_calls = result.get("tool_calls")
+        if isinstance(tool_calls, dict):
+            for name, count in tool_calls.items():
+                if isinstance(count, (int, float)):
+                    calls_by_mode[mode][str(name)] += int(count)
+            if any(_is_tilth_tool(name) for name in tool_calls):
+                tilth_cells_by_mode[mode] += 1
+        available = result.get("available_tools")
+        if isinstance(available, list):
+            availability_known_by_mode[mode] += 1
+            if any(_is_tilth_tool(name) for name in available):
+                tilth_available_by_mode[mode] += 1
+
+    all_tools = sorted(
+        {name for counter in calls_by_mode.values() for name in counter},
+        key=lambda name: (_is_tilth_tool(name), name),
+    )
+    lines = [
+        "## Tool usage",
+        "",
+        "Call totals per arm across all valid cells. Tilth tools are any "
+        "tool names containing 'tilth' (registered as mcp__tilth__*, callable "
+        "by bare name); everything else is a native built-in. An arm with "
+        "tilth attached but zero tilth calls is measuring the model's tool "
+        "choice; an arm where tilth was never available is a misconfigured "
+        "comparison.",
+        "",
+        "| Tool | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "|".join(["---:"] * len(modes)) + "|",
+    ]
+    for name in all_tools:
+        row = [name] + [str(calls_by_mode[mode].get(name, 0)) for mode in modes]
+        lines.append("| " + " | ".join(row) + " |")
+    for label, predicate in (
+        ("**Native subtotal**", lambda name: not _is_tilth_tool(name)),
+        ("**Tilth subtotal**", _is_tilth_tool),
+        ("**Total**", lambda name: True),
+    ):
+        row = [label] + [
+            str(sum(count for name, count in calls_by_mode[mode].items() if predicate(name)))
+            for mode in modes
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    lines.extend([
+        "",
+        "| Mode | Cells | Tilth available | Cells with ≥1 tilth call |",
+        "|---|---:|---:|---:|",
+    ])
+    for mode in modes:
+        cells = cells_by_mode[mode]
+        if availability_known_by_mode[mode]:
+            available = f"{tilth_available_by_mode[mode]}/{availability_known_by_mode[mode]}"
+        else:
+            available = "unrecorded"
+        lines.append(
+            f"| {mode_label(mode)} | {cells} | {available} | "
+            f"{tilth_cells_by_mode[mode]} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _failure_taxonomy_section(results: list[dict]) -> list[str]:
     """Report failure types, paired exclusivity, and direct tool-use signals."""
     modes = ordered_modes({str(r.get("mode", "unknown")) for r in results})
@@ -559,6 +640,7 @@ def generate_report(results: list[dict]) -> str:
     lines.extend(_capability_section(valid_results, modes))
     lines.extend(_control_section(valid_results, modes))
     lines.extend(_flags_section(results))
+    lines.extend(_tool_usage_section(valid_results))
     lines.extend(_failure_taxonomy_section(results))
     lines.extend([
         "## Context Efficiency",

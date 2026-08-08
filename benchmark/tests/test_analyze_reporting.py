@@ -301,3 +301,34 @@ def test_failure_taxonomy_reports_types_transitions_and_tool_signal():
     assert "| missing_required_literal | exact-symbol | 1 | 1 | one |" in report
     assert "| tilth-added vs baseline | 1 | 0 | 0 | 1 |" in report
     assert "| tilth-added | 1 | 1 | 2 |" in report
+
+
+def test_tool_usage_section_reports_per_arm_counts_and_availability():
+    """The tool-usage table must separate tilth from native calls per arm and
+    expose whether tilth was actually available — an arm with tilth attached
+    but zero availability is a misconfigured comparison, not evidence."""
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
+    baseline["tool_calls"] = {"Grep": 3, "Read": 2}
+    baseline["available_tools"] = ["Bash", "Grep", "Read"]
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    # Bare server-side names (e.g. from the mcp-shortening fork) must still
+    # count as tilth calls alongside the registered mcp__tilth__ alias.
+    tilth["tool_calls"] = {"Read": 1, "mcp__tilth__tilth_search": 4, "tilth_read": 2}
+    tilth["available_tools"] = ["Read", "mcp__tilth__tilth_search"]
+    legacy = _run(task="one", mode="tilth", cost=1.0, correct=True, repetition=1)
+    legacy["tool_calls"] = {"Grep": 1}
+
+    report = analyze.generate_report([baseline, tilth, legacy])
+
+    assert "## Tool usage" in report
+    assert "| Grep | 3 | 1 |" in report
+    assert "| mcp__tilth__tilth_search | 0 | 4 |" in report
+    assert "| tilth_read | 0 | 2 |" in report
+    assert "| **Native subtotal** | 5 | 2 |" in report
+    assert "| **Tilth subtotal** | 0 | 6 |" in report
+    assert "| **Total** | 5 | 8 |" in report
+    # Availability: baseline 0/1 recorded rows have tilth; tilth arm 1/1
+    # recorded (the legacy row lacks the field and only shrinks the known
+    # denominator); one tilth cell made >=1 tilth call.
+    assert "| baseline | 1 | 0/1 | 0 |" in report
+    assert "| tilth-added | 2 | 1/1 | 1 |" in report
