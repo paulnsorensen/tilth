@@ -268,3 +268,36 @@ def test_three_way_report_prioritizes_fork_upstream_and_guardrails():
     assert "fork vs no_tilth" in report
     assert "upstream vs no_tilth" in report
     assert "task is the sampling unit" in report
+
+
+def test_failure_type_covers_runner_and_grader_reasons():
+    assert analyze._failure_type({"error": "timeout after 10m"}) == ("runner_error", "timeout")
+    assert analyze._failure_type({"correctness_reason": "Contains forbidden: TODO"}) == (
+        "forbidden_literal",
+        "TODO",
+    )
+    assert analyze._failure_type({"correctness_reason": "Test failed: pytest"}) == (
+        "test_failed",
+        "pytest",
+    )
+    assert analyze._failure_type({"correctness_reason": "No changes in target file"}) == (
+        "missing_edit",
+        "No changes in target file",
+    )
+
+
+def test_failure_taxonomy_reports_types_transitions_and_tool_signal():
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=False)
+    baseline["correctness_reason"] = "Missing: exact-symbol"
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=False)
+    tilth["correctness_reason"] = "Missing: exact-symbol"
+    tilth["tool_calls"] = {"mcp__tilth__tilth_search": 2}
+    passed_baseline = _run(task="two", mode="baseline", cost=1.0, correct=True)
+    passed_tilth = _run(task="two", mode="tilth", cost=1.0, correct=True)
+
+    report = analyze.generate_report([baseline, tilth, passed_baseline, passed_tilth])
+
+    assert report.index("## Failure taxonomy") < report.index("## Context Efficiency")
+    assert "| missing_required_literal | exact-symbol | 1 | 1 | one |" in report
+    assert "| tilth-added vs baseline | 1 | 0 | 0 | 1 |" in report
+    assert "| tilth-added | 1 | 1 | 2 |" in report

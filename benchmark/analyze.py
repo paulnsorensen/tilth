@@ -10,7 +10,7 @@ import argparse
 import json
 import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -397,6 +397,126 @@ def _flags_section(results: list[dict]) -> list[str]:
     return lines
 
 
+def _failure_type(result: dict) -> tuple[str, str] | None:
+    """Classify an unsuccessful cell from runner error first, then grader reason."""
+    if result.get("correct", False):
+        return None
+    error = result.get("error")
+    if error:
+        error_text = str(error)
+        lowered = error_text.lower()
+        if "timeout" in lowered:
+            return "runner_error", "timeout"
+        if "budget" in lowered:
+            return "runner_error", "budget_exhausted"
+        return "runner_error", error_text
+
+    reason = str(result.get("correctness_reason") or "unspecified")
+    if reason.startswith("Missing: "):
+        return "missing_required_literal", reason.removeprefix("Missing: ")
+    if reason.startswith("Contains forbidden: "):
+        return "forbidden_literal", reason.removeprefix("Contains forbidden: ")
+    if reason.startswith("Diff missing: "):
+        return "diff_missing_literal", reason.removeprefix("Diff missing: ")
+    if reason.startswith("Test failed: "):
+        return "test_failed", reason.removeprefix("Test failed: ")
+    if reason == "No changes in target file":
+        return "missing_edit", reason
+    return "grader_failure", reason
+
+
+def _tilth_tool_call_count(result: dict) -> int:
+    """Count calls to any tool whose name identifies the tilth MCP server."""
+    tool_calls = result.get("tool_calls")
+    if not isinstance(tool_calls, dict):
+        return 0
+    return sum(
+        int(count)
+        for name, count in tool_calls.items()
+        if "tilth" in str(name).lower() and isinstance(count, (int, float))
+    )
+
+
+def _failure_taxonomy_section(results: list[dict]) -> list[str]:
+    """Report failure types, paired exclusivity, and direct tool-use signals."""
+    modes = ordered_modes({str(r.get("mode", "unknown")) for r in results})
+    failures = [
+        (result, failure)
+        for result in results
+        if (failure := _failure_type(result)) is not None
+    ]
+    lines = [
+        "## Failure taxonomy",
+        "",
+        "Failure type comes from the runner error first, then the grader reason. "
+        "A missing required literal is an exact-string failure, not proof that "
+        "the answer was semantically wrong.",
+        "",
+    ]
+    if not failures:
+        lines.extend(["No failures detected.", ""])
+        return lines
+
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for result, failure in failures:
+        grouped[failure].append(result)
+
+    lines.append("| Failure type | Detail | " + " | ".join(mode_label(mode) for mode in modes) + " | Tasks |")
+    lines.append("|---|---|" + "|".join(["---:"] * len(modes)) + "|---|")
+    for (kind, detail), grouped_results in sorted(
+        grouped.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
+        counts = Counter(str(result.get("mode", "unknown")) for result in grouped_results)
+        tasks = ", ".join(sorted({str(result.get("task", "unknown")) for result in grouped_results}))
+        row = [kind, detail.replace("|", "\\|")]
+        row.extend(str(counts[mode]) for mode in modes)
+        row.append(tasks)
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+
+    comparisons = comparison_pairs(modes)
+    if comparisons:
+        lines.extend([
+            "**Paired failure transitions:**",
+            "_Cells join on task, model, and repetition. Experiment-only failures "
+            "are the cells that can support a causal claim; shared failures point "
+            "at the task or grader instead._",
+            "",
+            "| Comparison | Both failed | Experiment-only failed | Reference-only failed | Neither failed |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for experiment_mode, reference in comparisons:
+            transitions = Counter()
+            for tuples in pair_modes(results, experiment_mode, reference).values():
+                for _rep, reference_correct, experiment_correct, _reference_cost, _experiment_cost in tuples:
+                    transitions[(experiment_correct, reference_correct)] += 1
+            lines.append(
+                f"| {mode_label(experiment_mode)} vs {mode_label(reference)} | "
+                f"{transitions[(False, False)]} | {transitions[(False, True)]} | "
+                f"{transitions[(True, False)]} | {transitions[(True, True)]} |"
+            )
+        lines.append("")
+
+    lines.extend([
+        "**Direct tilth-tool signal in failed cells:**",
+        "",
+        "| Mode | Failed cells | Failed cells with tilth calls | Tilth calls in failed cells |",
+        "|---|---:|---:|---:|",
+    ])
+    for mode in modes:
+        mode_failures = [
+            result for result, _failure in failures
+            if str(result.get("mode", "unknown")) == mode
+        ]
+        call_counts = [_tilth_tool_call_count(result) for result in mode_failures]
+        lines.append(
+            f"| {mode_label(mode)} | {len(mode_failures)} | "
+            f"{sum(count > 0 for count in call_counts)} | {sum(call_counts)} |"
+        )
+    lines.append("")
+    return lines
+
+
 def generate_report(results: list[dict]) -> str:
     """Generate markdown report from results."""
     if not results:
@@ -439,6 +559,7 @@ def generate_report(results: list[dict]) -> str:
     lines.extend(_capability_section(valid_results, modes))
     lines.extend(_control_section(valid_results, modes))
     lines.extend(_flags_section(results))
+    lines.extend(_failure_taxonomy_section(results))
     lines.extend([
         "## Context Efficiency",
         "",

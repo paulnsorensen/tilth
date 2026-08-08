@@ -52,6 +52,17 @@ def test_model_specific_breakdown_uses_all_token_categories():
     ("model", "expected"),
     [
         (
+            "claude-sonnet-5",
+            {
+                "input": 2.0,
+                "cache_creation": 4.0,
+                "cache_creation_5m": 2.5,
+                "cache_creation_1h": 4.0,
+                "cache_read": 0.2,
+                "output": 10.0,
+            },
+        ),
+        (
             "claude-opus-5",
             {
                 "input": 5.0,
