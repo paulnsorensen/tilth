@@ -223,21 +223,17 @@ def find_median_run(runs: list[dict], metric: str) -> dict:
     return sorted_runs[len(sorted_runs) // 2]
 
 
-def merge_tool_calls(runs: list[dict]) -> dict[str, float]:
-    """Merge tool_calls dicts from multiple runs and compute median counts."""
-    # Collect all tool names
-    all_tools = set()
+def total_tool_calls(runs: list[dict]) -> dict[str, int]:
+    """Sum tool_calls across runs so every tool that got used shows up."""
+    totals: dict[str, int] = {}
     for run in runs:
-        if "tool_calls" in run:
-            all_tools.update(run["tool_calls"].keys())
-
-    # Compute median count for each tool
-    result = {}
-    for tool in all_tools:
-        counts = [run.get("tool_calls", {}).get(tool, 0) for run in runs]
-        result[tool] = median(counts)
-
-    return result
+        tool_calls = run.get("tool_calls")
+        if not isinstance(tool_calls, dict):
+            continue
+        for tool, count in tool_calls.items():
+            if isinstance(count, (int, float)):
+                totals[tool] = totals.get(tool, 0) + int(count)
+    return totals
 
 CAPABILITIES = ("locate", "trace", "fix", "debug", "control")
 
@@ -728,6 +724,14 @@ def generate_report(results: list[dict]) -> str:
 
         lines.append("**Cost breakdown (median run):**")
         lines.append("")
+        lines.append(
+            "_Totals are the runner's native cost (prompt caching priced by "
+            "Claude Code itself, sidecar models included); the category split "
+            "is computed from recorded cache-tier tokens at pricing.yaml "
+            "rates. Δnative is the computed-minus-native residual — a large "
+            "value means the pricing table has drifted from native billing._"
+        )
+        lines.append("")
         for mode in present_modes:
             run = median_cost_runs[mode]
             total = run.get("total_cost_usd", 0.0)
@@ -736,6 +740,20 @@ def generate_report(results: list[dict]) -> str:
             label = mode_label(mode).ljust(label_width)
             lines.append(f"  {label}: {turns} turns, ${total:.2f}, {correct_str}")
             lines.append(format_cost_breakdown(median_costs[mode]))
+            computed_total = sum(median_costs[mode].values())
+            if total > 0:
+                residual = (computed_total - total) / total
+                lines.append(
+                    f"    native=${total:.4f} computed=${computed_total:.4f} "
+                    f"Δnative={residual:+.1%}"
+                )
+            model_usage = run.get("model_usage")
+            if isinstance(model_usage, dict) and model_usage:
+                per_model = ", ".join(
+                    f"{model}=${stats.get('costUSD', 0.0):.4f}"
+                    for model, stats in sorted(model_usage.items())
+                )
+                lines.append(f"    native per-model: {per_model}")
 
         if reference is not None and delta_modes:
             reference_run = median_cost_runs[reference]
@@ -776,20 +794,28 @@ def generate_report(results: list[dict]) -> str:
                 lines.append(f"  {label}: {spark} ({token_range})")
             lines.append("")
 
-        # Tool breakdown
+        # Tool breakdown — totals across reps, not medians: a tool used in a
+        # minority of reps must still show up as used.
         tools_by_mode = {
-            mode: merge_tool_calls(runs)
+            mode: total_tool_calls(runs)
             for mode, runs in runs_by_mode.items()
         }
         if any(tools_by_mode.values()):
-            lines.append("**Tool breakdown (median counts):**")
+            lines.append("**Tools used (total calls across reps):**")
             lines.append("")
             for mode in present_modes:
                 tools = tools_by_mode[mode]
-                if not tools:
-                    continue
-                tool_strs = [f"{name}={count:.0f}" for name, count in sorted(tools.items())]
                 label = mode_label(mode).ljust(label_width)
+                if not tools:
+                    lines.append(f"  {label}: (none)")
+                    continue
+                tool_strs = [
+                    f"{name}={count}"
+                    for name, count in sorted(
+                        tools.items(),
+                        key=lambda item: (_is_tilth_tool(item[0]), item[0]),
+                    )
+                ]
                 lines.append(f"  {label}: {', '.join(tool_strs)}")
             lines.append("")
 

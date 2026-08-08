@@ -552,6 +552,7 @@ def _run_single_in_repo(
         "tool_sequence": _compact_tool_sequence(run_result),
         "available_tools": run_result.available_tools,
         "mcp_servers": run_result.mcp_servers,
+        "model_usage": run_result.model_usage,
     }
 
 

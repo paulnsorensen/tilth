@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-08-07",
+  "as_of": "2026-08-08",
   "sources": {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing"
@@ -22,12 +22,12 @@
       "output": 15.0
     },
     "claude-sonnet-5": {
-      "input": 2.0,
-      "cache_creation": 4.0,
-      "cache_creation_5m": 2.5,
-      "cache_creation_1h": 4.0,
-      "cache_read": 0.2,
-      "output": 10.0
+      "input": 3.0,
+      "cache_creation": 6.0,
+      "cache_creation_5m": 3.75,
+      "cache_creation_1h": 6.0,
+      "cache_read": 0.3,
+      "output": 15.0
     },
     "claude-opus-4-6": {
       "input": 5.0,

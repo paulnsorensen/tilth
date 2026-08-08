@@ -332,3 +332,37 @@ def test_tool_usage_section_reports_per_arm_counts_and_availability():
     # denominator); one tilth cell made >=1 tilth call.
     assert "| baseline | 1 | 0/1 | 0 |" in report
     assert "| tilth-added | 2 | 1/1 | 1 |" in report
+
+
+def test_per_task_tools_used_totals_and_native_cost_reconciliation():
+    """Per-task sections must show which tools each arm called (totals, so a
+    tool used in one of three reps still appears) and reconcile the computed
+    category breakdown against the runner's native caching-aware total."""
+    runs = []
+    for repetition, tilth_calls in enumerate([1, 0, 0]):
+        run = _run(task="one", mode="tilth", cost=1.0, correct=True,
+                   repetition=repetition, model="claude-sonnet-5")
+        run["tool_calls"] = {"Read": 2}
+        if tilth_calls:
+            run["tool_calls"]["mcp__tilth__tilth_search"] = tilth_calls
+        runs.append(run)
+    # Native total deliberately above the computed sum: the residual line
+    # must surface the gap instead of hiding it.
+    for run in runs:
+        run["model_usage"] = {
+            "claude-sonnet-5": {"costUSD": 0.9},
+            "claude-haiku-4-5-20251001": {"costUSD": 0.1},
+        }
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True,
+                    model="claude-sonnet-5")
+    baseline["tool_calls"] = {"Grep": 4}
+
+    report = analyze.generate_report(runs + [baseline])
+
+    assert "**Tools used (total calls across reps):**" in report
+    assert "tilth-added: Read=6, mcp__tilth__tilth_search=1" in report
+    assert "baseline   : Grep=4" in report  # label ljust-padded to "tilth-added"
+    assert "Tool breakdown (median counts)" not in report
+    assert "native=$1.0000" in report
+    assert "Δnative=" in report
+    assert "native per-model: claude-haiku-4-5-20251001=$0.1000, claude-sonnet-5=$0.9000" in report

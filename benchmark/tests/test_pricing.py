@@ -53,13 +53,17 @@ def test_model_specific_breakdown_uses_all_token_categories():
     [
         (
             "claude-sonnet-5",
+            # Standard rates, not the dated introductory pricing: Claude Code's
+            # native total_cost_usd bills sonnet-5 at $3/$15 (verified against
+            # modelUsage.costUSD to the cent), and the computed breakdown must
+            # reconcile with the native totals the report treats as primary.
             {
-                "input": 2.0,
-                "cache_creation": 4.0,
-                "cache_creation_5m": 2.5,
-                "cache_creation_1h": 4.0,
-                "cache_read": 0.2,
-                "output": 10.0,
+                "input": 3.0,
+                "cache_creation": 6.0,
+                "cache_creation_5m": 3.75,
+                "cache_creation_1h": 6.0,
+                "cache_read": 0.3,
+                "output": 15.0,
             },
         ),
         (

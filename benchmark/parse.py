@@ -55,6 +55,29 @@ class RunResult:
     correctness_reason: str = ""
     available_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict] = field(default_factory=list)
+    model_usage: dict[str, dict] = field(default_factory=dict)
+
+
+_MODEL_USAGE_FIELDS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheReadInputTokens",
+    "cacheCreationInputTokens",
+    "costUSD",
+)
+
+
+def _trim_model_usage(model_usage: object) -> dict[str, dict]:
+    """Keep the native per-model token counts and cost, drop static metadata."""
+    if not isinstance(model_usage, dict):
+        return {}
+    return {
+        str(model): {
+            key: stats[key] for key in _MODEL_USAGE_FIELDS if key in stats
+        }
+        for model, stats in model_usage.items()
+        if isinstance(stats, dict)
+    }
 
 
 def _cache_creation_ttl_tokens(usage: dict) -> tuple[int, int]:
@@ -162,6 +185,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
         result_text="\n".join(result_text_parts),
         available_tools=available_tools,
         mcp_servers=mcp_servers,
+        model_usage=_trim_model_usage(final_summary.get("modelUsage")),
     )
 
 
