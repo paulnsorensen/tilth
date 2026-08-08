@@ -278,6 +278,13 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     }
 }
 
+fn append_batch_nudge(mut body: String, tool: &str, args: &Value, session: &Session) -> String {
+    if let Some(tip) = session.batch_nudge(tool, args) {
+        body.push_str("\n\n");
+        body.push_str(&tip);
+    }
+    body
+}
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
@@ -299,7 +306,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             }
         }
     }
-    match tool {
+    let result = match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(
             args,
@@ -314,7 +321,8 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
-    }
+    };
+    result.map(|body| append_batch_nudge(body, tool, args, services.session()))
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +436,22 @@ mod tests {
             a["cwd"] = serde_json::json!("/");
         }
         a
+    }
+
+    #[test]
+    fn batch_nudge_is_blank_line_separated_at_dispatch_seam() {
+        let session = Session::new();
+        let first = serde_json::json!({ "paths": ["a.go"] });
+        let second = serde_json::json!({ "paths": ["b.go"] });
+
+        assert_eq!(
+            append_batch_nudge("normal output".to_string(), "tilth_read", &first, &session),
+            "normal output"
+        );
+        assert_eq!(
+            append_batch_nudge("normal output".to_string(), "tilth_read", &second, &session),
+            "normal output\n\nTIP: batch into one call — paths: [\"a.go\", \"b.go\"]."
+        );
     }
 
     /// Integration seam: the real JSON-RPC dispatch path (`dispatch_tool`) must

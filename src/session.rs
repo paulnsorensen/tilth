@@ -5,7 +5,99 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
+use serde_json::Value;
+
 use crate::edit::snapshots::SnapshotStore;
+
+const BATCH_NUDGE_LIMIT: u8 = 2;
+const BATCH_NUDGE_MAX_CHARS: usize = 120;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchTool {
+    Read,
+    Search,
+    List,
+}
+
+impl BatchTool {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "tilth_read" => Some(Self::Read),
+            "tilth_search" => Some(Self::Search),
+            "tilth_list" => Some(Self::List),
+            _ => None,
+        }
+    }
+
+    fn parameter(self) -> &'static str {
+        match self {
+            Self::Read => "paths",
+            Self::Search => "queries",
+            Self::List => "patterns",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Read => 0,
+            Self::Search => 1,
+            Self::List => 2,
+        }
+    }
+
+    fn generic_tip(self) -> &'static str {
+        match self {
+            Self::Read => "TIP: batch into one call — paths: [\"a.rs\", \"b.rs\"].",
+            Self::Search => {
+                "TIP: batch into one call — queries: [{\"query\":\"foo\"}, {\"query\":\"bar\"}]."
+            }
+            Self::List => "TIP: batch into one call — patterns: [\"*.rs\", \"*.toml\"].",
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchNudgeState {
+    previous: Option<(BatchTool, Value)>,
+    emissions: [u8; 3],
+}
+
+impl BatchNudgeState {
+    fn record(&mut self, tool_name: &str, args: &Value) -> Option<String> {
+        let Some(tool) = BatchTool::from_name(tool_name) else {
+            self.previous = None;
+            return None;
+        };
+        let Some(items) = args.get(tool.parameter()).and_then(Value::as_array) else {
+            self.previous = None;
+            return None;
+        };
+        if items.len() != 1 {
+            self.previous = None;
+            return None;
+        }
+
+        let current = items[0].clone();
+        let previous = self.previous.replace((tool, current.clone()));
+        let (_, previous_item) = previous.filter(|(last, _)| *last == tool)?;
+
+        let emissions = &mut self.emissions[tool.index()];
+        if *emissions >= BATCH_NUDGE_LIMIT {
+            return None;
+        }
+        *emissions += 1;
+
+        let tip = format!(
+            "TIP: batch into one call — {}: [{previous_item}, {current}].",
+            tool.parameter()
+        );
+        if tip.chars().count() <= BATCH_NUDGE_MAX_CHARS {
+            Some(tip)
+        } else {
+            Some(tool.generic_tip().to_string())
+        }
+    }
+}
 
 /// Tracks MCP activity across calls.
 /// Stored alongside `OutlineCache` in server state.
@@ -27,6 +119,7 @@ pub struct Session {
     /// tokens actually returned across all reads in this session.
     baseline_tokens: AtomicU64,
     saved_tokens: AtomicU64,
+    batch_nudges: Mutex<BatchNudgeState>,
 }
 
 impl Session {
@@ -40,6 +133,7 @@ impl Session {
             snapshots: Mutex::new(SnapshotStore::new()),
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
+            batch_nudges: Mutex::new(BatchNudgeState::default()),
         }
     }
 
@@ -88,6 +182,15 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *syms.entry(query.to_string()).or_insert(0) += 1;
+    }
+
+    /// Observe one completed MCP tool call and return a just-in-time batching
+    /// tip when the same batchable tool receives consecutive single-item arrays.
+    pub fn batch_nudge(&self, tool: &str, args: &Value) -> Option<String> {
+        self.batch_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(tool, args)
     }
 
     fn record_dir(&self, path: &Path) {
@@ -188,6 +291,11 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.snapshots().clear();
+
+        *self
+            .batch_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = BatchNudgeState::default();
         self.baseline_tokens.store(0, Ordering::Relaxed);
         self.saved_tokens.store(0, Ordering::Relaxed);
     }
@@ -223,6 +331,111 @@ impl Default for Session {
 mod tests {
     use super::*;
 
+    #[test]
+    fn second_consecutive_single_item_call_returns_batch_nudge() {
+        let session = Session::new();
+
+        assert_eq!(
+            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["a.go"] })),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["b.go"] })),
+            Some("TIP: batch into one call — paths: [\"a.go\", \"b.go\"].".to_string())
+        );
+    }
+
+    #[test]
+    fn multi_item_call_resets_batch_nudge_streak() {
+        let session = Session::new();
+
+        assert_eq!(
+            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.rs"] })),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_list",
+                &serde_json::json!({ "patterns": ["*.rs", "*.toml"] })
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.md"] })),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.txt"] })),
+            Some("TIP: batch into one call — patterns: [\"*.md\", \"*.txt\"].".to_string())
+        );
+    }
+
+    #[test]
+    fn different_tool_resets_batch_nudge_streak() {
+        let session = Session::new();
+
+        assert_eq!(
+            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["a.rs"] })),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_search",
+                &serde_json::json!({ "queries": [{ "query": "needle" }] })
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["b.rs"] })),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["c.rs"] })),
+            Some("TIP: batch into one call — paths: [\"b.rs\", \"c.rs\"].".to_string())
+        );
+    }
+
+    #[test]
+    fn batch_nudge_emits_at_most_twice_per_tool() {
+        let session = Session::new();
+        let calls = ["one", "two", "three", "four"];
+
+        let nudges: Vec<_> = calls
+            .into_iter()
+            .map(|query| {
+                session.batch_nudge(
+                    "tilth_search",
+                    &serde_json::json!({ "queries": [{ "query": query }] }),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            nudges,
+            vec![
+                None,
+                Some(
+                    "TIP: batch into one call — queries: [{\"query\":\"one\"}, {\"query\":\"two\"}]."
+                        .to_string()
+                ),
+                Some(
+                    "TIP: batch into one call — queries: [{\"query\":\"two\"}, {\"query\":\"three\"}]."
+                        .to_string()
+                ),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_item_calls_never_emit_batch_nudge() {
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": ["a.rs", "b.rs"] });
+
+        assert_eq!(session.batch_nudge("tilth_read", &args), None);
+        assert_eq!(session.batch_nudge("tilth_read", &args), None);
+        assert_eq!(session.batch_nudge("tilth_read", &args), None);
+    }
     #[test]
     fn record_savings_accumulates_across_calls() {
         let session = Session::new();
