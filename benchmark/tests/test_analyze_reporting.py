@@ -339,7 +339,9 @@ def test_tool_usage_section_reports_per_arm_counts_and_availability():
 
 def test_batching_table_reports_multi_item_share_per_arm():
     """The batching table is the needle for batch-instruction experiments:
-    calls / multi-item / share / max per batchable tool, per arm."""
+    calls / multi-item / share / max per batchable tool, per arm. A mode whose
+    rows never recorded batch sizes renders "unrecorded", never "-" — the two
+    support opposite conclusions."""
     baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
     baseline["tool_calls"] = {"Read": 2}
     baseline["batch_sizes"] = {}
@@ -347,12 +349,14 @@ def test_batching_table_reports_multi_item_share_per_arm():
     tilth["tool_calls"] = {"mcp__tilth__tilth_read": 3}
     tilth["batch_sizes"] = {"mcp__tilth__tilth_read": [1, 4, 1],
                             "mcp__tilth__tilth_search": [1, 1]}
+    legacy = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
+    legacy["tool_calls"] = {"mcp__tilth__tilth_read": 5}
 
-    report = analyze.generate_report([baseline, tilth])
+    report = analyze.generate_report([baseline, tilth, legacy])
 
     assert "**Batching**" in report
-    assert "| mcp__tilth__tilth_read | - | 3 / 1 / 33% / 4 |" in report
-    assert "| mcp__tilth__tilth_search | - | 2 / 0 / 0% / 1 |" in report
+    assert "| mcp__tilth__tilth_read | - | 3 / 1 / 33% / 4 | unrecorded |" in report
+    assert "| mcp__tilth__tilth_search | - | 2 / 0 / 0% / 1 | unrecorded |" in report
     assert "_Batch sizes unrecorded" not in report
 
 

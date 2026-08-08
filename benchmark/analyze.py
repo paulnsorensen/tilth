@@ -521,6 +521,9 @@ def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
     if not recorded:
         return ["_Batch sizes unrecorded (rows predate batch-size capture)._", ""]
 
+    recorded_by_mode: Counter = Counter(str(r.get("mode", "unknown")) for r in recorded)
+    total_by_mode: Counter = Counter(str(r.get("mode", "unknown")) for r in valid_results)
+
     # (tool, mode) -> list of per-call sizes
     sizes: dict[tuple[str, str], list[int]] = defaultdict(list)
     for r in recorded:
@@ -531,7 +534,7 @@ def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
                     int(s) for s in call_sizes if isinstance(s, (int, float))
                 )
     if not sizes:
-        return []
+        return ["_No batchable tool calls recorded._", ""]
 
     lines = [
         "**Batching** (calls / multi-item / multi-item share / max items per "
@@ -547,6 +550,11 @@ def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
     for tool in tools:
         row = [tool]
         for mode in modes:
+            # "-" must mean "no batchable calls", never "not measured": a mode
+            # whose rows all predate capture renders as unrecorded instead.
+            if not recorded_by_mode[mode]:
+                row.append("unrecorded")
+                continue
             s = sizes.get((tool, mode))
             if not s:
                 row.append("-")
@@ -554,6 +562,14 @@ def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
             multi = sum(1 for n in s if n > 1)
             row.append(f"{len(s)} / {multi} / {multi / len(s):.0%} / {max(s)}")
         lines.append("| " + " | ".join(row) + " |")
+    partial = [
+        f"{mode_label(mode)} {recorded_by_mode[mode]}/{total_by_mode[mode]}"
+        for mode in modes
+        if 0 < recorded_by_mode[mode] < total_by_mode[mode]
+    ]
+    if partial:
+        lines.append("")
+        lines.append(f"_Batch sizes recorded on a subset of rows: {', '.join(partial)}._")
     lines.append("")
     return lines
 

@@ -57,14 +57,20 @@ def _tool_use_event(name: str, tool_input: dict, tool_id: str = "t1") -> dict:
 
 def test_tool_batch_sizes_records_batchable_calls_in_order():
     """Batch-size capture is the needle for batching instrumentation: array
-    params record their length, singular fallbacks count as 1, and
-    non-batchable tools (Bash) are excluded entirely."""
+    params record their length; the upstream singular fallbacks (path/query)
+    count as 1; both write shapes (upstream files, fork edits) are covered;
+    non-batchable tools (Bash, Glob, tilth_deps) are excluded entirely."""
     events = [
         _tool_use_event("mcp__tilth__tilth_read", {"paths": ["a.rs", "b.rs", "c.rs"]}, "t1"),
         _tool_use_event("mcp__tilth__tilth_read", {"path": "d.rs"}, "t2"),
         _tool_use_event("mcp__tilth__tilth_search", {"queries": [{"query": "x"}]}, "t3"),
         _tool_use_event("tilth_write", {"files": [{"path": "a"}, {"path": "b"}]}, "t4"),
-        _tool_use_event("Bash", {"command": "ls"}, "t5"),
+        _tool_use_event("mcp__tilth__tilth_write",
+                        {"edits": [{"path": "a", "ops": []}, {"path": "b", "ops": []},
+                                   {"path": "c", "ops": []}]}, "t5"),
+        _tool_use_event("Bash", {"command": "ls"}, "t6"),
+        _tool_use_event("Glob", {"pattern": "**/*.rs", "path": "src"}, "t7"),
+        _tool_use_event("mcp__tilth__tilth_deps", {"path": "src/cache.rs"}, "t8"),
         _result_event(),
     ]
 
@@ -74,14 +80,35 @@ def test_tool_batch_sizes_records_batchable_calls_in_order():
         "mcp__tilth__tilth_read": [3, 1],
         "mcp__tilth__tilth_search": [1],
         "tilth_write": [2],
+        "mcp__tilth__tilth_write": [3],
     }
 
 
-def test_tool_batch_sizes_handles_malformed_inputs():
-    """A non-list where an array belongs must not crash or fabricate a size."""
+def test_tool_batch_sizes_counts_coerced_bare_string_as_one():
+    """The server coerces a bare-string array param to one item — these are
+    exactly the un-batched calls the metric must count, not drop (dropping
+    them inflates the multi-item share in favor of the batching hypothesis)."""
     events = [
-        _tool_use_event("mcp__tilth__tilth_read", {"paths": "not-a-list"}, "t1"),
-        _tool_use_event("mcp__tilth__tilth_read", {}, "t2"),
+        _tool_use_event("mcp__tilth__tilth_read", {"paths": "a.rs"}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_search", {"queries": "foo"}, "t2"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert tool_batch_sizes(result) == {
+        "mcp__tilth__tilth_read": [1],
+        "mcp__tilth__tilth_search": [1],
+    }
+
+
+def test_tool_batch_sizes_skips_malformed_inputs():
+    """Genuinely malformed inputs (non-list non-string, empty array, absent
+    params) are skipped, never fabricated into a size."""
+    events = [
+        _tool_use_event("mcp__tilth__tilth_read", {"paths": 42}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_read", {"paths": []}, "t2"),
+        _tool_use_event("mcp__tilth__tilth_read", {}, "t3"),
         _result_event(),
     ]
 
