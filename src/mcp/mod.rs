@@ -535,7 +535,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1400,
+            1420,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -550,8 +550,12 @@ mod tests {
             "require-cwd path discipline must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_unified_diff\", cwd:"),
+            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_diff\", cwd:"),
             "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains("set `kind` (symbol|content|regex|callers)"),
+            "search kind grammar must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
             SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_search")
@@ -564,7 +568,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1798,
+            1777,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -575,11 +579,16 @@ mod tests {
             !EDIT_MODE_INSTRUCTIONS.contains("\n\n\n"),
             "EDIT_MODE_INSTRUCTIONS must not introduce triple newlines"
         );
-        assert!(EDIT_MODE_INSTRUCTIONS
-            .contains("edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops}, {path: \"src/b.rs\""));
+        assert!(EDIT_MODE_INSTRUCTIONS.contains(
+            "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
+        ));
         assert!(
             EDIT_MODE_INSTRUCTIONS.contains("Line ops use copied integer"),
             "op grammar pointer must remain in EDIT_MODE_INSTRUCTIONS"
+        );
+        assert!(
+            EDIT_MODE_INSTRUCTIONS.contains("must escape tabs/newlines"),
+            "control-char escape rule must remain in EDIT_MODE_INSTRUCTIONS"
         );
     }
 
@@ -1689,12 +1698,12 @@ mod tests {
                 );
             }
             assert!(
-                s.contains("DO NOT cat/head/tail/sed repo files via shell"),
+                s.contains("DO NOT use shell for repo files or history"),
                 "missing shell DO NOT line (edit={edit})"
             );
             assert!(
-                s.contains("DO NOT grep/rg/ls/find via shell"),
-                "missing shell DO NOT line (edit={edit})"
+                s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
+                "shell DO NOT line must enumerate the replaced commands (edit={edit})"
             );
         }
     }

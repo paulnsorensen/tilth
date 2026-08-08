@@ -75,7 +75,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Required batch (max 20). Suffixes: `path#n-m`, `path#n`, `path### Heading`, or `path#symbol`."
+                        "description": "Required batch (max 20). Suffixes: `path#n-m`, `path#n` (from line n), `path### Heading`, or `path#symbol`."
                     },
                     "mode": {
                         "type": "string",
