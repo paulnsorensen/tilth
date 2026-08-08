@@ -446,6 +446,36 @@ def tool_call_counts(result: RunResult) -> dict[str, int]:
     return counts
 
 
+# Array parameters that make a tool batchable, with their singular fallbacks.
+_BATCH_PARAMS = ("paths", "queries", "patterns", "files", "edits")
+_SINGULAR_PARAMS = {"paths": "path", "queries": "query", "patterns": "pattern"}
+
+
+def _batch_size(tool_input: object) -> Optional[int]:
+    """Items in one call for a batchable tool; None when not batchable."""
+    if not isinstance(tool_input, dict):
+        return None
+    for param in _BATCH_PARAMS:
+        value = tool_input.get(param)
+        if isinstance(value, list):
+            return len(value)
+        singular = _SINGULAR_PARAMS.get(param)
+        if singular is not None and tool_input.get(singular) is not None:
+            return 1
+    return None
+
+
+def tool_batch_sizes(result: RunResult) -> dict[str, list[int]]:
+    """Per-call batch sizes by tool, in call order, for batchable tools only."""
+    sizes: dict[str, list[int]] = {}
+    for turn in result.turns:
+        for tool_call in turn.tool_calls:
+            size = _batch_size(tool_call.input)
+            if size is not None:
+                sizes.setdefault(tool_call.name, []).append(size)
+    return sizes
+
+
 def extract_stream_error(stdout: str) -> Optional[str]:
     """Pull the human-readable error out of a codex/opencode JSON event stream.
 

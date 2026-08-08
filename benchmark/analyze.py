@@ -511,6 +511,50 @@ def _tool_usage_section(valid_results: list[dict]) -> list[str]:
             f"{tilth_cells_by_mode[mode]} |"
         )
     lines.append("")
+    lines.extend(_batch_size_table(valid_results, modes))
+    return lines
+
+
+def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
+    """Per-arm batching table: how often batchable tools carry >1 item."""
+    recorded = [r for r in valid_results if isinstance(r.get("batch_sizes"), dict)]
+    if not recorded:
+        return ["_Batch sizes unrecorded (rows predate batch-size capture)._", ""]
+
+    # (tool, mode) -> list of per-call sizes
+    sizes: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for r in recorded:
+        mode = str(r.get("mode", "unknown"))
+        for tool, call_sizes in r["batch_sizes"].items():
+            if isinstance(call_sizes, list):
+                sizes[(str(tool), mode)].extend(
+                    int(s) for s in call_sizes if isinstance(s, (int, float))
+                )
+    if not sizes:
+        return []
+
+    lines = [
+        "**Batching** (calls / multi-item / multi-item share / max items per "
+        "call — batchable tools only):",
+        "",
+        "| Tool | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "|".join(["---:"] * len(modes)) + "|",
+    ]
+    tools = sorted(
+        {tool for tool, _ in sizes},
+        key=lambda name: (_is_tilth_tool(name), name),
+    )
+    for tool in tools:
+        row = [tool]
+        for mode in modes:
+            s = sizes.get((tool, mode))
+            if not s:
+                row.append("-")
+                continue
+            multi = sum(1 for n in s if n > 1)
+            row.append(f"{len(s)} / {multi} / {multi / len(s):.0%} / {max(s)}")
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
     return lines
 
 

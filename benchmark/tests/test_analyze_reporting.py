@@ -332,6 +332,28 @@ def test_tool_usage_section_reports_per_arm_counts_and_availability():
     # denominator); one tilth cell made >=1 tilth call.
     assert "| baseline | 1 | 0/1 | 0 |" in report
     assert "| tilth-added | 2 | 1/1 | 1 |" in report
+    # No row carries batch_sizes -> the batching table degrades explicitly
+    # instead of rendering zeros.
+    assert "_Batch sizes unrecorded" in report
+
+
+def test_batching_table_reports_multi_item_share_per_arm():
+    """The batching table is the needle for batch-instruction experiments:
+    calls / multi-item / share / max per batchable tool, per arm."""
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
+    baseline["tool_calls"] = {"Read": 2}
+    baseline["batch_sizes"] = {}
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    tilth["tool_calls"] = {"mcp__tilth__tilth_read": 3}
+    tilth["batch_sizes"] = {"mcp__tilth__tilth_read": [1, 4, 1],
+                            "mcp__tilth__tilth_search": [1, 1]}
+
+    report = analyze.generate_report([baseline, tilth])
+
+    assert "**Batching**" in report
+    assert "| mcp__tilth__tilth_read | - | 3 / 1 / 33% / 4 |" in report
+    assert "| mcp__tilth__tilth_search | - | 2 / 0 / 0% / 1 |" in report
+    assert "_Batch sizes unrecorded" not in report
 
 
 def test_per_task_tools_used_totals_and_native_cost_reconciliation():

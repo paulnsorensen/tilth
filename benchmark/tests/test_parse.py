@@ -12,7 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from parse import parse_codex_json, parse_opencode_json, parse_stream_json
+from parse import (
+    parse_codex_json,
+    parse_opencode_json,
+    parse_stream_json,
+    tool_batch_sizes,
+)
 
 
 # --- stream-json (claude -p) ------------------------------------------------
@@ -36,6 +41,53 @@ def _assistant_event(text: str) -> dict:
 
 def _result_event() -> dict:
     return {"type": "result", "num_turns": 5, "total_cost_usd": 0.01}
+
+
+def _tool_use_event(name: str, tool_input: dict, tool_id: str = "t1") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "usage": {"input_tokens": 1, "output_tokens": 1,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            "content": [{"type": "tool_use", "id": tool_id, "name": name,
+                         "input": tool_input}],
+        },
+    }
+
+
+def test_tool_batch_sizes_records_batchable_calls_in_order():
+    """Batch-size capture is the needle for batching instrumentation: array
+    params record their length, singular fallbacks count as 1, and
+    non-batchable tools (Bash) are excluded entirely."""
+    events = [
+        _tool_use_event("mcp__tilth__tilth_read", {"paths": ["a.rs", "b.rs", "c.rs"]}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_read", {"path": "d.rs"}, "t2"),
+        _tool_use_event("mcp__tilth__tilth_search", {"queries": [{"query": "x"}]}, "t3"),
+        _tool_use_event("tilth_write", {"files": [{"path": "a"}, {"path": "b"}]}, "t4"),
+        _tool_use_event("Bash", {"command": "ls"}, "t5"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert tool_batch_sizes(result) == {
+        "mcp__tilth__tilth_read": [3, 1],
+        "mcp__tilth__tilth_search": [1],
+        "tilth_write": [2],
+    }
+
+
+def test_tool_batch_sizes_handles_malformed_inputs():
+    """A non-list where an array belongs must not crash or fabricate a size."""
+    events = [
+        _tool_use_event("mcp__tilth__tilth_read", {"paths": "not-a-list"}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_read", {}, "t2"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert tool_batch_sizes(result) == {}
 
 
 def test_stream_json_result_text_accumulates_across_all_assistant_turns():
