@@ -63,7 +63,10 @@ struct BatchNudgeState {
 }
 
 impl BatchNudgeState {
-    fn record(&mut self, tool_name: &str, args: &Value) -> Option<String> {
+    /// Record one dispatched call in the streak. `emit` is false for calls
+    /// whose response cannot carry a tip (errored dispatches): the streak
+    /// still advances, but no tip is produced and no emission is consumed.
+    fn record(&mut self, tool_name: &str, args: &Value, emit: bool) -> Option<String> {
         let Some(tool) = BatchTool::from_name(tool_name) else {
             self.previous = None;
             return None;
@@ -80,6 +83,15 @@ impl BatchNudgeState {
         let current = items[0].clone();
         let previous = self.previous.replace((tool, current.clone()));
         let (_, previous_item) = previous.filter(|(last, _)| *last == tool)?;
+        if !emit {
+            return None;
+        }
+        // A repeat of the same item would render a nonsense self-batch tip
+        // ("[a.rs, a.rs]"); re-reads with changed options are ordinary agent
+        // behavior, so skip without spending an emission.
+        if previous_item == current {
+            return None;
+        }
 
         let emissions = &mut self.emissions[tool.index()];
         if *emissions >= BATCH_NUDGE_LIMIT {
@@ -184,13 +196,16 @@ impl Session {
         *syms.entry(query.to_string()).or_insert(0) += 1;
     }
 
-    /// Observe one completed MCP tool call and return a just-in-time batching
-    /// tip when the same batchable tool receives consecutive single-item arrays.
-    pub fn batch_nudge(&self, tool: &str, args: &Value) -> Option<String> {
+    /// Observe one dispatched MCP tool call (every dispatch, errored or not —
+    /// skipping errored calls would let a failed intervening tool preserve a
+    /// streak it actually broke) and return a just-in-time batching tip when
+    /// the same batchable tool receives consecutive single-item arrays.
+    /// `emit` is false when the response cannot carry a tip.
+    pub fn batch_nudge(&self, tool: &str, args: &Value, emit: bool) -> Option<String> {
         self.batch_nudges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(tool, args)
+            .record(tool, args, emit)
     }
 
     fn record_dir(&self, path: &Path) {
@@ -336,11 +351,19 @@ mod tests {
         let session = Session::new();
 
         assert_eq!(
-            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["a.go"] })),
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["a.go"] }),
+                true
+            ),
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["b.go"] })),
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["b.go"] }),
+                true
+            ),
             Some("TIP: batch into one call — paths: [\"a.go\", \"b.go\"].".to_string())
         );
     }
@@ -350,22 +373,35 @@ mod tests {
         let session = Session::new();
 
         assert_eq!(
-            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.rs"] })),
+            session.batch_nudge(
+                "tilth_list",
+                &serde_json::json!({ "patterns": ["*.rs"] }),
+                true
+            ),
             None
         );
         assert_eq!(
             session.batch_nudge(
                 "tilth_list",
-                &serde_json::json!({ "patterns": ["*.rs", "*.toml"] })
+                &serde_json::json!({ "patterns": ["*.rs", "*.toml"] }),
+                true,
             ),
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.md"] })),
+            session.batch_nudge(
+                "tilth_list",
+                &serde_json::json!({ "patterns": ["*.md"] }),
+                true
+            ),
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_list", &serde_json::json!({ "patterns": ["*.txt"] })),
+            session.batch_nudge(
+                "tilth_list",
+                &serde_json::json!({ "patterns": ["*.txt"] }),
+                true
+            ),
             Some("TIP: batch into one call — patterns: [\"*.md\", \"*.txt\"].".to_string())
         );
     }
@@ -375,22 +411,35 @@ mod tests {
         let session = Session::new();
 
         assert_eq!(
-            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["a.rs"] })),
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["a.rs"] }),
+                true
+            ),
             None
         );
         assert_eq!(
             session.batch_nudge(
                 "tilth_search",
-                &serde_json::json!({ "queries": [{ "query": "needle" }] })
+                &serde_json::json!({ "queries": [{ "query": "needle" }] }),
+                true,
             ),
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["b.rs"] })),
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["b.rs"] }),
+                true
+            ),
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_read", &serde_json::json!({ "paths": ["c.rs"] })),
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["c.rs"] }),
+                true
+            ),
             Some("TIP: batch into one call — paths: [\"b.rs\", \"c.rs\"].".to_string())
         );
     }
@@ -406,6 +455,7 @@ mod tests {
                 session.batch_nudge(
                     "tilth_search",
                     &serde_json::json!({ "queries": [{ "query": query }] }),
+                    true,
                 )
             })
             .collect();
@@ -432,10 +482,132 @@ mod tests {
         let session = Session::new();
         let args = serde_json::json!({ "paths": ["a.rs", "b.rs"] });
 
-        assert_eq!(session.batch_nudge("tilth_read", &args), None);
-        assert_eq!(session.batch_nudge("tilth_read", &args), None);
-        assert_eq!(session.batch_nudge("tilth_read", &args), None);
+        assert_eq!(session.batch_nudge("tilth_read", &args, true), None);
+        assert_eq!(session.batch_nudge("tilth_read", &args, true), None);
+        assert_eq!(session.batch_nudge("tilth_read", &args, true), None);
     }
+
+    #[test]
+    fn repeating_the_same_item_never_tips_and_preserves_the_budget() {
+        // A re-read of the same file (changed budget/mode) must not render a
+        // nonsense self-batch tip, and must not spend an emission: the full
+        // 2-emission budget stays available for real advice afterwards.
+        let session = Session::new();
+        let same = serde_json::json!({ "paths": ["a.rs"] });
+
+        assert_eq!(session.batch_nudge("tilth_read", &same, true), None);
+        assert_eq!(session.batch_nudge("tilth_read", &same, true), None);
+        assert_eq!(session.batch_nudge("tilth_read", &same, true), None);
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["b.rs"] }),
+                true
+            ),
+            Some("TIP: batch into one call — paths: [\"a.rs\", \"b.rs\"].".to_string())
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["c.rs"] }),
+                true
+            ),
+            Some("TIP: batch into one call — paths: [\"b.rs\", \"c.rs\"].".to_string())
+        );
+    }
+
+    #[test]
+    fn non_batchable_tool_resets_batch_nudge_streak() {
+        // The from_name → None arm must reset `previous`, not merely skip.
+        let session = Session::new();
+
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["a.rs"] }),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge("tilth_grok", &serde_json::json!({ "target": "X" }), true),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["b.rs"] }),
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn errored_call_advances_streak_without_tipping_or_spending_budget() {
+        // emit=false (errored dispatch): the call still joins the streak, so
+        // the next successful call tips against it, and no emission is spent
+        // on the suppressed tip.
+        let session = Session::new();
+
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["a.rs"] }),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["b.rs"] }),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["c.rs"] }),
+                true
+            ),
+            Some("TIP: batch into one call — paths: [\"b.rs\", \"c.rs\"].".to_string())
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["d.rs"] }),
+                true
+            ),
+            Some("TIP: batch into one call — paths: [\"c.rs\", \"d.rs\"].".to_string())
+        );
+    }
+
+    #[test]
+    fn oversized_tip_falls_back_to_the_generic_form() {
+        let session = Session::new();
+        let long_a = format!("src/{}/mod.rs", "a".repeat(60));
+        let long_b = format!("src/{}/mod.rs", "b".repeat(60));
+
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": [long_a] }),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            session.batch_nudge(
+                "tilth_read",
+                &serde_json::json!({ "paths": [long_b] }),
+                true
+            ),
+            Some("TIP: batch into one call — paths: [\"a.rs\", \"b.rs\"].".to_string())
+        );
+    }
+
     #[test]
     fn record_savings_accumulates_across_calls() {
         let session = Session::new();
