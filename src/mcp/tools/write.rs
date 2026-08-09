@@ -211,7 +211,8 @@ fn resolve_edit(
                 return Err(TilthError::EditRejected(
                     "replace_text requires a tag from an edit-mode read; a section read \
                      (path#12-40) carries the whole-file tag without reading the file in \
-                     full. Files over the tag cap mint no tag — use line ops there."
+                     full, but `old` must occur in the lines it displayed. Files over the \
+                     tag cap mint no tag — use line ops there."
                         .into(),
                 ));
             }
@@ -1199,6 +1200,12 @@ mod tests {
                 assert!(
                     message.contains("over the tag cap"),
                     "rejection must name the over-cap case that has no tag: {message}"
+                );
+                // Pointing at the section read without this constraint sent
+                // agents into a second failed round trip via UnseenAnchor.
+                assert!(
+                    message.contains("must occur in the lines it displayed"),
+                    "rejection must state the seen-lines constraint: {message}"
                 );
             }
             other => panic!("expected EditRejected, got {other:?}"),

@@ -659,7 +659,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1876,
+            1881,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -688,20 +688,32 @@ mod tests {
     }
 
     /// ADR-003's hard surface cap. The spec elevated "the cap never yields" to
-    /// a quality gate but shipped no guard, so a description edit could cross
-    /// it unnoticed. Measures what an edit-mode client actually receives:
-    /// the served instructions plus the `tools/list` JSON.
+    /// a quality gate but shipped no guard.
+    ///
+    /// Drives `serve` and counts the bytes an edit-mode client actually
+    /// receives — envelopes, `serverInfo`, and JSON escaping included. An
+    /// earlier version of this guard summed `EDIT_MODE_INSTRUCTIONS.len()` with
+    /// the tool JSON and reported ~200 chars of headroom that did not exist:
+    /// it omitted the envelopes and mixed byte and char counts under one cap.
     #[test]
     fn edit_mode_surface_stays_within_cap() {
         const CAP: usize = 13_779;
-        let tools = serde_json::json!({ "tools": tool_definitions(true) });
-        let surface =
-            EDIT_MODE_INSTRUCTIONS.len() + serde_json::to_string(&tools).unwrap().chars().count();
+        let services = Services::new(true);
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+            "\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        serve(input.as_bytes(), &mut out, &services).expect("serve drains cleanly on EOF");
+        let out = String::from_utf8(out).expect("utf8 output");
+        let surface: usize = out.lines().filter(|l| !l.is_empty()).map(str::len).sum();
         assert!(
             surface <= CAP,
-            "edit-mode MCP surface is {surface} chars, over the {CAP} cap by {}. \
+            "edit-mode MCP surface is {surface} bytes, over the {CAP} cap by {}. \
              Trim a description — the cap does not yield.",
-            surface - CAP
+            surface.saturating_sub(CAP)
         );
     }
 
