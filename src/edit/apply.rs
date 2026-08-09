@@ -135,21 +135,12 @@ pub fn resolve_text_swap(
 
     let end = start + matched.len();
     let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let end_anchor = end.saturating_sub(1);
-    let matched_ends_at_line_break = text.as_bytes().get(end_anchor) == Some(&b'\n');
-    let line_end = if matched_ends_at_line_break {
-        end_anchor
-    } else {
-        text[end..].find('\n').map_or(text.len(), |i| end + i)
-    };
     let start_line = text[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
-    let end_line = text[..end_anchor].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
-    let suffix = if end < line_end {
-        &text[end..line_end]
-    } else {
-        ""
-    };
-    let replaced = format!("{}{}{}", &text[line_start..start], new, suffix);
+    let end_line = text[..end].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+    let line_end = text[end..].find('\n').map_or(text.len(), |i| end + i);
+    let prefix = &text[line_start..start];
+    let suffix = &text[end..line_end];
+    let replaced = format!("{prefix}{new}{suffix}");
     Ok((
         start_line,
         end_line,
@@ -865,5 +856,73 @@ mod tests {
                 vec!["head NEW".to_string(), "replacement TAIL".to_string()]
             )
         );
+    }
+
+    #[test]
+    fn resolve_text_swap_multibyte_final_char_applies_exactly() {
+        let text = "prefix café";
+        let result = resolve_text_swap(text, "é", "X").expect("unique match");
+        assert_eq!(result, (1, 1, vec!["prefix cafX".to_string()]));
+        let applied = apply_line_ops(
+            text,
+            &[LineOp::Swap {
+                start: result.0,
+                end: result.1,
+                payload: result.2,
+            }],
+        )
+        .expect("lowered op applies");
+        assert_eq!(applied.text, "prefix cafX");
+    }
+
+    #[test]
+    fn resolve_text_swap_newline_only_applies_exactly() {
+        let text = "a\nb";
+        let result = resolve_text_swap(text, "\n", "X").expect("unique match");
+        assert_eq!(result, (1, 2, vec!["aXb".to_string()]));
+        let applied = apply_line_ops(
+            text,
+            &[LineOp::Swap {
+                start: result.0,
+                end: result.1,
+                payload: result.2,
+            }],
+        )
+        .expect("lowered op applies");
+        assert_eq!(applied.text, "aXb");
+    }
+
+    #[test]
+    fn resolve_text_swap_interior_newline_applies_exactly() {
+        let text = "a\nb\nc";
+        let result = resolve_text_swap(text, "a\nb", "X\nY").expect("unique match");
+        assert_eq!(result, (1, 2, vec!["X".to_string(), "Y".to_string()]));
+        let applied = apply_line_ops(
+            text,
+            &[LineOp::Swap {
+                start: result.0,
+                end: result.1,
+                payload: result.2,
+            }],
+        )
+        .expect("lowered op applies");
+        assert_eq!(applied.text, "X\nY\nc");
+    }
+
+    #[test]
+    fn resolve_text_swap_newline_ending_at_eof_applies_exactly() {
+        let text = "a\nb\n";
+        let result = resolve_text_swap(text, "b\n", "X").expect("unique match");
+        assert_eq!(result, (2, 3, vec!["X".to_string()]));
+        let applied = apply_line_ops(
+            text,
+            &[LineOp::Swap {
+                start: result.0,
+                end: result.1,
+                payload: result.2,
+            }],
+        )
+        .expect("lowered op applies");
+        assert_eq!(applied.text, "a\nX");
     }
 }

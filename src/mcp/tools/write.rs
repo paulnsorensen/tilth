@@ -304,10 +304,17 @@ fn commit_file_op(
                     path.display()
                 )));
             }
-            crate::util::atomic_write_bytes(path, content.as_bytes()).map_err(|e| {
-                TilthError::IoError {
-                    path: path.to_path_buf(),
-                    source: e,
+            crate::util::atomic_create_bytes_no_replace(path, content.as_bytes()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    TilthError::EditRejected(format!(
+                        "create_file target already exists: {} — use a tagged read with replace instead",
+                        path.display()
+                    ))
+                } else {
+                    TilthError::IoError {
+                        path: path.to_path_buf(),
+                        source: e,
+                    }
                 }
             })?;
             session.record_read(path);
@@ -1226,6 +1233,40 @@ mod tests {
             )
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_dangling_symlink_rejected_without_target_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("missing.rs");
+        let link = root.join("link.rs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": "replacement\n" }]);
+
+        let out = tool_write(
+            &json!({"edits": edits(&link, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: create_file target already exists: {} — use a tagged read with replace instead",
+                link.display(),
+                link.display()
+            )
+        );
+        assert!(link.is_symlink(), "dangling symlink must remain untouched");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            !target.exists(),
+            "create_file must not create the symlink target"
+        );
     }
 
     #[test]

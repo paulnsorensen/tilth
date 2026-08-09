@@ -32,3 +32,21 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<(
         let _ = std::fs::remove_file(&tmp);
     })
 }
+
+/// Create bytes without replacing an existing destination, using a fully-written
+/// same-directory temporary file and a hard link as the no-replace commit.
+pub(crate) fn atomic_create_bytes_no_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".tilth-create-tmp.{}.{n}", std::process::id()));
+    std::fs::write(&tmp, bytes).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    let result = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
