@@ -1289,6 +1289,41 @@ mod tests {
     }
 
     #[test]
+    fn drift_with_unmatched_replace_text_names_text_match_not_bare_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("drift_swap.rs");
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        // Drift the file so its hash no longer matches the tag, and make sure
+        // the replace_text anchor is absent from both the snapshot and the
+        // drifted live text so recovery cannot land the edit either way.
+        std::fs::write(&p, "alpha\nCHANGED\ngamma\n").unwrap();
+        let ops = json!([{ "op": "replace_text", "old": "missing-text", "new": "replacement" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("Edit rejected for"),
+            "expected an Edit rejected message, got:\n{out}"
+        );
+        assert!(
+            out.contains("The file also changed since the read that minted this tag"),
+            "a drifted unmatched replace_text must report TextMatch, not bare Drift: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "alpha\nCHANGED\ngamma\n",
+            "rejected edit must not touch the file"
+        );
+    }
+
+    #[test]
     fn create_file_creates_missing_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -276,7 +276,18 @@ mod tests {
             scoped, unscoped,
             "a scoped overview must not equal the whole-checkout overview"
         );
-        assert_eq!(scoped, crate::overview::fingerprint(&inner));
+        assert!(
+            scoped.starts_with("[tilth] Rust project"),
+            "scoped overview must render the inner package, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("manifest: Cargo.toml"),
+            "scoped overview must name the inner manifest: {scoped}"
+        );
+        assert!(
+            !scoped.contains("outer"),
+            "scoped overview must not leak the outer package name: {scoped}"
+        );
     }
 
     /// A bad scope produces a warning on the pattern branch; the overview
@@ -295,9 +306,12 @@ mod tests {
         let out = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" }))
             .expect("missing scope falls back with a warning");
         let bare = tool_list(&serde_json::json!({ "cwd": cwd })).expect("bare overview");
-        assert!(
-            out.len() > bare.len() && out.ends_with(&bare),
-            "warning must be prepended to the overview, got: {out}"
+        assert_eq!(
+            out,
+            format!(
+                "scope \"does/not/exist\" is not a valid directory, searching the cwd/checkout directory instead.\n\n{bare}"
+            ),
+            "warning must name the bad scope and be prepended to the overview, got: {out}"
         );
     }
 

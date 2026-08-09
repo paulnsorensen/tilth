@@ -75,13 +75,17 @@ pub fn try_recover(
     // Both strategies discard their ApplyError, so a `replace_text` whose `old`
     // no longer resolves against live would surface as bare drift and send the
     // agent re-reading a file whose text simply does not contain the anchor.
-    // Re-lower against live purely to recover that diagnosis.
-    if let Err(err) = lower_ops(path, live, ops) {
-        if err.is_text_match_failure() {
-            return Err(MismatchError::TextMatch {
-                path: key,
-                source: err,
-            });
+    // Re-lower against live purely to recover that diagnosis — but only when a
+    // text swap is present, since lowering a block op re-parses the outline
+    // uncached (~86ms on 735KB of Rust) for a diagnosis it cannot produce.
+    if ops.iter().any(|o| matches!(o, Op::TextSwap { .. })) {
+        if let Err(err) = lower_ops(path, live, ops) {
+            if err.is_text_match_failure() {
+                return Err(MismatchError::TextMatch {
+                    path: key,
+                    source: err,
+                });
+            }
         }
     }
 
@@ -284,6 +288,37 @@ mod tests {
             matches!(err, MismatchError::Drift { .. }),
             "a resolvable anchor must not report TextMatch, got {err:?}"
         );
+    }
+
+    /// Positive counterpart to `ambiguous_in_snapshot_unique_in_live_must_not_edit_an_unseen_line`:
+    /// a session-chain recovery whose anchor line WAS displayed under this tag
+    /// (non-empty `seen_lines` covering it) must still succeed. An off-by-one
+    /// in the provenance guard would silently kill strategy-2 recovery for
+    /// every read that records provenance, and every other test here uses an
+    /// empty seen set, so nothing else would catch it.
+    #[test]
+    fn session_chain_recovery_succeeds_when_anchor_line_was_seen() {
+        let mut store = SnapshotStore::new();
+        let snapshot = "line1\nline2\nTARGET\nline4\nline5\n";
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, [1u32, 2, 3]).unwrap();
+
+        // Record a later snapshot so `tag` is no longer the head, forcing
+        // `try_recover` to consider the session-chain strategy at all.
+        let _ = store.record(&key, "line1\nline2\nTARGET\nline4\nline5\nline6\n", []);
+
+        // Live diverged on line2 (not the anchor), so strategy 1's exact-context
+        // patch cannot match and must fall through to the session-chain replay.
+        // Line count matches the snapshot, and the anchored line (TARGET) is
+        // byte-identical, so the session-chain strategy can land the edit.
+        let live = "line1\nCHANGED2\nTARGET\nline4\nline5\n";
+        let ops = vec![Op::TextSwap {
+            old: "TARGET".to_string(),
+            new: "RECOVERED".to_string(),
+        }];
+        let recovered =
+            try_recover(&store, &p(), tag, &ops, live).expect("seen anchor must recover");
+        assert_eq!(recovered, "line1\nCHANGED2\nRECOVERED\nline4\nline5\n");
     }
 
     /// Probe: `check_seen_lines` skips the provenance gate whenever `lower_ops`
