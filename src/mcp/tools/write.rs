@@ -194,6 +194,15 @@ fn resolve_edit(
     match section.tag {
         // Tagless [path]: seed a new file or edit live with no provenance gate.
         None => {
+            if section
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::TextSwap { .. }))
+            {
+                return Err(TilthError::EditRejected(
+                    "replace_text requires a tag from an edit-mode read".into(),
+                ));
+            }
             let snap = synthetic_snapshot(&key, live, live_tag);
             let r = gated_apply(&snap, path, &section.ops)?;
             Ok((r.text, r.file_op))
@@ -1111,6 +1120,33 @@ mod tests {
             "fn seeded() {}\n",
             "tagless section seeds the file with the inserted content"
         );
+    }
+
+    #[test]
+    fn tagless_text_swap_is_rejected_without_modifying_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("tagless.rs");
+        let original = "head target\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, _bloom) = services();
+        let section = Section {
+            path: p.to_string_lossy().into_owned(),
+            tag: None,
+            ops: vec![Op::TextSwap {
+                old: "target".into(),
+                new: "replacement".into(),
+            }],
+        };
+        let err = resolve_edit(&section, &p, &session, original).unwrap_err();
+        match err {
+            TilthError::EditRejected(message) => assert_eq!(
+                message,
+                "replace_text requires a tag from an edit-mode read"
+            ),
+            other => panic!("expected EditRejected, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
     }
 
     #[test]

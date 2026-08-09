@@ -239,7 +239,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
+            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; replace_text uses {old,new}, must match once; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
@@ -269,7 +269,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
                                             { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
-                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
+                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } },
+                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string" }, "new": { "type": "string" } } }
                                         ]
                                     }
                                 }
@@ -670,5 +671,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tilth_write_schema_includes_replace_text_branch() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let description = write["description"].as_str().expect("description");
+        assert!(description.contains("replace_text uses {old,new}, must match once"));
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
+            .expect("replace_text branch");
+        assert_eq!(branch["required"], serde_json::json!(["op", "old", "new"]));
     }
 }

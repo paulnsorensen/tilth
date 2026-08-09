@@ -42,6 +42,11 @@ enum JsonOp {
         end: u32,
         content: String,
     },
+    #[serde(rename = "replace_text")]
+    TextSwap {
+        old: String,
+        new: String,
+    },
     Delete {
         start: u32,
         end: u32,
@@ -125,6 +130,7 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
             payload: split_content(&content),
         },
         JsonOp::Delete { start, end } => Op::Del { start, end },
+        JsonOp::TextSwap { old, new } => Op::TextSwap { old, new },
         JsonOp::InsertBefore { line, content } => Op::Ins {
             cursor: Cursor::Pre(line),
             payload: split_content(&content),
@@ -293,6 +299,9 @@ fn render_op_as_json(op: &Op) -> Value {
         } => json!({
             "op": "replace", "start": start, "end": end, "content": payload.join("\n"),
         }),
+        Op::TextSwap { old, new } => {
+            json!({ "op": "replace_text", "old": old, "new": new })
+        }
         Op::Del { start, end } => json!({ "op": "delete", "start": start, "end": end }),
         Op::Ins { cursor, payload } => {
             let content = payload.join("\n");
@@ -527,6 +536,23 @@ mod tests {
         assert!(
             err.contains("tilth_read") && err.contains("mint"),
             "must hint how to mint a fresh tag: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_replace_text_op() {
+        let edits = json!([{
+            "path": "a.rs",
+            "tag": "1A2B",
+            "ops": [{ "op": "replace_text", "old": "target", "new": "replacement" }]
+        }]);
+        let sections = lower_edits(&edits).expect("replace_text lowers");
+        assert_eq!(
+            sections[0].ops,
+            vec![Op::TextSwap {
+                old: "target".into(),
+                new: "replacement".into()
+            }]
         );
     }
 }

@@ -62,6 +62,8 @@ pub enum Op {
         end: u32,
         payload: Vec<String>,
     },
+    /// Replace one exact text occurrence, expanding to its covering lines.
+    TextSwap { old: String, new: String },
     /// Delete lines `[start, end]` (inclusive).
     Del { start: u32, end: u32 },
     /// Insert `payload` at `cursor`.

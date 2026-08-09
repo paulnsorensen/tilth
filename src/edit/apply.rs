@@ -88,6 +88,12 @@ pub enum ApplyError {
     /// `REM` combined with other ops, or more than one file op.
     #[error("REM cannot combine with other ops; only one file op per section")]
     FileOpConflict,
+    /// The requested text did not occur in the source.
+    #[error("text to replace was not found; re-read the file and retry (preview: {preview})")]
+    TextUnmatched { preview: String },
+    /// The requested text occurred more than once in the source.
+    #[error("text to replace matched {count} times; add context so it matches once")]
+    TextAmbiguous { count: usize },
 }
 
 /// A lowered, concrete line op — no blocks, no file ops.
@@ -106,6 +112,50 @@ pub enum LineOp {
         cursor: Cursor,
         payload: Vec<String>,
     },
+}
+
+/// Resolve a unique literal text occurrence to a whole-line replacement span.
+///
+/// The returned payload contains the complete covering lines after substituting
+/// `old` with `new`; the caller lowers it to a concrete [`LineOp::Swap`].
+pub fn resolve_text_swap(
+    text: &str,
+    old: &str,
+    new: &str,
+) -> Result<(u32, u32, Vec<String>), ApplyError> {
+    let mut matches = text.match_indices(old);
+    let Some((start, matched)) = matches.next() else {
+        return Err(ApplyError::TextUnmatched {
+            preview: old.chars().take(80).collect(),
+        });
+    };
+    if matches.next().is_some() {
+        let count = 2 + matches.count();
+        return Err(ApplyError::TextAmbiguous { count });
+    }
+
+    let end = start + matched.len();
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let end_anchor = end.saturating_sub(1);
+    let matched_ends_at_line_break = text.as_bytes().get(end_anchor) == Some(&b'\n');
+    let line_end = if matched_ends_at_line_break {
+        end_anchor
+    } else {
+        text[end..].find('\n').map_or(text.len(), |i| end + i)
+    };
+    let start_line = text[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+    let end_line = text[..end_anchor].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+    let suffix = if end < line_end {
+        &text[end..line_end]
+    } else {
+        ""
+    };
+    let replaced = format!("{}{}{}", &text[line_start..start], new, suffix);
+    Ok((
+        start_line,
+        end_line,
+        replaced.split('\n').map(str::to_string).collect(),
+    ))
 }
 
 /// Lower `ops` into concrete [`LineOp`]s by resolving block anchors against
@@ -177,6 +227,14 @@ pub(super) fn lower_ops(
                         payload: payload.clone(),
                     }),
                 }
+            }
+            Op::TextSwap { old, new } => {
+                let (start, end, payload) = resolve_text_swap(text, old, new)?;
+                line_ops.push(LineOp::Swap {
+                    start,
+                    end,
+                    payload,
+                });
             }
             Op::Rem | Op::Mv { .. } => {}
         }
@@ -769,5 +827,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.text, "a\nx\ny\nb\n");
+    }
+
+    #[test]
+    fn resolve_text_swap_unique_match_substitutes() {
+        let result = resolve_text_swap("alpha target omega\n", "target", "replacement")
+            .expect("unique match");
+        assert_eq!(result, (1, 1, vec!["alpha replacement omega".to_string()]));
+    }
+
+    #[test]
+    fn resolve_text_swap_zero_matches_errors() {
+        let err = resolve_text_swap("alpha\n", "target", "replacement").unwrap_err();
+        assert_eq!(
+            err,
+            ApplyError::TextUnmatched {
+                preview: "target".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_text_swap_multi_match_errors() {
+        let err = resolve_text_swap("target\ntarget\n", "target", "replacement").unwrap_err();
+        assert_eq!(err, ApplyError::TextAmbiguous { count: 2 });
+    }
+
+    #[test]
+    fn resolve_text_swap_mid_line_span() {
+        let text = "head OLD-one\nmiddle two TAIL\nend\n";
+        let result = resolve_text_swap(text, "OLD-one\nmiddle two", "NEW\nreplacement")
+            .expect("unique multi-line match");
+        assert_eq!(
+            result,
+            (
+                1,
+                2,
+                vec!["head NEW".to_string(), "replacement TAIL".to_string()]
+            )
+        );
     }
 }
