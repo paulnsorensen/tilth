@@ -98,7 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "List a directory tree with token-size rollups. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
+            "description": "List a directory tree with token-size rollups; omit patterns for a project overview. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -108,7 +108,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Optional batch (max 20); omission lists all files."
+                        "description": "Optional batch (max 20); omit patterns for a project overview."
                     },
                     "depth": {
                         "type": "number",
@@ -604,10 +604,8 @@ mod tests {
         );
     }
 
-    /// `tilth_list` relaxed `patterns` to optional: a bare `{cwd}` call must
-    /// validate client-side (the `["*"]` default is applied at runtime), while
-    /// `cwd` stays required and a wrong-shape `patterns` is still rejected by
-    /// the schema before it reaches the server.
+    /// `tilth_list` treats an omitted `patterns` key as a project overview,
+    /// while present arrays retain glob-tree behavior and validation.
     #[test]
     fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
         let tools = tool_definitions(false);
@@ -632,8 +630,8 @@ mod tests {
             schema["properties"]["patterns"]["description"]
                 .as_str()
                 .expect("patterns description present")
-                .contains("Optional"),
-            "patterns description must advertise the omission default"
+                .contains("omit patterns for a project overview"),
+            "patterns description must advertise the overview omission"
         );
 
         let compiled = jsonschema::JSONSchema::compile(schema)
