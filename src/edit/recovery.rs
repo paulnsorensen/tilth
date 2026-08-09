@@ -67,7 +67,7 @@ pub fn try_recover(
 
     // Strategy 2: session-chain replay onto live directly.
     if !is_head {
-        if let Some(text) = replay_session_chain(path, &snapshot.text, live, ops) {
+        if let Some(text) = replay_session_chain(path, &snapshot, live, ops) {
             return Ok(text);
         }
     }
@@ -117,8 +117,13 @@ fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Optio
     Some(merged)
 }
 
-fn replay_session_chain(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<String> {
-    let prev: Vec<&str> = snapshot.split('\n').collect();
+fn replay_session_chain(
+    path: &Path,
+    snapshot: &Snapshot,
+    live: &str,
+    ops: &[Op],
+) -> Option<String> {
+    let prev: Vec<&str> = snapshot.text.split('\n').collect();
     let curr: Vec<&str> = live.split('\n').collect();
     if prev.len() != curr.len() {
         return None;
@@ -126,6 +131,14 @@ fn replay_session_chain(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> 
     let (line_ops, _) = lower_ops(path, live, ops).ok()?;
     let anchors = anchor_lines(&line_ops);
     for a in anchors {
+        // These anchors were resolved against LIVE, so check_seen_lines — which
+        // lowers against the snapshot — never validated them, and skips its gate
+        // entirely when that lowering fails. A `replace_text` whose `old` is
+        // ambiguous in the snapshot but unique in live takes exactly that route,
+        // so provenance has to be enforced here or not at all.
+        if !snapshot.seen_lines.is_empty() && !snapshot.seen_lines.contains(&a) {
+            return None;
+        }
         let idx = (a as usize).checked_sub(1)?;
         if idx >= prev.len() || idx >= curr.len() || prev[idx] != curr[idx] {
             return None;
@@ -147,7 +160,10 @@ pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<
     }
     // If lowering fails (unresolved block anchor, file-op conflict, bad range),
     // skip the gate rather than misreport it as an unseen-line violation —
-    // apply_ops re-runs the lowering and surfaces the real ApplyError.
+    // apply_ops re-runs the lowering against this same snapshot text and
+    // surfaces the real ApplyError. Paths that instead lower against LIVE
+    // cannot rely on that and must re-check provenance themselves; see
+    // replay_session_chain.
     let Ok((line_ops, _)) = lower_ops(path, &snapshot.text, ops) else {
         return Ok(());
     };
@@ -282,6 +298,63 @@ mod tests {
             Err(e) => assert!(
                 matches!(e, MismatchError::Drift { .. }),
                 "a resolvable anchor must not report TextMatch, got {e:?}"
+            ),
+        }
+    }
+
+    /// Probe: `check_seen_lines` skips the provenance gate whenever `lower_ops`
+    /// fails, and `replace_text` makes that failure content-triggerable. If an
+    /// `old` that is ambiguous in the snapshot is unique in live, the gate is
+    /// skipped and `replay_session_chain` lowers against live — potentially
+    /// landing the edit on a line the read never displayed.
+    #[test]
+    fn ambiguous_in_snapshot_unique_in_live_must_not_edit_an_unseen_line() {
+        let mut store = SnapshotStore::new();
+        let mut lines: Vec<String> = (1..=40).map(|i| format!("line{i}")).collect();
+        lines[1] = "ANCHOR".to_string(); // line 2 — displayed
+        lines[39] = "ANCHOR".to_string(); // line 40 — never displayed
+        let snapshot = lines.join("\n") + "\n";
+        let key = p().to_string_lossy().into_owned();
+        // Only lines 1-3 were ever shown to the model.
+        let tag = store.record(&key, &snapshot, [1u32, 2, 3]).unwrap();
+        // A later snapshot makes `tag` non-head so strategy 2 is reachable.
+        let mut newer = lines.clone();
+        newer[10] = "unrelated".to_string();
+        let _ = store.record(&key, &(newer.join("\n") + "\n"), []);
+
+        // External edit removed the line-2 occurrence, preserving line count.
+        let mut live_lines = lines.clone();
+        live_lines[1] = "SOMETHING_ELSE".to_string();
+        let live = live_lines.join("\n") + "\n";
+
+        let ops = vec![Op::TextSwap {
+            old: "ANCHOR".to_string(),
+            new: "PWNED".to_string(),
+        }];
+
+        // Compose exactly as the write egress does: gate, then recover.
+        let snap = store.by_tag(&key, tag).expect("snapshot recorded");
+
+        // The gate still skips here — lowering against the snapshot is
+        // ambiguous, and on the no-drift path apply_ops re-lowers the same text
+        // and reports that accurately. So the skip itself is not the bug.
+        assert!(
+            check_seen_lines(&snap, &p(), &ops).is_ok(),
+            "gate is expected to skip an unlowerable anchor; the bypass is downstream"
+        );
+
+        // Recovery must refuse: strategy 2 resolves against live, so line 40 is
+        // reachable there even though it was never displayed under this tag.
+        match try_recover(&store, &p(), tag, &ops, &live) {
+            Ok(text) => {
+                panic!("provenance bypass: edit landed on a line the read never displayed:\n{text}")
+            }
+            Err(e) => assert!(
+                matches!(
+                    e,
+                    MismatchError::TextMatch { .. } | MismatchError::Drift { .. }
+                ),
+                "unexpected rejection: {e:?}"
             ),
         }
     }
