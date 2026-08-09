@@ -19,26 +19,26 @@ use super::parser::{BlockMode, Cursor, Op};
 /// File-level operation surfaced separately from the text edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOp {
+    Create(String),
     Remove,
     Move(String),
 }
 
 impl FileOp {
-    /// Extract the file-level op (`REM`/`MV`) from `ops`, enforcing the same
-    /// conflict guard [`lower_ops`] applies: at most one file op per section,
-    /// and `REM` cannot combine with content edits. Returns `Ok(None)` for a
-    /// pure content edit. The canonical mapping every apply/recovery path shares
-    /// so no branch hand-derives a file op that bypasses these guards.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApplyError::FileOpConflict`] when two file ops appear, or `REM`
-    /// combines with a content op.
+    /// Extract the file-level op (`CREATE`/`REM`/`MV`) from `ops`, enforcing
+    /// at most one file op per section. `CREATE` and `REM` cannot combine with
+    /// content edits; `MV` may carry content edits for the destination.
     pub fn from_ops(ops: &[Op]) -> Result<Option<FileOp>, ApplyError> {
         let mut file_op: Option<FileOp> = None;
         let mut has_content = false;
         for op in ops {
             match op {
+                Op::Create { content } => {
+                    if file_op.is_some() {
+                        return Err(ApplyError::FileOpConflict);
+                    }
+                    file_op = Some(FileOp::Create(content.clone()));
+                }
                 Op::Rem => {
                     if file_op.is_some() {
                         return Err(ApplyError::FileOpConflict);
@@ -54,14 +54,13 @@ impl FileOp {
                 _ => has_content = true,
             }
         }
-        // REM deletes the whole file; it cannot combine with content edits.
-        if matches!(file_op, Some(FileOp::Remove)) && has_content {
+        // CREATE and REM operate on the whole file; neither combines with content edits.
+        if matches!(file_op, Some(FileOp::Create(_) | FileOp::Remove)) && has_content {
             return Err(ApplyError::FileOpConflict);
         }
         Ok(file_op)
     }
 }
-
 /// Result of applying ops to a text body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyResult {
@@ -69,7 +68,7 @@ pub struct ApplyResult {
     pub text: String,
     /// First 1-based line that changed, or `None` for a no-op.
     pub first_changed_line: Option<usize>,
-    /// A file-level op (`REM`/`MV`), if present.
+    /// A file-level op (`CREATE`/`REM`/`MV`), if present.
     pub file_op: Option<FileOp>,
 }
 
@@ -165,7 +164,7 @@ pub(super) fn lower_ops(
     text: &str,
     ops: &[Op],
 ) -> Result<(Vec<LineOp>, Option<FileOp>), ApplyError> {
-    // File ops (REM/MV) plus the one-file-op / REM-alone conflict guard live in
+    // File ops (CREATE/REM/MV) plus the one-file-op conflict guard live in
     // the canonical `FileOp::from_ops`; the loop below handles only content ops.
     let file_op = FileOp::from_ops(ops)?;
     let mut line_ops = Vec::new();
@@ -236,7 +235,7 @@ pub(super) fn lower_ops(
                     payload,
                 });
             }
-            Op::Rem | Op::Mv { .. } => {}
+            Op::Create { .. } | Op::Rem | Op::Mv { .. } => {}
         }
     }
 

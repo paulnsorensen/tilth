@@ -76,6 +76,9 @@ enum JsonOp {
         at: LineOrSymbol,
         content: String,
     },
+    CreateFile {
+        content: String,
+    },
     DeleteFile,
     MoveFile {
         dest: String,
@@ -162,6 +165,7 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
             mode: BlockMode::InsPost,
             payload: split_content(&content),
         },
+        JsonOp::CreateFile { content } => Op::Create { content },
         JsonOp::DeleteFile => Op::Rem,
         JsonOp::MoveFile { dest } => Op::Mv { dest },
     })
@@ -328,6 +332,7 @@ fn render_op_as_json(op: &Op) -> Value {
                 }
             }
         }
+        Op::Create { content } => json!({ "op": "create_file", "content": content }),
         Op::Rem => json!({ "op": "delete_file" }),
         Op::Mv { dest } => json!({ "op": "move_file", "dest": dest }),
     }

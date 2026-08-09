@@ -77,6 +77,8 @@ pub enum Op {
         mode: BlockMode,
         payload: Vec<String>,
     },
+    /// Create a new file with exact raw content.
+    Create { content: String },
     /// Remove the file.
     Rem,
     /// Move/rename the file to `dest`.

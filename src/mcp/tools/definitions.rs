@@ -239,7 +239,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; replace_text uses {old,new}, must match once; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
+            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; replace_text uses {old,new}, must match once; create_file uses {content} for tagless new paths; existing files use tagged read + replace; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
@@ -270,7 +270,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
                                             { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } },
-                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string" }, "new": { "type": "string" } } }
+                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string" }, "new": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } }
                                         ]
                                     }
                                 }
@@ -325,7 +326,7 @@ mod tests {
             item_required.contains(&"path") && item_required.contains(&"ops"),
             "each section must require path and ops: {item_required:?}"
         );
-        // The ops oneOf must name every one of the 11 verbs via `op` const.
+        // The ops oneOf must name every one of the 13 verbs via `op` const.
         let ops_item = &schema["properties"]["edits"]["items"]["properties"]["ops"]["items"];
         let branches = ops_item["oneOf"].as_array().expect("ops oneOf present");
         let verbs: Vec<&str> = branches
@@ -344,6 +345,7 @@ mod tests {
             "insert_after_block",
             "delete_file",
             "move_file",
+            "create_file",
         ] {
             assert!(
                 verbs.contains(&verb),
@@ -691,5 +693,24 @@ mod tests {
             .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
             .expect("replace_text branch");
         assert_eq!(branch["required"], serde_json::json!(["op", "old", "new"]));
+    }
+    #[test]
+    fn tilth_write_schema_includes_create_file_branch() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let description = write["description"].as_str().expect("description");
+        assert!(description.contains("create_file uses {content} for tagless new paths"));
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "create_file")
+            .expect("create_file branch");
+        assert_eq!(branch["required"], serde_json::json!(["op", "content"]));
     }
 }
