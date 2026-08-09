@@ -18,8 +18,24 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
 
     let patterns: Vec<String> = match args.get("patterns") {
         None => {
-            let overview = crate::overview::fingerprint(cwd);
-            return Ok(super::apply_budget(&overview, budget));
+            // `scope` is an advertised parameter and is honored on the pattern
+            // branch; fingerprinting `cwd` here would silently widen a scoped
+            // request to the whole checkout.
+            let overview = crate::overview::fingerprint(&scope);
+            // fingerprint() is contractually fail-silent (it catch_unwinds to
+            // an empty string) because it began life as a cosmetic initialize
+            // banner. As a whole tool response that inverts tool_list's own
+            // contract, so an empty result becomes an error rather than a
+            // successful "this project is empty".
+            if overview.trim().is_empty() {
+                return Err(format!(
+                    "no project overview could be generated for {}",
+                    scope.display()
+                ));
+            }
+            let mut result = scope_warning.unwrap_or_default();
+            result.push_str(&overview);
+            return Ok(super::apply_budget(&result, budget));
         }
         Some(value) => {
             let Some(arr) = value.as_array() else {
@@ -229,6 +245,59 @@ mod tests {
         assert!(
             !omitted.contains("a.rs"),
             "overview must not list individual files: {omitted}"
+        );
+    }
+
+    /// `scope` is advertised and honored on the pattern branch; the overview
+    /// branch must not silently widen a scoped request to the whole checkout.
+    #[test]
+    fn omitted_patterns_honors_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let inner = tmp.path().join("packages").join("api");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            "[package]\nname = \"scoped-inner\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(inner.join("lib.rs"), "fn inner() {}\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let scoped = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "packages/api" }))
+            .expect("scoped overview");
+        let unscoped = tool_list(&serde_json::json!({ "cwd": cwd })).expect("unscoped overview");
+
+        assert_ne!(
+            scoped, unscoped,
+            "a scoped overview must not equal the whole-checkout overview"
+        );
+        assert_eq!(scoped, crate::overview::fingerprint(&inner));
+    }
+
+    /// A bad scope produces a warning on the pattern branch; the overview
+    /// branch must surface it too rather than dropping it.
+    #[test]
+    fn omitted_patterns_surfaces_scope_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" }))
+            .expect("missing scope falls back with a warning");
+        let bare = tool_list(&serde_json::json!({ "cwd": cwd })).expect("bare overview");
+        assert!(
+            out.len() > bare.len() && out.ends_with(&bare),
+            "warning must be prepended to the overview, got: {out}"
         );
     }
 

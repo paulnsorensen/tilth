@@ -103,19 +103,11 @@ fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<S
 /// The per-section egress: read live content, verify/recover against the tag,
 /// carry out any file op, write, and record the fresh snapshot.
 fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<String, TilthError> {
-    if section.ops.iter().any(|op| matches!(op, Op::Create { .. })) {
-        if section.tag.is_some() {
-            return Err(TilthError::EditRejected(format!(
-                "create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
-                path.display()
-            )));
-        }
-        if path.exists() {
-            return Err(TilthError::EditRejected(format!(
-                "create_file target already exists: {} — use a tagged read with replace instead",
-                path.display()
-            )));
-        }
+    if section.ops.iter().any(|op| matches!(op, Op::Create { .. })) && section.tag.is_some() {
+        return Err(TilthError::EditRejected(format!(
+            "create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
+            path.display()
+        )));
     }
     let session = ctx.session;
     // Read live content (missing file is allowed only for a tagless seed).
@@ -251,9 +243,8 @@ fn resolve_edit(
 
 /// The drift/collision egress: the recorded snapshot (if any) no longer matches
 /// live content. Honor the seen-lines gate against the recorded snapshot, carry
-/// a pure file op (`CREATE`/`REM`/`MV`) through regardless of content drift, and
+/// a pure file op (`REM`/`MV`) through regardless of content drift, and
 /// otherwise 3-way-merge the content edit onto live.
-/// same op combinations the matched/tagless paths do.
 fn recover_edit(
     store: &SnapshotStore,
     section: &Section,
@@ -274,7 +265,7 @@ fn recover_edit(
     let has_content = section
         .ops
         .iter()
-        .any(|o| !matches!(o, Op::Create { .. } | Op::Rem | Op::Mv { .. }));
+        .any(|o| !matches!(o, Op::Rem | Op::Mv { .. }));
     // A pure file op carries no content edit — file-level intent is independent
     // of content drift, so proceed without recovery, but ONLY for a session-known
     // tag. An unknown/fabricated tag falls through to try_recover, which rejects
@@ -284,6 +275,13 @@ fn recover_edit(
     }
     let text = try_recover(store, path, tag, &section.ops, live)?;
     Ok((text, file_op))
+}
+
+fn create_target_exists_error(path: &Path) -> TilthError {
+    TilthError::EditRejected(format!(
+        "create_file target already exists: {} — use a tagged read with replace instead",
+        path.display()
+    ))
 }
 
 /// Carry out a `CREATE`/`REM`/`MV` file op with confinement, then reconcile the
@@ -298,18 +296,15 @@ fn commit_file_op(
     let session = ctx.session;
     match op {
         FileOp::Create(content) => {
-            if path.exists() {
-                return Err(TilthError::EditRejected(format!(
-                    "create_file target already exists: {} — use a tagged read with replace instead",
-                    path.display()
-                )));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
             }
             crate::util::atomic_create_bytes_no_replace(path, content.as_bytes()).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    TilthError::EditRejected(format!(
-                        "create_file target already exists: {} — use a tagged read with replace instead",
-                        path.display()
-                    ))
+                    create_target_exists_error(path)
                 } else {
                     TilthError::IoError {
                         path: path.to_path_buf(),
@@ -319,8 +314,13 @@ fn commit_file_op(
             })?;
             session.record_read(path);
             let line_count = u32::try_from(content.split('\n').count()).unwrap_or(u32::MAX);
-            let _ = session.record_snapshot(path, content, 1..=line_count);
-            Ok(format!("## {}\ncreated", path.display()))
+            let new_tag = session.record_snapshot(path, content, 1..=line_count);
+            let mut block = format!("## {}\ncreated", path.display());
+            if let Some(tag) = new_tag {
+                let header = format_header(&path.display().to_string(), tag);
+                let _ = write!(block, "\n{header}");
+            }
+            Ok(block)
         }
         FileOp::Remove => {
             // Capture the canonical key before the fs op: once the file is gone,
@@ -1188,6 +1188,25 @@ mod tests {
     }
 
     #[test]
+    fn create_file_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("newmod").join("thing.rs");
+        let content = "fn thing() {}\n";
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": content }]);
+
+        tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("create_file creates missing parent directory");
+
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+    }
+
+    #[test]
     fn create_file_new_file_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1203,7 +1222,15 @@ mod tests {
         )
         .expect("create_file succeeds");
 
-        assert_eq!(out, format!("## {}\ncreated", p.display()));
+        let header_line = format!("[{}#", p.display());
+        assert!(
+            out.starts_with(&format!("## {}\ncreated\n{header_line}", p.display())),
+            "expected created output with tag header, got: {out}"
+        );
+        assert!(
+            !out.contains(content),
+            "created output must not echo file body: {out}"
+        );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
     }
 
