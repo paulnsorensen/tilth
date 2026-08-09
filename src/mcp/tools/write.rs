@@ -1274,7 +1274,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "## {}\nerror: text to replace matched 2 times; add context so it matches once",
+                "## {}\nerror: text to replace matched at least 2 times; add context so it matches once",
                 p.display()
             )
         );

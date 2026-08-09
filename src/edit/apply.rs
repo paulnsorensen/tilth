@@ -93,8 +93,9 @@ pub enum ApplyError {
     /// The requested text did not occur in the source.
     #[error("text to replace was not found; re-read the file and retry (preview: {preview})")]
     TextUnmatched { preview: String },
-    /// The requested text occurred more than once in the source.
-    #[error("text to replace matched {count} times; add context so it matches once")]
+    /// The requested text occurred more than once in the source. `count` is a
+    /// lower bound — the search stops once ambiguity is established.
+    #[error("text to replace matched at least {count} times; add context so it matches once")]
     TextAmbiguous { count: usize },
     /// `old` was empty; a match-once anchor cannot be empty.
     #[error("replace_text \"old\" must not be empty")]
@@ -120,36 +121,27 @@ pub enum LineOp {
 }
 
 /// Resolve a unique literal text occurrence's byte span in `text`, counting
-/// TRUE (possibly overlapping) occurrences so a self-overlapping needle (e.g.
+/// possibly-overlapping occurrences so a self-overlapping needle (e.g.
 /// `old:"---"` in `"----"`) is reported as ambiguous rather than unique.
+///
+/// Stops at the second occurrence. The guard only needs "more than one", and
+/// `old` is caller-supplied and bounded only by the snapshot cap: counting
+/// every occurrence costs O(n·m), which measured 187s for a 200KB `old`
+/// against a 400KB file — enough to wedge the single-threaded server.
 fn find_text_span(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
-    if old.is_empty() {
+    let Some(lead) = old.chars().next() else {
         return Err(ApplyError::TextOldEmpty);
-    }
-    let mut start = None;
-    let mut count = 0usize;
-    let mut i = 0usize;
-    while i <= text.len() {
-        let Some(rel) = text[i..].find(old) else {
-            break;
-        };
-        let pos = i + rel;
-        count += 1;
-        if start.is_none() {
-            start = Some(pos);
-        }
-        i = pos + 1;
-        while i < text.len() && !text.is_char_boundary(i) {
-            i += 1;
-        }
-    }
-    let Some(start) = start else {
+    };
+    let Some(start) = text.find(old) else {
         return Err(ApplyError::TextUnmatched {
             preview: old.chars().take(80).collect(),
         });
     };
-    if count > 1 {
-        return Err(ApplyError::TextAmbiguous { count });
+    // `old` occupies `start`, so `lead`'s width lands on the next char boundary
+    // — the earliest a second, possibly overlapping, occurrence could begin.
+    let next = start + lead.len_utf8();
+    if next <= text.len() && text[next..].contains(old) {
+        return Err(ApplyError::TextAmbiguous { count: 2 });
     }
     Ok((start, start + old.len()))
 }
@@ -1043,10 +1035,35 @@ mod tests {
         assert_eq!(err, ApplyError::TextAmbiguous { count: 2 });
     }
 
+    /// Three overlapping occurrences must still be caught. `count` is a lower
+    /// bound: the scan stops once ambiguity is established, because counting
+    /// them all is O(n·m) in a caller-supplied needle.
     #[test]
-    fn resolve_text_swap_self_overlapping_triple_counts_every_occurrence() {
+    fn resolve_text_swap_self_overlapping_triple_is_ambiguous() {
         let err = resolve_text_swap("/////", "///", "//").expect_err("three true occurrences");
-        assert_eq!(err, ApplyError::TextAmbiguous { count: 3 });
+        let ApplyError::TextAmbiguous { count } = err else {
+            panic!("expected TextAmbiguous, got {err:?}");
+        };
+        assert!(
+            count >= 2,
+            "count is a lower bound on occurrences, got {count}"
+        );
+    }
+
+    /// The early exit must not scan the whole file: a large self-overlapping
+    /// needle used to take minutes here.
+    #[test]
+    fn resolve_text_swap_large_self_overlapping_needle_returns_promptly() {
+        let text = "a".repeat(400_000);
+        let old = "a".repeat(200_000);
+        let started = std::time::Instant::now();
+        let err = resolve_text_swap(&text, &old, "X").expect_err("ambiguous");
+        assert!(matches!(err, ApplyError::TextAmbiguous { .. }), "{err:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}; the occurrence scan is not short-circuiting",
+            started.elapsed()
+        );
     }
 
     /// The overlap fix must not make a genuinely unique match ambiguous.
