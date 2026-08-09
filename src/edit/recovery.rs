@@ -72,11 +72,35 @@ pub fn try_recover(
         }
     }
 
+    // Both strategies discard their ApplyError, so a `replace_text` whose `old`
+    // no longer resolves against live would surface as bare drift and send the
+    // agent re-reading a file whose text simply does not contain the anchor.
+    // Re-lower against live purely to recover that diagnosis.
+    if let Err(err) = lower_ops(path, live, ops) {
+        if is_text_match_failure(&err) {
+            return Err(MismatchError::TextMatch {
+                path: key,
+                reason: err.to_string(),
+            });
+        }
+    }
+
     Err(MismatchError::Drift {
         path: key,
         expected_tag: tag,
         actual_tag: compute_file_hash(live),
     })
+}
+
+/// Whether an [`ApplyError`] describes a `replace_text` anchor that did not
+/// resolve, as opposed to a structural lowering failure.
+fn is_text_match_failure(err: &ApplyError) -> bool {
+    matches!(
+        err,
+        ApplyError::TextUnmatched { .. }
+            | ApplyError::TextAmbiguous { .. }
+            | ApplyError::TextOldEmpty
+    )
 }
 
 fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<String> {
@@ -211,6 +235,55 @@ mod tests {
             matches!(err, MismatchError::Drift { expected_tag, .. } if expected_tag == tag),
             "{err:?}"
         );
+    }
+
+    /// A drifted file whose live text no longer contains the `replace_text`
+    /// anchor must name the match failure. Reporting bare drift tells the agent
+    /// to re-read, which cannot fix text that simply is not there.
+    #[test]
+    fn drifted_text_swap_reports_the_match_failure_not_bare_drift() {
+        let mut store = SnapshotStore::new();
+        let snapshot = "a\nlet x = OLDNAME;\nc\n";
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, []).unwrap();
+
+        // External edit removed the anchor text entirely and changed the shape.
+        let live = "a\nlet x = SOMETHING_ELSE;\nc\nextra\n";
+        let ops = vec![Op::TextSwap {
+            old: "OLDNAME".to_string(),
+            new: "NEWNAME".to_string(),
+        }];
+        let err = try_recover(&store, &p(), tag, &ops, live).unwrap_err();
+        let MismatchError::TextMatch { reason, .. } = &err else {
+            panic!("expected TextMatch, got {err:?}");
+        };
+        assert!(
+            reason.contains("text to replace was not found"),
+            "reason should name the match failure, got: {reason}"
+        );
+    }
+
+    /// The specific-error path must not swallow genuine drift.
+    #[test]
+    fn drifted_text_swap_that_still_matches_yields_drift() {
+        let mut store = SnapshotStore::new();
+        let snapshot = "a\nlet x = OLDNAME;\nc\n";
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, []).unwrap();
+
+        // Anchor still present, but live diverged so recovery declines.
+        let live = "totally\ndifferent\nlet x = OLDNAME;\nand\nmore\n";
+        let ops = vec![Op::TextSwap {
+            old: "OLDNAME".to_string(),
+            new: "NEWNAME".to_string(),
+        }];
+        match try_recover(&store, &p(), tag, &ops, live) {
+            Ok(_) => {}
+            Err(e) => assert!(
+                matches!(e, MismatchError::Drift { .. }),
+                "a resolvable anchor must not report TextMatch, got {e:?}"
+            ),
+        }
     }
 
     #[test]

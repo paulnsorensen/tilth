@@ -270,7 +270,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
                                             { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } },
-                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string" }, "new": { "type": "string" } } },
+                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" } } },
                                             { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } }
                                         ]
                                     }
@@ -691,6 +691,26 @@ mod tests {
             .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
             .expect("replace_text branch");
         assert_eq!(branch["required"], serde_json::json!(["op", "old", "new"]));
+    }
+    #[test]
+    fn tilth_write_schema_replace_text_old_requires_min_length() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
+            .expect("replace_text branch");
+        assert_eq!(
+            branch["properties"]["old"]["minLength"],
+            serde_json::json!(1)
+        );
     }
     #[test]
     fn tilth_write_schema_includes_create_file_branch() {
