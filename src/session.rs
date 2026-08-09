@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -11,6 +11,24 @@ use crate::edit::snapshots::SnapshotStore;
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
 const BATCH_NUDGE_MAX_CHARS: usize = 120;
+
+/// A query string is symbol-shaped when it looks like an identifier: no
+/// whitespace, quotes, slashes, or regex metacharacters, starting with a
+/// letter or `_` and ending alphanumeric (so `TODO:` and `1.5` never
+/// qualify). `:` and `.` stay legal inside for `Type::method` paths.
+fn is_symbol_shaped(query: &str) -> bool {
+    query.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && query.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+        && query
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.'))
+}
+
+#[derive(Default)]
+struct GrokNudgeState {
+    tipped: HashSet<String>,
+    grokked: HashSet<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchTool {
@@ -132,6 +150,7 @@ pub struct Session {
     baseline_tokens: AtomicU64,
     saved_tokens: AtomicU64,
     batch_nudges: Mutex<BatchNudgeState>,
+    grok_nudges: Mutex<GrokNudgeState>,
 }
 
 impl Session {
@@ -146,6 +165,7 @@ impl Session {
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
             batch_nudges: Mutex::new(BatchNudgeState::default()),
+            grok_nudges: Mutex::new(GrokNudgeState::default()),
         }
     }
 
@@ -194,6 +214,53 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *syms.entry(query.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record a `tilth_grok` attempt — even one that later fails — so a
+    /// repeat search of the same target never nudges toward a tool the
+    /// agent already reached for.
+    pub fn record_grok(&self, target: &str) {
+        self.grok_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .grokked
+            .insert(target.to_string());
+    }
+
+    /// Just-in-time nudge toward `tilth_grok`: fires once per symbol, the
+    /// first time a symbol-shaped query has been searched at least twice
+    /// this session without `tilth_grok` ever being called on that target.
+    /// When several symbols qualify at once, the most-searched one wins
+    /// (ties resolve arbitrarily). Only a `tilth_search` response carries
+    /// the tip; `emit` is false when the response cannot carry one — the
+    /// tip is withheld, not consumed, and rides the next eligible response.
+    pub fn grok_nudge(&self, tool: &str, emit: bool) -> Option<String> {
+        if !emit || tool != "tilth_search" {
+            return None;
+        }
+        let syms = self
+            .symbols
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .grok_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pick = syms
+            .iter()
+            .filter(|&(query, &count)| {
+                count >= 2
+                    && is_symbol_shaped(query)
+                    && !state.grokked.contains(query)
+                    && !state.tipped.contains(query)
+            })
+            .max_by_key(|&(_, &count)| count)
+            .map(|(query, _)| query.clone());
+        let query = pick?;
+        state.tipped.insert(query.clone());
+        Some(format!(
+            "TIP: tilth_grok {query} — definition, callers, callees, and tests in one call."
+        ))
     }
 
     /// Observe one dispatched MCP tool call (every dispatch, errored or not —
@@ -311,6 +378,10 @@ impl Session {
             .batch_nudges
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = BatchNudgeState::default();
+        *self
+            .grok_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = GrokNudgeState::default();
         self.baseline_tokens.store(0, Ordering::Relaxed);
         self.saved_tokens.store(0, Ordering::Relaxed);
     }
@@ -662,5 +733,98 @@ mod tests {
         let (b2, s2) = session.savings();
         assert_eq!(b2, 0, "baseline_tokens must be zero after reset");
         assert_eq!(s2, 0, "saved_tokens must be zero after reset");
+    }
+
+    #[test]
+    fn second_search_of_same_symbol_returns_grok_nudge() {
+        let session = Session::new();
+        session.record_search("foo");
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+        session.record_search("foo");
+        assert_eq!(
+            session.grok_nudge("tilth_search", true),
+            Some(
+                "TIP: tilth_grok foo — definition, callers, callees, and tests in one call."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn grok_nudge_fires_once_per_symbol() {
+        let session = Session::new();
+        session.record_search("foo");
+        session.record_search("foo");
+        assert!(session.grok_nudge("tilth_search", true).is_some());
+        session.record_search("foo");
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
+    fn single_searches_of_different_symbols_never_nudge() {
+        let session = Session::new();
+        session.record_search("foo");
+        session.record_search("bar");
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
+    fn non_symbol_queries_never_nudge() {
+        let session = Session::new();
+        for query in ["TODO: fix", "TODO:", "1.5"] {
+            session.record_search(query);
+            session.record_search(query);
+        }
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
+    fn grokked_target_never_nudges() {
+        let session = Session::new();
+        session.record_grok("foo");
+        session.record_search("foo");
+        session.record_search("foo");
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
+    fn withheld_grok_nudge_rides_the_next_eligible_response() {
+        let session = Session::new();
+        session.record_search("foo");
+        session.record_search("foo");
+        assert_eq!(session.grok_nudge("tilth_search", false), None);
+        assert!(session.grok_nudge("tilth_search", true).is_some());
+    }
+
+    #[test]
+    fn most_searched_symbol_wins_when_several_qualify() {
+        let session = Session::new();
+        session.record_search("foo");
+        session.record_search("bar");
+        session.record_search("bar");
+        session.record_search("foo");
+        session.record_search("foo");
+        assert_eq!(
+            session.grok_nudge("tilth_search", true),
+            Some(
+                "TIP: tilth_grok foo — definition, callers, callees, and tests in one call."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reset_clears_grok_nudge_state() {
+        let session = Session::new();
+        session.record_grok("foo");
+        session.record_search("bar");
+        session.record_search("bar");
+        session.reset();
+        session.record_search("foo");
+        session.record_search("foo");
+        assert!(
+            session.grok_nudge("tilth_search", true).is_some(),
+            "a grokked target must nudge again after reset"
+        );
     }
 }

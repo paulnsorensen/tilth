@@ -18,6 +18,7 @@ pub(in crate::mcp) fn tool_grok(
         .ok_or(
             "missing required parameter: target (symbol name or \"path:line\", e.g. \"Type::method\" or \"src/file.rs:7\")",
         )?;
+    session.record_grok(target);
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = resolve_scope(args, cwd)?;
     let budget = args
