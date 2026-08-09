@@ -345,6 +345,7 @@ mod tests {
             "insert_after_block",
             "delete_file",
             "move_file",
+            "replace_text",
             "create_file",
         ] {
             assert!(
@@ -352,6 +353,11 @@ mod tests {
                 "ops oneOf must name '{verb}': {verbs:?}"
             );
         }
+        assert_eq!(
+            branches.len(),
+            13,
+            "exactly 13 verbs expected in the ops oneOf: {verbs:?}"
+        );
         // The old per-file `files` array surface stays gone.
         assert!(
             schema["properties"].get("files").is_none(),

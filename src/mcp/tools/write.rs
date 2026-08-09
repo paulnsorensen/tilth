@@ -1207,6 +1207,81 @@ mod tests {
     }
 
     #[test]
+    fn replace_text_applies_through_tool_write_and_writes_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("swap.rs");
+        std::fs::write(&p, "fn a() { target(); }\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() { renamed(); }\n",
+            "replace_text must substitute the matched text exactly once, in place"
+        );
+    }
+
+    #[test]
+    fn replace_text_with_absent_old_is_a_per_section_error_and_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("absent.rs");
+        let original = "fn a() { present(); }\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "missing", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: text to replace was not found; re-read the file and retry (preview: missing)",
+                p.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn replace_text_with_ambiguous_old_is_a_per_section_error_and_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("ambiguous.rs");
+        let original = "fn a() { target(); }\nfn b() { target(); }\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: text to replace matched 2 times; add context so it matches once",
+                p.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
     fn create_file_creates_missing_parent_directory() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1744,6 +1819,64 @@ mod tests {
             std::fs::read_to_string(&a).unwrap(),
             "fn keep() {}\n",
             "the valid earlier section's file must be untouched when a later section fails to deserialize"
+        );
+    }
+
+    #[test]
+    fn create_file_combined_with_content_op_is_a_file_op_conflict_and_does_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("conflict_create.rs");
+        let (session, bloom) = services();
+        let ops = json!([
+            { "op": "create_file", "content": "fn created() {}\n" },
+            { "op": "append", "content": "fn extra() {}" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: a file op (CREATE/REM) cannot combine with content ops; only one file op per section",
+                p.display()
+            )
+        );
+        assert!(
+            !p.exists(),
+            "create_file combined with a content op must not create the file"
+        );
+    }
+
+    #[test]
+    fn two_create_file_ops_in_one_section_is_a_file_op_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("double_create.rs");
+        let (session, bloom) = services();
+        let ops = json!([
+            { "op": "create_file", "content": "first\n" },
+            { "op": "create_file", "content": "second\n" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: a file op (CREATE/REM) cannot combine with content ops; only one file op per section",
+                p.display()
+            )
+        );
+        assert!(
+            !p.exists(),
+            "two create_file ops in one section must not create the file"
         );
     }
 }
