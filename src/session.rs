@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use crate::edit::snapshots::SnapshotStore;
+use crate::hint::Hint;
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
 const BATCH_NUDGE_MAX_CHARS: usize = 120;
@@ -47,11 +48,9 @@ impl BatchTool {
 
     fn generic_tip(self) -> &'static str {
         match self {
-            Self::Read => "TIP: batch into one call — paths: [\"a.rs\", \"b.rs\"].",
-            Self::Search => {
-                "TIP: batch into one call — queries: [{\"query\":\"foo\"}, {\"query\":\"bar\"}]."
-            }
-            Self::List => "TIP: batch into one call — patterns: [\"*.rs\", \"*.toml\"].",
+            Self::Read => Hint::BatchTipRead.text(),
+            Self::Search => Hint::BatchTipSearch.text(),
+            Self::List => Hint::BatchTipList.text(),
         }
     }
 }

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
+use crate::hint::Hint;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
 use crate::types::FileType;
@@ -621,29 +622,26 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
     if !target_seen {
         return format!(
             "# Callers of \"{target}\" in {scope_disp} — no call sites found\n\n\
-             The name \"{target}\" does not appear anywhere in scope. \
-             Check the spelling, or widen scope if you expected hits outside this directory.",
-            scope_disp = scope.display()
+             The name \"{target}\" does not appear anywhere in scope. {hint}",
+            scope_disp = scope.display(),
+            hint = Hint::CallersNameNotFound.text()
         );
     }
     // Only mention glob-driven test exclusion when a glob was actually used.
     // Otherwise the line implies a filter that the caller didn't apply, which
     // would mislead an agent reasoning about what tilth searched.
     let glob_hint = if glob.is_some() {
-        "\n  • test files (if `glob` excluded them)"
+        Hint::CallersGlobExcludedNote.text()
     } else {
         ""
     };
     format!(
         "# Callers of \"{target}\" in {scope_disp} — no direct call sites found\n\n\
          \"{target}\" appears in the codebase but has no syntactic call sites. \
-         tilth detects only direct, by-name calls; this symbol may still be reachable via:\n\
-         \n  • interface / trait dispatch (Rust `dyn Trait`, Go interface, Java/Kotlin abstract method)\
-         \n  • reflection or dynamic dispatch (`getattr`, `Method::invoke`, `eval`)\
-         \n  • framework registration (HTTP routes, JSON-RPC, plugin systems, decorators)\
-         \n  • function values stored in maps, structs, or passed as callbacks{glob_hint}\n\
+         {hint}{glob_hint}\n\
          \nVerify with `tilth_search \"{target}\"` to see how it's referenced before assuming dead code.",
-        scope_disp = scope.display()
+        scope_disp = scope.display(),
+        hint = Hint::CallersIndirectionMechanisms.text()
     )
 }
 

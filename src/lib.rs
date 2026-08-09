@@ -24,6 +24,7 @@ pub mod diff;
 pub(crate) mod edit;
 pub mod error;
 pub(crate) mod format;
+pub(crate) mod hint;
 pub mod index;
 pub mod install;
 pub(crate) mod lang;
