@@ -205,8 +205,14 @@ fn resolve_edit(
                 .iter()
                 .any(|op| matches!(op, Op::TextSwap { .. }))
             {
+                // Naming only the requirement sent agents into a full re-read.
+                // A section read carries the whole-file tag, so the cheap route
+                // has to be part of the rejection.
                 return Err(TilthError::EditRejected(
-                    "replace_text requires a tag from an edit-mode read".into(),
+                    "replace_text requires a tag from an edit-mode read; a section read \
+                     (path#12-40) carries the whole-file tag without reading the file in \
+                     full. Files over the tag cap mint no tag — use line ops there."
+                        .into(),
                 ));
             }
             let snap = synthetic_snapshot(&key, live, live_tag);
@@ -1178,10 +1184,23 @@ mod tests {
         };
         let err = resolve_edit(&section, &p, &session, original).unwrap_err();
         match err {
-            TilthError::EditRejected(message) => assert_eq!(
-                message,
-                "replace_text requires a tag from an edit-mode read"
-            ),
+            // The rejection must name the cheap route to a tag; stating only
+            // the requirement drove agents into a full re-read of a large file
+            // when a section read would have supplied the same whole-file tag.
+            TilthError::EditRejected(message) => {
+                assert!(
+                    message.starts_with("replace_text requires a tag from an edit-mode read"),
+                    "unexpected rejection: {message}"
+                );
+                assert!(
+                    message.contains("section read"),
+                    "rejection must point at the section-read route: {message}"
+                );
+                assert!(
+                    message.contains("over the tag cap"),
+                    "rejection must name the over-cap case that has no tag: {message}"
+                );
+            }
             other => panic!("expected EditRejected, got {other:?}"),
         }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);

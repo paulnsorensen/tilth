@@ -626,7 +626,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1314,
+            1354,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -659,7 +659,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1672,
+            1876,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -684,6 +684,24 @@ mod tests {
         assert!(
             !EDIT_MODE_INSTRUCTIONS.contains("mcp__"),
             "edit instructions must use protocol tool names, not client-specific prefixes"
+        );
+    }
+
+    /// ADR-003's hard surface cap. The spec elevated "the cap never yields" to
+    /// a quality gate but shipped no guard, so a description edit could cross
+    /// it unnoticed. Measures what an edit-mode client actually receives:
+    /// the served instructions plus the `tools/list` JSON.
+    #[test]
+    fn edit_mode_surface_stays_within_cap() {
+        const CAP: usize = 13_779;
+        let tools = serde_json::json!({ "tools": tool_definitions(true) });
+        let surface =
+            EDIT_MODE_INSTRUCTIONS.len() + serde_json::to_string(&tools).unwrap().chars().count();
+        assert!(
+            surface <= CAP,
+            "edit-mode MCP surface is {surface} chars, over the {CAP} cap by {}. \
+             Trim a description — the cap does not yield.",
+            surface - CAP
         );
     }
 
