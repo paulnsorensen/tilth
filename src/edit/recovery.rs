@@ -77,10 +77,10 @@ pub fn try_recover(
     // agent re-reading a file whose text simply does not contain the anchor.
     // Re-lower against live purely to recover that diagnosis.
     if let Err(err) = lower_ops(path, live, ops) {
-        if is_text_match_failure(&err) {
+        if err.is_text_match_failure() {
             return Err(MismatchError::TextMatch {
                 path: key,
-                reason: err.to_string(),
+                source: err,
             });
         }
     }
@@ -90,17 +90,6 @@ pub fn try_recover(
         expected_tag: tag,
         actual_tag: compute_file_hash(live),
     })
-}
-
-/// Whether an [`ApplyError`] describes a `replace_text` anchor that did not
-/// resolve, as opposed to a structural lowering failure.
-fn is_text_match_failure(err: &ApplyError) -> bool {
-    matches!(
-        err,
-        ApplyError::TextUnmatched { .. }
-            | ApplyError::TextAmbiguous { .. }
-            | ApplyError::TextOldEmpty
-    )
 }
 
 fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<String> {
@@ -130,15 +119,14 @@ fn replay_session_chain(
     }
     let (line_ops, _) = lower_ops(path, live, ops).ok()?;
     let anchors = anchor_lines(&line_ops);
+    // These anchors resolved against LIVE, so check_seen_lines never saw them.
+    if snapshot
+        .first_unseen_anchor(anchors.iter().copied())
+        .is_some()
+    {
+        return None;
+    }
     for a in anchors {
-        // These anchors were resolved against LIVE, so check_seen_lines — which
-        // lowers against the snapshot — never validated them, and skips its gate
-        // entirely when that lowering fails. A `replace_text` whose `old` is
-        // ambiguous in the snapshot but unique in live takes exactly that route,
-        // so provenance has to be enforced here or not at all.
-        if !snapshot.seen_lines.is_empty() && !snapshot.seen_lines.contains(&a) {
-            return None;
-        }
         let idx = (a as usize).checked_sub(1)?;
         if idx >= prev.len() || idx >= curr.len() || prev[idx] != curr[idx] {
             return None;
@@ -155,27 +143,20 @@ fn replay_session_chain(
 /// producer never displayed under this tag. A snapshot with no recorded
 /// provenance (empty `seen_lines`) skips the check.
 pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    if snapshot.seen_lines.is_empty() {
-        return Ok(());
-    }
-    // If lowering fails (unresolved block anchor, file-op conflict, bad range),
-    // skip the gate rather than misreport it as an unseen-line violation —
-    // apply_ops re-runs the lowering against this same snapshot text and
-    // surfaces the real ApplyError. Paths that instead lower against LIVE
-    // cannot rely on that and must re-check provenance themselves; see
+    // Lowering failures (unresolved block anchor, file-op conflict, bad range)
+    // skip the gate: apply_ops re-lowers this same text and reports the real
+    // ApplyError. Live-lowering paths re-check provenance themselves — see
     // replay_session_chain.
     let Ok((line_ops, _)) = lower_ops(path, &snapshot.text, ops) else {
         return Ok(());
     };
-    for line in anchor_lines(&line_ops) {
-        if !snapshot.seen_lines.contains(&line) {
-            return Err(MismatchError::UnseenAnchor {
-                path: snapshot.path.clone(),
-                line,
-            });
-        }
+    match snapshot.first_unseen_anchor(anchor_lines(&line_ops)) {
+        Some(line) => Err(MismatchError::UnseenAnchor {
+            path: snapshot.path.clone(),
+            line,
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Failure from the composed edit egress: either the provenance gate rejected
@@ -270,12 +251,14 @@ mod tests {
             new: "NEWNAME".to_string(),
         }];
         let err = try_recover(&store, &p(), tag, &ops, live).unwrap_err();
-        let MismatchError::TextMatch { reason, .. } = &err else {
+        // Branch on the variant, not its prose — the point of carrying the
+        // ApplyError is that callers can tell the match failures apart.
+        let MismatchError::TextMatch { source, .. } = &err else {
             panic!("expected TextMatch, got {err:?}");
         };
         assert!(
-            reason.contains("text to replace was not found"),
-            "reason should name the match failure, got: {reason}"
+            matches!(source, ApplyError::TextUnmatched { .. }),
+            "expected TextUnmatched, got {source:?}"
         );
     }
 
@@ -293,13 +276,14 @@ mod tests {
             old: "OLDNAME".to_string(),
             new: "NEWNAME".to_string(),
         }];
-        match try_recover(&store, &p(), tag, &ops, live) {
-            Ok(_) => {}
-            Err(e) => assert!(
-                matches!(e, MismatchError::Drift { .. }),
-                "a resolvable anchor must not report TextMatch, got {e:?}"
-            ),
-        }
+        // Must reject — accepting an Ok here would let a wrong recovery pass,
+        // which is the regression this test exists to catch.
+        let err = try_recover(&store, &p(), tag, &ops, live)
+            .expect_err("divergent live must not recover");
+        assert!(
+            matches!(err, MismatchError::Drift { .. }),
+            "a resolvable anchor must not report TextMatch, got {err:?}"
+        );
     }
 
     /// Probe: `check_seen_lines` skips the provenance gate whenever `lower_ops`

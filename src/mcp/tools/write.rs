@@ -680,7 +680,7 @@ mod tests {
         )
         .expect("per-section error returns Ok");
         assert!(
-            out.contains("only one file op"),
+            out.contains("at most one file op (CREATE/REM/MV)"),
             "delete_file + move_file in one drifted section must be a FileOpConflict, got:\n{out}"
         );
         assert!(p.exists(), "rejected conflict must not remove the file");
@@ -1841,7 +1841,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "## {}\nerror: a file op (CREATE/REM) cannot combine with content ops; only one file op per section",
+                "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
                 p.display()
             )
         );
@@ -1870,7 +1870,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "## {}\nerror: a file op (CREATE/REM) cannot combine with content ops; only one file op per section",
+                "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
                 p.display()
             )
         );

@@ -11,7 +11,6 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
 
 use super::block::{outline_for, resolve_block_in};
@@ -85,9 +84,9 @@ pub enum ApplyError {
     /// A block anchor could not be resolved to a span.
     #[error("could not resolve block anchor: {0}")]
     BlockUnresolved(String),
-    /// A file op (`CREATE`/`REM`) combined with content ops, or more than one file op.
+    /// A file op (`CREATE`/`REM`/`MV`) combined with content ops, or more than one file op.
     #[error(
-        "a file op (CREATE/REM) cannot combine with content ops; only one file op per section"
+        "CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section"
     )]
     FileOpConflict,
     /// The requested text did not occur in the source.
@@ -100,6 +99,20 @@ pub enum ApplyError {
     /// `old` was empty; a match-once anchor cannot be empty.
     #[error("replace_text \"old\" must not be empty")]
     TextOldEmpty,
+}
+
+impl ApplyError {
+    /// Whether this describes a `replace_text` anchor that did not resolve, as
+    /// opposed to a structural lowering failure. Lives with the variants so a
+    /// new text-anchor error cannot silently fall through a consumer's match.
+    pub(crate) fn is_text_match_failure(&self) -> bool {
+        matches!(
+            self,
+            ApplyError::TextUnmatched { .. }
+                | ApplyError::TextAmbiguous { .. }
+                | ApplyError::TextOldEmpty
+        )
+    }
 }
 
 /// A lowered, concrete line op — no blocks, no file ops.
@@ -150,9 +163,13 @@ fn line_number(text: &str, byte_pos: usize) -> u32 {
     text[..byte_pos].bytes().filter(|&b| b == b'\n').count() as u32 + 1
 }
 
-/// Apply one or more non-overlapping byte-range substitutions that all land on
-/// the same covering line span, producing the replacement line span.
-fn merge_text_swaps(text: &str, edits: &[(usize, usize, &str)]) -> (u32, u32, Vec<String>) {
+/// Render the covering lines of `edits` with each substitution applied.
+///
+/// `edits` must be non-empty and sorted ascending by start, with no overlapping
+/// byte ranges — [`lower_text_swaps`] is the only producer and establishes all
+/// three. The caller already knows the line span, so this returns only the
+/// replacement lines rather than rescanning the prefix to recompute it.
+fn render_swapped_lines(text: &str, edits: &[(usize, usize, &str)]) -> Vec<String> {
     let first_start = edits[0].0;
     let last_end = edits[edits.len() - 1].1;
     let line_start = text[..first_start].rfind('\n').map_or(0, |i| i + 1);
@@ -167,32 +184,35 @@ fn merge_text_swaps(text: &str, edits: &[(usize, usize, &str)]) -> (u32, u32, Ve
         cursor = e;
     }
     out.push_str(&text[cursor..line_end]);
-    (
-        line_number(text, first_start),
-        line_number(text, last_end),
-        out.split('\n').map(str::to_string).collect(),
-    )
+    out.split('\n').map(str::to_string).collect()
 }
 
 /// Resolve a unique literal text occurrence to a whole-line replacement span.
 ///
-/// The returned payload contains the complete covering lines after substituting
-/// `old` with `new`; the caller lowers it to a concrete [`LineOp::Swap`].
-pub fn resolve_text_swap(
+/// Test-only: production lowers text swaps through [`lower_text_swaps`], which
+/// also coalesces same-line swaps. This composes the same two primitives
+/// ([`find_text_span`] then [`render_swapped_lines`]) for single-swap cases, and
+/// is confined to `cfg(test)` so it cannot be mistaken for a second entry point.
+#[cfg(test)]
+fn resolve_text_swap(
     text: &str,
     old: &str,
     new: &str,
 ) -> Result<(u32, u32, Vec<String>), ApplyError> {
     let (start, end) = find_text_span(text, old)?;
-    Ok(merge_text_swaps(text, &[(start, end, new)]))
+    Ok((
+        line_number(text, start),
+        line_number(text, end),
+        render_swapped_lines(text, &[(start, end, new)]),
+    ))
 }
 
-/// Resolve every `Op::TextSwap` in `ops` against `text`, coalescing swaps that
-/// resolve to the same covering line span into a single [`LineOp::Swap`] so
-/// two disjoint substring replacements on one line both apply. Two swaps whose
-/// matched byte ranges genuinely overlap still error. Returns one slot per op
-/// index in `ops`; `None` for non-`TextSwap` ops and for ops merged into an
-/// earlier slot.
+/// Resolve every `Op::TextSwap` in `ops` against `text`, coalescing swaps whose
+/// covering line spans overlap into a single [`LineOp::Swap`] so two substring
+/// replacements on one line both apply instead of colliding in
+/// [`reject_overlaps`]. Two swaps whose matched byte ranges genuinely overlap
+/// still error. Returns one slot per op index in `ops`; `None` for
+/// non-`TextSwap` ops and for ops merged into an earlier slot.
 fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<Vec<Option<LineOp>>, ApplyError> {
     struct Resolved<'a> {
         op_idx: usize,
@@ -206,43 +226,52 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<Vec<Option<LineOp>>, Apply
     for (op_idx, op) in ops.iter().enumerate() {
         if let Op::TextSwap { old, new } = op {
             let (start, end) = find_text_span(text, old)?;
-            let line_span = (line_number(text, start), line_number(text, end));
             resolved.push(Resolved {
                 op_idx,
                 start,
                 end,
                 new,
-                line_span,
+                line_span: (line_number(text, start), line_number(text, end)),
             });
         }
     }
-
-    let mut groups: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
-    for (i, r) in resolved.iter().enumerate() {
-        groups.entry(r.line_span).or_default().push(i);
-    }
+    // Sorting by byte start puts members of a run adjacent and makes the error
+    // reported for a conflicting pair deterministic; grouping through a HashMap
+    // left it dependent on iteration order.
+    resolved.sort_by_key(|r| r.start);
 
     let mut out: Vec<Option<LineOp>> = vec![None; ops.len()];
-    for members in groups.values() {
-        let mut sorted: Vec<&Resolved> = members.iter().map(|&i| &resolved[i]).collect();
-        sorted.sort_by_key(|r| r.start);
-        for w in sorted.windows(2) {
-            if w[1].start < w[0].end {
+    let mut run_start = 0;
+    while run_start < resolved.len() {
+        // Extend the run while the next swap's covering lines touch it. Keying
+        // on an exact (start_line, end_line) match instead would split two
+        // swaps that share a start line but differ in end line, and
+        // reject_overlaps would then reject the very pair coalescing exists
+        // to join.
+        let mut run_end = run_start + 1;
+        let mut last_line = resolved[run_start].line_span.1;
+        while run_end < resolved.len() && resolved[run_end].line_span.0 <= last_line {
+            if resolved[run_end].start < resolved[run_end - 1].end {
                 return Err(ApplyError::Overlap {
-                    a: w[0].line_span,
-                    b: w[1].line_span,
+                    a: resolved[run_end - 1].line_span,
+                    b: resolved[run_end].line_span,
                 });
             }
+            last_line = last_line.max(resolved[run_end].line_span.1);
+            run_end += 1;
         }
+
+        let run = &resolved[run_start..run_end];
         let edits: Vec<(usize, usize, &str)> =
-            sorted.iter().map(|r| (r.start, r.end, r.new)).collect();
-        let primary = sorted.iter().map(|r| r.op_idx).min().unwrap();
-        let (start, end, payload) = merge_text_swaps(text, &edits);
+            run.iter().map(|r| (r.start, r.end, r.new)).collect();
+        let payload = render_swapped_lines(text, &edits);
+        let primary = run.iter().map(|r| r.op_idx).min().unwrap_or(0);
         out[primary] = Some(LineOp::Swap {
-            start,
-            end,
+            start: run[0].line_span.0,
+            end: last_line,
             payload,
         });
+        run_start = run_end;
     }
 
     Ok(out)
@@ -1111,6 +1140,28 @@ mod tests {
         assert_eq!(applied.text, "let a = baz(qux);\n");
     }
 
+    /// Swaps sharing a start line but ending on different lines used to land in
+    /// different groups (the key was the exact line span), so they were emitted
+    /// as two `LineOp::Swap`s and then rejected by `reject_overlaps` — the exact
+    /// collision coalescing exists to prevent.
+    #[test]
+    fn text_swaps_sharing_a_start_line_but_not_an_end_line_coalesce() {
+        let text = "let a = foo(bar,\n    baz);\ntail\n";
+        let ops = vec![
+            Op::TextSwap {
+                old: "foo".into(),
+                new: "qux".into(),
+            },
+            Op::TextSwap {
+                old: "bar,\n    baz".into(),
+                new: "ONE\n    TWO".into(),
+            },
+        ];
+        let (line_ops, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
+        let applied = apply_line_ops(text, &line_ops).expect("both apply");
+        assert_eq!(applied.text, "let a = qux(ONE\n    TWO);\ntail\n");
+    }
+
     #[test]
     fn text_swaps_with_overlapping_byte_ranges_still_error() {
         let text = "abcdef\n";
@@ -1145,7 +1196,7 @@ mod tests {
         assert_eq!(err, ApplyError::FileOpConflict);
         assert_eq!(
             err.to_string(),
-            "a file op (CREATE/REM) cannot combine with content ops; only one file op per section"
+            "CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section"
         );
     }
 }
