@@ -30,7 +30,9 @@ ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ROUTE = (
     "{cmd} on project files is replaced by tilth: tilth_search (grep/rg), "
     "tilth_read (cat), tilth_list (ls/find), tilth_write (file writes). "
-    "Shell remains for tests, builds, and paths outside the project."
+    "Shell remains for tests, builds, and paths outside the project. "
+    "Generated, lock, and binary files return a header only from tilth_read "
+    "— use head, sed, or git show for their contents."
 )
 WRITE_ROUTE = (
     "{cmd} redirecting output into the project is replaced by tilth: "
@@ -269,7 +271,7 @@ def main():
             )
     except Exception as exc:  # fail open: never block the harness
         print(f"tilth-bash-guard: {exc!r}", file=sys.stderr)
-        return
+        sys.exit(1)
 
 
 SELF_TEST_CASES = [
@@ -348,17 +350,40 @@ def self_test():
         )
         try:
             envelope = json.loads(proc.stdout)["hookSpecificOutput"]
+            # Exit 0 on the deny path is part of the contract: PreToolUse treats
+            # exit 2 as blocking, so a deny that exited 2 would stop the call
+            # outright instead of surfacing this advisory envelope.
             envelope_ok = (
                 envelope["permissionDecision"] == "deny"
                 and envelope["hookEventName"] == "PreToolUse"
                 and envelope["permissionDecisionReason"]
+                and proc.returncode == 0
             )
         except (ValueError, KeyError):
             envelope_ok = False
         if not envelope_ok:
             failures += 1
             print(f"FAIL deny envelope malformed: {proc.stdout!r}")
-        total = len(SELF_TEST_CASES) + 1
+        # Malformed payload: fails open (nothing denied) with a stderr note.
+        malformed = subprocess.run(
+            [sys.executable, os.path.abspath(__file__)],
+            input="not json",
+            capture_output=True,
+            text=True,
+        )
+        malformed_ok = (
+            malformed.stdout == ""
+            and malformed.stderr.startswith("tilth-bash-guard:")
+            and malformed.returncode == 1
+        )
+        if not malformed_ok:
+            failures += 1
+            print(
+                f"FAIL malformed payload not fail-open: "
+                f"stdout={malformed.stdout!r} stderr={malformed.stderr!r} "
+                f"returncode={malformed.returncode}"
+            )
+        total = len(SELF_TEST_CASES) + 2
         print(f"self-test: {total - failures}/{total} passed")
         return 1 if failures else 0
 

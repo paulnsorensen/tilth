@@ -328,15 +328,12 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         _ => Err(format!("unknown tool: {tool}")),
     };
     // Observe every dispatch — an errored call still advances/resets the
-    // streak — but only successful responses can carry a tip. A grok tip
-    // (once per symbol) outranks the batch tip; the batch observation then
-    // runs with emit off so its limited emissions are not burned unseen.
-    let grok_tip = services.session().grok_nudge(tool, result.is_ok());
-    let batch_tip =
-        services
-            .session()
-            .batch_nudge(tool, args, result.is_ok() && grok_tip.is_none());
-    result.map(|body| append_batch_nudge(body, grok_tip.or(batch_tip)))
+    // batch streak — but only successful responses can carry a tip.
+    // `Session::nudge` resolves grok-vs-batch precedence internally.
+    // `nudge` runs unconditionally — `Result::map` would skip it on `Err` and
+    // let a failed intervening tool preserve a streak it actually broke.
+    let tip = services.session().nudge(tool, args, result.is_ok());
+    result.map(|body| append_batch_nudge(body, tip))
 }
 
 // ---------------------------------------------------------------------------

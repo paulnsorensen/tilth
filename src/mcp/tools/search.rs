@@ -316,7 +316,7 @@ fn search_merged_default(
             query, scope, cache, session, expand, context, glob, false, edit_mode, budget,
         )?
     ));
-    if crate::classify::is_identifier(query) {
+    if crate::classify::is_bare_callable_name(query) {
         sections.push(format!(
             "## caller results\n\n{}",
             crate::search::callers::search_callers_expanded(
@@ -404,6 +404,38 @@ mod tests {
         assert!(
             err.contains("cwd") && err.contains("absolute checkout directory"),
             "bare search must refuse without cwd: {err}"
+        );
+    }
+
+    /// Regression: a `::`-qualified query (`Session::new`) can never have a
+    /// real caller-search hit — the Rust callee query captures only the final
+    /// segment and `search::callers` compares the full query string against
+    /// it, so the section would always render empty with a false "no
+    /// syntactic call sites" dead-code signal. The merged default must omit
+    /// the caller-results section entirely for such queries.
+    #[test]
+    fn merged_default_omits_caller_section_for_qualified_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "struct Session;\nimpl Session {\n    fn new() {}\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "Session::new"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            !out.contains("## caller results"),
+            "qualified query must not get a caller-results section: {out}"
         );
     }
     /// Regression for P0-3: `kind=callers` with a comma query must search each

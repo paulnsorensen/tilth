@@ -190,8 +190,9 @@ fn has_regex_metachar(s: &str) -> bool {
     })
 }
 
-/// Identifier check without regex: first byte is [a-zA-Z_$@],
-/// rest are [a-zA-Z0-9_$\.\-]. Tight loop over bytes.
+/// Identifier check without regex: first byte is [a-zA-Z_$@], rest are
+/// [a-zA-Z0-9_$\.\-] plus `:` — but only as part of a `::` pair (`Type::method`
+/// paths), never a lone trailing colon (`TODO:`).
 pub fn is_identifier(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
@@ -202,12 +203,30 @@ pub fn is_identifier(s: &str) -> bool {
         b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' | b'@'
     );
     first_valid
-        && bytes[1..].iter().all(|&b| {
-            matches!(
+        && bytes[1..].iter().enumerate().all(|(i, &b)| {
+            if matches!(
                 b,
                 b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' | b'.' | b'-'
-            )
+            ) {
+                return true;
+            }
+            if b != b':' {
+                return false;
+            }
+            let idx = i + 1;
+            bytes.get(idx - 1) == Some(&b':') || bytes.get(idx + 1) == Some(&b':')
         })
+}
+
+/// Does `s` look like a bare callable name — an identifier with no `::` or
+/// `.` qualifier? Narrower than `is_identifier`: callers search can never
+/// match a qualified name (the callee queries capture only the final
+/// segment, and `search::callers` compares against the full query string),
+/// so gating the caller-results section on this instead of `is_identifier`
+/// avoids an always-empty section with a false "no syntactic call sites"
+/// dead-code signal for `Type::method` and `obj.method` queries.
+pub fn is_bare_callable_name(s: &str) -> bool {
+    is_identifier(s) && !s.contains("::") && !s.contains('.')
 }
 
 #[cfg(test)]
@@ -272,6 +291,10 @@ mod tests {
         ));
         assert!(matches!(
             classify("AuthService.validate", &scope),
+            QueryType::Symbol(_)
+        ));
+        assert!(matches!(
+            classify("Session::new", &scope),
             QueryType::Symbol(_)
         ));
         assert!(matches!(classify("$ref", &scope), QueryType::Symbol(_)));
@@ -362,8 +385,11 @@ mod tests {
         assert!(is_identifier("@decorator"));
         assert!(is_identifier("my-component"));
         assert!(is_identifier("Auth.validate"));
+        assert!(is_identifier("Session::new"));
         assert!(!is_identifier(""));
         assert!(!is_identifier("has space"));
         assert!(!is_identifier("123start"));
+        assert!(!is_identifier("TODO:"));
+        assert!(!is_identifier("a:b"));
     }
 }
