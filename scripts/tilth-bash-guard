@@ -48,14 +48,24 @@ WRITE_ROUTE = (
 )
 
 
-def tokenize(line):
-    lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+def tokenize(command):
+    """Tokenize the whole command in a single pass, pairing each token
+    with the source line (1-based) it starts on."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
-    return list(lex)
+    tokens = []
+    while True:
+        line = lex.lineno
+        tok = lex.get_token()
+        if tok is None:
+            break
+        tokens.append((tok, line))
+    return tokens
 
 
 def heredoc_delimiters(tokens):
-    """The delimiters of every heredoc opened on this line, in order.
+    """The delimiters of every heredoc opened by these same-line tokens,
+    in order.
 
     `<<` inside `$(( ))` arithmetic is a shift, not a heredoc; quoted `<<`
     never surfaces as its own token under posix shlex.
@@ -69,6 +79,42 @@ def heredoc_delimiters(tokens):
         elif tok in HEREDOC_OPENERS and arith == 0 and i + 1 < len(tokens):
             delims.append(tokens[i + 1])
     return delims
+
+
+def heredoc_body_lines(tokens, command):
+    """Line numbers (1-based) that fall inside a heredoc body or its
+    terminator line — data, never judged."""
+    tokens_by_line = {}
+    for tok, line in tokens:
+        tokens_by_line.setdefault(line, []).append(tok)
+
+    body_lines = set()
+    pending = []
+    for lineno, raw in enumerate(command.split("\n"), start=1):
+        if pending:
+            body_lines.add(lineno)
+            if raw.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        pending = heredoc_delimiters(tokens_by_line.get(lineno, []))
+    return body_lines
+
+
+def statement_stream(tokens, body_lines):
+    """Flatten tokens into segment order, dropping heredoc-body tokens
+    and inserting a `;` wherever a bare newline (not absorbed by a
+    continuation or a multi-line quoted string) separates two
+    statements."""
+    flat = []
+    prev_end = None
+    for tok, line in tokens:
+        if line in body_lines:
+            continue
+        if prev_end is not None and line > prev_end:
+            flat.append(";")
+        flat.append(tok)
+        prev_end = line + tok.count("\n")
+    return flat
 
 
 def leading_segments(tokens):
@@ -233,72 +279,26 @@ def resolve_cd(args, cwd):
     return os.path.realpath(ap)
 
 
-def strip_quote_prefix(line, quote):
-    """Drop the tail of a string opened on an earlier line; return the
-    remainder and the still-open quote (None once it closed)."""
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote == '"' and ch == "\\":
-            i += 2
-            continue
-        if ch == quote:
-            return line[i + 1 :], None
-        i += 1
-    return "", quote
-
-
-def open_quote_at_end(line):
-    """The quote character a line leaves unclosed, if any."""
-    quote = None
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote is None:
-            if ch in "'\"":
-                quote = ch
-            elif ch == "\\":
-                i += 1
-        elif ch == quote:
-            quote = None
-        elif quote == '"' and ch == "\\":
-            i += 1
-        i += 1
-    return quote
-
-
 def decide(command, root):
     """Return the deny reason, or None to allow."""
-    pending = []  # heredoc delimiters awaiting their terminator lines
-    quote = None  # quote char carried across lines by a multi-line string
+    try:
+        tokens = tokenize(command)
+    except ValueError:
+        return None  # unbalanced quote: fail open
+
+    body_lines = heredoc_body_lines(tokens, command)
     cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
-    for line in command.split("\n"):
-        if pending:
-            if line.strip() == pending[0]:
-                pending.pop(0)
-            continue  # heredoc body is data, never judged
-        if quote is not None:
-            line, quote = strip_quote_prefix(line, quote)
-            if quote is not None:
-                continue  # whole line inside the string — data
-        try:
-            tokens = tokenize(line)
-        except ValueError:
-            # Unbalanced quote: the string continues on the next line.
-            quote = open_quote_at_end(line)
+    for segment in leading_segments(statement_stream(tokens, body_lines)):
+        cmd, args, out_targets = command_and_args(segment)
+        if cmd == "cd":
+            cwd = resolve_cd(args, cwd)
             continue
-        pending = heredoc_delimiters(tokens)
-        for segment in leading_segments(tokens):
-            cmd, args, out_targets = command_and_args(segment)
-            if cmd == "cd":
-                cwd = resolve_cd(args, cwd)
-                continue
-            if cmd in DENY:
-                if any(a in INFO_FLAGS for a in args):
-                    continue  # reads no files
-                reason = judge(cmd, args, out_targets, cwd, root)
-                if reason:
-                    return reason
+        if cmd in DENY:
+            if any(a in INFO_FLAGS for a in args):
+                continue  # reads no files
+            reason = judge(cmd, args, out_targets, cwd, root)
+            if reason:
+                return reason
     return None
 
 
@@ -388,6 +388,16 @@ SELF_TEST_CASES = [
     ("cd sub && cd .. && ls", "deny"),
     # Bare cd goes to $HOME, which this hook cannot resolve — fail open.
     ("cd && ls", "allow"),
+    # Backslash-continued commands are a single statement; the tail after
+    # the continuation must still be judged.
+    ("grep foo \\\nsrc/", "deny"),
+    ("rg pattern \\\n--glob '*.rs' src/", "deny"),
+    ("cat \\\nREADME.md", "deny"),
+    # A bare newline separates statements, so the single-pass tokenizer must
+    # synthesize the break the old per-line loop got for free.
+    ("cargo build\ngrep foo src/", "deny"),
+    ("cd /tmp\nls", "allow"),
+    ("# just a note\ngrep foo src/", "deny"),
 ]
 
 
