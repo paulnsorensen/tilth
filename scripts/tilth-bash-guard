@@ -26,6 +26,13 @@ WRAPPERS = {"command", "time", "sudo"}
 STATEMENT_BREAKS = {"&&", "||", ";", "&"}
 HEREDOC_OPENERS = {"<<", "<<-"}
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# --help/--version read no files; -h/-V are excluded because -h means
+# no-filename in grep and would mask a real project read.
+INFO_FLAGS = {"--help", "--version"}
+# find's global options may precede the root path(s); skip them while
+# scanning for roots instead of treating them as a path-ending predicate.
+FIND_GLOBAL_FLAGS = {"-L", "-H", "-P"}
+FIND_GLOBAL_VALUE_OPTS = {"-maxdepth", "-mindepth", "-D"}
 
 ROUTE = (
     "{cmd} on project files is replaced by tilth: tilth_search (grep/rg), "
@@ -133,57 +140,97 @@ def command_and_args(segment):
     return cmd, args, out_targets
 
 
-def looks_pathlike(tok, root):
+def looks_pathlike(tok, cwd):
     return (
         os.path.isabs(tok)
         or tok.startswith(("~", "$"))
         or "/" in tok
-        or os.path.exists(os.path.join(root, tok))
+        or os.path.exists(os.path.join(cwd, tok))
     )
 
 
-def path_args(cmd, args, root):
+def _find_global_opt_skip(tok):
+    """Tokens to skip past when scanning find's roots: 1 for a flag, 2 for
+    an option that consumes a separate value, 0 if not a global option."""
+    if tok in FIND_GLOBAL_FLAGS:
+        return 1
+    if tok.startswith("-O") and tok[2:].isdigit():
+        return 1
+    if tok in FIND_GLOBAL_VALUE_OPTS:
+        return 2
+    return 0
+
+
+def path_args(cmd, args, cwd):
     """The tokens that may name filesystem read targets for this command."""
     if cmd == "find":
-        # Roots come before the first predicate (-name, !, ( ...).
+        # Roots come before the first predicate (-name, !, ( ...), but
+        # global options (-L, -maxdepth 2, ...) may precede the roots too.
         roots = []
-        for tok in args:
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            skip = _find_global_opt_skip(tok)
+            if skip:
+                i += skip
+                continue
             if tok.startswith("-") or tok in {"!", "("}:
                 break
             roots.append(tok)
+            i += 1
         return roots
     positional = [t for t in args if not t.startswith("-")]
     if cmd in PATTERN_FIRST:
         # Drop the first positional (the pattern or an option value), then
         # keep only plausible paths — slashed patterns like 'http://' and
         # repo-named patterns must not read as project paths.
-        return [t for t in positional[1:] if looks_pathlike(t, root)]
+        return [t for t in positional[1:] if looks_pathlike(t, cwd)]
     return positional
 
 
-def targets_project(paths, root):
+def targets_project(paths, cwd, root):
+    """True if any path, resolved against cwd, falls under root."""
     for p in paths:
         p = os.path.expanduser(p)
         if p.startswith("$"):
             continue  # unexpanded shell variable — unresolvable, fail open
-        ap = p if os.path.isabs(p) else os.path.join(root, p)
+        ap = p if os.path.isabs(p) else os.path.join(cwd, p)
         rp = os.path.realpath(ap)
         if rp == root or rp.startswith(root + os.sep):
             return True
     return False
 
 
-def judge(cmd, args, out_targets, root):
+def judge(cmd, args, out_targets, cwd, root):
     """Deny reason for one leading segment, or None."""
-    candidates = path_args(cmd, args, root)
+    if cwd is None:
+        return None  # cd target unresolvable — fail open
+    candidates = path_args(cmd, args, cwd)
     if candidates:
-        if targets_project(candidates, root):
+        if targets_project(candidates, cwd, root):
             return ROUTE.format(cmd=cmd)
     elif not out_targets:
-        return ROUTE.format(cmd=cmd)  # a bare command defaults to cwd
-    if targets_project(out_targets, root):
+        # No path was supplied at all — the command defaults to cwd, which
+        # only denies when that cwd is actually inside the project.
+        if targets_project([cwd], cwd, root):
+            return ROUTE.format(cmd=cmd)
+    if targets_project(out_targets, cwd, root):
         return WRITE_ROUTE.format(cmd=cmd)
     return None
+
+
+def resolve_cd(args, cwd):
+    """The effective cwd after a `cd` segment, or None if unresolvable."""
+    if cwd is None:
+        return None
+    positional = [t for t in args if not t.startswith("-")]
+    if not positional:
+        return None  # bare `cd` (goes to $HOME) — unresolvable here
+    target = positional[0]
+    if target.startswith(("$", "~")):
+        return None  # unexpanded/home-relative — unresolvable, fail open
+    ap = target if os.path.isabs(target) else os.path.join(cwd, target)
+    return os.path.realpath(ap)
 
 
 def strip_quote_prefix(line, quote):
@@ -224,6 +271,7 @@ def decide(command, root):
     """Return the deny reason, or None to allow."""
     pending = []  # heredoc delimiters awaiting their terminator lines
     quote = None  # quote char carried across lines by a multi-line string
+    cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
     for line in command.split("\n"):
         if pending:
             if line.strip() == pending[0]:
@@ -242,8 +290,13 @@ def decide(command, root):
         pending = heredoc_delimiters(tokens)
         for segment in leading_segments(tokens):
             cmd, args, out_targets = command_and_args(segment)
+            if cmd == "cd":
+                cwd = resolve_cd(args, cwd)
+                continue
             if cmd in DENY:
-                reason = judge(cmd, args, out_targets, root)
+                if any(a in INFO_FLAGS for a in args):
+                    continue  # reads no files
+                reason = judge(cmd, args, out_targets, cwd, root)
                 if reason:
                     return reason
     return None
@@ -318,6 +371,23 @@ SELF_TEST_CASES = [
     ('echo "a\ncat src/main.rs\nb"', "allow"),
     ('echo "a\nb" && grep foo src/', "deny"),
     ("python3 - <<A <<B\nx\nA\ngrep -rn foo src/\nB", "allow"),
+    ("find -L /tmp/elsewhere -name '*.rs'", "allow"),
+    ("find -maxdepth 2 /var/log", "allow"),
+    ("find -maxdepth 1 /etc", "allow"),
+    ("find -name '*.rs'", "deny"),
+    ("find /tmp -name x", "allow"),
+    ("cd /tmp && ls", "allow"),
+    ("cd /etc && cat hosts", "allow"),
+    ("rg --version", "allow"),
+    ("ls --help", "allow"),
+    ("cat Cargo.lock", "deny"),
+    # -h is not an info flag: in grep it means no-filename, so this is a real
+    # project read. Adding -h to INFO_FLAGS would silently open a bypass.
+    ("grep -h pat src/", "deny"),
+    # A cd chain that returns into the project is still a project read.
+    ("cd sub && cd .. && ls", "deny"),
+    # Bare cd goes to $HOME, which this hook cannot resolve — fail open.
+    ("cd && ls", "allow"),
 ]
 
 
