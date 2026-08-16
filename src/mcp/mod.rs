@@ -278,7 +278,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     }
 }
 
-fn append_batch_nudge(body: String, tip: Option<String>) -> String {
+fn append_nudge(body: String, tip: Option<String>) -> String {
     let Some(tip) = tip else {
         return body;
     };
@@ -330,10 +330,8 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
     // `Session::nudge` resolves grok-vs-batch precedence internally.
-    // `nudge` runs unconditionally — `Result::map` would skip it on `Err` and
-    // let a failed intervening tool preserve a streak it actually broke.
     let tip = services.session().nudge(tool, args, result.is_ok());
-    result.map(|body| append_batch_nudge(body, tip))
+    result.map(|body| append_nudge(body, tip))
 }
 
 // ---------------------------------------------------------------------------
@@ -559,13 +557,15 @@ mod tests {
         let cwd = dir.path().to_str().unwrap();
         let services = Services::new(false);
 
-        // foo reaches count 2 inside one dispatch, then the third entry's
-        // unknown kind fails the whole call — the tip is withheld.
+        // foo reaches candidacy count 2 inside one dispatch (both entries are
+        // symbol-kind searches — content/regex kinds no longer arm the nudge),
+        // then the third entry's unknown kind fails the whole call — the tip
+        // is withheld.
         let err = dispatch_tool(
             "tilth_search",
             &serde_json::json!({ "queries": [
                 { "query": "foo" },
-                { "query": "foo", "kind": "content" },
+                { "query": "foo", "kind": "symbol" },
                 { "query": "foo", "kind": "bogus" }
             ], "cwd": cwd }),
             &services,

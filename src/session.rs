@@ -10,34 +10,13 @@ use serde_json::Value;
 use crate::edit::snapshots::SnapshotStore;
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
-const BATCH_NUDGE_MAX_CHARS: usize = 120;
+const NUDGE_MAX_CHARS: usize = 120;
 const GROK_NUDGE_LIMIT: u8 = 2;
 
-/// A query string is symbol-shaped when it looks like an identifier
-/// (`classify::is_identifier`), its last byte is alphanumeric or `_`, and it
-/// doesn't name a known file. The tail rule drops the trailing `::`, `.`, and
-/// `-` forms `is_identifier` admits (`Session::`, `TODO::`, `foo.`, `foo-`),
-/// none of which is a real symbol name; the file rule stops a repeated search
-/// for `session.rs` or `Makefile` from nudging toward a `tilth_grok` that
-/// cannot resolve a filename. Both would tip toward a call that errors.
-fn is_symbol_shaped(query: &str) -> bool {
-    crate::classify::is_identifier(query)
-        && query
-            .as_bytes()
-            .last()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        && !names_a_known_file(query)
-}
-
-/// Does `query` name a file tilth recognizes — by extension (`session.rs`) or
-/// by bare filename (`Makefile`, `Dockerfile`)? Reuses `lang::detect_file_type`
-/// rather than hardcoding a second extension table here.
-fn names_a_known_file(query: &str) -> bool {
-    !matches!(
-        crate::lang::detect_file_type(Path::new(query)),
-        crate::types::FileType::Other
-    )
-}
+/// Generic grok tip used when the query-inclusive form would exceed
+/// `NUDGE_MAX_CHARS`.
+const GROK_GENERIC_TIP: &str =
+    "TIP: tilth_grok — definition, callers, callees, and tests in one call.";
 
 #[derive(Default)]
 struct GrokNudgeState {
@@ -137,7 +116,7 @@ impl BatchNudgeState {
             "TIP: batch into one call — {}: [{previous_item}, {current}].",
             tool.parameter()
         );
-        if tip.chars().count() <= BATCH_NUDGE_MAX_CHARS {
+        if tip.chars().count() <= NUDGE_MAX_CHARS {
             Some(tip)
         } else {
             Some(tool.generic_tip().to_string())
@@ -150,7 +129,13 @@ impl BatchNudgeState {
 pub struct Session {
     reads: AtomicUsize,
     searches: AtomicUsize,
-    symbols: Mutex<HashMap<String, usize>>, // query → search count
+    symbols: Mutex<HashMap<String, usize>>, // query → search count (reporting only)
+    /// query → search count, populated only for symbol/any-kind searches.
+    /// Grok-nudge candidacy is drawn from here, kept separate from `symbols`
+    /// so content/regex/callers hits keep contributing to the `summary()`
+    /// "Top queries" reporting counter without arming a nudge they can't
+    /// satisfy (`tilth_grok` resolves symbols, not arbitrary text hits).
+    nudge_candidates: Mutex<HashMap<String, usize>>,
     dir_hits: Mutex<HashMap<String, usize>>, // dir → count
     /// `path:line` → file mtime at expand-time. mtime versioning lets
     /// `is_expanded` detect stale records when the file has been edited
@@ -169,12 +154,21 @@ pub struct Session {
     grok_nudges: Mutex<GrokNudgeState>,
 }
 
+// Every lock site in this file recovers from poisoning via
+// `PoisonError::into_inner` instead of propagating the panic: a panicking
+// tool handler must not wedge every later dispatch behind a permanently
+// poisoned mutex for state (nudge bookkeeping, savings counters) that is
+// advisory, not correctness-critical. This is an intentional, repo-wide
+// pattern, not an oversight — recovery is unlogged because a poisoned guard
+// is already a symptom of a panic that gets its own diagnostics elsewhere.
+
 impl Session {
     pub fn new() -> Self {
         Session {
             reads: AtomicUsize::new(0),
             searches: AtomicUsize::new(0),
             symbols: Mutex::new(HashMap::new()),
+            nudge_candidates: Mutex::new(HashMap::new()),
             dir_hits: Mutex::new(HashMap::new()),
             expanded: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotStore::new()),
@@ -223,24 +217,51 @@ impl Session {
         self.record_dir(path);
     }
 
-    pub fn record_search(&self, query: &str) {
+    /// Records a search; always counts toward the `searches`/`summary()`
+    /// reporting tally regardless of kind. `is_symbol_kind` marks searches
+    /// whose kind is `symbol` or `any` (the merged default) — only those
+    /// feed `nudge_candidates`, since a content/regex/callers hit that
+    /// happens to look identifier-shaped isn't something `tilth_grok` could
+    /// resolve differently. Within either counter, only queries
+    /// `search::grok::can_resolve` would actually resolve are tracked.
+    pub fn record_search(&self, query: &str, is_symbol_kind: bool) {
         self.searches.fetch_add(1, Ordering::Relaxed);
+        if !crate::search::grok::can_resolve(query) {
+            return;
+        }
         let mut syms = self
             .symbols
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *syms.entry(query.to_string()).or_insert(0) += 1;
+        if !is_symbol_kind {
+            return;
+        }
+        let mut candidates = self
+            .nudge_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *candidates.entry(query.to_string()).or_insert(0) += 1;
     }
 
     /// Record a `tilth_grok` attempt — even one that later fails — so a
     /// repeat search of the same target never nudges toward a tool the
-    /// agent already reached for.
-    pub fn record_grok(&self, target: &str) {
-        self.grok_nudges
+    /// agent already reached for. Skips `path:line` targets (never grok-nudge
+    /// candidates) and stops recording once the lifetime nudge budget is
+    /// spent, so a fully spent feature doesn't keep growing a set nobody
+    /// reads again.
+    fn record_grok(&self, target: &str) {
+        if crate::search::grok::is_path_line_target(target) {
+            return;
+        }
+        let mut state = self
+            .grok_nudges
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .grokked
-            .insert(target.to_string());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.emissions >= GROK_NUDGE_LIMIT {
+            return;
+        }
+        state.grokked.insert(target.to_string());
     }
 
     /// Just-in-time nudge toward `tilth_grok`: fires once per symbol, capped
@@ -256,10 +277,28 @@ impl Session {
         if !emit || tool != "tilth_search" {
             return None;
         }
-        let syms = self
-            .symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let state = self
+                .grok_nudges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.emissions >= GROK_NUDGE_LIMIT {
+                return None;
+            }
+        }
+        // Snapshot qualifying entries under the `nudge_candidates` lock,
+        // then drop it before taking `grok_nudges` — no two locks held
+        // simultaneously.
+        let candidates: Vec<(String, usize)> = {
+            let syms = self
+                .nudge_candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            syms.iter()
+                .filter(|&(_, &count)| count >= 2)
+                .map(|(query, &count)| (query.clone(), count))
+                .collect()
+        };
         let mut state = self
             .grok_nudges
             .lock()
@@ -267,22 +306,22 @@ impl Session {
         if state.emissions >= GROK_NUDGE_LIMIT {
             return None;
         }
-        let pick = syms
-            .iter()
-            .filter(|&(query, &count)| {
-                count >= 2
-                    && is_symbol_shaped(query)
-                    && !state.grokked.contains(query)
-                    && !state.tipped.contains(query)
-            })
-            .max_by_key(|&(_, &count)| count)
-            .map(|(query, _)| query.clone());
-        let query = pick?;
-        state.tipped.insert(query.clone());
-        state.emissions += 1;
-        Some(format!(
+        let query = candidates
+            .into_iter()
+            .filter(|(query, _)| !state.grokked.contains(query) && !state.tipped.contains(query))
+            .max_by_key(|(_, count)| *count)
+            .map(|(query, _)| query)?;
+        let tip = format!(
             "TIP: tilth_grok {query} — definition, callers, callees, and tests in one call."
-        ))
+        );
+        let tip = if tip.chars().count() <= NUDGE_MAX_CHARS {
+            tip
+        } else {
+            GROK_GENERIC_TIP.to_string()
+        };
+        state.tipped.insert(query);
+        state.emissions += 1;
+        Some(tip)
     }
 
     /// Observe one dispatched MCP tool call (every dispatch, errored or not —
@@ -300,9 +339,17 @@ impl Session {
     /// Single entry point for both nudge producers: grok wins precedence
     /// (once per symbol, capped lifetime), and batch only observes with a
     /// derived `emit` so it doesn't burn a private emission on a dispatch
-    /// whose response already carries the grok tip.
+    /// whose response already carries the grok tip. Also owns grok-target
+    /// suppression recording: a `tilth_grok` dispatch feeds its `target`
+    /// into `record_grok` here, replacing a direct call from the grok tool
+    /// handler.
     pub fn nudge(&self, tool: &str, args: &Value, emit: bool) -> Option<String> {
         let grok_tip = self.grok_nudge(tool, emit);
+        if tool == "tilth_grok" {
+            if let Some(target) = args.get("target").and_then(Value::as_str) {
+                self.record_grok(target);
+            }
+        }
         let batch_tip = self.batch_nudge(tool, args, emit && grok_tip.is_none());
         grok_tip.or(batch_tip)
     }
@@ -393,6 +440,10 @@ impl Session {
         self.reads.store(0, Ordering::Relaxed);
         self.searches.store(0, Ordering::Relaxed);
         self.symbols
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.nudge_candidates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -770,9 +821,9 @@ mod tests {
     #[test]
     fn second_search_of_same_symbol_returns_grok_nudge() {
         let session = Session::new();
-        session.record_search("foo");
+        session.record_search("foo", true);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
-        session.record_search("foo");
+        session.record_search("foo", true);
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -785,18 +836,18 @@ mod tests {
     #[test]
     fn grok_nudge_fires_once_per_symbol() {
         let session = Session::new();
-        session.record_search("foo");
-        session.record_search("foo");
+        session.record_search("foo", true);
+        session.record_search("foo", true);
         assert!(session.grok_nudge("tilth_search", true).is_some());
-        session.record_search("foo");
+        session.record_search("foo", true);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
     #[test]
     fn single_searches_of_different_symbols_never_nudge() {
         let session = Session::new();
-        session.record_search("foo");
-        session.record_search("bar");
+        session.record_search("foo", true);
+        session.record_search("bar", true);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
@@ -812,8 +863,8 @@ mod tests {
             "Makefile",
             "Dockerfile",
         ] {
-            session.record_search(query);
-            session.record_search(query);
+            session.record_search(query, true);
+            session.record_search(query, true);
         }
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
@@ -822,8 +873,8 @@ mod tests {
     fn trailing_colon_or_hyphen_never_nudges() {
         let session = Session::new();
         for query in ["Session::", "foo-"] {
-            session.record_search(query);
-            session.record_search(query);
+            session.record_search(query, true);
+            session.record_search(query, true);
         }
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
@@ -831,8 +882,8 @@ mod tests {
     #[test]
     fn qualified_symbol_query_nudges() {
         let session = Session::new();
-        session.record_search("Session::new");
-        session.record_search("Session::new");
+        session.record_search("Session::new", true);
+        session.record_search("Session::new", true);
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -846,16 +897,16 @@ mod tests {
     fn grokked_target_never_nudges() {
         let session = Session::new();
         session.record_grok("foo");
-        session.record_search("foo");
-        session.record_search("foo");
+        session.record_search("foo", true);
+        session.record_search("foo", true);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
     #[test]
     fn withheld_grok_nudge_rides_the_next_eligible_response() {
         let session = Session::new();
-        session.record_search("foo");
-        session.record_search("foo");
+        session.record_search("foo", true);
+        session.record_search("foo", true);
         assert_eq!(session.grok_nudge("tilth_search", false), None);
         assert!(session.grok_nudge("tilth_search", true).is_some());
     }
@@ -863,11 +914,11 @@ mod tests {
     #[test]
     fn most_searched_symbol_wins_when_several_qualify() {
         let session = Session::new();
-        session.record_search("foo");
-        session.record_search("bar");
-        session.record_search("bar");
-        session.record_search("foo");
-        session.record_search("foo");
+        session.record_search("foo", true);
+        session.record_search("bar", true);
+        session.record_search("bar", true);
+        session.record_search("foo", true);
+        session.record_search("foo", true);
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -881,8 +932,8 @@ mod tests {
     fn grok_nudge_stops_after_lifetime_limit() {
         let session = Session::new();
         for symbol in ["foo", "bar", "baz"] {
-            session.record_search(symbol);
-            session.record_search(symbol);
+            session.record_search(symbol, true);
+            session.record_search(symbol, true);
         }
         assert!(session.grok_nudge("tilth_search", true).is_some());
         assert!(session.grok_nudge("tilth_search", true).is_some());
@@ -890,17 +941,57 @@ mod tests {
     }
 
     #[test]
+    fn oversized_grok_tip_falls_back_to_the_generic_form() {
+        let session = Session::new();
+        let long = "a".repeat(120);
+        session.record_search(&long, true);
+        session.record_search(&long, true);
+        assert_eq!(
+            session.grok_nudge("tilth_search", true),
+            Some(GROK_GENERIC_TIP.to_string())
+        );
+    }
+
+    #[test]
+    fn nudge_records_grok_target_via_tilth_grok_dispatch() {
+        // record_grok is no longer called from the grok tool handler directly;
+        // Session::nudge derives grok-target suppression from the tool name
+        // and args.
+        let session = Session::new();
+        session.record_search("foo", true);
+        session.record_search("foo", true);
+        session.nudge("tilth_grok", &serde_json::json!({ "target": "foo" }), true);
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
     fn reset_clears_grok_nudge_state() {
         let session = Session::new();
         session.record_grok("foo");
-        session.record_search("bar");
-        session.record_search("bar");
+        session.record_search("bar", true);
+        session.record_search("bar", true);
         session.reset();
-        session.record_search("foo");
-        session.record_search("foo");
+        session.record_search("foo", true);
+        session.record_search("foo", true);
         assert!(
             session.grok_nudge("tilth_search", true).is_some(),
             "a grokked target must nudge again after reset"
         );
+    }
+
+    #[test]
+    fn non_symbol_search_kind_never_nudges_even_for_symbol_shaped_query() {
+        let session = Session::new();
+        session.record_search("foo", false);
+        session.record_search("foo", false);
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    #[test]
+    fn non_symbol_search_kind_still_counts_toward_reporting() {
+        let session = Session::new();
+        session.record_search("foo", false);
+        session.record_search("foo", false);
+        assert!(session.summary().contains("foo (2)"));
     }
 }

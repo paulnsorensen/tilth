@@ -221,7 +221,7 @@ For headless runs, `--disallowedTools` (above) is the equivalent lever.
 
 ### Bash guard hook
 
-Banning built-in Grep/Glob moves exploration into Bash (`grep`/`rg` lead `tilth_search` by up to 4.6:1 in the same telemetry), where the MCP surface cannot see it. `scripts/tilth-bash-guard` is a Claude Code PreToolUse hook that denies common leading `grep`/`rg`/`find`/`cat`/`ls` commands targeting project files (wrapper forms like `bash -c` are not inspected) and routes the agent to `tilth_search`/`tilth_read`/`tilth_list`; pipe filters (`cargo test | grep foo`) and paths outside the project pass through. Verify the guard with `python3 scripts/tilth-bash-guard --self-test`, then install it in a tilth-enabled project's `.claude/settings.json`:
+Banning built-in Grep/Glob moves exploration into Bash (`grep`/`rg` lead `tilth_search` by up to 4.6:1 in the same telemetry), where the MCP surface cannot see it. `scripts/tilth-bash-guard` is a Claude Code PreToolUse hook that denies common leading `grep`/`rg`/`find`/`cat`/`ls` commands targeting project files (wrapper forms like `bash -c` are not inspected) and routes the agent to `tilth_search`/`tilth_read`/`tilth_list`; pipe filters (`cargo test | grep foo`) and paths outside the project pass through. Verify the guard with `python3 scripts/tilth-bash-guard --self-test`, then install it in a tilth-enabled project's `.claude/settings.json`; review the script itself like any other executable dependency before installing it, especially when checking out untrusted branches:
 
 ```json
 {
