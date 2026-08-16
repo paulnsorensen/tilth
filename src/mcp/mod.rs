@@ -153,6 +153,10 @@ fn current_dir_or_log() -> PathBuf {
 /// deps-index cache key: lowercase, internal whitespace runs collapsed to
 /// `-`. Absent or blank names fall back to a stable placeholder so the
 /// deps-index path stays deterministic even when a host omits `clientInfo`.
+// The dash/lowercase normalization here is the display-facing client key
+// (used as a redb cache-directory component name); `deps::paths::normalize_client_key`
+// is a separate function that applies the actual filesystem-safe sanitization
+// downstream, in `redb_path`.
 fn normalize_client_key(name: Option<&str>) -> String {
     match name.map(str::trim) {
         Some(n) if !n.is_empty() => n
@@ -369,9 +373,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     }
     let surface = services.surface();
     let result = match tool {
-        "tilth_read" if surface != SearchSurface::V2 => {
-            tool_read(args, services.cache(), services.session(), edit_mode)
-        }
+        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" if surface != SearchSurface::V2 => tool_search(
             args,
             services.cache(),
@@ -384,7 +386,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_grok" if surface != SearchSurface::V2 => {
             tool_grok(args, services.bloom(), services.session())
         }
-        "tilth_diff" if surface != SearchSurface::V2 => tool_diff(args),
+        "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         "tilth_search_v2" if surface != SearchSurface::V1 => dispatch_search_v2(args, services),
         _ => Err(format!("unknown tool: {tool}")),
@@ -406,12 +408,15 @@ const DEPS_WARM_DEADLINE_MS: u64 = 200;
 /// errors are swallowed here — a search must succeed cold-partial rather
 /// than fail because the deps index couldn't open.
 fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, String> {
+    let client = services.client_key();
+    let mut worktree = String::new();
     if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
         let cwd = Path::new(cwd);
-        if let Ok(handle) = crate::index::deps::open(cwd, services.client_key()) {
+        if let Ok(handle) = crate::index::deps::open(cwd, client) {
             let deadline = Instant::now() + Duration::from_millis(DEPS_WARM_DEADLINE_MS);
             crate::index::deps::reconcile(&handle, cwd, deadline);
         }
+        worktree = crate::index::deps::worktree_key(cwd);
     }
     tool_search_v2(
         args,
@@ -419,6 +424,8 @@ fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, Strin
         services.session(),
         services.bloom(),
         services.telemetry(),
+        client,
+        &worktree,
     )
 }
 

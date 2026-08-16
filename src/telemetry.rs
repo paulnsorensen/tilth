@@ -11,7 +11,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -57,6 +58,7 @@ pub(crate) struct SearchTelemetryRecord {
 pub(crate) struct TelemetrySink {
     dir: PathBuf,
     max_bytes: u64,
+    dir_ready: OnceLock<()>,
 }
 
 impl TelemetrySink {
@@ -66,13 +68,17 @@ impl TelemetrySink {
         Self {
             dir: resolve_dir(),
             max_bytes: DEFAULT_MAX_BYTES,
+            dir_ready: OnceLock::new(),
         }
     }
 
     /// Appends one compact JSON line for `rec`, rotating the current file
     /// first if the write would exceed `max_bytes`.
     pub(crate) fn record(&self, rec: &SearchTelemetryRecord) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
+        if self.dir_ready.get().is_none() {
+            fs::create_dir_all(&self.dir)?;
+            let _ = self.dir_ready.set(());
+        }
         let mut line = serde_json::to_string(rec)?;
         line.push('\n');
 
@@ -90,14 +96,23 @@ impl TelemetrySink {
     }
 
     /// Renames the current file to a timestamped name and prunes the
-    /// oldest rotated file beyond `MAX_ROTATED_FILES`.
-    fn rotate(&self, current: &PathBuf) -> io::Result<()> {
+    /// oldest rotated file beyond `MAX_ROTATED_FILES`. Concurrent tilth
+    /// processes can race this: if another writer already rotated (or
+    /// pruned) the same path, the resulting `NotFound` is not an error —
+    /// the desired end state (no oversized current file) already holds.
+    fn rotate(&self, current: &Path) -> io::Result<()> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let rotated = self.dir.join(format!("rotated-{nanos}.jsonl"));
-        fs::rename(current, &rotated)?;
+        let rotated = self
+            .dir
+            .join(format!("rotated-{nanos}-{}.jsonl", std::process::id()));
+        match fs::rename(current, &rotated) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
         self.prune_rotated()
     }
 
@@ -114,7 +129,11 @@ impl TelemetrySink {
         rotated.sort();
         while rotated.len() > MAX_ROTATED_FILES {
             let oldest = rotated.remove(0);
-            fs::remove_file(oldest)?;
+            match fs::remove_file(oldest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -161,6 +180,7 @@ mod tests {
         TelemetrySink {
             dir: dir.to_path_buf(),
             max_bytes: DEFAULT_MAX_BYTES,
+            dir_ready: OnceLock::new(),
         }
     }
 
@@ -240,6 +260,7 @@ mod tests {
         let sink = TelemetrySink {
             dir: temp.path().to_path_buf(),
             max_bytes: 512,
+            dir_ready: OnceLock::new(),
         };
 
         for _ in 0..500 {

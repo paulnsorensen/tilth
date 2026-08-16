@@ -1,8 +1,7 @@
 //! F11 cold-partial verified-only search-v2 engine: deterministic query
 //! routing (path -> regex -> symbol/ambiguous -> literal -> miss) with bounded
-//! grok/deps enrichment on unique hits. Not yet wired into MCP dispatch --
-//! that's a later curd (see `.hallouminate/wiki/adr/tilth-search-v2-trial.md`).
-#![allow(dead_code)]
+//! grok/deps enrichment on unique hits (see
+//! `.hallouminate/wiki/adr/tilth-search-v2-trial.md`).
 
 use std::path::Path;
 use std::time::Instant;
@@ -30,6 +29,8 @@ pub(in crate::mcp) fn tool_search_v2(
     session: &Session,
     bloom: &BloomFilterCache,
     telemetry: &TelemetrySink,
+    client: &str,
+    worktree: &str,
 ) -> Result<String, String> {
     let start = Instant::now();
     let cwd = require_cwd(args)?;
@@ -91,8 +92,8 @@ pub(in crate::mcp) fn tool_search_v2(
         timeout: false,
         dependency_coverage: 1.0,
         shard_state: "none".to_string(),
-        client: String::new(),
-        worktree: String::new(),
+        client: client.to_string(),
+        worktree: worktree.to_string(),
     });
 
     Ok(response_str)
@@ -291,7 +292,15 @@ mod tests {
     fn call(args: Value) -> Result<Value, String> {
         let (cache, session, bloom) = components();
         let (telemetry, _tmp) = telemetry();
-        let out = tool_search_v2(&args, &cache, &session, &bloom, &telemetry)?;
+        let out = tool_search_v2(
+            &args,
+            &cache,
+            &session,
+            &bloom,
+            &telemetry,
+            "test-client",
+            "test-worktree",
+        )?;
         Ok(serde_json::from_str(&out).expect("valid json response"))
     }
 
@@ -445,8 +454,16 @@ mod tests {
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{"query": "detect_file_type"}, {"query": "run"}],
         });
-        let out = tool_search_v2(&args, &cache, &session, &bloom, &telemetry)
-            .expect("batch query succeeds");
+        let out = tool_search_v2(
+            &args,
+            &cache,
+            &session,
+            &bloom,
+            &telemetry,
+            "test-client",
+            "test-worktree",
+        )
+        .expect("batch query succeeds");
         assert!(
             !out.contains("routes_tried"),
             "response must never carry routes_tried: {out}"

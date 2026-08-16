@@ -7,6 +7,7 @@
 //! Both are `&str → &[u8]` (JSON-encoded values) so the redb types stay
 //! private to this module.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -88,6 +89,25 @@ pub(super) fn all_file_keys(db: &Database) -> Result<Vec<String>, DepsError> {
         keys.push(k.value().to_string());
     }
     Ok(keys)
+}
+
+/// All (relative path -> signature) pairs currently tracked in the `files`
+/// table, read in one transaction — avoids opening one read transaction per
+/// walked file during `reconcile`'s unchanged-file check.
+pub(super) fn all_signatures(db: &Database) -> Result<HashMap<String, FileSignature>, DepsError> {
+    let txn = db.begin_read().map_err(redb_err)?;
+    let table = match txn.open_table(FILES) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let mut map = HashMap::new();
+    for entry in table.iter().map_err(redb_err)? {
+        let (k, v) = entry.map_err(redb_err)?;
+        let shard: FileShard = serde_json::from_slice(v.value()).map_err(redb_err)?;
+        map.insert(k.value().to_string(), shard.signature);
+    }
+    Ok(map)
 }
 
 /// One atomic reconcile write: upsert changed shards, remove deleted ones,

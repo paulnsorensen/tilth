@@ -290,6 +290,9 @@ fn child_crash(path: &str) {
         let mut table = write_txn.open_table(TABLE).unwrap();
         table.insert("uncommitted", 999u64).unwrap();
     }
+    // Signal readiness so the parent SIGKILLs us mid-transaction
+    // deterministically: baseline is committed and the uncommitted txn is open.
+    let _ = std::fs::write(format!("{path}.ready"), b"1");
     std::thread::sleep(Duration::from_secs(10));
     write_txn.commit().unwrap();
 }
@@ -303,8 +306,13 @@ fn gate_recovery(dir: &Path) -> Value {
         .spawn()
         .unwrap();
 
-    // Give the child time to commit the baseline and start the in-progress txn.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for the child's readiness marker (baseline committed and the
+    // in-progress txn open) instead of a fixed sleep, bounded by a timeout.
+    let ready = format!("{}.ready", path.display());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !Path::new(&ready).exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     #[cfg(unix)]
     {
@@ -322,7 +330,16 @@ fn gate_recovery(dir: &Path) -> Value {
         let _ = child.wait();
     }
 
-    let db = Database::open(&path).unwrap();
+    let db = match Database::open(&path) {
+        Ok(db) => db,
+        Err(_) => {
+            return json!({"pass": false, "measurement": {
+                "baseline_survived": 0u64,
+                "uncommitted_absent": false,
+                "error": "recovery db could not be opened after crash",
+            }});
+        }
+    };
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_table(TABLE).unwrap();
     let baseline = table.get("baseline").unwrap().map(|v| v.value()).unwrap_or(0);

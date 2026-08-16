@@ -8,7 +8,11 @@
 //! edge.
 //!
 //! Every redb type and table definition stays private to this module family
-//! (`storage.rs`); callers only see the four items re-exported below.
+//! (`storage.rs`, `paths.rs`). This module (`mod.rs`) is the crate-visible
+//! surface: the `DepsError`, `HandleState`, `Coverage`, and `VerifiedPartial`
+//! types plus the `open`, `reconcile`, `impact`, and `worktree_key` free
+//! functions are all `pub(crate)` here; `handles::DepsIndexHandles` is the
+//! one item re-exported from a submodule.
 
 // The wiring curd (a separate change) is the first crate-internal caller of
 // this module's public API; until it lands, everything here is unreachable
@@ -92,16 +96,23 @@ pub(crate) fn open(cwd: &Path, client_key: &str) -> Result<HandleState, DepsErro
         .open(cwd, client_key)
 }
 
+/// The same worktree-identity hash used for the deps-index cache-dir key
+/// (see `paths::worktree_key`), for telemetry's `worktree` field. Best-effort:
+/// an unresolvable git identity yields an empty string rather than an error.
+pub(crate) fn worktree_key(cwd: &Path) -> String {
+    paths::worktree_identity(cwd)
+        .map(|identity| paths::worktree_key(&identity))
+        .unwrap_or_default()
+}
+
 /// Atomically replace the per-file shards + reverse edges for every file
 /// under `worktree` whose content signature (mtime + length) changed since
 /// the last reconcile, and remove shards for files that disappeared.
 /// Stops scanning at `deadline`, in which case deletions are not inferred
 /// (an incomplete scan cannot tell "not seen" from "not yet reached").
 pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant) -> Coverage {
-    let previously_known: HashSet<String> = storage::all_file_keys(&handle.db)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let known_signatures = storage::all_signatures(&handle.db).unwrap_or_default();
+    let previously_known: HashSet<String> = known_signatures.keys().cloned().collect();
 
     let mut seen = HashSet::new();
     let mut upserts = Vec::new();
@@ -128,25 +139,35 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         let Some(signature) = storage::signature_of(path) else {
             continue;
         };
-        let unchanged = storage::read_shard(&handle.db, &rel)
-            .ok()
-            .flatten()
-            .is_some_and(|shard| shard.signature == signature);
+        let unchanged = known_signatures
+            .get(&rel)
+            .is_some_and(|sig| *sig == signature);
         if unchanged {
             continue;
         }
 
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
+        // Non-code files (including binaries that would fail read_to_string
+        // as non-UTF-8) never have imports to resolve; storing an empty-deps
+        // shard for them (instead of `continue`-ing without one) records
+        // their signature so they aren't re-scanned on every future pass.
+        let deps = if matches!(
+            crate::lang::detect_file_type(path),
+            crate::types::FileType::Code(_)
+        ) {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            crate::read::imports::resolve_related_files_with_content(path, &content)
+                .into_iter()
+                .filter_map(|p| {
+                    p.strip_prefix(worktree)
+                        .ok()
+                        .map(|r| r.to_string_lossy().to_string())
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
-        let deps = crate::read::imports::resolve_related_files_with_content(path, &content)
-            .into_iter()
-            .filter_map(|p| {
-                p.strip_prefix(worktree)
-                    .ok()
-                    .map(|r| r.to_string_lossy().to_string())
-            })
-            .collect();
         upserts.push((rel, storage::FileShard { signature, deps }));
     }
 
