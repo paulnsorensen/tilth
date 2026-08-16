@@ -1,0 +1,11 @@
+{
+  "thresholds": {
+    "accuracy": 0.8,
+    "cost_per_correct": 0.5
+  },
+  "floors": {
+    "haiku": 0.85,
+    "codex": "[BLOCKED]",
+    "omp": "[BLOCKED]"
+  }
+}

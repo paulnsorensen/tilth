@@ -33,6 +33,7 @@ pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod session;
+pub(crate) mod telemetry;
 pub(crate) mod timeout;
 pub(crate) mod types;
 pub(crate) mod util;

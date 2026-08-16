@@ -5,6 +5,7 @@ mod grok;
 mod list;
 mod read;
 mod search;
+mod search_v2;
 mod write;
 
 pub(super) use definitions::tool_definitions;
@@ -14,6 +15,9 @@ pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
 pub(super) use read::tool_read;
 pub(super) use search::tool_search;
+// Consumed by the surface-gated dispatch arm in a later curd (mcp-services-and-surface).
+#[allow(unused_imports)]
+pub(super) use search_v2::tool_search_v2;
 pub(super) use write::tool_write;
 
 use std::path::PathBuf;

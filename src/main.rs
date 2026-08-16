@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
+    /// Which search surface(s) to expose over MCP: v1 (default), v2, or both.
+    #[arg(long, value_enum, default_value = "v1")]
+    search_surface: tilth::mcp::SearchSurface,
+
     /// Inline source for top N search matches (default 2 when flag bare).
     ///
     /// Applies to symbol / text / regex queries. Without the flag the
@@ -258,7 +262,7 @@ fn main() {
                     .unwrap_or_else(|_| cli.scope.clone()),
             )
         };
-        if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
+        if let Err(e) = tilth::mcp::run(cli.edit, cli.search_surface, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
             process::exit(1);
         }

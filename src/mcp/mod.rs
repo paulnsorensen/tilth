@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,8 +18,18 @@ mod tree;
 
 use tools::{
     tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
-    tool_write,
+    tool_search_v2, tool_write,
 };
+
+/// Which search surface(s) are exposed over MCP. `V1` (default) is the
+/// stable registry; `V2` is the trial engine alone; `Both` advertises both
+/// registries side by side during the trial.
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchSurface {
+    V1,
+    V2,
+    Both,
+}
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -28,16 +39,22 @@ struct Services {
     bloom: Arc<BloomFilterCache>,
     tracker: Arc<ThreadTracker>,
     edit_mode: bool,
+    surface: SearchSurface,
+    client_profile: Arc<OnceLock<String>>,
+    telemetry: Arc<crate::telemetry::TelemetrySink>,
 }
 
 impl Services {
-    fn new(edit_mode: bool) -> Self {
+    fn new(edit_mode: bool, surface: SearchSurface) -> Self {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             tracker: Arc::new(ThreadTracker::new()),
             edit_mode,
+            surface,
+            client_profile: Arc::new(OnceLock::new()),
+            telemetry: Arc::new(crate::telemetry::TelemetrySink::new()),
         }
     }
 
@@ -59,6 +76,22 @@ impl Services {
 
     fn edit_mode(&self) -> bool {
         self.edit_mode
+    }
+
+    fn surface(&self) -> SearchSurface {
+        self.surface
+    }
+
+    fn telemetry(&self) -> &crate::telemetry::TelemetrySink {
+        &self.telemetry
+    }
+
+    /// The deps-index cache key: the client-declared name normalized at
+    /// `initialize`, or a stable fallback when the host omitted `clientInfo`.
+    fn client_key(&self) -> &str {
+        self.client_profile
+            .get()
+            .map_or("unknown-client", String::as_str)
     }
 }
 
@@ -116,13 +149,28 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
+/// Normalizes an MCP client's declared name into a filesystem-safe, stable
+/// deps-index cache key: lowercase, internal whitespace runs collapsed to
+/// `-`. Absent or blank names fall back to a stable placeholder so the
+/// deps-index path stays deterministic even when a host omits `clientInfo`.
+fn normalize_client_key(name: Option<&str>) -> String {
+    match name.map(str::trim) {
+        Some(n) if !n.is_empty() => n
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-"),
+        _ => "unknown-client".to_string(),
+    }
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
 /// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
-pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+pub fn run(edit_mode: bool, surface: SearchSurface, scope: Option<&Path>) -> io::Result<()> {
     // Resolve the project root and chdir to it.
     // Priority: explicit --scope > package_root(cwd) > cwd. The server never
     // chdirs on client roots — path anchoring is driven entirely by the
@@ -137,7 +185,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             chdir_or_log(root);
         }
     }
-    let services = Services::new(edit_mode);
+    let services = Services::new(edit_mode, surface);
     let stdin = io::stdin();
     let stdout = io::stdout();
     serve(stdin.lock(), stdout.lock(), &services)
@@ -230,6 +278,14 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     match req.method.as_str() {
         "initialize" => {
             let instructions = build_instructions(edit_mode);
+            let client_name = req
+                .params
+                .get("clientInfo")
+                .and_then(|c| c.get("name"))
+                .and_then(Value::as_str);
+            let _ = services
+                .client_profile
+                .set(normalize_client_key(client_name));
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -252,7 +308,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             jsonrpc: "2.0",
             id: req.id.clone(),
             result: Some(serde_json::json!({
-                "tools": tool_definitions(edit_mode)
+                "tools": tool_definitions(edit_mode, services.surface())
             })),
             error: None,
         },
@@ -311,9 +367,12 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             }
         }
     }
+    let surface = services.surface();
     let result = match tool {
-        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(
+        "tilth_read" if surface != SearchSurface::V2 => {
+            tool_read(args, services.cache(), services.session(), edit_mode)
+        }
+        "tilth_search" if surface != SearchSurface::V2 => tool_search(
             args,
             services.cache(),
             services.session(),
@@ -321,16 +380,45 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             edit_mode,
         ),
         "tilth_list" => tool_list(args),
-        "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-        "tilth_diff" => tool_diff(args),
+        "tilth_deps" if surface != SearchSurface::V2 => tool_deps(args, services.bloom()),
+        "tilth_grok" if surface != SearchSurface::V2 => {
+            tool_grok(args, services.bloom(), services.session())
+        }
+        "tilth_diff" if surface != SearchSurface::V2 => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+        "tilth_search_v2" if surface != SearchSurface::V1 => dispatch_search_v2(args, services),
         _ => Err(format!("unknown tool: {tool}")),
     };
     // Observe every dispatch — an errored call still advances/resets the
     // streak — but only successful responses can carry the tip.
     let tip = services.session().batch_nudge(tool, args, result.is_ok());
     result.map(|body| append_batch_nudge(body, tip))
+}
+
+/// Milliseconds budgeted to warm the persistent deps index before search-v2
+/// runs. A cold or slow deps index must never block or fail the search — it
+/// only affects `dependency_impact.coverage` in the v2 response.
+const DEPS_WARM_DEADLINE_MS: u64 = 200;
+
+/// Opens (or reuses) the per-(worktree, client) deps index and reconciles it
+/// against the current tree before delegating to the v2 search engine. Deps
+/// errors are swallowed here — a search must succeed cold-partial rather
+/// than fail because the deps index couldn't open.
+fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, String> {
+    if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
+        let cwd = Path::new(cwd);
+        if let Ok(handle) = crate::index::deps::open(cwd, services.client_key()) {
+            let deadline = Instant::now() + Duration::from_millis(DEPS_WARM_DEADLINE_MS);
+            crate::index::deps::reconcile(&handle, cwd, deadline);
+        }
+    }
+    tool_search_v2(
+        args,
+        services.cache(),
+        services.session(),
+        services.bloom(),
+        services.telemetry(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +545,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false);
+        let services = Services::new(false, SearchSurface::V1);
 
         let first = dispatch_tool(
             "tilth_read",
@@ -496,7 +584,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false);
+        let services = Services::new(false, SearchSurface::V1);
 
         for path in ["a.rs", "b.rs"] {
             if path == "b.rs" {
@@ -529,7 +617,7 @@ mod tests {
     /// dispatch without the `require_cwd` gate.
     #[test]
     fn dispatch_refuses_missing_cwd_for_every_path_tool() {
-        let services = Services::new(true); // edit_mode=true so tilth_write dispatches
+        let services = Services::new(true, SearchSurface::V1); // edit_mode=true so tilth_write dispatches
         let cases = [
             ("tilth_read", serde_json::json!({ "paths": ["x.rs"] })),
             (
@@ -563,7 +651,7 @@ mod tests {
     /// request. Guards the deleted post-initialize handshake.
     #[test]
     fn serve_emits_no_roots_list_after_initialize() {
-        let services = Services::new(false);
+        let services = Services::new(false, SearchSurface::V1);
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
             r#""params":{"capabilities":{"roots":{"listChanged":true}}}}"#,
@@ -698,7 +786,7 @@ mod tests {
     #[test]
     fn edit_mode_surface_stays_within_cap() {
         const CAP: usize = 13_779;
-        let services = Services::new(true);
+        let services = Services::new(true, SearchSurface::V1);
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             "\n",
@@ -1992,7 +2080,7 @@ mod tests {
     /// to collapse batch output to useless stubs.
     #[test]
     fn dispatch_rejects_non_positive_budget() {
-        let services = Services::new(false);
+        let services = Services::new(false, SearchSurface::V1);
         for bad in [
             serde_json::json!(0),
             serde_json::json!(-1),
@@ -2029,7 +2117,7 @@ mod tests {
     #[test]
     fn budget_validation_skipped_for_non_budget_tools() {
         // tilth_write in edit_mode=true, budget:0 → own empty-edits error, not budget error.
-        let services = Services::new(true);
+        let services = Services::new(true, SearchSurface::V1);
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
             "budget": 0,
@@ -2048,7 +2136,7 @@ mod tests {
         );
 
         // tilth_list, budget:0 → own patterns error, not budget error.
-        let services = Services::new(false);
+        let services = Services::new(false, SearchSurface::V1);
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
             "budget": 0,
