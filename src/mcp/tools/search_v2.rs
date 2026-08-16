@@ -109,7 +109,7 @@ fn route_query(
     session: &Session,
     bloom: &BloomFilterCache,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    session.record_search(query);
+    session.record_search(query, true);
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
     let candidate = cwd.join(query);
