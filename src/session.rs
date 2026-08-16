@@ -217,24 +217,23 @@ impl Session {
         self.record_dir(path);
     }
 
-    /// Records a search; always counts toward the `searches`/`summary()`
-    /// reporting tally regardless of kind. `is_symbol_kind` marks searches
-    /// whose kind is `symbol` or `any` (the merged default) — only those
-    /// feed `nudge_candidates`, since a content/regex/callers hit that
-    /// happens to look identifier-shaped isn't something `tilth_grok` could
-    /// resolve differently. Within either counter, only queries
-    /// `search::grok::can_resolve` would actually resolve are tracked.
+    /// Records a search; every query counts toward the `searches` tally and
+    /// the `symbols`/`summary()` reporting map regardless of kind or shape
+    /// (reporting reflects what was actually searched). `is_symbol_kind`
+    /// marks searches whose kind is `symbol` or `any` (the merged default) —
+    /// only those feed `nudge_candidates`, and only when
+    /// `search::grok::can_resolve` says `tilth_grok` could actually resolve
+    /// the query.
     pub fn record_search(&self, query: &str, is_symbol_kind: bool) {
         self.searches.fetch_add(1, Ordering::Relaxed);
-        if !crate::search::grok::can_resolve(query) {
-            return;
+        {
+            let mut syms = self
+                .symbols
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *syms.entry(query.to_string()).or_insert(0) += 1;
         }
-        let mut syms = self
-            .symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *syms.entry(query.to_string()).or_insert(0) += 1;
-        if !is_symbol_kind {
+        if !is_symbol_kind || !crate::search::grok::can_resolve(query) {
             return;
         }
         let mut candidates = self
@@ -993,5 +992,15 @@ mod tests {
         session.record_search("foo", false);
         session.record_search("foo", false);
         assert!(session.summary().contains("foo (2)"));
+    }
+
+    #[test]
+    fn non_resolvable_query_still_counts_toward_reporting() {
+        // Reporting reflects what was actually searched — a query grok could
+        // never resolve still lands in summary()'s "Top queries".
+        let session = Session::new();
+        session.record_search("TODO: fix", true);
+        session.record_search("TODO: fix", true);
+        assert!(session.summary().contains("TODO: fix (2)"));
     }
 }
