@@ -94,6 +94,9 @@ twox-hash = "2.1.2"
 diffy = "0.5.0"
 clru = "0.6.3"
 
+# Embedded key-value store for the persistent deps index
+redb = "4.1.0"
+
 # Low-level system constants — only used cfg(unix) to pass O_NOFOLLOW to the
 # overwrite open() so a symlink at the target cannot escape the scope guard.
 [target.'cfg(unix)'.dependencies]

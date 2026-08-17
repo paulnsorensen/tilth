@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+use crate::mcp::SearchSurface;
+
+pub(in crate::mcp) fn tool_definitions(edit_mode: bool, surface: SearchSurface) -> Vec<Value> {
     let read_desc = include_str!("../../../prompts/tools/read.md");
     let cwd_prop = cwd_property();
     let mut tools = vec![
@@ -235,6 +237,15 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
     ];
 
+    if surface == SearchSurface::V2 {
+        tools.retain(|t| {
+            !matches!(
+                t["name"].as_str(),
+                Some("tilth_search" | "tilth_grok" | "tilth_deps")
+            )
+        });
+    }
+
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
@@ -289,6 +300,38 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }));
     }
 
+    if surface != SearchSurface::V1 {
+        tools.push(serde_json::json!({
+            "name": "tilth_search_v2",
+            "annotations": { "readOnlyHint": true },
+            "description": "Trial cold-partial search-v2 engine: deterministic query routing (path -> regex -> symbol -> literal) with bounded dependency-impact enrichment on unique hits. Batch example: tilth_search_v2(queries: [{query: \"foo\"}, {query: \"bar\", glob: \"*.rs\"}], cwd: \"/abs/repo\").",
+            "inputSchema": {
+                "type": "object",
+                "required": ["queries", "cwd"],
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["query"],
+                            "properties": {
+                                "query": { "type": "string", "description": "Symbol, text, or regex." },
+                                "glob": { "type": "string", "description": "Glob filter for this query." }
+                            }
+                        },
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "description": "Required batch of 1-10 {query, glob?} objects."
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max response tokens."
+                    },
+                    "cwd": cwd_prop.clone()
+                }
+            }
+        }));
+    }
     tools
 }
 
@@ -304,7 +347,7 @@ mod tests {
 
     #[test]
     fn tilth_write_surface_teaches_replace_text_first() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -337,7 +380,7 @@ mod tests {
 
     #[test]
     fn tilth_write_schema_requires_edits_array_of_sections() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -403,7 +446,7 @@ mod tests {
     /// required field is rejected at the schema layer before any file work.
     #[test]
     fn tilth_write_schema_validates_ops_and_rejects_bad_op() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -479,7 +522,7 @@ mod tests {
     /// rejected client-side.
     #[test]
     fn tilth_search_schema_matches_runtime_kind_and_requires_a_query() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, SearchSurface::V1);
         let search = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_search"))
@@ -545,7 +588,7 @@ mod tests {
     fn tool_schemas_are_openai_strict_compatible() {
         const FORBIDDEN_TOP_LEVEL: [&str; 5] = ["oneOf", "anyOf", "allOf", "enum", "not"];
         // edit_mode=true advertises the widest tool set (includes tilth_write).
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions(true, SearchSurface::V1) {
             let name = tool["name"].as_str().expect("tool name present");
             let schema = &tool["inputSchema"];
             assert_eq!(
@@ -569,7 +612,7 @@ mod tests {
     #[test]
     fn tilth_files_is_not_advertised() {
         for edit_mode in [false, true] {
-            let defs = tool_definitions(edit_mode);
+            let defs = tool_definitions(edit_mode, SearchSurface::V1);
             let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
             assert!(
                 !names.contains(&"tilth_files"),
@@ -588,7 +631,7 @@ mod tests {
     #[test]
     fn tool_names_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions(true, SearchSurface::V1) {
             let name = tool["name"]
                 .as_str()
                 .expect("tool name present")
@@ -605,7 +648,7 @@ mod tests {
     /// (`tilth_diff` included) take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         assert_eq!(tools.len(), 7, "edit mode advertises 7 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
@@ -647,7 +690,7 @@ mod tests {
     /// while present arrays retain glob-tree behavior and validation.
     #[test]
     fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, SearchSurface::V1);
         let list = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_list"))
@@ -700,7 +743,7 @@ mod tests {
     #[test]
     fn tool_descriptions_fit_2kb() {
         for edit_mode in [false, true] {
-            for tool in tool_definitions(edit_mode) {
+            for tool in tool_definitions(edit_mode, SearchSurface::V1) {
                 let name = tool["name"].as_str().expect("tool name present");
                 let desc = tool["description"].as_str().expect("description present");
                 assert!(
@@ -714,7 +757,7 @@ mod tests {
 
     #[test]
     fn tilth_write_schema_includes_replace_text_branch() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -733,7 +776,7 @@ mod tests {
     }
     #[test]
     fn tilth_write_schema_replace_text_old_requires_min_length() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -753,7 +796,7 @@ mod tests {
     }
     #[test]
     fn tilth_write_schema_includes_create_file_branch() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, SearchSurface::V1);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
