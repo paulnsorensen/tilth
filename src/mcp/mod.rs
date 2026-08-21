@@ -352,6 +352,19 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
+/// Build the error for an unrecognized tool name, adding a "did you mean"
+/// hint for names agents commonly confuse for a real verb. Genuinely unknown
+/// names keep the plain `unknown tool: X` message.
+fn unknown_tool_error(tool: &str) -> String {
+    match tool {
+        "tilth_files" => "unknown tool 'tilth_files' — did you mean 'tilth_list' \
+            (directory listing) or 'tilth_read' (file contents)?"
+            .to_string(),
+        "tilth_edit" => "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string(),
+        _ => format!("unknown tool: {tool}"),
+    }
+}
+
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
     // Budget validation only applies to tools that honour the budget param.
@@ -389,7 +402,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         "tilth_search_v2" if surface != SearchSurface::V1 => dispatch_search_v2(args, services),
-        _ => Err(format!("unknown tool: {tool}")),
+        _ => Err(unknown_tool_error(tool)),
     };
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
@@ -581,6 +594,28 @@ mod tests {
             !second.ends_with(&format!("\n\n\n{tip}")),
             "double blank line before tip: {second:?}"
         );
+    }
+
+    #[test]
+    fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
+        let services = Services::new(true, SearchSurface::V1);
+        let args = serde_json::json!({ "cwd": "/" });
+
+        let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
+        assert!(
+            files_err.contains("did you mean 'tilth_list'") && files_err.contains("'tilth_read'"),
+            "tilth_files must suggest tilth_list/tilth_read: {files_err}"
+        );
+
+        let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
+        assert!(
+            edit_err.contains("did you mean 'tilth_write'"),
+            "tilth_edit must suggest tilth_write: {edit_err}"
+        );
+
+        // Genuinely unknown names keep the plain message — no suggestion.
+        let other_err = dispatch_tool("tilth_bogus", &args, &services).unwrap_err();
+        assert_eq!(other_err, "unknown tool: tilth_bogus");
     }
 
     #[test]
