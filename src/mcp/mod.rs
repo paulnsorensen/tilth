@@ -104,6 +104,11 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
 
+/// Trial-routing note appended on non-`v1` search surfaces so the
+/// instructions actually teach `tilth_search_v2` instead of silently routing
+/// find/explore to the v1 tools that a `v2`-only surface never advertises.
+const V2_SURFACE_NOTE: &str = include_str!("../../prompts/mcp-v2-note.md");
+
 /// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md. Exact
 /// substring of both files, guarded by `cwd_guidance_spans_present` so an edit
 /// that drops or reworks the explicit-cwd directive fails the test rather than
@@ -113,14 +118,20 @@ const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout
 
 /// Select and return the complete MCP `instructions` string for the given
 /// mode: the standalone base file, or the standalone edit-mode file — never
-/// both.
-fn build_instructions(edit_mode: bool) -> String {
+/// both. On any non-`v1` surface, appends the trial-routing note so the
+/// instructions teach `tilth_search_v2`; `v1` output stays byte-identical.
+fn build_instructions(edit_mode: bool, surface: SearchSurface) -> String {
     let source = if edit_mode {
         EDIT_MODE_INSTRUCTIONS
     } else {
         SERVER_INSTRUCTIONS
     };
-    source.trim_end().to_string()
+    let mut instructions = source.trim_end().to_string();
+    if surface != SearchSurface::V1 {
+        instructions.push_str("\n\n");
+        instructions.push_str(V2_SURFACE_NOTE.trim_end());
+    }
+    instructions
 }
 
 /// Change the process working directory, logging failures to stderr.
@@ -281,7 +292,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let instructions = build_instructions(edit_mode);
+            let instructions = build_instructions(edit_mode, services.surface());
             let client_name = req
                 .params
                 .get("clientInfo")
@@ -951,8 +962,8 @@ mod tests {
     fn build_instructions_selects_one_complete_file_per_mode() {
         // build_instructions selects exactly one standalone file — never both,
         // never concatenated.
-        let base = build_instructions(false);
-        let edit = build_instructions(true);
+        let base = build_instructions(false, SearchSurface::V1);
+        let edit = build_instructions(true, SearchSurface::V1);
         assert_eq!(base, SERVER_INSTRUCTIONS.trim_end());
         assert_eq!(edit, EDIT_MODE_INSTRUCTIONS.trim_end());
         assert!(
@@ -1980,11 +1991,59 @@ mod tests {
     #[test]
     fn build_instructions_no_trailing_whitespace() {
         for &edit in &[false, true] {
-            let s = build_instructions(edit);
-            assert!(
-                !s.ends_with('\n') && !s.ends_with(' '),
-                "wire output must not end with whitespace (edit={edit})"
+            for &surface in &[SearchSurface::V1, SearchSurface::V2, SearchSurface::Both] {
+                let s = build_instructions(edit, surface);
+                assert!(
+                    !s.ends_with('\n') && !s.ends_with(' '),
+                    "wire output must not end with whitespace (edit={edit}, surface={surface:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_instructions_v1_surface_unchanged() {
+        for &edit in &[false, true] {
+            let expected = build_instructions(edit, SearchSurface::V1);
+            assert_eq!(
+                expected,
+                if edit {
+                    EDIT_MODE_INSTRUCTIONS.trim_end().to_string()
+                } else {
+                    SERVER_INSTRUCTIONS.trim_end().to_string()
+                },
+                "v1 surface must stay byte-identical to the standalone prompt file (edit={edit})"
             );
+            assert!(
+                !expected.contains("tilth_search_v2"),
+                "v1 surface must not mention tilth_search_v2 (edit={edit})"
+            );
+        }
+    }
+
+    #[test]
+    fn build_instructions_trial_surfaces_append_v2_note() {
+        for &edit in &[false, true] {
+            let base = if edit {
+                EDIT_MODE_INSTRUCTIONS.trim_end()
+            } else {
+                SERVER_INSTRUCTIONS.trim_end()
+            };
+            for &surface in &[SearchSurface::Both, SearchSurface::V2] {
+                let s = build_instructions(edit, surface);
+                assert!(
+                    s.starts_with(base.lines().next().unwrap()),
+                    "trial surface must still open with the base file's first line (edit={edit}, surface={surface:?})"
+                );
+                assert!(
+                    s.ends_with(V2_SURFACE_NOTE.trim_end()),
+                    "trial surface must end with the v2 note (edit={edit}, surface={surface:?})"
+                );
+                assert!(
+                    !s.contains("\n\n\n"),
+                    "no triple newline at the note seam (edit={edit}, surface={surface:?})"
+                );
+            }
         }
     }
 
@@ -2017,7 +2076,7 @@ mod tests {
             "tilth_diff",
         ];
         for &edit in &[false, true] {
-            let s = build_instructions(edit);
+            let s = build_instructions(edit, SearchSurface::V1);
             assert!(
                 s.len() <= 2048,
                 "instructions (edit={edit}) must fit the 2KB field: {} bytes",
