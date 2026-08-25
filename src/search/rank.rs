@@ -68,6 +68,22 @@ fn score(
     pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
     now: SystemTime,
 ) -> i32 {
+    score_without_recency(m, query, scope, ctx_parent, ctx_pkg_root, pkg_cache)
+        + recency(m.mtime, now) as i32
+}
+
+/// `score` minus the recency term. Used by `Scorer::selection_score` to decide what
+/// bounded retention keeps — see `search::retain`'s `MAX_RETAINED` doc for why recency
+/// is excluded: it depends on when a candidate was scored during the walk, and a
+/// retention decision must not depend on that.
+fn score_without_recency(
+    m: &Match,
+    query: &str,
+    scope: &Path,
+    ctx_parent: Option<&Path>,
+    ctx_pkg_root: Option<&PathBuf>,
+    pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> i32 {
     let mut s = 0i32;
 
     if m.is_definition {
@@ -81,7 +97,6 @@ fn score(
     s += query_intent_boost(m, query);
     s += multi_word_boost(m, query);
     s += scope_proximity(&m.path, scope) as i32;
-    s += recency(m.mtime, now) as i32;
 
     if m.file_lines > 0 && m.file_lines < 200 {
         s += 50;
@@ -108,6 +123,46 @@ fn score(
     }
 
     s
+}
+
+/// Per-walk-thread scorer for bounded retention (`search::retain::BoundedRetain`).
+///
+/// Caches `context`'s package root and a per-path package-root lookup cache across every
+/// candidate a thread scores, mirroring what `sort`'s batch prelude does for a whole slice.
+/// `selection_score` omits recency by construction — see `score_without_recency`.
+pub(crate) struct Scorer<'a> {
+    query: &'a str,
+    scope: &'a Path,
+    ctx_parent: Option<&'a Path>,
+    ctx_pkg_root: Option<PathBuf>,
+    pkg_cache: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl<'a> Scorer<'a> {
+    pub(crate) fn new(query: &'a str, scope: &'a Path, context: Option<&'a Path>) -> Self {
+        let ctx_parent = context.and_then(Path::parent);
+        let ctx_pkg_root = context
+            .and_then(crate::lang::package_root)
+            .map(Path::to_path_buf);
+        Self {
+            query,
+            scope,
+            ctx_parent,
+            ctx_pkg_root,
+            pkg_cache: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn selection_score(&mut self, m: &Match) -> i32 {
+        score_without_recency(
+            m,
+            self.query,
+            self.scope,
+            self.ctx_parent,
+            self.ctx_pkg_root.as_ref(),
+            &mut self.pkg_cache,
+        )
+    }
 }
 
 /// Boost matches whose file stem matches the query.

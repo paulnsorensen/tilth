@@ -1362,6 +1362,7 @@ dependencies = [
  "diffy",
  "fastbloom",
  "globset",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "home",
