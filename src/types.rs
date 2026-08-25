@@ -134,6 +134,11 @@ pub struct Match {
 pub struct SearchResult {
     pub query: String,
     pub scope: PathBuf,
+    /// The directory actually walked. Equals `scope` for a directory scope;
+    /// for a file scope this is the file's parent (the walk root), while
+    /// `scope` stays the file itself so a basename-outline fallback never
+    /// surfaces a sibling file.
+    pub walk_root: PathBuf,
     pub matches: Vec<Match>,
     pub total_found: usize,
     pub definitions: usize,

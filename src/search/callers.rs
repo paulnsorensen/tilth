@@ -307,6 +307,7 @@ pub fn search_callers_expanded(
     } else {
         (MAX_MATCHES, BATCH_EARLY_QUIT)
     };
+    let base = crate::search::scope_base(scope);
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
     let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
@@ -318,7 +319,7 @@ pub fn search_callers_expanded(
 
     // Sort by relevance (context file first, then by proximity)
     let mut sorted_callers = callers;
-    rank_callers(&mut sorted_callers, scope, context);
+    rank_callers(&mut sorted_callers, base, context);
 
     let total = sorted_callers.len();
 
@@ -332,12 +333,21 @@ pub fn search_callers_expanded(
     sorted_callers.truncate(max_matches);
 
     let mut output = String::new();
-    write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
+    write_caller_bucket(
+        &mut output,
+        target,
+        scope,
+        base,
+        total,
+        &sorted_callers,
+        expand,
+    );
     write_second_hop_impact(
         &mut output,
         &all_caller_names,
         &sorted_callers,
         scope,
+        base,
         bloom,
         glob,
         batch_quit,
@@ -364,6 +374,7 @@ fn write_caller_bucket(
     output: &mut String,
     target: &str,
     scope: &Path,
+    base: &Path,
     total: usize,
     sorted_callers: &[CallerMatch],
     expand: usize,
@@ -384,7 +395,7 @@ fn write_caller_bucket(
             "\n## {}:{} [caller: {}]\n",
             caller
                 .path
-                .strip_prefix(scope)
+                .strip_prefix(base)
                 .unwrap_or(&caller.path)
                 .display(),
             caller.line,
@@ -434,6 +445,7 @@ fn write_second_hop_impact(
     all_caller_names: &HashSet<String>,
     sorted_callers: &[CallerMatch],
     scope: &Path,
+    base: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
     batch_quit: usize,
@@ -473,7 +485,7 @@ fn write_second_hop_impact(
             break;
         }
 
-        let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
+        let rel_path = m.path.strip_prefix(base).unwrap_or(&m.path).display();
         let _ = writeln!(
             output,
             "  {:<20} {}:{}  -> {}",
@@ -545,6 +557,7 @@ pub fn search_callers_multi_expanded(
     // later targets.
     let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
 
+    let base = crate::search::scope_base(scope);
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
     let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
 
@@ -567,7 +580,7 @@ pub fn search_callers_multi_expanded(
             continue;
         }
 
-        rank_callers(&mut callers, scope, context);
+        rank_callers(&mut callers, base, context);
         let total = callers.len();
 
         // Unique direct-caller names BEFORE truncation, same as the
@@ -581,12 +594,13 @@ pub fn search_callers_multi_expanded(
 
         callers.truncate(max_matches);
 
-        write_caller_bucket(&mut output, target, scope, total, &callers, expand);
+        write_caller_bucket(&mut output, target, scope, base, total, &callers, expand);
         write_second_hop_impact(
             &mut output,
             &all_caller_names,
             &callers,
             scope,
+            base,
             bloom,
             glob,
             batch_quit,

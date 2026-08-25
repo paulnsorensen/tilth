@@ -57,6 +57,7 @@ pub fn analyze_deps(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Result<DepsResult, TilthError> {
+    let scope = crate::search::scope_base(scope);
     // Canonicalize for reliable path comparison (callers return absolute paths).
     let path = &path.canonicalize().map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),

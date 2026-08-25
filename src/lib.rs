@@ -209,7 +209,7 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
         search::grok::GrokCaps::default()
     };
     let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
-    Ok(search::grok::format_grok(&result, scope))
+    Ok(search::grok::format_grok(&result))
 }
 
 fn run_inner(
@@ -588,6 +588,40 @@ mod fuzzy_search_tests {
         assert!(
             matches!(err, error::TilthError::NotFound { .. }),
             "expected NotFound, got: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scope_file_path_tests {
+    use super::*;
+
+    /// Public API (CLI-level): a file-scope search is confined to that file —
+    /// a sibling file's call site to the same target must not appear.
+    #[test]
+    fn run_with_a_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "fn alpha() {}\nfn uses_alpha() { alpha(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sibling.rs"),
+            "fn uses_alpha_sibling() { alpha(); }\n",
+        )
+        .unwrap();
+
+        let scope = tmp.path().join("target.rs");
+        let out = run_callers("alpha", &scope, 2, None, None, false).unwrap();
+
+        assert!(
+            out.contains("uses_alpha"),
+            "expected the scoped file's call site: {out}"
+        );
+        assert!(
+            !out.contains("uses_alpha_sibling"),
+            "file scope must not surface a sibling file's call site: {out}"
         );
     }
 }

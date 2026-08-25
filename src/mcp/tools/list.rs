@@ -13,7 +13,8 @@ const PATTERNS_SHAPE: &str = "\"patterns\" must be an array of glob strings; pas
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
     let cwd = super::require_cwd(args)?;
-    let (scope, scope_warning) = super::resolve_scope(args, cwd)?;
+    let scope = super::resolve_scope(args, cwd)?;
+    let scope = crate::search::scope_base(&scope);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns: Vec<String> = match args.get("patterns") {
@@ -21,7 +22,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
             // `scope` is an advertised parameter and is honored on the pattern
             // branch; fingerprinting `cwd` here would silently widen a scoped
             // request to the whole checkout.
-            let overview = crate::overview::fingerprint(&scope);
+            let overview = crate::overview::fingerprint(scope);
             // fingerprint() is contractually fail-silent (it catch_unwinds to
             // an empty string) because it began life as a cosmetic initialize
             // banner. As a whole tool response that inverts tool_list's own
@@ -33,9 +34,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
                     scope.display()
                 ));
             }
-            let mut result = scope_warning.unwrap_or_default();
-            result.push_str(&overview);
-            return Ok(super::apply_budget(&result, budget));
+            return Ok(super::apply_budget(&overview, budget));
         }
         Some(value) => {
             let Some(arr) = value.as_array() else {
@@ -76,7 +75,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
 
     let mut entries: Vec<(PathBuf, u64)> = Vec::new();
     let mut extensions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut builder = ignore::WalkBuilder::new(&scope);
+    let mut builder = ignore::WalkBuilder::new(scope);
     builder
         .follow_links(true)
         .hidden(false)
@@ -107,7 +106,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         }
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let rel = path.strip_prefix(&scope).unwrap_or(path);
+        let rel = path.strip_prefix(scope).unwrap_or(path);
         let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
         if matched {
             let bytes = entry.metadata().map_or(0, |m| m.len());
@@ -117,9 +116,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         }
     }
 
-    let tree = crate::mcp::tree::render_tree(&scope, &entries);
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&tree);
+    let mut result = crate::mcp::tree::render_tree(scope, &entries);
     if entries.is_empty() {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
@@ -290,10 +287,9 @@ mod tests {
         );
     }
 
-    /// A bad scope produces a warning on the pattern branch; the overview
-    /// branch must surface it too rather than dropping it.
+    /// A missing scope is refused, not widened to cwd, on the overview branch too.
     #[test]
-    fn omitted_patterns_surfaces_scope_warning() {
+    fn omitted_patterns_refuses_missing_scope() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -303,15 +299,11 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
 
-        let out = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" }))
-            .expect("missing scope falls back with a warning");
-        let bare = tool_list(&serde_json::json!({ "cwd": cwd })).expect("bare overview");
-        assert_eq!(
-            out,
-            format!(
-                "scope \"does/not/exist\" is not a valid directory, searching the cwd/checkout directory instead.\n\n{bare}"
-            ),
-            "warning must name the bad scope and be prepended to the overview, got: {out}"
+        let err =
+            tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" })).unwrap_err();
+        assert!(
+            err.contains("does/not/exist") && err.contains("does not exist"),
+            "refusal must name the bad scope: {err}"
         );
     }
 
