@@ -569,6 +569,9 @@ pub struct TestMatch {
 /// formatter can render "shown N of M" headings.
 #[derive(Debug)]
 pub struct GrokResult {
+    /// The directory results render against. Collapsed from a file scope
+    /// once, inside `grok()`, so `format_grok` never needs its own scope arg.
+    pub scope: PathBuf,
     pub target: ResolvedTarget,
     /// The target's own source body, sliced from the file. Empty when the
     /// body span is degenerate (`start_line > end_line`) or when the target
@@ -605,6 +608,7 @@ pub fn grok(
     session: &crate::session::Session,
     caps: GrokCaps,
 ) -> Result<GrokResult, TilthError> {
+    let scope = crate::search::scope_base(scope);
     let (target, content, lang) = resolve_with_source(target_spec, scope)?;
     let entries = get_outline_entries(&content, lang);
     let body = body_with_dedup(&target, &content, session, caps.max_body_lines);
@@ -754,6 +758,7 @@ pub fn grok(
     };
 
     Ok(GrokResult {
+        scope: scope.to_path_buf(),
         target,
         body,
         callees_internal,
@@ -871,7 +876,8 @@ fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -
 /// Sections are skipped when empty. Pre-truncation totals are surfaced in the
 /// section heading when capping happened (e.g. `## callers (5 of 23)`).
 #[must_use]
-pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
+pub fn format_grok(result: &GrokResult) -> String {
+    let scope = result.scope.as_path();
     let mut out = String::new();
     let target_rel = display_rel(&result.target.path, scope);
 
@@ -2155,7 +2161,7 @@ pub fn target() {
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
         let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
 
         assert!(
             rendered.starts_with("# grok: target [src/lib.rs:"),
@@ -2184,6 +2190,7 @@ pub fn target() {
             other_def_count: 3,
         };
         let result = GrokResult {
+            scope: PathBuf::from("."),
             target,
             body: String::new(),
             callees_internal: Vec::new(),
@@ -2198,7 +2205,7 @@ pub fn target() {
             total_tests: 0,
             delegate_body: None,
         };
-        let out = format_grok(&result, Path::new("."));
+        let out = format_grok(&result);
         assert!(out.contains("ambiguous: 3 other definitions match"));
     }
 
@@ -2216,6 +2223,7 @@ pub fn target() {
         };
         // Manually construct a result where callers count > total displayed.
         let result = GrokResult {
+            scope: PathBuf::from("."),
             target,
             body: String::new(),
             callees_internal: Vec::new(),
@@ -2236,7 +2244,7 @@ pub fn target() {
             total_tests: 0,
             delegate_body: None,
         };
-        let out = format_grok(&result, Path::new("."));
+        let out = format_grok(&result);
         assert!(out.contains("... and 16 more"));
     }
 
@@ -2313,7 +2321,7 @@ pub fn target_fn() -> u32 {
             "body should contain target source, got {:?}",
             result.body
         );
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
         assert!(
             rendered.contains("## body"),
             "format must surface body section"
@@ -2459,7 +2467,7 @@ pub fn caller_b() { target(); }
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
         let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
 
         // File header appears once, then per-site lines are indented.
         let callers_block = rendered
@@ -2505,7 +2513,7 @@ pub fn target_fn() {
             GrokCaps::default(),
         )
         .unwrap();
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
 
         let callees_block = rendered
             .split("## callees")
@@ -2602,7 +2610,7 @@ pub fn wrapper(x: u32) -> u32 {
         );
 
         // format_grok must emit a `## delegate body` section between body and callees.
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
         assert!(
             rendered.contains("## delegate body"),
             "formatted output must contain delegate body heading, got: {rendered}"
@@ -2642,7 +2650,7 @@ pub fn wrapper(x: u32) -> u32 {
             result.delegate_body.is_none(),
             "large-body function must not produce delegate_body"
         );
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
         assert!(
             !rendered.contains("## delegate body"),
             "large-body function must not render delegate body section"
@@ -2669,7 +2677,7 @@ pub fn multi(x: u32) -> u32 {
             result.delegate_body.is_none(),
             "multi-callee function must not produce delegate_body"
         );
-        let rendered = format_grok(&result, tmp.path());
+        let rendered = format_grok(&result);
         assert!(
             !rendered.contains("## delegate body"),
             "multi-callee function must not render delegate body section"

@@ -43,6 +43,7 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-md = "0.5"
 
 # Search (ripgrep internals)
+grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"

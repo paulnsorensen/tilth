@@ -163,6 +163,13 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     let new_tag = session.record_snapshot(path, &new_text, 1..=line_count);
 
     let mut block = format!("## {}\napplied", path.display());
+    if let Some(report) = crate::edit::parse_check::check(path, &live, &new_text) {
+        let _ = write!(
+            block,
+            "\n{}",
+            crate::edit::parse_check::format_report(&report)
+        );
+    }
     match new_tag {
         Some(tag) => {
             let header = format_header(&path.display().to_string(), tag);
@@ -1919,6 +1926,79 @@ mod tests {
         assert!(
             !p.exists(),
             "two create_file ops in one section must not create the file"
+        );
+    }
+
+    #[test]
+    fn parse_check_surfaces_new_error_on_broken_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("broken.rs");
+        std::fs::write(&p, "fn a() { 1 }\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([
+            { "op": "replace_text", "old": "fn a() { 1 }", "new": "fn a() { 1" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "expected a parse warning block, got:\n{out}"
+        );
+        assert!(
+            out.contains("ERROR") || out.contains("MISSING"),
+            "expected an ERROR/MISSING entry, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn parse_check_stays_silent_on_already_broken_file_with_no_new_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("already_broken.rs");
+        std::fs::write(&p, "fn a() { 1\nfn b() { 2 }\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([
+            { "op": "replace_text", "old": "fn b() { 2 }", "new": "fn b() { 22 }" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "pre-existing error must not surface as new, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn parse_check_skipped_on_file_with_no_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("notes.txt");
+        std::fs::write(&p, "hello\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([
+            { "op": "replace_text", "old": "hello", "new": "hello (((" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "non-grammar file must not run the parse check, got:\n{out}"
         );
     }
 }

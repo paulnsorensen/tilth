@@ -108,7 +108,7 @@ fn collect_candidates_capped(
     let candidates = Mutex::new(HashSet::new());
     let code_files_attempted = AtomicUsize::new(0);
 
-    walker.run(|| {
+    crate::search::run_walk(walker, || {
         let candidates = &candidates;
         let code_files_attempted = &code_files_attempted;
         Box::new(move |entry| {

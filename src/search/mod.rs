@@ -8,6 +8,7 @@ mod fuzzy_symbol;
 pub mod glob;
 pub mod grok;
 pub mod rank;
+mod retain;
 pub mod siblings;
 pub mod strip;
 pub mod symbol;
@@ -103,6 +104,17 @@ pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// are found. Used by both the parallel search walker (`walker()`) and the
 /// sequential map walker (`crate::map::generate`), which each apply their own
 /// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+/// Resolves a scope to a directory for walker/matcher construction: a file
+/// scope collapses to its parent directory (directory-only walkers/overrides
+/// have no single-file meaning); a directory scope passes through unchanged.
+pub(crate) fn scope_base(scope: &Path) -> &Path {
+    if scope.is_file() {
+        scope.parent().unwrap_or(scope)
+    } else {
+        scope
+    }
+}
+
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder
@@ -144,7 +156,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            let mut overrides = ignore::overrides::OverrideBuilder::new(scope_base(scope));
             overrides
                 .add(pattern)
                 .map_err(|e| TilthError::InvalidQuery {
@@ -161,10 +173,62 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     Ok(builder.build_parallel())
 }
 
+/// Run a parallel walk, quitting early if the request that built it has been abandoned.
+///
+/// All search walks go through here rather than calling `WalkParallel::run` directly, so the
+/// cancellation and walk-budget checks have one home instead of many. This closure's
+/// `cancel.is_cancelled()` check is the walk's single cancellation seam — `base_walk_builder`'s
+/// `filter_entry` does not duplicate it. One [`crate::walkbudget::begin_walk`] window is opened
+/// per call and shared across this walk's worker threads via `Arc`, so this walk is charged
+/// against the ceiling independently of any other walk the same request runs — see
+/// `walkbudget`'s module docs.
+pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, factory: F)
+where
+    F: FnMut() -> Box<
+        dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
+    >,
+{
+    run_walk_with(crate::cancel::current(), walker, factory);
+}
+
+/// `run_walk` with an explicitly captured cancel token. A walk that runs on a
+/// rayon pool thread (see `symbol::search`) must capture the token on the
+/// request thread and pass it here: `cancel::current()` is thread-ambient, and
+/// a pool thread is not the request thread (under test it cannot even see the
+/// published token).
+pub(crate) fn run_walk_with<'a, F>(
+    cancel: crate::cancel::CancelToken,
+    walker: ignore::WalkParallel,
+    mut factory: F,
+) where
+    F: FnMut() -> Box<
+        dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
+    >,
+{
+    let window = std::sync::Arc::new(crate::walkbudget::begin_walk());
+    walker.run(move || {
+        let cancel = cancel.clone();
+        let window = window.clone();
+        let mut inner = factory();
+        Box::new(move |entry| {
+            if cancel.is_cancelled() {
+                return ignore::WalkState::Quit;
+            }
+            if let Ok(e) = &entry {
+                if crate::walkbudget::note_walk_visit(&window, e.path()) {
+                    return ignore::WalkState::Quit;
+                }
+            }
+            inner(entry)
+        })
+    });
+}
+
 /// Upper bound on file size searched by content/regex walkers. Files larger
 /// than this skip on stat alone. Shared so `content::search` and
-/// `count_files_for_empty` stay aligned.
-pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+/// `count_files_for_empty` stay aligned, and with `parse_budget::MAX_PARSE_FILE_SIZE`
+/// (raised from 500 000 to 1 MB) so the symbol walk's own gate moves with it.
+pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = crate::lang::parse_budget::MAX_PARSE_FILE_SIZE;
 
 /// Shared file-walk entry filter for the content and symbol search walkers:
 /// unwraps the walker result, keeps only files, skips filenames that look
@@ -242,7 +306,7 @@ fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
     let files_matched_glob = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
 
-    walker.run(|| {
+    run_walk(walker, || {
         let files_matched_glob = &files_matched_glob;
         let files_searched = &files_searched;
         Box::new(move |entry| {
@@ -377,7 +441,7 @@ pub fn search_multi_symbol_expanded(
         }
         let mut out = format::search_header(
             &result.query,
-            &result.scope,
+            &result.walk_root,
             result.matches.len(),
             result.definitions,
             result.usages,
@@ -582,6 +646,7 @@ pub fn format_raw_result(
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
+    let scope = scope_base(scope);
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
 }
@@ -1244,6 +1309,7 @@ fn basename_file_outline(
     query: &str,
     matches: &[Match],
     scope: &Path,
+    walk_root: &Path,
     cache: &OutlineCache,
 ) -> Option<String> {
     let query_lower = query.to_ascii_lowercase();
@@ -1255,7 +1321,7 @@ fn basename_file_outline(
 
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
-        .or_else(|| find_basename_fallback(scope, &query_lower))?;
+        .or_else(|| find_basename_fallback(walk_root, &query_lower))?;
     if path_is_secret_file(&matched_path) {
         return None;
     }
@@ -1313,7 +1379,7 @@ fn format_search_result(
     }
     let header = format::search_header(
         &result.query,
-        &result.scope,
+        &result.walk_root,
         result.matches.len(),
         result.definitions,
         result.usages,
@@ -1325,9 +1391,13 @@ fn format_search_result(
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
-    if let Some(file_outline) =
-        basename_file_outline(&result.query, &result.matches, &result.scope, cache)
-    {
+    if let Some(file_outline) = basename_file_outline(
+        &result.query,
+        &result.matches,
+        &result.scope,
+        &result.walk_root,
+        cache,
+    ) {
         let _ = write!(out, "\n\n{file_outline}");
     }
 
@@ -1651,7 +1721,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {

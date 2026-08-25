@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::accept_walk_entry;
@@ -16,24 +15,20 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
+use crate::search::retain::{BoundedRetain, MAX_RETAINED};
 use crate::types::{FacetTotals, FileType, Match, SearchResult};
+// `Matcher` is only in scope for `is_match` on a single definition line, to count the exact
+// def/usage overlap in `find_definitions` — see its doc comment.
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw definition matches.
-const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
-/// Stop walking once we have this many raw usage matches.
-const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Match-count cap when `--full` is set. Generous but bounded so a `tilth
 /// foo --full` on a huge repo can't blow up output.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
-const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -49,10 +44,10 @@ fn stratum_for_display(m: &Match) -> u8 {
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
 ///
-/// `full` controls the truncation cap and walker early-quit thresholds:
-/// `false` (default) uses the tight defaults that keep agent token budgets
-/// in check; `true` raises both caps so interactive `--full` callers see
-/// every match instead of "... and N more matches."
+/// `full` controls the truncation cap: `false` (default) uses the tight default that keeps
+/// agent token budgets in check; `true` raises it so interactive `--full` callers see every
+/// match instead of "... and N more matches." Both walks always run to completion — see
+/// `search::retain` for why a shared early-quit counter was removed.
 pub fn search(
     query: &str,
     scope: &Path,
@@ -60,19 +55,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
-    } else {
-        (
-            MAX_MATCHES,
-            EARLY_QUIT_THRESHOLD_DEFINITIONS,
-            EARLY_QUIT_THRESHOLD_USAGES,
-        )
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -81,16 +64,38 @@ pub fn search(
         reason: e.to_string(),
     })?;
 
+    let base = crate::search::scope_base(scope);
+
+    // Both walks share the one compiled `\bquery\b`: the usage walk to find usages, the
+    // definition walk to count how many of its definition lines that same pattern also
+    // matches — see `find_definitions`'s doc comment.
+    // Capture the cancel token on this (request) thread: the walks below run on
+    // rayon pool threads, where thread-ambient `cancel::current()` is not this
+    // request's token (and under test is invisible entirely).
+    let cancel = crate::cancel::current();
+
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold),
-        || find_usages(query, &matcher, scope, glob, usage_threshold),
+        || {
+            find_definitions(
+                query,
+                &matcher,
+                scope,
+                glob,
+                context,
+                MAX_RETAINED,
+                base,
+                cancel.clone(),
+            )
+        },
+        || find_usages(query, &matcher, scope, glob, context, cancel.clone()),
     );
 
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, def_offered, overlap_count) = defs?;
+    let (usages, usage_offered) = usages?;
 
-    // Deduplicate: remove usage matches that overlap with definition matches.
-    // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
+    // Deduplicate: remove usage matches that overlap with definition matches. `def_count` is
+    // the retained (bounded) definitions, same as before — this dedup only needs to know which
+    // matches are on-screen candidates, not the exact total.
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
@@ -103,10 +108,19 @@ pub fn search(
         }
     }
 
-    let total = merged.len();
-    let usage_count = total - def_count;
+    // Totals come from what the walks *offered*, not from what retention kept, so a bounded
+    // search never under-reports. `overlap_count` is the exact number of usage lines that
+    // coincide with a definition line, counted during the definition walk before any capping
+    // (donor commit db1d504) — deriving it from the retained sets instead would omit every
+    // collision retention clipped.
+    debug_assert!(
+        overlap_count <= usage_offered,
+        "overlap_count ({overlap_count}) exceeds usage_offered ({usage_offered})"
+    );
+    let usage_count = usage_offered.saturating_sub(overlap_count);
+    let total = def_offered + usage_count;
 
-    rank::sort(&mut merged, query, scope, context);
+    rank::sort(&mut merged, query, base, context);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
@@ -118,11 +132,11 @@ pub fn search(
 
     // Compute per-subfacet totals on the *pre-cap* set so the renderer can
     // print `displayed/total` headings + per-facet hidden-count lines.
-    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
-    // clone is cheap. Faceting is pure / side-effect-free.
+    // `merged` is bounded by retention (`MAX_RETAINED`), so the clone is cheap.
+    // Faceting is pure / side-effect-free.
     let totals = {
         let snapshot = merged.clone();
-        let f = super::facets::facet_matches(snapshot, scope);
+        let f = super::facets::facet_matches(snapshot, base);
         FacetTotals {
             definitions: f.definitions.len(),
             implementations: f.implementations.len(),
@@ -136,10 +150,11 @@ pub fn search(
 
     Ok(SearchResult {
         query: query.to_string(),
-        scope: scope.to_path_buf(),
+        scope: base.to_path_buf(),
+        walk_root: scope.to_path_buf(),
         matches: merged,
         total_found: total,
-        definitions: def_count,
+        definitions: def_offered,
         usages: usage_count,
         facet_totals: totals,
     })
@@ -152,31 +167,41 @@ pub fn search(
 ///
 /// Single-read design: reads each file once, checks for symbol via
 /// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
-/// Early termination: quits the parallel walker once enough defs are found.
+///
+/// The walk completes; it is never cut short on a match count — see `search::retain` for why
+/// a shared early-quit counter was removed. Per-file work is still bounded by the size gate
+/// and the `memmem` needle check below, and what is *retained* is bounded by `MAX_RETAINED`.
+///
+/// `matcher` is the usage walk's `\bquery\b`. It does not decide which definitions are found;
+/// it is used only to count, exactly, how many of a file's definition lines the usage walk
+/// also matches (donor commit db1d504). That overlap is what `search()`'s dedup removes from
+/// the usage count, and counting it here — over the full per-file `file_defs` list, before
+/// retention clips it — is what keeps the count exact regardless of the cap.
+///
+/// Returns `(retained definitions, exact total offered, exact def/usage overlap)`.
+#[allow(clippy::too_many_arguments)] // internal seam; the params are the search request itself
 fn find_definitions(
     query: &str,
+    matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let found_count = AtomicUsize::new(0);
+    context: Option<&Path>,
+    cap: usize,
+    base: &Path,
+    cancel: crate::cancel::CancelToken,
+) -> Result<(Vec<Match>, usize, usize), TilthError> {
+    let sink = BoundedRetain::new(cap);
+    let overlap_count = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+    super::run_walk_with(cancel, walker, || {
+        let sink = &sink;
+        let overlap_count = &overlap_count;
+        let mut scorer = rank::Scorer::new(query, base, context);
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
@@ -249,20 +274,25 @@ fn find_definitions(
             }
 
             if !file_defs.is_empty() {
-                found_count.fetch_add(file_defs.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_defs);
+                let mut seen = std::collections::HashSet::new();
+                file_defs.retain(|d| seen.insert((d.path.clone(), d.line)));
+
+                // Exact overlap over the full per-file list, before retention clips it.
+                let overlap_in_file = file_defs
+                    .iter()
+                    .filter(|d| matcher.is_match(d.text.as_bytes()).unwrap_or(false))
+                    .count();
+                overlap_count.fetch_add(overlap_in_file, Ordering::Relaxed);
+                sink.offer_file(file_defs, &mut scorer);
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    let offered = sink.offered();
+    let overlap = overlap_count.load(Ordering::Relaxed);
+    Ok((sink.into_matches(), offered, overlap))
 }
 
 /// Return every structural definition matching `query`, ranked like display search
@@ -273,8 +303,23 @@ pub(crate) fn all_definitions(
     scope: &Path,
     glob: Option<&str>,
 ) -> Result<Vec<Match>, TilthError> {
-    let mut defs = find_definitions(query, scope, glob, usize::MAX)?;
-    rank::sort(&mut defs, query, scope, None);
+    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
+    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+        query: query.to_string(),
+        reason: e.to_string(),
+    })?;
+    let base = crate::search::scope_base(scope);
+    let (mut defs, _offered, _overlap) = find_definitions(
+        query,
+        &matcher,
+        scope,
+        glob,
+        None,
+        usize::MAX,
+        base,
+        crate::cancel::current(),
+    )?;
+    rank::sort(&mut defs, query, base, None);
     defs.sort_by_key(stratum_for_display);
     Ok(defs)
 }
@@ -290,12 +335,7 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(content, ts_lang) else {
         return Vec::new();
     };
 
@@ -510,30 +550,27 @@ fn find_defs_heuristic_buf(
 
 /// Find all usages via ripgrep (word-boundary matching).
 /// Collects per-file, locks once per file (not per line).
-/// Early termination once enough usages found.
+///
+/// The walk completes; it is never cut short on a match count — see `search::retain`. What is
+/// *retained* is bounded by `MAX_RETAINED`; `find_usages`'s exact total offered is what
+/// `search()` uses for `usages`/`total_found`, not the retained count.
 fn find_usages(
     query: &str,
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
-    let found_count = AtomicUsize::new(0);
+    context: Option<&Path>,
+    cancel: crate::cancel::CancelToken,
+) -> Result<(Vec<Match>, usize), TilthError> {
+    let sink = BoundedRetain::new(MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+    super::run_walk_with(cancel, walker, || {
+        let sink = &sink;
+        let mut scorer = rank::Scorer::new(query, scope, context);
 
         Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
@@ -580,20 +617,15 @@ fn find_usages(
             );
 
             if !file_matches.is_empty() {
-                found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
+                sink.offer_file(file_matches, &mut scorer);
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    let offered = sink.offered();
+    Ok((sink.into_matches(), offered))
 }
 
 /// Markdown heading definition detector.
@@ -1476,6 +1508,42 @@ Body to end.
         assert_eq!(
             result_default.total_found, result_full.total_found,
             "total_found must be the same regardless of full flag"
+        );
+    }
+
+    /// A 1ms-deadline `spawn_with_timeout` wrapping `symbol::search` over a wide tree must
+    /// abandon the walk before it visits every file — the worker's own result, captured
+    /// separately since `spawn_with_timeout` discards it on timeout, must show fewer
+    /// definitions than the tree contains.
+    #[test]
+    fn cancelled_walk_abandons_before_visiting_every_file() {
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _visible = crate::cancel::make_visible_on_this_thread();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path().to_path_buf();
+        const FILES: usize = 300;
+        for i in 0..FILES {
+            let path = scope.join(format!("file_{i:03}.rs"));
+            std::fs::write(&path, "pub fn widget() {}\n").expect("write");
+        }
+
+        // Deterministic: cancel the published request before the walk starts.
+        // The timeout->cancel linkage is pinned separately in `timeout.rs`
+        // (`only_the_expired_request_is_cancelled`); this test pins that a
+        // cancelled token actually cuts a real symbol walk short — the walks
+        // run on rayon pool threads, so the token must be the one `search()`
+        // captured on this thread, not thread-ambient state.
+        let request = crate::cancel::begin_request();
+        request.cancel();
+
+        let result = search("widget", &scope, None, None, false).expect("search");
+        assert_eq!(
+            result.definitions, 0,
+            "a pre-cancelled walk should visit no files, found {} of {FILES}",
+            result.definitions
         );
     }
 }

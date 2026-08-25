@@ -222,7 +222,7 @@ fn unique_hit(
         session,
         crate::search::grok::GrokCaps::default(),
     )?;
-    let core = crate::search::grok::format_grok(&grok_result, cwd);
+    let core = crate::search::grok::format_grok(&grok_result);
 
     let deps_result = crate::search::deps::analyze_deps(target_path, cwd, bloom)?;
     let impact = crate::search::deps::format_deps(&deps_result, cwd, None);

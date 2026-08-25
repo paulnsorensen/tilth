@@ -114,13 +114,13 @@ impl OutlineCache {
     }
 
     /// Parse a code file with tree-sitter and cache the result. Returns
-    /// `None` for non-code files, files larger than the 500 KB cap, or parse
-    /// failures.
+    /// `None` for non-code files, files larger than `parse_budget::MAX_PARSE_FILE_SIZE`
+    /// (1 MB), or parse failures.
     #[must_use]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         let meta = std::fs::metadata(path).ok()?;
         let mtime = meta.modified().ok()?;
-        if meta.len() > 500_000 {
+        if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
             return None;
         }
         let key = path.to_path_buf();

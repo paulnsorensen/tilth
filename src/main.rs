@@ -162,6 +162,10 @@ enum Command {
 
 fn main() {
     configure_thread_pools();
+    // The CLI gets the same walk ceiling the MCP server does. Without this the budget is
+    // inert here — `GLOBAL` starts unlimited and only `reset()` reads `TILTH_MAX_WALK` — so
+    // the trip note would advertise an env var that does nothing on this path.
+    tilth::walkbudget::reset();
     let cli = Cli::parse();
 
     // Shell completions
@@ -421,6 +425,20 @@ fn emit_result(
 
 /// Write output to stdout. When TTY and output is long, pipe through $PAGER.
 fn emit_output(output: &str, is_tty: bool) {
+    // To stderr, not stdout: a truncation warning must not land in a pipeline's data.
+    let truncated = tilth::walkbudget::report();
+    if let Some(note) = &truncated {
+        eprint!("{note}");
+    }
+    // The walk was cut short, so a `# Search:` header's match count is a lower bound,
+    // not an exact total — mark it `~N+` rather than let it read as exact.
+    let rewritten;
+    let output = if truncated.is_some() {
+        rewritten = rewrite_search_header(output);
+        rewritten.as_str()
+    } else {
+        output
+    };
     let line_count = output.lines().count();
     let term_height = terminal_height();
 
@@ -486,6 +504,44 @@ fn configure_thread_pools() {
         .ok();
 }
 
+/// Rewrite a `# Search:` header line's match count to the inexact `~N+` form
+/// (e.g. `42 matches` -> `~42+ matches`). Only the first line is a header line;
+/// the rest of `output` passes through untouched.
+fn rewrite_search_header(output: &str) -> String {
+    let (header, rest) = match output.split_once('\n') {
+        Some((h, r)) => (h, Some(r)),
+        None => (output, None),
+    };
+    if !header.starts_with("# Search:") {
+        return output.to_string();
+    }
+    let header = mark_search_count_inexact(header);
+    match rest {
+        Some(rest) => format!("{header}\n{rest}"),
+        None => header,
+    }
+}
+
+/// Prefix the digit run immediately before " matches" with `~` and suffix it with `+`.
+/// Leaves `line` unchanged if no such digit run is found.
+fn mark_search_count_inexact(line: &str) -> String {
+    let Some(digits_end) = line.find(" matches") else {
+        return line.to_string();
+    };
+    let digits_start = line[..digits_end]
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    if digits_start == digits_end {
+        return line.to_string();
+    }
+    format!(
+        "{}~{}+{}",
+        &line[..digits_start],
+        &line[digits_start..digits_end],
+        &line[digits_end..]
+    )
+}
+
 /// Compute the effective `expand` value for a search query from the raw
 /// CLI flags. Lifted out of `main` so the `--full` / `--expand` precedence
 /// is unit-testable.
@@ -538,6 +594,44 @@ mod tests {
     #[test]
     fn neither_flag_means_zero_expand() {
         assert_eq!(compute_expand(None, false), 0);
+    }
+
+    /// Pin the digit-run rewrite: only the count immediately before " matches"
+    /// gets the `~N+` treatment; unrelated numbers in the line are untouched.
+    #[test]
+    fn mark_search_count_inexact_rewrites_only_the_match_count() {
+        assert_eq!(
+            mark_search_count_inexact(
+                "# Search: \"foo\" in src/ — 42 matches (2 definitions, 40 usages)"
+            ),
+            "# Search: \"foo\" in src/ — ~42+ matches (2 definitions, 40 usages)"
+        );
+    }
+
+    /// A line with no " matches" substring is returned unchanged.
+    #[test]
+    fn mark_search_count_inexact_leaves_non_header_lines_alone() {
+        let line = "some other line with 42 in it";
+        assert_eq!(mark_search_count_inexact(line), line);
+    }
+
+    /// `rewrite_search_header` only touches the first line; the rest of a
+    /// multi-line search result passes through untouched.
+    #[test]
+    fn rewrite_search_header_only_touches_the_header_line() {
+        let output = "# Search: \"foo\" in src/ — 3 matches\n\nsome body with 3 in it\n";
+        let rewritten = rewrite_search_header(output);
+        assert_eq!(
+            rewritten,
+            "# Search: \"foo\" in src/ — ~3+ matches\n\nsome body with 3 in it\n"
+        );
+    }
+
+    /// Output that isn't a search result (no `# Search:` header) is left alone.
+    #[test]
+    fn rewrite_search_header_ignores_non_search_output() {
+        let output = "just some file contents\n";
+        assert_eq!(rewrite_search_header(output), output);
     }
 
     /// Pin the regression that 16212fc was authored to prevent: a piped
