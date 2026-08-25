@@ -34,7 +34,7 @@ pub(in crate::mcp) fn tool_grok(
     let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
         .map_err(|e| e.to_string())?;
     Ok(crate::budget::apply(
-        &crate::search::grok::format_grok(&result, &scope),
+        &crate::search::grok::format_grok(&result),
         budget,
     ))
 }
@@ -114,7 +114,7 @@ mod tests {
             "cwd": env!("CARGO_MANIFEST_DIR"),
             "budget": 50
         });
-        let full = tool_grok(&args_full, &bloom(), &Session::new()).expect("full grok succeeds");
+        let _full = tool_grok(&args_full, &bloom(), &Session::new()).expect("full grok succeeds");
         let small =
             tool_grok(&args_small, &bloom(), &Session::new()).expect("budgeted grok succeeds");
         assert!(

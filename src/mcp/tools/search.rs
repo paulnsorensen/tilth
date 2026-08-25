@@ -1037,4 +1037,166 @@ mod tests {
             "dropped-names note did not survive if_modified_since redaction: {out}"
         );
     }
+
+    /// A file-scope search (scope set to a single file, not a directory) is
+    /// confined to that file — a sibling file with the same symbol name must
+    /// not appear in the results.
+    #[test]
+    fn symbol_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "pub fn shared() {}\n").unwrap();
+        std::fs::write(tmp.path().join("sibling.rs"), "pub fn shared() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "shared", "kind": "symbol"}],
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("target.rs"),
+            "expected the scoped file's match: {out}"
+        );
+        assert!(
+            !out.contains("sibling.rs"),
+            "file scope must not surface a sibling file's match: {out}"
+        );
+    }
+
+    /// Same containment contract for `kind: content`.
+    #[test]
+    fn content_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "// needle marker\n").unwrap();
+        std::fs::write(tmp.path().join("sibling.rs"), "// needle marker\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "needle marker", "kind": "content"}],
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("target.rs"),
+            "expected the scoped file's match: {out}"
+        );
+        assert!(
+            !out.contains("sibling.rs"),
+            "file scope must not surface a sibling file's match: {out}"
+        );
+    }
+
+    /// Same containment contract for `kind: callers`.
+    #[test]
+    fn callers_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "fn alpha() {}\nfn uses_alpha() { alpha(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sibling.rs"),
+            "fn uses_alpha_sibling() { alpha(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "alpha", "kind": "callers"}],
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("uses_alpha"),
+            "expected the scoped file's call site: {out}"
+        );
+        assert!(
+            !out.contains("uses_alpha_sibling"),
+            "file scope must not surface a sibling file's call site: {out}"
+        );
+    }
+
+    /// A file-scope search whose query matches a *different* file's basename
+    /// must not fall back to the basename-outline of that sibling file — a
+    /// file scope's walk root is the file itself, not its parent directory.
+    #[test]
+    fn file_scope_basename_fallback_does_not_surface_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "pub fn something_else() {}\n").unwrap();
+        std::fs::write(tmp.path().join("sibling.rs"), "pub fn sibling_fn() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "sibling"}],
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            !out.contains("sibling_fn"),
+            "file scope must not surface a sibling file's basename-outline: {out}"
+        );
+    }
+
+    /// caa6d2b: expanding a definition inside a file scope must still resolve
+    /// and render its callees defined in a sibling file, with the callee's
+    /// path rendered relative to the file's parent directory (the scope's
+    /// base), not error against the single-file scope.
+    #[test]
+    fn file_scope_expand_resolves_callee_against_parent_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Go: same-directory files share a package namespace with no explicit
+        // imports, so callee resolution here isolates the cross-file lookup
+        // itself rather than depending on import parsing too.
+        std::fs::write(
+            tmp.path().join("target.go"),
+            "package main\nfunc caller() { helper() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("helper.go"),
+            "package main\nfunc helper() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "caller", "kind": "symbol"}],
+            "scope": tmp.path().join("target.go").to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("-- calls --") && out.contains("helper"),
+            "expected the callee section to resolve helper() in the sibling file: {out}"
+        );
+        assert!(
+            out.contains("helper.go"),
+            "callee path must render relative to the parent directory, not error: {out}"
+        );
+    }
 }

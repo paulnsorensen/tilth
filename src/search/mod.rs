@@ -103,6 +103,17 @@ pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// are found. Used by both the parallel search walker (`walker()`) and the
 /// sequential map walker (`crate::map::generate`), which each apply their own
 /// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+/// Resolves a scope to a directory for walker/matcher construction: a file
+/// scope collapses to its parent directory (directory-only walkers/overrides
+/// have no single-file meaning); a directory scope passes through unchanged.
+pub(crate) fn scope_base(scope: &Path) -> &Path {
+    if scope.is_file() {
+        scope.parent().unwrap_or(scope)
+    } else {
+        scope
+    }
+}
+
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder
@@ -144,7 +155,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            let mut overrides = ignore::overrides::OverrideBuilder::new(scope_base(scope));
             overrides
                 .add(pattern)
                 .map_err(|e| TilthError::InvalidQuery {
@@ -377,7 +388,7 @@ pub fn search_multi_symbol_expanded(
         }
         let mut out = format::search_header(
             &result.query,
-            &result.scope,
+            &result.walk_root,
             result.matches.len(),
             result.definitions,
             result.usages,
@@ -582,6 +593,7 @@ pub fn format_raw_result(
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
+    let scope = scope_base(scope);
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
 }
@@ -1244,6 +1256,7 @@ fn basename_file_outline(
     query: &str,
     matches: &[Match],
     scope: &Path,
+    walk_root: &Path,
     cache: &OutlineCache,
 ) -> Option<String> {
     let query_lower = query.to_ascii_lowercase();
@@ -1255,7 +1268,7 @@ fn basename_file_outline(
 
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
-        .or_else(|| find_basename_fallback(scope, &query_lower))?;
+        .or_else(|| find_basename_fallback(walk_root, &query_lower))?;
     if path_is_secret_file(&matched_path) {
         return None;
     }
@@ -1313,7 +1326,7 @@ fn format_search_result(
     }
     let header = format::search_header(
         &result.query,
-        &result.scope,
+        &result.walk_root,
         result.matches.len(),
         result.definitions,
         result.usages,
@@ -1325,9 +1338,13 @@ fn format_search_result(
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
-    if let Some(file_outline) =
-        basename_file_outline(&result.query, &result.matches, &result.scope, cache)
-    {
+    if let Some(file_outline) = basename_file_outline(
+        &result.query,
+        &result.matches,
+        &result.scope,
+        &result.walk_root,
+        cache,
+    ) {
         let _ = write!(out, "\n\n{file_outline}");
     }
 

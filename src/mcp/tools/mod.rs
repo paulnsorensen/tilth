@@ -67,34 +67,37 @@ pub(super) fn resolve_anchored(
 }
 
 /// Resolve the `scope` arg under the trust-absolute posture (`resolve_anchored`).
-/// An omitted scope defaults to `"."` → `cwd`.
+/// An omitted scope defaults to `"."` → `cwd`. Accepts either a directory or a
+/// single file path; a file scope restricts search/grok/deps to that file (a
+/// tool with no single-file meaning, such as list, collapses it to its parent).
 ///
-/// When the anchored path does not resolve to an existing directory, this
-/// refuses rather than falling back to `cwd`. A silent fallback substitutes a
+/// When the anchored path does not resolve to an existing file or directory,
+/// this refuses rather than falling back to `cwd`. A silent fallback substitutes a
 /// search the caller did not ask for and cannot see they got — a scope naming
 /// one file that does not exist would silently widen to the whole checkout.
 /// Refusing is immediate and actionable; the error names which of three
-/// things went wrong — missing, not a directory, or unstattable — using
+/// things went wrong — missing, not a file/directory, or unstattable — using
 /// `try_exists()` rather than `exists()`/`is_dir()` because both of those
 /// answer "no" to a permission error too.
 ///
-/// Adapted from lack435/tilth 19c235e9d132d052700199ca9617c89c88d6ba02.
+/// Adapted from lack435/tilth 19c235e9d132d052700199ca9617c89c88d6ba02, extended
+/// to accept a file scope per lack435/tilth b5e964c + caa6d2b.
 pub(super) fn resolve_scope(args: &Value, cwd: &std::path::Path) -> Result<PathBuf, String> {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
     let raw: PathBuf = raw_str.into();
     let anchored = resolve_anchored(&raw, cwd)?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
-    if resolved.is_dir() {
+    if resolved.is_dir() || resolved.is_file() {
         return Ok(resolved);
     }
 
-    // Not a directory. Refused rather than widened to `cwd`.
+    // Neither a file nor a directory. Refused rather than widened to `cwd`.
     //
-    // `is_dir()`/`exists()` both answer "no" to a permission error, so a bare "does
-    // not exist" would be a false statement about a directory that demonstrably exists.
+    // `is_dir()`/`is_file()`/`exists()` all answer "no" to a permission error, so a bare
+    // "does not exist" would be a false statement about a path that demonstrably exists.
     let detail: String = match resolved.try_exists() {
-        Ok(true) => "exists but is not a directory (a file scope is not supported yet — \
-                     pass its parent directory)"
+        Ok(true) => "exists but is neither a file nor a directory (e.g. a special file, \
+                     or a symlink whose target is missing)"
             .to_string(),
         Ok(false) => "does not exist".to_string(),
         Err(e) => format!("cannot be inspected: {e}"),
@@ -225,6 +228,31 @@ mod tests {
             "scope \"/nonexistent/directory/zzz\" does not exist. Refusing rather than \
              falling back to a broader scope, which would silently search far more than \
              you asked for."
+        );
+    }
+
+    #[test]
+    fn resolve_scope_file_is_accepted_and_returned_verbatim() {
+        // A file scope is now accepted (not refused) and returned as the
+        // canonicalized file path — restricting search/grok/deps to that file.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("foo.rs");
+        std::fs::write(&file, "fn foo() {}").unwrap();
+        let args = serde_json::json!({ "scope": file.to_str().unwrap() });
+        let scope = resolve_scope(&args, tmp.path()).unwrap();
+        assert_eq!(scope, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_scope_accepts_file_and_still_refuses_missing() {
+        // A missing path is still refused even though files are now accepted —
+        // acceptance is limited to paths that actually exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "scope": "missing.rs" });
+        let err = resolve_scope(&args, tmp.path()).unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "missing file scope must still be refused: {err}"
         );
     }
 

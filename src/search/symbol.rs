@@ -106,7 +106,9 @@ pub fn search(
     let total = merged.len();
     let usage_count = total - def_count;
 
-    rank::sort(&mut merged, query, scope, context);
+    let base = crate::search::scope_base(scope);
+
+    rank::sort(&mut merged, query, base, context);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
@@ -122,7 +124,7 @@ pub fn search(
     // clone is cheap. Faceting is pure / side-effect-free.
     let totals = {
         let snapshot = merged.clone();
-        let f = super::facets::facet_matches(snapshot, scope);
+        let f = super::facets::facet_matches(snapshot, base);
         FacetTotals {
             definitions: f.definitions.len(),
             implementations: f.implementations.len(),
@@ -136,7 +138,8 @@ pub fn search(
 
     Ok(SearchResult {
         query: query.to_string(),
-        scope: scope.to_path_buf(),
+        scope: base.to_path_buf(),
+        walk_root: scope.to_path_buf(),
         matches: merged,
         total_found: total,
         definitions: def_count,

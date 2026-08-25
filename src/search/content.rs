@@ -138,13 +138,15 @@ pub fn search(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    let base = super::scope_base(scope);
+    rank::sort(&mut all_matches, pattern, base, context);
     all_matches.truncate(max_matches);
 
     Ok((
         SearchResult {
             query: pattern.to_string(),
-            scope: scope.to_path_buf(),
+            scope: base.to_path_buf(),
+            walk_root: scope.to_path_buf(),
             matches: all_matches,
             total_found: total,
             definitions: 0,

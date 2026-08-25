@@ -67,4 +67,27 @@ mod tests {
         // Resolves and runs without error (the file exists under cwd).
         tool_deps(&args, &bloom()).expect("relative path anchors under cwd");
     }
+
+    /// deps has no single-file meaning of its own — a file scope collapses
+    /// to its parent directory rather than confining the dependents walk to
+    /// that one file (which would silently miss every real dependent).
+    #[test]
+    fn a_file_scope_collapses_to_its_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("foo.rs"), "pub fn foo() {}\n").unwrap();
+        std::fs::write(tmp.path().join("bar.rs"), "fn bar() { foo(); }\n").unwrap();
+        std::fs::write(tmp.path().join("scope_file.rs"), "// unrelated\n").unwrap();
+        let args = serde_json::json!({
+            "path": "foo.rs",
+            "cwd": tmp.path().to_str().unwrap(),
+            "scope": tmp.path().join("scope_file.rs").to_str().unwrap(),
+        });
+        let out = tool_deps(&args, &bloom())
+            .expect("a file scope must collapse to its parent directory, not error");
+        assert!(
+            out.contains("bar.rs"),
+            "dependents search must see sibling files after the file scope collapses \
+             to its parent directory: {out}"
+        );
+    }
 }
