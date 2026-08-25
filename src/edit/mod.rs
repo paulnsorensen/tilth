@@ -6,6 +6,7 @@ pub mod apply;
 pub mod block;
 pub mod json;
 pub mod mismatch;
+pub mod parse_check;
 pub mod parser;
 pub mod recovery;
 pub mod snapshots;
