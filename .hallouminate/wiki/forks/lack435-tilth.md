@@ -54,3 +54,26 @@ They kept `tilth_savings`; we cut it deliberately (#121).
 Cheapest wins first: scope refuse-don't-widen (single function), post-write parse check,
 symbol-retention bound (verify pathology first), walkbudget/cancel. C++ + BOM campaigns are
 high value for C++-heavy use but are re-implementations, not ports.
+
+
+## Ported 2026-08-24 (branch paulnsorensen/lack435-ports)
+
+Re-implemented (never merged — lack435 history carries the never-merge commits):
+parse budget (byte-based, 6 sites, 1MB gate), post-write parse check (advisory,
+wired to whole-file-tag commit path), bounded retention (replaced our early-quit,
+which was confirmed nondeterministic and under-counting), walkbudget + cancel
+(per-walk entry windows after review), scope refuse-don't-widen + file-path-as-scope.
+Review (2 HIGH, 4 MED, 4 LOW) all cured. Durable gotchas:
+
+- `cancel::current()` is thread-ambient. Any walk running on a rayon pool thread
+  must use `run_walk_with` with a token captured on the request thread —
+  `symbol::search`'s rayon::join walks silently lost cancellation otherwise.
+- The walk budget must be charged per walk (WalkWindow), not per request: one
+  batched request legitimately runs dozens of walks.
+- Any new tree-sitter parse site must route through `parse_budgeted`/
+  `try_parse_budgeted` or be listed as exempt in parse_budget.rs's inventory.
+- Deliberately NOT ported: vcsignore (we use the `ignore` crate), C++/BOM
+  campaigns (re-implementations against our per-language src/lang/ layout).
+- Open item: early-quit removal means full-tree scans per search; benchmark
+  cost-per-correct-answer delta not yet measured.
+
