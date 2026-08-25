@@ -68,8 +68,9 @@ pub(super) fn resolve_anchored(
 
 /// Resolve the `scope` arg under the trust-absolute posture (`resolve_anchored`).
 /// An omitted scope defaults to `"."` → `cwd`. Accepts either a directory or a
-/// single file path; a file scope restricts search/grok/deps to that file (a
-/// tool with no single-file meaning, such as list, collapses it to its parent).
+/// single file path; a file scope restricts search to that file. grok, deps
+/// and list have no single-file meaning and collapse it to the parent
+/// directory instead.
 ///
 /// When the anchored path does not resolve to an existing file or directory,
 /// this refuses rather than falling back to `cwd`. A silent fallback substitutes a

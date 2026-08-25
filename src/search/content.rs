@@ -49,12 +49,13 @@ pub fn search(
 
     let sink = BoundedRetain::new(MAX_RETAINED);
 
+    let base = super::scope_base(scope);
     let walker = super::walker(scope, glob)?;
 
     super::run_walk(walker, || {
         let matcher = &matcher;
         let sink = &sink;
-        let mut scorer = rank::Scorer::new(pattern, scope, context);
+        let mut scorer = rank::Scorer::new(pattern, base, context);
 
         Box::new(move |entry| {
             let Some((path, file_size)) = accept_walk_entry(entry) else {
@@ -114,7 +115,6 @@ pub fn search(
     let total = sink.offered();
     let mut all_matches = sink.into_matches();
 
-    let base = super::scope_base(scope);
     rank::sort(&mut all_matches, pattern, base, context);
     all_matches.truncate(max_matches);
 

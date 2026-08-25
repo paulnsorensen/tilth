@@ -64,12 +64,30 @@ pub fn search(
         reason: e.to_string(),
     })?;
 
+    let base = crate::search::scope_base(scope);
+
     // Both walks share the one compiled `\bquery\b`: the usage walk to find usages, the
     // definition walk to count how many of its definition lines that same pattern also
     // matches — see `find_definitions`'s doc comment.
+    // Capture the cancel token on this (request) thread: the walks below run on
+    // rayon pool threads, where thread-ambient `cancel::current()` is not this
+    // request's token (and under test is invisible entirely).
+    let cancel = crate::cancel::current();
+
     let (defs, usages) = rayon::join(
-        || find_definitions(query, &matcher, scope, glob, context),
-        || find_usages(query, &matcher, scope, glob, context),
+        || {
+            find_definitions(
+                query,
+                &matcher,
+                scope,
+                glob,
+                context,
+                MAX_RETAINED,
+                base,
+                cancel.clone(),
+            )
+        },
+        || find_usages(query, &matcher, scope, glob, context, cancel.clone()),
     );
 
     let (defs, def_offered, overlap_count) = defs?;
@@ -95,10 +113,12 @@ pub fn search(
     // coincide with a definition line, counted during the definition walk before any capping
     // (donor commit db1d504) — deriving it from the retained sets instead would omit every
     // collision retention clipped.
+    debug_assert!(
+        overlap_count <= usage_offered,
+        "overlap_count ({overlap_count}) exceeds usage_offered ({usage_offered})"
+    );
     let usage_count = usage_offered.saturating_sub(overlap_count);
     let total = def_offered + usage_count;
-
-    let base = crate::search::scope_base(scope);
 
     rank::sort(&mut merged, query, base, context);
 
@@ -159,23 +179,27 @@ pub fn search(
 /// retention clips it — is what keeps the count exact regardless of the cap.
 ///
 /// Returns `(retained definitions, exact total offered, exact def/usage overlap)`.
+#[allow(clippy::too_many_arguments)] // internal seam; the params are the search request itself
 fn find_definitions(
     query: &str,
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
     context: Option<&Path>,
+    cap: usize,
+    base: &Path,
+    cancel: crate::cancel::CancelToken,
 ) -> Result<(Vec<Match>, usize, usize), TilthError> {
-    let sink = BoundedRetain::new(MAX_RETAINED);
+    let sink = BoundedRetain::new(cap);
     let overlap_count = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
 
-    super::run_walk(walker, || {
+    super::run_walk_with(cancel, walker, || {
         let sink = &sink;
         let overlap_count = &overlap_count;
-        let mut scorer = rank::Scorer::new(query, scope, context);
+        let mut scorer = rank::Scorer::new(query, base, context);
 
         Box::new(move |entry| {
             let Some((path, file_size)) = accept_walk_entry(entry) else {
@@ -250,6 +274,9 @@ fn find_definitions(
             }
 
             if !file_defs.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                file_defs.retain(|d| seen.insert((d.path.clone(), d.line)));
+
                 // Exact overlap over the full per-file list, before retention clips it.
                 let overlap_in_file = file_defs
                     .iter()
@@ -281,8 +308,18 @@ pub(crate) fn all_definitions(
         query: query.to_string(),
         reason: e.to_string(),
     })?;
-    let (mut defs, _offered, _overlap) = find_definitions(query, &matcher, scope, glob, None)?;
-    rank::sort(&mut defs, query, scope, None);
+    let base = crate::search::scope_base(scope);
+    let (mut defs, _offered, _overlap) = find_definitions(
+        query,
+        &matcher,
+        scope,
+        glob,
+        None,
+        usize::MAX,
+        base,
+        crate::cancel::current(),
+    )?;
+    rank::sort(&mut defs, query, base, None);
     defs.sort_by_key(stratum_for_display);
     Ok(defs)
 }
@@ -523,12 +560,13 @@ fn find_usages(
     scope: &Path,
     glob: Option<&str>,
     context: Option<&Path>,
+    cancel: crate::cancel::CancelToken,
 ) -> Result<(Vec<Match>, usize), TilthError> {
     let sink = BoundedRetain::new(MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
-    super::run_walk(walker, || {
+    super::run_walk_with(cancel, walker, || {
         let sink = &sink;
         let mut scorer = rank::Scorer::new(query, scope, context);
 
@@ -1470,6 +1508,42 @@ Body to end.
         assert_eq!(
             result_default.total_found, result_full.total_found,
             "total_found must be the same regardless of full flag"
+        );
+    }
+
+    /// A 1ms-deadline `spawn_with_timeout` wrapping `symbol::search` over a wide tree must
+    /// abandon the walk before it visits every file — the worker's own result, captured
+    /// separately since `spawn_with_timeout` discards it on timeout, must show fewer
+    /// definitions than the tree contains.
+    #[test]
+    fn cancelled_walk_abandons_before_visiting_every_file() {
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _visible = crate::cancel::make_visible_on_this_thread();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path().to_path_buf();
+        const FILES: usize = 300;
+        for i in 0..FILES {
+            let path = scope.join(format!("file_{i:03}.rs"));
+            std::fs::write(&path, "pub fn widget() {}\n").expect("write");
+        }
+
+        // Deterministic: cancel the published request before the walk starts.
+        // The timeout->cancel linkage is pinned separately in `timeout.rs`
+        // (`only_the_expired_request_is_cancelled`); this test pins that a
+        // cancelled token actually cuts a real symbol walk short — the walks
+        // run on rayon pool threads, so the token must be the one `search()`
+        // captured on this thread, not thread-ambient state.
+        let request = crate::cancel::begin_request();
+        request.cancel();
+
+        let result = search("widget", &scope, None, None, false).expect("search");
+        assert_eq!(
+            result.definitions, 0,
+            "a pre-cancelled walk should visit no files, found {} of {FILES}",
+            result.definitions
         );
     }
 }

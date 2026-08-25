@@ -117,7 +117,6 @@ pub(crate) fn scope_base(scope: &Path) -> &Path {
 
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
-    let cancel = crate::cancel::current();
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
@@ -128,10 +127,7 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
         .ignore(false)
         .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
-        .filter_entry(move |entry| {
-            if cancel.is_cancelled() {
-                return false;
-            }
+        .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
                     return !SKIP_DIRS.contains(&name);
@@ -180,17 +176,35 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 /// Run a parallel walk, quitting early if the request that built it has been abandoned.
 ///
 /// All search walks go through here rather than calling `WalkParallel::run` directly, so the
-/// cancellation and walk-budget checks have one home instead of many. One
-/// [`crate::walkbudget::begin_walk`] window is opened per call and shared across this walk's
-/// worker threads via `Arc`, so this walk is charged against the ceiling independently of any
-/// other walk the same request runs — see `walkbudget`'s module docs.
-pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, mut factory: F)
+/// cancellation and walk-budget checks have one home instead of many. This closure's
+/// `cancel.is_cancelled()` check is the walk's single cancellation seam — `base_walk_builder`'s
+/// `filter_entry` does not duplicate it. One [`crate::walkbudget::begin_walk`] window is opened
+/// per call and shared across this walk's worker threads via `Arc`, so this walk is charged
+/// against the ceiling independently of any other walk the same request runs — see
+/// `walkbudget`'s module docs.
+pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, factory: F)
 where
     F: FnMut() -> Box<
         dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
     >,
 {
-    let cancel = crate::cancel::current();
+    run_walk_with(crate::cancel::current(), walker, factory);
+}
+
+/// `run_walk` with an explicitly captured cancel token. A walk that runs on a
+/// rayon pool thread (see `symbol::search`) must capture the token on the
+/// request thread and pass it here: `cancel::current()` is thread-ambient, and
+/// a pool thread is not the request thread (under test it cannot even see the
+/// published token).
+pub(crate) fn run_walk_with<'a, F>(
+    cancel: crate::cancel::CancelToken,
+    walker: ignore::WalkParallel,
+    mut factory: F,
+) where
+    F: FnMut() -> Box<
+        dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
+    >,
+{
     let window = std::sync::Arc::new(crate::walkbudget::begin_walk());
     walker.run(move || {
         let cancel = cancel.clone();
