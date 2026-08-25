@@ -1,4 +1,4 @@
-//! A ceiling on how many entries one request's walks may visit.
+//! A ceiling on how many entries one walk may visit.
 //!
 //! A backstop for trees with no ignore file to rescue them. `base_walk_builder` prunes a fixed
 //! `SKIP_DIRS` list and does not consult `.gitignore`, deliberately, so gitignored-but-locally-
@@ -17,6 +17,20 @@
 //! and surfaced on the response, together with the directories that consumed the budget — the
 //! note is the point, the early exit is just what makes it cheap.
 //!
+//! # Charged per walk, not per request
+//!
+//! One MCP tool call can run several walks: `symbol::search` runs its definition and usage
+//! walks concurrently (`rayon::join`), `kind: "any"` layers content and callers walks on top of
+//! that, and a batch of queries multiplies further. Each [`WalkWindow`] (opened by
+//! [`begin_walk`], one per `run_walk` call) is charged against the full ceiling independently —
+//! a request is not penalized for running many small walks instead of one big one, and a single
+//! pathological walk still trips at the documented size regardless of how many other walks share
+//! the request.
+//!
+//! [`report`] aggregates at the request level: it says whether *any* walk in the request
+//! tripped and, if so, names the directories that consumed that walk's budget. It is not a sum
+//! across walks.
+//!
 //! # Why a plain global rather than `cancel`'s published-token machinery
 //!
 //! `cancel` publishes a fresh `Arc` per request and takes care to give each walk the token of the
@@ -29,17 +43,17 @@
 //! [`report`] at the bottom bracket exactly one request's walks.
 //!
 //! An abandoned worker from a timed-out earlier request keeps walking after the next request has
-//! taken over the budget. Each walk therefore captures a **generation** at its start and its
-//! visits are discarded once that no longer matches.
+//! taken over the budget. Each walk therefore captures a **generation** at its start (in its
+//! [`WalkWindow`]) and its visits are discarded once that no longer matches.
 //!
 //! This was first written without the generation, on the reasoning that stale visits "can only
 //! push the count up, so the failure mode is a spurious 'incomplete' note". That was wrong in the
-//! dangerous direction, and is recorded because the reasoning is tempting:
-//! [`WalkBudget::note_visit`] *returns* `true`, which the caller turns into `WalkState::Quit`, so
-//! a stale worker did not merely annotate the next request — it cut that request's own walk
-//! short and labelled complete results INCOMPLETE. Worse, it was self-reinforcing: the request
-//! most likely to leave a worker behind is one that timed out on a pathological tree, which is
-//! precisely the worker that then burns the whole ceiling in seconds.
+//! dangerous direction, and is recorded because the reasoning is tempting: a stale visit used to
+//! *return* `true`, which the caller turns into `WalkState::Quit`, so a stale worker did not
+//! merely annotate the next request — it cut that request's own walk short and labelled complete
+//! results INCOMPLETE. Worse, it was self-reinforcing: the request most likely to leave a worker
+//! behind is one that timed out on a pathological tree, which is precisely the worker that then
+//! burns the whole ceiling in seconds.
 //!
 //! # Why the state is a struct and not bare statics
 //!
@@ -58,14 +72,16 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-/// Entries one request may visit before the walk is cut short.
+/// Entries one walk may visit before it is cut short.
 ///
-/// 500k is chosen to sit above real source trees and below the pathological ones. The Linux
-/// kernel is ~80k files and Chromium ~400k, so neither trips.
+/// Charged per walk (see module docs), not summed across the walks a single request may run —
+/// each [`WalkWindow`] gets its own full ceiling. 500k is chosen to sit above one walk over a
+/// real source tree and below the pathological ones: the Linux kernel is ~80k files and
+/// Chromium ~400k, so neither trips a single walk.
 ///
 /// Deliberately generous. This is a floor on the worst case, not a tuning knob: a ceiling low
-/// enough to make a big tree *fast* would truncate legitimate large searches, and a truncated
-/// answer is worse than a slow one.
+/// enough to make a big tree's walk *fast* would truncate legitimate large searches, and a
+/// truncated answer is worse than a slow one.
 const DEFAULT_MAX_WALK: usize = 500_000;
 
 /// Sample rate for the per-directory tally. Every visit bumps the counter; only every 64th takes
@@ -77,13 +93,24 @@ const TALLY_EVERY: usize = 64;
 const UNLIMITED: usize = usize::MAX;
 
 pub(crate) struct WalkBudget {
+    /// The walk-local count captured at the moment some walk tripped, for [`WalkBudget::report`].
+    /// Not a running total across concurrent walks — each [`WalkWindow`] counts independently.
     visited: AtomicUsize,
     tripped: AtomicBool,
     limit: AtomicUsize,
-    /// Bumped by [`WalkBudget::start`]. A walk carries the generation it began under and its
-    /// visits are dropped once that no longer matches — see [`WalkBudget::note_visit`].
+    /// Bumped by [`WalkBudget::start`]. Captured by [`WalkBudget::begin_walk`] into the returned
+    /// [`WalkWindow`]; a window's visits are dropped once that no longer matches the live
+    /// generation — see [`WalkBudget::note_walk_visit`].
     generation: AtomicUsize,
     tally: Mutex<Option<HashMap<String, usize>>>,
+}
+
+/// One walk's accounting window, opened by [`WalkBudget::begin_walk`]. Owns its own counter so
+/// concurrent walks within a request are charged independently against the ceiling rather than
+/// sharing one pool — see the module's "Charged per walk" section.
+pub(crate) struct WalkWindow {
+    generation: usize,
+    visited: AtomicUsize,
 }
 
 impl WalkBudget {
@@ -106,35 +133,41 @@ impl WalkBudget {
         *self.tally.lock().unwrap_or_else(PoisonError::into_inner) = Some(HashMap::new());
     }
 
-    /// The generation a walk should capture when it starts.
-    pub(crate) fn generation(&self) -> usize {
-        self.generation.load(Ordering::Relaxed)
+    /// Open an accounting window for one walk. Captures the current generation so a walk
+    /// abandoned by a timed-out earlier request is recognized as stale, and starts its own
+    /// counter at zero so this walk gets the full ceiling regardless of what other walks in the
+    /// same request have already visited.
+    pub(crate) fn begin_walk(&self) -> WalkWindow {
+        WalkWindow {
+            generation: self.generation.load(Ordering::Relaxed),
+            visited: AtomicUsize::new(0),
+        }
     }
 
-    /// Record one visited entry. Returns `true` once the ceiling is passed, meaning the caller
-    /// should stop walking.
+    /// Record one visited entry against `window`'s own counter. Returns `true` once that walk's
+    /// ceiling is passed, meaning the caller should stop walking.
     ///
     /// `Relaxed` throughout for the same reason `CancelToken` uses it: nothing is published
     /// alongside these, every read drives a best-effort early exit, and a late read costs one
     /// more entry of walking.
-    pub(crate) fn note_visit(&self, gen: usize, path: &Path) -> bool {
+    pub(crate) fn note_walk_visit(&self, window: &WalkWindow, path: &Path) -> bool {
         // A walk from an abandoned request must not spend a LIVE request's budget.
         //
         // The first version of this had no generation and its module doc claimed the cross-talk
         // "can only push the count up, so the failure mode is a spurious 'incomplete' note". That
-        // was wrong, and wrong in the dangerous direction: `note_visit` returns `true`, which the
-        // caller turns into `WalkState::Quit`. So an abandoned worker did not merely annotate the
-        // next request — it cut that request's own walk short and mislabelled correct, complete
-        // results as INCOMPLETE.
+        // was wrong, and wrong in the dangerous direction: a stale visit used to *return* `true`,
+        // which the caller turns into `WalkState::Quit`. So an abandoned worker did not merely
+        // annotate the next request — it cut that request's own walk short and mislabelled
+        // correct, complete results as INCOMPLETE.
         //
         // The scenario is self-reinforcing: request N times out on a pathological tree (exactly
         // what this module exists for), its worker keeps walking and burns the whole ceiling in
         // seconds, and request N+1 — a narrow, cheap, correct search — is truncated almost
         // immediately.
-        if gen != self.generation.load(Ordering::Relaxed) {
+        if window.generation != self.generation.load(Ordering::Relaxed) {
             return true; // stale walk: stop it, but charge it to nobody
         }
-        let n = self.visited.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = window.visited.fetch_add(1, Ordering::Relaxed) + 1;
 
         if n.is_multiple_of(TALLY_EVERY) {
             if let Some(key) = tally_key(path) {
@@ -148,14 +181,15 @@ impl WalkBudget {
 
         if n > self.limit.load(Ordering::Relaxed) {
             self.tripped.store(true, Ordering::Relaxed);
+            self.visited.fetch_max(n, Ordering::Relaxed);
             return true;
         }
         false
     }
 
-    /// Did these walks hit the ceiling, and if so what consumed it?
+    /// Did any walk in this request hit the ceiling, and if so what consumed it?
     ///
-    /// `None` when the walk completed. `Some(note)` is caller-facing prose meant to be shown
+    /// `None` when every walk completed. `Some(note)` is caller-facing prose meant to be shown
     /// alongside whatever partial results were produced.
     pub(crate) fn report(&self) -> Option<String> {
         if !self.tripped.load(Ordering::Relaxed) {
@@ -176,7 +210,7 @@ impl WalkBudget {
         heavy.truncate(3);
 
         let mut note = format!(
-            "NOTE: the walk stopped after {visited} entries (limit {cap}), so these results \
+            "NOTE: a walk stopped after {visited} entries (limit {cap}), so these results \
              are INCOMPLETE."
         );
         if !heavy.is_empty() {
@@ -238,14 +272,14 @@ pub fn reset() {
     GLOBAL.start(limit_from_env());
 }
 
-/// The generation a walk should capture at its start, so its visits can be discarded if a later
-/// request takes over the budget while it is still running.
-pub(crate) fn generation() -> usize {
-    GLOBAL.generation()
+/// Open an accounting window for one walk against the request's budget. Each `run_walk` call
+/// opens its own window so concurrent walks are charged independently — see module docs.
+pub(crate) fn begin_walk() -> WalkWindow {
+    GLOBAL.begin_walk()
 }
 
-pub(crate) fn note_visit(gen: usize, path: &Path) -> bool {
-    GLOBAL.note_visit(gen, path)
+pub(crate) fn note_walk_visit(window: &WalkWindow, path: &Path) -> bool {
+    GLOBAL.note_walk_visit(window, path)
 }
 
 #[must_use]
@@ -264,8 +298,9 @@ mod tests {
     fn under_the_ceiling_nothing_is_reported() {
         let b = WalkBudget::new();
         b.start(100);
+        let w = b.begin_walk();
         for i in 0..50 {
-            assert!(!b.note_visit(b.generation(), Path::new(&format!("/a/b/f{i}.rs"))));
+            assert!(!b.note_walk_visit(&w, Path::new(&format!("/a/b/f{i}.rs"))));
         }
         assert!(b.report().is_none(), "a completed walk must not warn");
     }
@@ -276,13 +311,11 @@ mod tests {
     fn tripping_reports_and_names_the_heavy_directory() {
         let b = WalkBudget::new();
         b.start(200);
+        let w = b.begin_walk();
 
         let mut stopped_at = None;
         for i in 0..400 {
-            if b.note_visit(
-                b.generation(),
-                Path::new(&format!("/repo/Saved/Logs/f{i}.log")),
-            ) {
+            if b.note_walk_visit(&w, Path::new(&format!("/repo/Saved/Logs/f{i}.log"))) {
                 stopped_at = Some(i);
                 break;
             }
@@ -316,17 +349,17 @@ mod tests {
     fn a_stale_walk_does_not_spend_the_current_budget() {
         let b = WalkBudget::new();
         b.start(1000);
-        let stale_gen = b.generation();
+        let stale = b.begin_walk();
 
         // The next request takes over.
         b.start(1000);
-        let live_gen = b.generation();
-        assert_ne!(stale_gen, live_gen);
+        let live = b.begin_walk();
+        assert_ne!(stale.generation, live.generation);
 
         // The abandoned worker keeps going, far past the ceiling.
         for i in 0..5000 {
             assert!(
-                b.note_visit(stale_gen, Path::new(&format!("/old/f{i}.rs"))),
+                b.note_walk_visit(&stale, Path::new(&format!("/old/f{i}.rs"))),
                 "a stale walk must be told to stop immediately"
             );
         }
@@ -338,11 +371,64 @@ mod tests {
         // And the live request still has its full budget.
         for i in 0..1000 {
             assert!(
-                !b.note_visit(live_gen, Path::new(&format!("/new/f{i}.rs"))),
+                !b.note_walk_visit(&live, Path::new(&format!("/new/f{i}.rs"))),
                 "the live request's budget was spent by a stale walk"
             );
         }
         assert!(b.report().is_none());
+    }
+
+    /// The core of HIGH-1: a request may run several walks concurrently (definition + usage,
+    /// content, callers, batched queries). Each gets its own full ceiling rather than sharing
+    /// one pool, so a request whose walks *combined* exceed the limit must not trip when no
+    /// single walk does.
+    #[test]
+    fn combined_walks_over_the_ceiling_do_not_trip_when_no_single_walk_does() {
+        let b = WalkBudget::new();
+        b.start(1000);
+        let w1 = b.begin_walk();
+        let w2 = b.begin_walk();
+        let w3 = b.begin_walk();
+
+        for i in 0..800 {
+            assert!(!b.note_walk_visit(&w1, Path::new(&format!("/a/f{i}.rs"))));
+        }
+        for i in 0..800 {
+            assert!(!b.note_walk_visit(&w2, Path::new(&format!("/b/f{i}.rs"))));
+        }
+        for i in 0..800 {
+            assert!(!b.note_walk_visit(&w3, Path::new(&format!("/c/f{i}.rs"))));
+        }
+
+        // 2400 combined visits across three walks, each well under the 1000 ceiling on its own.
+        assert!(
+            b.report().is_none(),
+            "no single walk exceeded the ceiling, so the request must not report a trip"
+        );
+    }
+
+    /// A single walk that DOES exceed the ceiling still trips, even while other walks in the
+    /// same request are running under their own windows.
+    #[test]
+    fn one_walk_over_the_ceiling_trips_even_with_others_under_it() {
+        let b = WalkBudget::new();
+        b.start(200);
+        let heavy = b.begin_walk();
+        let light = b.begin_walk();
+
+        for i in 0..100 {
+            assert!(!b.note_walk_visit(&light, Path::new(&format!("/light/f{i}.rs"))));
+        }
+
+        let mut tripped = false;
+        for i in 0..400 {
+            if b.note_walk_visit(&heavy, Path::new(&format!("/heavy/f{i}.rs"))) {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "the heavy walk must trip on its own ceiling");
+        assert!(b.report().is_some(), "the request must report the trip");
     }
 
     /// The tally samples every 64th visit, so a trip on a small ceiling can leave it empty. The
@@ -351,8 +437,9 @@ mod tests {
     fn a_trip_with_no_tallied_directories_does_not_reference_a_missing_list() {
         let b = WalkBudget::new();
         b.start(5);
+        let w = b.begin_walk();
         for i in 0..20 {
-            if b.note_visit(b.generation(), Path::new(&format!("/a/f{i}.rs"))) {
+            if b.note_walk_visit(&w, Path::new(&format!("/a/f{i}.rs"))) {
                 break;
             }
         }
@@ -372,8 +459,9 @@ mod tests {
     fn an_unlimited_budget_never_trips() {
         let b = WalkBudget::new();
         b.start(UNLIMITED);
+        let w = b.begin_walk();
         for i in 0..1000 {
-            assert!(!b.note_visit(b.generation(), Path::new(&format!("/a/f{i}.rs"))));
+            assert!(!b.note_walk_visit(&w, Path::new(&format!("/a/f{i}.rs"))));
         }
         assert!(b.report().is_none());
     }
@@ -382,8 +470,9 @@ mod tests {
     fn start_clears_a_previous_trip() {
         let b = WalkBudget::new();
         b.start(10);
+        let w = b.begin_walk();
         for i in 0..50 {
-            if b.note_visit(b.generation(), Path::new(&format!("/a/f{i}.rs"))) {
+            if b.note_walk_visit(&w, Path::new(&format!("/a/f{i}.rs"))) {
                 break;
             }
         }

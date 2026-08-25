@@ -180,9 +180,10 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 /// Run a parallel walk, quitting early if the request that built it has been abandoned.
 ///
 /// All search walks go through here rather than calling `WalkParallel::run` directly, so the
-/// cancellation and walk-budget checks have one home instead of many. The token and budget
-/// generation are captured here rather than threaded from `walker()`, matching
-/// `base_walk_builder`'s `filter_entry` capture.
+/// cancellation and walk-budget checks have one home instead of many. One
+/// [`crate::walkbudget::begin_walk`] window is opened per call and shared across this walk's
+/// worker threads via `Arc`, so this walk is charged against the ceiling independently of any
+/// other walk the same request runs — see `walkbudget`'s module docs.
 pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, mut factory: F)
 where
     F: FnMut() -> Box<
@@ -190,16 +191,17 @@ where
     >,
 {
     let cancel = crate::cancel::current();
-    let budget_gen = crate::walkbudget::generation();
+    let window = std::sync::Arc::new(crate::walkbudget::begin_walk());
     walker.run(move || {
         let cancel = cancel.clone();
+        let window = window.clone();
         let mut inner = factory();
         Box::new(move |entry| {
             if cancel.is_cancelled() {
                 return ignore::WalkState::Quit;
             }
             if let Ok(e) = &entry {
-                if crate::walkbudget::note_visit(budget_gen, e.path()) {
+                if crate::walkbudget::note_walk_visit(&window, e.path()) {
                     return ignore::WalkState::Quit;
                 }
             }
