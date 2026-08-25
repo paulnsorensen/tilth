@@ -61,7 +61,7 @@ pub fn search(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matcher = &matcher;
         let matches = &matches;
         let total_found = &total_found;

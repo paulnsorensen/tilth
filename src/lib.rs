@@ -19,6 +19,7 @@
 
 pub(crate) mod budget;
 pub mod cache;
+pub(crate) mod cancel;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
@@ -37,6 +38,7 @@ pub(crate) mod telemetry;
 pub(crate) mod timeout;
 pub(crate) mod types;
 pub(crate) mod util;
+pub mod walkbudget;
 
 /// Re-exports for the fuzz harness. Not stable; do not depend on this.
 /// Items here are only `pub` so `fuzz/fuzz_targets/*.rs` can reach them
