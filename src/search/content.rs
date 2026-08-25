@@ -1,20 +1,17 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use super::{accept_walk_entry, file_metadata};
 
 use crate::error::TilthError;
 use crate::search::rank;
+use crate::search::retain::{BoundedRetain, MAX_RETAINED};
 use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
-const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 /// Returns the result plus, when a regex pattern failed to compile and was
@@ -28,11 +25,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<(SearchResult, Option<String>), TilthError> {
-    let (max_matches, early_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
-    } else {
-        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let invalid_query = |reason: String| TilthError::InvalidQuery {
         query: pattern.to_string(),
         reason,
@@ -54,23 +47,16 @@ pub fn search(
         (m, None)
     };
 
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let total_found = AtomicUsize::new(0);
+    let sink = BoundedRetain::new(MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matcher = &matcher;
-        let matches = &matches;
-        let total_found = &total_found;
+        let sink = &sink;
+        let mut scorer = rank::Scorer::new(pattern, scope, context);
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                return ignore::WalkState::Quit;
-            }
-
             let Some((path, file_size)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
@@ -118,25 +104,15 @@ pub fn search(
             );
 
             if !file_matches.is_empty() {
-                total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
+                sink.offer_file(file_matches, &mut scorer);
             }
 
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                ignore::WalkState::Quit
-            } else {
-                ignore::WalkState::Continue
-            }
+            ignore::WalkState::Continue
         })
     });
 
-    let total = total_found.load(Ordering::Relaxed);
-    let mut all_matches = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = sink.offered();
+    let mut all_matches = sink.into_matches();
 
     rank::sort(&mut all_matches, pattern, scope, context);
     all_matches.truncate(max_matches);
@@ -153,4 +129,59 @@ pub fn search(
         },
         fallback_reason,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the bounded-retention port: a dense-match tree that exceeds
+    /// `retain::MAX_RETAINED` must still report an exact total and a stable
+    /// retained/displayed order across runs — the property the old shared-counter
+    /// early-quit could not guarantee (see `search::retain`'s module doc).
+    #[test]
+    fn dense_matches_report_exact_total_and_stable_order_under_retention_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+
+        // 30 files x 100 lines each containing the pattern = 3_000 raw matches,
+        // comfortably past MAX_RETAINED (2_000) so the bound actually clips.
+        const FILES: usize = 30;
+        const LINES_PER_FILE: usize = 100;
+        for i in 0..FILES {
+            let path = scope.join(format!("file_{i:03}.rs"));
+            let content: String = (0..LINES_PER_FILE)
+                .map(|n| format!("let widget_{n} = load_widget();\n"))
+                .collect();
+            std::fs::write(&path, content).expect("write");
+        }
+
+        let (first, _) = search("widget", scope, false, None, None, false).expect("search 1");
+        let (second, _) = search("widget", scope, false, None, None, false).expect("search 2");
+
+        let expected_total = FILES * LINES_PER_FILE;
+        assert_eq!(
+            first.total_found, expected_total,
+            "total_found must be exact even though retention bounds what is kept"
+        );
+        assert_eq!(second.total_found, expected_total);
+
+        assert!(
+            first.matches.len() <= MAX_MATCHES,
+            "display cap must still apply: got {}",
+            first.matches.len()
+        );
+
+        let key = |r: &SearchResult| -> Vec<(std::path::PathBuf, u32, String)> {
+            r.matches
+                .iter()
+                .map(|m| (m.path.clone(), m.line, m.text.clone()))
+                .collect()
+        };
+        assert_eq!(
+            key(&first),
+            key(&second),
+            "retained/displayed order must be stable across runs on an identical tree"
+        );
+    }
 }

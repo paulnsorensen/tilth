@@ -8,6 +8,7 @@ mod fuzzy_symbol;
 pub mod glob;
 pub mod grok;
 pub mod rank;
+mod retain;
 pub mod siblings;
 pub mod strip;
 pub mod symbol;
