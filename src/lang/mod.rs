@@ -1,5 +1,6 @@
 pub mod detection;
 pub mod outline;
+pub mod parse_budget;
 pub mod treesitter;
 
 pub(crate) mod spec;

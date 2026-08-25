@@ -163,8 +163,9 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
 /// Upper bound on file size searched by content/regex walkers. Files larger
 /// than this skip on stat alone. Shared so `content::search` and
-/// `count_files_for_empty` stay aligned.
-pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+/// `count_files_for_empty` stay aligned, and with `parse_budget::MAX_PARSE_FILE_SIZE`
+/// (raised from 500 000 to 1 MB) so the symbol walk's own gate moves with it.
+pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = crate::lang::parse_budget::MAX_PARSE_FILE_SIZE;
 
 /// Shared file-walk entry filter for the content and symbol search walkers:
 /// unwraps the walker result, keeps only files, skips filenames that look
@@ -1651,7 +1652,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {

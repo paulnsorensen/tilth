@@ -45,12 +45,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
         .extract_receiver
         .and_then(|extract| extract(content, &ts_lang));
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(content, &ts_lang) else {
         return Vec::new();
     };
 
