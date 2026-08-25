@@ -54,7 +54,10 @@ pub(crate) struct ParseReport {
 
 /// Parse `before` and `after`, return a report of errors introduced by the
 /// edit. Returns `None` when:
-/// - the path's language has no tree-sitter grammar, or
+/// - the path's language has no tree-sitter grammar,
+/// - either side exceeds `parse_budget::MAX_PARSE_FILE_SIZE`,
+/// - the process-wide parse budget has no room for it right now (advisory
+///   feature: skipped silently rather than blocking the write it decorates), or
 /// - no new errors were introduced.
 pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
     let FileType::Code(lang) = detect_file_type(path) else {
@@ -62,10 +65,15 @@ pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseRepor
     };
     let grammar = outline_language(lang)?;
 
-    // A `None` from parse_errors (tree-sitter `parser.parse()` failing
-    // internally) reads as a clean parse via `?`. Intentional advisory
-    // limitation — effectively unreachable here: tree-sitter is error-tolerant,
-    // the language is always set, and no parse timeout is configured.
+    if before.len() as u64 > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE
+        || after.len() as u64 > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE
+    {
+        return None;
+    }
+
+    // A `None` from parse_errors (grammar/parse failure, or the budget declining
+    // to admit this parse right now) reads as a clean parse via `?`. Intentional
+    // advisory limitation.
     let pre = parse_errors(&grammar, before)?;
     let post = parse_errors(&grammar, after)?;
 
@@ -109,9 +117,7 @@ pub(crate) fn format_report(report: &ParseReport) -> String {
 }
 
 fn parse_errors(grammar: &tree_sitter::Language, source: &str) -> Option<Vec<ParseError>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(grammar).ok()?;
-    let tree = parser.parse(source, None)?;
+    let tree = crate::lang::parse_budget::try_parse_budgeted(source, grammar)?;
     let mut errors = Vec::new();
     collect_errors(tree.root_node(), source.as_bytes(), &mut errors);
     errors.sort_by_key(|e| (e.line, e.col));
@@ -291,6 +297,19 @@ mod tests {
         assert!(
             formatted.contains("... and 5 more (15 new, 15 total)"),
             "summary missing: {formatted}",
+        );
+    }
+
+    #[test]
+    fn oversized_file_skips_the_check() {
+        // Content well past MAX_PARSE_FILE_SIZE with a real introduced error; the size gate
+        // must skip the check (and thus the parse) before ever reaching tree-sitter.
+        let filler = "a".repeat(crate::lang::parse_budget::MAX_PARSE_FILE_SIZE as usize + 1);
+        let before = format!("fn a() {{ 1 }}\n// {filler}\n");
+        let after = format!("fn a() {{ 1 \n// {filler}\n"); // missing closing brace
+        assert!(
+            check(&rust("oversized"), &before, &after).is_none(),
+            "an oversized file must skip the parse check entirely"
         );
     }
 

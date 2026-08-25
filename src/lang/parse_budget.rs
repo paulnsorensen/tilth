@@ -34,11 +34,16 @@
 //!
 //! ## What reserves, and what deliberately does not
 //!
-//! Six sites reserve here: `search::symbol::find_defs_treesitter`, `search::callers`,
-//! `search::callees`, `search::siblings`, `lang::outline::get_outline_entries`, and
+//! Seven sites reserve here: `search::symbol::find_defs_treesitter`, `search::callers`,
+//! `search::callees`, `search::siblings`, `lang::outline::get_outline_entries`,
 //! `diff::matching::compute_structural_hash` (the diff pair is worth naming because it runs
 //! under `par_iter` while calling `get_outline_entries` twice per changed file — parallel
-//! without being a file walk).
+//! without being a file walk), and `edit::parse_check::check`, via [`try_parse_budgeted`] rather
+//! than [`parse_budgeted`] — it runs synchronously on the `tilth_write` response path, not a
+//! walk thread, so it must never block waiting for space. It also gates on
+//! [`MAX_PARSE_FILE_SIZE`] itself before parsing at all, since it is advisory (a post-write
+//! error surface) and skipping it silently is a fine outcome; the write it decorates always
+//! completes independent of whether the check ran.
 //!
 //! `cache::OutlineCache::get_or_parse` deliberately does not reserve: it retains its tree in
 //! the cache beyond the call that produced it (bounded by an LRU entry cap in this fork, not by
@@ -148,6 +153,34 @@ impl ParseBudget {
         }
     }
 
+    /// Reserve `estimate` bytes without waiting: `None` if they do not currently fit.
+    ///
+    /// For callers that must never block — `edit::parse_check::check` runs synchronously on
+    /// the `tilth_write` response path, not a walk thread, so it skips its (advisory) check
+    /// rather than stalling a write behind unrelated walks' reservations. Still deadlock-free by
+    /// the same `*in_flight > 0` guard as `reserve`: it always admits when nothing else is in
+    /// flight.
+    fn try_reserve(&self, estimate: usize) -> Option<Permit<'_>> {
+        if self.ceiling == 0 {
+            return Some(Permit {
+                budget: self,
+                estimate: 0,
+            });
+        }
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *in_flight > 0 && *in_flight + estimate > self.ceiling {
+            return None;
+        }
+        *in_flight += estimate;
+        Some(Permit {
+            budget: self,
+            estimate,
+        })
+    }
+
     /// Estimated bytes currently reserved. Report-only; nothing branches on it outside `reserve`.
     #[cfg(test)]
     fn in_flight(&self) -> usize {
@@ -224,6 +257,23 @@ fn estimate_bytes(content: &str) -> usize {
 /// load or the parse itself fails, exactly as a bare `Parser::parse` call would.
 pub fn parse_budgeted(content: &str, ts_lang: &tree_sitter::Language) -> Option<BudgetedTree> {
     let permit = global().reserve(estimate_bytes(content));
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(ts_lang).ok()?;
+    let tree = parser.parse(content, None)?;
+    Some(BudgetedTree {
+        tree,
+        _permit: permit,
+    })
+}
+
+/// Non-blocking counterpart to [`parse_budgeted`]: `None` if the reservation does not currently
+/// fit, in addition to the grammar/parse failure cases `parse_budgeted` already returns `None`
+/// for. See [`ParseBudget::try_reserve`] for who needs this and why.
+pub(crate) fn try_parse_budgeted(
+    content: &str,
+    ts_lang: &tree_sitter::Language,
+) -> Option<BudgetedTree> {
+    let permit = global().try_reserve(estimate_bytes(content))?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(ts_lang).ok()?;
     let tree = parser.parse(content, None)?;
@@ -363,5 +413,34 @@ mod tests {
     #[test]
     fn an_empty_file_still_reserves() {
         assert_eq!(estimate_bytes(""), TREE_BYTES_PER_SOURCE_BYTE);
+    }
+
+    /// `try_reserve` never waits: it returns `None` immediately instead of blocking for space,
+    /// unlike `reserve`.
+    #[test]
+    fn try_reserve_declines_instead_of_waiting() {
+        let b = ParseBudget::with_ceiling(1000);
+        let _held = b.reserve(800);
+        assert_eq!(b.in_flight(), 800);
+
+        assert!(
+            b.try_reserve(400).is_none(),
+            "800 + 400 > 1000 with something in flight must decline, not wait"
+        );
+        assert_eq!(
+            b.in_flight(),
+            800,
+            "a declined try_reserve must not charge anything"
+        );
+    }
+
+    /// Like `reserve`, `try_reserve` still always admits when nothing else is in flight, however
+    /// large the estimate — the same deadlock-freedom property, just without waiting.
+    #[test]
+    fn try_reserve_admits_when_nothing_in_flight_however_large() {
+        let b = ParseBudget::with_ceiling(1024);
+        let p = b.try_reserve(64 * 1024 * 1024);
+        assert!(p.is_some());
+        assert_eq!(b.in_flight(), 64 * 1024 * 1024);
     }
 }
