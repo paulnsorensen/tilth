@@ -67,26 +67,53 @@ pub(super) fn resolve_anchored(
 }
 
 /// Resolve the `scope` arg under the trust-absolute posture (`resolve_anchored`).
-/// An omitted scope defaults to `"."` → `cwd`. When the anchored path does not
-/// resolve to an existing directory, fall back to `cwd` (the caller's checkout,
-/// always absolute) with a soft warning.
-pub(super) fn resolve_scope(
-    args: &Value,
-    cwd: &std::path::Path,
-) -> Result<(PathBuf, Option<String>), String> {
+/// An omitted scope defaults to `"."` → `cwd`.
+///
+/// When the anchored path does not resolve to an existing directory, this
+/// refuses rather than falling back to `cwd`. A silent fallback substitutes a
+/// search the caller did not ask for and cannot see they got — a scope naming
+/// one file that does not exist would silently widen to the whole checkout.
+/// Refusing is immediate and actionable; the error names which of three
+/// things went wrong — missing, not a directory, or unstattable — using
+/// `try_exists()` rather than `exists()`/`is_dir()` because both of those
+/// answer "no" to a permission error too.
+///
+/// Adapted from lack435/tilth 19c235e9d132d052700199ca9617c89c88d6ba02.
+pub(super) fn resolve_scope(args: &Value, cwd: &std::path::Path) -> Result<PathBuf, String> {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
     let raw: PathBuf = raw_str.into();
     let anchored = resolve_anchored(&raw, cwd)?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
-    if !resolved.is_dir() {
-        return Ok((
-            cwd.to_path_buf(),
-            Some(format!(
-                "scope \"{raw_str}\" is not a valid directory, searching the cwd/checkout directory instead.\n\n"
-            )),
-        ));
+    if resolved.is_dir() {
+        return Ok(resolved);
     }
-    Ok((resolved, None))
+
+    // Not a directory. Refused rather than widened to `cwd`.
+    //
+    // `is_dir()`/`exists()` both answer "no" to a permission error, so a bare "does
+    // not exist" would be a false statement about a directory that demonstrably exists.
+    let detail: String = match resolved.try_exists() {
+        Ok(true) => "exists but is not a directory (a file scope is not supported yet — \
+                     pass its parent directory)"
+            .to_string(),
+        Ok(false) => "does not exist".to_string(),
+        Err(e) => format!("cannot be inspected: {e}"),
+    };
+    // Name the resolved path too, but only when anchoring actually moved it — with a
+    // relative scope the two differ and which one is wrong is exactly what the caller
+    // cannot tell; with an absolute scope they already agree.
+    let resolved_str = resolved.display().to_string();
+    let same_place = |a: &str| a.trim_start_matches(r"\\?\").replace('\\', "/");
+    let where_it_looked = if same_place(&resolved_str) == same_place(raw_str) {
+        String::new()
+    } else {
+        format!(" (resolved to \"{resolved_str}\")")
+    };
+    Err(format!(
+        "scope \"{raw_str}\"{where_it_looked} {detail}. \
+         Refusing rather than falling back to a broader scope, which would silently \
+         search far more than you asked for."
+    ))
 }
 
 pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
@@ -160,9 +187,8 @@ mod tests {
     fn resolve_scope_explicit_absolute_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
-        let (scope, warning) = resolve_scope(&args, std::path::Path::new("/unused/cwd")).unwrap();
+        let scope = resolve_scope(&args, std::path::Path::new("/unused/cwd")).unwrap();
         assert_eq!(scope, tmp.path().canonicalize().unwrap());
-        assert!(warning.is_none());
     }
 
     #[test]
@@ -171,9 +197,8 @@ mod tests {
         // (require_cwd guarantees it), so this is a safe repo-wide search.
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({});
-        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
+        let scope = resolve_scope(&args, tmp.path()).unwrap();
         assert_eq!(scope, tmp.path().canonicalize().unwrap());
-        assert!(warning.is_none());
     }
 
     #[test]
@@ -183,22 +208,23 @@ mod tests {
         let sub = tmp.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         let args = serde_json::json!({ "scope": "sub" });
-        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
+        let scope = resolve_scope(&args, tmp.path()).unwrap();
         assert_eq!(scope, sub.canonicalize().unwrap());
-        assert!(warning.is_none());
     }
 
+    /// A `scope` that does not exist is refused, not widened to `cwd`. A silent
+    /// fallback substitutes a search the caller did not ask for — a scope naming
+    /// one file that does not exist would silently widen to the whole checkout.
     #[test]
-    fn resolve_scope_missing_dir_falls_back_to_cwd() {
-        // A missing anchored scope falls back to cwd (the caller's checkout,
-        // always absolute), with a soft warning — never to the server cwd.
+    fn resolve_scope_missing_dir_is_refused_not_widened_to_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
-        assert_eq!(scope, tmp.path(), "fallback must be cwd");
-        assert!(
-            warning.is_some() && warning.unwrap().contains("not a valid directory"),
-            "a soft warning must name the issue"
+        let err = resolve_scope(&args, tmp.path()).unwrap_err();
+        assert_eq!(
+            err,
+            "scope \"/nonexistent/directory/zzz\" does not exist. Refusing rather than \
+             falling back to a broader scope, which would silently search far more than \
+             you asked for."
         );
     }
 

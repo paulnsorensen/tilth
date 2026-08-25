@@ -19,7 +19,7 @@ pub(in crate::mcp) fn tool_grok(
             "missing required parameter: target (symbol name or \"path:line\", e.g. \"Type::method\" or \"src/file.rs:7\")",
         )?;
     let cwd = super::require_cwd(args)?;
-    let (scope, scope_warning) = resolve_scope(args, cwd)?;
+    let scope = resolve_scope(args, cwd)?;
     let budget = args
         .get("budget")
         .and_then(Value::as_u64)
@@ -33,9 +33,10 @@ pub(in crate::mcp) fn tool_grok(
 
     let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
         .map_err(|e| e.to_string())?;
-    let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::grok::format_grok(&result, &scope));
-    Ok(crate::budget::apply(&output, budget))
+    Ok(crate::budget::apply(
+        &crate::search::grok::format_grok(&result, &scope),
+        budget,
+    ))
 }
 
 #[cfg(test)]

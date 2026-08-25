@@ -104,7 +104,7 @@ pub(in crate::mcp) fn tool_search(
     }
     let combined = parts.join("\n\n---\n\n");
     let cwd = super::require_cwd(args)?;
-    let (scope, _) = resolve_scope(args, cwd)?;
+    let scope = resolve_scope(args, cwd)?;
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
@@ -132,7 +132,7 @@ fn tool_search_single(
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query (or queries array)")?;
     let cwd = super::require_cwd(args)?;
-    let (scope, scope_warning) = resolve_scope(args, cwd)?;
+    let scope = resolve_scope(args, cwd)?;
     let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")
@@ -264,9 +264,7 @@ fn tool_search_single(
     }
     .map_err(|e| e.to_string())?;
 
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&output);
-    Ok(result)
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
