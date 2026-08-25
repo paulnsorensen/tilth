@@ -105,6 +105,7 @@ pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
+    let cancel = crate::cancel::current();
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
@@ -115,7 +116,10 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
         .ignore(false)
         .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if cancel.is_cancelled() {
+                return false;
+            }
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
                     return !SKIP_DIRS.contains(&name);
@@ -159,6 +163,37 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     }
 
     Ok(builder.build_parallel())
+}
+
+/// Run a parallel walk, quitting early if the request that built it has been abandoned.
+///
+/// All search walks go through here rather than calling `WalkParallel::run` directly, so the
+/// cancellation and walk-budget checks have one home instead of many. The token and budget
+/// generation are captured here rather than threaded from `walker()`, matching
+/// `base_walk_builder`'s `filter_entry` capture.
+pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, mut factory: F)
+where
+    F: FnMut() -> Box<
+        dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
+    >,
+{
+    let cancel = crate::cancel::current();
+    let budget_gen = crate::walkbudget::generation();
+    walker.run(move || {
+        let cancel = cancel.clone();
+        let mut inner = factory();
+        Box::new(move |entry| {
+            if cancel.is_cancelled() {
+                return ignore::WalkState::Quit;
+            }
+            if let Ok(e) = &entry {
+                if crate::walkbudget::note_visit(budget_gen, e.path()) {
+                    return ignore::WalkState::Quit;
+                }
+            }
+            inner(entry)
+        })
+    });
 }
 
 /// Upper bound on file size searched by content/regex walkers. Files larger
@@ -242,7 +277,7 @@ fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
     let files_matched_glob = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
 
-    walker.run(|| {
+    run_walk(walker, || {
         let files_matched_glob = &files_matched_glob;
         let files_searched = &files_searched;
         Box::new(move |entry| {

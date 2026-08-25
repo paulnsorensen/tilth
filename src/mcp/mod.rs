@@ -445,7 +445,18 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
                 .into(),
         )
     } else {
-        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
+        // One request's walks are bracketed here. The serial request loop makes that exact
+        // for the live request; a worker abandoned by an earlier timeout keeps running, and
+        // is excluded by the generation `run_walk` captures rather than by this bracket.
+        crate::walkbudget::reset();
+        let out = run_tool_with_timeout(services, tool_name, args, timeout::request_timeout());
+        match out {
+            Ok(body) => {
+                let prefix = crate::walkbudget::report().unwrap_or_default();
+                Ok(format!("{prefix}{body}"))
+            }
+            err => err,
+        }
     };
 
     build_tool_response(req.id.clone(), result)

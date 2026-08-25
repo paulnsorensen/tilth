@@ -167,7 +167,7 @@ fn find_definitions(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         let found_count = &found_count;
 
@@ -524,7 +524,7 @@ fn find_usages(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         let found_count = &found_count;
 

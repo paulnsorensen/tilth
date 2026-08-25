@@ -74,7 +74,7 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
     let needle = target.as_bytes();
     let seen = AtomicBool::new(false);
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let seen = &seen;
         Box::new(move |entry| {
             if seen.load(Ordering::Relaxed) {
@@ -118,7 +118,7 @@ pub(crate) fn find_callers_batch(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         let found_count = &found_count;
 
