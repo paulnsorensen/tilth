@@ -171,6 +171,30 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
     })
 }
 
+/// The teaching example appended to a per-op deserialize error, tailored to the
+/// fumbled op `verb`. `replace_text` *is* find/replace, so it gets its own
+/// old/new example and drops the misleading "not find/replace" clause; a
+/// recognized line op gets the line-addressed `replace` example; an unknown or
+/// missing verb gets that example plus the list of valid op verbs.
+fn op_error_hint(verb: &str) -> String {
+    const LINE_EXAMPLE: &str = "Example op: \
+         {\"op\":\"replace\",\"start\":12,\"end\":14,\"content\":\"...\"} — ops are line-addressed \
+         using line numbers from the tagged read — not find/replace.";
+    const OP_VERBS: &str = "replace, replace_text, delete, insert_before, insert_after, prepend, \
+         append, replace_block, delete_block, insert_after_block, create_file, delete_file, \
+         move_file";
+    match verb {
+        "replace_text" => "Example op: \
+             {\"op\":\"replace_text\",\"old\":\"exact existing text\",\"new\":\"replacement\"} — \
+             old must match the file exactly once."
+            .to_string(),
+        "replace" | "delete" | "insert_before" | "insert_after" | "prepend" | "append"
+        | "replace_block" | "delete_block" | "insert_after_block" | "create_file"
+        | "delete_file" | "move_file" => LINE_EXAMPLE.to_string(),
+        _ => format!("{LINE_EXAMPLE} Valid ops: {OP_VERBS}."),
+    }
+}
+
 fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     let tag = match raw.tag {
         None => None,
@@ -194,9 +218,8 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
             .to_string();
         let parsed: JsonOp = serde_json::from_value(ov).map_err(|e| {
             format!(
-                "edits[{index}].ops[{j}] op \"{verb}\": {e}. Example op: \
-                 {{\"op\":\"replace\",\"start\":12,\"end\":14,\"content\":\"...\"}} — ops are \
-                 line-addressed using line numbers from the tagged read — not find/replace."
+                "edits[{index}].ops[{j}] op \"{verb}\": {e}. {}",
+                op_error_hint(&verb)
             )
         })?;
         ops.push(
@@ -558,6 +581,51 @@ mod tests {
                 old: "target".into(),
                 new: "replacement".into()
             }]
+        );
+    }
+
+    #[test]
+    fn replace_text_op_failure_teaches_find_replace_not_line_addressed() {
+        // The #200 class: a fumbled `replace_text` field must get a
+        // `replace_text` old/new example, NOT the line-addressed `replace`
+        // example, and must NOT be told the tool is "not find/replace" —
+        // `replace_text` *is* find/replace.
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "replace_text", "replace_all": true }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown field on replace_text must fail");
+        assert!(err.contains("replace_text"), "must name the op: {err}");
+        assert!(
+            err.contains(
+                r#"{"op":"replace_text","old":"exact existing text","new":"replacement"}"#
+            ),
+            "must show the replace_text example: {err}"
+        );
+        assert!(
+            !err.contains("not find/replace"),
+            "must not tell replace_text it is not find/replace: {err}"
+        );
+        assert!(
+            !err.contains("line-addressed"),
+            "must not push replace_text toward line-addressing: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_op_verb_lists_valid_ops() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "seed" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown verb must fail");
+        assert!(
+            err.contains("line-addressed"),
+            "unknown verb keeps the line example: {err}"
+        );
+        assert!(
+            err.contains("Valid ops:") && err.contains("replace_text"),
+            "unknown verb lists the valid op verbs: {err}"
         );
     }
 }
