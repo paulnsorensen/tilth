@@ -12,9 +12,19 @@ use crate::index::bloom::BloomFilterCache;
 /// query latency without surfacing useful matches.
 pub(super) const MAX_FILE_SIZE: u64 = 500_000;
 
+/// Outcome of [`read_with_bloom_check`].
+#[derive(Debug, PartialEq)]
+pub(super) enum BloomRead {
+    /// Content and mtime of a file at least one target is bloom-positive in.
+    Hit(String, SystemTime),
+    /// Oversized, or bloom-negative for every target.
+    Skip,
+    /// Stat, read, or UTF-8 decode failed.
+    Unreadable,
+}
+
 /// Read `path`, validate size, and pass through only when at least one
-/// target is bloom-positive. Returns `(content, mtime)` for the next stage,
-/// or `None` to skip the file.
+/// target is bloom-positive.
 ///
 /// Bloom is probabilistic: a positive may be a false positive. Callers that
 /// need a tighter pre-AST filter (e.g. memchr) should run it on the returned
@@ -24,26 +34,30 @@ pub(super) fn read_with_bloom_check<I, S>(
     targets: I,
     bloom: &BloomFilterCache,
     max_size: u64,
-) -> Option<(String, SystemTime)>
+) -> BloomRead
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let meta = std::fs::metadata(path).ok()?;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return BloomRead::Unreadable;
+    };
     if meta.len() > max_size {
-        return None;
+        return BloomRead::Skip;
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let content = std::fs::read_to_string(path).ok()?;
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BloomRead::Unreadable;
+    };
 
     if !targets
         .into_iter()
         .any(|t| bloom.contains(path, mtime, &content, t.as_ref()))
     {
-        return None;
+        return BloomRead::Skip;
     }
 
-    Some((content, mtime))
+    BloomRead::Hit(content, mtime)
 }
 
 #[cfg(test)]
@@ -53,7 +67,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn returns_none_for_oversized_file() {
+    fn returns_skip_for_oversized_file() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("big.rs");
         // Fill past max_size
@@ -62,17 +76,23 @@ mod tests {
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["foo".to_string()].into_iter().collect();
         // max_size below file len → skip
-        assert!(read_with_bloom_check(&p, &targets, &bloom, 1).is_none());
+        assert_eq!(
+            read_with_bloom_check(&p, &targets, &bloom, 1),
+            BloomRead::Skip
+        );
     }
 
     #[test]
-    fn returns_none_when_no_target_is_bloom_positive() {
+    fn returns_skip_when_no_target_is_bloom_positive() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a.rs");
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["beta".to_string()].into_iter().collect();
-        assert!(read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).is_none());
+        assert_eq!(
+            read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE),
+            BloomRead::Skip
+        );
     }
 
     #[test]
@@ -82,8 +102,36 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["alpha".to_string()].into_iter().collect();
-        let (content, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).unwrap();
+        let BloomRead::Hit(content, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE)
+        else {
+            panic!("expected a bloom hit");
+        };
         assert!(content.contains("alpha"));
+    }
+
+    #[test]
+    fn returns_unreadable_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("missing.rs");
+        let bloom = BloomFilterCache::new();
+        let targets: HashSet<&str> = ["alpha"].into_iter().collect();
+        assert_eq!(
+            read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE),
+            BloomRead::Unreadable
+        );
+    }
+
+    #[test]
+    fn returns_unreadable_for_non_utf8_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("latin1.rs");
+        fs::write(&p, b"fn alpha() {} // caf\xe9\n").unwrap();
+        let bloom = BloomFilterCache::new();
+        let targets: HashSet<&str> = ["alpha"].into_iter().collect();
+        assert_eq!(
+            read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE),
+            BloomRead::Unreadable
+        );
     }
 
     #[test]
@@ -95,6 +143,9 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<&str> = ["alpha"].into_iter().collect();
-        assert!(read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).is_some());
+        let BloomRead::Hit(_, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE)
+        else {
+            panic!("expected a bloom hit");
+        };
     }
 }

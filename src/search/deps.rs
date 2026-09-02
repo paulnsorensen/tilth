@@ -172,7 +172,7 @@ pub fn analyze_deps(
 
     let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch(
+        let (raw_matches, _) = find_callers_batch(
             &symbols_set,
             scope,
             bloom,

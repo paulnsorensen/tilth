@@ -138,6 +138,12 @@ pub struct SearchResult {
     pub total_found: usize,
     pub definitions: usize,
     pub usages: usize,
+    /// Files the walk could not read: I/O failures for any file, plus UTF-8
+    /// decode failures for code and markdown files (the kinds the definition
+    /// walk mines). Symbol search takes the max across its definition and
+    /// usage walks since both visit the same files. Nonzero means the result
+    /// may be incomplete; the headers surface it.
+    pub files_unreadable: usize,
     /// Pre-cap subfacet counts. Computed in `symbol::search` by faceting the
     /// merged set before truncation; used by the renderer to print
     /// `displayed/total` headings and the per-facet hidden-count tail line.

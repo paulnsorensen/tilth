@@ -58,6 +58,7 @@ pub fn search(
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     // Early-quit checks are approximate by design — one extra iteration is harmless.
     let total_found = AtomicUsize::new(0);
+    let files_unreadable = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
@@ -65,6 +66,7 @@ pub fn search(
         let matcher = &matcher;
         let matches = &matches;
         let total_found = &total_found;
+        let files_unreadable = &files_unreadable;
 
         Box::new(move |entry| {
             if total_found.load(Ordering::Relaxed) >= early_quit {
@@ -81,6 +83,7 @@ pub fn search(
             // share a single kernel read — no double I/O, no TOCTOU window
             // between the heuristic and the search.
             let Ok(bytes) = std::fs::read(path) else {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
                 return ignore::WalkState::Continue;
             };
 
@@ -149,6 +152,7 @@ pub fn search(
             total_found: total,
             definitions: 0,
             usages: total,
+            files_unreadable: files_unreadable.load(Ordering::Relaxed),
             facet_totals: FacetTotals::default(),
         },
         fallback_reason,

@@ -655,7 +655,7 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let (raw_callers, _) = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()

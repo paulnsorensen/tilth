@@ -105,22 +105,25 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
 }
 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
-/// Returns tuples of (`target_name`, match) so callers know which symbol was matched.
+/// Returns tuples of (`target_name`, match) so callers know which symbol was matched,
+/// plus the count of code files the walk could not read.
 pub(crate) fn find_callers_batch(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<(String, CallerMatch)>, TilthError> {
+) -> Result<(Vec<(String, CallerMatch)>, usize), TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
+    let files_unreadable = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let files_unreadable = &files_unreadable;
 
         Box::new(move |entry| {
             // Early termination: enough callers found
@@ -138,14 +141,29 @@ pub(crate) fn find_callers_batch(
 
             let path = entry.path();
 
+            // Only process files with tree-sitter grammars
+            let file_type = detect_file_type(path);
+            let FileType::Code(lang) = file_type else {
+                return ignore::WalkState::Continue;
+            };
+
+            let Some(ts_lang) = outline_language(lang) else {
+                return ignore::WalkState::Continue;
+            };
+
             // Read + size-gate + bloom prefilter in one shared step.
-            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
+            let content = match super::bloom_walk::read_with_bloom_check(
                 path,
                 targets,
                 bloom,
                 super::bloom_walk::MAX_FILE_SIZE,
-            ) else {
-                return ignore::WalkState::Continue;
+            ) {
+                super::bloom_walk::BloomRead::Hit(content, _mtime) => content,
+                super::bloom_walk::BloomRead::Skip => return ignore::WalkState::Continue,
+                super::bloom_walk::BloomRead::Unreadable => {
+                    files_unreadable.fetch_add(1, Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
+                }
             };
 
             // Fast byte check via memchr::memmem (SIMD) — cheap second pass that
@@ -156,16 +174,6 @@ pub(crate) fn find_callers_batch(
             {
                 return ignore::WalkState::Continue;
             }
-
-            // Only process files with tree-sitter grammars
-            let file_type = detect_file_type(path);
-            let FileType::Code(lang) = file_type else {
-                return ignore::WalkState::Continue;
-            };
-
-            let Some(ts_lang) = outline_language(lang) else {
-                return ignore::WalkState::Continue;
-            };
 
             let content = Arc::new(content);
             let file_callers =
@@ -183,9 +191,10 @@ pub(crate) fn find_callers_batch(
         })
     });
 
-    Ok(matches
+    let matches = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 
 /// Tree-sitter call site detection for a set of target symbols.
@@ -313,12 +322,18 @@ pub fn search_callers_expanded(
         (MAX_MATCHES, BATCH_EARLY_QUIT)
     };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
+    let (raw, files_unreadable) = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
         let target_seen = target_seen_in_scope(target, scope, glob);
-        return Ok(no_callers_message(target, scope, target_seen, glob));
+        return Ok(no_callers_message(
+            target,
+            scope,
+            target_seen,
+            glob,
+            files_unreadable,
+        ));
     }
 
     // Sort by relevance (context file first, then by proximity)
@@ -337,7 +352,15 @@ pub fn search_callers_expanded(
     sorted_callers.truncate(max_matches);
 
     let mut output = String::new();
-    write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
+    write_caller_bucket(
+        &mut output,
+        target,
+        scope,
+        total,
+        &sorted_callers,
+        expand,
+        files_unreadable,
+    );
     write_second_hop_impact(
         &mut output,
         &all_caller_names,
@@ -372,14 +395,16 @@ fn write_caller_bucket(
     total: usize,
     sorted_callers: &[CallerMatch],
     expand: usize,
+    files_unreadable: usize,
 ) {
     let _ = writeln!(
         output,
-        "# Callers of \"{}\" in {} — {} call site{}",
+        "# Callers of \"{}\" in {} — {} call site{}{}",
         target,
         scope.display(),
         total,
-        if total == 1 { "" } else { "s" }
+        if total == 1 { "" } else { "s" },
+        crate::format::unreadable_note(files_unreadable)
     );
 
     for (i, caller) in sorted_callers.iter().enumerate() {
@@ -446,7 +471,7 @@ fn write_second_hop_impact(
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
     }
-    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
+    let Ok((hop2, _)) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
         return;
     };
 
@@ -551,7 +576,7 @@ pub fn search_callers_multi_expanded(
     let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
 
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
+    let (raw, files_unreadable) = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
 
     // Bucket matches by which target they call. Preserve the caller-supplied
     // target order so output is deterministic.
@@ -567,7 +592,13 @@ pub fn search_callers_multi_expanded(
 
         if callers.is_empty() {
             let target_seen = target_seen_in_scope(target, scope, glob);
-            output.push_str(&no_callers_message(target, scope, target_seen, glob));
+            output.push_str(&no_callers_message(
+                target,
+                scope,
+                target_seen,
+                glob,
+                files_unreadable,
+            ));
             output.push_str("\n\n");
             continue;
         }
@@ -586,7 +617,15 @@ pub fn search_callers_multi_expanded(
 
         callers.truncate(max_matches);
 
-        write_caller_bucket(&mut output, target, scope, total, &callers, expand);
+        write_caller_bucket(
+            &mut output,
+            target,
+            scope,
+            total,
+            &callers,
+            expand,
+            files_unreadable,
+        );
         write_second_hop_impact(
             &mut output,
             &all_caller_names,
@@ -617,10 +656,17 @@ pub fn search_callers_multi_expanded(
 /// the literal name never appears in scope — most often a typo or wrong
 /// scope, so we suppress the indirect-dispatch hint to avoid misleading
 /// the agent.
-fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Option<&str>) -> String {
+fn no_callers_message(
+    target: &str,
+    scope: &Path,
+    target_seen: bool,
+    glob: Option<&str>,
+    files_unreadable: usize,
+) -> String {
+    let unreadable = crate::format::unreadable_note(files_unreadable);
     if !target_seen {
         return format!(
-            "# Callers of \"{target}\" in {scope_disp} — no call sites found\n\n\
+            "# Callers of \"{target}\" in {scope_disp} — no call sites found{unreadable}\n\n\
              The name \"{target}\" does not appear anywhere in scope. \
              Check the spelling, or widen scope if you expected hits outside this directory.",
             scope_disp = scope.display()
@@ -635,7 +681,7 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
         ""
     };
     format!(
-        "# Callers of \"{target}\" in {scope_disp} — no direct call sites found\n\n\
+        "# Callers of \"{target}\" in {scope_disp} — no direct call sites found{unreadable}\n\n\
          \"{target}\" appears in the codebase but has no syntactic call sites. \
          tilth detects only direct, by-name calls; this symbol may still be reachable via:\n\
          \n  • interface / trait dispatch (Rust `dyn Trait`, Go interface, Java/Kotlin abstract method)\
@@ -743,7 +789,7 @@ mod tests {
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {
-        let msg = no_callers_message("doesNotExist", Path::new("/repo"), false, None);
+        let msg = no_callers_message("doesNotExist", Path::new("/repo"), false, None, 0);
         assert!(msg.contains("does not appear anywhere in scope"));
         assert!(msg.contains("Check the spelling"));
         // Must NOT include the indirect-dispatch hint — that would mislead.
@@ -753,7 +799,7 @@ mod tests {
 
     #[test]
     fn no_callers_message_for_seen_symbol_lists_indirection_modes() {
-        let msg = no_callers_message("Foo", Path::new("/repo"), true, None);
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, None, 0);
         assert!(msg.contains("appears in the codebase"));
         assert!(msg.contains("interface"));
         assert!(msg.contains("reflection"));
@@ -768,7 +814,7 @@ mod tests {
     /// agent into thinking tilth filtered something it did not.
     #[test]
     fn no_callers_message_omits_glob_hint_when_no_glob() {
-        let msg = no_callers_message("Foo", Path::new("/repo"), true, None);
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, None, 0);
         assert!(
             !msg.contains("test files"),
             "glob-driven hint must not appear when glob is None: {msg}"
@@ -777,7 +823,7 @@ mod tests {
 
     #[test]
     fn no_callers_message_includes_glob_hint_when_glob_set() {
-        let msg = no_callers_message("Foo", Path::new("/repo"), true, Some("*.rs"));
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, Some("*.rs"), 0);
         assert!(
             msg.contains("test files"),
             "glob-driven hint should appear when glob is Some: {msg}"
