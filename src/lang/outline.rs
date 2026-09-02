@@ -1,4 +1,4 @@
-use crate::lang::treesitter::{node_text_simple, NodeTextMode};
+use crate::lang::treesitter::{extract_definition_name, node_text_simple, NodeTextMode};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -179,6 +179,7 @@ fn node_to_entry(
         "const_item" | "const_declaration" | "static_item" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| first_identifier_text(node, lines))
+                .or_else(|| extract_definition_name(node, lines))
                 .unwrap_or_else(|| "<const>".into());
             (OutlineKind::Constant, name, None)
         }
@@ -186,8 +187,10 @@ fn node_to_entry(
             let name = first_identifier_text(node, lines).unwrap_or_else(|| "<val>".into());
             (OutlineKind::ImmutableVariable, name, None)
         }
-        "lexical_declaration" | "variable_declaration" | "var_definition" => {
-            let name = first_identifier_text(node, lines).unwrap_or_else(|| "<var>".into());
+        "lexical_declaration" | "variable_declaration" | "var_definition" | "var_declaration" => {
+            let name = first_identifier_text(node, lines)
+                .or_else(|| extract_definition_name(node, lines))
+                .unwrap_or_else(|| "<var>".into());
             (OutlineKind::Variable, name, None)
         }
 
@@ -1103,6 +1106,25 @@ main() {
         assert!(
             !names.contains(&"y"),
             "nested local 'y' must not appear in top-level outline, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn go_outline_names_const_and_var_declarations() {
+        let src =
+            "package x\n\nvar GlobalVar = 1\nconst MaxRetries = 3\nconst (\n\tA = 1\n\tB = 2\n)\n";
+        let entries = get_outline_entries(src, Lang::Go);
+        let mut got = Vec::new();
+        for entry in &entries {
+            got.push((entry.kind, entry.name.as_str(), entry.start_line));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (OutlineKind::Variable, "GlobalVar", 3),
+                (OutlineKind::Constant, "MaxRetries", 4),
+                (OutlineKind::Constant, "A", 5),
+            ]
         );
     }
 

@@ -141,7 +141,7 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         "trait_declaration" | "trait_item" => "trait",
         "type_alias_declaration" | "type_item" | "type_declaration" => "type",
         "enum_item" | "enum_declaration" => "enum",
-        "lexical_declaration" | "variable_declaration" => "variable",
+        "lexical_declaration" | "variable_declaration" | "var_declaration" => "variable",
         "const_item" | "const_declaration" => "const",
         "static_item" => "static",
         "property_declaration" => "property",

@@ -39,8 +39,9 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "namespace_definition",
     // Python
     "decorated_definition",
-    // Go
+    // Go (`var_declaration` is also Scala's abstract `var x: T`, named via its `name` field)
     "type_declaration",
+    "var_declaration",
     // Exports
     "export_statement",
 ];
@@ -76,22 +77,21 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
-    // Go `type_declaration` wraps the named node: `type X struct{...}` parses
-    // as type_declaration → type_spec (or type_alias for `type X = Y`), and
-    // the `name` field lives on that inner node, so the field walk above finds
-    // nothing and every Go type definition would be dropped as nameless.
-    if node.kind() == "type_declaration" {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "type_spec" || child.kind() == "type_alias" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let text = node_text_simple(name_node, lines, NodeTextMode::Full);
-                    if !text.is_empty() {
-                        return Some(text);
-                    }
-                }
+    // Go `type_declaration` / `const_declaration` / `var_declaration` wrap the
+    // named node: `type X struct{...}` parses as type_declaration → type_spec
+    // (or type_alias for `type X = Y`), `const X = 1` as const_declaration →
+    // const_spec, `var X = 1` as var_declaration → var_spec (nested under
+    // var_spec_list for `var ( ... )` groups). The `name` field lives on that
+    // inner spec, so the field walk above finds nothing and every Go
+    // type/const/var definition would be dropped as nameless. Grouped
+    // declarations surface their first spec's name.
+    match node.kind() {
+        "type_declaration" | "const_declaration" | "var_declaration" => {
+            if let Some(name) = go_spec_name(node, lines) {
+                return Some(name);
             }
         }
+        _ => {}
     }
 
     // JS/TS `lexical_declaration` and C# `variable_declaration` store the
@@ -112,6 +112,30 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
+    None
+}
+
+fn go_spec_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "type_spec" | "type_alias" | "const_spec" | "var_spec" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let text = node_text_simple(name_node, lines, NodeTextMode::Full);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            "var_spec_list" => {
+                if let Some(name) = go_spec_name(child, lines) {
+                    return Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
     None
 }
 
@@ -253,7 +277,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "type_declaration"
         | "decorated_definition" => 100,
         "impl_item" | "object_declaration" => 90,
-        "const_item" | "const_declaration" | "static_item" => 80,
+        "const_item" | "const_declaration" | "var_declaration" | "static_item" => 80,
         "mod_item" | "namespace_definition" | "property_declaration" => 70,
         "lexical_declaration" | "variable_declaration" => 40,
         "variable_assignment" => 60,
@@ -435,6 +459,53 @@ mod tests {
         assert_eq!(
             extract_definition_name(node, &lines),
             Some("HandlersChain".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_go_const_declaration() {
+        let src = "const MaxRetries = 3\n";
+        let tree = parse(src, Lang::Go);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "const_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("MaxRetries".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_go_var_declaration() {
+        let src = "var GlobalVar = 1\n";
+        let tree = parse(src, Lang::Go);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "var_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("GlobalVar".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_go_grouped_const_and_var_take_first_spec() {
+        let src = "const (\n\tA = 1\n\tB = 2\n)\nvar (\n\tC = 3\n\tD = 4\n)\n";
+        let tree = parse(src, Lang::Go);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "const_declaration");
+        assert_eq!(extract_definition_name(node, &lines), Some("A".to_string()));
+        let node = find_by_kind(tree.root_node(), "var_declaration");
+        assert_eq!(extract_definition_name(node, &lines), Some("C".to_string()));
+    }
+
+    #[test]
+    fn extract_definition_name_scala_var_declaration_uses_name_field() {
+        let src = "trait Counter {\n  var count: Int\n}\n";
+        let tree = parse(src, Lang::Scala);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "var_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("count".to_string())
         );
     }
 

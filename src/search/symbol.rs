@@ -847,6 +847,42 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
     }
 
     #[test]
+    fn go_const_and_var_declarations_detected_as_definitions() {
+        let code = "package x\n\nvar GlobalVar = 1\nconst MaxRetries = 3\nfunc UseIt() int { return GlobalVar + MaxRetries }\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Go).unwrap();
+
+        for (query, line) in [("GlobalVar", 3), ("MaxRetries", 4)] {
+            let defs = find_defs_treesitter(
+                std::path::Path::new("x.go"),
+                query,
+                &ts_lang,
+                Some(crate::types::Lang::Go),
+                code,
+                5,
+                SystemTime::now(),
+            );
+            assert_eq!(defs.len(), 1, "{query}: expected one definition");
+            let def = &defs[0];
+            assert!(
+                def.is_definition,
+                "{query}: declaration line is a definition"
+            );
+            assert_eq!(def.line, line, "{query}: definition line");
+            assert_eq!(
+                def.def_range,
+                Some((line, line)),
+                "{query}: definition range"
+            );
+            assert_eq!(
+                def.def_name.as_deref(),
+                Some(query),
+                "{query}: definition name"
+            );
+            assert_eq!(def.def_weight, 80, "{query}: const/var weight");
+        }
+    }
+
+    #[test]
     fn typescript_export_const_detected_as_definition() {
         let code = r#"export const UNTAGGED_REQUESTS_SQL = `SELECT foo FROM bar`;
 
