@@ -77,7 +77,7 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 ```bash
 cargo build --release        # release build
 cargo test                   # unit tests (in-source #[cfg(test)] modules)
-cargo clippy -- -D warnings  # lint
+cargo clippy --all-targets -- -D warnings  # lint
 cargo fmt --check            # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
 ```

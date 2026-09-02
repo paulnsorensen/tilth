@@ -1,22 +1,8 @@
 // The tilth_write tool schema is one deeply-nested `serde_json::json!` literal;
 // its per-op `oneOf` branches exceed the default 128-frame macro recursion limit.
 #![recursion_limit = "256"]
-#![warn(clippy::pedantic)]
-#![allow(
-    clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit
-    clippy::cast_sign_loss,            // same
-    clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
-    clippy::module_name_repetitions,   // Rust naming conventions
-    clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
-                                       // narrow to a per-function allow once a refactor shrinks that file
-    clippy::too_many_arguments,        // internal recursive AST walker
-    clippy::unnecessary_wraps,         // Result return for API consistency
-    clippy::struct_excessive_bools,    // CLI struct derives clap
-    clippy::missing_errors_doc,        // internal pub(crate) fns don't need error docs
-    clippy::missing_panics_doc,        // same
-)]
-
+// `clippy::pedantic` and its allow list are configured in `[lints.clippy]` in Cargo.toml, so they
+// reach every target rather than just this crate root. See the note there.
 pub(crate) mod budget;
 pub mod cache;
 pub(crate) mod classify;
