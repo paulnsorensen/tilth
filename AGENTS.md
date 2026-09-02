@@ -1,4 +1,4 @@
-<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->
+<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md + prompts/mcp-v2-nudge.md by scripts/regen-agents-md.sh — do not edit directly -->
 
 ## Base mode
 
@@ -43,3 +43,9 @@ JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls 
 
 ROUTE: find/explore → `tilth_search`; read → `tilth_read`; importers/imports → `tilth_deps` (not import-greps); understand one symbol → `tilth_grok` (replaces search → expand → callers); changes → `tilth_diff`; browse → `tilth_list` (omit `patterns` for a project overview); edit → `tilth_write`.
 DO NOT re-read expanded search content.
+
+## Search-v2 surfaces
+
+Spliced above the ROUTE line in either mode when `--search-surface v2|both`:
+
+PREFER `tilth_search_v2` for find/explore when advertised: `queries: [{query, glob?}]` (1-10) + `cwd`; follow its `hints`.
