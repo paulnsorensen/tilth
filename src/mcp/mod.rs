@@ -608,18 +608,18 @@ mod tests {
         let args = serde_json::json!({ "cwd": "/" });
 
         let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
-        assert!(
-            files_err.contains("did you mean 'tilth_list'") && files_err.contains("'tilth_read'"),
-            "tilth_files must suggest tilth_list/tilth_read: {files_err}"
+        assert_eq!(
+            files_err,
+            "unknown tool 'tilth_files' — did you mean 'tilth_list' \
+            (directory listing) or 'tilth_read' (file contents)?"
         );
 
         let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
-        assert!(
-            edit_err.contains("did you mean 'tilth_write'"),
-            "tilth_edit must suggest tilth_write: {edit_err}"
+        assert_eq!(
+            edit_err,
+            "unknown tool 'tilth_edit' — did you mean 'tilth_write'?"
         );
 
-        // Genuinely unknown names keep the plain message — no suggestion.
         let other_err = dispatch_tool("tilth_bogus", &args, &services).unwrap_err();
         assert_eq!(other_err, "unknown tool: tilth_bogus");
     }
