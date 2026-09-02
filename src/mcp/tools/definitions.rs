@@ -20,7 +20,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool, surface: SearchSurface) 
                             "type": "object",
                             "required": ["query"],
                             "properties": {
-                                "query": {"type": "string", "description": "Symbol, text, or regex. Commas split up to five symbols only for any/symbol/callers; use separate entries for mixed terms."},
+                                "query": {"type": "string", "description": "Symbol, text, or regex. Commas split symbols only for any/symbol/callers; use separate entries for mixed terms."},
                                 "glob": {"type": "string"},
                                 "kind": {"type": "string", "enum": ["any", "symbol", "content", "regex", "callers"]}
                             }

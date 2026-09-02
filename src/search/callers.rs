@@ -34,9 +34,7 @@ const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
 /// `FULL_BATCH_EARLY_QUIT`) sized for one symbol therefore starves later
 /// targets in a multi-target search once an earlier, hit-rich target
 /// consumes it. Scaling linearly by target count gives each target
-/// approximately its own full budget's worth of headroom; `n_targets` is
-/// already bounded to 5 by the dispatch layer (`tool_search`'s
-/// `2..=5 => ...` arm), so the scaled result stays bounded too.
+/// approximately its own full budget's worth of headroom.
 ///
 /// Note: the early-quit mechanism itself is a coarse walk-wide heuristic
 /// that is a candidate for removal/replacement in a future change — this
@@ -507,7 +505,7 @@ fn write_second_hop_impact(
     });
 }
 
-/// Multi-target caller search: find call sites of 2..=5 symbols in a single
+/// Multi-target caller search: find call sites of two or more symbols in a single
 /// walk via `find_callers_batch`, then render one labeled section per target.
 /// Mirrors `search_multi_symbol_expanded` for the `kind=callers` comma path.
 ///
