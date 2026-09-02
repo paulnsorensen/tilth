@@ -886,9 +886,9 @@ mod tests {
     /// symbol, and the response body stays inside the budget.
     #[test]
     fn many_symbols_respect_budget() {
+        use std::fmt::Write as _;
         let tmp = tempfile::tempdir().unwrap();
         let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
-        use std::fmt::Write as _;
         let mut src = String::new();
         for name in names {
             let _ = writeln!(src, "fn {name}() {{");
