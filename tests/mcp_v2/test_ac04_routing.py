@@ -15,7 +15,7 @@ ROUTE_EXPECTATIONS = {
     "literal": ("DO NOT re-read expanded search content", "literal"),
     "regex_fallback": (r"fn\s+detect_file_type", "regex"),
     "ambiguous_symbol": ("run", "ambiguous"),
-    "miss": ("zzz_definitely_not_present_zzz", "miss"),
+    "miss": ("tilth_absent_probe_" + "91c6a4", "miss"),
 }
 
 
@@ -24,11 +24,14 @@ def setUpModule():
 
 
 class AC04Routing(unittest.TestCase):
-    def _call(self, query):
+    def _call(self, query, glob=None):
+        entry = {"query": query}
+        if glob is not None:
+            entry["glob"] = glob
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(
-                2, "tilth_search_v2", {"queries": [{"query": query}], "cwd": CWD}
+                2, "tilth_search_v2", {"queries": [entry], "cwd": CWD}
             ),
         ]
         res = harness.run_mcp(["--search-surface", "both"], requests)
@@ -47,6 +50,36 @@ class AC04Routing(unittest.TestCase):
 
     def test_unique_symbol(self):
         self._assert_route("unique_symbol")
+
+    def test_usage_only_identifier_in_exact_file_ignores_external_definition(self):
+        response = self._call(
+            "SearchTelemetryRecord", "src/mcp/tools/search_v2.rs"
+        )
+        self.assertIsNotNone(response)
+        result = json.loads(harness.tool_result_text(response))["results"][0]
+        self.assertEqual(result["resolved_as"], "literal")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
+        self.assertNotIn("src/telemetry.rs:", result["preview"])
+        self.assertIn(
+            "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
+            result["preview"],
+        )
+
+    def test_regex_in_exact_file_stays_bounded_to_requested_path(self):
+        response = self._call(
+            "SearchTelemetryRecord.*", "src/mcp/tools/search_v2.rs"
+        )
+        self.assertIsNotNone(response)
+        result = json.loads(harness.tool_result_text(response))["results"][0]
+        self.assertEqual(result["resolved_as"], "regex")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
+        self.assertNotIn("src/telemetry.rs:", result["preview"])
+        self.assertIn(
+            "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
+            result["preview"],
+        )
 
     def test_literal(self):
         self._assert_route("literal")

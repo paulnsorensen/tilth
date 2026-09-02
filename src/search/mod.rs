@@ -104,6 +104,10 @@ pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// sequential map walker (`crate::map::generate`), which each apply their own
 /// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
+    walk_builder(scope, None)
+}
+
+fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
@@ -115,13 +119,19 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
         .ignore(false)
         .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
-                }
+        .filter_entry(move |entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| SKIP_DIRS.contains(&name))
+            {
+                return false;
             }
-            true
+
+            exact_target
+                .as_ref()
+                .is_none_or(|target| target.starts_with(entry.path()))
         });
     builder
 }
@@ -130,7 +140,8 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
 /// directories and anything a repo's `.tilthignore` excludes. `.gitignore` is
 /// intentionally NOT honored — gitignored-but-relevant files (generated code,
 /// local configs) stay findable; `.tilthignore` is the opt-in deny knob.
-/// When `glob` is Some, applies a file-pattern override (whitelist or negation).
+/// When `glob` names one exact file, the walker prunes unrelated directories.
+/// Other globs use an override pattern.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
         .ok()
@@ -139,11 +150,13 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let mut builder = base_walk_builder(scope);
+    let exact_target = exact_glob_target(scope, glob);
+    let has_exact_target = exact_target.is_some();
+    let mut builder = walk_builder(scope, exact_target);
     builder.threads(threads);
 
-    if let Some(pattern) = glob {
-        if !pattern.is_empty() {
+    if !has_exact_target {
+        if let Some(pattern) = glob.filter(|pattern| !pattern.is_empty()) {
             let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
             overrides
                 .add(pattern)
@@ -159,6 +172,31 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     }
 
     Ok(builder.build_parallel())
+}
+
+fn exact_glob_target(scope: &Path, glob: Option<&str>) -> Option<PathBuf> {
+    let pattern = glob?;
+    if pattern.is_empty()
+        || !pattern.contains('/')
+        || pattern.starts_with('!')
+        || pattern
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}') || byte == 92)
+    {
+        return None;
+    }
+
+    let relative = Path::new(pattern);
+    if !relative.is_relative()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let target = scope.join(relative);
+    target.is_file().then_some(target)
 }
 
 /// Upper bound on file size searched by content/regex walkers. Files larger
@@ -1870,6 +1908,22 @@ mod tests {
         v
     }
 
+    #[cfg(unix)]
+    fn walk_errors(scope: &Path, glob: Option<&str>) -> Vec<String> {
+        let walker = walker(scope, glob).expect("walker build failed");
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        walker.run(|| {
+            let errors = &errors;
+            Box::new(move |entry| {
+                if let Err(error) = entry {
+                    errors.lock().unwrap().push(error.to_string());
+                }
+                ignore::WalkState::Continue
+            })
+        });
+        errors.into_inner().unwrap()
+    }
+
     fn extensions(paths: &[PathBuf]) -> HashSet<String> {
         paths
             .iter()
@@ -2002,6 +2056,139 @@ mod tests {
         let all = walk_paths(&scope, None);
         let empty = walk_paths(&scope, Some(""));
         assert_eq!(all.len(), empty.len(), "empty glob should behave like None");
+    }
+
+    #[test]
+    fn walker_exact_file_glob_prunes_to_target_and_honors_tilthignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let target = nested.join("target.rs");
+        std::fs::write(&target, "fn target() {}").unwrap();
+        std::fs::write(tmp.path().join("unrelated.rs"), "fn unrelated() {}").unwrap();
+
+        assert_eq!(
+            walk_paths(tmp.path(), Some("nested/target.rs")),
+            vec![target.clone()]
+        );
+
+        std::fs::write(nested.join(".tilthignore"), "target.rs\n").unwrap();
+        assert!(
+            walk_paths(tmp.path(), Some("nested/target.rs")).is_empty(),
+            "exact-file optimization must preserve nested .tilthignore rules"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_walk_does_not_descend_unrelated_subtrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wanted = tmp.path().join("wanted");
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir(&wanted).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(wanted.join("target.rs"), "fn target() {}\n").unwrap();
+        std::os::unix::fs::symlink(&unrelated, unrelated.join("loop")).unwrap();
+
+        let broad_errors = walk_errors(tmp.path(), None);
+        assert!(
+            broad_errors.iter().any(|error| error.contains("loop")),
+            "the symlink-loop sentinel must prove broad traversal: {broad_errors:?}"
+        );
+
+        let exact_errors = walk_errors(tmp.path(), Some("wanted/target.rs"));
+        assert!(
+            exact_errors.is_empty(),
+            "exact-file walking must prune the unrelated loop: {exact_errors:?}"
+        );
+    }
+
+    #[test]
+    fn exact_glob_target_rejects_absolute_parent_wildcard_negated_and_missing_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = tmp.path().join("scope");
+        let nested = scope.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root_target = scope.join("target.rs");
+        let target = nested.join("target.rs");
+        let outside = tmp.path().join("outside.rs");
+        std::fs::write(&root_target, "fn root_target() {}\n").unwrap();
+        std::fs::write(&target, "fn target() {}\n").unwrap();
+        std::fs::write(&outside, "fn outside() {}\n").unwrap();
+
+        assert_eq!(
+            exact_glob_target(&scope, Some("nested/target.rs")),
+            Some(target.clone())
+        );
+        for pattern in [
+            outside.to_str().unwrap(),
+            "../outside.rs",
+            "*.rs",
+            "target?.rs",
+            "[t]arget.rs",
+            "{target,other}.rs",
+            r"target\.rs",
+            "!target.rs",
+            "",
+            "missing.rs",
+            "target.rs",
+        ] {
+            assert_eq!(
+                exact_glob_target(&scope, Some(pattern)),
+                None,
+                "unsafe or unmatched glob must not be treated as an exact file: {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_file_search_returns_target_content_and_honors_nested_tilthignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let target = nested.join("target.txt");
+        let sibling = nested.join("sibling.txt");
+        let root_target = tmp.path().join("target.txt");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&target, "TARGET_MARKER target\n").unwrap();
+        std::fs::write(&sibling, "TARGET_MARKER sibling\n").unwrap();
+        std::fs::write(&root_target, "TARGET_MARKER root\n").unwrap();
+        std::fs::write(&outside, "TARGET_MARKER outside\n").unwrap();
+
+        let exact = search_content_raw("TARGET_MARKER", tmp.path(), Some("nested/target.txt"))
+            .expect("exact-file search should succeed");
+        assert_eq!(exact.total_found, 1);
+        assert_eq!(exact.matches.len(), 1);
+        assert_eq!(exact.matches[0].path, target);
+        assert_eq!(exact.matches[0].line, 1);
+        assert_eq!(exact.matches[0].text, "TARGET_MARKER target");
+
+        let basename = search_content_raw("TARGET_MARKER", tmp.path(), Some("target.txt"))
+            .expect("slashless basename glob should succeed");
+        let mut basename_paths: Vec<PathBuf> =
+            basename.matches.iter().map(|m| m.path.clone()).collect();
+        basename_paths.sort();
+        let mut expected_basename_paths = vec![root_target, target.clone()];
+        expected_basename_paths.sort();
+        assert_eq!(basename.total_found, 2);
+        assert_eq!(basename_paths, expected_basename_paths);
+
+        let wildcard = search_content_raw("TARGET_MARKER", tmp.path(), Some("nested/*.txt"))
+            .expect("wildcard search should succeed");
+        let mut wildcard_paths: Vec<PathBuf> =
+            wildcard.matches.iter().map(|m| m.path.clone()).collect();
+        wildcard_paths.sort();
+        assert_eq!(wildcard.total_found, 2);
+        assert_eq!(wildcard_paths, vec![sibling.clone(), target.clone()]);
+
+        std::fs::write(nested.join(".tilthignore"), "target.txt\n").unwrap();
+        let ignored = search_content_raw("TARGET_MARKER", tmp.path(), Some("nested/target.txt"))
+            .expect("ignored exact-file search should succeed");
+        assert_eq!(ignored.total_found, 0);
+        assert!(
+            ignored.matches.is_empty(),
+            "nested .tilthignore must suppress the exact target: {ignored:?}"
+        );
     }
 
     #[test]

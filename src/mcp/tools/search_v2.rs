@@ -134,7 +134,8 @@ fn route_query(
         return Ok((result, "regex".to_string(), Vec::new()));
     }
 
-    // 3. symbol / ambiguous — bare identifier: search definitions.
+    // 3. symbol / ambiguous — bare identifier: prefer definitions, then reuse
+    // the symbol scan's usage matches as the literal fallback.
     if is_identifier(query) {
         let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
         if sym_result.definitions == 1 {
@@ -152,10 +153,12 @@ fn route_query(
             let hint = json!({"kind": "disambiguate", "target": query});
             return Ok((result, "ambiguous".to_string(), vec![hint]));
         }
-        // 0 definitions: an identifier that names no symbol is a miss,
-        // regardless of incidental literal occurrences (e.g. the query string
-        // sitting inside a test fixture). Only non-identifier phrases route to
-        // literal content search.
+        if sym_result.total_found > 0 {
+            let mut result = base_result(query, "literal", "ok");
+            result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
+            return Ok((result, "literal".to_string(), Vec::new()));
+        }
+
         let result = base_result(query, "miss", "miss");
         return Ok((result, "miss".to_string(), Vec::new()));
     }
@@ -324,6 +327,28 @@ mod tests {
     }
 
     #[test]
+    fn usage_only_identifier_in_exact_file_falls_back_to_literal() {
+        let resp = call(json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{
+                "query": "SearchTelemetryRecord",
+                "glob": "src/mcp/tools/search_v2.rs",
+            }],
+        }))
+        .expect("usage query succeeds");
+        let result = &resp["results"][0];
+
+        assert_eq!(result["resolved_as"], "literal");
+        assert_eq!(result["status"], "ok");
+        assert!(
+            result["preview"]
+                .as_str()
+                .is_some_and(|preview| preview.contains("SearchTelemetryRecord")),
+            "literal fallback must return the matching usage: {result}"
+        );
+    }
+
+    #[test]
     fn route_literal_resolves_multi_word_content() {
         let resp =
             single_query("DO NOT re-read expanded search content").expect("literal query succeeds");
@@ -345,7 +370,7 @@ mod tests {
     /// Built at runtime (not a single source literal) so the query itself
     /// never appears as a contiguous match in this very test file.
     fn absent_query() -> String {
-        format!("{}_{}", "zzz_definitely_not_present", "zzz")
+        ["tilth_absent_probe_", "91c6a4"].concat()
     }
 
     #[test]
