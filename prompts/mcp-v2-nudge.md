@@ -1,0 +1,1 @@
+PREFER `tilth_search_v2` for find/explore when advertised: `queries: [{query, glob?}]` (1-10) + `cwd`; follow its `hints`.

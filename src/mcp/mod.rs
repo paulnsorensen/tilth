@@ -103,6 +103,10 @@ impl Services {
 // what MCP hosts receive in the `instructions` field.
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
+/// One-line adoption nudge spliced directly above the ROUTE line on the `v2`
+/// and `both` surfaces, so the routing section teaches `tilth_search_v2`
+/// where it is advertised. `v1` output never carries it.
+const V2_SURFACE_NUDGE: &str = include_str!("../../prompts/mcp-v2-nudge.md");
 
 /// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md. Exact
 /// substring of both files, guarded by `cwd_guidance_spans_present` so an edit
@@ -113,14 +117,21 @@ const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout
 
 /// Select and return the complete MCP `instructions` string for the given
 /// mode: the standalone base file, or the standalone edit-mode file — never
-/// both.
-fn build_instructions(edit_mode: bool) -> String {
+/// both. Non-`v1` surfaces get [`V2_SURFACE_NUDGE`] spliced in above the
+/// ROUTE line, keeping it top-weighted rather than appended below the fold.
+fn build_instructions(edit_mode: bool, surface: SearchSurface) -> String {
     let source = if edit_mode {
         EDIT_MODE_INSTRUCTIONS
     } else {
         SERVER_INSTRUCTIONS
     };
-    source.trim_end().to_string()
+    let source = source.trim_end();
+    match surface {
+        SearchSurface::V1 => source.to_string(),
+        SearchSurface::V2 | SearchSurface::Both => {
+            source.replacen("\nROUTE", &format!("\n{V2_SURFACE_NUDGE}\nROUTE"), 1)
+        }
+    }
 }
 
 /// Change the process working directory, logging failures to stderr.
@@ -281,7 +292,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let instructions = build_instructions(edit_mode);
+            let instructions = build_instructions(edit_mode, services.surface());
             let client_name = req
                 .params
                 .get("clientInfo")
@@ -527,6 +538,7 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum as _;
     use std::fmt::Write as _;
 
     /// Tool handlers now require an absolute `cwd`. Injects a default so the
@@ -901,6 +913,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v2_surface_nudge_byte_lock() {
+        assert_eq!(
+            V2_SURFACE_NUDGE.len(),
+            122,
+            "V2_SURFACE_NUDGE byte count drifted from baseline"
+        );
+        assert!(V2_SURFACE_NUDGE.starts_with("PREFER `tilth_search_v2` for find/explore"));
+        assert!(
+            !V2_SURFACE_NUDGE.contains('\n'),
+            "V2_SURFACE_NUDGE must stay a single line so it splices cleanly above ROUTE"
+        );
+        assert!(
+            !V2_SURFACE_NUDGE.contains("mcp__"),
+            "nudge must use protocol tool names, not client-specific prefixes"
+        );
+    }
+
     /// ADR-003's hard surface cap. The spec elevated "the cap never yields" to
     /// a quality gate but shipped no guard.
     ///
@@ -939,7 +969,7 @@ mod tests {
     fn agents_md_matches_prompt_sources() {
         const AGENTS_MD: &str = include_str!("../../AGENTS.md");
         let expected = format!(
-            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n"
+            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md + prompts/mcp-v2-nudge.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n\n## Search-v2 surfaces\n\nSpliced above the ROUTE line in either mode when `--search-surface v2|both`:\n\n{V2_SURFACE_NUDGE}\n"
         );
         assert_eq!(
             AGENTS_MD, expected,
@@ -951,8 +981,8 @@ mod tests {
     fn build_instructions_selects_one_complete_file_per_mode() {
         // build_instructions selects exactly one standalone file — never both,
         // never concatenated.
-        let base = build_instructions(false);
-        let edit = build_instructions(true);
+        let base = build_instructions(false, SearchSurface::V1);
+        let edit = build_instructions(true, SearchSurface::V1);
         assert_eq!(base, SERVER_INSTRUCTIONS.trim_end());
         assert_eq!(edit, EDIT_MODE_INSTRUCTIONS.trim_end());
         assert!(
@@ -1979,12 +2009,42 @@ mod tests {
 
     #[test]
     fn build_instructions_no_trailing_whitespace() {
-        for &edit in &[false, true] {
-            let s = build_instructions(edit);
+        for edit in [false, true] {
+            for &surface in SearchSurface::value_variants() {
+                let s = build_instructions(edit, surface);
+                assert!(
+                    !s.ends_with('\n') && !s.ends_with(' '),
+                    "wire output must not end with whitespace (edit={edit}, surface={surface:?})"
+                );
+            }
+        }
+    }
+
+    /// The v2 nudge is served only where `tilth_search_v2` is advertised, and
+    /// there it sits directly above the ROUTE line — top-weighted for weaker
+    /// models — rather than trailing below the fold.
+    #[test]
+    fn build_instructions_nudges_search_v2_only_on_trial_surfaces() {
+        for edit in [false, true] {
+            let v1 = build_instructions(edit, SearchSurface::V1);
             assert!(
-                !s.ends_with('\n') && !s.ends_with(' '),
-                "wire output must not end with whitespace (edit={edit})"
+                !v1.contains("tilth_search_v2"),
+                "v1 surface must not mention tilth_search_v2 (edit={edit})"
             );
+            for surface in [SearchSurface::V2, SearchSurface::Both] {
+                let s = build_instructions(edit, surface);
+                let nudge_at = s
+                    .find(V2_SURFACE_NUDGE)
+                    .unwrap_or_else(|| panic!("nudge missing (edit={edit}, surface={surface:?})"));
+                assert!(
+                    s[nudge_at + V2_SURFACE_NUDGE.len()..].starts_with("\nROUTE"),
+                    "nudge must sit directly above ROUTE (edit={edit}, surface={surface:?})"
+                );
+                assert!(
+                    !s.contains("\n\n\n"),
+                    "no triple newline at the splice seam (edit={edit}, surface={surface:?})"
+                );
+            }
         }
     }
 
@@ -2001,11 +2061,11 @@ mod tests {
         );
     }
 
-    /// Both modes must fit Claude Code's 2KB `instructions`-field truncation
-    /// (per-mode root cause: an 8.7KB composed prompt was truncated below the
-    /// fold, so agents never saw the per-tool routing section) and must still
-    /// carry the full routing surface: the cwd PATHS guidance, every tool the
-    /// mode offers, and the shell DO NOT lines.
+    /// Every mode × surface must fit Claude Code's 2KB `instructions`-field
+    /// truncation (per-mode root cause: an 8.7KB composed prompt was truncated
+    /// below the fold, so agents never saw the per-tool routing section) and
+    /// must still carry the full routing surface: the cwd PATHS guidance,
+    /// every tool the mode offers, and the shell DO NOT lines.
     #[test]
     fn build_instructions_fit_2kb_and_carry_critical_spans() {
         let shared_tools = [
@@ -2016,34 +2076,39 @@ mod tests {
             "tilth_grok",
             "tilth_diff",
         ];
-        for &edit in &[false, true] {
-            let s = build_instructions(edit);
-            assert!(
-                s.len() <= 2048,
-                "instructions (edit={edit}) must fit the 2KB field: {} bytes",
-                s.len()
-            );
-            assert!(
-                s.contains(CWD_PATHS_SPAN),
-                "missing PATHS span (edit={edit})"
-            );
-            for tool in shared_tools {
-                assert!(s.contains(tool), "missing tool {tool} (edit={edit})");
-            }
-            if edit {
+        for edit in [false, true] {
+            for &surface in SearchSurface::value_variants() {
+                let s = build_instructions(edit, surface);
                 assert!(
-                    s.contains("tilth_write"),
-                    "edit mode must advertise tilth_write"
+                    s.len() <= 2048,
+                    "instructions (edit={edit}, surface={surface:?}) must fit the 2KB field: {} bytes",
+                    s.len()
+                );
+                assert!(
+                    s.contains(CWD_PATHS_SPAN),
+                    "missing PATHS span (edit={edit}, surface={surface:?})"
+                );
+                for tool in shared_tools {
+                    assert!(
+                        s.contains(tool),
+                        "missing tool {tool} (edit={edit}, surface={surface:?})"
+                    );
+                }
+                if edit {
+                    assert!(
+                        s.contains("tilth_write"),
+                        "edit mode must advertise tilth_write (surface={surface:?})"
+                    );
+                }
+                assert!(
+                    s.contains("DO NOT use shell for repo files or history"),
+                    "missing shell DO NOT line (edit={edit}, surface={surface:?})"
+                );
+                assert!(
+                    s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
+                    "shell DO NOT line must enumerate the replaced commands (edit={edit}, surface={surface:?})"
                 );
             }
-            assert!(
-                s.contains("DO NOT use shell for repo files or history"),
-                "missing shell DO NOT line (edit={edit})"
-            );
-            assert!(
-                s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
-                "shell DO NOT line must enumerate the replaced commands (edit={edit})"
-            );
         }
     }
 
