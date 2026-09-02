@@ -66,6 +66,21 @@ class AC04Routing(unittest.TestCase):
             result["preview"],
         )
 
+    def test_embedded_identifier_falls_back_to_literal_in_exact_file(self):
+        query = "".join(("Telemetry", "Record"))
+        response = self._call(query, "src/mcp/tools/search_v2.rs")
+        self.assertIsNotNone(response)
+        result = json.loads(harness.tool_result_text(response))["results"][0]
+        self.assertEqual(result["query"], query)
+        self.assertEqual(result["resolved_as"], "literal")
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
+        self.assertIn(
+            "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
+            result["preview"],
+        )
+        self.assertNotIn("src/telemetry.rs:", result["preview"])
+
     def test_regex_in_exact_file_stays_bounded_to_requested_path(self):
         response = self._call(
             "SearchTelemetryRecord.*", "src/mcp/tools/search_v2.rs"

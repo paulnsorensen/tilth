@@ -176,21 +176,26 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
 fn exact_glob_target(scope: &Path, glob: Option<&str>) -> Option<PathBuf> {
     let pattern = glob?;
-    if pattern.is_empty()
-        || !pattern.contains('/')
-        || pattern.starts_with('!')
-        || pattern
-            .bytes()
-            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}') || byte == 92)
+    if !pattern.contains('/') {
+        return None;
+    }
+    if pattern.starts_with('!') || pattern.starts_with('#') {
+        return None;
+    }
+    if pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'\\'))
     {
         return None;
     }
 
     let relative = Path::new(pattern);
-    if !relative.is_relative()
-        || !relative
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    if !relative.is_relative() {
+        return None;
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
     {
         return None;
     }
@@ -2104,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_glob_target_rejects_absolute_parent_wildcard_negated_and_missing_paths() {
+    fn exact_glob_target_accepts_only_normalized_relative_files() {
         let tmp = tempfile::tempdir().unwrap();
         let scope = tmp.path().join("scope");
         let nested = scope.join("nested");
@@ -2112,26 +2117,37 @@ mod tests {
         let root_target = scope.join("target.rs");
         let target = nested.join("target.rs");
         let outside = tmp.path().join("outside.rs");
+        let non_file = nested.join("subdir");
         std::fs::write(&root_target, "fn root_target() {}\n").unwrap();
         std::fs::write(&target, "fn target() {}\n").unwrap();
         std::fs::write(&outside, "fn outside() {}\n").unwrap();
+        std::fs::create_dir(&non_file).unwrap();
+
+        for prefixed in ["!nested", "#nested"] {
+            let prefixed_dir = scope.join(prefixed);
+            std::fs::create_dir(&prefixed_dir).unwrap();
+            std::fs::write(prefixed_dir.join("target.rs"), "prefixed\n").unwrap();
+        }
 
         assert_eq!(
             exact_glob_target(&scope, Some("nested/target.rs")),
-            Some(target.clone())
+            Some(target)
         );
+
         for pattern in [
-            outside.to_str().unwrap(),
+            "nested//target.rs",
+            "nested/./target.rs",
+            "#nested/target.rs",
+            "!nested/target.rs",
+            "nested/*.rs",
+            "nested/target?.rs",
+            "nested/[t]arget.rs",
+            "nested/{target,other}.rs",
+            r"nested/target\.rs",
             "../outside.rs",
-            "*.rs",
-            "target?.rs",
-            "[t]arget.rs",
-            "{target,other}.rs",
-            r"target\.rs",
-            "!target.rs",
-            "",
-            "missing.rs",
-            "target.rs",
+            "nested/../outside.rs",
+            "nested/missing.rs",
+            "nested/subdir",
         ] {
             assert_eq!(
                 exact_glob_target(&scope, Some(pattern)),
@@ -2139,6 +2155,18 @@ mod tests {
                 "unsafe or unmatched glob must not be treated as an exact file: {pattern:?}"
             );
         }
+
+        assert_eq!(
+            exact_glob_target(&scope, Some(outside.to_str().unwrap())),
+            None,
+            "absolute paths must not be treated as exact files"
+        );
+        assert_eq!(
+            exact_glob_target(&scope, Some("target.rs")),
+            None,
+            "slashless basename globs must not be treated as exact files"
+        );
+        assert_eq!(exact_glob_target(&scope, Some("")), None);
     }
 
     #[test]
