@@ -40,7 +40,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// test that reads or writes it, to keep parallel tests from racing.
 #[cfg(test)]
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Failure opening or operating on a deps-index redb handle.

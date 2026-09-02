@@ -13,6 +13,26 @@ categories = ["command-line-utilities", "development-tools"]
 name = "tilth"
 path = "src/main.rs"
 
+# `clippy::pedantic` lives here, not as `#![warn(..)]` in src/lib.rs, because an inner attribute
+# reaches only its own crate root — src/main.rs, tests/, and examples/ are separate crate roots and
+# would inherit none of it. A package-level `[lints]` table applies to every target.
+#
+# `priority = -1` on the group is required so the individual allows below win over it.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow" # line numbers as u32, token counts — we target 64-bit
+cast_sign_loss = "allow"           # same
+cast_possible_wrap = "allow"       # u32→i32 for tree-sitter APIs
+module_name_repetitions = "allow"  # Rust naming conventions
+similar_names = "allow"            # common in parser/search code
+too_many_lines = "allow"           # crate-wide to cover find_definitions in src/search/symbol.rs;
+                                   # narrow to a per-function allow once a refactor shrinks that file
+too_many_arguments = "allow"       # internal recursive AST walker
+unnecessary_wraps = "allow"        # Result return for API consistency
+struct_excessive_bools = "allow"   # CLI struct derives clap
+missing_errors_doc = "allow"       # internal pub(crate) fns don't need error docs
+missing_panics_doc = "allow"       # same
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }

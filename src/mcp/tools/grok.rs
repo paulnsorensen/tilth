@@ -113,7 +113,7 @@ mod tests {
             "cwd": env!("CARGO_MANIFEST_DIR"),
             "budget": 50
         });
-        let full = tool_grok(&args_full, &bloom(), &Session::new()).expect("full grok succeeds");
+        let _full = tool_grok(&args_full, &bloom(), &Session::new()).expect("full grok succeeds");
         let small =
             tool_grok(&args_small, &bloom(), &Session::new()).expect("budgeted grok succeeds");
         assert!(

@@ -1347,7 +1347,7 @@ mod tests {
         );
     }
 
-    /// The general auto-read path (non-code file over TOKEN_THRESHOLD, e.g.
+    /// The general auto-read path (non-code file over `TOKEN_THRESHOLD`, e.g.
     /// markdown/JSON/YAML) must also book savings against what the caller
     /// actually receives (response + batching note) — this path
     /// (read.rs:404) is a separate `record_savings` call site from the

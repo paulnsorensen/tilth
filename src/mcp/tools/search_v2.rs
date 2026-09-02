@@ -286,11 +286,11 @@ mod tests {
         (OutlineCache::new(), Session::new(), BloomFilterCache::new())
     }
 
-    fn call_with_telemetry(args: Value) -> Result<(Value, tempfile::TempDir), String> {
+    fn call_with_telemetry(args: &Value) -> Result<(Value, tempfile::TempDir), String> {
         let (cache, session, bloom) = components();
         let (telemetry, tmp) = telemetry();
         let out = tool_search_v2(
-            &args,
+            args,
             &cache,
             &session,
             &bloom,
@@ -304,12 +304,12 @@ mod tests {
         ))
     }
 
-    fn call(args: Value) -> Result<Value, String> {
+    fn call(args: &Value) -> Result<Value, String> {
         call_with_telemetry(args).map(|(response, _tmp)| response)
     }
 
     fn single_query(query: &str) -> Result<Value, String> {
-        call(json!({
+        call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{"query": query}],
         }))
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn usage_only_identifier_in_exact_file_falls_back_to_literal() {
-        let (resp, tmp) = call_with_telemetry(json!({
+        let (resp, tmp) = call_with_telemetry(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{
                 "query": "SearchTelemetryRecord",
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn embedded_identifier_in_larger_token_falls_back_to_literal() {
         let query = ["Telemetry", "Record"].concat();
-        let resp = call(json!({
+        let resp = call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{
                 "query": query,
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn batch_of_three_preserves_order_and_yields_one_record_each() {
-        let resp = call(json!({
+        let resp = call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [
                 {"query": "src/mcp/mod.rs"},
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn empty_batch_is_refused() {
-        let err = call(json!({
+        let err = call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [],
         }))
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn oversized_batch_is_refused() {
         let queries: Vec<Value> = (0..11).map(|i| json!({"query": format!("q{i}")})).collect();
-        let err = call(json!({
+        let err = call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": queries,
         }))
