@@ -353,12 +353,18 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
 /// Build the error for an unrecognized tool name, adding a "did you mean"
 /// hint for names agents commonly confuse for a real verb. Genuinely unknown
 /// names keep the plain `unknown tool: X` message.
-fn unknown_tool_error(tool: &str) -> String {
+fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
     match tool {
         "tilth_files" => "unknown tool 'tilth_files' — did you mean 'tilth_list' \
             (directory listing) or 'tilth_read' (file contents)?"
             .to_string(),
-        "tilth_edit" => "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string(),
+        "tilth_edit" if edit_mode => {
+            "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
+        }
+        "tilth_edit" => {
+            "unknown tool 'tilth_edit' — edit tools are disabled (server not in edit mode)"
+                .to_string()
+        }
         _ => format!("unknown tool: {tool}"),
     }
 }
@@ -402,7 +408,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         "tilth_search_v2" if surface != SearchSurface::V1 => dispatch_search_v2(args, services),
-        _ => Err(unknown_tool_error(tool)),
+        _ => Err(unknown_tool_error(tool, edit_mode)),
     };
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
@@ -616,6 +622,18 @@ mod tests {
         // Genuinely unknown names keep the plain message — no suggestion.
         let other_err = dispatch_tool("tilth_bogus", &args, &services).unwrap_err();
         assert_eq!(other_err, "unknown tool: tilth_bogus");
+    }
+
+    #[test]
+    fn dispatch_tool_reports_edit_tools_disabled_in_read_only_mode() {
+        let services = Services::new(false, SearchSurface::V1);
+        let args = serde_json::json!({ "cwd": "/" });
+
+        let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
+        assert_eq!(
+            edit_err,
+            "unknown tool 'tilth_edit' — edit tools are disabled (server not in edit mode)"
+        );
     }
 
     #[test]
