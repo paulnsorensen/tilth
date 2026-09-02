@@ -350,8 +350,6 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
     out
 }
 
-/// Execute a tool by name with the given arguments. Returns formatted output or error string.
-/// No classifier involved — the caller specifies the tool explicitly.
 /// Build the error for an unrecognized tool name, adding a "did you mean"
 /// hint for names agents commonly confuse for a real verb. Genuinely unknown
 /// names keep the plain `unknown tool: X` message.
@@ -365,6 +363,8 @@ fn unknown_tool_error(tool: &str) -> String {
     }
 }
 
+/// Execute a tool by name with the given arguments. Returns formatted output or error string.
+/// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
     // Budget validation only applies to tools that honour the budget param.
