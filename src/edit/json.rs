@@ -171,6 +171,33 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
     })
 }
 
+/// The teaching example appended to a per-op deserialize error, tailored to the
+/// fumbled op `verb`. `replace_text` *is* find/replace, so it gets an old/new
+/// example instead of the misleading "not find/replace" clause; the file ops
+/// take whole-file fields, so they get a `create_file` example; every other
+/// verb — line op, block op, unknown, or missing — gets the line-addressed
+/// `replace` example. An unknown verb already carries serde's exhaustive
+/// variant list, so nothing here re-enumerates the ops.
+fn op_error_hint(verb: &str) -> &'static str {
+    match verb {
+        "replace_text" => {
+            "Example op: \
+             {\"op\":\"replace_text\",\"old\":\"exact existing text\",\"new\":\"replacement\"} — \
+             old must match the file exactly once."
+        }
+        "create_file" | "delete_file" | "move_file" => {
+            "Example op: {\"op\":\"create_file\",\"content\":\"...\"} — file ops take no line \
+             numbers: create_file needs content, delete_file takes no fields, move_file needs \
+             dest."
+        }
+        _ => {
+            "Example op: \
+             {\"op\":\"replace\",\"start\":12,\"end\":14,\"content\":\"...\"} — ops are line-addressed \
+             using line numbers from the tagged read — not find/replace."
+        }
+    }
+}
+
 fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     let tag = match raw.tag {
         None => None,
@@ -194,9 +221,8 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
             .to_string();
         let parsed: JsonOp = serde_json::from_value(ov).map_err(|e| {
             format!(
-                "edits[{index}].ops[{j}] op \"{verb}\": {e}. Example op: \
-                 {{\"op\":\"replace\",\"start\":12,\"end\":14,\"content\":\"...\"}} — ops are \
-                 line-addressed using line numbers from the tagged read — not find/replace."
+                "edits[{index}].ops[{j}] op \"{verb}\": {e}. {}",
+                op_error_hint(&verb)
             )
         })?;
         ops.push(
@@ -558,6 +584,74 @@ mod tests {
                 old: "target".into(),
                 new: "replacement".into()
             }]
+        );
+    }
+
+    #[test]
+    fn replace_text_op_failure_teaches_find_replace_not_line_addressed() {
+        // The #200 class: a fumbled `replace_text` field must get a
+        // `replace_text` old/new example, NOT the line-addressed `replace`
+        // example, and must NOT be told the tool is "not find/replace" —
+        // `replace_text` *is* find/replace.
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "replace_text", "replace_all": true }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown field on replace_text must fail");
+        assert!(err.contains("replace_text"), "must name the op: {err}");
+        assert!(
+            err.contains(
+                r#"{"op":"replace_text","old":"exact existing text","new":"replacement"}"#
+            ),
+            "must show the replace_text example: {err}"
+        );
+        assert!(
+            !err.contains("not find/replace"),
+            "must not tell replace_text it is not find/replace: {err}"
+        );
+        assert!(
+            !err.contains("line-addressed"),
+            "must not push replace_text toward line-addressing: {err}"
+        );
+    }
+
+    #[test]
+    fn file_op_failure_teaches_file_shape_not_line_addressed() {
+        let cases = [
+            json!([{ "path": "a.rs", "ops": [{ "op": "create_file", "start": 1, "end": 2, "content": "x" }] }]),
+            json!([{ "path": "a.rs", "tag": "0000", "ops": [{ "op": "move_file" }] }]),
+        ];
+        for edits in cases {
+            let err = lower_edits(&edits).expect_err("malformed file op must fail");
+            assert!(
+                err.contains(r#"{"op":"create_file","content":"..."}"#),
+                "must show the create_file example: {err}"
+            );
+            assert!(
+                err.contains("move_file needs dest"),
+                "must teach the move_file shape: {err}"
+            );
+            assert!(
+                !err.contains("line-addressed") && !err.contains("not find/replace"),
+                "must not push a file op toward line-addressing: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_op_verb_lists_every_valid_op() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "seed" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown verb must fail");
+        assert!(
+            err.contains("line-addressed"),
+            "unknown verb keeps the line example: {err}"
+        );
+        assert!(
+            err.contains("expected one of `replace`") && err.contains("`move_file`"),
+            "unknown verb lists the valid op verbs: {err}"
         );
     }
 }
