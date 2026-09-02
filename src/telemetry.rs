@@ -65,11 +65,20 @@ impl TelemetrySink {
     /// Resolves the telemetry directory from `$XDG_STATE_HOME` else
     /// `$HOME/.local/state`. The directory is created lazily on first write.
     pub(crate) fn new() -> Self {
+        Self::from_dir(resolve_dir())
+    }
+
+    fn from_dir(dir: PathBuf) -> Self {
         Self {
-            dir: resolve_dir(),
+            dir,
             max_bytes: DEFAULT_MAX_BYTES,
             dir_ready: OnceLock::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &Path) -> Self {
+        Self::from_dir(dir.to_path_buf())
     }
 
     /// Appends one compact JSON line for `rec`, rotating the current file
@@ -177,11 +186,7 @@ mod tests {
     }
 
     fn sink_in(dir: &std::path::Path) -> TelemetrySink {
-        TelemetrySink {
-            dir: dir.to_path_buf(),
-            max_bytes: DEFAULT_MAX_BYTES,
-            dir_ready: OnceLock::new(),
-        }
+        TelemetrySink::for_test(dir)
     }
 
     fn read_lines(path: &std::path::Path) -> Vec<String> {

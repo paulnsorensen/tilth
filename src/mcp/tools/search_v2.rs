@@ -134,7 +134,8 @@ fn route_query(
         return Ok((result, "regex".to_string(), Vec::new()));
     }
 
-    // 3. symbol / ambiguous — bare identifier: search definitions.
+    // 3. symbol / ambiguous — bare identifier: prefer definitions, then reuse
+    // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
         let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
         if sym_result.definitions == 1 {
@@ -152,10 +153,18 @@ fn route_query(
             let hint = json!({"kind": "disambiguate", "target": query});
             return Ok((result, "ambiguous".to_string(), vec![hint]));
         }
-        // 0 definitions: an identifier that names no symbol is a miss,
-        // regardless of incidental literal occurrences (e.g. the query string
-        // sitting inside a test fixture). Only non-identifier phrases route to
-        // literal content search.
+        if sym_result.total_found > 0 {
+            let mut result = base_result(query, "literal", "ok");
+            result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
+            return Ok((result, "literal".to_string(), Vec::new()));
+        }
+        let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+        if content_result.total_found > 0 {
+            let mut result = base_result(query, "literal", "ok");
+            result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
+            return Ok((result, "literal".to_string(), Vec::new()));
+        }
+
         let result = base_result(query, "miss", "miss");
         return Ok((result, "miss".to_string(), Vec::new()));
     }
@@ -262,9 +271,6 @@ fn display_rel(path: &Path, cwd: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Once;
-
-    static INIT_TELEMETRY_ENV: Once = Once::new();
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -272,16 +278,7 @@ mod tests {
 
     fn telemetry() -> (TelemetrySink, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        INIT_TELEMETRY_ENV.call_once(|| {});
-        // SAFETY: test-only env mutation; scoped by setting immediately before
-        // constructing the sink, matching telemetry.rs's own test pattern.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", tmp.path());
-        }
-        let sink = TelemetrySink::new();
-        unsafe {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
+        let sink = TelemetrySink::for_test(tmp.path());
         (sink, tmp)
     }
 
@@ -289,9 +286,9 @@ mod tests {
         (OutlineCache::new(), Session::new(), BloomFilterCache::new())
     }
 
-    fn call(args: Value) -> Result<Value, String> {
+    fn call_with_telemetry(args: Value) -> Result<(Value, tempfile::TempDir), String> {
         let (cache, session, bloom) = components();
-        let (telemetry, _tmp) = telemetry();
+        let (telemetry, tmp) = telemetry();
         let out = tool_search_v2(
             &args,
             &cache,
@@ -301,7 +298,14 @@ mod tests {
             "test-client",
             "test-worktree",
         )?;
-        Ok(serde_json::from_str(&out).expect("valid json response"))
+        Ok((
+            serde_json::from_str(&out).expect("valid json response"),
+            tmp,
+        ))
+    }
+
+    fn call(args: Value) -> Result<Value, String> {
+        call_with_telemetry(args).map(|(response, _tmp)| response)
     }
 
     fn single_query(query: &str) -> Result<Value, String> {
@@ -321,6 +325,75 @@ mod tests {
     fn route_symbol_resolves_unique_definition() {
         let resp = single_query("detect_file_type").expect("symbol query succeeds");
         assert_eq!(resp["results"][0]["resolved_as"], "symbol");
+    }
+
+    #[test]
+    fn usage_only_identifier_in_exact_file_falls_back_to_literal() {
+        let (resp, tmp) = call_with_telemetry(json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{
+                "query": "SearchTelemetryRecord",
+                "glob": "src/mcp/tools/search_v2.rs",
+            }],
+        }))
+        .expect("usage query succeeds");
+        let result = &resp["results"][0];
+
+        assert_eq!(result["resolved_as"], "literal");
+        assert_eq!(result["status"], "ok");
+        let preview = result["preview"].as_str().expect("literal preview");
+        assert!(
+            preview.contains("src/mcp/tools/search_v2.rs:"),
+            "literal fallback must stay within the exact file: {preview}"
+        );
+        assert!(
+            preview.contains("use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};"),
+            "literal fallback must return the exact source usage: {preview}"
+        );
+        assert!(
+            !preview.contains("src/telemetry.rs:"),
+            "literal fallback must exclude the external definition: {preview}"
+        );
+
+        let telemetry_log = std::fs::read_to_string(tmp.path().join("current.jsonl"))
+            .expect("literal route telemetry should be persisted");
+        let record_line = telemetry_log
+            .lines()
+            .next()
+            .expect("telemetry log should contain one record");
+        let record: Value = serde_json::from_str(record_line).expect("valid telemetry record");
+        assert_eq!(record["route"], "literal");
+        assert_eq!(record["routes_tried"], json!(["literal"]));
+    }
+
+    #[test]
+    fn embedded_identifier_in_larger_token_falls_back_to_literal() {
+        let query = ["Telemetry", "Record"].concat();
+        let resp = call(json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{
+                "query": query,
+                "glob": "src/mcp/tools/search_v2.rs",
+            }],
+        }))
+        .expect("embedded identifier query succeeds");
+        let result = &resp["results"][0];
+
+        assert_eq!(result["resolved_as"], "literal");
+        assert_eq!(result["status"], "ok");
+        let preview = result["preview"].as_str().expect("literal preview");
+        assert!(
+            preview.contains("src/mcp/tools/search_v2.rs:"),
+            "literal fallback must return the exact file: {preview}"
+        );
+        assert!(
+            preview.contains("use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};"),
+            "literal fallback must return embedded content: {preview}"
+        );
+        assert!(
+            !preview.contains("src/telemetry.rs:"),
+            "exact-file literal fallback must exclude external content: {preview}"
+        );
     }
 
     #[test]
@@ -345,7 +418,7 @@ mod tests {
     /// Built at runtime (not a single source literal) so the query itself
     /// never appears as a contiguous match in this very test file.
     fn absent_query() -> String {
-        format!("{}_{}", "zzz_definitely_not_present", "zzz")
+        ["tilth_absent_probe_", "91c6a4"].concat()
     }
 
     #[test]
