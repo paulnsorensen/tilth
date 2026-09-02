@@ -15,8 +15,8 @@ pub(super) const MAX_FILE_SIZE: u64 = 500_000;
 /// Outcome of [`read_with_bloom_check`].
 #[derive(Debug, PartialEq)]
 pub(super) enum BloomRead {
-    /// Content and mtime of a file at least one target is bloom-positive in.
-    Hit(String, SystemTime),
+    /// Content of a file at least one target is bloom-positive in.
+    Hit(String),
     /// Oversized, or bloom-negative for every target.
     Skip,
     /// Stat, read, or UTF-8 decode failed.
@@ -57,7 +57,7 @@ where
         return BloomRead::Skip;
     }
 
-    BloomRead::Hit(content, mtime)
+    BloomRead::Hit(content)
 }
 
 #[cfg(test)]
@@ -102,7 +102,7 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["alpha".to_string()].into_iter().collect();
-        let BloomRead::Hit(content, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE)
+        let BloomRead::Hit(content) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE)
         else {
             panic!("expected a bloom hit");
         };
@@ -143,8 +143,7 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<&str> = ["alpha"].into_iter().collect();
-        let BloomRead::Hit(_, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE)
-        else {
+        let BloomRead::Hit(_) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE) else {
             panic!("expected a bloom hit");
         };
     }

@@ -213,7 +213,7 @@ pub fn resolve_callees(
 
         // Read + bloom prefilter via shared helper. Skip the file when no
         // remaining symbol is bloom-positive.
-        let super::bloom_walk::BloomRead::Hit(import_content, _mtime) =
+        let super::bloom_walk::BloomRead::Hit(import_content) =
             super::bloom_walk::read_with_bloom_check(
                 &import_path,
                 remaining.iter().copied(),

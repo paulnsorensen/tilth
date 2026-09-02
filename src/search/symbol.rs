@@ -186,16 +186,19 @@ fn find_definitions(
             let path = path.as_path();
 
             // Single read: read file once, use buffer for both check and parse
-            let file_type = detect_file_type(path);
             let Ok(bytes) = fs::read(path) else {
                 files_unreadable.fetch_add(1, Ordering::Relaxed);
                 return ignore::WalkState::Continue;
             };
-            let Ok(content) = String::from_utf8(bytes) else {
-                if mines_definitions(file_type) {
-                    files_unreadable.fetch_add(1, Ordering::Relaxed);
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(err) => {
+                    // Undecodable source is a lost result; a binary blob is not.
+                    if !crate::lang::detection::is_binary(err.as_bytes()) {
+                        files_unreadable.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return ignore::WalkState::Continue;
                 }
-                return ignore::WalkState::Continue;
             };
 
             // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
@@ -214,6 +217,7 @@ fn find_definitions(
             let (file_lines, mtime) = file_metadata(path);
 
             // Try tree-sitter structural detection
+            let file_type = detect_file_type(path);
             let lang = match file_type {
                 FileType::Code(l) => Some(l),
                 _ => None,
@@ -274,13 +278,6 @@ fn find_definitions(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok((matches, files_unreadable.load(Ordering::Relaxed)))
-}
-
-fn mines_definitions(file_type: FileType) -> bool {
-    match file_type {
-        FileType::Code(_) | FileType::Markdown => true,
-        FileType::StructuredData | FileType::Tabular | FileType::Log | FileType::Other => false,
-    }
 }
 
 /// Return every structural definition matching `query`, ranked like display search

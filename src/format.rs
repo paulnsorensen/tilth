@@ -71,7 +71,6 @@ pub enum EmptyHint {
 /// from the dispatch table:
 ///
 /// * `files_matched_glob == 0` → `glob matched no files — broaden glob or check path`
-/// * `files_unreadable > 0` → `results may be incomplete — unreadable files were skipped`
 /// * `Symbol` → `no symbols matched; try kind: content or check spelling`
 /// * `Content` → `no content matches; try kind: symbol or a broader pattern`
 /// * `Regex` → `regex matched zero content; try kind: symbol or a broader pattern`
@@ -87,8 +86,6 @@ pub fn search_empty_header(
 ) -> String {
     let hint = if files_matched_glob == 0 {
         "glob matched no files — broaden glob or check path"
-    } else if files_unreadable > 0 {
-        "results may be incomplete — unreadable files were skipped"
     } else {
         match kind {
             EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
@@ -164,6 +161,7 @@ mod tests {
             "{header}"
         );
         assert!(!header.contains("check spelling"), "{header}");
+        assert!(!header.contains("Files unreadable"), "{header}");
     }
 
     /// Regression: a result with hits but zero definitions (every content
@@ -219,13 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn search_header_omits_unreadable_line_when_all_readable() {
-        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2, 0);
-        assert!(!header.contains("Files unreadable"), "{header}");
-    }
-
-    #[test]
-    fn empty_header_unreadable_replaces_kind_hint() {
+    fn empty_header_unreadable_line_keeps_kind_hint() {
         let out = search_empty_header("Foo", &scope(), 47, 47, 0, 1, EmptyHint::Symbol);
         assert_eq!(
             out,
@@ -234,7 +226,7 @@ mod tests {
              Files searched:     47\n  \
              Content hits:       0\n  \
              Files unreadable:   1 (results may be incomplete)\n  \
-             Hint: results may be incomplete — unreadable files were skipped"
+             Hint: no symbols matched; try kind: content or check spelling"
         );
     }
 

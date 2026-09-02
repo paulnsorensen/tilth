@@ -158,7 +158,7 @@ pub(crate) fn find_callers_batch(
                 bloom,
                 super::bloom_walk::MAX_FILE_SIZE,
             ) {
-                super::bloom_walk::BloomRead::Hit(content, _mtime) => content,
+                super::bloom_walk::BloomRead::Hit(content) => content,
                 super::bloom_walk::BloomRead::Skip => return ignore::WalkState::Continue,
                 super::bloom_walk::BloomRead::Unreadable => {
                     files_unreadable.fetch_add(1, Ordering::Relaxed);

@@ -2556,7 +2556,7 @@ mod tests {
     /// Strips read permission; returns false (skip the test) when the read
     /// still succeeds, i.e. running as root.
     #[cfg(unix)]
-    fn deny_read(path: &Path) -> bool {
+    fn read_is_denied(path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::read(path).is_err()
@@ -2569,7 +2569,7 @@ mod tests {
         std::fs::write(tmp.path().join("open.txt"), "needle\n").unwrap();
         let locked = tmp.path().join("locked.txt");
         std::fs::write(&locked, "needle\n").unwrap();
-        if !deny_read(&locked) {
+        if !read_is_denied(&locked) {
             eprintln!("skipping: chmod 000 does not deny reads for this user");
             return;
         }
@@ -2586,7 +2586,7 @@ mod tests {
             miss.contains(
                 "\n  Content hits:       0\n  \
                  Files unreadable:   1 (results may be incomplete)\n  \
-                 Hint: results may be incomplete — unreadable files were skipped"
+                 Hint: no content matches; try kind: symbol or a broader pattern"
             ),
             "{miss}"
         );
@@ -2603,7 +2603,7 @@ mod tests {
         .unwrap();
         let locked = tmp.path().join("locked.rs");
         std::fs::write(&locked, "fn other() {\n    callee();\n}\n").unwrap();
-        if !deny_read(&locked) {
+        if !read_is_denied(&locked) {
             eprintln!("skipping: chmod 000 does not deny reads for this user");
             return;
         }
