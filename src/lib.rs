@@ -579,11 +579,12 @@ mod multi_symbol_tests {
     ];
 
     fn write_source(dir: &Path, body_lines: usize) {
+        use std::fmt::Write as _;
         let mut src = String::new();
         for name in NAMES {
-            src.push_str(&format!("fn {name}() {{\n"));
+            let _ = writeln!(src, "fn {name}() {{");
             for i in 0..body_lines {
-                src.push_str(&format!("    line_{i}();\n"));
+                let _ = writeln!(src, "    line_{i}();");
             }
             src.push_str("}\n");
         }

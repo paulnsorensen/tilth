@@ -888,11 +888,12 @@ mod tests {
     fn many_symbols_respect_budget() {
         let tmp = tempfile::tempdir().unwrap();
         let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        use std::fmt::Write as _;
         let mut src = String::new();
         for name in names {
-            src.push_str(&format!("fn {name}() {{\n"));
+            let _ = writeln!(src, "fn {name}() {{");
             for i in 0..60 {
-                src.push_str(&format!("    line_{i}();\n"));
+                let _ = writeln!(src, "    line_{i}();");
             }
             src.push_str("}\n");
         }
