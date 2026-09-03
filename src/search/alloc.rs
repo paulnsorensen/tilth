@@ -152,7 +152,11 @@ pub(crate) fn fit_sections_to_budget(
     sections: Vec<BudgetedSection>,
     budget_tokens: u64,
 ) -> Vec<String> {
-    let mut total = 0u64;
+    // Count the `.join(SECTION_SEPARATOR)` overhead the caller adds so the
+    // fast path can't pass a join that is actually over budget — that would let
+    // `budget::apply`'s position cut drop a trailing section.
+    let separators = SECTION_SEPARATOR.len() * sections.len().saturating_sub(1);
+    let mut total = estimate_tokens(separators as u64);
     for (out, _) in &sections {
         total += estimate_tokens(out.len() as u64);
     }
@@ -164,7 +168,6 @@ pub(crate) fn fit_sections_to_budget(
         return fitted;
     }
 
-    let separators = SECTION_SEPARATOR.len() * sections.len().saturating_sub(1);
     let mut remaining = budget_tokens.saturating_sub(estimate_tokens(separators as u64));
     let count = sections.len() as u64;
     for (i, (out, segments)) in sections.into_iter().enumerate() {
@@ -331,5 +334,33 @@ mod tests {
         ];
 
         assert_eq!(fit_sections_to_budget(sections, 1_000), vec![a, b]);
+    }
+
+    /// Regression: the fast path must count the `.join(SECTION_SEPARATOR)`
+    /// overhead. Two sections sum to 200 tokens — under a 201-token budget —
+    /// but the separator pushes the real join to 202 tokens. The old fast path
+    /// passed that over-budget join through unchanged, so `budget::apply`
+    /// position-cut the tail; the fix must trim within budget instead.
+    #[test]
+    fn fit_sections_to_budget_accounts_for_separators_in_fast_path() {
+        let a = format!("h\n{}", "x".repeat(398)); // 400 bytes -> 100 tokens
+        let b = format!("h\n{}", "y".repeat(398)); // 400 bytes -> 100 tokens
+        let sections = vec![
+            (a.clone(), vec![(1i64, 2usize, a.len())]),
+            (b.clone(), vec![(1i64, 2usize, b.len())]),
+        ];
+
+        let fitted = fit_sections_to_budget(sections, 201);
+        let joined = fitted.join(SECTION_SEPARATOR);
+
+        assert!(
+            estimate_tokens(joined.len() as u64) <= 201,
+            "joined output must fit the budget once separators are counted: {} tokens",
+            estimate_tokens(joined.len() as u64)
+        );
+        assert_ne!(
+            fitted[0], a,
+            "the fast path must not pass the over-budget join through unchanged"
+        );
     }
 }
