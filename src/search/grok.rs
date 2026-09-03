@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
+use crate::hint::Hint;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
@@ -108,7 +109,7 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
         .flatten()
         .map(|(names, truncated)| {
             let list = names.join(", ");
-            let note = "Scope too large to fully search — narrow scope for a better match.";
+            let note = Hint::GrokScopeTooLarge.text();
             match (list.is_empty(), truncated) {
                 (_, false) => list,
                 (true, true) => note.to_string(),

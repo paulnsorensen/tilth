@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::path::Path;
 
+use crate::hint::Hint;
 use crate::types::{estimate_tokens, ViewMode};
 
 /// Build the standard header line:
@@ -36,7 +37,7 @@ pub fn search_header(
     usages: usize,
 ) -> String {
     let parts = match (total, defs, usages) {
-        (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
+        (0, _, _) => format!("0 matches ({})", Hint::SearchZeroMatchesAdvisory.text()),
         (_, 0, _) => format!("{total} matches"),
         (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
@@ -70,13 +71,13 @@ pub fn search_empty_header(
     kind: EmptyHint,
 ) -> String {
     let hint = if files_matched_glob == 0 {
-        "glob matched no files — broaden glob or check path"
+        Hint::SearchEmptyGlobNoFiles.text()
     } else {
         match kind {
-            EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
-            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
-            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
-            EmptyHint::Merged => "no matches in any mode — re-check the query and glob",
+            EmptyHint::Symbol => Hint::SearchEmptyNoSymbols.text(),
+            EmptyHint::Content => Hint::SearchEmptyNoContent.text(),
+            EmptyHint::Regex => Hint::SearchEmptyRegexZero.text(),
+            EmptyHint::Merged => Hint::SearchEmptyMerged.text(),
         }
     };
     format!(
