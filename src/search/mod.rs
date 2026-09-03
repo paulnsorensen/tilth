@@ -417,6 +417,7 @@ pub fn search_multi_symbol_expanded(
                 files_matched_glob,
                 files_searched,
                 result.total_found,
+                result.files_unreadable,
                 format::EmptyHint::Symbol,
             ));
             continue;
@@ -427,6 +428,7 @@ pub fn search_multi_symbol_expanded(
             result.matches.len(),
             result.definitions,
             result.usages,
+            result.files_unreadable,
         );
         let mut segments: Vec<(i64, usize, usize)> = Vec::new();
         format_matches(
@@ -1354,6 +1356,7 @@ fn format_search_result(
             files_matched_glob,
             files_searched,
             result.total_found,
+            result.files_unreadable,
             kind,
         ));
     }
@@ -1363,6 +1366,7 @@ fn format_search_result(
         result.matches.len(),
         result.definitions,
         result.usages,
+        result.files_unreadable,
     );
     let mut out = header;
     let mut expand_remaining = expand;
@@ -2516,12 +2520,141 @@ mod tests {
     }
 
     #[test]
+    fn symbol_search_counts_undecodable_source_but_not_binaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("good.rs"), "fn target() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("latin1.rs"),
+            b"fn target() {}\n// caf\xe9\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("logo.png"), b"\x89PNG\r\n\x1a\n\x00\xff").unwrap();
+
+        let result = symbol::search("target", tmp.path(), None, None, false).unwrap();
+        assert_eq!(result.files_unreadable, 1);
+        assert_eq!(result.definitions, 1);
+
+        let out = search_symbol("target", tmp.path(), &OutlineCache::new(), None).unwrap();
+        assert!(
+            out.contains("\n  Files unreadable:   1 (results may be incomplete)\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn symbol_search_all_readable_omits_unreadable_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("good.rs"), "fn target() {}\n").unwrap();
+
+        let result = symbol::search("target", tmp.path(), None, None, false).unwrap();
+        assert_eq!(result.files_unreadable, 0);
+
+        let out = search_symbol("target", tmp.path(), &OutlineCache::new(), None).unwrap();
+        assert!(!out.contains("Files unreadable"), "{out}");
+    }
+
+    /// Strips read permission; returns false (skip the test) when the read
+    /// still succeeds, i.e. running as root.
+    #[cfg(unix)]
+    fn read_is_denied(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read(path).is_err()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_search_reports_permission_denied_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("open.txt"), "needle\n").unwrap();
+        let locked = tmp.path().join("locked.txt");
+        std::fs::write(&locked, "needle\n").unwrap();
+        if !read_is_denied(&locked) {
+            eprintln!("skipping: chmod 000 does not deny reads for this user");
+            return;
+        }
+        let cache = OutlineCache::new();
+
+        let hit = search_content("needle", tmp.path(), &cache, None).unwrap();
+        assert!(
+            hit.contains("— 1 matches\n  Files unreadable:   1 (results may be incomplete)\n"),
+            "{hit}"
+        );
+
+        let miss = search_content("absent", tmp.path(), &cache, None).unwrap();
+        assert!(
+            miss.contains(
+                "\n  Content hits:       0\n  \
+                 Files unreadable:   1 (results may be incomplete)\n  \
+                 Hint: no content matches; try kind: symbol or a broader pattern"
+            ),
+            "{miss}"
+        );
+    }
+
+    #[test]
+    fn content_search_counts_undecodable_matching_line_but_not_binaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The match sits on a line with an invalid UTF-8 byte: the `UTF8` sink
+        // errors, the match is dropped, and the file must be counted unreadable.
+        std::fs::write(tmp.path().join("bad.txt"), b"needle \xe9 tail\n").unwrap();
+        // A binary blob with the term and a NUL must NOT inflate the count.
+        std::fs::write(tmp.path().join("blob.bin"), b"needle\x00\xe9\n").unwrap();
+        std::fs::write(tmp.path().join("good.txt"), "needle\n").unwrap();
+
+        let (result, _) = content::search("needle", tmp.path(), false, None, None, false).unwrap();
+        assert_eq!(result.files_unreadable, 1);
+
+        let out = search_content("needle", tmp.path(), &OutlineCache::new(), None).unwrap();
+        assert!(
+            out.contains("\n  Files unreadable:   1 (results may be incomplete)\n"),
+            "{out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callers_search_reports_permission_denied_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.rs"),
+            "fn callee() {}\nfn caller() {\n    callee();\n}\n",
+        )
+        .unwrap();
+        let locked = tmp.path().join("locked.rs");
+        std::fs::write(&locked, "fn other() {\n    callee();\n}\n").unwrap();
+        if !read_is_denied(&locked) {
+            eprintln!("skipping: chmod 000 does not deny reads for this user");
+            return;
+        }
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let hit =
+            callers::search_callers_expanded("callee", tmp.path(), &bloom, 0, None, None, false)
+                .unwrap();
+        assert!(
+            hit.contains("— 1 call site\n  Files unreadable:   1 (results may be incomplete)\n"),
+            "{hit}"
+        );
+
+        let miss =
+            callers::search_callers_expanded("absent", tmp.path(), &bloom, 0, None, None, false)
+                .unwrap();
+        assert!(
+            miss.contains(
+                "— no call sites found\n  Files unreadable:   1 (results may be incomplete)\n\n"
+            ),
+            "{miss}"
+        );
+    }
+
+    #[test]
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(
+        let (rs_callers, _) = callers::find_callers_batch(
             &single,
             &scope,
             &bloom,
@@ -2529,7 +2662,7 @@ mod tests {
             callers::BATCH_EARLY_QUIT,
         )
         .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(
+        let (toml_callers, _) = callers::find_callers_batch(
             &single,
             &scope,
             &bloom,

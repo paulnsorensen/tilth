@@ -34,13 +34,27 @@ pub fn search_header(
     total: usize,
     defs: usize,
     usages: usize,
+    files_unreadable: usize,
 ) -> String {
     let parts = match (total, defs, usages) {
         (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
         (_, 0, _) => format!("{total} matches"),
         (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
-    format!("# Search: \"{query}\" in {} — {parts}", scope.display())
+    format!(
+        "# Search: \"{query}\" in {} — {parts}{}",
+        scope.display(),
+        unreadable_note(files_unreadable)
+    )
+}
+
+/// Header line reporting files a search walk could not read; empty when
+/// every file was readable.
+pub(crate) fn unreadable_note(files_unreadable: usize) -> String {
+    if files_unreadable == 0 {
+        return String::new();
+    }
+    format!("\n  Files unreadable:   {files_unreadable} (results may be incomplete)")
 }
 
 /// Which search-kind produced a zero-result response. Determines which hint
@@ -67,6 +81,7 @@ pub fn search_empty_header(
     files_matched_glob: usize,
     files_searched: usize,
     content_hits: usize,
+    files_unreadable: usize,
     kind: EmptyHint,
 ) -> String {
     let hint = if files_matched_glob == 0 {
@@ -83,9 +98,10 @@ pub fn search_empty_header(
         "# Search: \"{query}\" in {scope_disp} — 0 matches\n  \
          Files matched glob: {files_matched_glob}\n  \
          Files searched:     {files_searched}\n  \
-         Content hits:       {content_hits}\n  \
+         Content hits:       {content_hits}{unreadable}\n  \
          Hint: {hint}",
-        scope_disp = scope.display()
+        scope_disp = scope.display(),
+        unreadable = unreadable_note(files_unreadable)
     )
 }
 
@@ -130,7 +146,7 @@ mod tests {
     /// retrying the same query blindly, not just report "0 matches".
     #[test]
     fn search_header_zero_matches_includes_hint() {
-        let header = search_header("doesNotExist", Path::new("/repo"), 0, 0, 0);
+        let header = search_header("doesNotExist", Path::new("/repo"), 0, 0, 0, 0);
         assert!(header.contains("0 matches"), "{header}");
         assert!(header.contains("kind=content"), "{header}");
         assert!(header.contains("widen scope"), "{header}");
@@ -139,12 +155,13 @@ mod tests {
 
     #[test]
     fn search_header_with_matches_has_no_hint() {
-        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2);
+        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2, 0);
         assert!(
             header.contains("3 matches (1 definitions, 2 usages)"),
             "{header}"
         );
         assert!(!header.contains("check spelling"), "{header}");
+        assert!(!header.contains("Files unreadable"), "{header}");
     }
 
     /// Regression: a result with hits but zero definitions (every content
@@ -153,7 +170,7 @@ mod tests {
     /// hint change accidentally reintroduced on this path.
     #[test]
     fn search_header_usages_only_omits_definition_counts() {
-        let header = search_header("logLine", Path::new("/repo"), 10, 0, 10);
+        let header = search_header("logLine", Path::new("/repo"), 10, 0, 10, 0);
         assert!(header.contains("10 matches"), "{header}");
         assert!(
             !header.contains("0 definitions"),
@@ -169,7 +186,7 @@ mod tests {
     #[test]
     fn empty_header_glob_zero_overrides_kind() {
         // files_matched_glob == 0 wins regardless of kind.
-        let out = search_empty_header("foo", &scope(), 0, 0, 0, EmptyHint::Symbol);
+        let out = search_empty_header("foo", &scope(), 0, 0, 0, 0, EmptyHint::Symbol);
         assert!(out.contains("0 matches"), "{out}");
         assert!(out.contains("Files matched glob: 0"), "{out}");
         assert!(
@@ -180,17 +197,42 @@ mod tests {
 
     #[test]
     fn empty_header_symbol_branch() {
-        let out = search_empty_header("Foo", &scope(), 47, 47, 0, EmptyHint::Symbol);
+        let out = search_empty_header("Foo", &scope(), 47, 47, 0, 0, EmptyHint::Symbol);
         assert!(
             out.contains("no symbols matched; try kind: content or check spelling"),
             "{out}"
         );
         assert!(out.contains("Files searched:     47"), "{out}");
+        assert!(!out.contains("Files unreadable"), "{out}");
+    }
+
+    #[test]
+    fn search_header_reports_unreadable_files() {
+        let header = search_header("Foo", Path::new("/repo"), 3, 1, 2, 2);
+        assert_eq!(
+            header,
+            "# Search: \"Foo\" in /repo — 3 matches (1 definitions, 2 usages)\n  \
+             Files unreadable:   2 (results may be incomplete)"
+        );
+    }
+
+    #[test]
+    fn empty_header_unreadable_line_keeps_kind_hint() {
+        let out = search_empty_header("Foo", &scope(), 47, 47, 0, 1, EmptyHint::Symbol);
+        assert_eq!(
+            out,
+            "# Search: \"Foo\" in /repo — 0 matches\n  \
+             Files matched glob: 47\n  \
+             Files searched:     47\n  \
+             Content hits:       0\n  \
+             Files unreadable:   1 (results may be incomplete)\n  \
+             Hint: no symbols matched; try kind: content or check spelling"
+        );
     }
 
     #[test]
     fn empty_header_content_branch() {
-        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Content);
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, 0, EmptyHint::Content);
         assert!(
             out.contains("no content matches; try kind: symbol or a broader pattern"),
             "{out}"
@@ -200,7 +242,7 @@ mod tests {
     #[test]
     fn empty_header_regex_branch() {
         // Regex has its own hint, distinct from Content's.
-        let out = search_empty_header("foo.*bar", &scope(), 47, 47, 0, EmptyHint::Regex);
+        let out = search_empty_header("foo.*bar", &scope(), 47, 47, 0, 0, EmptyHint::Regex);
         assert!(
             out.contains("regex matched zero content; try kind: symbol or a broader pattern"),
             "{out}"
@@ -209,7 +251,7 @@ mod tests {
 
     #[test]
     fn empty_header_merged_branch() {
-        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Merged);
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, 0, EmptyHint::Merged);
         assert!(
             out.contains("no matches in any mode — re-check the query and glob"),
             "{out}"

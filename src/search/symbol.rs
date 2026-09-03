@@ -86,8 +86,8 @@ pub fn search(
         || find_usages(query, &matcher, scope, glob, usage_threshold),
     );
 
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, defs_unreadable) = defs?;
+    let (usages, usages_unreadable) = usages?;
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -141,6 +141,7 @@ pub fn search(
         total_found: total,
         definitions: def_count,
         usages: usage_count,
+        files_unreadable: defs_unreadable.max(usages_unreadable),
         facet_totals: totals,
     })
 }
@@ -158,11 +159,12 @@ fn find_definitions(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, usize), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     // Early-quit checks are approximate by design — one extra iteration is harmless.
     let found_count = AtomicUsize::new(0);
+    let files_unreadable = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
@@ -170,6 +172,7 @@ fn find_definitions(
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let files_unreadable = &files_unreadable;
 
         Box::new(move |entry| {
             // Early termination: enough definitions found
@@ -183,8 +186,19 @@ fn find_definitions(
             let path = path.as_path();
 
             // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            let Ok(bytes) = fs::read(path) else {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
                 return ignore::WalkState::Continue;
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(err) => {
+                    // Undecodable source is a lost result; a binary blob is not.
+                    if !crate::lang::detection::is_binary(err.as_bytes()) {
+                        files_unreadable.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return ignore::WalkState::Continue;
+                }
             };
 
             // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
@@ -260,9 +274,10 @@ fn find_definitions(
         })
     });
 
-    Ok(matches
+    let matches = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 
 /// Return every structural definition matching `query`, ranked like display search
@@ -273,7 +288,7 @@ pub(crate) fn all_definitions(
     scope: &Path,
     glob: Option<&str>,
 ) -> Result<Vec<Match>, TilthError> {
-    let mut defs = find_definitions(query, scope, glob, usize::MAX)?;
+    let (mut defs, _files_unreadable) = find_definitions(query, scope, glob, usize::MAX)?;
     rank::sort(&mut defs, query, scope, None);
     defs.sort_by_key(stratum_for_display);
     Ok(defs)
@@ -517,16 +532,18 @@ fn find_usages(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, usize), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
     let found_count = AtomicUsize::new(0);
+    let files_unreadable = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let files_unreadable = &files_unreadable;
 
         Box::new(move |entry| {
             // Early termination: enough usages found
@@ -542,6 +559,7 @@ fn find_usages(
             // Read once and dispatch via `search_slice` so the minified
             // heuristic and the search share a single kernel read.
             let Ok(bytes) = std::fs::read(path) else {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
                 return ignore::WalkState::Continue;
             };
 
@@ -558,26 +576,34 @@ fn find_usages(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_slice(
-                matcher,
-                &bytes,
-                UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: line.trim_end().to_string(),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
-                    Ok(true)
-                }),
-            );
+            // A matching line with invalid UTF-8 makes the `UTF8` sink error
+            // and drops the match. Count the file as unreadable (unless it is a
+            // binary blob) so the completeness signal stays honest.
+            let search_ok = searcher
+                .search_slice(
+                    matcher,
+                    &bytes,
+                    UTF8(|line_num, line| {
+                        file_matches.push(Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: line.trim_end().to_string(),
+                            is_definition: false,
+                            exact: line.contains(query),
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        });
+                        Ok(true)
+                    }),
+                )
+                .is_ok();
+            if !search_ok && !crate::lang::detection::is_binary(&bytes) {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
+            }
 
             if !file_matches.is_empty() {
                 found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
@@ -591,9 +617,10 @@ fn find_usages(
         })
     });
 
-    Ok(matches
+    let matches = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 
 /// Markdown heading definition detector.
