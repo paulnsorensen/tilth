@@ -390,7 +390,7 @@ fn enrich_from_outline(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(&path)?;
     let entries = get_outline_entries(&content, lang);
-    let target = match find_by_start_line(&entries, start_line) {
+    let mut target = match find_by_start_line(&entries, start_line) {
         Some(e) => target_from_entry(e, path, other_def_count),
         None => {
             // The outline tree caps its nesting at one container level, so a
@@ -401,7 +401,7 @@ fn enrich_from_outline(
                 None => match find_entry_at_line(&entries, start_line) {
                     Some(e) => target_from_entry(e, path, other_def_count),
                     None => ResolvedTarget {
-                        name,
+                        name: name.clone(),
                         path,
                         start_line,
                         end_line: start_line,
@@ -414,6 +414,12 @@ fn enrich_from_outline(
             }
         }
     };
+    if lang == Lang::Go
+        && target.name != name
+        && (target.kind == OutlineKind::Constant || target.kind == OutlineKind::Variable)
+    {
+        target.name = name;
+    }
     Ok((target, content, lang))
 }
 
@@ -1593,6 +1599,19 @@ impl<T> Foo<T> {
             "Foo.Bar must resolve to Foo's method by receiver type, got {}",
             target.path.display()
         );
+    }
+
+    #[test]
+    fn resolve_go_grouped_and_multi_name_declarations_use_query_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "package main\n\nconst (\n\tStatusActive = 1\n\tStatusInactive = 2\n)\nvar CounterA, CounterB int\n";
+        write_fixture(tmp.path(), "consts.go", code);
+
+        for name in ["StatusInactive", "CounterB"] {
+            let (target, _, _) = resolve_with_source(name, tmp.path())
+                .unwrap_or_else(|e| panic!("grok could not resolve `{name}`: {e}"));
+            assert_eq!(target.name, name);
+        }
     }
 
     #[test]

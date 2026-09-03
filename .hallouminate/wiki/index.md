@@ -15,6 +15,7 @@ under `.cheese/`.
 
 
 - [Edit-anchor design: per-line hash vs whole-file tag](edit-anchor-design.md) — why tilth originally anchored edits with a per-line content hash, the FNV low-bit-mask bug, the measured ~25% per-read token tax vs oh-my-pi's O(1) whole-file tag, and the analysis behind the since-shipped switch to the whole-file-tag model.
+- [Go grouped declaration resolution](go-declaration-resolution.md) — why definition search uses each matched identifier line while keeping the enclosing declaration range, and why grok replaces the outline's first-name label for later const and var members.
 - [Local gate gotchas (macOS)](local-gate-gotchas.md) — why a local `cargo test` shows one failure CI does not (`batch_budget_represents_every_query`), and why CI's `cargo clippy -- -D warnings` is clean while `--all-targets` is not. Both are baseline; check before "fixing" either.
 - [MCP cost model: why tilth costs more per correct answer on Sonnet 5](mcp-cost-model-sonnet5.md) — valid three-way benchmark result (+18-21% cost per correct, no accuracy gain at a 97.5% ceiling); the cost is a ~5,350-token fixed MCP prefix cache-written per cell, not per-call output volume; why mixed tool adoption (28 tilth→native fallbacks) is the worst posture.
 - [MCP cwd / workspace-root binding](mcp-cwd-root-binding.md) — why tilth uses a required per-call `cwd` param (renamed from `root` in PR #113, hook removed in #144; not the MCP `roots` capability) to resolve paths to the right git-worktree checkout; the silent worktree gotcha; 8-harness client survey.
