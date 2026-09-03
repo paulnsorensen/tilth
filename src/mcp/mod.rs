@@ -2429,17 +2429,16 @@ mod tests {
                 "query '{q}' was silently dropped under a tight budget:\n{out}"
             );
         }
-        // Under a tight budget each query's matches are trimmed deterministically
-        // (there are far more matches than fit). Assert the per-query trim marker,
-        // which is path-independent — unlike the aggregate ceiling, whose firing
-        // depends on the temp-dir path length echoed in each search header (#155).
-        assert!(
-            out.contains("omitted to fit budget"),
-            "expected per-query truncation marker:\n{out}"
-        );
-        assert!(
-            out.contains("raise `budget`"),
-            "truncation must name the budget lever:\n{out}"
+        // Under a tight budget every query is trimmed, so each of the three
+        // sections must carry a truncation marker that names the `budget` lever.
+        // The exact marker differs by path length — a long temp-dir path trims
+        // via the per-query allocator ("omitted to fit budget"), a short one
+        // collapses via the section cap ("truncated") — but both cite "raise
+        // `budget`", so that phrase is the path-independent signal (#155).
+        assert_eq!(
+            out.matches("raise `budget`").count(),
+            3,
+            "each query must signal truncation and name the budget lever:\n{out}"
         );
     }
 
