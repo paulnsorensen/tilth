@@ -39,7 +39,6 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "namespace_definition",
     // Python
     "decorated_definition",
-    // Go (`var_declaration` is also Scala's abstract `var x: T`, named via its `name` field)
     "type_declaration",
     "var_declaration",
     // Exports
@@ -77,21 +76,11 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
-    // Go `type_declaration` / `const_declaration` / `var_declaration` wrap the
-    // named node: `type X struct{...}` parses as type_declaration → type_spec
-    // (or type_alias for `type X = Y`), `const X = 1` as const_declaration →
-    // const_spec, `var X = 1` as var_declaration → var_spec (nested under
-    // var_spec_list for `var ( ... )` groups). The `name` field lives on that
-    // inner spec, so the field walk above finds nothing and every Go
-    // type/const/var definition would be dropped as nameless. Grouped
-    // declarations surface their first spec's name.
-    match node.kind() {
-        "type_declaration" | "const_declaration" | "var_declaration" => {
-            if let Some(name) = go_spec_name(node, lines) {
-                return Some(name);
-            }
+    let kind = node.kind();
+    if kind == "type_declaration" || kind == "const_declaration" || kind == "var_declaration" {
+        if let Some(name) = go_spec_name(node, lines) {
+            return Some(name);
         }
-        _ => {}
     }
 
     // JS/TS `lexical_declaration` and C# `variable_declaration` store the
@@ -118,22 +107,47 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
 fn go_spec_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "type_spec" | "type_alias" | "const_spec" | "var_spec" => {
-                let Some(name_node) = child.child_by_field_name("name") else {
-                    continue;
-                };
-                let text = node_text_simple(name_node, lines, NodeTextMode::Full);
-                if !text.is_empty() {
-                    return Some(text);
+        let kind = child.kind();
+        if kind == "type_spec" || kind == "type_alias" || kind == "const_spec" || kind == "var_spec"
+        {
+            let Some(name_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let text = node_text_simple(name_node, lines, NodeTextMode::Full);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        if kind == "var_spec_list" {
+            if let Some(name) = go_spec_name(child, lines) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn go_declaration_name_line(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+) -> Option<u32> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        if kind == "type_spec" || kind == "type_alias" || kind == "const_spec" || kind == "var_spec"
+        {
+            let mut names = child.walk();
+            for name_node in child.children_by_field_name("name", &mut names) {
+                if node_text_simple(name_node, lines, NodeTextMode::Full) == query {
+                    return Some(name_node.start_position().row as u32 + 1);
                 }
             }
-            "var_spec_list" => {
-                if let Some(name) = go_spec_name(child, lines) {
-                    return Some(name);
-                }
+        }
+        if kind == "var_spec_list" {
+            if let Some(line) = go_declaration_name_line(child, lines, query) {
+                return Some(line);
             }
-            _ => {}
         }
     }
     None

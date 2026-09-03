@@ -10,6 +10,7 @@ use crate::lang::elixir::is_elixir_definition;
 use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use crate::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
+    go_declaration_name_line,
 };
 
 use crate::error::TilthError;
@@ -344,31 +345,35 @@ fn walk_for_definitions(
     };
 
     if def_kinds.contains(&kind) {
-        // Check if this node defines the queried symbol
-        if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_name: Some(query.to_string()),
-                    def_weight: (def_ops.weight)(node, lines),
-                    impl_target: None,
-                });
-            }
+        let go_name_line = if lang == Some(crate::types::Lang::Go) {
+            go_declaration_name_line(node, lines, query)
+        } else {
+            None
+        };
+        let defines_query =
+            (def_ops.extract_name)(node, lines).as_deref() == Some(query) || go_name_line.is_some();
+        if defines_query {
+            let line_num = go_name_line.unwrap_or_else(|| node.start_position().row as u32 + 1);
+            let line_text = lines
+                .get(line_num.saturating_sub(1) as usize)
+                .unwrap_or(&"")
+                .trim_end();
+            defs.push(Match {
+                path: path.to_path_buf(),
+                line: line_num,
+                text: line_text.to_string(),
+                is_definition: true,
+                exact: true,
+                file_lines,
+                mtime,
+                def_range: Some((
+                    node.start_position().row as u32 + 1,
+                    node.end_position().row as u32 + 1,
+                )),
+                def_name: Some(query.to_string()),
+                def_weight: (def_ops.weight)(node, lines),
+                impl_target: None,
+            });
         }
 
         // Impl/interface detection: surface `impl Trait for Type` and
@@ -848,17 +853,23 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
 
     #[test]
     fn go_const_and_var_declarations_detected_as_definitions() {
-        let code = "package x\n\nvar GlobalVar = 1\nconst MaxRetries = 3\nfunc UseIt() int { return GlobalVar + MaxRetries }\n";
+        let code = "package x\n\nvar GlobalVar = 1\nconst MaxRetries = 3\nconst (\n\tStatusActive = 1\n\tStatusInactive = 2\n)\nvar CounterA, CounterB int\nfunc UseIt() int { return GlobalVar + MaxRetries + StatusInactive + CounterB }\n";
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Go).unwrap();
+        let file_lines = code.lines().count() as u32;
 
-        for (query, line) in [("GlobalVar", 3), ("MaxRetries", 4)] {
+        for (query, line, range) in [
+            ("GlobalVar", 3, (3, 3)),
+            ("MaxRetries", 4, (4, 4)),
+            ("StatusInactive", 7, (5, 8)),
+            ("CounterB", 9, (9, 9)),
+        ] {
             let defs = find_defs_treesitter(
                 std::path::Path::new("x.go"),
                 query,
                 &ts_lang,
                 Some(crate::types::Lang::Go),
                 code,
-                5,
+                file_lines,
                 SystemTime::now(),
             );
             assert_eq!(defs.len(), 1, "{query}: expected one definition");
@@ -868,11 +879,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
                 "{query}: declaration line is a definition"
             );
             assert_eq!(def.line, line, "{query}: definition line");
-            assert_eq!(
-                def.def_range,
-                Some((line, line)),
-                "{query}: definition range"
-            );
+            assert_eq!(def.def_range, Some(range), "{query}: definition range");
             assert_eq!(
                 def.def_name.as_deref(),
                 Some(query),
