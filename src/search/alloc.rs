@@ -135,6 +135,50 @@ pub(crate) fn fit_to_budget(
     out
 }
 
+pub(crate) const SECTION_SEPARATOR: &str = "\n\n---\n";
+
+/// A rendered per-symbol section plus its `(value, byte_start, byte_end)`
+/// match blocks for `fit_to_budget`.
+pub(crate) type BudgetedSection = (String, Vec<(i64, usize, usize)>);
+
+/// Fit the per-symbol sections of a multi-symbol search into one shared
+/// budget. Under budget every section is returned unchanged. Over budget each
+/// section is value-trimmed to an equal share of what remains — a section that
+/// needs less than its share leaves the rest to later ones — so every listed
+/// symbol keeps its header instead of trailing symbols being position-cut by
+/// `budget::apply`. There is no cap on the symbol count; a long list degrades
+/// to headers plus the highest-value blocks.
+pub(crate) fn fit_sections_to_budget(
+    sections: Vec<BudgetedSection>,
+    budget_tokens: u64,
+) -> Vec<String> {
+    // Count the `.join(SECTION_SEPARATOR)` overhead the caller adds so the
+    // fast path can't pass a join that is actually over budget — that would let
+    // `budget::apply`'s position cut drop a trailing section.
+    let separators = SECTION_SEPARATOR.len() * sections.len().saturating_sub(1);
+    let mut total = estimate_tokens(separators as u64);
+    for (out, _) in &sections {
+        total += estimate_tokens(out.len() as u64);
+    }
+    let mut fitted = Vec::with_capacity(sections.len());
+    if total <= budget_tokens {
+        for (out, _) in sections {
+            fitted.push(out);
+        }
+        return fitted;
+    }
+
+    let mut remaining = budget_tokens.saturating_sub(estimate_tokens(separators as u64));
+    let count = sections.len() as u64;
+    for (i, (out, segments)) in sections.into_iter().enumerate() {
+        let share = remaining / (count - i as u64);
+        let out = fit_to_budget(&out, &segments, share);
+        remaining = remaining.saturating_sub(estimate_tokens(out.len() as u64));
+        fitted.push(out);
+    }
+    fitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +293,74 @@ mod tests {
         assert!(
             !out.contains("omitted"),
             "no misleading omitted note when nothing was value-dropped: {out}"
+        );
+    }
+
+    /// Over budget, a section that needs less than its share leaves the rest
+    /// to later sections: with an even split the third section here would be
+    /// trimmed too, but the first section's unused share carries forward.
+    #[test]
+    fn fit_sections_to_budget_carries_unused_share_forward() {
+        let small = "h0\n".to_string();
+        let big_a = format!("h1\n{}", "x".repeat(240));
+        let big_b = format!("h2\n{}", "y".repeat(240));
+        let sections = vec![
+            (small.clone(), Vec::new()),
+            (big_a.clone(), vec![(1i64, 3usize, big_a.len())]),
+            (big_b.clone(), vec![(1i64, 3usize, big_b.len())]),
+        ];
+
+        let fitted = fit_sections_to_budget(sections, 100);
+
+        assert_eq!(fitted[0], small);
+        assert!(
+            fitted[1].starts_with("h1\n") && !fitted[1].contains("xxx"),
+            "second section must be trimmed to its header: {:?}",
+            fitted[1]
+        );
+        assert_eq!(
+            fitted[2], big_b,
+            "third section must fit in the carried-forward share"
+        );
+    }
+
+    #[test]
+    fn fit_sections_to_budget_under_budget_is_byte_identical() {
+        let a = format!("h0\n{}", "x".repeat(40));
+        let b = format!("h1\n{}", "y".repeat(40));
+        let sections = vec![
+            (a.clone(), vec![(1i64, 3usize, a.len())]),
+            (b.clone(), vec![(1i64, 3usize, b.len())]),
+        ];
+
+        assert_eq!(fit_sections_to_budget(sections, 1_000), vec![a, b]);
+    }
+
+    /// Regression: the fast path must count the `.join(SECTION_SEPARATOR)`
+    /// overhead. Two sections sum to 200 tokens — under a 201-token budget —
+    /// but the separator pushes the real join to 202 tokens. The old fast path
+    /// passed that over-budget join through unchanged, so `budget::apply`
+    /// position-cut the tail; the fix must trim within budget instead.
+    #[test]
+    fn fit_sections_to_budget_accounts_for_separators_in_fast_path() {
+        let a = format!("h\n{}", "x".repeat(398)); // 400 bytes -> 100 tokens
+        let b = format!("h\n{}", "y".repeat(398)); // 400 bytes -> 100 tokens
+        let sections = vec![
+            (a.clone(), vec![(1i64, 2usize, a.len())]),
+            (b.clone(), vec![(1i64, 2usize, b.len())]),
+        ];
+
+        let fitted = fit_sections_to_budget(sections, 201);
+        let joined = fitted.join(SECTION_SEPARATOR);
+
+        assert!(
+            estimate_tokens(joined.len() as u64) <= 201,
+            "joined output must fit the budget once separators are counted: {} tokens",
+            estimate_tokens(joined.len() as u64)
+        );
+        assert_ne!(
+            fitted[0], a,
+            "the fast path must not pass the over-budget join through unchanged"
         );
     }
 }

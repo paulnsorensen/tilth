@@ -27,7 +27,7 @@ Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <c
 
 ```bash
 tilth <symbol> --scope <dir>                # definitions + usages
-tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol (max 5)
+tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol lookup
 tilth <symbol> --expand                     # inline source for top 2 matches
 tilth <symbol> --expand=5                   # inline source for top 5
 tilth <symbol> --full                       # expand every match (capped at 50)

@@ -405,13 +405,13 @@ pub fn search_multi_symbol_expanded(
         expand.max(queries.len())
     };
     let mut expanded_files = HashSet::new();
-    let mut sections = Vec::with_capacity(queries.len());
+    let mut sections: Vec<alloc::BudgetedSection> = Vec::with_capacity(queries.len());
 
     for query in queries {
         let result = symbol::search(query, scope, context, glob, full)?;
         if result.matches.is_empty() {
             let (files_matched_glob, files_searched) = count_files_for_empty(scope, glob);
-            sections.push(format::search_empty_header(
+            let header = format::search_empty_header(
                 &result.query,
                 &result.scope,
                 files_matched_glob,
@@ -419,7 +419,8 @@ pub fn search_multi_symbol_expanded(
                 result.total_found,
                 result.files_unreadable,
                 format::EmptyHint::Symbol,
-            ));
+            );
+            sections.push((header, Vec::new()));
             continue;
         }
         let mut out = format::search_header(
@@ -450,14 +451,13 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
-        // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
-        // identical to before this fix (see format_search_result's own comment).
-        let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
-        sections.push(out);
+        sections.push((out, segments));
     }
 
-    Ok(sections.join("\n\n---\n"))
+    // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
+    // identical to before this fix (see format_search_result's own comment).
+    let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    Ok(alloc::fit_sections_to_budget(sections, budget_tokens).join(alloc::SECTION_SEPARATOR))
 }
 
 /// Formats the leading disclosure note when a regex pattern failed to

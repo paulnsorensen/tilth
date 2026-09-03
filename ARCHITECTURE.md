@@ -207,7 +207,7 @@ breakpoint when learning the codebase.
             ┌───────┴───────┐
             │               │
    contains ',' &&     QueryType arms
-   2..=5 idents             │
+   2+ idents                │
    (multi-symbol)           │
             │       ┌───────┼─────────┐
             │  FilePath   Glob    other QT

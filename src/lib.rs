@@ -212,7 +212,7 @@ fn run_inner(
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
-    // Multi-symbol: comma-separated identifiers, 2..=5 items
+    // Multi-symbol: comma-separated identifiers, 2+ items
     // Check before main dispatch. Only activate when all parts look like identifiers
     // to avoid hijacking regex (/foo,bar/) or glob (*.{rs,ts}) queries.
     if query.contains(',')
@@ -227,13 +227,7 @@ fn run_inner(
             .filter(|s| !s.is_empty())
             .collect();
         let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
-        if parts.len() > 5 && all_identifiers {
-            return Err(TilthError::InvalidQuery {
-                query: query.to_string(),
-                reason: "multi-symbol search supports 2-5 symbols".to_string(),
-            });
-        }
-        if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
+        if parts.len() >= 2 && all_identifiers {
             let session = session::Session::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
@@ -572,6 +566,92 @@ mod fuzzy_search_tests {
         assert!(
             matches!(err, error::TilthError::NotFound { .. }),
             "expected NotFound, got: {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_symbol_tests {
+    use super::*;
+
+    const NAMES: [&str; 8] = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ];
+
+    fn write_source(dir: &Path, body_lines: usize) {
+        use std::fmt::Write as _;
+        let mut src = String::new();
+        for name in NAMES {
+            let _ = writeln!(src, "fn {name}() {{");
+            for i in 0..body_lines {
+                let _ = writeln!(src, "    line_{i}();");
+            }
+            src.push_str("}\n");
+        }
+        std::fs::write(dir.join("demo.rs"), src).unwrap();
+    }
+
+    fn search_all(dir: &Path, budget: Option<u64>) -> String {
+        run_expanded(
+            &NAMES.join(","),
+            dir,
+            None,
+            budget,
+            false,
+            1,
+            None,
+            &cache::OutlineCache::new(),
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Every comma-separated identifier is searched: the CLI path used to
+    /// hard-error above five symbols.
+    #[test]
+    fn multi_symbol_search_runs_every_identifier_past_five() {
+        let dir = tempfile::tempdir().unwrap();
+        write_source(dir.path(), 0);
+
+        let output = search_all(dir.path(), None);
+
+        for name in NAMES {
+            assert!(
+                output.contains(&format!("# Search: \"{name}\" in ")),
+                "missing a section for {name}: {output}"
+            );
+        }
+        assert_eq!(
+            output.matches("— 1 matches").count(),
+            NAMES.len(),
+            "every symbol must report its real hit: {output}"
+        );
+    }
+
+    /// Many symbols under a tight budget still render one section per
+    /// symbol, and the whole output stays inside the budget.
+    #[test]
+    fn multi_symbol_search_many_identifiers_respect_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write_source(dir.path(), 60);
+        let budget = 1500;
+
+        let output = search_all(dir.path(), Some(budget));
+
+        for name in NAMES {
+            assert!(
+                output.contains(&format!("# Search: \"{name}\" in ")),
+                "missing a section for {name} under budget: {output}"
+            );
+        }
+        assert!(
+            output.contains("omitted to fit budget"),
+            "fixture must exceed the budget so trimming is exercised: {output}"
+        );
+        let tokens = types::estimate_tokens(output.len() as u64);
+        assert!(
+            tokens <= budget,
+            "output is {tokens} tokens, budget {budget}: {output}"
         );
     }
 }
