@@ -576,26 +576,34 @@ fn find_usages(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_slice(
-                matcher,
-                &bytes,
-                UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: line.trim_end().to_string(),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
-                    Ok(true)
-                }),
-            );
+            // A matching line with invalid UTF-8 makes the `UTF8` sink error
+            // and drops the match. Count the file as unreadable (unless it is a
+            // binary blob) so the completeness signal stays honest.
+            let search_ok = searcher
+                .search_slice(
+                    matcher,
+                    &bytes,
+                    UTF8(|line_num, line| {
+                        file_matches.push(Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: line.trim_end().to_string(),
+                            is_definition: false,
+                            exact: line.contains(query),
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        });
+                        Ok(true)
+                    }),
+                )
+                .is_ok();
+            if !search_ok && !crate::lang::detection::is_binary(&bytes) {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
+            }
 
             if !file_matches.is_empty() {
                 found_count.fetch_add(file_matches.len(), Ordering::Relaxed);

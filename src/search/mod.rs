@@ -2592,6 +2592,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn content_search_counts_undecodable_matching_line_but_not_binaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The match sits on a line with an invalid UTF-8 byte: the `UTF8` sink
+        // errors, the match is dropped, and the file must be counted unreadable.
+        std::fs::write(tmp.path().join("bad.txt"), b"needle \xe9 tail\n").unwrap();
+        // A binary blob with the term and a NUL must NOT inflate the count.
+        std::fs::write(tmp.path().join("blob.bin"), b"needle\x00\xe9\n").unwrap();
+        std::fs::write(tmp.path().join("good.txt"), "needle\n").unwrap();
+
+        let (result, _) = content::search("needle", tmp.path(), false, None, None, false).unwrap();
+        assert_eq!(result.files_unreadable, 1);
+
+        let out = search_content("needle", tmp.path(), &OutlineCache::new(), None).unwrap();
+        assert!(
+            out.contains("\n  Files unreadable:   1 (results may be incomplete)\n"),
+            "{out}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn callers_search_reports_permission_denied_files() {
