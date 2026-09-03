@@ -13,7 +13,7 @@ const PATTERNS_SHAPE: &str = "\"patterns\" must be an array of glob strings; pas
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
     let cwd = super::require_cwd(args)?;
-    let (scope, scope_warning) = super::resolve_scope(args, cwd)?;
+    let scope = super::resolve_scope(args, cwd)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns: Vec<String> = match args.get("patterns") {
@@ -33,9 +33,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
                     scope.display()
                 ));
             }
-            let mut result = scope_warning.unwrap_or_default();
-            result.push_str(&overview);
-            return Ok(super::apply_budget(&result, budget));
+            return Ok(super::apply_budget(&overview, budget));
         }
         Some(value) => {
             let Some(arr) = value.as_array() else {
@@ -117,9 +115,7 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
         }
     }
 
-    let tree = crate::mcp::tree::render_tree(&scope, &entries);
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&tree);
+    let mut result = crate::mcp::tree::render_tree(&scope, &entries);
     if entries.is_empty() {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
@@ -290,10 +286,9 @@ mod tests {
         );
     }
 
-    /// A bad scope produces a warning on the pattern branch; the overview
-    /// branch must surface it too rather than dropping it.
+    /// A missing scope is refused before the overview can widen to `cwd`.
     #[test]
-    fn omitted_patterns_surfaces_scope_warning() {
+    fn omitted_patterns_refuses_missing_scope() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -303,15 +298,29 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
 
-        let out = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" }))
-            .expect("missing scope falls back with a warning");
-        let bare = tool_list(&serde_json::json!({ "cwd": cwd })).expect("bare overview");
-        assert_eq!(
-            out,
-            format!(
-                "scope \"does/not/exist\" is not a valid directory, searching the cwd/checkout directory instead.\n\n{bare}"
-            ),
-            "warning must name the bad scope and be prepended to the overview, got: {out}"
+        let err =
+            tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" })).unwrap_err();
+        assert!(
+            err.contains("does/not/exist")
+                && err.contains("does not exist")
+                && err.contains("refusing to search a broader directory"),
+            "missing scope must return a teaching error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_string_scope_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "cwd": tmp.path().to_str().unwrap(),
+            "scope": null,
+        });
+        let err = tool_list(&args).unwrap_err();
+        assert!(
+            err.contains("\"scope\" must be a string")
+                && err.contains("refusing to search a broader directory"),
+            "null scope must return a teaching error: {err}"
         );
     }
 
