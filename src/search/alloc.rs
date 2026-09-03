@@ -129,7 +129,7 @@ pub(crate) fn fit_to_budget(
     if dropped > 0 {
         let _ = write!(
             out,
-            "\n\n... {dropped} lower-value match(es) omitted to fit budget"
+            "\n\n... {dropped} lower-value match(es) omitted to fit budget — raise `budget` to see more"
         );
     }
     out

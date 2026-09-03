@@ -2429,9 +2429,13 @@ mod tests {
                 "query '{q}' was silently dropped under a tight budget:\n{out}"
             );
         }
+        // Under a tight budget each query's matches are trimmed deterministically
+        // (there are far more matches than fit). Assert the per-query trim marker,
+        // which is path-independent — unlike the aggregate ceiling, whose firing
+        // depends on the temp-dir path length echoed in each search header (#155).
         assert!(
-            out.contains("truncated"),
-            "expected truncation marker:\n{out}"
+            out.contains("omitted to fit budget"),
+            "expected per-query truncation marker:\n{out}"
         );
         assert!(
             out.contains("raise `budget`"),
