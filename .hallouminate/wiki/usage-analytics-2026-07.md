@@ -172,6 +172,31 @@ that keeps other tools at it.
 Analytics-side (dotfiles repo, not tilth): omp adapter PR; fix `mcp_calls`
 to include codex/omp naming schemes; fix codex MCP `is_error` capture.
 
+### Disposition (checked against `main`, 2026-08-09)
+
+All six recommendations have shipped. Read the list above as the *evidence*
+for those changes, not as open work — and re-derive fresh numbers (below)
+before quoting any rate here as current:
+
+1. → PR #146 (teaching errors for op-shape guesses), on top of the
+   JSON-native `edits` array from #116; `replace_text` (#177) additionally
+   gives the find/replace mental model a legal op — see
+   [tilth_write text and file ops](write-text-and-file-ops.md).
+2. → PR #147 (directory-prefix scoping, did-you-mean, default-branch
+   teaching errors). Background: [diff git-ref resolution](diff-git-ref-resolution.md).
+3. → PR #148 (regex literal fallback with note).
+4. → PR #150 (grok teaches missing targets and suggests symbols).
+5. → PR #149 (bare-string `paths` coercion, `mode` teaching error) + #148's
+   multi-symbol soft cap. **Partly open**: issue #152 — the CLI still hard-
+   errors on the 5-symbol cap where MCP soft-caps, and the cap literal is
+   duplicated at 13 sites.
+6. → PR #146 (leading-`#` tag strip).
+
+Still open from this evidence base: `tilth_deps` under-discovery (issue #156)
+and the claude-side grok/diff adoption gaps, whose root cause turned out to
+be host-side instruction truncation rather than tool ergonomics — see
+[MCP instructions & tool descriptions](mcp-instructions-limits-and-format.md).
+
 ## Re-deriving these numbers
 
 ```sql

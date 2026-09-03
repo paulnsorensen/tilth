@@ -23,6 +23,29 @@ agents seeing ~25% of the manual. Codex/omp render instructions unclipped
 Corollary: **error messages never truncate** — failure-time teaching errors
 (the PR #146-#149 idiom) are the only guaranteed-delivery channel.
 
+## The whole-surface cap, and paying for new text
+
+Per-field 2KB is not the only budget. An edit-mode client also receives the
+entire `tools/list` payload, and ADR-003 fixed a hard cap on the total:
+`edit_mode_surface_stays_within_cap` (`src/mcp/mod.rs`) drives `serve` through
+a real initialize + `tools/list` and sums the non-empty response lines —
+envelopes, `serverInfo`, and JSON escaping included — against a `CAP` of
+13,779 bytes.
+
+The measurement method is the gotcha. An earlier version of the guard summed
+`EDIT_MODE_INSTRUCTIONS.len()` with the tool JSON and reported ~200 chars of
+headroom that did not exist: it omitted the envelopes and mixed byte with
+char counts under one cap. Drive the server; do not add up the parts.
+
+Practically this is a **funding rule**, not a budget line — new teaching text
+must be paid for by deleting text elsewhere. PR #179's one added sentence
+("Block ops span the tree-sitter definition at a line or `#symbol`") was
+funded by deleting two property-description restatements of the tag-omission
+rule that the main description already stated, landing at 13,774 of 13,779.
+Look for restatements first: they are the cheapest bytes to find, and per the
+recipe below a parameter's semantics belong in its schema `description`
+exactly once.
+
 ## What the spec says
 
 `InitializeResult.instructions` and `Tool.description` are optional, untyped
