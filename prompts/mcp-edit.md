@@ -14,5 +14,5 @@ READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numb
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
-ROUTE: find/explore → `tilth_search`; read → `tilth_read`; importers/imports → `tilth_deps` (not import-greps); understand one symbol → `tilth_grok` (replaces search → expand → callers); changes → `tilth_diff`; browse → `tilth_list` (omit `patterns` for a project overview); edit → `tilth_write`.
+ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?, kind?}]`, routing is automatic: path → regex → symbol → literal); read → `tilth_read`; importers/imports → `tilth_deps` (not import-greps); understand one symbol → `tilth_grok` (replaces search → expand → callers); changes → `tilth_diff`; browse → `tilth_list` (omit `patterns` for a project overview); edit → `tilth_write`.
 DO NOT re-read expanded search content.

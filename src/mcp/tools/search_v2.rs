@@ -94,8 +94,8 @@ pub(in crate::mcp) fn tool_search_v2(
     let response_str = serde_json::to_string(&response).map_err(|e| e.to_string())?;
 
     let _ = telemetry.record(&SearchTelemetryRecord {
-        verb: "search_v2".to_string(),
-        version: 1,
+        verb: "tilth_search".to_string(),
+        version: 2,
         route: primary_route,
         routes_tried,
         first_call: true,

@@ -24,27 +24,6 @@ const FULL_MAX_MATCHES: usize = 100;
 /// Walker early-quit threshold when `--full` is set.
 const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
 
-/// Scale a single-target batch-walk budget for a multi-target search.
-///
-/// `find_callers_batch`'s `early_quit_threshold` is a walk-wide raw-match
-/// count shared by every target in the `HashSet` passed to it — the walker
-/// has no concept of "budget per target," it just stops once the total
-/// match count crosses the threshold (see `found_count` in
-/// `find_callers_batch`). A single target's budget (`BATCH_EARLY_QUIT` /
-/// `FULL_BATCH_EARLY_QUIT`) sized for one symbol therefore starves later
-/// targets in a multi-target search once an earlier, hit-rich target
-/// consumes it. Scaling linearly by target count gives each target
-/// approximately its own full budget's worth of headroom.
-///
-/// Note: the early-quit mechanism itself is a coarse walk-wide heuristic
-/// that is a candidate for removal/replacement in a future change — this
-/// scaling is a minimal parity fix so multi-target does not regress vs. N
-/// separate single-target calls, not a long-term investment in the
-/// mechanism's design.
-fn scaled_batch_quit(base_quit: usize, n_targets: usize) -> usize {
-    base_quit.saturating_mul(n_targets.max(1))
-}
-
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
 pub struct CallerMatch {
@@ -530,122 +509,6 @@ fn write_second_hop_impact(
     });
 }
 
-/// Multi-target caller search: find call sites of two or more symbols in a single
-/// walk via `find_callers_batch`, then render one labeled section per target.
-/// Mirrors `search_multi_symbol_expanded` for the `kind=callers` comma path.
-///
-/// Each target's bucket renders via the same `write_caller_bucket` +
-/// `write_second_hop_impact` helpers the single-target path uses, so a
-/// bucket here is byte-identical to what a lone `search_callers_expanded`
-/// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
-/// MED — header shape parity). The batch walk's early-quit budget is scaled
-/// by target count so a hit-rich earlier target cannot starve a later,
-/// rarer one (PR #138 review: MED — budget scaling).
-pub fn search_callers_multi_expanded(
-    targets: &[&str],
-    scope: &Path,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    expand: usize,
-    context: Option<&Path>,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<String, TilthError> {
-    let (max_matches, base_batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
-
-    // Dedupe targets, preserving first-seen order: a repeated target (e.g.
-    // query "foo,foo") must not render an empty no-callers section on its
-    // second occurrence after the first consumed the matched bucket. The
-    // deduped list also feeds the batch search, so the input is deduped once.
-    let mut seen: HashSet<&str> = HashSet::new();
-    let ordered: Vec<&str> = targets
-        .iter()
-        .copied()
-        .filter(|t| seen.insert(*t))
-        .collect();
-
-    // Scale the walk-wide early-quit budget by (deduped) target count so
-    // each target gets roughly its own single-target budget's headroom —
-    // see `scaled_batch_quit` for why an unscaled shared budget starves
-    // later targets.
-    let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
-
-    let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let (raw, files_unreadable) = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
-
-    // Bucket matches by which target they call. Preserve the caller-supplied
-    // target order so output is deterministic.
-    let mut by_target: std::collections::HashMap<String, Vec<CallerMatch>> =
-        std::collections::HashMap::new();
-    for (name, m) in raw {
-        by_target.entry(name).or_default().push(m);
-    }
-
-    let mut output = String::new();
-    for target in &ordered {
-        let mut callers = by_target.remove(*target).unwrap_or_default();
-
-        if callers.is_empty() {
-            let target_seen = target_seen_in_scope(target, scope, glob);
-            output.push_str(&no_callers_message(
-                target,
-                scope,
-                target_seen,
-                glob,
-                files_unreadable,
-            ));
-            output.push_str("\n\n");
-            continue;
-        }
-
-        rank_callers(&mut callers, scope, context);
-        let total = callers.len();
-
-        // Unique direct-caller names BEFORE truncation, same as the
-        // single-target path — feeds the 2nd-hop fan-out threshold check
-        // with the true hop-1 breadth rather than the display-capped one.
-        let all_caller_names: HashSet<String> = callers
-            .iter()
-            .filter(|c| c.calling_function != "<top-level>")
-            .map(|c| c.calling_function.clone())
-            .collect();
-
-        callers.truncate(max_matches);
-
-        write_caller_bucket(
-            &mut output,
-            target,
-            scope,
-            total,
-            &callers,
-            expand,
-            files_unreadable,
-        );
-        write_second_hop_impact(
-            &mut output,
-            &all_caller_names,
-            &callers,
-            scope,
-            bloom,
-            glob,
-            batch_quit,
-        );
-        output.push('\n');
-    }
-
-    let tokens = crate::types::estimate_tokens(output.len() as u64);
-    let token_str = if tokens >= 1000 {
-        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
-    } else {
-        format!("~{tokens}")
-    };
-    let _ = write!(output, "\n({token_str} tokens)");
-    Ok(output)
-}
-
 /// Build the user-facing message when callers search returns no hits.
 /// Splits two cases that mean very different things to an agent:
 /// `target_seen = true` means the symbol exists somewhere but has no direct
@@ -751,38 +614,6 @@ mod tests {
                 "caller content should reuse the Arc created for the file"
             );
         }
-    }
-
-    /// MED finding from PR review: the batch walk's early-quit budget is a
-    /// walk-wide raw-match count shared by every target passed to
-    /// `find_callers_batch` — a single target's budget therefore starves
-    /// later targets in a multi-target search. `scaled_batch_quit` is the
-    /// pure scaling function `search_callers_multi_expanded` uses to size
-    /// the walk's budget by target count instead of reusing the unscaled
-    /// single-target constant. This asserts the scaling directly (rather
-    /// than only via an integration test against the parallel walker, whose
-    /// starvation is real but not reliably reproducible in a small,
-    /// deterministic unit test — see
-    /// `callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target`
-    /// in `src/mcp/tools/search.rs` for that scenario-level guard).
-    #[test]
-    fn scaled_batch_quit_multiplies_by_target_count() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 1), BATCH_EARLY_QUIT);
-        assert_eq!(
-            scaled_batch_quit(BATCH_EARLY_QUIT, 2),
-            BATCH_EARLY_QUIT * 2,
-            "2 targets must not share a single target's budget"
-        );
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 5), BATCH_EARLY_QUIT * 5);
-    }
-
-    /// `n_targets = 0` cannot happen through the dispatch layer (`tool_search`
-    /// rejects an empty query before reaching `search_callers_multi_expanded`),
-    /// but the scaling function must stay total rather than dividing by zero
-    /// or returning a zero budget that would make every walk quit instantly.
-    #[test]
-    fn scaled_batch_quit_treats_zero_targets_as_one() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 0), BATCH_EARLY_QUIT);
     }
 
     #[test]

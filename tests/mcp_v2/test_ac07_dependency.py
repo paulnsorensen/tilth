@@ -21,10 +21,10 @@ class AC07Dependency(unittest.TestCase):
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(
-                2, "tilth_search_v2", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
+                2, "tilth_search", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
             ),
         ]
-        res = harness.run_mcp(["--search-surface", "both"], requests)
+        res = harness.run_mcp([], requests)
         response = res.response_by_id(2)
         self.assertIsNotNone(response)
         return json.loads(harness.tool_result_text(response))

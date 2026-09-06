@@ -19,7 +19,7 @@ def setUpModule():
 def _v2_call_requests():
     return [
         harness.tools_call_request(
-            2, "tilth_search_v2", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
+            2, "tilth_search", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
         )
     ]
 
@@ -32,7 +32,7 @@ class AC09ClientInfo(unittest.TestCase):
                 harness.initialize_request(1, client_info={"name": "Claude Code"}),
                 *_v2_call_requests(),
             ]
-            res = harness.run_mcp(["--search-surface", "both"], requests, env=env)
+            res = harness.run_mcp([], requests, env=env)
             self.assertEqual(res.returncode, 0)
             cache_paths = list(Path(tmp).rglob("*"))
             self.assertTrue(any("claude-code" in str(p) for p in cache_paths))
@@ -44,7 +44,7 @@ class AC09ClientInfo(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                 *_v2_call_requests(),
             ]
-            res = harness.run_mcp(["--search-surface", "both"], requests, env=env)
+            res = harness.run_mcp([], requests, env=env)
             self.assertEqual(res.returncode, 0)
             cache_paths = [p for p in Path(tmp).rglob("*") if p.is_file()]
             self.assertTrue(len(cache_paths) > 0)
@@ -58,8 +58,8 @@ class AC09ClientInfo(unittest.TestCase):
             ]
             env_a = dict(os.environ, XDG_CACHE_HOME=tmp_a)
             env_b = dict(os.environ, XDG_CACHE_HOME=tmp_b)
-            harness.run_mcp(["--search-surface", "both"], requests, env=env_a)
-            harness.run_mcp(["--search-surface", "both"], requests, env=env_b)
+            harness.run_mcp([], requests, env=env_a)
+            harness.run_mcp([], requests, env=env_b)
 
             def relative_paths(base):
                 return sorted(str(p.relative_to(base)) for p in Path(base).rglob("*"))

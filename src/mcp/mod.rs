@@ -17,19 +17,9 @@ mod tools;
 mod tree;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
-    tool_search_v2, tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search_v2,
+    tool_write,
 };
-
-/// Which search surface(s) are exposed over MCP. `V1` (default) is the
-/// stable registry; `V2` is the trial engine alone; `Both` advertises both
-/// registries side by side during the trial.
-#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SearchSurface {
-    V1,
-    V2,
-    Both,
-}
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -39,20 +29,18 @@ struct Services {
     bloom: Arc<BloomFilterCache>,
     tracker: Arc<ThreadTracker>,
     edit_mode: bool,
-    surface: SearchSurface,
     client_profile: Arc<OnceLock<String>>,
     telemetry: Arc<crate::telemetry::TelemetrySink>,
 }
 
 impl Services {
-    fn new(edit_mode: bool, surface: SearchSurface) -> Self {
+    fn new(edit_mode: bool) -> Self {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             tracker: Arc::new(ThreadTracker::new()),
             edit_mode,
-            surface,
             client_profile: Arc::new(OnceLock::new()),
             telemetry: Arc::new(crate::telemetry::TelemetrySink::new()),
         }
@@ -78,10 +66,6 @@ impl Services {
         self.edit_mode
     }
 
-    fn surface(&self) -> SearchSurface {
-        self.surface
-    }
-
     fn telemetry(&self) -> &crate::telemetry::TelemetrySink {
         &self.telemetry
     }
@@ -103,10 +87,6 @@ impl Services {
 // what MCP hosts receive in the `instructions` field.
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
-/// One-line adoption nudge spliced directly above the ROUTE line on the `v2`
-/// and `both` surfaces, so the routing section teaches `tilth_search_v2`
-/// where it is advertised. `v1` output never carries it.
-const V2_SURFACE_NUDGE: &str = include_str!("../../prompts/mcp-v2-nudge.md");
 
 /// The cwd-guidance span in prompts/mcp-base.md and prompts/mcp-edit.md. Exact
 /// substring of both files, guarded by `cwd_guidance_spans_present` so an edit
@@ -117,21 +97,14 @@ const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout
 
 /// Select and return the complete MCP `instructions` string for the given
 /// mode: the standalone base file, or the standalone edit-mode file — never
-/// both. Non-`v1` surfaces get [`V2_SURFACE_NUDGE`] spliced in above the
-/// ROUTE line, keeping it top-weighted rather than appended below the fold.
-fn build_instructions(edit_mode: bool, surface: SearchSurface) -> String {
+/// both.
+fn build_instructions(edit_mode: bool) -> String {
     let source = if edit_mode {
         EDIT_MODE_INSTRUCTIONS
     } else {
         SERVER_INSTRUCTIONS
     };
-    let source = source.trim_end();
-    match surface {
-        SearchSurface::V1 => source.to_string(),
-        SearchSurface::V2 | SearchSurface::Both => {
-            source.replacen("\nROUTE", &format!("\n{V2_SURFACE_NUDGE}\nROUTE"), 1)
-        }
-    }
+    source.trim_end().to_string()
 }
 
 /// Change the process working directory, logging failures to stderr.
@@ -185,7 +158,7 @@ fn normalize_client_key(name: Option<&str>) -> String {
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
 /// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
-pub fn run(edit_mode: bool, surface: SearchSurface, scope: Option<&Path>) -> io::Result<()> {
+pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     // Resolve the project root and chdir to it.
     // Priority: explicit --scope > package_root(cwd) > cwd. The server never
     // chdirs on client roots — path anchoring is driven entirely by the
@@ -200,7 +173,7 @@ pub fn run(edit_mode: bool, surface: SearchSurface, scope: Option<&Path>) -> io:
             chdir_or_log(root);
         }
     }
-    let services = Services::new(edit_mode, surface);
+    let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
     serve(stdin.lock(), stdout.lock(), &services)
@@ -292,7 +265,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let instructions = build_instructions(edit_mode, services.surface());
+            let instructions = build_instructions(edit_mode);
             let client_name = req
                 .params
                 .get("clientInfo")
@@ -323,7 +296,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             jsonrpc: "2.0",
             id: req.id.clone(),
             result: Some(serde_json::json!({
-                "tools": tool_definitions(edit_mode, services.surface())
+                "tools": tool_definitions(edit_mode)
             })),
             error: None,
         },
@@ -401,24 +374,14 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             }
         }
     }
-    let surface = services.surface();
     let result = match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" if surface != SearchSurface::V2 => tool_search(
-            args,
-            services.cache(),
-            services.session(),
-            services.bloom(),
-            edit_mode,
-        ),
+        "tilth_search" => dispatch_search_v2(args, services),
         "tilth_list" => tool_list(args),
-        "tilth_deps" if surface != SearchSurface::V2 => tool_deps(args, services.bloom()),
-        "tilth_grok" if surface != SearchSurface::V2 => {
-            tool_grok(args, services.bloom(), services.session())
-        }
+        "tilth_deps" => tool_deps(args, services.bloom()),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
-        "tilth_search_v2" if surface != SearchSurface::V1 => dispatch_search_v2(args, services),
         _ => Err(unknown_tool_error(tool, edit_mode)),
     };
     // Observe every dispatch — an errored call still advances/resets the
@@ -557,7 +520,6 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::ValueEnum as _;
     use std::fmt::Write as _;
 
     /// Tool handlers now require an absolute `cwd`. Injects a default so the
@@ -584,7 +546,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
 
         let first = dispatch_tool(
             "tilth_read",
@@ -616,7 +578,7 @@ mod tests {
 
     #[test]
     fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
-        let services = Services::new(true, SearchSurface::V1);
+        let services = Services::new(true);
         let args = serde_json::json!({ "cwd": "/" });
 
         let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
@@ -638,7 +600,7 @@ mod tests {
 
     #[test]
     fn dispatch_tool_reports_edit_tools_disabled_in_read_only_mode() {
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
         let args = serde_json::json!({ "cwd": "/" });
 
         let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
@@ -653,7 +615,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
 
         let first = dispatch_tool(
             "tilth_search",
@@ -715,7 +677,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
 
         // foo reaches candidacy count 2 inside one dispatch (both entries are
         // symbol-kind searches — content/regex kinds no longer arm the nudge),
@@ -775,7 +737,7 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
 
         for path in ["a.rs", "b.rs"] {
             if path == "b.rs" {
@@ -808,7 +770,7 @@ mod tests {
     /// dispatch without the `require_cwd` gate.
     #[test]
     fn dispatch_refuses_missing_cwd_for_every_path_tool() {
-        let services = Services::new(true, SearchSurface::V1); // edit_mode=true so tilth_write dispatches
+        let services = Services::new(true); // edit_mode=true so tilth_write dispatches
         let cases = [
             ("tilth_read", serde_json::json!({ "paths": ["x.rs"] })),
             (
@@ -842,7 +804,7 @@ mod tests {
     /// request. Guards the deleted post-initialize handshake.
     #[test]
     fn serve_emits_no_roots_list_after_initialize() {
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
             r#""params":{"capabilities":{"roots":{"listChanged":true}}}}"#,
@@ -905,7 +867,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1354,
+            1345,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -925,8 +887,8 @@ mod tests {
             "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("set `kind` (symbol|content|regex|callers)"),
-            "search kind grammar must remain in SERVER_INSTRUCTIONS"
+            SERVER_INSTRUCTIONS.contains("routing is automatic (path → regex → symbol → literal)"),
+            "v2 automatic-routing guidance must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
             !SERVER_INSTRUCTIONS.contains("mcp__"),
@@ -938,7 +900,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1881,
+            1979,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -966,24 +928,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v2_surface_nudge_byte_lock() {
-        assert_eq!(
-            V2_SURFACE_NUDGE.len(),
-            122,
-            "V2_SURFACE_NUDGE byte count drifted from baseline"
-        );
-        assert!(V2_SURFACE_NUDGE.starts_with("PREFER `tilth_search_v2` for find/explore"));
-        assert!(
-            !V2_SURFACE_NUDGE.contains('\n'),
-            "V2_SURFACE_NUDGE must stay a single line so it splices cleanly above ROUTE"
-        );
-        assert!(
-            !V2_SURFACE_NUDGE.contains("mcp__"),
-            "nudge must use protocol tool names, not client-specific prefixes"
-        );
-    }
-
     /// ADR-003's hard surface cap. The spec elevated "the cap never yields" to
     /// a quality gate but shipped no guard.
     ///
@@ -995,7 +939,7 @@ mod tests {
     #[test]
     fn edit_mode_surface_stays_within_cap() {
         const CAP: usize = 13_779;
-        let services = Services::new(true, SearchSurface::V1);
+        let services = Services::new(true);
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             "\n",
@@ -1022,7 +966,7 @@ mod tests {
     fn agents_md_matches_prompt_sources() {
         const AGENTS_MD: &str = include_str!("../../AGENTS.md");
         let expected = format!(
-            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md + prompts/mcp-v2-nudge.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n\n## Search-v2 surfaces\n\nSpliced above the ROUTE line in either mode when `--search-surface v2|both`:\n\n{V2_SURFACE_NUDGE}\n"
+            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n"
         );
         assert_eq!(
             AGENTS_MD, expected,
@@ -1034,8 +978,8 @@ mod tests {
     fn build_instructions_selects_one_complete_file_per_mode() {
         // build_instructions selects exactly one standalone file — never both,
         // never concatenated.
-        let base = build_instructions(false, SearchSurface::V1);
-        let edit = build_instructions(true, SearchSurface::V1);
+        let base = build_instructions(false);
+        let edit = build_instructions(true);
         assert_eq!(base, SERVER_INSTRUCTIONS.trim_end());
         assert_eq!(edit, EDIT_MODE_INSTRUCTIONS.trim_end());
         assert!(
@@ -1043,6 +987,16 @@ mod tests {
             "tilth_write must not leak into base mode"
         );
         assert!(edit.contains("tilth_write"));
+    }
+
+    #[test]
+    fn edit_mode_instructions_fit_2kb() {
+        let s = build_instructions(true);
+        assert!(
+            s.len() <= 2048,
+            "edit-mode instructions must fit the 2KB MCP field: {} bytes",
+            s.len()
+        );
     }
 
     // -- tilth_read tool: batch reads, suffix grammar, view modes ----------
@@ -2063,41 +2017,23 @@ mod tests {
     #[test]
     fn build_instructions_no_trailing_whitespace() {
         for edit in [false, true] {
-            for &surface in SearchSurface::value_variants() {
-                let s = build_instructions(edit, surface);
-                assert!(
-                    !s.ends_with('\n') && !s.ends_with(' '),
-                    "wire output must not end with whitespace (edit={edit}, surface={surface:?})"
-                );
-            }
+            let s = build_instructions(edit);
+            assert!(
+                !s.ends_with('\n') && !s.ends_with(' '),
+                "wire output must not end with whitespace (edit={edit})"
+            );
         }
     }
 
-    /// The v2 nudge is served only where `tilth_search_v2` is advertised, and
-    /// there it sits directly above the ROUTE line — top-weighted for weaker
-    /// models — rather than trailing below the fold.
+    /// The retired v2 trial nudge must not resurface in either mode.
     #[test]
-    fn build_instructions_nudges_search_v2_only_on_trial_surfaces() {
+    fn build_instructions_never_mention_search_v2() {
         for edit in [false, true] {
-            let v1 = build_instructions(edit, SearchSurface::V1);
+            let s = build_instructions(edit);
             assert!(
-                !v1.contains("tilth_search_v2"),
-                "v1 surface must not mention tilth_search_v2 (edit={edit})"
+                !s.contains("tilth_search_v2"),
+                "instructions must not mention the retired tilth_search_v2 (edit={edit})"
             );
-            for surface in [SearchSurface::V2, SearchSurface::Both] {
-                let s = build_instructions(edit, surface);
-                let nudge_at = s
-                    .find(V2_SURFACE_NUDGE)
-                    .unwrap_or_else(|| panic!("nudge missing (edit={edit}, surface={surface:?})"));
-                assert!(
-                    s[nudge_at + V2_SURFACE_NUDGE.len()..].starts_with("\nROUTE"),
-                    "nudge must sit directly above ROUTE (edit={edit}, surface={surface:?})"
-                );
-                assert!(
-                    !s.contains("\n\n\n"),
-                    "no triple newline at the splice seam (edit={edit}, surface={surface:?})"
-                );
-            }
         }
     }
 
@@ -2130,38 +2066,33 @@ mod tests {
             "tilth_diff",
         ];
         for edit in [false, true] {
-            for &surface in SearchSurface::value_variants() {
-                let s = build_instructions(edit, surface);
+            let s = build_instructions(edit);
+            assert!(
+                s.len() <= 2048,
+                "instructions (edit={edit}) must fit the 2KB field: {} bytes",
+                s.len()
+            );
+            assert!(
+                s.contains(CWD_PATHS_SPAN),
+                "missing PATHS span (edit={edit})"
+            );
+            for tool in shared_tools {
+                assert!(s.contains(tool), "missing tool {tool} (edit={edit})");
+            }
+            if edit {
                 assert!(
-                    s.len() <= 2048,
-                    "instructions (edit={edit}, surface={surface:?}) must fit the 2KB field: {} bytes",
-                    s.len()
-                );
-                assert!(
-                    s.contains(CWD_PATHS_SPAN),
-                    "missing PATHS span (edit={edit}, surface={surface:?})"
-                );
-                for tool in shared_tools {
-                    assert!(
-                        s.contains(tool),
-                        "missing tool {tool} (edit={edit}, surface={surface:?})"
-                    );
-                }
-                if edit {
-                    assert!(
-                        s.contains("tilth_write"),
-                        "edit mode must advertise tilth_write (surface={surface:?})"
-                    );
-                }
-                assert!(
-                    s.contains("DO NOT use shell for repo files or history"),
-                    "missing shell DO NOT line (edit={edit}, surface={surface:?})"
-                );
-                assert!(
-                    s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
-                    "shell DO NOT line must enumerate the replaced commands (edit={edit}, surface={surface:?})"
+                    s.contains("tilth_write"),
+                    "edit mode must advertise tilth_write"
                 );
             }
+            assert!(
+                s.contains("DO NOT use shell for repo files or history"),
+                "missing shell DO NOT line (edit={edit})"
+            );
+            assert!(
+                s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
+                "shell DO NOT line must enumerate the replaced commands (edit={edit})"
+            );
         }
     }
 
@@ -2295,36 +2226,12 @@ mod tests {
         );
     }
 
-    /// `tilth_search` accepts `queries: [{query}]` and dispatches each.
-    #[test]
-    fn tool_search_queries_array_form() {
-        let scope = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
-        let args = serde_json::json!({
-            "queries": [{ "query": "build_instructions" }],
-            "expand": 0,
-            "scope": scope.to_str().unwrap(),
-            "cwd": scope.to_str().unwrap()
-        });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
-        assert!(
-            out.contains("\"if_modified_since\""),
-            "expected JSON cache-token header: {out}"
-        );
-        assert!(
-            out.contains("query: build_instructions"),
-            "expected per-query header: {out}"
-        );
-    }
-
     /// Dispatch rejects a non-positive `budget` (0, negative, non-integer)
     /// across all tools instead of silently defaulting — a sub-1 budget used
     /// to collapse batch output to useless stubs.
     #[test]
     fn dispatch_rejects_non_positive_budget() {
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
         for bad in [
             serde_json::json!(0),
             serde_json::json!(-1),
@@ -2361,7 +2268,7 @@ mod tests {
     #[test]
     fn budget_validation_skipped_for_non_budget_tools() {
         // tilth_write in edit_mode=true, budget:0 → own empty-edits error, not budget error.
-        let services = Services::new(true, SearchSurface::V1);
+        let services = Services::new(true);
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
             "budget": 0,
@@ -2380,7 +2287,7 @@ mod tests {
         );
 
         // tilth_list, budget:0 → own patterns error, not budget error.
-        let services = Services::new(false, SearchSurface::V1);
+        let services = Services::new(false);
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
             "budget": 0,
@@ -2396,49 +2303,6 @@ mod tests {
         assert!(
             !err.contains("positive integer"),
             "budget gate must not fire for tilth_list: {err}"
-        );
-    }
-
-    /// Batch search splits the budget per query so every query is
-    /// represented even under a tight budget — no silent trailing drops.
-    #[test]
-    fn batch_budget_represents_every_query() {
-        let tmp = tempfile::tempdir().unwrap();
-        let body: String = (0..400).fold(String::new(), |mut acc, i| {
-            let _ = writeln!(acc, "fn f_{i}() {{ let u_{i} = use_it({i}); }}");
-            acc
-        });
-        std::fs::write(tmp.path().join("lib.rs"), body).unwrap();
-        let args = serde_json::json!({
-            "queries": [
-                { "query": "fn", "kind": "content" },
-                { "query": "let", "kind": "content" },
-                { "query": "use", "kind": "content" }
-            ],
-            "scope": tmp.path().to_str().unwrap(),
-            "cwd": tmp.path().to_str().unwrap(),
-            "budget": 300
-        });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("batch search");
-        for q in ["fn", "let", "use"] {
-            assert!(
-                out.contains(&format!("query: {q}")),
-                "query '{q}' was silently dropped under a tight budget:\n{out}"
-            );
-        }
-        // Under a tight budget every query is trimmed, so each of the three
-        // sections must carry a truncation marker that names the `budget` lever.
-        // The exact marker differs by path length — a long temp-dir path trims
-        // via the per-query allocator ("omitted to fit budget"), a short one
-        // collapses via the section cap ("truncated") — but both cite "raise
-        // `budget`", so that phrase is the path-independent signal (#155).
-        assert_eq!(
-            out.matches("raise `budget`").count(),
-            3,
-            "each query must signal truncation and name the budget lever:\n{out}"
         );
     }
 
@@ -2475,394 +2339,6 @@ mod tests {
         assert!(
             out.contains("truncated"),
             "expected truncation marker:\n{out}"
-        );
-    }
-
-    /// `tilth_search` empty queries array errors clearly.
-    #[test]
-    fn tool_search_queries_empty_errors() {
-        let args = serde_json::json!({ "queries": [] });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("empty errors");
-        assert!(err.contains("empty"), "unexpected error: {err}");
-    }
-
-    /// `tilth_search` queries[] entry missing `query` field returns a clear
-    /// error naming the offending index.
-    #[test]
-    fn tool_search_queries_missing_query_field_errors() {
-        let args = serde_json::json!({ "queries": [{ "glob": "*.rs" }] });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err("missing query");
-        assert!(err.contains("queries[0]"), "must name index: {err}");
-        assert!(err.contains("query"), "must mention 'query': {err}");
-    }
-
-    /// `tilth_search` queries[] enforces the 10-entry cap.
-    #[test]
-    fn tool_search_queries_over_limit_rejected() {
-        let mut qs = Vec::with_capacity(11);
-        for _ in 0..11 {
-            qs.push(serde_json::json!({ "query": "foo" }));
-        }
-        let args = serde_json::json!({ "queries": qs });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let err = tool_search(&args, &cache, &session, &bloom, false).expect_err(">10 must error");
-        assert!(err.contains("limited to 10"), "unexpected error: {err}");
-    }
-
-    // ── F5 hardening: a request that still carries the dropped `context`
-    // field must NOT error. Old agents have the parameter cached in their
-    // tool spec; tolerating it silently is the documented contract (the
-    // F5 verifier says "or is silently ignored — implementer's call").
-    #[test]
-    fn tool_search_tolerates_stray_context_field() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [{"query": "handleAuth"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-            "context": "src/old.rs"
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false)
-            .expect("stray context must not fail the request");
-        assert!(
-            out.contains("handleAuth"),
-            "search must still find the symbol despite the stray field: {out}"
-        );
-    }
-
-    /// `tilth_search` honors `if_modified_since` by stubbing unchanged files
-    /// without leaking expanded source bodies.
-    #[test]
-    fn tool_search_if_modified_since_redacts_unchanged_bodies() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("lib.rs");
-        std::fs::write(
-            &p,
-            "fn demo() {\n    let needle_unique = \"secret body text\";\n}\n",
-        )
-        .unwrap();
-        let args = serde_json::json!({
-            "queries": [{"query": "needle_unique", "kind": "content"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-            "expand": 1,
-            "if_modified_since": "2099-01-01T00:00:00Z"
-        });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        assert!(
-            out.contains("\"if_modified_since\""),
-            "JSON cache-token header missing: {out}"
-        );
-        assert!(out.contains("unchanged"), "stub missing: {out}");
-        assert!(
-            !out.contains("secret body text"),
-            "unchanged search body must be redacted: {out}"
-        );
-    }
-
-    // ── F1 hardening: the JSON cache-token must stand alone on the first
-    // line so a trivial JSON-line parse pulls the field. The prose-header
-    // baseline was 0 / 2,042 round-trips; the integration regression here
-    // is "response shape changed but the field is no longer parseable."
-    #[test]
-    fn tool_search_first_line_is_parseable_cache_token_json() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [{"query": "handleAuth"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        let first = out.lines().next().expect("response has a first line");
-        let parsed: serde_json::Value =
-            serde_json::from_str(first).expect("first line must be valid one-line JSON");
-        let ts = parsed
-            .get("if_modified_since")
-            .and_then(|v| v.as_str())
-            .expect("if_modified_since field present");
-        assert!(
-            crate::mcp::iso::parse_iso_utc(ts).is_some(),
-            "ts must round-trip through parse_iso_utc: {ts}"
-        );
-    }
-
-    /// Default search merges symbol, content, and identifier-shaped caller
-    /// results when `kind` is omitted.
-    #[test]
-    fn tool_search_default_merges_symbol_content_and_callers() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("lib.rs");
-        std::fs::write(
-            &p,
-            "fn target_fn() {\n    let _marker = \"content branch\";\n}\n\nfn caller() {\n    target_fn();\n}\n",
-        )
-        .unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [{"query": "target_fn"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-            "expand": 0
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("merged search ok");
-        assert!(
-            out.contains("symbol results"),
-            "symbol facet missing: {out}"
-        );
-        assert!(
-            out.contains("content results"),
-            "content facet missing: {out}"
-        );
-        assert!(
-            out.contains("caller results"),
-            "caller facet missing: {out}"
-        );
-        assert!(
-            out.contains("[caller: caller]"),
-            "caller result missing: {out}"
-        );
-    }
-
-    /// A per-query `kind` overrides the top-level `kind`. Entry 1 overrides to
-    /// `content` and queries a string literal whose enclosing fn name
-    /// (`enclosing_alpha`) surfaces only when content search matches — a
-    /// top-level `symbol` search would never match a string literal, so the
-    /// name appearing proves the override took effect. Entry 2 omits `kind`
-    /// and must inherit the top-level `symbol`, finding `other_beta`. Both
-    /// discriminator names are queried by neither entry, so the header echo
-    /// of the query strings cannot satisfy the assertions.
-    #[test]
-    fn tool_search_per_query_kind_overrides_top_level() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("a.rs"),
-            "fn enclosing_alpha() {\n    let _ = \"QUERYTOKEN_A\";\n}\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("b.rs"), "fn other_beta() {}\n").unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [
-                {"query": "QUERYTOKEN_A", "kind": "content"},
-                {"query": "other_beta"}
-            ],
-            "kind": "symbol",
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-            "expand": 1
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("override search ok");
-        assert!(
-            out.contains("enclosing_alpha"),
-            "entry 1 must override to kind=content — the string literal's \
-             enclosing fn appears only via a content match, never via the \
-             top-level symbol kind: {out}"
-        );
-        assert!(
-            out.contains("other_beta"),
-            "entry 2 must inherit top-level kind=symbol and find the fn def: {out}"
-        );
-    }
-
-    /// Batch redaction: `if_modified_since` stubs the unchanged file's section
-    /// while leaving the changed file's body intact across a multi-query batch.
-    #[test]
-    fn tool_search_batch_redacts_only_unchanged_query_sections() {
-        use std::time::{Duration, UNIX_EPOCH};
-        let dir = tempfile::tempdir().unwrap();
-        let path_old = dir.path().join("old.rs");
-        let path_new = dir.path().join("new.rs");
-        // Query the fn name; assert on a body-only token (SECRET_*_BODY) so the
-        // `## query:` header echo of the query string can't mask redaction.
-        std::fs::write(
-            &path_old,
-            "fn old_target() {\n    let _ = \"SECRET_OLD_BODY\";\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &path_new,
-            "fn new_target() {\n    let _ = \"SECRET_NEW_BODY\";\n}\n",
-        )
-        .unwrap();
-
-        // since sits between the two files' mtimes: old < since < new.
-        let since = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&path_old)
-            .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_hours(250_000))
-            .unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path_new)
-            .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_secs(1_100_000_000))
-            .unwrap();
-
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [
-                {"query": "old_target", "kind": "content"},
-                {"query": "new_target", "kind": "content"}
-            ],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-            "expand": 1,
-            "if_modified_since": crate::mcp::iso::iso_ts(since)
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("batch redaction ok");
-        assert!(
-            out.contains("unchanged"),
-            "unchanged file must be stubbed: {out}"
-        );
-        assert!(
-            !out.contains("SECRET_OLD_BODY"),
-            "unchanged file body must be redacted: {out}"
-        );
-        assert!(
-            out.contains("SECRET_NEW_BODY"),
-            "changed file body must remain intact: {out}"
-        );
-    }
-
-    /// In `edit_mode`, expanded search source lines carry `<line>:<content>`
-    /// numbered prefixes (no leading gutter), matching the whole-file-tag read
-    /// format.
-    #[test]
-    fn tool_search_expand_emits_numbered_anchors_in_edit_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("hello.rs");
-        // Consecutive blank lines (3, 4) exercise the blank-line collapse /
-        // noise-stripping path. The marker on line 5 must keep its correct
-        // absolute anchor number even though lines above it are collapsed.
-        std::fs::write(
-            &p,
-            "fn unique_symbol_for_hashline_test() {\n    let a = 1;\n\n\n    let marker_xyz = a + 1;\n    marker_xyz\n}\n",
-        )
-        .unwrap();
-        let args = serde_json::json!({
-            "queries": [{"query": "unique_symbol_for_hashline_test"}],
-            "expand": 1,
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap(),
-        });
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let out = tool_search(&args, &cache, &session, &bloom, true).expect("edit-mode search ok");
-        // Exact-match locks the whole-file-tag `N:content` format. A reintroduced
-        // per-line hash (`1:abc|fn ...`) or a 0-indexed anchor (`0:fn ...`) both
-        // fail this equality — `starts_with("1:")` alone would accept the hash form.
-        assert!(
-            out.lines()
-                .any(|l| l == "1:fn unique_symbol_for_hashline_test() {"),
-            "expected exact numbered anchor `1:fn unique_symbol_for_hashline_test() {{`: {out}"
-        );
-        // The marker is on source line 5; its anchor must read `5:` despite the
-        // collapsed blank run above it. Proves stripping preserves absolute line
-        // numbers (anchors stay valid for round-tripping into tilth_write).
-        assert!(
-            out.lines().any(|l| l == "5:    let marker_xyz = a + 1;"),
-            "expected marker line to keep exact absolute anchor `5:...`: {out}"
-        );
-        // The gutter form must NOT appear when edit_mode is set.
-        assert!(
-            !out.contains("| fn unique_symbol_for_hashline_test"),
-            "gutter form must be suppressed under edit_mode: {out}"
-        );
-    }
-
-    // ── F3 hardening: zero-match search emits the new empty header with the
-    // three counts and the per-kind hint, end-to-end through tool_search.
-    // The unit tests in src/format.rs cover the helper in isolation; this
-    // proves the wiring from search.rs → format_search_result actually
-    // routes through the empty path on real walker results.
-    #[test]
-    fn tool_search_zero_matches_emits_empty_header_with_kind_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("only.rs"),
-            "fn unrelated() {}\n", // nothing here will match "zZxQyN_no_such_symbol"
-        )
-        .unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "queries": [{"query": "zZxQyN_no_such_symbol", "kind": "content"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        assert!(out.contains("0 matches"), "empty header missing: {out}");
-        assert!(
-            out.contains("Files matched glob:"),
-            "files matched count missing: {out}"
-        );
-        assert!(
-            out.contains("Files searched:"),
-            "files searched count missing: {out}"
-        );
-        assert!(out.contains("Content hits:"), "hits count missing: {out}");
-        // kind=content ⇒ literal-content hint (split from regex per Copilot review).
-        assert!(
-            out.contains("no content matches"),
-            "content-kind hint missing: {out}"
-        );
-    }
-
-    // ── F3 hardening: glob that excludes every file emits the dedicated
-    // glob-mismatch hint, regardless of the requested kind. This is the
-    // dispatch-table row most likely to silently regress if a future
-    // refactor stops populating files_matched_glob.
-    #[test]
-    fn tool_search_glob_excludes_everything_emits_glob_hint() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn anything() {}\n").unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        // Glob matches nothing in the scope → files_matched_glob == 0.
-        let args = serde_json::json!({
-            "queries": [{"query": "anything", "kind": "symbol", "glob": "*.bogus_ext_does_not_exist"}],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        assert!(out.contains("0 matches"), "empty header missing: {out}");
-        assert!(
-            out.contains("Files matched glob: 0"),
-            "glob-mismatch count must be zero: {out}"
-        );
-        assert!(
-            out.contains("glob matched no files"),
-            "glob-zero hint must override the kind hint: {out}"
         );
     }
 }

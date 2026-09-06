@@ -11,7 +11,7 @@ BATCH related work; array parameters never accept singular values:
 
 ROUTE:
 
-- Find/explore → `tilth_search`; omitted `kind` merges definitions, usages, and callers; set `kind` (symbol|content|regex|callers) when the shape is known.
+- Find/explore → `tilth_search`: `queries: [{query, glob?, kind?}]`; routing is automatic (path → regex → symbol → literal); follow `hints`.
 - Read known files/symbols/ranges → `tilth_read`.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
