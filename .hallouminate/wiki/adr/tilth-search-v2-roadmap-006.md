@@ -50,6 +50,17 @@ The earlier path field accepts directories as well as files and globs.
 The shipped glob filter is not automatically an equivalent alias.
 This phase keeps glob and does not add a path alias.[^1][^3]
 
+
+
+The pre-merge review of PR #231 fixed four contract gaps that the tests now pin:[^4]
+
+- An echoed follow target must be cwd-relative and must canonicalize under the canonical cwd, glob or not. Absolute hint paths and symlinks that escape cwd are rejected. `cwd` and `scope` themselves stay trusted-absolute per fork law; only the hint's `path` is constrained.
+- Every emitted text payload (`core`, continuation `signature` and `call`) passes the secrets denylist. v1's formatters were the only prior gate, so the cutover would otherwise have emitted `credentials.py` bodies verbatim.
+- Budget reduction downgrades only `ok` to `partial`; an `ambiguous` or `no_match` result keeps its status and gains `budget_limited`.
+- Telemetry is captured before budget reduction and records `budget_limited`, a session-derived `first_call`, and `route: batch` for multi-entry calls, so a small client budget is never logged as dependency-index incompleteness.
+
+A bare `worktrees/` directory is skipped only when an immediate child holds a `.git` entry; `.worktrees/` is skipped unconditionally. The deps reconcile walk shares that predicate with the search walker.
+
 ## Alternatives Rejected
 
 - Restore kind:callers: preserves the mode-selection problem instead of implementing the planned continuation.
@@ -67,5 +78,6 @@ Additional tests cover target collisions, scope, batch order, invalid requests, 
 [^1]: User-approved continuation correction for PR #231, 2026-09-06: https://github.com/paulnsorensen/tilth/pull/231
 [^2]: [Search v2 public discovery topology](./tilth-search-v2-roadmap-001.md), lines 12–26; [Measured parallel trial](./tilth-search-v2-roadmap-004.md), lines 20–26.
 [^3]: [Deterministic search contract](./tilth-search-v2-roadmap-002.md).
+[^4]: Affinage review of PR #231, 2026-09-06 (`.cheese/affinage/pr-231.md`); deferred findings tracked in https://github.com/paulnsorensen/tilth/issues/233.
 
 _Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the initial ADR-006 caller-kind exception and permanent seven-verb conclusion._

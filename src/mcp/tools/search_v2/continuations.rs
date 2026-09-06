@@ -296,14 +296,17 @@ impl Follow {
 }
 
 pub(super) fn dependencies(target: &Target, cwd: &Path, client: &str) -> Result<Value, String> {
-    dependencies_until(target, cwd, client, Instant::now() + DEPS_WARM_DEADLINE)
+    dependencies_within(target, cwd, client, DEPS_WARM_DEADLINE)
 }
 
-fn dependencies_until(
+/// `budget` is the wall clock granted to reconcile + impact once the index
+/// handle is open; opening (git identity lookups, redb creation) is not
+/// charged against it, so a cold first call on a slow host still completes.
+fn dependencies_within(
     target: &Target,
     cwd: &Path,
     client: &str,
-    deadline: Instant,
+    budget: Duration,
 ) -> Result<Value, String> {
     let full = cwd
         .join(&target.path)
@@ -320,6 +323,7 @@ fn dependencies_until(
     imports.dedup();
     let (refresh, impact, state) = match crate::index::deps::open(cwd, client) {
         Ok(handle) => {
+            let deadline = Instant::now() + budget;
             let refresh = crate::index::deps::reconcile(&handle, handle.worktree_root(), deadline);
             let impact = crate::index::deps::impact(&handle, &full, deadline);
             (refresh, Some(impact), "open")
@@ -450,7 +454,7 @@ mod tests {
             glob: None,
         };
         let result =
-            dependencies_until(&target, tmp.path(), "deadline-test", Instant::now()).unwrap();
+            dependencies_within(&target, tmp.path(), "deadline-test", Duration::ZERO).unwrap();
         assert_eq!(result["coverage"], "partial");
         assert_eq!(result["timed_out"], true);
         assert_eq!(result["refresh"]["complete"], false);
