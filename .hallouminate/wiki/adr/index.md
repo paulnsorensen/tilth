@@ -10,7 +10,7 @@
 - [tilth-search-v2-roadmap-003](./tilth-search-v2-roadmap-003.md) — Persistent Per-client Dependency Index
 - [tilth-search-v2-roadmap-004](./tilth-search-v2-roadmap-004.md) — Measured Parallel Search v2 Trial
 - [tilth-search-v2-roadmap-005](./tilth-search-v2-roadmap-005.md) — Independent Read and Write Adoption Lane
-- [tilth-search-v2-roadmap-006](./tilth-search-v2-roadmap-006.md) — Keep tilth_grok and tilth_deps MCP Verbs at Cutover
+- [tilth-search-v2-roadmap-006](./tilth-search-v2-roadmap-006.md) — Search Continuations Before MCP Verb Removal
 - [tilth-write-json-ops](./tilth-write-json-ops.md) — ADRs — tilth_write JSON-native ops (slug: tilth-write-json-ops)
 - [tilth-write-teaching-errors](./tilth-write-teaching-errors.md) — ADRs — tilth_write teaching errors (slug: tilth-write-teaching-errors)
 <!-- HALLOUMINATE:INDEX-END -->

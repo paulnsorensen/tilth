@@ -9,13 +9,13 @@ DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Rela
 
 BATCH related work; array parameters never accept singular values:
 
-- `queries: [{query: "foo"}, {query: "bar", kind: "symbol"}]`
+- `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: hint}]`
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
 - `patterns: ["*.rs", "*.toml"]`
 
 ROUTE:
 
-- Find/explore → `tilth_search`: `queries: [{query, glob?, kind?}]`; routing is automatic (path → regex → symbol → literal); follow `hints`.
+- Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint}]`; routing is automatic. Do not add query `kind`, `expand`, or `context`.
 - Read known files/symbols/ranges → `tilth_read`.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
@@ -32,7 +32,7 @@ DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Rela
 
 BATCH related work; array parameters never accept singular values:
 
-- `queries: [{query: "foo"}, {query: "bar", kind: "symbol"}]`
+- `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: hint}]`
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
 - `patterns: ["*.rs", "*.toml"]`
 - `edits: [{path: "src/a.rs", tag: "1A2B", ops: [...]}, {path: "src/b.rs", tag: "3C4D", ops: [...]}]`
@@ -41,5 +41,5 @@ READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numb
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
-ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?, kind?}]`, routing is automatic: path → regex → symbol → literal); read → `tilth_read`; importers/imports → `tilth_deps` (not import-greps); understand one symbol → `tilth_grok` (replaces search → expand → callers); changes → `tilth_diff`; browse → `tilth_list` (omit `patterns` for a project overview); edit → `tilth_write`.
+ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read`; importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes → `tilth_diff`; browse → `tilth_list`.
 DO NOT re-read expanded search content.

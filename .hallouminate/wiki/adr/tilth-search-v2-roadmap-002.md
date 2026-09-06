@@ -1,44 +1,78 @@
 ---
-status: trusted
-last_verified: 2026-08-14
+status: reviewed
+last_verified: 2026-09-06
 confidence: high
 sources:
-  - /home/paul/.local/share/cheese/paulnsorensen-tilth/specs/tilth-search-v2-roadmap.md
-  - src/mcp/tools/search.rs:36-302
-  - src/mcp/tools/definitions.rs:448-513
+  - https://github.com/paulnsorensen/tilth/pull/189
+  - https://github.com/paulnsorensen/tilth/pull/231
 ---
 # Deterministic Search v2 Contract
 
-Search v2 accepts one ordered object batch and owns intent routing. Callers no longer provide `kind`, `expand`, or `context`; the server applies deterministic precedence and returns a structured JSON envelope as MCP text.
+Search owns initial query routing.
+Clients request deeper graph work by echoing server-emitted continuation hints.
+Fresh queries do not accept kind, expand, or context.[^1]
 
-## Context
+## Request
 
-The current search surface supports per-query overrides and several routing branches (`src/mcp/tools/search.rs:36-302`). Analytics found invented values such as `kind: text`, target/tool-name confusion, and retries that repeat the same mistake. Multi-query batching is valuable and must survive the simplification.
-
-## Decision
-
-The canonical request is:
+The canonical request is an ordered batch of 1–10 entries:
 
 ```text
-{ cwd, queries: [{ query, path? }] x 1..10, budget? }
+{ cwd, queries: [{ query, glob? } | { follow: hint }], budget? }
 ```
 
-Each optional path independently accepts a file, directory, or glob. Input order is output order. Routing precedence is:
+Each entry contains either query or follow, never both.
+The optional positive budget applies to the serialized JSON response.
+Glob remains the canonical query filter.
+This correction does not add an alias for the original path field.[^2]
 
-1. exact path or unique symbol;
-2. literal content;
-3. regex only for unmistakable regex syntax or an empty literal result;
-4. fuzzy symbol/path candidates.
+The initial query retains deterministic routing.
+A continuation bypasses intent selection because its hint identifies a resolved operation and target.[^1]
 
-Responses are JSON text with top-level `results`, `hints`, and `diagnostics`. Every query reports `resolved_as`, status, completeness, and typed hints. `routes_tried` is telemetry-only.
+## Continuations
 
-## Alternatives rejected
+Hints identify bounded callers, callees, siblings, tests, or dependency work.
+Every emitted hint must execute inside tilth_search.
+A hint preserves target identity and applicable scope constraints.
+The client copies the hint into follow without constructing a fresh query.[^2]
 
-- **Public kinds or prefixes:** moves classification back to the caller and preserves adoption failures.
-- **Learned/heuristic classifier:** makes routing nondeterministic and harder to benchmark or debug.
-- **Single-query-only API:** sacrifices the existing high-value batching behavior.
-- **Prose-only output:** forces clients to reinterpret diagnostics and follow-up conditions.
+The request-shape restriction does not require signed tokens or a session hint registry.
+The server validates the concrete target and scope again when it executes the continuation.[^2]
 
-## Consequences
+## Response
 
-The server bears routing complexity but gains deterministic tests and attributable telemetry. JSON can add token overhead, so graduation includes a result-token non-regression gate. Expensive graph work remains opt-in through typed continuations rather than unconditional expansion.
+Responses remain JSON text with top-level results, hints, and diagnostics.
+Result order matches request order.
+Statuses are ok, partial, no_match, and ambiguous.
+Completeness describes actual output coverage.
+An incomplete scan cannot establish no_match.
+Routes tried remain telemetry-only.[^1][^2]
+
+Budget reduction preserves JSON and one result record for every input.
+The server rejects a budget that cannot fit required metadata.[^2]
+
+## Non-code Filename Queries
+
+An exact query naming a non-code file searches for repository text references.
+It does not imply a request to read that file.
+Issue #202 explicitly requests this behavior for uv.lock.
+Restricting the search to that file would remove the requested documentation and lockfile references.[^3]
+
+## Historical Contract
+
+The original roadmap names the filter path and permits files, directories, and globs.
+The implementation ships glob instead.
+The 2026-09-06 correction selects glob without assuming that directory-valued path inputs are equivalent.[^2]
+
+## Alternatives Rejected
+
+- Public query kinds or prefixes: require the caller to classify intent.
+- Query plus follow: restores a mode selector under another name.
+- Single-query-only requests: discard useful batching.
+- Prose outside the JSON envelope: forces clients to reinterpret the response.
+- Unconditional graph expansion: increases cost without a continuation request.[^1][^2]
+
+[^1]: [Merged roadmap PR #189](https://github.com/paulnsorensen/tilth/pull/189); [Discovery topology](./tilth-search-v2-roadmap-001.md).
+[^2]: User-approved continuation correction for [PR #231](https://github.com/paulnsorensen/tilth/pull/231), 2026-09-06; [Continuation decision](./tilth-search-v2-roadmap-006.md).
+[^3]: [Issue #202](https://github.com/paulnsorensen/tilth/issues/202).
+
+_Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the original path-filter request sketch; preserves server-owned initial routing._

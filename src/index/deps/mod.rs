@@ -64,6 +64,9 @@ pub(crate) struct HandleState {
 }
 
 impl HandleState {
+    pub(crate) fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
     /// Path to the backing `.redb` file. Test/introspection only.
     #[cfg(test)]
     pub(crate) fn db_path(&self) -> &Path {
@@ -113,20 +116,26 @@ pub(crate) fn worktree_key(cwd: &Path) -> String {
 /// Stops scanning at `deadline`, in which case deletions are not inferred
 /// (an incomplete scan cannot tell "not seen" from "not yet reached").
 pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant) -> Coverage {
-    let known_signatures = storage::all_signatures(&handle.db).unwrap_or_default();
+    let Ok(known_signatures) = storage::all_signatures(&handle.db) else {
+        return Coverage::default();
+    };
     let previously_known: HashSet<String> = known_signatures.keys().cloned().collect();
 
     let mut seen = HashSet::new();
     let mut upserts = Vec::new();
     let mut files_scanned = 0usize;
     let mut timed_out = false;
+    let mut failed = false;
 
     for entry in ignore::WalkBuilder::new(worktree).build() {
         if Instant::now() >= deadline {
             timed_out = true;
             break;
         }
-        let Ok(entry) = entry else { continue };
+        let Ok(entry) = entry else {
+            failed = true;
+            continue;
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -139,6 +148,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         files_scanned += 1;
 
         let Some(signature) = storage::signature_of(path) else {
+            failed = true;
             continue;
         };
         let unchanged = known_signatures
@@ -157,6 +167,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             crate::types::FileType::Code(_)
         ) {
             let Ok(content) = std::fs::read_to_string(path) else {
+                failed = true;
                 continue;
             };
             crate::read::imports::resolve_related_files_with_content(path, &content)
@@ -175,7 +186,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
 
     // A cut-short scan cannot distinguish "deleted" from "not yet reached",
     // so only infer deletions from a complete pass.
-    let deletes: Vec<String> = if timed_out {
+    let deletes: Vec<String> = if timed_out || failed {
         Vec::new()
     } else {
         previously_known.difference(&seen).cloned().collect()
@@ -192,8 +203,9 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         };
     }
 
+    timed_out |= Instant::now() >= deadline;
     Coverage {
-        complete: !timed_out,
+        complete: !timed_out && !failed,
         files_scanned,
         files_changed,
         timed_out,
@@ -217,17 +229,21 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         return VerifiedPartial {
             target: target_abs,
             dependents: Vec::new(),
-            coverage: Coverage {
-                complete: true,
-                ..Coverage::default()
-            },
+            coverage: Coverage::default(),
         };
     };
 
-    let candidates = storage::read_reverse(&handle.db, &target_rel).unwrap_or_default();
+    let Ok(candidates) = storage::read_reverse(&handle.db, &target_rel) else {
+        return VerifiedPartial {
+            target: target_abs,
+            dependents: Vec::new(),
+            coverage: Coverage::default(),
+        };
+    };
     let mut dependents = Vec::new();
     let mut checked = 0usize;
-    let mut timed_out = false;
+    let mut timed_out = Instant::now() >= deadline;
+    let mut failed = false;
 
     for candidate_rel in &candidates {
         if Instant::now() >= deadline {
@@ -237,20 +253,23 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         checked += 1;
         let candidate_abs = handle.worktree_root.join(candidate_rel);
         let Some(live_signature) = storage::signature_of(&candidate_abs) else {
+            failed |= candidate_abs.exists();
             continue; // source no longer exists: drop the stale edge
         };
         let Ok(Some(shard)) = storage::read_shard(&handle.db, candidate_rel) else {
+            failed = true;
             continue;
         };
         let verified = if shard.signature == live_signature {
             true
+        } else if let Ok(content) = std::fs::read_to_string(&candidate_abs) {
+            crate::read::imports::resolve_related_files_with_content(&candidate_abs, &content)
+                .iter()
+                .filter_map(|p| p.strip_prefix(&handle.worktree_root).ok())
+                .any(|r| r.to_string_lossy() == target_rel)
         } else {
-            std::fs::read_to_string(&candidate_abs).is_ok_and(|content| {
-                crate::read::imports::resolve_related_files_with_content(&candidate_abs, &content)
-                    .iter()
-                    .filter_map(|p| p.strip_prefix(&handle.worktree_root).ok())
-                    .any(|r| r.to_string_lossy() == target_rel)
-            })
+            failed = true;
+            false
         };
         if verified {
             dependents.push(candidate_abs);
@@ -261,7 +280,7 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         target: target_abs,
         dependents,
         coverage: Coverage {
-            complete: !timed_out,
+            complete: !timed_out && !failed,
             files_scanned: checked,
             files_changed: 0,
             timed_out,
@@ -306,6 +325,18 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CACHE_HOME", cache_dir.path());
         (guard, cache_dir)
+    }
+
+    #[test]
+    fn unreadable_code_does_not_report_complete_coverage() {
+        let repo = init_git_repo();
+        std::fs::write(repo.path().join("broken.rs"), [0xff, 0xfe]).unwrap();
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "unreadable-test")
+            .unwrap();
+        let coverage = reconcile(&handle, repo.path(), far_deadline());
+        assert!(!coverage.complete);
+        assert!(!coverage.timed_out);
     }
 
     #[test]

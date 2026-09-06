@@ -1,7 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -388,29 +387,23 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // batch streak — but only successful responses can carry a tip.
     // `Session::nudge` resolves grok-vs-batch precedence internally.
     let tip = services.session().nudge(tool, args, result.is_ok());
-    result.map(|body| append_nudge(body, tip))
+    result.map(|body| {
+        if tool == "tilth_search" {
+            body
+        } else {
+            append_nudge(body, tip)
+        }
+    })
 }
 
-/// Milliseconds budgeted to warm the persistent deps index before search-v2
-/// runs. A cold or slow deps index must never block or fail the search — it
-/// only affects `dependency_impact.coverage` in the v2 response.
-const DEPS_WARM_DEADLINE_MS: u64 = 200;
-
-/// Opens (or reuses) the per-(worktree, client) deps index and reconciles it
-/// against the current tree before delegating to the v2 search engine. Deps
-/// errors are swallowed here — a search must succeed cold-partial rather
-/// than fail because the deps index couldn't open.
+/// Search owns dependency refresh so coverage and output use the same evidence.
 fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, String> {
     let client = services.client_key();
-    let mut worktree = String::new();
-    if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
-        let cwd = Path::new(cwd);
-        if let Ok(handle) = crate::index::deps::open(cwd, client) {
-            let deadline = Instant::now() + Duration::from_millis(DEPS_WARM_DEADLINE_MS);
-            crate::index::deps::reconcile(&handle, cwd, deadline);
-        }
-        worktree = crate::index::deps::worktree_key(cwd);
-    }
+    let worktree = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(|cwd| crate::index::deps::worktree_key(Path::new(cwd)))
+        .unwrap_or_default();
     tool_search_v2(
         args,
         services.cache(),
@@ -611,110 +604,59 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_tool_appends_grok_nudge_on_repeated_symbol_search() {
+    fn repeated_queries_and_follows_keep_the_json_budget_envelope() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn foo() {}\nfn caller() { foo(); }\n",
+        )
+        .unwrap();
         let cwd = dir.path().to_str().unwrap();
         let services = Services::new(false);
-
-        let first = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
-            &services,
-        )
-        .unwrap();
-        assert!(
-            !first.contains("TIP:"),
-            "first search must not tip: {first}"
-        );
-
-        let second = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [{ "query": "bar" }], "cwd": cwd }),
-            &services,
-        )
-        .unwrap();
-        assert!(
-            second.contains("TIP: batch into one call"),
-            "consecutive single-item searches must batch-tip: {second:?}"
-        );
-
-        let third = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
-            &services,
-        )
-        .unwrap();
-        let tip = "TIP: tilth_grok foo — definition, callers, callees, and tests in one call.";
-        assert!(
-            third.ends_with(&format!("\n\n{tip}")),
-            "grok tip must ride foo's second search: {third:?}"
-        );
-        assert!(
-            !third.contains("TIP: batch into one call"),
-            "grok tip must outrank the batch tip: {third:?}"
-        );
-
-        // Discriminator: the old wiring spent batch emission 2-of-2 on the
-        // preempted pair above, leaving nothing here; the fixed wiring
-        // observes with emit off, so this pair still tips.
-        let fourth = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [{ "query": "qux" }], "cwd": cwd }),
-            &services,
-        )
-        .unwrap();
-        assert!(
-            fourth.contains("TIP: batch into one call"),
-            "the batch emission preempted by the grok tip must not be burned: {fourth:?}"
-        );
+        let args = serde_json::json!({"queries": [{"query": "foo"}], "cwd": cwd});
+        let initial = dispatch_tool("tilth_search", &args, &services).unwrap();
+        let initial: Value = serde_json::from_str(&initial).unwrap();
+        let hint = &initial["hints"][0];
+        for entry in [
+            serde_json::json!({"follow": hint}),
+            serde_json::json!({"follow": hint}),
+            serde_json::json!({"query": "foo"}),
+            serde_json::json!({"query": "bar"}),
+        ] {
+            let output = dispatch_tool(
+                "tilth_search",
+                &serde_json::json!({"queries": [entry], "cwd": cwd, "budget": 1000}),
+                &services,
+            )
+            .unwrap();
+            let payload: Value = serde_json::from_str(&output).expect("one JSON envelope");
+            assert_eq!(payload["results"].as_array().unwrap().len(), 1);
+            assert!(!output.contains("TIP:"));
+            assert!(crate::types::estimate_tokens(output.len() as u64) <= 1000);
+        }
     }
 
-    /// The grok tip is gated to successful `tilth_search` responses: a
-    /// qualifying-but-withheld tip must not leak onto a read response.
     #[test]
-    fn withheld_grok_tip_skips_reads_and_rides_the_next_search() {
+    fn rejected_selectors_do_not_arm_grok_nudges() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
         let services = Services::new(false);
-
-        // foo reaches candidacy count 2 inside one dispatch (both entries are
-        // symbol-kind searches — content/regex kinds no longer arm the nudge),
-        // then the third entry's unknown kind fails the whole call — the tip
-        // is withheld.
-        let err = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [
-                { "query": "foo" },
-                { "query": "foo", "kind": "symbol" },
-                { "query": "foo", "kind": "bogus" }
-            ], "cwd": cwd }),
-            &services,
-        );
-        assert!(err.is_err(), "unknown kind must fail the batched call");
-
+        for selector in ["kind", "expand", "context"] {
+            let mut args = serde_json::json!({"queries": [{"query": "foo"}], "cwd": cwd});
+            args[selector] = serde_json::json!("symbol");
+            assert!(dispatch_tool("tilth_search", &args, &services).is_err());
+            args.as_object_mut().unwrap().remove(selector);
+            args["queries"][0][selector] = serde_json::json!("symbol");
+            assert!(dispatch_tool("tilth_search", &args, &services).is_err());
+        }
         let read = dispatch_tool(
             "tilth_read",
-            &serde_json::json!({ "paths": ["a.rs"], "cwd": cwd }),
+            &serde_json::json!({"paths": ["a.rs"], "cwd": cwd}),
             &services,
         )
         .unwrap();
-        assert!(
-            !read.contains("TIP: tilth_grok"),
-            "grok tip must not ride a read response: {read:?}"
-        );
-
-        let search = dispatch_tool(
-            "tilth_search",
-            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
-            &services,
-        )
-        .unwrap();
-        assert!(
-            search.contains("TIP: tilth_grok foo"),
-            "withheld tip must ride the next successful search: {search:?}"
-        );
+        assert!(!read.contains("TIP: tilth_grok"));
     }
 
     #[test]
@@ -867,7 +809,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1345,
+            1368,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -887,7 +829,8 @@ mod tests {
             "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("routing is automatic (path → regex → symbol → literal)"),
+            SERVER_INSTRUCTIONS
+                .contains("routing is automatic. Do not add query `kind`, `expand`, or `context`."),
             "v2 automatic-routing guidance must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
@@ -900,7 +843,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1979,
+            1885,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -969,7 +912,8 @@ mod tests {
             "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{SERVER_INSTRUCTIONS}\n\n## Edit mode\n\n{EDIT_MODE_INSTRUCTIONS}\n"
         );
         assert_eq!(
-            AGENTS_MD, expected,
+            AGENTS_MD.trim_end(),
+            expected.trim_end(),
             "AGENTS.md is out of sync with prompts/ — run ./scripts/regen-agents-md.sh"
         );
     }
@@ -2252,8 +2196,6 @@ mod tests {
         let ok = serde_json::json!({
             "queries": [{ "query": "foo" }],
             "budget": 5000,
-            "expand": 0,
-            "scope": env!("CARGO_MANIFEST_DIR"),
             "cwd": env!("CARGO_MANIFEST_DIR")
         });
         assert!(

@@ -1,43 +1,71 @@
 ---
-status: trusted
+status: reviewed
 last_verified: 2026-09-06
 confidence: high
 sources:
+  - https://github.com/paulnsorensen/tilth/pull/231
   - https://github.com/paulnsorensen/tilth/issues/190
-  - .hallouminate/wiki/adr/tilth-search-v2-roadmap-004.md
-  - session telemetry 2026-08-26..2026-09-06
 ---
-# Keep tilth_grok and tilth_deps MCP Verbs at Cutover
+# Search Continuations Before MCP Verb Removal
 
-At the search-v2 cutover, tilth keeps the `tilth_grok` and `tilth_deps` MCP verbs. ADR-001 planned to fold both behind search. The cutover retires only the v1 `tilth_search` surface and the `tilth_search_v2` alias. `tilth_grok` and `tilth_deps` stay this round.
+Search continuations replace the caller-selected search kind.
+MCP grok/deps remain temporarily until Part B passes its removal and graduation gates.[^1]
 
 ## Context
 
-ADR-001 set a five-verb target: `search`, `read`, `list`, `diff`, and conditional `write`. It planned to remove public `grok` and `deps` after the measured trial. ADR-004 gated the cutover on evidence, not on a calendar.
+ADR-001 plans five public verbs: search, read, list, diff, and conditional write.
+Its replacement for grok/deps combines bounded search enrichment with typed continuations.[^2]
+ADR-002 rejects caller-selected kind, expand, and context.[^3]
 
-The cutover session had to decide the final verb set. Search-v2 enriches a unique hit with bounded grok core context and verified-only dependency impact, so search covers part of the grok and deps value. It does not cover every direct grok or deps call.
-
-Session telemetry from 2026-08-26 to 2026-09-06 measured real use:
-
-- v1 `tilth_search`: 745 calls. `kind` was set on 97% (content 505, symbol 227, regex 87, callers 42). `glob` 388, `expand` 70, `scope` 17, `context` 0, `if_modified_since` 0.
-- `tilth_search_v2`: 56 calls.
-
-The `callers` kind had 42 real calls per week with no v2 equivalent at trial end. Direct `tilth_grok` and `tilth_deps` calls carry their own weekly volume that search enrichment does not replace.
+The initial PR #231 draft retains grok/deps and restores kind:callers.
+Its usage count establishes demand for callers, not a requirement for that request shape.
+The user rejects that exception and approves executable search continuations instead.[^1]
 
 ## Decision
 
-- Keep `tilth_grok` and `tilth_deps` as MCP verbs at cutover.
-- Remove only the v1 `tilth_search` schema, the `tilth_search_v2` alias, the `--search-surface` flag, and the `SearchSurface` machinery.
-- Add a per-query `kind: "callers"` override to the new `tilth_search`, because 42 real calls per week have no other v2 path. No other caller-supplied `kind` returns; all remaining routing stays deterministic.
-- Leave the public Rust `run_grok` and `run_deps` APIs unchanged.
-- Revisit folding `grok` and `deps` into `search` in a later round, gated on fresh telemetry.
+- Accept either a query entry or an echoed follow hint in each search batch.
+- Keep glob as the canonical query filter.
+- Reject a fresh query combined with follow.
+- Reject caller-selected kind, expand, and context.
+- Execute every emitted hint inside tilth_search.
+- Use fetch_callers, fetch_callees, fetch_siblings, fetch_tests, and fetch_dependencies.
+- Preserve the resolved target, original scope, and applicable glob in each hint.
+- Validate hint data without introducing signed tokens or a session-issued-hint registry.
+- Return the requested bounded section and report incomplete output accurately.
+- Keep MCP grok/deps in this phase.
+- Remove those verbs only after Part B proves replacement coverage and the graduation gates pass.
+- Keep the public Rust grok/deps APIs.[^1][^2]
 
-## Alternatives rejected
+The remaining kind field belongs inside the server-emitted follow hint.
+It identifies a continuation, not a caller-selected mode for a fresh query.[^3]
 
-- **Fold grok and deps now (ADR-001 target):** removes verbs that still carry unique weekly volume; search enrichment does not replace every direct call.
-- **Keep the general `kind` parameter:** returns intent classification to the caller and repeats the adoption failure ADR-002 aimed to fix.
-- **Drop callers with no replacement:** loses 42 real calls per week of caller search with no v2 equivalent.
+## Contract Corrections
 
-## Consequences
+The canonical status values are ok, partial, no_match, and ambiguous.
+A failed index refresh cannot establish complete dependency coverage.
+Budget reduction preserves valid JSON and one result record per batch entry.
+A budget below the required metadata size produces an explicit error.[^1]
 
-The final MCP verb set is `search`, `read`, `list`, `deps`, `grok`, `diff`, and conditional `write` — two verbs above the ADR-001 target. The extra verbs are evidence-backed, not permanent. A later round can retire them when telemetry shows search enrichment covers their use. The single caller-facing `kind` value (`callers`) is a bounded, measured exception to deterministic routing.
+The earlier path field accepts directories as well as files and globs.
+The shipped glob filter is not automatically an equivalent alias.
+This phase keeps glob and does not add a path alias.[^1][^3]
+
+## Alternatives Rejected
+
+- Restore kind:callers: preserves the mode-selection problem instead of implementing the planned continuation.
+- Accept query plus follow: turns a continuation back into an intent selector.
+- Rename hints without dispatch support: leaves the replacement workflow unusable.
+- Remove grok/deps immediately: bypasses Part B and the measured graduation gate.
+- Preserve both path and glob without normalization rules: risks a silent scope change.
+
+## Verification
+
+Each continuation test copies a hint from a real search response.
+The test follows that hint and checks the requested output.
+Additional tests cover target collisions, scope, batch order, invalid requests, partial coverage, and JSON budgets.[^1]
+
+[^1]: User-approved continuation correction for PR #231, 2026-09-06: https://github.com/paulnsorensen/tilth/pull/231
+[^2]: [Search v2 public discovery topology](./tilth-search-v2-roadmap-001.md), lines 12–26; [Measured parallel trial](./tilth-search-v2-roadmap-004.md), lines 20–26.
+[^3]: [Deterministic search contract](./tilth-search-v2-roadmap-002.md).
+
+_Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the initial ADR-006 caller-kind exception and permanent seven-verb conclusion._

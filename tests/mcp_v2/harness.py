@@ -7,8 +7,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 BIN = REPO_ROOT / "target" / "debug" / "tilth"
 
 WITNESS = {
-    "AC-1": "A surface value advertises a tool outside its defined set, or absent flag ≠ v1",
-    "AC-2": "Both-surface omits v2, changes list, or exposes an unapproved verb",
     "AC-3": "Mixed per-query paths reorder/drop results or invalid batch accepted",
     "AC-4": "A deterministic fixture resolves through the wrong precedence or needs `kind",
     "AC-5": "Response invalid/missing envelope fields or leaks `routes_tried`; telemetry omits route",
@@ -19,7 +17,6 @@ WITNESS = {
     "AC-10": "Any predeclared gate fails yet verdict reads pass, or verdict artifact unparseable",
     "AC-11": "Record missing required field, contains source content, or file grows unbounded",
     "AC-12": "Evaluator reports pass with a missing/`[BLOCKED]` floor or unmet threshold",
-    "AC-13": "v1 surface drifts from 13,779 baseline or trial surface exceeds re-baselined cap",
     "AC-14": "Library behavior or list behavior changes",
 }
 

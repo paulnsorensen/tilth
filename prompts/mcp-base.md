@@ -5,13 +5,13 @@ DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Rela
 
 BATCH related work; array parameters never accept singular values:
 
-- `queries: [{query: "foo"}, {query: "bar", kind: "symbol"}]`
+- `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: hint}]`
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
 - `patterns: ["*.rs", "*.toml"]`
 
 ROUTE:
 
-- Find/explore → `tilth_search`: `queries: [{query, glob?, kind?}]`; routing is automatic (path → regex → symbol → literal); follow `hints`.
+- Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint}]`; routing is automatic. Do not add query `kind`, `expand`, or `context`.
 - Read known files/symbols/ranges → `tilth_read`.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.

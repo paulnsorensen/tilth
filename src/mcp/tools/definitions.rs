@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Find/explore code. Deterministic routing (path -> regex -> symbol -> literal) with dependency-impact enrichment on unique hits. Batch example: tilth_search(queries: [{query: \"foo\"}, {query: \"bar\", glob: \"*.rs\"}], cwd: \"/abs/repo\"). Per-query kind:\"callers\" finds call sites.",
+            "description": "Find/explore code with automatic routing. Batch entries use {query, glob?} or {follow: hint}; do not select kind, expand, or context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -16,23 +16,63 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "required": ["query"],
-                            "properties": {
-                                "query": { "type": "string", "description": "Symbol, text, or regex." },
-                                "glob": { "type": "string", "description": "Glob filter for this query." },
-                                "kind": { "type": "string", "enum": ["callers"], "description": "Optional per-query override; only \"callers\" (find call sites)." }
-                            }
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "required": ["query"],
+                                    "properties": {
+                                        "query": { "type": "string", "description": "Symbol, text, or regex." },
+                                        "glob": { "type": "string", "description": "Glob filter for this query." }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "required": ["follow"],
+                                    "properties": {
+                                        "follow": {
+                                            "type": "object",
+                                            "description": "One unchanged server-emitted continuation hint.",
+                                            "required": ["kind", "target"],
+                                            "additionalProperties": false,
+                                            "if": {"properties": {"kind": {"not": {"const": "fetch_dependencies"}}}},
+                                            "then": {"properties": {"target": {"properties": {"line": {"type": "integer"}}}}},
+                                            "properties": {
+                                                "kind": {"enum": ["fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests", "fetch_dependencies"]},
+                                                "target": {
+                                                    "type": "object",
+                                                    "required": ["path", "scope", "line", "name"],
+                                                    "additionalProperties": false,
+                                                    "properties": {
+                                                        "path": {"type": "string", "minLength": 1},
+                                                        "scope": {"type": "string", "minLength": 1},
+                                                        "line": {"type": ["integer", "null"], "minimum": 1, "maximum": 4_294_967_295_u64},
+                                                        "name": {"type": ["string", "null"], "minLength": 1},
+                                                        "glob": {"type": ["string", "null"]}
+                                                    },
+                                                    "oneOf": [
+                                                        {"properties": {"line": {"type": "integer"}, "name": {"type": "string"}}},
+                                                        {"properties": {"line": {"type": "null"}, "name": {"type": "null"}}}
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            ]
                         },
                         "minItems": 1,
                         "maxItems": 10,
-                        "description": "Required batch of 1-10 {query, glob?} objects."
+                        "description": "Required batch of 1-10 query or follow entries."
                     },
                     "budget": {
-                        "type": "number",
+                        "type": "integer", "minimum": 1,
                         "description": "Max response tokens."
                     },
                     "cwd": cwd_prop.clone()
-                }
+                },
+                "additionalProperties": false
             }
         }),
         serde_json::json!({
@@ -445,67 +485,45 @@ mod tests {
         );
     }
 
-    /// The canonical `tilth_search` carries the v2 contract: deterministic
-    /// routing owns intent, so there is no top-level `kind` and the only
-    /// per-entry `kind` value is `callers`. The root requires `queries` + `cwd`,
-    /// so `{}` and the dropped singular `query` are rejected client-side.
+    /// The canonical `tilth_search` accepts one query or one unchanged follow hint per entry.
     #[test]
     fn tilth_search_schema_matches_v2_contract_and_requires_queries_and_cwd() {
         let tools = tool_definitions(false);
         let search = tools
             .iter()
-            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_search"))
-            .expect("tilth_search tool definition present");
+            .find(|t| t["name"] == "tilth_search")
+            .expect("search tool");
         let schema = &search["inputSchema"];
-
-        assert!(
-            schema["properties"]["kind"].is_null(),
-            "v2 tilth_search must not carry a top-level kind: {schema}"
-        );
+        assert!(schema["properties"]["kind"].is_null());
         for dropped in ["scope", "expand", "context", "if_modified_since"] {
-            assert!(
-                schema["properties"][dropped].is_null(),
-                "v2 tilth_search must drop the v1 `{dropped}` property"
-            );
+            assert!(schema["properties"][dropped].is_null());
         }
-
-        let entry_enum: Vec<&str> = schema["properties"]["queries"]["items"]["properties"]["kind"]
-            ["enum"]
-            .as_array()
-            .expect("per-entry kind enum present")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(
-            entry_enum,
-            vec!["callers"],
-            "per-entry kind enum must be exactly [\"callers\"]: {entry_enum:?}"
-        );
-
-        let compiled = jsonschema::JSONSchema::compile(schema)
-            .expect("tilth_search inputSchema must be a valid JSON Schema");
-        assert!(
-            !compiled.is_valid(&serde_json::json!({})),
-            "empty args must fail: queries is required"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"query": "x"})),
-            "the singular `query` key was dropped — only `queries` is accepted"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})),
-            "queries without cwd must fail: cwd is required"
-        );
+        let items = &schema["properties"]["queries"]["items"];
+        assert!(items["oneOf"].is_array());
+        assert!(items["oneOf"][0]["properties"]["kind"].is_null());
+        let compiled = jsonschema::JSONSchema::compile(schema).expect("valid search schema");
+        assert!(!compiled.is_valid(&serde_json::json!({})));
+        assert!(!compiled.is_valid(&serde_json::json!({"query": "x"})));
+        assert!(!compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})));
         assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}], "cwd": "/abs"})));
         assert!(compiled.is_valid(
+            &serde_json::json!({"queries": [{"follow": {"kind": "fetch_tests", "target": {
+                "path": "x.rs", "line": 1, "name": "x", "scope": "/abs", "glob": null
+            }}}], "cwd": "/abs"})
+        ));
+        assert!(!compiled.is_valid(
+            &serde_json::json!({"queries": [{"follow": {"kind": "fetch_tests"}}], "cwd": "/abs"})
+        ));
+        assert!(!compiled.is_valid(&serde_json::json!({"queries": [{"follow": {
+            "kind": "fetch_callers", "target": {"path": "x.rs", "line": null, "name": null, "scope": "/abs"}
+        }}], "cwd": "/abs"})));
+        assert!(!compiled.is_valid(&serde_json::json!({"queries": [{}], "cwd": "/abs"})));
+        assert!(!compiled.is_valid(
+            &serde_json::json!({"queries": [{"query": "x", "follow": {}}], "cwd": "/abs"})
+        ));
+        assert!(!compiled.is_valid(
             &serde_json::json!({"queries": [{"query": "x", "kind": "callers"}], "cwd": "/abs"})
         ));
-        assert!(
-            !compiled.is_valid(
-                &serde_json::json!({"queries": [{"query": "x", "kind": "symbol"}], "cwd": "/abs"})
-            ),
-            "per-entry kind only accepts \"callers\" now"
-        );
     }
 
     /// Regression for issue #47: OpenAI/Codex's strict function-schema
