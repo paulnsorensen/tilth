@@ -29,12 +29,22 @@ pub enum MismatchError {
              Re-read the file to copy a current [path#tag] header — never invent a tag."
     )]
     Fabricated { path: String, expected_tag: u16 },
-    /// An edit anchored on a line the read never displayed under this tag.
+    /// An edit anchored on a line the read never displayed under this tag. Names
+    /// the ranges that WERE displayed and the exact re-read that would cover the
+    /// unseen line, so the fix is one bounded read rather than a guess. `reread`
+    /// is the smallest span joining `line` to the nearest displayed range, capped
+    /// at 60 lines.
     #[error(
-        "Edit rejected for {path}: line {line} was never displayed under this tag. \
-             Re-read the region you intend to edit."
+        "Edit rejected for {path}: line {line} was never displayed under this tag \
+             (displayed: {displayed}). Re-read {path}#{reread_lo}-{reread_hi} to cover line {line}."
     )]
-    UnseenAnchor { path: String, line: u32 },
+    UnseenAnchor {
+        path: String,
+        line: u32,
+        displayed: String,
+        reread_lo: u32,
+        reread_hi: u32,
+    },
     /// A `replace_text` anchor did not resolve against the live file. The
     /// specific match failure is what the caller must act on — reporting it as
     /// generic drift sends the agent into a re-read loop that cannot help.
@@ -66,6 +76,24 @@ mod tests {
         assert!(s.contains("#1A2B"), "{s}");
         assert!(s.contains("#3C4D"), "{s}");
         assert!(s.contains("changed between read and edit"), "{s}");
+    }
+
+    #[test]
+    fn unseen_anchor_message_names_displayed_ranges_and_reread() {
+        let e = MismatchError::UnseenAnchor {
+            path: "src/a.rs".into(),
+            line: 2823,
+            displayed: "2655-2700, 3250-3270".into(),
+            reread_lo: 2764,
+            reread_hi: 2823,
+        };
+        let s = e.to_string();
+        assert!(s.contains("line 2823 was never displayed"), "{s}");
+        assert!(s.contains("displayed: 2655-2700, 3250-3270"), "{s}");
+        assert!(
+            s.contains("Re-read src/a.rs#2764-2823 to cover line 2823"),
+            "{s}"
+        );
     }
 
     #[test]

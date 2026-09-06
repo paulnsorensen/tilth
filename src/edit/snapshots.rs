@@ -54,6 +54,23 @@ impl Snapshot {
         }
         anchors.into_iter().find(|a| !self.seen_lines.contains(a))
     }
+
+    /// The displayed lines as sorted, coalesced inclusive `(lo, hi)` ranges —
+    /// the shape the unseen-anchor rejection names so the model can see exactly
+    /// which regions it read. Empty when nothing was displayed.
+    pub(crate) fn seen_ranges(&self) -> Vec<(u32, u32)> {
+        let mut lines: Vec<u32> = self.seen_lines.iter().copied().collect();
+        lines.sort_unstable();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for line in lines {
+            match ranges.last_mut() {
+                Some((_, hi)) if line == *hi + 1 => *hi = line,
+                Some((_, hi)) if line == *hi => {}
+                _ => ranges.push((line, line)),
+            }
+        }
+        ranges
+    }
 }
 
 /// Weigh a path's version history by the sum of its retained text bytes.
@@ -466,6 +483,31 @@ mod tests {
         store.record_seen_lines("a.rs", tag, [2, 3]);
         let snap = store.by_tag("a.rs", tag).unwrap();
         assert_eq!(snap.seen_lines, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn seen_ranges_coalesces_sorted_runs() {
+        let snap = Snapshot {
+            path: "a.rs".into(),
+            text: String::new(),
+            tag: 0,
+            recorded_at: 0,
+            seen_lines: [3u32, 1, 2, 7, 8, 5].into_iter().collect(),
+        };
+        // {1,2,3,5,7,8} → (1,3),(5,5),(7,8).
+        assert_eq!(snap.seen_ranges(), vec![(1, 3), (5, 5), (7, 8)]);
+    }
+
+    #[test]
+    fn seen_ranges_empty_when_nothing_displayed() {
+        let snap = Snapshot {
+            path: "a.rs".into(),
+            text: String::new(),
+            tag: 0,
+            recorded_at: 0,
+            seen_lines: HashSet::new(),
+        };
+        assert!(snap.seen_ranges().is_empty());
     }
 
     #[test]

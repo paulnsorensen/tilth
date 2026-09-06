@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::edit::apply::FileOp;
+use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
@@ -62,10 +62,21 @@ pub(crate) fn tool_write(
     };
     let mut results: Vec<String> = Vec::with_capacity(sections.len());
     let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut any_ok = false;
     for section in &sections {
-        results.push(apply_section(section, &ctx, &mut seen_paths));
+        let (block, is_error) = apply_section(section, &ctx, &mut seen_paths);
+        any_ok |= !is_error;
+        results.push(block);
     }
-    Ok(results.join("\n\n---\n\n"))
+    let joined = results.join("\n\n---\n\n");
+    // Surface `isError: true` only when EVERY section failed — a mixed call
+    // keeps `isError: false` with per-section `error:` lines. All-failed calls
+    // were previously invisible to dashboards that key on the MCP error flag.
+    if any_ok {
+        Ok(joined)
+    } else {
+        Err(joined)
+    }
 }
 
 /// Shared per-call context threaded through the section pipeline: the caller's
@@ -77,26 +88,34 @@ struct SectionCtx<'a> {
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
-/// returns a `## <path>` Markdown block (success or error) — one failed section
-/// never aborts the others.
-fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<String>) -> String {
+/// returns a `## <path>` Markdown block plus whether it failed (success or
+/// error) — one failed section never aborts the others, and the boolean lets the
+/// caller decide the all-failed MCP `isError` flag.
+fn apply_section(
+    section: &Section,
+    ctx: &SectionCtx,
+    seen_paths: &mut HashSet<String>,
+) -> (String, bool) {
     let raw = &section.path;
     let path = match super::resolve_anchored(std::path::Path::new(raw), ctx.cwd) {
         Ok(p) => p,
-        Err(e) => return format!("## {raw}\nerror: {e}"),
+        Err(e) => return (format!("## {raw}\nerror: {e}"), true),
     };
     // Key the duplicate-path guard on the canonical key so `src/a.rs` and
     // `src/./a.rs` collide, preserving the one-section-per-file invariant.
     if !seen_paths.insert(crate::edit::normalize_path_key(&path)) {
-        return format!(
-            "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
-            path.display()
+        return (
+            format!(
+                "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
+                path.display()
+            ),
+            true,
         );
     }
 
     match commit_section(section, &path, ctx) {
-        Ok(block) => block,
-        Err(e) => format!("## {}\nerror: {e}", path.display()),
+        Ok(block) => (block, false),
+        Err(e) => (format!("## {}\nerror: {e}", path.display()), true),
     }
 }
 
@@ -135,7 +154,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     };
 
-    let (new_text, file_op) = resolve_edit(section, path, session, &live)?;
+    let (new_text, file_op, normalized) = resolve_edit(section, path, session, &live)?;
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
@@ -162,7 +181,15 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     let line_count = u32::try_from(new_text.split('\n').count()).unwrap_or(u32::MAX);
     let new_tag = session.record_snapshot(path, &new_text, 1..=line_count);
 
-    let mut block = format!("## {}\napplied", path.display());
+    // Decision 5: when the exact `old` failed and the whitespace-normalized
+    // fallback landed the swap, say so on the status line so the model knows its
+    // `old` did not match byte-for-byte.
+    let status = if normalized {
+        "applied (matched with whitespace normalization)"
+    } else {
+        "applied"
+    };
+    let mut block = format!("## {}\n{status}", path.display());
     match new_tag {
         Some(tag) => {
             let header = format_header(&path.display().to_string(), tag);
@@ -184,8 +211,26 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     Ok(block)
 }
 
-/// Verify the section's tag against live content and produce the edited text
-/// plus any file op. On a matched tag with intact content, the seen-lines-gated
+/// Enrich a `replace_text` no-match into decision 4's provenance-teaching error;
+/// every other edit failure keeps its own already-actionable message. The tag is
+/// the section's whole-file tag — always present when a `replace_text` reaches
+/// the matcher, since a tagless text swap is rejected upstream.
+fn map_edit_error(e: EditError, path: &Path, tag: Option<u16>) -> TilthError {
+    if let EditError::Apply(ApplyError::TextUnmatched { preview }) = &e {
+        if let Some(tag) = tag {
+            return TilthError::EditRejected(format!(
+                "text to replace was not found; copy old verbatim from the numbered lines of \
+                 [{}#{tag:04X}] — do not retype it from memory or shell output (preview: {preview})",
+                path.display()
+            ));
+        }
+    }
+    e.into()
+}
+
+/// Verify the section's tag against live content and produce the edited text,
+/// any file op, and whether a `replace_text` resolved through whitespace
+/// normalization. On a matched tag with intact content, the seen-lines-gated
 /// apply runs; on a drifted (or tag-collided) tag, [`recover_edit`] runs; a
 /// tagless section seeds/edits against live directly (gate skipped).
 fn resolve_edit(
@@ -193,7 +238,7 @@ fn resolve_edit(
     path: &Path,
     session: &Session,
     live: &str,
-) -> Result<(String, Option<FileOp>), TilthError> {
+) -> Result<(String, Option<FileOp>, bool), TilthError> {
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
 
@@ -217,8 +262,9 @@ fn resolve_edit(
                 ));
             }
             let snap = synthetic_snapshot(&key, live, live_tag);
-            let r = gated_apply(&snap, path, &section.ops)?;
-            Ok((r.text, r.file_op))
+            let r = gated_apply(&snap, path, &section.ops)
+                .map_err(|e| map_edit_error(e, path, section.tag))?;
+            Ok((r.text, r.file_op, r.normalized_swap))
         }
         // Tag matches live → no drift (or a 16-bit tag collision). Run the
         // seen-lines gate over the recorded snapshot and apply — but only when
@@ -229,16 +275,18 @@ fn resolve_edit(
             let store = session.snapshots();
             if let Some(snap) = store.by_tag(&key, tag) {
                 if snap.text == live {
-                    let r = gated_apply(&snap, path, &section.ops)?;
-                    return Ok((r.text, r.file_op));
+                    let r = gated_apply(&snap, path, &section.ops)
+                        .map_err(|e| map_edit_error(e, path, section.tag))?;
+                    return Ok((r.text, r.file_op, r.normalized_swap));
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
             }
             // The read's snapshot was evicted: synthetic over live (tag guards
             // content; empty provenance skips the seen-lines gate).
             let snap = synthetic_snapshot(&key, live, tag);
-            let r = gated_apply(&snap, path, &section.ops)?;
-            Ok((r.text, r.file_op))
+            let r = gated_apply(&snap, path, &section.ops)
+                .map_err(|e| map_edit_error(e, path, section.tag))?;
+            Ok((r.text, r.file_op, r.normalized_swap))
         }
         // Tag ≠ live → the file drifted since the read. Recover via 3-way merge.
         Some(tag) => {
@@ -259,7 +307,7 @@ fn recover_edit(
     key: &str,
     tag: u16,
     live: &str,
-) -> Result<(String, Option<FileOp>), TilthError> {
+) -> Result<(String, Option<FileOp>, bool), TilthError> {
     // Provenance gate: if the read's snapshot survives, an edit anchored on a
     // never-displayed line is rejected here exactly as on the no-drift path. A
     // missing snapshot means the tag was never recorded this session (fabricated,
@@ -278,10 +326,12 @@ fn recover_edit(
     // tag. An unknown/fabricated tag falls through to try_recover, which rejects
     // it as Fabricated rather than silently deleting/moving on unverified intent.
     if tag_known && file_op.is_some() && !has_content {
-        return Ok((live.to_string(), file_op));
+        return Ok((live.to_string(), file_op, false));
     }
     let text = try_recover(store, path, tag, &section.ops, live)?;
-    Ok((text, file_op))
+    // Recovery does not surface the whitespace-normalization note; the drifted
+    // path already carries its own richer status.
+    Ok((text, file_op, false))
 }
 
 fn create_target_exists_error(path: &Path) -> TilthError {
@@ -543,7 +593,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("error:") && out.contains("changed between read and edit"),
             "conflicting drift must be a Drift rejection, got:\n{out}"
@@ -591,7 +641,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("never displayed"),
             "drift branch must enforce seen-lines; unseen-line edit must be rejected, got:\n{out}"
@@ -679,7 +729,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("at most one file op (CREATE/REM/MV)"),
             "delete_file + move_file in one drifted section must be a FileOpConflict, got:\n{out}"
@@ -710,7 +760,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("not from this session"),
             "pure delete_file with a never-recorded tag must be Fabricated, got:\n{out}"
@@ -745,7 +795,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("not from this session"),
             "pure move_file with a never-recorded tag must be Fabricated, got:\n{out}"
@@ -794,7 +844,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("error:"),
             "colliding-tag edit over drifted content must be rejected, got:\n{out}"
@@ -821,7 +871,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("not from this session"),
             "unknown tag must be a Fabricated rejection, got:\n{out}"
@@ -841,7 +891,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("escapes") && out.contains(".."),
             "`..` traversal in a section path must be rejected, got:\n{out}"
@@ -894,7 +944,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("escapes") && out.contains(".."),
             "move_file dest with `..` must be rejected, got:\n{out}"
@@ -940,7 +990,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             rej.contains("never displayed"),
             "relocated snapshot must gate an unseen line at dest, got:\n{rej}"
@@ -1007,7 +1057,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             rej.contains("never displayed"),
             "relocated snapshot must gate an unseen line at dest, got:\n{rej}"
@@ -1035,7 +1085,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("already exists"),
             "move onto an existing different file must be rejected, got:\n{out}"
@@ -1076,7 +1126,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out2.contains("not from this session"),
             "post-delete edit with the old tag must be Fabricated, got:\n{out2}"
@@ -1134,7 +1184,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out2.contains("not from this session"),
             "post-delete edit with the old tag must be Fabricated, got:\n{out2}"
@@ -1251,12 +1301,14 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
+        // Decision 4: the not-found message teaches provenance — copy `old`
+        // verbatim from the numbered read, naming the exact [path#TAG] source.
         assert_eq!(
             out,
             format!(
-                "## {}\nerror: text to replace was not found; re-read the file and retry (preview: missing)",
-                p.display()
+                "## {p}\nerror: text to replace was not found; copy old verbatim from the numbered lines of [{p}#{tag}] — do not retype it from memory or shell output (preview: missing)",
+                p = p.display()
             )
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
@@ -1277,7 +1329,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert_eq!(
             out,
             format!(
@@ -1307,7 +1359,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("Edit rejected for"),
             "expected an Edit rejected message, got:\n{out}"
@@ -1385,7 +1437,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
 
         assert_eq!(
             out,
@@ -1414,7 +1466,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
 
         assert_eq!(
             out,
@@ -1448,7 +1500,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
 
         assert_eq!(
             out,
@@ -1671,7 +1723,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             reject.contains("never displayed"),
             "edit on a line outside the read symbol span must be rejected, got:\n{reject}"
@@ -1735,7 +1787,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert!(
             out.contains("never displayed"),
             "signature read must not grant seen-lines; line-3 edit must be rejected, got:\n{out}"
@@ -1879,7 +1931,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert_eq!(
             out,
             format!(
@@ -1908,7 +1960,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("per-section error returns Ok");
+        .expect_err("all sections failed → isError");
         assert_eq!(
             out,
             format!(
@@ -1919,6 +1971,105 @@ mod tests {
         assert!(
             !p.exists(),
             "two create_file ops in one section must not create the file"
+        );
+    }
+
+    /// Decision 5: an exact-miss `replace_text` that resolves only through the
+    /// whitespace-normalized fallback applies over the original span and flags
+    /// the normalization on the status line.
+    #[test]
+    fn replace_text_normalized_match_notes_whitespace_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("ws.rs");
+        // The file indents with a tab; the edit's `old` uses spaces, so the
+        // exact match fails and only the normalized fallback can land it.
+        std::fs::write(&p, "fn a() {\n\tlet y = 2;\n}\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            out.contains("applied (matched with whitespace normalization)"),
+            "status line must flag the normalized fallback, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() {\n\tlet y = 42;\n}\n",
+            "new splices over the original span, preserving the file's tab indent"
+        );
+    }
+
+    /// Decision 6: a call whose only section is rejected surfaces `isError: true`
+    /// (an `Err` from `tool_write`), so dashboards keyed on the MCP flag see it.
+    #[test]
+    fn sole_rejected_section_surfaces_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("only.rs");
+        std::fs::write(&p, "fn a() {}\n").unwrap();
+        let (session, bloom) = services();
+        let bogus = format!("{:04X}", compute_file_hash("fn a() {}\n") ^ 0x1);
+        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("every section failed → isError:true");
+        assert!(out.contains("not from this session"), "got:\n{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "fn a() {}\n");
+    }
+
+    /// Decision 6: a mixed call (one section applies, one is rejected) stays
+    /// `isError: false` (an `Ok`) and carries both section blocks.
+    #[test]
+    fn mixed_call_one_rejection_stays_ok_with_both_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let a = root.join("good.rs");
+        let b = root.join("bad.rs");
+        std::fs::write(&a, "fn a() {}\n").unwrap();
+        std::fs::write(&b, "fn b() {}\n").unwrap();
+        let (session, bloom) = services();
+        let tag_a = read_for_tag(&session, &a);
+        let bogus = format!("{:04X}", compute_file_hash("fn b() {}\n") ^ 0x1);
+        let edits_val = json!([
+            {
+                "path": a.to_str().unwrap(),
+                "tag": tag_a,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}" }]
+            },
+            {
+                "path": b.to_str().unwrap(),
+                "tag": bogus,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn B() {}" }]
+            }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("a mixed call keeps isError:false (Ok)");
+        assert!(
+            out.contains("applied"),
+            "the good section must apply, got:\n{out}"
+        );
+        assert!(
+            out.contains("not from this session"),
+            "the bad section must still report its error, got:\n{out}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn A() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "fn b() {}\n",
+            "the rejected section must not touch its file"
         );
     }
 }

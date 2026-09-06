@@ -52,3 +52,58 @@ Session 2026-08-02; spec at the durable corpus
   unambiguous by construction.
 - **Consequences:** Strip lives at the lowering site (`json.rs`), keeping
   `parse_tag`/`tag.rs` strict.
+
+### ADR-004: Overlap gate for replace_text, strict gate for line ops [status: accepted]
+
+- **Context:** The seen-lines gate rejected any `replace_text` whose resolved
+  span crossed the edge of the displayed window (15 of 19 unseen-anchor
+  rejections in the post-fix window; a section read of 6-41 lines with the
+  match span 1-5 lines outside it). The whole matched span had to be seen even
+  though the agent had clearly seen the text it was replacing.
+- **Decision:** `replace_text` passes when its resolved match span OVERLAPS the
+  seen set by at least one line; a span with zero seen lines is still rejected.
+  Line, insert, and block ops keep the strict per-anchor rule (every anchored
+  line must have been displayed). The span is resolved via the same matcher the
+  apply path uses (`apply.rs match_text_span`), so gate and apply never diverge.
+- **Consequences:** `check_seen_lines` splits ops — text swaps checked for
+  overlap, the rest lowered and checked strictly. `replay_session_chain` keeps
+  its own strict guard (a security net against a text-swap provenance bypass on
+  the drift path) and is deliberately NOT loosened.
+
+### ADR-005: Self-correcting rejection messages + whitespace-normalized fallback [status: accepted]
+
+- **Context:** Two rejection classes dominated and both sent the agent guessing.
+  Unseen-anchor named neither what WAS displayed nor where to re-read.
+  `text to replace was not found` named neither the provenance source nor the
+  cheap fix; 9 of 15 misses were `old` retyped from memory or shell output.
+- **Decision (two messages):**
+  1. Unseen-anchor names the displayed ranges and the exact re-read:
+     `line {N} was never displayed under this tag (displayed: {A-B, C-D}).
+     Re-read {path}#{lo}-{hi} to cover line {N}.` `{lo}-{hi}` is the smallest
+     span joining N to the nearest displayed range, capped at 60 lines by
+     trimming the far (range) side so the anchor stays covered.
+  2. Not-found teaches provenance: `copy old verbatim from the numbered lines
+     of [{path}#{TAG}] — do not retype it from memory or shell output`.
+- **Decision (fallback):** When the exact `old` misses, retry with runs of
+  spaces/tabs collapsed and leading/trailing whitespace ignored on both sides.
+  Exactly one normalized match applies `new` over the ORIGINAL span and appends
+  `(matched with whitespace normalization)` to the section status line. Zero →
+  the not-found message above; more than one → the existing not-unique error.
+  Exact-ambiguous and empty-`old` paths are untouched. `replace_all` (#175)
+  stays out of scope.
+- **Consequences:** The `normalized` flag threads `apply.rs` →
+  `ApplyResult.normalized_swap` → the write status line. Prompts are unchanged;
+  the error text is the teaching channel (never truncated by the host).
+
+### ADR-006: All-sections-failed surfaces MCP isError [status: accepted]
+
+- **Context:** Every per-section rejection returned `isError: false` with the
+  error rendered inside the text body, so dashboards keyed on the MCP error
+  flag counted zero write failures.
+- **Decision:** `tool_write` returns `Err` (→ `isError: true`) when EVERY
+  section in the call failed; a mixed call keeps `isError: false` with
+  per-section `error:` lines and every section block present.
+- **Consequences:** `apply_section` returns `(block, is_error)`; `tool_write`
+  ORs the successes. Single-section rejections (the common shape) now surface as
+  errors — the many `tool_write(...).expect(...)` write tests that exercised a
+  sole rejected section moved to `.expect_err(...)`.

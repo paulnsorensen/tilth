@@ -70,6 +70,11 @@ pub struct ApplyResult {
     pub first_changed_line: Option<usize>,
     /// A file-level op (`CREATE`/`REM`/`MV`), if present.
     pub file_op: Option<FileOp>,
+    /// True when at least one `replace_text` op resolved only through the
+    /// whitespace-normalized fallback (exact match failed). The write surface
+    /// notes this on the section status line so the model knows its `old` did
+    /// not match byte-for-byte.
+    pub normalized_swap: bool,
 }
 
 /// Why an apply failed.
@@ -159,7 +164,80 @@ fn find_text_span(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
     Ok((start, start + old.len()))
 }
 
-fn line_number(text: &str, byte_pos: usize) -> u32 {
+/// Resolve a `replace_text` span, exact first and whitespace-normalized second.
+/// Returns `(start, end, normalized)` where `normalized` is true only when the
+/// exact match failed and the collapse-whitespace fallback found a unique match.
+/// The span is always into the ORIGINAL `text`, so `new` splices over the real
+/// bytes regardless of how the match was found.
+pub(super) fn match_text_span(text: &str, old: &str) -> Result<(usize, usize, bool), ApplyError> {
+    match find_text_span(text, old) {
+        Ok((s, e)) => Ok((s, e, false)),
+        // An exact miss is the only failure the fallback may rescue. Ambiguity
+        // (two exact matches) and an empty `old` keep their existing errors —
+        // decision 5 leaves the not-unique and empty paths untouched.
+        Err(ApplyError::TextUnmatched { .. }) => {
+            let (s, e) = find_text_span_normalized(text, old)?;
+            Ok((s, e, true))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Collapse each maximal run of spaces/tabs in `s` to a single space, returning
+/// the normalized string and a map from every normalized byte offset to the
+/// originating byte offset in `s` (plus a trailing sentinel = `s.len()`).
+/// Newlines and all other characters are preserved verbatim.
+fn normalize_ws_with_map(s: &str) -> (String, Vec<usize>) {
+    let mut norm = String::with_capacity(s.len());
+    let mut map: Vec<usize> = Vec::with_capacity(s.len() + 1);
+    let mut prev_ws = false;
+    for (off, ch) in s.char_indices() {
+        if ch == ' ' || ch == '\t' {
+            if prev_ws {
+                continue;
+            }
+            prev_ws = true;
+            norm.push(' ');
+            map.push(off);
+        } else {
+            prev_ws = false;
+            let bytes = ch.len_utf8();
+            norm.push(ch);
+            for _ in 0..bytes {
+                map.push(off);
+            }
+        }
+    }
+    map.push(s.len());
+    (norm, map)
+}
+
+/// Whitespace-normalized fallback for a `replace_text` exact miss: collapse
+/// runs of spaces/tabs and ignore leading/trailing spaces on both sides, then
+/// require exactly one match. Maps the normalized match back to the original
+/// byte span. Zero → [`ApplyError::TextUnmatched`]; two or more →
+/// [`ApplyError::TextAmbiguous`].
+fn find_text_span_normalized(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
+    let preview = || old.chars().take(80).collect::<String>();
+    let (norm_old, _) = normalize_ws_with_map(old);
+    let needle = norm_old.trim_matches(' ');
+    if needle.is_empty() {
+        return Err(ApplyError::TextUnmatched { preview: preview() });
+    }
+    let (norm_text, map) = normalize_ws_with_map(text);
+    let mut hits = norm_text.match_indices(needle);
+    let Some((at, _)) = hits.next() else {
+        return Err(ApplyError::TextUnmatched { preview: preview() });
+    };
+    if hits.next().is_some() {
+        return Err(ApplyError::TextAmbiguous { count: 2 });
+    }
+    // `map` carries one entry per normalized byte plus the sentinel, so both
+    // ends resolve to a real original offset.
+    Ok((map[at], map[at + needle.len()]))
+}
+
+pub(super) fn line_number(text: &str, byte_pos: usize) -> u32 {
     text[..byte_pos].bytes().filter(|&b| b == b'\n').count() as u32 + 1
 }
 
@@ -213,7 +291,7 @@ fn resolve_text_swap(
 /// [`reject_overlaps`]. Two swaps whose matched byte ranges genuinely overlap
 /// still error. Returns one slot per op index in `ops`; `None` for
 /// non-`TextSwap` ops and for ops merged into an earlier slot.
-fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<Vec<Option<LineOp>>, ApplyError> {
+fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool), ApplyError> {
     struct Resolved<'a> {
         op_idx: usize,
         start: usize,
@@ -223,9 +301,11 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<Vec<Option<LineOp>>, Apply
     }
 
     let mut resolved: Vec<Resolved> = Vec::new();
+    let mut normalized = false;
     for (op_idx, op) in ops.iter().enumerate() {
         if let Op::TextSwap { old, new } = op {
-            let (start, end) = find_text_span(text, old)?;
+            let (start, end, was_normalized) = match_text_span(text, old)?;
+            normalized |= was_normalized;
             resolved.push(Resolved {
                 op_idx,
                 start,
@@ -274,7 +354,7 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<Vec<Option<LineOp>>, Apply
         run_start = run_end;
     }
 
-    Ok(out)
+    Ok((out, normalized))
 }
 
 /// Lower `ops` into concrete [`LineOp`]s by resolving block anchors against
@@ -283,7 +363,7 @@ pub(super) fn lower_ops(
     path: &Path,
     text: &str,
     ops: &[Op],
-) -> Result<(Vec<LineOp>, Option<FileOp>), ApplyError> {
+) -> Result<(Vec<LineOp>, Option<FileOp>, bool), ApplyError> {
     // File ops (CREATE/REM/MV) plus the one-file-op conflict guard live in
     // the canonical `FileOp::from_ops`; the loop below handles only content ops.
     let file_op = FileOp::from_ops(ops)?;
@@ -299,7 +379,7 @@ pub(super) fn lower_ops(
     };
     // Text swaps resolve against the pristine `text` up front so overlapping
     // and same-line groups can be detected/coalesced before lowering.
-    let mut text_swaps = lower_text_swaps(text, ops)?;
+    let (mut text_swaps, normalized) = lower_text_swaps(text, ops)?;
     for (i, op) in ops.iter().enumerate() {
         match op {
             Op::Swap {
@@ -359,7 +439,7 @@ pub(super) fn lower_ops(
         }
     }
 
-    Ok((line_ops, file_op))
+    Ok((line_ops, file_op, normalized))
 }
 
 /// The anchor lines an op set reads, for recovery's session-chain content check.
@@ -388,9 +468,10 @@ pub(super) fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
 /// Returns [`ApplyError`] when ops overlap, an anchor is out of bounds or
 /// unresolved, or file ops conflict.
 pub(super) fn apply_ops(path: &Path, text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
-    let (line_ops, file_op) = lower_ops(path, text, ops)?;
+    let (line_ops, file_op, normalized) = lower_ops(path, text, ops)?;
     let mut result = apply_line_ops(text, &line_ops)?;
     result.file_op = file_op;
+    result.normalized_swap = normalized;
     Ok(result)
 }
 
@@ -509,6 +590,7 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
         text: out,
         first_changed_line,
         file_op: None,
+        normalized_swap: false,
     })
 }
 
@@ -1119,6 +1201,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn match_text_span_prefers_exact_and_flags_no_normalization() {
+        let (s, e, normalized) = match_text_span("let x = 1;\n", "let x = 1;").expect("exact");
+        assert!(!normalized, "an exact match must not report normalization");
+        assert_eq!((s, e), (0, 10));
+    }
+
+    #[test]
+    fn match_text_span_normalizes_tabs_against_spaces() {
+        // `old` is indented with spaces; the file uses a leading tab.
+        let text = "fn f() {\n\tlet y = 2;\n}\n";
+        let (s, e, normalized) = match_text_span(text, "    let y = 2;").expect("normalized match");
+        assert!(
+            normalized,
+            "tab/space divergence must resolve via normalization"
+        );
+        assert_eq!(
+            &text[s..e],
+            "let y = 2;",
+            "the span excludes the leading whitespace trimmed on both sides"
+        );
+    }
+
+    #[test]
+    fn match_text_span_ignores_trailing_space_in_old() {
+        let text = "let x = 1;\n";
+        let (s, e, normalized) = match_text_span(text, "let x = 1; ").expect("normalized match");
+        assert!(normalized);
+        assert_eq!(&text[s..e], "let x = 1;");
+    }
+
+    #[test]
+    fn match_text_span_zero_normalized_matches_is_unmatched() {
+        let err = match_text_span("let x = 1;\n", "totally different").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::TextUnmatched { .. }),
+            "no match either way must stay TextUnmatched, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn match_text_span_two_normalized_matches_is_ambiguous() {
+        // Neither line matches "x y" exactly (space-run lengths differ), but both
+        // collapse to it — the fallback must report ambiguity, not pick one.
+        let text = "x  y\nx   y\n";
+        let err = match_text_span(text, "x y").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::TextAmbiguous { count: 2 }),
+            "two normalized matches must be ambiguous, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn text_swap_applies_through_whitespace_normalization() {
+        let text = "fn f() {\n\tlet y = 2;\n}\n";
+        let ops = vec![Op::TextSwap {
+            old: "    let y = 2;".into(),
+            new: "let y = 42;".into(),
+        }];
+        let (line_ops, _, normalized) = lower_ops(Path::new("a.rs"), text, &ops).expect("lower");
+        assert!(normalized, "fallback must flag normalization up the stack");
+        let applied = apply_line_ops(text, &line_ops).expect("apply");
+        assert_eq!(
+            applied.text, "fn f() {\n\tlet y = 42;\n}\n",
+            "new splices over the original span, leaving the file's own indentation"
+        );
+    }
+
     /// Two disjoint substring replacements on one line are the most natural
     /// `replace_text` batch; each lowers to the same covering line span, so
     /// they must coalesce instead of colliding in `reject_overlaps`.
@@ -1135,7 +1285,7 @@ mod tests {
                 new: "qux".into(),
             },
         ];
-        let (line_ops, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
+        let (line_ops, _, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
         let applied = apply_line_ops(text, &line_ops).expect("both apply");
         assert_eq!(applied.text, "let a = baz(qux);\n");
     }
@@ -1157,7 +1307,7 @@ mod tests {
                 new: "ONE\n    TWO".into(),
             },
         ];
-        let (line_ops, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
+        let (line_ops, _, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
         let applied = apply_line_ops(text, &line_ops).expect("both apply");
         assert_eq!(applied.text, "let a = qux(ONE\n    TWO);\ntail\n");
     }
