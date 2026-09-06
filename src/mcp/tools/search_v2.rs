@@ -127,6 +127,8 @@ fn route_query(
     }
 
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
+    // A glob naming one exact existing file is single-file-bounded by
+    // `search::exact_glob_target` inside the walker — no separate short-circuit needed here.
     if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
         let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
         let mut result = base_result(query, "regex", "ok");
@@ -420,6 +422,35 @@ mod tests {
     fn route_regex_resolves_metachar_pattern() {
         let resp = single_query(r"fn\s+detect_file_type").expect("regex query succeeds");
         assert_eq!(resp["results"][0]["resolved_as"], "regex");
+    }
+
+    #[test]
+    fn regex_with_exact_file_glob_is_bounded_to_that_file() {
+        let start = Instant::now();
+        let resp = call(&json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{
+                "query": r"SearchTelemetryRecord.*",
+                "glob": "src/mcp/tools/search_v2.rs",
+            }],
+        }))
+        .expect("bounded regex query succeeds");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "exact-file-glob regex must be single-file-bounded and fast: {:?}",
+            start.elapsed()
+        );
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "regex");
+        let preview = result["preview"].as_str().expect("regex preview");
+        assert!(
+            preview.contains("src/mcp/tools/search_v2.rs:"),
+            "regex preview must include the exact-glob file: {preview}"
+        );
+        assert!(
+            !preview.contains("src/telemetry.rs:"),
+            "regex preview must exclude files outside the exact glob: {preview}"
+        );
     }
 
     #[test]
