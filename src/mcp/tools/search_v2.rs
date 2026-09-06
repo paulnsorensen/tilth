@@ -63,7 +63,9 @@ pub(in crate::mcp) fn tool_search_v2(
             entries.len()
         ));
     }
-    // Validate the full batch before any search changes session state.
+    // Validate the full batch before any search changes session state; each
+    // follow hint is parsed once here and reused by the execution loop.
+    let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
     for entry in entries {
         let object = entry.as_object().ok_or("each entry must be an object")?;
         if object.contains_key("query") == object.contains_key("follow") {
@@ -73,7 +75,7 @@ pub(in crate::mcp) fn tool_search_v2(
             if object.len() != 1 {
                 return Err("follow entries accept only follow".into());
             }
-            Follow::parse(hint, cwd)?;
+            follows.push(Some(Follow::parse(hint, cwd)?));
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
                 return Err("query entries accept only query and glob".into());
@@ -86,30 +88,28 @@ pub(in crate::mcp) fn tool_search_v2(
             }
             crate::search::walker(cwd, entry.get("glob").and_then(Value::as_str))
                 .map_err(|e| e.to_string())?;
+            follows.push(None);
         }
     }
     let mut results = Vec::with_capacity(entries.len());
     let mut hints = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
-    for entry in entries {
-        let (mut result, route, mut entry_hints, diagnostic) =
-            if let Some(hint) = entry.get("follow") {
-                let follow = Follow::parse(hint, cwd)?;
-                let result = follow.execute(cwd, bloom, client)?;
-                (result, follow.kind.clone(), Vec::new(), None)
-            } else {
-                route_query(
-                    entry["query"].as_str().unwrap(),
-                    entry.get("glob").and_then(Value::as_str),
-                    cwd,
-                    cache,
-                    session,
-                    bloom,
-                )
-                .map_err(|e| e.to_string())?
-            };
-        if result.get("target").is_some() && entry.get("follow").is_none() {
+    for (entry, follow) in entries.iter().zip(&follows) {
+        let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
+            let result = follow.execute(cwd, bloom, client)?;
+            (result, follow.kind.clone(), Vec::new(), None)
+        } else {
+            route_query(
+                entry["query"].as_str().unwrap(),
+                entry.get("glob").and_then(Value::as_str),
+                cwd,
+                cache,
+                session,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        if result.get("target").is_some() && follow.is_none() {
             let target: Target =
                 serde_json::from_value(result["target"].clone()).map_err(|e| e.to_string())?;
             result["dependency_impact"] = continuations::dependencies(&target, cwd, client)?;
@@ -169,8 +169,13 @@ pub(in crate::mcp) fn tool_search_v2(
     Ok(output)
 }
 
+/// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
+/// `ambiguous` or `no_match` verdict keeps its own meaning and carries the
+/// incompleteness in `completeness`.
 fn mark_partial(result: &mut Value) {
-    result["status"] = json!("partial");
+    if result["status"] == "ok" {
+        result["status"] = json!("partial");
+    }
     result["completeness"] = json!("partial");
 }
 
@@ -231,11 +236,8 @@ fn route_query(
     cwd: &Path,
     cache: &OutlineCache,
     session: &Session,
-    bloom: &BloomFilterCache,
 ) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
     session.record_search(query, true);
-
-    // Automatic routing rejects caller-selected kind, expand, and context.
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
     let candidate = cwd.join(query);
@@ -246,17 +248,9 @@ fn route_query(
                 crate::types::FileType::Code(_)
             ) {
                 let target_spec = format!("{query}:1");
-                let (result, hints) = unique_hit(
-                    &target_spec,
-                    "path",
-                    &candidate,
-                    1,
-                    cwd,
-                    bloom,
-                    session,
-                    glob,
-                )?;
-                let result = with_query(result, query);
+                let (mut result, hints) =
+                    unique_hit(&target_spec, "path", &candidate, 1, cwd, glob)?;
+                result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
             let content_result = crate::search::search_content_raw(query, cwd, glob)?;
@@ -286,8 +280,7 @@ fn route_query(
     // signature-shaped phrase still hits the underlying symbol.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
-            let (mut result, route, hints) =
-                route_identifier(ident, glob, cwd, cache, session, bloom)?;
+            let (mut result, route, hints) = route_identifier(ident, glob, cwd, cache)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -301,7 +294,7 @@ fn route_query(
     // 4. filename-shaped miss — a bare basename with an extension that doesn't
     // exist verbatim: suggest fuzzy-matched real paths instead of falling
     // through to identifier/literal routing.
-    if Path::new(query).extension().is_some() && !query.contains('/') && !cwd.join(query).exists() {
+    if Path::new(query).extension().is_some() && !query.contains('/') {
         if let crate::read::fuzzy_path::FuzzyResolution::Suggestions(suggestions) =
             crate::read::fuzzy_path::resolve_fuzzy_path(
                 cwd,
@@ -323,7 +316,7 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session, bloom)?;
+        let (result, route, hints) = route_identifier(query, glob, cwd, cache)?;
         return Ok((result, route, hints, None));
     }
 
@@ -350,8 +343,6 @@ fn route_identifier(
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
-    session: &Session,
-    bloom: &BloomFilterCache,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
     let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
     let discovery_partial = sym_result.files_unreadable > 0
@@ -377,16 +368,8 @@ fn route_identifier(
     code_defs.dedup_by(|a, b| a.path == b.path && a.line == b.line);
     if code_defs.len() == 1 {
         let target = &code_defs[0];
-        let (mut result, hints) = unique_hit(
-            query,
-            "symbol",
-            &target.path,
-            target.line,
-            cwd,
-            bloom,
-            session,
-            glob,
-        )?;
+        let (mut result, hints) =
+            unique_hit(query, "symbol", &target.path, target.line, cwd, glob)?;
         if discovery_partial {
             mark_partial(&mut result);
         }
@@ -458,13 +441,6 @@ fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Overwrite the `"query"` field of an enrichment result built against a
-/// derived target spec (e.g. `"path:1"`) with the caller's original query.
-fn with_query(mut result: Value, query: &str) -> Value {
-    result["query"] = json!(query);
-    result
-}
-
 fn raw_result(query: &str, route: &str, raw: &crate::types::SearchResult) -> Value {
     let mut result = base_result(
         query,
@@ -507,40 +483,47 @@ fn candidates(matches: &[Match], cwd: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Bodies and signatures from files on the secrets denylist are never emitted;
+/// v1's formatters suppressed the same content through `SECRET_REDACTION_NOTICE`.
+fn redact_secret_text(path: &Path, text: String) -> String {
+    if crate::search::path_is_secret_file(path) {
+        crate::search::SECRET_REDACTION_NOTICE
+            .trim_start()
+            .to_string()
+    } else {
+        text
+    }
+}
+
 fn unique_hit(
     query: &str,
     resolved_as: &str,
     target_path: &Path,
     target_line: u32,
     cwd: &Path,
-    _bloom: &BloomFilterCache,
-    _session: &Session,
     glob: Option<&str>,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let content = std::fs::read_to_string(target_path).map_err(|source| {
-        crate::error::TilthError::IoError {
-            path: target_path.to_path_buf(),
-            source,
-        }
-    })?;
-    let mut core_partial = content.lines().count() > 60;
-    let (line, name, body) = if resolved_as == "path" {
-        (
-            None,
-            None,
-            content.lines().take(60).collect::<Vec<_>>().join("\n"),
-        )
+    let (line, name, body, core_partial) = if resolved_as == "path" {
+        let content = std::fs::read_to_string(target_path).map_err(|source| {
+            crate::error::TilthError::IoError {
+                path: target_path.to_path_buf(),
+                source,
+            }
+        })?;
+        let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
+        let core_partial = content.lines().count() > 60;
+        (None, None, body, core_partial)
     } else {
         let spec = format!("{}:{target_line}", target_path.display());
-        let (target, _, _) = crate::search::grok::resolve_with_source(&spec, cwd)?;
-        core_partial = target.end_line - target.start_line + 1 > 60;
+        let (target, content, _) = crate::search::grok::resolve_with_source(&spec, cwd)?;
+        let (start, end) = (target.start_line, target.end_line);
         let body = content
             .lines()
-            .skip(target.start_line.saturating_sub(1) as usize)
-            .take((target.end_line - target.start_line + 1).min(60) as usize)
+            .skip(start.saturating_sub(1) as usize)
+            .take((end - start + 1).min(60) as usize)
             .collect::<Vec<_>>()
             .join("\n");
-        (Some(target.start_line), Some(target.name), body)
+        (Some(start), Some(target.name), body, end - start + 1 > 60)
     };
     let target = Target {
         path: display_rel(target_path, cwd),
@@ -553,7 +536,7 @@ fn unique_hit(
         return Ok((base_result(query, resolved_as, "no_match"), Vec::new()));
     }
     let mut result = base_result(query, resolved_as, "ok");
-    result["core"] = json!(body);
+    result["core"] = json!(redact_secret_text(target_path, body));
     result["target"] = json!(target);
     if core_partial {
         mark_partial(&mut result);
@@ -561,6 +544,7 @@ fn unique_hit(
     let hints = target.hints();
     Ok((result, hints))
 }
+
 fn is_identifier(query: &str) -> bool {
     let mut chars = query.chars();
     match chars.next() {
@@ -589,9 +573,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
-        let (cache, session, bloom) = components();
-        let (result, route, hints) =
-            route_identifier("root", None, tmp.path(), &cache, &session, &bloom).unwrap();
+        let (cache, _session, _bloom) = components();
+        let (result, route, hints) = route_identifier("root", None, tmp.path(), &cache).unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -608,7 +591,7 @@ mod tests {
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let result = call(&json!({"cwd": tmp.path(), "queries": [{"query": "root"}]})).unwrap();
         assert_eq!(result["results"][0]["resolved_as"], "ambiguous");
-        assert_eq!(result["results"][0]["status"], "partial");
+        assert_eq!(result["results"][0]["status"], "ambiguous");
         assert_eq!(result["results"][0]["completeness"], "partial");
         assert_eq!(
             result["results"][0]["candidates"].as_array().unwrap().len(),
@@ -636,7 +619,7 @@ mod tests {
                 call_with_telemetry(&json!({"cwd": tmp.path(), "queries": [{"query": "root"}]}))
                     .unwrap();
             assert_eq!(result["results"][0]["resolved_as"], "ambiguous");
-            assert_eq!(result["results"][0]["status"], "partial");
+            assert_eq!(result["results"][0]["status"], "ambiguous");
             assert_eq!(result["results"][0]["completeness"], "partial");
             assert_eq!(
                 result["results"][0]["candidates"].as_array().unwrap().len(),
@@ -697,6 +680,39 @@ mod tests {
             response["results"][0]["dependency_impact"]["coverage"],
             "partial"
         );
+    }
+
+    #[test]
+    fn budget_trim_keeps_ambiguous_status() {
+        let mut response = json!({"results": [{"query": "root", "resolved_as": "ambiguous",
+            "status": "ambiguous", "completeness": "complete",
+            "candidates": [{"path": "x".repeat(5000)}]}], "hints": [], "diagnostics": {}});
+        let output = reduce_response(&mut response, 100).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["results"][0]["status"], "ambiguous");
+        assert_eq!(parsed["results"][0]["completeness"], "partial");
+        assert_eq!(parsed["results"][0]["budget_limited"], true);
+    }
+
+    #[test]
+    fn secret_files_never_emit_source_in_core() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("credentials.py"),
+            "def token():\n    return \"hunter2\"\n",
+        )
+        .unwrap();
+        assert!(crate::lang::detection::is_secret_file("credentials.py"));
+        let notice = crate::search::SECRET_REDACTION_NOTICE.trim_start();
+        for query in ["credentials.py", "token"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            assert_eq!(
+                response["results"][0]["core"], notice,
+                "{query}: {response}"
+            );
+            assert!(!response.to_string().contains("hunter2"), "{response}");
+        }
     }
 
     #[test]

@@ -127,7 +127,16 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
     let mut timed_out = false;
     let mut failed = false;
 
-    for entry in ignore::WalkBuilder::new(worktree).build() {
+    for entry in ignore::WalkBuilder::new(worktree)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|ft| ft.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| crate::search::skip_dir_entry(entry.path(), name)))
+        })
+        .build()
+    {
         if Instant::now() >= deadline {
             timed_out = true;
             break;
@@ -203,7 +212,8 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         };
     }
 
-    timed_out |= Instant::now() >= deadline;
+    // `timed_out` reflects the walk only: a fully-walked pass stays complete
+    // even when the redb write phase runs past the deadline.
     Coverage {
         complete: !timed_out && !failed,
         files_scanned,
@@ -337,6 +347,21 @@ mod tests {
         let coverage = reconcile(&handle, repo.path(), far_deadline());
         assert!(!coverage.complete);
         assert!(!coverage.timed_out);
+    }
+
+    #[test]
+    fn nested_checkout_under_worktrees_is_not_ingested() {
+        let repo = init_git_repo();
+        std::fs::write(repo.path().join("real.rs"), "fn real() {}\n").unwrap();
+        let nested = repo.path().join("worktrees").join("x");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        std::fs::write(nested.join("buried.rs"), "fn buried() {}\n").unwrap();
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "nested-worktree-test")
+            .unwrap();
+        let coverage = reconcile(&handle, repo.path(), far_deadline());
+        assert!(coverage.complete);
+        assert_eq!(coverage.files_scanned, 1, "nested checkout was ingested");
     }
 
     #[test]

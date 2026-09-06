@@ -10,19 +10,22 @@ use crate::search::{callees, callers, grok};
 use crate::types::is_test_file;
 
 const SECTION_CAP: usize = 30;
+/// Deps enrichment is best-effort: a cold or stale index must never block a
+/// search, so reconcile/impact get this much wall clock and then report partial.
+const DEPS_WARM_DEADLINE: Duration = Duration::from_millis(200);
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Target {
-    pub path: String,
-    pub line: Option<u32>,
-    pub name: Option<String>,
-    pub scope: String,
-    pub glob: Option<String>,
+    pub(super) path: String,
+    pub(super) line: Option<u32>,
+    pub(super) name: Option<String>,
+    pub(super) scope: String,
+    pub(super) glob: Option<String>,
 }
 
 impl Target {
-    pub fn hints(&self) -> Vec<Value> {
+    pub(super) fn hints(&self) -> Vec<Value> {
         let kinds: &[&str] = if self.line.is_some() {
             &[
                 "fetch_callers",
@@ -62,6 +65,9 @@ impl Target {
         if self.scope != cwd.to_string_lossy() {
             return Err("follow target scope does not match cwd".into());
         }
+        if Path::new(&self.path).is_absolute() {
+            return Err("follow target requires a cwd-relative path".into());
+        }
         if self.path.is_empty()
             || Path::new(&self.path)
                 .components()
@@ -72,6 +78,16 @@ impl Target {
         let full = cwd.join(&self.path);
         if !full.is_file() {
             return Err("follow target must be an existing file".into());
+        }
+        // Containment is unconditional: canonicalize so a symlink inside cwd
+        // cannot point the concrete target outside the declared scope.
+        let canonical_cwd = cwd.canonicalize().map_err(|e| e.to_string())?;
+        if !full
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .starts_with(&canonical_cwd)
+        {
+            return Err("follow target is outside cwd".into());
         }
         if self.line == Some(0)
             || self.line.is_some() != self.name.is_some()
@@ -95,7 +111,7 @@ impl Target {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Follow {
     pub kind: String,
@@ -164,9 +180,15 @@ impl Follow {
         match self.kind.as_str() {
             "fetch_siblings" => {
                 let entries = crate::lang::outline::get_outline_entries(&content, lang);
-                items = grok::collect_siblings(&entries, &target).into_iter().map(|s| json!({
-                    "path": self.target.path, "name": s.name, "line": s.start_line, "end_line": s.end_line, "signature": s.signature
-                })).collect();
+                items = grok::collect_siblings(&entries, &target)
+                    .into_iter()
+                    .map(|s| {
+                        let signature =
+                            s.signature.map(|sig| super::redact_secret_text(&full, sig));
+                        json!({"path": self.target.path, "name": s.name, "line": s.start_line,
+                        "end_line": s.end_line, "signature": signature})
+                    })
+                    .collect();
             }
             "fetch_callees" => {
                 let names = callees::extract_callee_names(
@@ -177,13 +199,25 @@ impl Follow {
                 let resolved = callees::resolve_callees(&names, &full, &content, bloom);
                 // Unresolved names are not verified external calls.
                 partial = names.iter().any(|n| !resolved.iter().any(|c| &c.name == n));
-                items = resolved
+                let candidates: Vec<_> = resolved
                     .into_iter()
                     .filter(|c| !(c.file == full && c.start_line == target.start_line))
+                    .collect();
+                let candidate_count = candidates.len();
+                let in_scope: Vec<_> = candidates
+                    .into_iter()
                     .filter(|c| self.target.allows(&c.file, cwd))
+                    .collect();
+                // Scope-dropped callees are real callees the caller cannot see.
+                partial |= in_scope.len() < candidate_count;
+                items = in_scope
+                    .into_iter()
                     .map(|c| {
+                        let signature = c
+                            .signature
+                            .map(|sig| super::redact_secret_text(&c.file, sig));
                         json!({"path": super::display_rel(&c.file, cwd), "name": c.name,
-                        "line": c.start_line, "end_line": c.end_line, "signature": c.signature})
+                        "line": c.start_line, "end_line": c.end_line, "signature": signature})
                     })
                     .collect();
             }
@@ -200,6 +234,9 @@ impl Follow {
                 partial = unreadable > 0 || matches.len() >= callers::BATCH_EARLY_QUIT;
                 for (_, caller) in matches {
                     if is_test_file(&caller.path) != (self.kind == "fetch_tests") {
+                        continue;
+                    }
+                    if !self.target.allows(&caller.path, cwd) {
                         continue;
                     }
                     // Bind same-name candidates to the resolved definition through the existing import resolver.
@@ -224,9 +261,10 @@ impl Follow {
                     {
                         continue;
                     }
+                    let call = super::redact_secret_text(&caller.path, caller.call_text);
                     items.push(
                         json!({"path": super::display_rel(&caller.path, cwd), "line": caller.line,
-                        "name": caller.calling_function, "call": caller.call_text}),
+                        "name": caller.calling_function, "call": call}),
                     );
                 }
             }
@@ -258,12 +296,7 @@ impl Follow {
 }
 
 pub(super) fn dependencies(target: &Target, cwd: &Path, client: &str) -> Result<Value, String> {
-    dependencies_until(
-        target,
-        cwd,
-        client,
-        Instant::now() + Duration::from_millis(200),
-    )
+    dependencies_until(target, cwd, client, Instant::now() + DEPS_WARM_DEADLINE)
 }
 
 fn dependencies_until(
@@ -323,6 +356,81 @@ fn dependencies_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn follow_hint(cwd: &Path, kind: &str, glob: &Value) -> Value {
+        json!({"kind": kind, "target": {"path": "root.ts", "line": 2, "name": "root",
+            "scope": cwd.to_string_lossy(), "glob": glob}})
+    }
+
+    fn scoped_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("helper.ts"), "export function leaf() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("root.ts"),
+            "import { leaf } from './helper';\nexport function root() { leaf(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("caller.ts"),
+            "import { root } from './root';\nfunction outside_caller() { root(); }\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn run(cwd: &Path, hint: &Value) -> Value {
+        Follow::parse(hint, cwd)
+            .unwrap()
+            .execute(cwd, &BloomFilterCache::new(), "scope-test")
+            .unwrap()
+    }
+
+    #[test]
+    fn glob_scoped_follows_exclude_out_of_scope_items() {
+        let tmp = scoped_fixture();
+        let cwd = tmp.path();
+
+        let unscoped_callees = run(cwd, &follow_hint(cwd, "fetch_callees", &Value::Null));
+        assert_eq!(unscoped_callees["items"][0]["name"], "leaf");
+        let scoped_callees = run(cwd, &follow_hint(cwd, "fetch_callees", &json!("root.ts")));
+        assert!(scoped_callees["items"].as_array().unwrap().is_empty());
+        assert_eq!(scoped_callees["completeness"], "partial");
+
+        let unscoped_callers = run(cwd, &follow_hint(cwd, "fetch_callers", &Value::Null));
+        assert_eq!(unscoped_callers["items"][0]["name"], "outside_caller");
+        let scoped_callers = run(cwd, &follow_hint(cwd, "fetch_callers", &json!("root.ts")));
+        assert!(scoped_callers["items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn targets_outside_cwd_are_rejected() {
+        let tmp = scoped_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.ts"),
+            "export function root() {}\n",
+        )
+        .unwrap();
+
+        let mut absolute = follow_hint(tmp.path(), "fetch_callers", &Value::Null);
+        absolute["target"]["path"] = json!(outside.path().join("secret.ts").to_string_lossy());
+        let err = Follow::parse(&absolute, tmp.path()).unwrap_err();
+        assert!(err.contains("cwd-relative"), "{err}");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.ts"),
+                tmp.path().join("linked.ts"),
+            )
+            .unwrap();
+            let mut linked = follow_hint(tmp.path(), "fetch_callers", &Value::Null);
+            linked["target"]["path"] = json!("linked.ts");
+            linked["target"]["line"] = json!(1);
+            let err = Follow::parse(&linked, tmp.path()).unwrap_err();
+            assert!(err.contains("outside cwd"), "{err}");
+        }
+    }
 
     #[test]
     fn expired_dependency_deadline_reports_actual_partial_coverage() {

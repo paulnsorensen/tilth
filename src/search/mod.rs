@@ -78,10 +78,29 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
-const SECRET_REDACTION_NOTICE: &str =
+pub(crate) const SECRET_REDACTION_NOTICE: &str =
     "\n-> contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
 
-fn path_is_secret_file(path: &Path) -> bool {
+/// Shared junk-directory rule for the search walker and the deps-index
+/// reconcile walk. Every `SKIP_DIRS` name is skipped by name except a bare
+/// `worktrees`, which is a legitimate source directory in some repos: skip it
+/// only when it actually holds checkouts (an immediate child with a `.git`
+/// entry). `.worktrees` stays unconditional.
+pub(crate) fn skip_dir_entry(path: &Path, name: &str) -> bool {
+    if !SKIP_DIRS.contains(&name) {
+        return false;
+    }
+    if name != "worktrees" {
+        return true;
+    }
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.flatten().any(|child| {
+            child.file_type().is_ok_and(|ft| ft.is_dir()) && child.path().join(".git").exists()
+        })
+    })
+}
+
+pub(crate) fn path_is_secret_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(crate::lang::detection::is_secret_file)
@@ -129,7 +148,7 @@ fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
                 && entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| SKIP_DIRS.contains(&name))
+                    .is_some_and(|name| skip_dir_entry(entry.path(), name))
             {
                 return false;
             }
@@ -2062,12 +2081,13 @@ mod tests {
 
     #[test]
     fn walker_skips_worktrees_dirs() {
-        // `worktrees/`/`.worktrees/` hold other checkouts (incl. `.claude/worktrees`) — never source.
+        // `worktrees/`/`.worktrees/` holding nested checkouts (incl. `.claude/worktrees`) are never source.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
         for wt in ["worktrees", ".worktrees"] {
-            let dir = tmp.path().join(wt);
-            std::fs::create_dir(&dir).unwrap();
+            let dir = tmp.path().join(wt).join("wt1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".git"), "gitdir: elsewhere").unwrap();
             std::fs::write(dir.join("buried.rs"), "fn buried() {}").unwrap();
         }
 
@@ -2082,6 +2102,24 @@ mod tests {
         assert!(
             !names.contains(&"buried.rs".to_string()),
             "worktrees dir leaked through the walker: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walker_keeps_worktrees_dir_holding_plain_sources() {
+        // A bare `worktrees/` with no nested checkout is ordinary source.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("worktrees");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("kept.rs"), "fn kept() {}").unwrap();
+
+        let names: Vec<String> = walk_paths(tmp.path(), None)
+            .iter()
+            .filter_map(|p| Some(p.file_name()?.to_str()?.to_string()))
+            .collect();
+        assert!(
+            names.contains(&"kept.rs".to_string()),
+            "plain worktrees/ source must be searchable: {names:?}"
         );
     }
 
