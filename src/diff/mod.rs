@@ -761,6 +761,24 @@ mod tests {
     }
 
     /// Run a git command in the given directory.
+    /// Replace the relative commit age in a log header (`(0s ago, @Test)`)
+    /// with a placeholder. Two runs can straddle a second boundary, so tests
+    /// that compare log output must compare structure, not wall-clock timing.
+    fn mask_commit_age(out: &str) -> String {
+        out.lines()
+            .map(|line| {
+                let Some(ago) = line.find(" ago, @") else {
+                    return line.to_string();
+                };
+                let Some(open) = line[..ago].rfind(" (") else {
+                    return line.to_string();
+                };
+                format!("{}AGE{}", &line[..open + 2], &line[ago..])
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(args)
@@ -1988,7 +2006,8 @@ diff --git a/src/main.rs b/src/main.rs
         )
         .unwrap();
         assert_eq!(
-            absolute_result, relative_result,
+            mask_commit_age(&absolute_result),
+            mask_commit_age(&relative_result),
             "absolute file scope should resolve to the same commit history as its repo-relative spelling:\nabs:\n{absolute_result}\nrel:\n{relative_result}"
         );
     }

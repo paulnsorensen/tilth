@@ -290,6 +290,15 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
+    /// Canonicalize each path so equality holds where the temp dir is reached
+    /// through a symlink (macOS aliases `/var` to `/private/var`). The index
+    /// stores canonicalized worktree paths, so the expected side is
+    /// canonicalized too — a portable normalization, not a `/private` string
+    /// replacement.
+    fn canonicalized(paths: &[PathBuf]) -> Vec<PathBuf> {
+        paths.iter().map(|p| p.canonicalize().unwrap()).collect()
+    }
+
     /// `XDG_CACHE_HOME` is process-global, so tests that set it must not
     /// run concurrently with each other; this guard serializes them.
     fn set_cache_dir() -> (std::sync::MutexGuard<'static, ()>, TempDir) {
@@ -349,7 +358,10 @@ mod tests {
         reconcile(&handle, repo.path(), far_deadline());
 
         let before = impact(&handle, Path::new("target.rs"), far_deadline());
-        assert_eq!(before.dependents, vec![repo.path().join("dep.rs")]);
+        assert_eq!(
+            canonicalized(&before.dependents),
+            canonicalized(&[repo.path().join("dep.rs")])
+        );
 
         std::fs::remove_file(repo.path().join("dep.rs")).unwrap();
         let after = impact(&handle, Path::new("target.rs"), far_deadline());
@@ -429,7 +441,10 @@ mod tests {
         .unwrap();
         reconcile(&handle, repo.path(), far_deadline());
         let after = impact(&handle, Path::new("target.rs"), far_deadline());
-        assert_eq!(after.dependents, vec![repo.path().join("renamed.rs")]);
+        assert_eq!(
+            canonicalized(&after.dependents),
+            canonicalized(&[repo.path().join("renamed.rs")])
+        );
     }
 
     #[test]
