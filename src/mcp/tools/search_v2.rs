@@ -56,6 +56,8 @@ pub(in crate::mcp) fn tool_search_v2(
     let mut routes_tried = Vec::with_capacity(queries.len());
     let mut primary_route = String::new();
 
+    let mut normalizations = Vec::new();
+
     for entry in queries {
         let query = entry
             .get("query")
@@ -63,7 +65,7 @@ pub(in crate::mcp) fn tool_search_v2(
             .ok_or_else(|| "each queries entry requires a \"query\" string.".to_string())?;
         let glob = entry.get("glob").and_then(Value::as_str);
 
-        let (result, route, mut entry_hints) =
+        let (result, route, mut entry_hints, diagnostic) =
             route_query(query, glob, cwd, cache, session, bloom).map_err(|e| e.to_string())?;
         routes_tried.push(route.clone());
         if primary_route.is_empty() {
@@ -71,12 +73,21 @@ pub(in crate::mcp) fn tool_search_v2(
         }
         hints.append(&mut entry_hints);
         results.push(result);
+        if let Some(diag) = diagnostic {
+            normalizations.push(diag);
+        }
     }
+
+    let diagnostics = if normalizations.is_empty() {
+        json!({})
+    } else {
+        json!({"normalizations": normalizations})
+    };
 
     let response = json!({
         "results": results,
         "hints": hints,
-        "diagnostics": {},
+        "diagnostics": diagnostics,
     });
     let response_str = serde_json::to_string(&response).map_err(|e| e.to_string())?;
 
@@ -100,8 +111,10 @@ pub(in crate::mcp) fn tool_search_v2(
 }
 
 /// Route one query through the deterministic precedence: path -> regex ->
-/// symbol/ambiguous -> literal -> miss. Returns the result record, the
-/// resolved route name (for telemetry), and any hints emitted for it.
+/// signature-prefix normalization -> filename-shaped miss -> symbol/ambiguous
+/// -> literal -> miss. Returns the result record, the resolved route name
+/// (for telemetry), any hints emitted for it, and an optional normalization
+/// diagnostic when the query was rewritten before routing.
 fn route_query(
     query: &str,
     glob: Option<&str>,
@@ -109,7 +122,7 @@ fn route_query(
     cache: &OutlineCache,
     session: &Session,
     bloom: &BloomFilterCache,
-) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
+) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
     session.record_search(query, true);
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
@@ -124,7 +137,7 @@ fn route_query(
                 let (result, hints) =
                     unique_hit(&target_spec, "path", &candidate, cwd, bloom, session)?;
                 let result = with_query(result, query);
-                return Ok((result, "path".to_string(), hints));
+                return Ok((result, "path".to_string(), hints, None));
             }
             let content_result = crate::search::search_content_raw(query, cwd, glob)?;
             let mut result = base_result(query, "path", "ok");
@@ -132,10 +145,10 @@ fn route_query(
                 result["preview"] =
                     json!(crate::search::format_raw_result(&content_result, cache)?);
             }
-            return Ok((result, "path".to_string(), Vec::new()));
+            return Ok((result, "path".to_string(), Vec::new(), None));
         }
         let result = base_result(query, "path", "ok");
-        return Ok((result, "path".to_string(), Vec::new()));
+        return Ok((result, "path".to_string(), Vec::new(), None));
     }
 
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
@@ -145,10 +158,27 @@ fn route_query(
         let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
         let mut result = base_result(query, "regex", "ok");
         result["preview"] = json!(crate::search::format_raw_result(&search_result, cache)?);
-        return Ok((result, "regex".to_string(), Vec::new()));
+        return Ok((result, "regex".to_string(), Vec::new(), None));
     }
 
-    // 3. filename-shaped miss — a bare basename with an extension that doesn't
+    // 3. signature-prefix normalization — strip a leading declaration keyword
+    // (`fn foo` -> `foo`) before identifier/path routing, so a pasted
+    // signature-shaped phrase still hits the underlying symbol.
+    if let Some((kw, ident)) = strip_signature_prefix(query) {
+        if is_identifier(ident) {
+            let (mut result, route, hints) =
+                route_identifier(ident, glob, cwd, cache, session, bloom)?;
+            result["query"] = json!(query);
+            let diag = json!({
+                "query": query,
+                "normalized_to": ident,
+                "stripped_keyword": kw,
+            });
+            return Ok((result, route, hints, Some(diag)));
+        }
+    }
+
+    // 4. filename-shaped miss — a bare basename with an extension that doesn't
     // exist verbatim: suggest fuzzy-matched real paths instead of falling
     // through to identifier/literal routing.
     if !is_identifier(query)
@@ -170,60 +200,76 @@ fn route_query(
                     .map(|p| json!({"path": p}))
                     .collect::<Vec<_>>());
                 let hint = json!({"kind": "disambiguate", "target": query});
-                return Ok((result, "path".to_string(), vec![hint]));
+                return Ok((result, "path".to_string(), vec![hint], None));
             }
         }
     }
 
-    // 4. symbol / ambiguous — bare identifier: prefer definitions, then reuse
+    // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
-        let code_defs: Vec<Match> = sym_result
-            .matches
-            .iter()
-            .filter(|m| {
-                m.is_definition
-                    && matches!(
-                        crate::lang::detect_file_type(&m.path),
-                        crate::types::FileType::Code(_)
-                    )
-            })
-            .cloned()
-            .collect();
-        if code_defs.len() == 1 {
-            let target = &code_defs[0];
-            let (result, hints) = unique_hit(query, "symbol", &target.path, cwd, bloom, session)?;
-            return Ok((result, "symbol".to_string(), hints));
-        }
-        if code_defs.len() > 1 {
-            let content_result = crate::search::search_content_raw(query, cwd, glob)?;
-            let mut result = base_result(query, "ambiguous", "ambiguous");
-            result["candidates"] = json!(candidates(&code_defs, cwd));
-            if content_result.total_found > 0 {
-                result["preview"] =
-                    json!(crate::search::format_raw_result(&content_result, cache)?);
-            }
-            let hint = json!({"kind": "disambiguate", "target": query});
-            return Ok((result, "ambiguous".to_string(), vec![hint]));
-        }
-        if sym_result.total_found > 0 {
-            let mut result = base_result(query, "literal", "ok");
-            result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
-            return Ok((result, "literal".to_string(), Vec::new()));
-        }
-        let content_result = crate::search::search_content_raw(query, cwd, glob)?;
-        if content_result.total_found > 0 {
-            let mut result = base_result(query, "literal", "ok");
-            result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
-            return Ok((result, "literal".to_string(), Vec::new()));
-        }
-
-        let result = base_result(query, "miss", "miss");
-        return Ok((result, "miss".to_string(), Vec::new()));
+        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session, bloom)?;
+        return Ok((result, route, hints, None));
     }
 
-    // 5. literal — content search (non-identifier phrases only).
+    // 6. literal — content search (non-identifier phrases only).
+    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+    if content_result.total_found > 0 {
+        let mut result = base_result(query, "literal", "ok");
+        result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
+        return Ok((result, "literal".to_string(), Vec::new(), None));
+    }
+
+    // 7. miss — nothing matched.
+    let result = base_result(query, "miss", "miss");
+    Ok((result, "miss".to_string(), Vec::new(), None))
+}
+
+/// Route a bare identifier through the definitions-first symbol cascade:
+/// unique code definition -> ambiguous multi-definition -> usage/literal
+/// fallback -> miss. Shared by the plain identifier route and the
+/// signature-prefix-normalized route.
+fn route_identifier(
+    query: &str,
+    glob: Option<&str>,
+    cwd: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &BloomFilterCache,
+) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
+    let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
+    let code_defs: Vec<Match> = sym_result
+        .matches
+        .iter()
+        .filter(|m| {
+            m.is_definition
+                && matches!(
+                    crate::lang::detect_file_type(&m.path),
+                    crate::types::FileType::Code(_)
+                )
+        })
+        .cloned()
+        .collect();
+    if code_defs.len() == 1 {
+        let target = &code_defs[0];
+        let (result, hints) = unique_hit(query, "symbol", &target.path, cwd, bloom, session)?;
+        return Ok((result, "symbol".to_string(), hints));
+    }
+    if code_defs.len() > 1 {
+        let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+        let mut result = base_result(query, "ambiguous", "ambiguous");
+        result["candidates"] = json!(candidates(&code_defs, cwd));
+        if content_result.total_found > 0 {
+            result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
+        }
+        let hint = json!({"kind": "disambiguate", "target": query});
+        return Ok((result, "ambiguous".to_string(), vec![hint]));
+    }
+    if sym_result.total_found > 0 {
+        let mut result = base_result(query, "literal", "ok");
+        result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
+        return Ok((result, "literal".to_string(), Vec::new()));
+    }
     let content_result = crate::search::search_content_raw(query, cwd, glob)?;
     if content_result.total_found > 0 {
         let mut result = base_result(query, "literal", "ok");
@@ -231,9 +277,38 @@ fn route_query(
         return Ok((result, "literal".to_string(), Vec::new()));
     }
 
-    // 6. miss — nothing matched.
     let result = base_result(query, "miss", "miss");
     Ok((result, "miss".to_string(), Vec::new()))
+}
+
+/// Split `query` into `(keyword, identifier)` when it is exactly a
+/// declaration keyword followed by a single identifier token (e.g.
+/// `"fn detect_file_type"` -> `("fn", "detect_file_type")`).
+fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
+    const KEYWORDS: &[&str] = &[
+        "fn",
+        "func",
+        "function",
+        "def",
+        "class",
+        "struct",
+        "enum",
+        "trait",
+        "interface",
+        "impl",
+        "type",
+    ];
+    let mut parts = query.split_whitespace();
+    let kw = parts.next()?;
+    let ident = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if KEYWORDS.contains(&kw) {
+        Some((kw, ident))
+    } else {
+        None
+    }
 }
 
 /// Overwrite the `"query"` field of an enrichment result built against a
@@ -686,6 +761,26 @@ mod tests {
         assert!(
             !out.contains("routes_tried"),
             "response must never carry routes_tried: {out}"
+        );
+    }
+
+    #[test]
+    fn signature_prefix_normalizes_to_symbol_and_emits_diagnostic() {
+        let resp = single_query("fn detect_file_type").expect("signature-prefix query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "symbol");
+        assert_eq!(result["query"], "fn detect_file_type");
+
+        let normalizations = resp["diagnostics"]["normalizations"]
+            .as_array()
+            .expect("normalizations array");
+        assert!(
+            normalizations.iter().any(|n| {
+                n["query"] == "fn detect_file_type"
+                    && n["normalized_to"] == "detect_file_type"
+                    && n["stripped_keyword"] == "fn"
+            }),
+            "missing normalization diagnostic: {normalizations:?}"
         );
     }
 }
