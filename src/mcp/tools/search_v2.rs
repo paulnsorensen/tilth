@@ -138,18 +138,31 @@ fn route_query(
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
         let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
-        if sym_result.definitions == 1 {
-            let target = sym_result
-                .matches
-                .iter()
-                .find(|m| m.is_definition)
-                .expect("definitions == 1 implies one is_definition match");
+        let code_defs: Vec<Match> = sym_result
+            .matches
+            .iter()
+            .filter(|m| {
+                m.is_definition
+                    && matches!(
+                        crate::lang::detect_file_type(&m.path),
+                        crate::types::FileType::Code(_)
+                    )
+            })
+            .cloned()
+            .collect();
+        if code_defs.len() == 1 {
+            let target = &code_defs[0];
             let (result, hints) = unique_hit(query, "symbol", &target.path, cwd, bloom, session)?;
             return Ok((result, "symbol".to_string(), hints));
         }
-        if sym_result.definitions > 1 {
+        if code_defs.len() > 1 {
+            let content_result = crate::search::search_content_raw(query, cwd, glob)?;
             let mut result = base_result(query, "ambiguous", "ambiguous");
-            result["candidates"] = json!(candidates(&sym_result.matches, cwd));
+            result["candidates"] = json!(candidates(&code_defs, cwd));
+            if content_result.total_found > 0 {
+                result["preview"] =
+                    json!(crate::search::format_raw_result(&content_result, cache)?);
+            }
             let hint = json!({"kind": "disambiguate", "target": query});
             return Ok((result, "ambiguous".to_string(), vec![hint]));
         }
@@ -517,6 +530,46 @@ mod tests {
             .map(|h| h["kind"].as_str().expect("kind is a string"))
             .collect();
         assert!(hint_kinds.contains(&"disambiguate"));
+    }
+
+    #[test]
+    fn markdown_heading_collision_still_resolves_unique_code_symbol() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("notes.md"),
+            "# tilth_probe_widget\n\nSome docs.\n",
+        )
+        .expect("write markdown");
+        std::fs::write(tmp.path().join("widget.rs"), "fn tilth_probe_widget() {}\n")
+            .expect("write rust");
+
+        let resp = call(&json!({
+            "cwd": tmp.path().to_str().unwrap(),
+            "queries": [{"query": "tilth_probe_widget"}],
+        }))
+        .expect("symbol query succeeds");
+        assert_eq!(resp["results"][0]["resolved_as"], "symbol");
+    }
+
+    #[test]
+    fn two_code_definitions_and_content_hits_yield_ambiguous_with_preview() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "fn tilth_probe_dupe() {}\n").expect("write a.rs");
+        std::fs::write(tmp.path().join("b.rs"), "fn tilth_probe_dupe() {}\n").expect("write b.rs");
+        std::fs::write(tmp.path().join("c.rs"), "// calls tilth_probe_dupe here\n")
+            .expect("write c.rs");
+
+        let resp = call(&json!({
+            "cwd": tmp.path().to_str().unwrap(),
+            "queries": [{"query": "tilth_probe_dupe"}],
+        }))
+        .expect("ambiguous query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "ambiguous");
+        let candidates = result["candidates"].as_array().expect("candidates array");
+        assert_eq!(candidates.len(), 2, "candidates: {candidates:?}");
+        let preview = result["preview"].as_str().expect("preview must be present");
+        assert!(!preview.is_empty(), "preview must not be empty");
     }
 
     #[test]
