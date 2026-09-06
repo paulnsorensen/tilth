@@ -116,11 +116,23 @@ fn route_query(
     let candidate = cwd.join(query);
     if candidate.exists() {
         if candidate.is_file() {
-            let target_spec = format!("{query}:1");
-            let (result, hints) =
-                unique_hit(&target_spec, "path", &candidate, cwd, bloom, session)?;
-            let result = with_query(result, query);
-            return Ok((result, "path".to_string(), hints));
+            if matches!(
+                crate::lang::detect_file_type(&candidate),
+                crate::types::FileType::Code(_)
+            ) {
+                let target_spec = format!("{query}:1");
+                let (result, hints) =
+                    unique_hit(&target_spec, "path", &candidate, cwd, bloom, session)?;
+                let result = with_query(result, query);
+                return Ok((result, "path".to_string(), hints));
+            }
+            let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+            let mut result = base_result(query, "path", "ok");
+            if content_result.total_found > 0 {
+                result["preview"] =
+                    json!(crate::search::format_raw_result(&content_result, cache)?);
+            }
+            return Ok((result, "path".to_string(), Vec::new()));
         }
         let result = base_result(query, "path", "ok");
         return Ok((result, "path".to_string(), Vec::new()));
@@ -334,6 +346,14 @@ mod tests {
     fn route_path_resolves_existing_file() {
         let resp = single_query("src/mcp/mod.rs").expect("path query succeeds");
         assert_eq!(resp["results"][0]["resolved_as"], "path");
+    }
+
+    #[test]
+    fn route_path_routes_non_code_file_to_text_search() {
+        let resp = single_query("Cargo.lock").expect("path query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "path");
+        assert_eq!(result["status"], "ok");
     }
 
     #[test]
