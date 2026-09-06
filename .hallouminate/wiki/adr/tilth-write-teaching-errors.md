@@ -64,7 +64,7 @@ Session 2026-08-02; spec at the durable corpus
   seen set by at least one line; a span with zero seen lines is still rejected.
   Line, insert, and block ops keep the strict per-anchor rule (every anchored
   line must have been displayed). The span is resolved via the same matcher the
-  apply path uses (`apply.rs match_text_span`), so gate and apply never diverge.
+  apply path uses (`apply.rs match_text_span`) — the matcher is shared.
 - **Consequences:** `check_seen_lines` splits ops — text swaps checked for
   overlap, the rest lowered and checked strictly. `replay_session_chain` keeps
   its own strict guard (a security net against a text-swap provenance bypass on
@@ -107,3 +107,46 @@ Session 2026-08-02; spec at the durable corpus
   ORs the successes. Single-section rejections (the common shape) now surface as
   errors — the many `tool_write(...).expect(...)` write tests that exercised a
   sole rejected section moved to `.expect_err(...)`.
+
+
+### ADR-007: Review amendments to ADR-004/005 (PR #232 /age pass) [status: accepted]
+
+- **Context:** A five-lens review of the ADR-004..006 implementation found one
+  blocker and two highs in the new code: (1) the gate derived the content-end
+  line from `end - 1`, which is not a UTF-8 char boundary when `old` ends in a
+  multi-byte char — `text[..end-1]` panicked the whole `tool_write` call after
+  earlier sections had already been written; (2) the normalized fallback
+  counted matches with `match_indices` (non-overlapping), so a self-overlapping
+  needle passed the uniqueness guard — the same fail-open the exact path had
+  already fixed; (3) the not-found teaching text was wired only on the no-drift
+  path.
+- **Decisions:**
+  1. Gate and apply attribute a matched span to lines by *different* rules on
+     purpose: the gate uses the **content span** (`apply.rs content_line_span`,
+     char-safe: last char start in `start..end`) so a trailing `\n` never counts
+     the phantom next line; apply keeps the **covering span** (exclusive `end`)
+     because run coalescing relies on it. Only the matcher is shared.
+  2. Normalized-match rules: ambiguity is overlap-aware (same probe as the exact
+     path); a multi-line normalized match additionally requires each interior
+     line's leading whitespace to be byte-equal between the file span and `old`
+     (only trailing/intra-line runs and the first line's indent may differ), so
+     the fallback cannot splice the model's indentation into a
+     whitespace-significant file; a whitespace run immediately before a newline
+     or end-of-string normalizes to nothing, not to one space.
+  3. One producer of the not-found teaching text covers both
+     `EditError::Apply(TextUnmatched)` and the drift path's
+     `MismatchError::TextMatch { source: TextUnmatched }`; the `[path#TAG]`
+     header comes from `tag::format_header`.
+  4. Unseen-anchor `displayed:` lists at most the 4 ranges nearest the anchor,
+     nearest first, then `… +K more`; the re-read window keeps the anchor covered
+     even when the anchor region itself exceeds the 60-line cap.
+  5. `lower_ops` returns a named `Lowered { line_ops, file_op, normalized }`;
+     `normalized_swap` is threaded through `try_recover` and `commit_file_op`, so
+     the status suffix also fires on the drift path and on `move_file` +
+     `replace_text` sections. `apply_section` returns `Result<String, String>`
+     (supersedes the ADR-006 consequence line that named `(block, is_error)`).
+- **Deferred (not decided here):** a minimum seen-fraction for large tolerant
+  spans (would revise ADR-004); single-pass lowering shared by gate and apply
+  (needs an intermediate carrying byte spans; pre-existing double parse for
+  block anchors); a per-op normalized-`old` list on the status line.
+

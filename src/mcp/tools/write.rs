@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
+use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
@@ -27,14 +28,11 @@ use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
-pub(crate) fn tool_write(
-    args: &Value,
-    session: &Session,
-    _bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
-    // `edits` is a JSON array of {path, tag?, ops} section objects. A string
-    // (legacy `[path#TAG]` blob or a double-encoded array) is rejected with a
-    // teaching error that shows the corrected JSON form.
+/// Extract and validate the top-level `tool_write` arguments: the lowered
+/// `{path, tag?, ops}` sections, the anchoring `cwd`, and the `diff` flag.
+/// A string `edits` (legacy `[path#TAG]` blob or a double-encoded array) is
+/// rejected with a teaching error that shows the corrected JSON form.
+fn parse_write_args(args: &Value) -> Result<(Vec<Section>, &Path, bool), String> {
     let edits_val = args.get("edits").ok_or(
         "missing required parameter: edits (JSON array of {path, tag?, ops} section objects)",
     )?;
@@ -55,6 +53,16 @@ pub(crate) fn tool_write(
         return Err("edits array contained no sections".into());
     }
 
+    Ok((sections, cwd, show_diff))
+}
+
+pub(crate) fn tool_write(
+    args: &Value,
+    session: &Session,
+    _bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
+    let (sections, cwd, show_diff) = parse_write_args(args)?;
+
     let ctx = SectionCtx {
         cwd,
         session,
@@ -64,9 +72,13 @@ pub(crate) fn tool_write(
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut any_ok = false;
     for section in &sections {
-        let (block, is_error) = apply_section(section, &ctx, &mut seen_paths);
-        any_ok |= !is_error;
-        results.push(block);
+        match apply_section(section, &ctx, &mut seen_paths) {
+            Ok(block) => {
+                any_ok = true;
+                results.push(block);
+            }
+            Err(block) => results.push(block),
+        }
     }
     let joined = results.join("\n\n---\n\n");
     // Surface `isError: true` only when EVERY section failed — a mixed call
@@ -88,34 +100,31 @@ struct SectionCtx<'a> {
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
-/// returns a `## <path>` Markdown block plus whether it failed (success or
-/// error) — one failed section never aborts the others, and the boolean lets the
-/// caller decide the all-failed MCP `isError` flag.
+/// returns a `## <path>` Markdown block, `Ok` on success and `Err` on failure —
+/// one failed section never aborts the others, and the variant lets the caller
+/// decide the all-failed MCP `isError` flag.
 fn apply_section(
     section: &Section,
     ctx: &SectionCtx,
     seen_paths: &mut HashSet<String>,
-) -> (String, bool) {
+) -> Result<String, String> {
     let raw = &section.path;
     let path = match super::resolve_anchored(std::path::Path::new(raw), ctx.cwd) {
         Ok(p) => p,
-        Err(e) => return (format!("## {raw}\nerror: {e}"), true),
+        Err(e) => return Err(format!("## {raw}\nerror: {e}")),
     };
     // Key the duplicate-path guard on the canonical key so `src/a.rs` and
     // `src/./a.rs` collide, preserving the one-section-per-file invariant.
     if !seen_paths.insert(crate::edit::normalize_path_key(&path)) {
-        return (
-            format!(
-                "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
-                path.display()
-            ),
-            true,
-        );
+        return Err(format!(
+            "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
+            path.display()
+        ));
     }
 
     match commit_section(section, &path, ctx) {
-        Ok(block) => (block, false),
-        Err(e) => (format!("## {}\nerror: {e}", path.display()), true),
+        Ok(block) => Ok(block),
+        Err(e) => Err(format!("## {}\nerror: {e}", path.display())),
     }
 }
 
@@ -158,7 +167,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
-        return commit_file_op(&op, path, &new_text, &live, ctx);
+        return commit_file_op(&op, path, &new_text, &live, normalized, ctx);
     }
 
     // No-op guard: nothing changed.
@@ -211,19 +220,23 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     Ok(block)
 }
 
+/// The provenance-teaching message for a `replace_text` `old` that did not
+/// match against `path` under `tag` (decision 4 / ADR-005).
+fn text_unmatched_message(path: &Path, tag: u16, preview: &str) -> String {
+    format!(
+        "text to replace was not found; copy old verbatim from the numbered lines of \
+         {} — do not retype it from memory or shell output (preview: {preview})",
+        format_header(&path.display().to_string(), tag)
+    )
+}
+
 /// Enrich a `replace_text` no-match into decision 4's provenance-teaching error;
 /// every other edit failure keeps its own already-actionable message. The tag is
 /// the section's whole-file tag — always present when a `replace_text` reaches
 /// the matcher, since a tagless text swap is rejected upstream.
-fn map_edit_error(e: EditError, path: &Path, tag: Option<u16>) -> TilthError {
+fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     if let EditError::Apply(ApplyError::TextUnmatched { preview }) = &e {
-        if let Some(tag) = tag {
-            return TilthError::EditRejected(format!(
-                "text to replace was not found; copy old verbatim from the numbered lines of \
-                 [{}#{tag:04X}] — do not retype it from memory or shell output (preview: {preview})",
-                path.display()
-            ));
-        }
+        return TilthError::EditRejected(text_unmatched_message(path, tag, preview));
     }
     e.into()
 }
@@ -262,8 +275,7 @@ fn resolve_edit(
                 ));
             }
             let snap = synthetic_snapshot(&key, live, live_tag);
-            let r = gated_apply(&snap, path, &section.ops)
-                .map_err(|e| map_edit_error(e, path, section.tag))?;
+            let r = gated_apply(&snap, path, &section.ops)?;
             Ok((r.text, r.file_op, r.normalized_swap))
         }
         // Tag matches live → no drift (or a 16-bit tag collision). Run the
@@ -276,7 +288,7 @@ fn resolve_edit(
             if let Some(snap) = store.by_tag(&key, tag) {
                 if snap.text == live {
                     let r = gated_apply(&snap, path, &section.ops)
-                        .map_err(|e| map_edit_error(e, path, section.tag))?;
+                        .map_err(|e| map_edit_error(e, path, tag))?;
                     return Ok((r.text, r.file_op, r.normalized_swap));
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
@@ -284,8 +296,8 @@ fn resolve_edit(
             // The read's snapshot was evicted: synthetic over live (tag guards
             // content; empty provenance skips the seen-lines gate).
             let snap = synthetic_snapshot(&key, live, tag);
-            let r = gated_apply(&snap, path, &section.ops)
-                .map_err(|e| map_edit_error(e, path, section.tag))?;
+            let r =
+                gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
             Ok((r.text, r.file_op, r.normalized_swap))
         }
         // Tag ≠ live → the file drifted since the read. Recover via 3-way merge.
@@ -312,9 +324,9 @@ fn recover_edit(
     // never-displayed line is rejected here exactly as on the no-drift path. A
     // missing snapshot means the tag was never recorded this session (fabricated,
     // cross-session replay, or LRU-evicted) — it earns no short-circuit below.
-    let tag_known = store.by_tag(key, tag).is_some();
-    if let Some(snapshot) = store.by_tag(key, tag) {
-        check_seen_lines(&snapshot, path, &section.ops).map_err(EditError::from)?;
+    let snapshot = store.by_tag(key, tag);
+    if let Some(snapshot) = &snapshot {
+        check_seen_lines(snapshot, path, &section.ops).map_err(EditError::from)?;
     }
     let file_op = FileOp::from_ops(&section.ops).map_err(EditError::Apply)?;
     let has_content = section
@@ -325,13 +337,23 @@ fn recover_edit(
     // of content drift, so proceed without recovery, but ONLY for a session-known
     // tag. An unknown/fabricated tag falls through to try_recover, which rejects
     // it as Fabricated rather than silently deleting/moving on unverified intent.
-    if tag_known && file_op.is_some() && !has_content {
+    if snapshot.is_some() && file_op.is_some() && !has_content {
         return Ok((live.to_string(), file_op, false));
     }
-    let text = try_recover(store, path, tag, &section.ops, live)?;
-    // Recovery does not surface the whitespace-normalization note; the drifted
-    // path already carries its own richer status.
-    Ok((text, file_op, false))
+    let (text, normalized) = match try_recover(store, path, tag, &section.ops, live) {
+        Ok(t) => t,
+        Err(MismatchError::TextMatch {
+            path: p,
+            source: ApplyError::TextUnmatched { preview },
+        }) => {
+            return Err(TilthError::EditRejected(format!(
+                "Edit rejected for {p}: {}. The file also changed since the read that minted this tag — re-read to refresh it.",
+                text_unmatched_message(path, tag, &preview)
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok((text, file_op, normalized))
 }
 
 fn create_target_exists_error(path: &Path) -> TilthError {
@@ -348,9 +370,17 @@ fn commit_file_op(
     path: &Path,
     new_text: &str,
     live: &str,
+    normalized: bool,
     ctx: &SectionCtx,
 ) -> Result<String, TilthError> {
     let session = ctx.session;
+    // Decision 5: mirror the in-place write's whitespace-normalization note
+    // when the move/create/remove section also carried a normalized swap.
+    let suffix = if normalized {
+        " (matched with whitespace normalization)"
+    } else {
+        ""
+    };
     match op {
         FileOp::Create(content) => {
             if let Some(parent) = path.parent() {
@@ -372,7 +402,7 @@ fn commit_file_op(
             session.record_read(path);
             let line_count = u32::try_from(content.split('\n').count()).unwrap_or(u32::MAX);
             let new_tag = session.record_snapshot(path, content, 1..=line_count);
-            let mut block = format!("## {}\ncreated", path.display());
+            let mut block = format!("## {}\ncreated{suffix}", path.display());
             if let Some(tag) = new_tag {
                 let header = format_header(&path.display().to_string(), tag);
                 let _ = write!(block, "\n{header}");
@@ -391,7 +421,7 @@ fn commit_file_op(
                 source: e,
             })?;
             session.invalidate_snapshot(&canonical);
-            Ok(format!("## {}\nremoved", path.display()))
+            Ok(format!("## {}\nremoved{suffix}", path.display()))
         }
         FileOp::Move(dest_raw) => {
             let dest = super::resolve_anchored(std::path::Path::new(dest_raw), ctx.cwd)
@@ -428,7 +458,11 @@ fn commit_file_op(
                 source: e,
             })?;
             session.relocate_snapshot(&canonical_src, &dest);
-            Ok(format!("## {}\nmoved → {}", path.display(), dest.display()))
+            Ok(format!(
+                "## {}\nmoved{suffix} → {}",
+                path.display(),
+                dest.display()
+            ))
         }
     }
 }
@@ -1368,6 +1402,10 @@ mod tests {
             out.contains("The file also changed since the read that minted this tag"),
             "a drifted unmatched replace_text must report TextMatch, not bare Drift: {out}"
         );
+        assert!(
+            out.contains("copy old verbatim from the numbered lines of"),
+            "drift + text-unmatched must still teach provenance: {out}"
+        );
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "alpha\nCHANGED\ngamma\n",
@@ -2005,25 +2043,120 @@ mod tests {
         );
     }
 
+    /// F6/F7 regression: a drifted tag plus an `old` that only matches after
+    /// whitespace normalization must recover through the 3-way-merge path AND
+    /// still carry the normalized-match note, not just "applied".
+    #[test]
+    fn drifted_tag_with_normalized_replace_text_notes_whitespace_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("drift_ws.rs");
+        std::fs::write(&p, "fn a() {\n\tlet y = 2;\n}\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        // External edit prepends an unrelated line, drifting the tag while
+        // leaving the target line's tab indent (and its surrounding context)
+        // untouched, so the 3-way merge still lands cleanly.
+        std::fs::write(&p, "// note\nfn a() {\n\tlet y = 2;\n}\n").unwrap();
+
+        // `old` uses spaces where the file uses a tab, so only the
+        // whitespace-normalized fallback can resolve the swap.
+        let ops = json!([{ "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("drifted write recovers");
+        assert!(
+            out.contains("applied (matched with whitespace normalization)"),
+            "recovered status line must flag the normalized fallback, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "// note\nfn a() {\n\tlet y = 42;\n}\n",
+            "3-way merge must land the normalized swap at the shifted position"
+        );
+    }
+
+    /// F6/F7 regression: one section combining `move_file` with a
+    /// whitespace-normalized `replace_text` must carry the normalization
+    /// suffix on the `moved` status line, not just the bare move.
+    #[test]
+    fn move_file_combined_with_normalized_replace_text_notes_whitespace_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("mv_ws.rs");
+        std::fs::write(&p, "fn a() {\n\tlet y = 2;\n}\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        let ops = json!([
+            { "op": "move_file", "dest": "mv_ws_dest.rs" },
+            { "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(
+            out.contains("moved (matched with whitespace normalization)"),
+            "status line must carry both the move and the normalization suffix, got:\n{out}"
+        );
+        assert!(!p.exists(), "source removed after move");
+        assert_eq!(
+            std::fs::read_to_string(root.join("mv_ws_dest.rs")).unwrap(),
+            "fn a() {\n\tlet y = 42;\n}\n",
+            "the normalized swap must land in the moved content"
+        );
+    }
+
     /// Decision 6: a call whose only section is rejected surfaces `isError: true`
     /// (an `Err` from `tool_write`), so dashboards keyed on the MCP flag see it.
     #[test]
     fn sole_rejected_section_surfaces_is_error() {
+        // Two sections, both rejected: the call must surface isError (Err) AND
+        // the joined body must name both files, not just report the flag.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let p = root.join("only.rs");
-        std::fs::write(&p, "fn a() {}\n").unwrap();
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        std::fs::write(&a, "fn a() {}\n").unwrap();
+        std::fs::write(&b, "fn b() {}\n").unwrap();
         let (session, bloom) = services();
-        let bogus = format!("{:04X}", compute_file_hash("fn a() {}\n") ^ 0x1);
-        let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
+        let bogus_a = format!("{:04X}", compute_file_hash("fn a() {}\n") ^ 0x1);
+        let bogus_b = format!("{:04X}", compute_file_hash("fn b() {}\n") ^ 0x1);
+        let edits_val = json!([
+            {
+                "path": a.to_str().unwrap(),
+                "tag": bogus_a,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "X" }]
+            },
+            {
+                "path": b.to_str().unwrap(),
+                "tag": bogus_b,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "Y" }]
+            }
+        ]);
         let out = tool_write(
-            &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
+            &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
         .expect_err("every section failed → isError:true");
-        assert!(out.contains("not from this session"), "got:\n{out}");
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "fn a() {}\n");
+        assert!(
+            out.contains(&format!("## {}\nerror:", a.display())),
+            "missing a's block, got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("## {}\nerror:", b.display())),
+            "missing b's block, got:\n{out}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn a() {}\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "fn b() {}\n");
     }
 
     /// Decision 6: a mixed call (one section applies, one is rejected) stays

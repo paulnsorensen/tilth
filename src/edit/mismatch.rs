@@ -7,6 +7,40 @@
 
 #![allow(dead_code)]
 
+/// Render displayed ranges as `A-B, C-D` (a single-line range as `N`),
+/// nearest the `anchor` line first, capped to 4 entries plus a `… +K more`
+/// tail when more were displayed.
+pub(super) fn format_ranges(ranges: &[(u32, u32)], anchor: u32) -> String {
+    const CAP: usize = 4;
+    let mut sorted: Vec<(u32, u32)> = ranges.to_vec();
+    sorted.sort_by_key(|(lo, hi)| {
+        if anchor < *lo {
+            lo - anchor
+        } else if anchor > *hi {
+            anchor - hi
+        } else {
+            0
+        }
+    });
+    let rendered = sorted
+        .iter()
+        .take(CAP)
+        .map(|(lo, hi)| {
+            if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if sorted.len() > CAP {
+        format!("{rendered}, \u{2026} +{} more", sorted.len() - CAP)
+    } else {
+        rendered
+    }
+}
+
 /// A tag/content mismatch that recovery could not resolve.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MismatchError {
@@ -36,12 +70,13 @@ pub enum MismatchError {
     /// at 60 lines.
     #[error(
         "Edit rejected for {path}: line {line} was never displayed under this tag \
-             (displayed: {displayed}). Re-read {path}#{reread_lo}-{reread_hi} to cover line {line}."
+             (displayed: {}). Re-read {path}#{reread_lo}-{reread_hi} to cover line {line}.",
+        format_ranges(displayed, *line)
     )]
     UnseenAnchor {
         path: String,
         line: u32,
-        displayed: String,
+        displayed: Vec<(u32, u32)>,
         reread_lo: u32,
         reread_hi: u32,
     },
@@ -83,16 +118,32 @@ mod tests {
         let e = MismatchError::UnseenAnchor {
             path: "src/a.rs".into(),
             line: 2823,
-            displayed: "2655-2700, 3250-3270".into(),
+            displayed: vec![(2655, 2700), (3250, 3270)],
             reread_lo: 2764,
             reread_hi: 2823,
         };
-        let s = e.to_string();
-        assert!(s.contains("line 2823 was never displayed"), "{s}");
-        assert!(s.contains("displayed: 2655-2700, 3250-3270"), "{s}");
-        assert!(
-            s.contains("Re-read src/a.rs#2764-2823 to cover line 2823"),
-            "{s}"
+        assert_eq!(
+            e.to_string(),
+            "Edit rejected for src/a.rs: line 2823 was never displayed under this tag \
+             (displayed: 2655-2700, 3250-3270). Re-read src/a.rs#2764-2823 to cover line 2823."
+        );
+    }
+
+    #[test]
+    fn format_ranges_caps_to_four_nearest_with_more_tail() {
+        let ranges: Vec<(u32, u32)> = vec![
+            (10, 10),
+            (20, 20),
+            (30, 30),
+            (40, 40),
+            (50, 50),
+            (60, 60),
+            (70, 70),
+            (80, 80),
+        ];
+        assert_eq!(
+            format_ranges(&ranges, 45),
+            "40, 50, 30, 60, \u{2026} +4 more"
         );
     }
 

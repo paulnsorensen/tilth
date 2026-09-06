@@ -74,7 +74,7 @@ fn parse_apply_recover_pipeline_after_external_drift() {
         "external drift invalidates the tag"
     );
 
-    let recovered = try_recover(&store, path, tag, &section.ops, live)
+    let (recovered, _) = try_recover(&store, path, tag, &section.ops, live)
         .expect("moved-but-unchanged target recovers via 3-way merge");
     assert_eq!(
         recovered,

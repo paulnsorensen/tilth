@@ -138,6 +138,11 @@ pub enum LineOp {
     },
 }
 
+/// The first 80 chars of a caller-supplied `old`, quoted back in not-found errors.
+fn preview_of(old: &str) -> String {
+    old.chars().take(80).collect()
+}
+
 /// Resolve a unique literal text occurrence's byte span in `text`, counting
 /// possibly-overlapping occurrences so a self-overlapping needle (e.g.
 /// `old:"---"` in `"----"`) is reported as ambiguous rather than unique.
@@ -152,7 +157,7 @@ fn find_text_span(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
     };
     let Some(start) = text.find(old) else {
         return Err(ApplyError::TextUnmatched {
-            preview: old.chars().take(80).collect(),
+            preview: preview_of(old),
         });
     };
     // `old` occupies `start`, so `lead`'s width lands on the next char boundary
@@ -183,62 +188,146 @@ pub(super) fn match_text_span(text: &str, old: &str) -> Result<(usize, usize, bo
     }
 }
 
-/// Collapse each maximal run of spaces/tabs in `s` to a single space, returning
-/// the normalized string and a map from every normalized byte offset to the
-/// originating byte offset in `s` (plus a trailing sentinel = `s.len()`).
-/// Newlines and all other characters are preserved verbatim.
-fn normalize_ws_with_map(s: &str) -> (String, Vec<usize>) {
+/// Collapse each maximal run of spaces/tabs in `s` to a single space, dropping
+/// the run entirely when it is trailing (immediately followed by a newline or
+/// end of string) since trailing whitespace never carries meaning. Newlines
+/// and all other characters are preserved verbatim. Map-free: used only for
+/// the needle (`old`), which the caller never needs to translate back.
+fn normalize_ws(s: &str) -> String {
     let mut norm = String::with_capacity(s.len());
-    let mut map: Vec<usize> = Vec::with_capacity(s.len() + 1);
-    let mut prev_ws = false;
-    for (off, ch) in s.char_indices() {
-        if ch == ' ' || ch == '\t' {
-            if prev_ws {
-                continue;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' ' || c == '\t' {
+            while matches!(chars.peek(), Some(' ' | '\t')) {
+                chars.next();
             }
-            prev_ws = true;
-            norm.push(' ');
-            map.push(off);
+            if !matches!(chars.peek(), Some('\n') | None) {
+                norm.push(' ');
+            }
         } else {
-            prev_ws = false;
-            let bytes = ch.len_utf8();
-            norm.push(ch);
-            for _ in 0..bytes {
-                map.push(off);
+            norm.push(c);
+        }
+    }
+    norm
+}
+
+/// Same collapsing rule as [`normalize_ws`], plus a map from every normalized
+/// byte offset back to its originating byte offset in `s` (plus a trailing
+/// sentinel = `s.len()`), needed to translate a match found in the normalized
+/// haystack back to a real span in `text`.
+fn normalize_ws_with_map(s: &str) -> (String, Vec<u32>) {
+    let mut norm = String::with_capacity(s.len());
+    let mut map: Vec<u32> = Vec::with_capacity(s.len() + 1);
+    let mut chars = s.char_indices().peekable();
+    while let Some((off, c)) = chars.next() {
+        if c == ' ' || c == '\t' {
+            while matches!(chars.peek(), Some((_, ' ' | '\t'))) {
+                chars.next();
+            }
+            match chars.peek() {
+                Some((_, '\n')) | None => {}
+                _ => {
+                    norm.push(' ');
+                    map.push(off as u32);
+                }
+            }
+        } else {
+            let bytes = c.len_utf8();
+            norm.push(c);
+            for k in 0..bytes {
+                map.push((off + k) as u32);
             }
         }
     }
-    map.push(s.len());
+    map.push(s.len() as u32);
     (norm, map)
 }
 
+/// The leading run of spaces/tabs in `line`.
+fn leading_ws(line: &str) -> &str {
+    let end = line
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+/// A multi-line normalized match must still agree, line by line, on interior
+/// indentation style: whitespace normalization equates a tab and four spaces,
+/// which is correct for a single indent level but would silently accept an
+/// `old` written in the wrong indentation style spanning several lines.
+/// Single-line matches (nothing interior) and line-count mismatches (already
+/// impossible once matched) pass through.
+fn multiline_indentation_matches(original: &str, old: &str) -> bool {
+    let orig_lines: Vec<&str> = original.split('\n').collect();
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    if orig_lines.len() != old_lines.len() || orig_lines.len() < 2 {
+        return true;
+    }
+    (1..orig_lines.len()).all(|i| leading_ws(orig_lines[i]) == leading_ws(old_lines[i]))
+}
+
 /// Whitespace-normalized fallback for a `replace_text` exact miss: collapse
-/// runs of spaces/tabs and ignore leading/trailing spaces on both sides, then
-/// require exactly one match. Maps the normalized match back to the original
-/// byte span. Zero → [`ApplyError::TextUnmatched`]; two or more →
-/// [`ApplyError::TextAmbiguous`].
+/// runs of spaces/tabs and require exactly one match, counting
+/// possibly-overlapping occurrences the same way [`find_text_span`] does so a
+/// self-overlapping needle is reported as ambiguous rather than unique. Maps
+/// the normalized match back to the original byte span, then rejects a
+/// multi-line match whose interior indentation diverges from `old`'s. Zero →
+/// [`ApplyError::TextUnmatched`]; two or more, or interior indentation
+/// mismatch → [`ApplyError::TextAmbiguous`] / [`ApplyError::TextUnmatched`].
 fn find_text_span_normalized(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
-    let preview = || old.chars().take(80).collect::<String>();
-    let (norm_old, _) = normalize_ws_with_map(old);
-    let needle = norm_old.trim_matches(' ');
+    let needle = normalize_ws(old);
+    let needle = needle.trim_matches(' ');
     if needle.is_empty() {
-        return Err(ApplyError::TextUnmatched { preview: preview() });
+        return Err(ApplyError::TextUnmatched {
+            preview: preview_of(old),
+        });
     }
     let (norm_text, map) = normalize_ws_with_map(text);
-    let mut hits = norm_text.match_indices(needle);
-    let Some((at, _)) = hits.next() else {
-        return Err(ApplyError::TextUnmatched { preview: preview() });
+    let Some(at) = norm_text.find(needle) else {
+        return Err(ApplyError::TextUnmatched {
+            preview: preview_of(old),
+        });
     };
-    if hits.next().is_some() {
+    // Mirrors find_text_span's overlap probe: the earliest a second,
+    // possibly-overlapping occurrence could begin is one lead-char-width past
+    // this match's start.
+    let lead = needle.chars().next().expect("checked non-empty above");
+    let next = at + lead.len_utf8();
+    if next <= norm_text.len() && norm_text[next..].contains(needle) {
         return Err(ApplyError::TextAmbiguous { count: 2 });
     }
     // `map` carries one entry per normalized byte plus the sentinel, so both
     // ends resolve to a real original offset.
-    Ok((map[at], map[at + needle.len()]))
+    let start = map[at] as usize;
+    let end = map[at + needle.len()] as usize;
+    if !multiline_indentation_matches(&text[start..end], old) {
+        return Err(ApplyError::TextUnmatched {
+            preview: preview_of(old),
+        });
+    }
+    Ok((start, end))
 }
 
-pub(super) fn line_number(text: &str, byte_pos: usize) -> u32 {
-    text[..byte_pos].bytes().filter(|&b| b == b'\n').count() as u32 + 1
+fn line_number(text: &str, byte_pos: usize) -> u32 {
+    u32::try_from(memchr::memchr_iter(b'\n', &text.as_bytes()[..byte_pos]).count())
+        .unwrap_or(u32::MAX)
+        + 1
+}
+
+/// The line span COVERING a byte range, i.e. the 1-based line numbers of the
+/// range's start byte and of its last actual character — never a phantom line
+/// past the range's exclusive end (which would misattribute a swap ending in a
+/// multibyte character or right before a newline). Distinct from the covering
+/// span computed in [`lower_text_swaps`] for run-coalescing and
+/// [`reject_overlaps`], which intentionally may include an adjacent line.
+pub(super) fn content_line_span(text: &str, start: usize, end: usize) -> (u32, u32) {
+    let lo = line_number(text, start);
+    let last_char_start = text[start..end]
+        .char_indices()
+        .last()
+        .map_or(start, |(i, _)| start + i);
+    let hi = line_number(text, last_char_start);
+    (lo, hi)
 }
 
 /// Render the covering lines of `edits` with each substitution applied.
@@ -311,6 +400,9 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool
                 start,
                 end,
                 new,
+                // Covering span (may include a line past the match's real
+                // content) — correct for run-coalescing/reject_overlaps below,
+                // but not for the seen-lines gate; use content_line_span there.
                 line_span: (line_number(text, start), line_number(text, end)),
             });
         }
@@ -359,11 +451,15 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool
 
 /// Lower `ops` into concrete [`LineOp`]s by resolving block anchors against
 /// `text` (language inferred from `path`). File ops are returned separately.
-pub(super) fn lower_ops(
-    path: &Path,
-    text: &str,
-    ops: &[Op],
-) -> Result<(Vec<LineOp>, Option<FileOp>, bool), ApplyError> {
+/// Result of lowering parsed [`Op`]s into line-level splices.
+#[derive(Debug)]
+pub(super) struct Lowered {
+    pub line_ops: Vec<LineOp>,
+    pub file_op: Option<FileOp>,
+    pub normalized: bool,
+}
+
+pub(super) fn lower_ops(path: &Path, text: &str, ops: &[Op]) -> Result<Lowered, ApplyError> {
     // File ops (CREATE/REM/MV) plus the one-file-op conflict guard live in
     // the canonical `FileOp::from_ops`; the loop below handles only content ops.
     let file_op = FileOp::from_ops(ops)?;
@@ -439,7 +535,11 @@ pub(super) fn lower_ops(
         }
     }
 
-    Ok((line_ops, file_op, normalized))
+    Ok(Lowered {
+        line_ops,
+        file_op,
+        normalized,
+    })
 }
 
 /// The anchor lines an op set reads, for recovery's session-chain content check.
@@ -468,10 +568,10 @@ pub(super) fn anchor_lines(ops: &[LineOp]) -> Vec<u32> {
 /// Returns [`ApplyError`] when ops overlap, an anchor is out of bounds or
 /// unresolved, or file ops conflict.
 pub(super) fn apply_ops(path: &Path, text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
-    let (line_ops, file_op, normalized) = lower_ops(path, text, ops)?;
-    let mut result = apply_line_ops(text, &line_ops)?;
-    result.file_op = file_op;
-    result.normalized_swap = normalized;
+    let lowered = lower_ops(path, text, ops)?;
+    let mut result = apply_line_ops(text, &lowered.line_ops)?;
+    result.file_op = lowered.file_op;
+    result.normalized_swap = lowered.normalized;
     Ok(result)
 }
 
@@ -1254,15 +1354,53 @@ mod tests {
     }
 
     #[test]
+    fn match_text_span_normalized_self_overlapping_is_ambiguous() {
+        let err = match_text_span("x  x  x", "x x").unwrap_err();
+        assert!(
+            matches!(err, ApplyError::TextAmbiguous { count: 2 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn match_text_span_normalized_tab_indented_overlap_is_ambiguous() {
+        let text = "\t}\n\t}\n\t}\n\t}\n";
+        let old = "  }\n  }\n  }";
+        let err = match_text_span(text, old).unwrap_err();
+        assert!(matches!(err, ApplyError::TextAmbiguous { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn match_text_span_normalized_rejects_multiline_indentation_mismatch() {
+        let text = "fn f() {\n    foo();\n}\n"; // spaces
+        let old = "{\n\tfoo();\n}"; // tab -- interior line indent differs
+        let err = match_text_span(text, old).unwrap_err();
+        assert!(matches!(err, ApplyError::TextUnmatched { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn match_text_span_normalized_multiline_trailing_space_only_still_matches() {
+        let text = "foo();\nbar();\n";
+        let old = "foo();  \nbar();"; // trailing spaces on line 1 only
+        let (s, e, normalized) =
+            match_text_span(text, old).expect("trailing-only mismatch matches");
+        assert!(normalized);
+        assert_eq!(&text[s..e], "foo();\nbar();");
+    }
+
+    #[test]
     fn text_swap_applies_through_whitespace_normalization() {
         let text = "fn f() {\n\tlet y = 2;\n}\n";
         let ops = vec![Op::TextSwap {
             old: "    let y = 2;".into(),
             new: "let y = 42;".into(),
         }];
-        let (line_ops, _, normalized) = lower_ops(Path::new("a.rs"), text, &ops).expect("lower");
-        assert!(normalized, "fallback must flag normalization up the stack");
-        let applied = apply_line_ops(text, &line_ops).expect("apply");
+        let lowered = lower_ops(Path::new("a.rs"), text, &ops).expect("lower");
+        assert!(
+            lowered.normalized,
+            "fallback must flag normalization up the stack"
+        );
+        let applied = apply_line_ops(text, &lowered.line_ops).expect("apply");
         assert_eq!(
             applied.text, "fn f() {\n\tlet y = 42;\n}\n",
             "new splices over the original span, leaving the file's own indentation"
@@ -1285,8 +1423,8 @@ mod tests {
                 new: "qux".into(),
             },
         ];
-        let (line_ops, _, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
-        let applied = apply_line_ops(text, &line_ops).expect("both apply");
+        let lowered = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
+        let applied = apply_line_ops(text, &lowered.line_ops).expect("both apply");
         assert_eq!(applied.text, "let a = baz(qux);\n");
     }
 
@@ -1307,8 +1445,8 @@ mod tests {
                 new: "ONE\n    TWO".into(),
             },
         ];
-        let (line_ops, _, _) = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
-        let applied = apply_line_ops(text, &line_ops).expect("both apply");
+        let lowered = lower_ops(Path::new("a.rs"), text, &ops).expect("both lower");
+        let applied = apply_line_ops(text, &lowered.line_ops).expect("both apply");
         assert_eq!(applied.text, "let a = qux(ONE\n    TWO);\ntail\n");
     }
 
