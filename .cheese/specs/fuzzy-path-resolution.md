@@ -1,5 +1,9 @@
 ---
 slug: fuzzy-path-resolution
+status: retired
+retired: 2026-09-06
+superseded_by: .hallouminate/wiki/specs/fuzzy-suggest-only.md
+retired_reason: Shipped behaviour is suggest-only ("did you mean"), not the auto-open resolution this spec proposed (PR #111).
 source: mold-handshake
 intent: When an agent gives tilth a slightly-off file path, resolve it to the right file via fuzzy path matching and auto-open it, instead of only emitting a "did you mean" suggestion.
 blast_radius: medium

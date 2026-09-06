@@ -1,3 +1,11 @@
+---
+slug: tilth-mcp-overhaul
+status: retired
+retired: 2026-09-06
+superseded_by: "#116, .hallouminate/wiki/adr/tilth-search-v2-roadmap-001.md"
+retired_reason: The hash|overwrite|append no-tag write modes were superseded by the whole-file-tag edit model (#116) and the search-v2 roadmap ADRs.
+---
+
 # tilth MCP overhaul — agent-facing surface v2
 
 **Status:** Draft (curdled from `/mold` 2026-05-13)
