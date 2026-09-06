@@ -984,7 +984,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("write call");
+        .expect_err("sole rejected section → isError");
         assert!(
             out.contains("never displayed"),
             "outline read must not grant whole-file seenLines; line-50 edit must be rejected, got:\n{out}"
@@ -1035,7 +1035,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("write call");
+        .expect_err("sole rejected section → isError");
         assert!(
             out.contains("never displayed"),
             "heading read must not grant whole-file seenLines; a Section-B edit must be rejected, got:\n{out}"
@@ -1115,7 +1115,7 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect("write call");
+        .expect_err("sole rejected section → isError");
         assert!(
             out.contains("never displayed"),
             "multi-path outline read must not grant whole-file seenLines, got:\n{out}"

@@ -18,7 +18,9 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::apply::{anchor_lines, apply_ops, lower_ops, ApplyError, ApplyResult};
+use super::apply::{
+    anchor_lines, apply_ops, content_line_span, lower_ops, match_text_span, ApplyError, ApplyResult,
+};
 use super::mismatch::MismatchError;
 use super::parser::Op;
 use super::snapshots::{Snapshot, SnapshotStore};
@@ -38,7 +40,7 @@ pub fn try_recover(
     tag: u16,
     ops: &[Op],
     live: &str,
-) -> Result<String, MismatchError> {
+) -> Result<(String, bool), MismatchError> {
     // Derive the store key through the crate's single canonical-key owner so a
     // tag recorded under a canonical realpath is found here regardless of the
     // raw path spelling (e.g. macOS case divergence).
@@ -67,8 +69,8 @@ pub fn try_recover(
 
     // Strategy 2: session-chain replay onto live directly.
     if !is_head {
-        if let Some(text) = replay_session_chain(path, &snapshot, live, ops) {
-            return Ok(text);
+        if let Some(recovered) = replay_session_chain(path, &snapshot, live, ops) {
+            return Ok(recovered);
         }
     }
 
@@ -96,7 +98,7 @@ pub fn try_recover(
     })
 }
 
-fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<String> {
+fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Option<(String, bool)> {
     let applied = apply_ops(path, snapshot, ops).ok()?;
     if applied.text == snapshot {
         return None;
@@ -107,7 +109,7 @@ fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Optio
     if merged == live {
         return None;
     }
-    Some(merged)
+    Some((merged, applied.normalized_swap))
 }
 
 fn replay_session_chain(
@@ -115,14 +117,14 @@ fn replay_session_chain(
     snapshot: &Snapshot,
     live: &str,
     ops: &[Op],
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let prev: Vec<&str> = snapshot.text.split('\n').collect();
     let curr: Vec<&str> = live.split('\n').collect();
     if prev.len() != curr.len() {
         return None;
     }
-    let (line_ops, _) = lower_ops(path, live, ops).ok()?;
-    let anchors = anchor_lines(&line_ops);
+    let lowered = lower_ops(path, live, ops).ok()?;
+    let anchors = anchor_lines(&lowered.line_ops);
     // These anchors resolved against LIVE, so check_seen_lines never saw them.
     if snapshot
         .first_unseen_anchor(anchors.iter().copied())
@@ -140,27 +142,113 @@ fn replay_session_chain(
     if applied.text == live {
         return None;
     }
-    Some(applied.text)
+    Some((applied.text, applied.normalized_swap))
 }
 
 /// seenLines gate for the no-drift path: reject an edit anchored on a line the
 /// producer never displayed under this tag. A snapshot with no recorded
 /// provenance (empty `seen_lines`) skips the check.
+///
+/// `replace_text` is tolerant: its resolved span need only OVERLAP the seen set
+/// by one line (the model saw part of the text it is replacing). Line, insert,
+/// and block ops stay strict — every anchored line must have been displayed.
 pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    // Lowering failures (unresolved block anchor, file-op conflict, bad range)
-    // skip the gate: apply_ops re-lowers this same text and reports the real
-    // ApplyError. Live-lowering paths re-check provenance themselves — see
-    // replay_session_chain.
-    let Ok((line_ops, _)) = lower_ops(path, &snapshot.text, ops) else {
+    // Whole-file / outline reads record no provenance and admit every anchor.
+    if snapshot.seen_lines.is_empty() {
+        return Ok(());
+    }
+
+    check_text_swap_overlap(snapshot, ops)?;
+    check_strict_anchors(snapshot, path, ops)
+}
+
+// Text swaps: resolve the span against the snapshot and require one seen
+// line inside it. An `old` that does not resolve (unmatched/ambiguous/empty)
+// skips the gate here — apply_ops re-resolves the same text and reports the
+// real match failure, exactly as the strict path defers to it below.
+fn check_text_swap_overlap(snapshot: &Snapshot, ops: &[Op]) -> Result<(), MismatchError> {
+    for op in ops {
+        if let Op::TextSwap { old, .. } = op {
+            if let Ok((start, end, _)) = match_text_span(&snapshot.text, old) {
+                let (lo, hi) = content_line_span(&snapshot.text, start, end);
+                if !(lo..=hi).any(|l| snapshot.seen_lines.contains(&l)) {
+                    return Err(unseen_anchor(snapshot, lo, (lo, hi)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Line/insert/block ops stay strict. Lower only the non-text-swap ops (text
+// swaps handled above); a lowering failure skips the gate — apply_ops
+// re-lowers this same text and reports the real ApplyError. Live-lowering
+// paths re-check provenance themselves — see replay_session_chain.
+fn check_strict_anchors(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
+    let non_text: Vec<Op> = ops
+        .iter()
+        .filter(|o| !matches!(o, Op::TextSwap { .. }))
+        .cloned()
+        .collect();
+    let Ok(lowered) = lower_ops(path, &snapshot.text, &non_text) else {
         return Ok(());
     };
-    match snapshot.first_unseen_anchor(anchor_lines(&line_ops)) {
-        Some(line) => Err(MismatchError::UnseenAnchor {
-            path: snapshot.path.clone(),
-            line,
-        }),
+    match snapshot.first_unseen_anchor(anchor_lines(&lowered.line_ops)) {
+        Some(line) => Err(unseen_anchor(snapshot, line, (line, line))),
         None => Ok(()),
     }
+}
+
+/// Build the unseen-anchor rejection, naming the displayed ranges and the
+/// smallest re-read that would cover the offending anchor `region`.
+fn unseen_anchor(snapshot: &Snapshot, line: u32, region: (u32, u32)) -> MismatchError {
+    let ranges = snapshot.seen_ranges();
+    let total = u32::try_from(snapshot.text.lines().count())
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let (reread_lo, reread_hi) = reread_span(region, &ranges, total);
+    MismatchError::UnseenAnchor {
+        path: snapshot.path.clone(),
+        line,
+        displayed: ranges,
+        reread_lo,
+        reread_hi,
+    }
+}
+
+/// The smallest re-read joining the anchor `region` to the nearest displayed
+/// range, capped at 60 lines. Capping keeps the anchor covered by dropping the
+/// far (range) side of the window; a region that itself exceeds the cap keeps
+/// its full span, so the window can exceed 60 lines (ADR-007).
+fn reread_span(region: (u32, u32), ranges: &[(u32, u32)], total: u32) -> (u32, u32) {
+    const CAP: u32 = 60;
+    let (a_lo, a_hi) = region;
+    let nearest = ranges.iter().min_by_key(|(r_lo, r_hi)| {
+        if a_hi < *r_lo {
+            r_lo - a_hi
+        } else if a_lo > *r_hi {
+            a_lo - r_hi
+        } else {
+            0
+        }
+    });
+    // Empty provenance is filtered before the gate runs, so `nearest` is Some in
+    // every reachable call; `unwrap_or(region)` is a total fallback for a path
+    // reachable calls never take.
+    let (r_lo, r_hi) = nearest.copied().unwrap_or(region);
+    let mut lo = a_lo.min(r_lo);
+    let mut hi = a_hi.max(r_hi);
+    if hi - lo + 1 > CAP {
+        if a_lo > r_hi {
+            // Anchor after the range: keep the anchor end, trim the low side.
+            lo = hi.saturating_sub(CAP - 1).min(a_lo);
+        } else {
+            // Anchor before or overlapping the range: keep the anchor start, trim the high side.
+            hi = (lo + CAP - 1).max(a_hi);
+        }
+    }
+    let hi = hi.min(total).max(lo);
+    (lo, hi)
 }
 
 /// Failure from the composed edit egress: either the provenance gate rejected
@@ -214,7 +302,7 @@ mod tests {
 
         // External edit prepended a line, shifting TARGET from line 3 to line 4.
         let live = "PREPENDED\nline1\nline2\nTARGET\nline4\nline5\n";
-        let recovered = try_recover(&store, &p(), tag, &swap(3, "CHANGED"), live)
+        let (recovered, _) = try_recover(&store, &p(), tag, &swap(3, "CHANGED"), live)
             .expect("moved block recovers");
         assert_eq!(
             recovered,
@@ -316,9 +404,37 @@ mod tests {
             old: "TARGET".to_string(),
             new: "RECOVERED".to_string(),
         }];
-        let recovered =
+        let (recovered, _) =
             try_recover(&store, &p(), tag, &ops, live).expect("seen anchor must recover");
         assert_eq!(recovered, "line1\nCHANGED2\nRECOVERED\nline4\nline5\n");
+    }
+
+    #[test]
+    fn text_swap_gate_survives_multibyte_old_end() {
+        let mut store = SnapshotStore::new();
+        let snapshot = "line1\nlet s = \"caf\u{e9}\";\nline3\n"; // caf + e-acute, 2-byte UTF-8
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, [2u32]).unwrap();
+        let snap = store.by_tag(&key, tag).unwrap();
+        let ops = vec![Op::TextSwap {
+            old: "caf\u{e9}".into(),
+            new: "coffee".into(),
+        }];
+        check_seen_lines(&snap, &p(), &ops).expect("seen line 2 covers the swap");
+    }
+
+    #[test]
+    fn text_swap_gate_survives_multibyte_old_end_before_newline() {
+        let mut store = SnapshotStore::new();
+        let snapshot = "line1\ncaf\u{e9}\nline3\n"; // old ends right at EOL
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, [2u32]).unwrap();
+        let snap = store.by_tag(&key, tag).unwrap();
+        let ops = vec![Op::TextSwap {
+            old: "caf\u{e9}".into(),
+            new: "coffee".into(),
+        }];
+        check_seen_lines(&snap, &p(), &ops).expect("seen line 2 covers the swap");
     }
 
     /// Probe: `check_seen_lines` skips the provenance gate whenever `lower_ops`
@@ -365,7 +481,7 @@ mod tests {
         // Recovery must refuse: strategy 2 resolves against live, so line 40 is
         // reachable there even though it was never displayed under this tag.
         match try_recover(&store, &p(), tag, &ops, &live) {
-            Ok(text) => {
+            Ok((text, _)) => {
                 panic!("provenance bypass: edit landed on a line the read never displayed:\n{text}")
             }
             Err(e) => assert!(
@@ -404,7 +520,7 @@ mod tests {
         // context (which includes the old line 2 "b") cannot match live, so the
         // session-chain fallback applies the edit directly onto live.
         let live = v2;
-        let recovered =
+        let (recovered, _) =
             try_recover(&store, &p(), tag1, &swap(3, "NEW"), live).expect("session chain recovers");
         assert_eq!(recovered, "a\nMODIFIED\nNEW\nd\n");
     }
@@ -474,7 +590,7 @@ mod tests {
             canonical,
             "raw spelling must differ from the canonical key for this test to bite"
         );
-        let recovered = try_recover(&store, &raw_spelling, tag, &swap(2, "CHANGED"), snapshot)
+        let (recovered, _) = try_recover(&store, &raw_spelling, tag, &swap(2, "CHANGED"), snapshot)
             .expect("canonical key lookup recovers despite raw path spelling");
         assert_eq!(recovered, "line1\nCHANGED\nline3\n");
     }
@@ -489,19 +605,165 @@ mod tests {
             seen_lines: [1, 2].into_iter().collect(),
         };
 
-        // An edit on an unseen line is rejected by the composed gate.
+        // An edit on an unseen line is rejected by the composed gate, naming the
+        // displayed range and the smallest re-read that covers line 3.
         let err = gated_apply(&snap, &p(), &swap(3, "x")).unwrap_err();
         assert_eq!(
             err,
             EditError::Mismatch(MismatchError::UnseenAnchor {
                 path: "g.rs".into(),
                 line: 3,
+                displayed: vec![(1, 2)],
+                reread_lo: 1,
+                reread_hi: 3,
             })
         );
 
         // An edit on a seen line passes the gate and applies to snapshot text.
         let result = gated_apply(&snap, &p(), &swap(2, "CHANGED")).unwrap();
         assert_eq!(result.text, "l1\nCHANGED\nl3\n");
+    }
+
+    #[test]
+    fn reread_span_keeps_anchor_start_when_anchor_precedes_distant_range() {
+        // Anchor before the range and wider than the cap: the whole anchor must
+        // survive. Before the `.max(a_hi)` clamp this returned (1, 60) and
+        // dropped anchor lines 61-200.
+        let (lo, hi) = reread_span((1, 200), &[(250, 260)], 300);
+        assert_eq!((lo, hi), (1, 200));
+        // Narrow anchor: the cap trims the range side, never the anchor.
+        let (lo, hi) = reread_span((1, 5), &[(200, 300)], 500);
+        assert_eq!((lo, hi), (1, 60));
+    }
+
+    #[test]
+    fn reread_span_covers_anchor_when_region_exceeds_cap_after_range() {
+        let (lo, hi) = reread_span((100, 200), &[(1, 10)], 300);
+        assert!(
+            lo <= 100 && 100 <= hi,
+            "reread span ({lo},{hi}) must cover anchor line 100"
+        );
+    }
+
+    #[test]
+    fn replace_text_span_overlapping_seen_lines_applies_but_disjoint_is_rejected() {
+        let lines: Vec<String> = (1..=1000).map(|i| format!("line{i}")).collect();
+        let text = lines.join("\n") + "\n";
+        let snap = Snapshot {
+            path: "big.rs".into(),
+            text,
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: (886u32..=897).collect(),
+        };
+
+        // Span 897-898 overlaps the seen set on line 897 → tolerant gate applies.
+        let ok_ops = vec![Op::TextSwap {
+            old: "line897\nline898".into(),
+            new: "R897\nR898".into(),
+        }];
+        let applied = gated_apply(&snap, &p(), &ok_ops).expect("overlapping span applies");
+        assert!(
+            applied.text.contains("R897\nR898"),
+            "the overlapping edit must land"
+        );
+
+        // Span 898-899 shares no seen line → rejected, naming the displayed range
+        // and the smallest covering re-read.
+        let rej_ops = vec![Op::TextSwap {
+            old: "line898\nline899".into(),
+            new: "X".into(),
+        }];
+        let err = gated_apply(&snap, &p(), &rej_ops).unwrap_err();
+        let EditError::Mismatch(m) = err else {
+            panic!("expected mismatch, got {err:?}");
+        };
+        let s = m.to_string();
+        assert!(s.contains("displayed: 886-897"), "{s}");
+        assert!(s.contains("Re-read big.rs#886-899"), "{s}");
+    }
+
+    #[test]
+    fn replace_text_span_ending_in_newline_does_not_count_phantom_next_line() {
+        // `old` ending in "\n" resolves to a byte span whose exclusive end sits
+        // at the start of the NEXT line. The gate must attribute the span to the
+        // line whose content it replaces, not the phantom next line — otherwise
+        // a swap of an unseen line 5 slips through because a seen line 6 appears
+        // to overlap.
+        let text = (1..=10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let seen_six = Snapshot {
+            path: "nl.rs".into(),
+            text: text.clone(),
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: [6u32].into_iter().collect(),
+        };
+        // Only line 6 was displayed; the swap replaces line 5's content → reject.
+        let ops = vec![Op::TextSwap {
+            old: "l5\n".into(),
+            new: "X\n".into(),
+        }];
+        let err = check_seen_lines(&seen_six, &p(), &ops).unwrap_err();
+        assert!(
+            matches!(err, MismatchError::UnseenAnchor { line: 5, .. }),
+            "a trailing-newline span must attribute to its content line, got {err:?}"
+        );
+
+        // With line 5 itself seen, the same swap passes the tolerant gate.
+        let seen_five = Snapshot {
+            seen_lines: [5u32].into_iter().collect(),
+            ..seen_six
+        };
+        assert!(
+            check_seen_lines(&seen_five, &p(), &ops).is_ok(),
+            "the swap must apply when its real content line was displayed"
+        );
+    }
+
+    #[test]
+    fn line_op_just_past_seen_range_names_range_and_adjacent_reread() {
+        let snap = Snapshot {
+            path: "f.rs".into(),
+            text: "l1\nl2\nl3\nl4\nl5\nl6\nl7\n".into(),
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: (1u32..=5).collect(),
+        };
+        // A line op stays strict — line 6 was never displayed.
+        let err = check_seen_lines(&snap, &p(), &swap(6, "x")).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("line 6 was never displayed"), "{s}");
+        assert!(s.contains("displayed: 1-5"), "{s}");
+        assert!(s.contains("Re-read f.rs#1-6"), "{s}");
+    }
+
+    #[test]
+    fn two_displayed_ranges_pick_nearest_and_cap_reread_at_sixty() {
+        let total = 4000u32;
+        let text = (1..=total)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let mut seen: Vec<u32> = (2655..=2700).collect();
+        seen.extend(3250..=3270);
+        let snap = Snapshot {
+            path: "f.rs".into(),
+            text,
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: seen.into_iter().collect(),
+        };
+        let err = check_seen_lines(&snap, &p(), &swap(2823, "x")).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("displayed: 2655-2700, 3250-3270"), "{s}");
+        // Nearest range is 2655-2700; the naive join 2655-2823 exceeds 60 lines,
+        // so the window keeps the anchor and trims the low side to 2764-2823.
+        assert!(s.contains("Re-read f.rs#2764-2823"), "{s}");
     }
 
     #[test]
