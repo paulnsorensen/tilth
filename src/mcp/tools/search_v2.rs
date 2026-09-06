@@ -64,9 +64,11 @@ pub(in crate::mcp) fn tool_search_v2(
             .and_then(Value::as_str)
             .ok_or_else(|| "each queries entry requires a \"query\" string.".to_string())?;
         let glob = entry.get("glob").and_then(Value::as_str);
+        let kind = entry.get("kind").and_then(Value::as_str);
 
         let (result, route, mut entry_hints, diagnostic) =
-            route_query(query, glob, cwd, cache, session, bloom).map_err(|e| e.to_string())?;
+            route_query(query, kind, glob, cwd, cache, session, bloom)
+                .map_err(|e| e.to_string())?;
         routes_tried.push(route.clone());
         if primary_route.is_empty() {
             primary_route = route;
@@ -117,6 +119,7 @@ pub(in crate::mcp) fn tool_search_v2(
 /// diagnostic when the query was rewritten before routing.
 fn route_query(
     query: &str,
+    kind: Option<&str>,
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
@@ -124,6 +127,22 @@ fn route_query(
     bloom: &BloomFilterCache,
 ) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
     session.record_search(query, true);
+
+    // 0. kind override — an explicit per-query kind short-circuits the whole
+    // cascade below.
+    if let Some(k) = kind {
+        if k == "callers" {
+            let mut result = base_result(query, "callers", "ok");
+            result["preview"] = json!(crate::search::callers::search_callers_expanded(
+                query, cwd, bloom, 0, None, glob, false,
+            )?);
+            return Ok((result, "callers".to_string(), Vec::new(), None));
+        }
+        return Err(crate::error::TilthError::InvalidQuery {
+            query: query.to_string(),
+            reason: format!("unsupported kind {k:?}; only \"callers\" is supported."),
+        });
+    }
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
     let candidate = cwd.join(query);
@@ -782,5 +801,16 @@ mod tests {
             }),
             "missing normalization diagnostic: {normalizations:?}"
         );
+    }
+
+    #[test]
+    fn kind_callers_override_resolves_to_callers_route() {
+        let resp = call(&json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{"query": "detect_file_type", "kind": "callers"}],
+        }))
+        .expect("kind:callers query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "callers");
     }
 }

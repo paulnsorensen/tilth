@@ -316,7 +316,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool, surface: SearchSurface) 
                             "required": ["query"],
                             "properties": {
                                 "query": { "type": "string", "description": "Symbol, text, or regex." },
-                                "glob": { "type": "string", "description": "Glob filter for this query." }
+                                "glob": { "type": "string", "description": "Glob filter for this query." },
+                                "kind": { "type": "string", "enum": ["callers"], "description": "Optional per-query override; only \"callers\" (find call sites)." }
                             }
                         },
                         "minItems": 1,
