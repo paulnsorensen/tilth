@@ -72,6 +72,8 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "target",
     ".bloop",
     ".metals",
+    ".worktrees",
+    "worktrees",
 ];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
@@ -2055,6 +2057,31 @@ mod tests {
         assert!(
             !names.contains(&"store.rs".to_string()),
             "VCS-internal file leaked through the walker: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walker_skips_worktrees_dirs() {
+        // `worktrees/`/`.worktrees/` hold other checkouts (incl. `.claude/worktrees`) — never source.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
+        for wt in ["worktrees", ".worktrees"] {
+            let dir = tmp.path().join(wt);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("buried.rs"), "fn buried() {}").unwrap();
+        }
+
+        let names: Vec<String> = walk_paths(tmp.path(), None)
+            .iter()
+            .filter_map(|p| Some(p.file_name()?.to_str()?.to_string()))
+            .collect();
+        assert!(
+            names.contains(&"real.rs".to_string()),
+            "source file must be found: {names:?}"
+        );
+        assert!(
+            !names.contains(&"buried.rs".to_string()),
+            "worktrees dir leaked through the walker: {names:?}"
         );
     }
 
