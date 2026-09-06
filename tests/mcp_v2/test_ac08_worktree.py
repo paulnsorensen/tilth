@@ -20,14 +20,14 @@ def setUpModule():
 def _v2_call_requests():
     return [
         harness.tools_call_request(
-            2, "tilth_search_v2", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
+            2, "tilth_search", {"queries": [{"query": "detect_file_type"}], "cwd": CWD}
         )
     ]
 
 
 def _call_v2(env=None):
     requests = [harness.initialize_request(1), *_v2_call_requests()]
-    return harness.run_mcp(["--search-surface", "both"], requests, env=env)
+    return harness.run_mcp([], requests, env=env)
 
 
 class AC08Worktree(unittest.TestCase):
@@ -39,13 +39,13 @@ class AC08Worktree(unittest.TestCase):
                 harness.initialize_request(1, client_info={"name": "client-a"}),
                 *_v2_call_requests(),
             ]
-            harness.run_mcp(["--search-surface", "both"], requests_a, env=env)
+            harness.run_mcp([], requests_a, env=env)
 
             requests_b = [
                 harness.initialize_request(1, client_info={"name": "client-b"}),
                 *_v2_call_requests(),
             ]
-            harness.run_mcp(["--search-surface", "both"], requests_b, env=env)
+            harness.run_mcp([], requests_b, env=env)
 
             redb_files = list(Path(tmp).rglob("*.redb"))
             self.assertEqual(len({f.parent for f in redb_files}), 2)
@@ -73,9 +73,15 @@ class AC08Worktree(unittest.TestCase):
         self.assertEqual(self._coverage(), "complete")
 
     def test_missing_anchor(self):
+        # A search must succeed cold-partial rather than fail when the deps
+        # index cannot resolve an anchor (ADR-003: search correctness is
+        # independent of index availability). It returns a coverage field,
+        # never a tool error.
         response = _call_v2().response_by_id(2)
         self.assertIsNotNone(response)
-        self.assertTrue(harness.tool_is_error(response))
+        self.assertFalse(harness.tool_is_error(response))
+        payload = json.loads(harness.tool_result_text(response))
+        self.assertIn("coverage", payload["results"][0]["dependency_impact"])
 
     def _coverage(self):
         response = _call_v2().response_by_id(2)

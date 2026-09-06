@@ -77,12 +77,13 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 ```bash
 cargo build --release        # release build
 cargo test                   # unit tests (in-source #[cfg(test)] modules)
+python3 -m unittest discover -s tests/mcp_v2 -t tests/mcp_v2  # MCP end-to-end tests (needs target/debug/tilth)
 cargo clippy --all-targets -- -D warnings  # lint
 cargo fmt --check            # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
 ```
 
-CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
+CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, and the `tests/mcp_v2` unittest suite on every push/PR.
 
 ## Fork law
 

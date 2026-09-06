@@ -87,25 +87,6 @@ pub(crate) fn rank_path_suggestions(query: &str, candidates: &[String]) -> Vec<S
         .collect()
 }
 
-/// Search-miss suggestions for the MCP `tilth_search` default path, which
-/// returns an empty-result header on a miss and so never reaches the basic-path
-/// `fuzzy_path_fallback`. Non-path-like queries return `None` before any walk
-/// (guarded here via [`is_path_like`], so a normal empty symbol search never
-/// walks the tree); callers confirm the search produced no matches before
-/// invoking this. Returns the ranked "did you mean" list for a path-like miss,
-/// or `None` when nothing subsequence-matches (the caller keeps its own
-/// empty-result output unchanged). Never opens a file the agent didn't name.
-#[must_use]
-pub fn search_miss_suggestions(scope: &Path, query: &str) -> Option<Vec<String>> {
-    if !is_path_like(query) {
-        return None;
-    }
-    match resolve_fuzzy_path(scope, query, GateProfile::Search) {
-        FuzzyResolution::Suggestions(s) => Some(s),
-        FuzzyResolution::None => None,
-    }
-}
-
 /// nucleo path-matcher over collected scope-relative paths. Returns
 /// `(score, relative_path)` for every subsequence match. The `PathBuf` is
 /// built only for the handful of matches — non-matching candidates stay
@@ -128,13 +109,6 @@ fn score_candidates(query: &str, candidates: &[String]) -> Vec<(u16, PathBuf)> {
                 .map(|score| (score, PathBuf::from(rel_str)))
         })
         .collect()
-}
-
-/// A query is path-like when it contains a path separator and the final
-/// segment has a file extension. The MCP search-miss path uses this as a
-/// pre-check so a normal bare-concept search never walks the whole tree.
-pub fn is_path_like(query: &str) -> bool {
-    query.contains('/') && Path::new(query).extension().is_some()
 }
 
 /// Walk the `.tilthignore`-pruned tree under `scope`, collecting scope-relative
@@ -328,27 +302,6 @@ mod tests {
             top_suggestion(&res).as_deref(),
             Some("src/search/symbol.rs"),
             "path-like single-winner query should suggest the real file first under Search"
-        );
-    }
-
-    #[test]
-    fn search_miss_suggestions_guards_non_path_like() {
-        // `symbol` subsequence-matches src/search/symbol.rs, but a bare-concept
-        // query must return None before any tree walk — the internal
-        // `is_path_like` guard keeps the pub API safe without relying on
-        // caller pre-checks.
-        let dir = fixture(&["src/search/symbol.rs"]);
-        assert!(
-            search_miss_suggestions(dir.path(), "symbol").is_none(),
-            "non-path-like query must be guarded to None"
-        );
-        assert_eq!(
-            search_miss_suggestions(dir.path(), "serch/symbol.rs")
-                .unwrap()
-                .first()
-                .map(String::as_str),
-            Some("src/search/symbol.rs"),
-            "path-like miss must still return the did-you-mean list"
         );
     }
 

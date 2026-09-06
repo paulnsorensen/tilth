@@ -18,9 +18,9 @@ class AC03Request(unittest.TestCase):
     def _call(self, queries):
         requests = [
             harness.initialize_request(1),
-            harness.tools_call_request(2, "tilth_search_v2", {"queries": queries, "cwd": CWD}),
+            harness.tools_call_request(2, "tilth_search", {"queries": queries, "cwd": CWD}),
         ]
-        res = harness.run_mcp(["--search-surface", "both"], requests)
+        res = harness.run_mcp([], requests)
         return res.response_by_id(2)
 
     def _assert_valid_batch(self, queries):

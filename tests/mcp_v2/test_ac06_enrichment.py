@@ -19,10 +19,10 @@ class AC06Enrichment(unittest.TestCase):
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(
-                2, "tilth_search_v2", {"queries": [{"query": query}], "cwd": CWD}
+                2, "tilth_search", {"queries": [{"query": query}], "cwd": CWD}
             ),
         ]
-        res = harness.run_mcp(["--search-surface", "both"], requests)
+        res = harness.run_mcp([], requests)
         response = res.response_by_id(2)
         self.assertIsNotNone(response)
         return json.loads(harness.tool_result_text(response))
@@ -38,16 +38,16 @@ class AC06Enrichment(unittest.TestCase):
         self.assertIn("core", result)
 
     def test_callers_continuation(self):
-        self._assert_hint("detect_file_type", "callers")
+        self._assert_hint("detect_file_type", "fetch_callers")
 
     def test_callees_continuation(self):
-        self._assert_hint("detect_file_type", "callees")
+        self._assert_hint("detect_file_type", "fetch_callees")
 
     def test_siblings_continuation(self):
-        self._assert_hint("detect_file_type", "siblings")
+        self._assert_hint("detect_file_type", "fetch_siblings")
 
     def test_tests_continuation(self):
-        self._assert_hint("detect_file_type", "tests")
+        self._assert_hint("detect_file_type", "fetch_tests")
 
     def test_ambiguous_disambiguation(self):
         payload = self._call("run")
@@ -55,7 +55,7 @@ class AC06Enrichment(unittest.TestCase):
         self.assertIn("candidates", result)
         self.assertGreater(len(result["candidates"]), 1)
         hints = payload.get("hints", [])
-        self.assertTrue(any(h.get("kind") == "disambiguate" for h in hints))
+        self.assertEqual(hints, [])
         self.assertNotIn("core", result)
 
 

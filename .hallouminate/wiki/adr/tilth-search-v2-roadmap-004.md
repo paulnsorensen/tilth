@@ -1,5 +1,6 @@
 ---
-status: trusted
+status: superseded
+superseded_by: tilth-search-v2-roadmap-006
 last_verified: 2026-08-14
 confidence: high
 sources:
@@ -8,6 +9,8 @@ sources:
   - .cheese/research/tilth-api-analytics-verdict/report.md
 ---
 # Measured Parallel Search v2 Trial
+
+> Superseded: the cutover this roadmap gated shipped in PR #231 — `tilth_search` is now the v2 engine and `tilth_search_v2` is retired. See `tilth-search-v2-roadmap-006`.
 
 Tilth will advertise temporary `tilth_search_v2` beside the existing discovery tools, compare matched v1/v2 benchmark cells and per-harness real telemetry, then perform one clean canonical cutover only after predeclared gates pass.
 

@@ -76,6 +76,7 @@ pub(super) fn read_reverse(db: &Database, rel: &str) -> Result<Vec<String>, Deps
 }
 
 /// All relative paths currently tracked in the `files` table.
+#[allow(dead_code)] // introspection helper; only `all_signatures` is on the reconcile path
 pub(super) fn all_file_keys(db: &Database) -> Result<Vec<String>, DepsError> {
     let txn = db.begin_read().map_err(redb_err)?;
     let table = match txn.open_table(FILES) {

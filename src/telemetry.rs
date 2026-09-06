@@ -45,6 +45,9 @@ pub(crate) struct SearchTelemetryRecord {
     pub result_tokens: u64,
     pub partial: bool,
     pub timeout: bool,
+    /// True when the budget trim dropped payload from at least one result;
+    /// the fields above describe the search as it ran, before any trim.
+    pub budget_limited: bool,
     pub dependency_coverage: f64,
     pub shard_state: String,
     pub client: String,
@@ -178,6 +181,7 @@ mod tests {
             result_tokens: 340,
             partial: false,
             timeout: false,
+            budget_limited: false,
             dependency_coverage: 1.0,
             shard_state: "warm".to_string(),
             client: "claude-code".to_string(),
@@ -217,6 +221,7 @@ mod tests {
             "latency_ms",
             "result_tokens",
             "partial",
+            "budget_limited",
             "timeout",
             "dependency_coverage",
             "shard_state",

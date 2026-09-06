@@ -31,10 +31,10 @@ class AC04Routing(unittest.TestCase):
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(
-                2, "tilth_search_v2", {"queries": [entry], "cwd": CWD}
+                2, "tilth_search", {"queries": [entry], "cwd": CWD}
             ),
         ]
-        res = harness.run_mcp(["--search-surface", "both"], requests)
+        res = harness.run_mcp([], requests)
         return res.response_by_id(2)
 
     def _assert_route(self, row):

@@ -71,7 +71,7 @@ pub fn is_path_line_target(s: &str) -> bool {
 
 /// Resolve a target spec and return the loaded source plus its detected
 /// language. Single file read; single outline parse downstream.
-fn resolve_with_source(
+pub(crate) fn resolve_with_source(
     spec: &str,
     scope: &Path,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
@@ -1123,7 +1123,10 @@ fn is_recursive_call_site(
 ///
 /// Skips imports/exports (noise) and the target itself. Sorted by:
 /// functions/methods first, then alphabetical.
-fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<SiblingEntry> {
+pub(crate) fn collect_siblings(
+    entries: &[OutlineEntry],
+    target: &ResolvedTarget,
+) -> Vec<SiblingEntry> {
     let parent = entries.iter().find(|e| {
         e.children
             .iter()

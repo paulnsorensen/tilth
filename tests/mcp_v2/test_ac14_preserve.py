@@ -15,15 +15,15 @@ def setUpModule():
 
 class AC14Preserve(unittest.TestCase):
     def test_list_and_grok_unchanged(self):
-        # Under the trial `both` surface, the v1 registry (tilth_list/grok/deps)
-        # must be preserved unchanged. RED today: the flag does not exist yet
-        # (exit 2); GREEN once `--search-surface both` lands and preserves them.
+        # After the v2 cutover, tilth_list/grok/deps stay in the canonical
+        # registry unconditionally (ADR-006). This guards that they still
+        # dispatch and answer normally.
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(2, "tilth_list", {"cwd": CWD}),
             harness.tools_call_request(3, "tilth_grok", {"target": "detect_file_type", "cwd": CWD}),
         ]
-        res = harness.run_mcp(["--search-surface", "both"], requests)
+        res = harness.run_mcp([], requests)
         self.assertEqual(res.returncode, 0, msg=harness.WITNESS[_AC])
 
         list_response = res.response_by_id(2)
