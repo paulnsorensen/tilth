@@ -130,11 +130,11 @@ pub struct Session {
     reads: AtomicUsize,
     searches: AtomicUsize,
     symbols: Mutex<HashMap<String, usize>>, // query → search count (reporting only)
-    /// query → search count, populated only for symbol/any-kind searches.
-    /// Grok-nudge candidacy is drawn from here, kept separate from `symbols`
-    /// so content/regex/callers hits keep contributing to the `summary()`
-    /// "Top queries" reporting counter without arming a nudge they can't
-    /// satisfy (`tilth_grok` resolves symbols, not arbitrary text hits).
+    /// query → search count, populated only for queries `tilth_grok` could
+    /// actually resolve. Grok-nudge candidacy is drawn from here, kept
+    /// separate from `symbols` so content/regex hits keep contributing to the
+    /// `summary()` "Top queries" reporting counter without arming a nudge they
+    /// can't satisfy (`tilth_grok` resolves symbols, not arbitrary text hits).
     nudge_candidates: Mutex<HashMap<String, usize>>,
     dir_hits: Mutex<HashMap<String, usize>>, // dir → count
     /// `path:line` → file mtime at expand-time. mtime versioning lets
@@ -217,14 +217,13 @@ impl Session {
         self.record_dir(path);
     }
 
-    /// Records a search; every query counts toward the `searches` tally and
-    /// the `symbols`/`summary()` reporting map regardless of kind or shape
-    /// (reporting reflects what was actually searched). `is_symbol_kind`
-    /// marks searches whose kind is `symbol` or `any` (the merged default) —
-    /// only those feed `nudge_candidates`, and only when
-    /// `search::grok::can_resolve` says `tilth_grok` could actually resolve
-    /// the query.
-    pub fn record_search(&self, query: &str, is_symbol_kind: bool) {
+    /// Records a search. Every query counts toward the `searches` tally and
+    /// the `symbols`/`summary()` reporting map, since reporting reflects what
+    /// was actually searched. Grok-nudge candidacy is then armed
+    /// automatically for the queries `search::grok::can_resolve` says
+    /// `tilth_grok` could resolve — routing is the engine's call, not the
+    /// caller's to declare.
+    pub fn record_search(&self, query: &str) {
         self.searches.fetch_add(1, Ordering::Relaxed);
         {
             let mut syms = self
@@ -233,7 +232,7 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *syms.entry(query.to_string()).or_insert(0) += 1;
         }
-        if !is_symbol_kind || !crate::search::grok::can_resolve(query) {
+        if !crate::search::grok::can_resolve(query) {
             return;
         }
         let mut candidates = self
@@ -241,6 +240,18 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *candidates.entry(query.to_string()).or_insert(0) += 1;
+    }
+
+    /// Counts one continuation (`follow`) execution toward the search tally.
+    /// A follow carries no query text, so it feeds neither the reporting map
+    /// nor grok-nudge candidacy — only `searches` moves.
+    pub fn record_follow(&self) {
+        self.searches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Searches recorded this session, queries and follows alike.
+    pub fn search_count(&self) -> usize {
+        self.searches.load(Ordering::Relaxed)
     }
 
     /// Record a `tilth_grok` attempt — even one that later fails — so a
@@ -840,9 +851,9 @@ mod tests {
     #[test]
     fn second_search_of_same_symbol_returns_grok_nudge() {
         let session = Session::new();
-        session.record_search("foo", true);
+        session.record_search("foo");
         assert_eq!(session.grok_nudge("tilth_search", true), None);
-        session.record_search("foo", true);
+        session.record_search("foo");
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -855,18 +866,18 @@ mod tests {
     #[test]
     fn grok_nudge_fires_once_per_symbol() {
         let session = Session::new();
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("foo");
         assert!(session.grok_nudge("tilth_search", true).is_some());
-        session.record_search("foo", true);
+        session.record_search("foo");
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
     #[test]
     fn single_searches_of_different_symbols_never_nudge() {
         let session = Session::new();
-        session.record_search("foo", true);
-        session.record_search("bar", true);
+        session.record_search("foo");
+        session.record_search("bar");
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
@@ -882,9 +893,20 @@ mod tests {
             "Makefile",
             "Dockerfile",
         ] {
-            session.record_search(query, true);
-            session.record_search(query, true);
+            session.record_search(query);
+            session.record_search(query);
         }
+        assert_eq!(session.grok_nudge("tilth_search", true), None);
+    }
+
+    /// Follows are searches for tallying purposes but carry no query text, so
+    /// they must never arm a grok nudge.
+    #[test]
+    fn follows_count_as_searches_without_arming_a_nudge() {
+        let session = Session::new();
+        session.record_follow();
+        session.record_follow();
+        assert_eq!(session.search_count(), 2);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
@@ -892,8 +914,8 @@ mod tests {
     fn trailing_colon_or_hyphen_never_nudges() {
         let session = Session::new();
         for query in ["Session::", "foo-"] {
-            session.record_search(query, true);
-            session.record_search(query, true);
+            session.record_search(query);
+            session.record_search(query);
         }
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
@@ -901,8 +923,8 @@ mod tests {
     #[test]
     fn qualified_symbol_query_nudges() {
         let session = Session::new();
-        session.record_search("Session::new", true);
-        session.record_search("Session::new", true);
+        session.record_search("Session::new");
+        session.record_search("Session::new");
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -916,16 +938,16 @@ mod tests {
     fn grokked_target_never_nudges() {
         let session = Session::new();
         session.record_grok("foo");
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("foo");
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
 
     #[test]
     fn withheld_grok_nudge_rides_the_next_eligible_response() {
         let session = Session::new();
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("foo");
         assert_eq!(session.grok_nudge("tilth_search", false), None);
         assert!(session.grok_nudge("tilth_search", true).is_some());
     }
@@ -933,11 +955,11 @@ mod tests {
     #[test]
     fn most_searched_symbol_wins_when_several_qualify() {
         let session = Session::new();
-        session.record_search("foo", true);
-        session.record_search("bar", true);
-        session.record_search("bar", true);
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("bar");
+        session.record_search("bar");
+        session.record_search("foo");
+        session.record_search("foo");
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(
@@ -951,8 +973,8 @@ mod tests {
     fn grok_nudge_stops_after_lifetime_limit() {
         let session = Session::new();
         for symbol in ["foo", "bar", "baz"] {
-            session.record_search(symbol, true);
-            session.record_search(symbol, true);
+            session.record_search(symbol);
+            session.record_search(symbol);
         }
         assert!(session.grok_nudge("tilth_search", true).is_some());
         assert!(session.grok_nudge("tilth_search", true).is_some());
@@ -963,8 +985,8 @@ mod tests {
     fn oversized_grok_tip_falls_back_to_the_generic_form() {
         let session = Session::new();
         let long = "a".repeat(120);
-        session.record_search(&long, true);
-        session.record_search(&long, true);
+        session.record_search(&long);
+        session.record_search(&long);
         assert_eq!(
             session.grok_nudge("tilth_search", true),
             Some(GROK_GENERIC_TIP.to_string())
@@ -977,8 +999,8 @@ mod tests {
         // Session::nudge derives grok-target suppression from the tool name
         // and args.
         let session = Session::new();
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("foo");
         session.nudge("tilth_grok", &serde_json::json!({ "target": "foo" }), true);
         assert_eq!(session.grok_nudge("tilth_search", true), None);
     }
@@ -987,11 +1009,11 @@ mod tests {
     fn reset_clears_grok_nudge_state() {
         let session = Session::new();
         session.record_grok("foo");
-        session.record_search("bar", true);
-        session.record_search("bar", true);
+        session.record_search("bar");
+        session.record_search("bar");
         session.reset();
-        session.record_search("foo", true);
-        session.record_search("foo", true);
+        session.record_search("foo");
+        session.record_search("foo");
         assert!(
             session.grok_nudge("tilth_search", true).is_some(),
             "a grokked target must nudge again after reset"
@@ -999,28 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn non_symbol_search_kind_never_nudges_even_for_symbol_shaped_query() {
-        let session = Session::new();
-        session.record_search("foo", false);
-        session.record_search("foo", false);
-        assert_eq!(session.grok_nudge("tilth_search", true), None);
-    }
-
-    #[test]
-    fn non_symbol_search_kind_still_counts_toward_reporting() {
-        let session = Session::new();
-        session.record_search("foo", false);
-        session.record_search("foo", false);
-        assert!(session.summary().contains("foo (2)"));
-    }
-
-    #[test]
     fn non_resolvable_query_still_counts_toward_reporting() {
         // Reporting reflects what was actually searched — a query grok could
         // never resolve still lands in summary()'s "Top queries".
         let session = Session::new();
-        session.record_search("TODO: fix", true);
-        session.record_search("TODO: fix", true);
+        session.record_search("TODO: fix");
+        session.record_search("TODO: fix");
         assert!(session.summary().contains("TODO: fix (2)"));
     }
 }

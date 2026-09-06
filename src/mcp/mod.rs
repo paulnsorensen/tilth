@@ -386,14 +386,15 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
     // `Session::nudge` resolves grok-vs-batch precedence internally.
-    let tip = services.session().nudge(tool, args, result.is_ok());
-    result.map(|body| {
-        if tool == "tilth_search" {
-            body
-        } else {
-            append_nudge(body, tip)
-        }
-    })
+    // `tilth_search` is exempt: its response is pure JSON and drops any tip,
+    // so observing it would break an unrelated streak and silently spend a
+    // grok emission on a response nobody can read it from.
+    let tip = if tool == "tilth_search" {
+        None
+    } else {
+        services.session().nudge(tool, args, result.is_ok())
+    };
+    result.map(|body| append_nudge(body, tip))
 }
 
 /// Search owns dependency refresh so coverage and output use the same evidence.
@@ -702,6 +703,46 @@ mod tests {
                 "streak must reset across the errored call: {body}"
             );
         }
+    }
+
+    /// A `tilth_search` dispatch must not touch nudge state at all: its JSON
+    /// response can never carry a tip, so observing it would break a read
+    /// streak that the agent never actually broke.
+    #[test]
+    fn search_dispatch_leaves_nudge_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new(false);
+
+        dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["a.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        let search = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "a" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            !search.contains("TIP:"),
+            "search responses never carry a tip: {search}"
+        );
+
+        let second = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["b.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            second.ends_with("\n\nTIP: batch into one call — paths: [\"a.rs\", \"b.rs\"]."),
+            "the read streak must survive the interleaved search: {second:?}"
+        );
     }
 
     /// Integration seam: the real JSON-RPC dispatch path (`dispatch_tool`) must

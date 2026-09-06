@@ -66,8 +66,20 @@ class Continuations(unittest.TestCase):
                 self.assertEqual(result["resolved_as"], hint["kind"])
                 self.assertEqual(result["target"], hint["target"])
                 self.assertEqual(result["status"], "ok")
-                self.assertIn(needle, result["preview"])
-                self.assertNotIn("wrong_caller", result["preview"])
+                if hint["kind"] == "fetch_dependencies":
+                    impact = result["dependency_impact"]
+                    identities = impact["imports"] + impact["dependents"]
+                else:
+                    items = result["items"]
+                    self.assertEqual(result["total_found"], len(items))
+                    identities = [
+                        value
+                        for item in items
+                        for value in (item.get("name"), item.get("path"))
+                        if value is not None
+                    ]
+                self.assertIn(needle, identities)
+                self.assertNotIn("wrong_caller", identities)
 
     def test_noncode_filename_searches_references(self):
         (self.cwd / "uv.lock").write_text("not a reference\n")

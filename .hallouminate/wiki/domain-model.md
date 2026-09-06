@@ -28,11 +28,11 @@ _Code_: NEW ENTITY (scope resolution near `src/mcp/tools/mod.rs`)
 
 **Dependency index** — Private per-client, per-worktree redb-derived state containing per-file outgoing edges and reverse indexes.
 _Avoid_: shared dependency database, source of truth
-_Code_: NEW ENTITY (`src/index/dependency.rs`)
+_Code_: NEW ENTITY (`src/index/deps/mod.rs`)
 
 **Verified-only partial** — A core search result plus only dependency facts proven fresh before the internal sub-deadline; stale edges are omitted.
 _Avoid_: stale-with-warning
-_Code_: NEW ENTITY (`src/index/dependency.rs`)
+_Code_: NEW ENTITY (`src/index/deps/mod.rs`)
 
 **Graduation manifest** — A prepared per-harness record that freezes every matched v1/v2 threshold and real-call sample floor before trial advertisement.
 _Avoid_: calendar sunset, best-effort comparison

@@ -1,7 +1,9 @@
-//! F11 cold-partial verified-only search-v2 engine: deterministic query
-//! routing (path -> regex -> symbol/ambiguous -> literal -> miss) with bounded
-//! grok/deps enrichment on unique hits (see
-//! `.hallouminate/wiki/adr/tilth-search-v2-trial.md`).
+//! The canonical `tilth_search` engine: deterministic query routing (path ->
+//! regex -> signature-prefix normalization -> filename-shaped miss ->
+//! symbol/ambiguous -> literal -> miss) with bounded grok/deps enrichment on
+//! unique hits, plus a `follow` branch that executes the continuation hints a
+//! prior result handed back (see
+//! `.hallouminate/wiki/adr/tilth-search-v2-roadmap-006.md`).
 
 use std::path::Path;
 use std::time::Instant;
@@ -91,12 +93,16 @@ pub(in crate::mcp) fn tool_search_v2(
             follows.push(None);
         }
     }
+    // `searches` has not moved yet, so this is the session's first search
+    // exactly when nothing was recorded before the execution loop below.
+    let first_call = session.search_count() == 0;
     let mut results = Vec::with_capacity(entries.len());
     let mut hints = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
     for (entry, follow) in entries.iter().zip(&follows) {
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
+            session.record_follow();
             let result = follow.execute(cwd, bloom, client)?;
             (result, follow.kind.clone(), Vec::new(), None)
         } else {
@@ -124,45 +130,62 @@ pub(in crate::mcp) fn tool_search_v2(
             normalizations.push(diagnostic);
         }
     }
+    // Telemetry describes the search that ran, so every input is snapshotted
+    // here — before `reduce_response` may drop payloads and downgrade
+    // statuses. The trim is reported on its own as `budget_limited`.
+    let dependency_states: Vec<(bool, bool, bool)> = results
+        .iter()
+        .filter_map(|r| r.get("dependency_impact"))
+        .map(|d| {
+            (
+                d["coverage"] == "complete",
+                d["timed_out"] == true,
+                d["index_state"] == "unavailable",
+            )
+        })
+        .collect();
+    let partial = results.iter().any(|r| r["completeness"] == "partial");
+    let timeout = dependency_states.iter().any(|&(_, timed_out, _)| timed_out);
+    let dependency_coverage = if dependency_states.is_empty() {
+        1.0
+    } else {
+        let complete = dependency_states.iter().filter(|&&(c, _, _)| c).count();
+        f64::from(u32::try_from(complete).unwrap())
+            / f64::from(u32::try_from(dependency_states.len()).unwrap())
+    };
+    let shard_state = if dependency_states.is_empty() {
+        "none"
+    } else if dependency_states.iter().any(|&(_, _, missing)| missing) {
+        "unavailable"
+    } else {
+        "open"
+    };
+    // A multi-entry call has no single route; `routes_tried` keeps the detail.
+    let route = if routes_tried.len() > 1 {
+        "batch".to_string()
+    } else {
+        routes_tried[0].clone()
+    };
+
     let mut response = json!({"results": results, "hints": hints,
         "diagnostics": if normalizations.is_empty() { json!({}) } else { json!({"normalizations": normalizations}) }});
     let output = reduce_response(&mut response, budget)?;
-    let results = response["results"].as_array().unwrap();
-    let dependency_results: Vec<_> = results
-        .iter()
-        .filter_map(|r| r.get("dependency_impact"))
-        .collect();
-    let complete_count = dependency_results
-        .iter()
-        .filter(|d| d["coverage"] == "complete")
-        .count();
+    let budget_limited = response["results"]
+        .as_array()
+        .is_some_and(|results| results.iter().any(|r| r["budget_limited"] == true));
     let _ = telemetry.record(&SearchTelemetryRecord {
         verb: "tilth_search".into(),
         version: 2,
-        route: routes_tried[0].clone(),
+        route,
         routes_tried,
-        first_call: true,
+        first_call,
         latency_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         result_tokens: crate::types::estimate_tokens(output.len() as u64),
-        partial: results.iter().any(|r| r["completeness"] == "partial"),
-        timeout: dependency_results.iter().any(|d| d["timed_out"] == true),
-        dependency_coverage: if dependency_results.is_empty() {
-            1.0
-        } else {
-            f64::from(u32::try_from(complete_count).unwrap())
-                / f64::from(u32::try_from(dependency_results.len()).unwrap())
-        },
-        shard_state: if dependency_results.is_empty() {
-            "none"
-        } else if dependency_results
-            .iter()
-            .any(|d| d["index_state"] == "unavailable")
-        {
-            "unavailable"
-        } else {
-            "open"
-        }
-        .into(),
+        partial,
+        timeout,
+        budget_limited,
+        dependency_coverage,
+        shard_state: shard_state.into(),
         client: client.into(),
         worktree: worktree.into(),
     });
@@ -179,50 +202,81 @@ fn mark_partial(result: &mut Value) {
     result["completeness"] = json!("partial");
 }
 
+/// Optional payloads a budget trim may drop, as `(owner, field)`. A `None`
+/// owner addresses the result record itself, `Some(key)` a nested object.
+const REMOVABLE: [(Option<&str>, &str); 6] = [
+    (None, "core"),
+    (None, "preview"),
+    (None, "items"),
+    (None, "candidates"),
+    (Some("dependency_impact"), "imports"),
+    (Some("dependency_impact"), "dependents"),
+];
+
+/// Serialize `response`, dropping optional payloads largest-first until the
+/// token estimate fits `budget`. Candidates are sized once up front — dropping
+/// one never changes another's serialized size — and length is then tracked by
+/// exact deltas so the whole response is serialized only once at the end.
+/// Entries and hints are never removed, so a budget too small for the required
+/// metadata is an error rather than a lossy answer.
 fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> {
-    loop {
-        let output = serde_json::to_string(response).map_err(|e| e.to_string())?;
-        if crate::types::estimate_tokens(output.len() as u64) <= budget {
-            return Ok(output);
+    let output = serde_json::to_string(response).map_err(|e| e.to_string())?;
+    let mut len = output.len();
+    if crate::types::estimate_tokens(len as u64) <= budget {
+        return Ok(output);
+    }
+    let Some(results) = response["results"].as_array() else {
+        return Err("search response must carry a results array".into());
+    };
+    let mut candidates: Vec<(usize, Option<&str>, &str, usize)> = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        for (owner, field) in REMOVABLE {
+            let parent = match owner {
+                None => result.as_object(),
+                Some(key) => result.get(key).and_then(Value::as_object),
+            };
+            let Some(parent) = parent else { continue };
+            let Some(value) = parent.get(field) else {
+                continue;
+            };
+            // Dropping the field removes `"field":<value>` plus its separating
+            // comma, which is there whenever the owner keeps another member.
+            let size = field.len() + 3 + usize::from(parent.len() > 1) + value.to_string().len();
+            candidates.push((index, owner, field, size));
         }
-        // Remove the largest optional payload. Never remove an entry or alter a hint.
-        let mut largest = None;
-        for (index, result) in response["results"].as_array().unwrap().iter().enumerate() {
-            for key in [
-                "/core",
-                "/preview",
-                "/items",
-                "/candidates",
-                "/dependency_impact/imports",
-                "/dependency_impact/dependents",
-            ] {
-                if let Some(value) = result.pointer(key) {
-                    let size = value.to_string().len();
-                    if largest.is_none_or(|(_, _, previous)| size > previous) {
-                        largest = Some((index, key, size));
-                    }
-                }
-            }
+    }
+    // Stable sort: equally sized payloads keep result order, then `REMOVABLE` order.
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.3));
+
+    for (index, owner, field, size) in candidates {
+        if crate::types::estimate_tokens(len as u64) <= budget {
+            break;
         }
-        let Some((index, key, _)) = largest else {
-            return Err(format!(
-                "budget {budget} cannot fit required search metadata"
-            ));
-        };
         let result = &mut response["results"][index];
-        let (parent, field) = key.rsplit_once('/').unwrap();
-        result
-            .pointer_mut(parent)
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .remove(field);
-        if parent == "/dependency_impact" {
-            result["dependency_impact"]["coverage"] = json!("partial");
+        let removed = match owner {
+            None => result.as_object_mut().and_then(|o| o.remove(field)),
+            Some(key) => result[key].as_object_mut().and_then(|o| o.remove(field)),
+        };
+        if removed.is_none() {
+            continue;
+        }
+        len -= size;
+        // The trim markers below add bytes back; measure the record around them
+        // so `len` stays exact and the final serialization needs no re-check.
+        let before = result.to_string().len();
+        if let Some(key) = owner {
+            result[key]["coverage"] = json!("partial");
         }
         mark_partial(result);
         result["budget_limited"] = json!(true);
+        len = len + result.to_string().len() - before;
     }
+    if crate::types::estimate_tokens(len as u64) > budget {
+        return Err(format!(
+            "budget {budget} cannot fit required search metadata"
+        ));
+    }
+    serde_json::to_string(response).map_err(|e| e.to_string())
 }
 
 /// Route one query through the deterministic precedence: path -> regex ->
@@ -237,7 +291,7 @@ fn route_query(
     cache: &OutlineCache,
     session: &Session,
 ) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
-    session.record_search(query, true);
+    session.record_search(query);
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
     let candidate = cwd.join(query);
@@ -253,13 +307,8 @@ fn route_query(
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
-            let content_result = crate::search::search_content_raw(query, cwd, glob)?;
-            let mut result = raw_result(query, "path", &content_result);
-            if content_result.total_found > 0 {
-                result["preview"] =
-                    json!(crate::search::format_raw_result(&content_result, cache)?);
-            }
-            return Ok((result, "path".to_string(), Vec::new(), None));
+            let (result, route) = content_route(query, glob, cwd, cache, Some("path"))?;
+            return Ok((result, route, Vec::new(), None));
         }
         let result = base_result(query, "path", "ok");
         return Ok((result, "path".to_string(), Vec::new(), None));
@@ -321,17 +370,8 @@ fn route_query(
     }
 
     // 6. literal — content search (non-identifier phrases only).
-    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
-    let route = if content_result.total_found > 0 {
-        "literal"
-    } else {
-        "miss"
-    };
-    let mut result = raw_result(query, route, &content_result);
-    if content_result.total_found > 0 {
-        result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
-    }
-    Ok((result, route.to_string(), Vec::new(), None))
+    let (result, route) = content_route(query, glob, cwd, cache, None)?;
+    Ok((result, route, Vec::new(), None))
 }
 
 /// Route a bare identifier through the definitions-first symbol cascade:
@@ -395,20 +435,35 @@ fn route_identifier(
         result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
         return Ok((result, "literal".to_string(), Vec::new()));
     }
-    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
-    let route = if content_result.total_found > 0 {
-        "literal"
-    } else {
-        "miss"
-    };
-    let mut result = raw_result(query, route, &content_result);
+    let (mut result, route) = content_route(query, glob, cwd, cache, None)?;
     if sym_result.files_unreadable > 0 {
         mark_partial(&mut result);
     }
+    Ok((result, route, Vec::new()))
+}
+
+/// The literal-content tail shared by every route that ends in a content
+/// search. `route_name` pins the recorded route (the non-code path route);
+/// `None` derives `literal` on a hit and `miss` on none. A `preview` is
+/// attached only when the search actually found something.
+fn content_route(
+    query: &str,
+    glob: Option<&str>,
+    cwd: &Path,
+    cache: &OutlineCache,
+    route_name: Option<&str>,
+) -> Result<(Value, String), crate::error::TilthError> {
+    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+    let route = route_name.unwrap_or(if content_result.total_found > 0 {
+        "literal"
+    } else {
+        "miss"
+    });
+    let mut result = raw_result(query, route, &content_result);
     if content_result.total_found > 0 {
         result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
     }
-    Ok((result, route.to_string(), Vec::new()))
+    Ok((result, route.to_string()))
 }
 
 /// Split `query` into `(keyword, identifier)` when it is exactly a
@@ -1292,5 +1347,55 @@ mod tests {
         ] {
             assert!(call(&json!({"cwd": tmp.path(), "queries": [entry]})).is_err());
         }
+    }
+
+    /// Telemetry describes the search that ran, not the trimmed envelope: a
+    /// budget-trimmed batch reports `budget_limited` while `dependency_coverage`
+    /// keeps its pre-trim value, `route` collapses to `batch`, and `first_call`
+    /// is a session fact rather than a constant.
+    #[test]
+    fn telemetry_snapshots_pretrim_inputs_and_session_first_call() {
+        let (cache, session, bloom) = components();
+        let (telemetry, sink) = telemetry();
+        let args = json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [{"query": "detect_file_type"}, {"query": "detect_file_type"}],
+            "budget": 900,
+        });
+        let mut output = String::new();
+        for _ in 0..2 {
+            output = tool_search_v2(
+                &args,
+                &cache,
+                &session,
+                &bloom,
+                &telemetry,
+                "test-client",
+                "test-worktree",
+            )
+            .expect("budget fits the required metadata");
+        }
+        let emitted: Value = serde_json::from_str(&output).expect("valid json response");
+        let trimmed = emitted["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["budget_limited"] == true);
+        assert!(trimmed, "budget must have forced a trim: {output}");
+
+        let records: Vec<Value> = std::fs::read_to_string(sink.path().join("current.jsonl"))
+            .expect("telemetry file written")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid record"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["first_call"], true);
+        assert_eq!(records[1]["first_call"], false);
+        assert_eq!(records[0]["route"], "batch");
+        assert_eq!(records[0]["routes_tried"], json!(["symbol", "symbol"]));
+        assert_eq!(records[0]["budget_limited"], true);
+        // Pre-trim coverage: both hits resolved complete dependency impact even
+        // though the trim downgraded the coverage in the emitted response.
+        assert_eq!(records[0]["dependency_coverage"], 1.0);
     }
 }

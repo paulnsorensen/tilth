@@ -14,12 +14,6 @@
 //! functions are all `pub(crate)` here; `handles::DepsIndexHandles` is the
 //! one item re-exported from a submodule.
 
-// The wiring curd (a separate change) is the first crate-internal caller of
-// this module's public API; until it lands, everything here is unreachable
-// outside `#[cfg(test)]` and clippy's dead-code lint would otherwise fail
-// the build. Mirrors the same allow on `src/edit/tag.rs` for the same reason.
-#![allow(dead_code)]
-
 mod handles;
 mod paths;
 mod storage;
@@ -60,6 +54,7 @@ pub(crate) enum DepsError {
 pub(crate) struct HandleState {
     db: Arc<Database>,
     worktree_root: PathBuf,
+    #[allow(dead_code)] // read by `db_path()` under #[cfg(test)] only
     db_path: PathBuf,
 }
 
@@ -86,6 +81,7 @@ pub(crate) struct Coverage {
 
 /// Dependents of a target file, verified against current on-disk state.
 pub(crate) struct VerifiedPartial {
+    #[allow(dead_code)] // echoed back for callers that report the resolved target
     pub(crate) target: PathBuf,
     pub(crate) dependents: Vec<PathBuf>,
     pub(crate) coverage: Coverage,

@@ -40,19 +40,46 @@ class ContinuationBoundary(unittest.TestCase):
         return json.loads(harness.tool_result_text(response))
 
     def test_malformed_follow_shapes_are_rejected(self):
+        scope = str(self.cwd)
         cases = [
-            {"follow": None},
-            {"follow": {"kind": "fetch_callers"}},
-            {"follow": {"kind": "unknown", "target": {}}},
-            {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts"}}},
-            {"follow": {"kind": "fetch_callers", "target": {"path": "../fixture.ts", "line": 1, "name": "root", "scope": str(self.cwd)}}},
-            {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 0, "name": "root", "scope": str(self.cwd)}}},
-            {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 1, "name": "root", "scope": str(self.cwd), "extra": True}}},
+            ({"follow": None}, "follow hint requires kind"),
+            ({"follow": {"kind": "fetch_callers"}}, "invalid follow hint"),
+            ({"follow": {"kind": "unknown", "target": {}}}, "unknown continuation kind"),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts"}}},
+                "follow target requires line and name",
+            ),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "../fixture.ts", "line": 1, "name": "root", "scope": scope}}},
+                "follow target requires a normalized path",
+            ),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "/etc/hosts", "line": 1, "name": "root", "scope": scope}}},
+                "follow target requires a cwd-relative path",
+            ),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 1, "name": "root", "scope": "/tmp"}}},
+                "follow target scope does not match cwd",
+            ),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 0, "name": "root", "scope": scope}}},
+                "positive line",
+            ),
+            (
+                {"follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 1, "name": "root", "scope": scope, "extra": True}}},
+                "invalid follow hint",
+            ),
+            (
+                {"query": "root", "follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 1, "name": "root", "scope": scope}}},
+                "exactly one of query or follow",
+            ),
+            ({}, "exactly one of query or follow"),
         ]
-        for entry in cases:
+        for entry, expected in cases:
             with self.subTest(entry=entry):
                 response = self.call([entry])
                 self.assertTrue(harness.tool_is_error(response), response)
+                self.assertIn(expected, harness.tool_result_text(response))
 
     def test_follow_rejects_identity_drift_after_emission(self):
         first = self.payload([{"query": "root"}])
@@ -72,7 +99,7 @@ class ContinuationBoundary(unittest.TestCase):
         self.assertEqual(payload["results"][0]["resolved_as"], "fetch_callers")
         self.assertEqual(payload["results"][1]["query"], "caller")
 
-    def test_budget_error_keeps_required_metadata_and_valid_json(self):
+    def test_unfittable_budget_returns_explicit_error(self):
         response = self.call([{"query": "root"}], budget=1)
         self.assertTrue(harness.tool_is_error(response), response)
         self.assertIn("budget", harness.tool_result_text(response).lower())
