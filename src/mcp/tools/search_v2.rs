@@ -148,7 +148,34 @@ fn route_query(
         return Ok((result, "regex".to_string(), Vec::new()));
     }
 
-    // 3. symbol / ambiguous — bare identifier: prefer definitions, then reuse
+    // 3. filename-shaped miss — a bare basename with an extension that doesn't
+    // exist verbatim: suggest fuzzy-matched real paths instead of falling
+    // through to identifier/literal routing.
+    if !is_identifier(query)
+        && Path::new(query).extension().is_some()
+        && !query.contains('/')
+        && !cwd.join(query).exists()
+    {
+        if let crate::read::fuzzy_path::FuzzyResolution::Suggestions(suggestions) =
+            crate::read::fuzzy_path::resolve_fuzzy_path(
+                cwd,
+                query,
+                crate::read::fuzzy_path::GateProfile::Search,
+            )
+        {
+            if !suggestions.is_empty() {
+                let mut result = base_result(query, "path", "ambiguous");
+                result["candidates"] = json!(suggestions
+                    .iter()
+                    .map(|p| json!({"path": p}))
+                    .collect::<Vec<_>>());
+                let hint = json!({"kind": "disambiguate", "target": query});
+                return Ok((result, "path".to_string(), vec![hint]));
+            }
+        }
+    }
+
+    // 4. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
         let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
@@ -196,7 +223,7 @@ fn route_query(
         return Ok((result, "miss".to_string(), Vec::new()));
     }
 
-    // 4. literal — content search (non-identifier phrases only).
+    // 5. literal — content search (non-identifier phrases only).
     let content_result = crate::search::search_content_raw(query, cwd, glob)?;
     if content_result.total_found > 0 {
         let mut result = base_result(query, "literal", "ok");
@@ -204,7 +231,7 @@ fn route_query(
         return Ok((result, "literal".to_string(), Vec::new()));
     }
 
-    // 5. miss — nothing matched.
+    // 6. miss — nothing matched.
     let result = base_result(query, "miss", "miss");
     Ok((result, "miss".to_string(), Vec::new()))
 }
@@ -354,6 +381,21 @@ mod tests {
         let result = &resp["results"][0];
         assert_eq!(result["resolved_as"], "path");
         assert_eq!(result["status"], "ok");
+    }
+
+    #[test]
+    fn route_filename_shaped_miss_suggests_fuzzy_path_candidates() {
+        let resp = single_query("harness.py").expect("filename-shaped query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "path");
+        assert_eq!(result["status"], "ambiguous");
+        let candidates = result["candidates"].as_array().expect("candidates array");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c["path"] == "tests/mcp_v2/harness.py"),
+            "candidates must include tests/mcp_v2/harness.py: {candidates:?}"
+        );
     }
 
     #[test]
