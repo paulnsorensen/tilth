@@ -361,7 +361,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // produces a confusing read-oriented error on non-read operations.
     let budget_aware = matches!(
         tool,
-        "tilth_read" | "tilth_search" | "tilth_deps" | "tilth_diff" | "tilth_grok"
+        "tilth_read" | "tilth_deps" | "tilth_diff" | "tilth_grok"
     );
     if budget_aware {
         if let Some(b) = args.get("budget") {
@@ -777,6 +777,21 @@ mod tests {
                 "{tool} dispatch must refuse missing cwd with the teaching error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn dispatch_search_invalid_budget_records_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut services = Services::new(false);
+        services.telemetry = Arc::new(crate::telemetry::TelemetrySink::for_test(temp.path()));
+        let args = serde_json::json!({"cwd": temp.path(), "queries": [{"query": "anything"}], "budget": 0});
+        let err = dispatch_tool("tilth_search", &args, &services).unwrap_err();
+        assert!(err.contains("budget"));
+        let log = std::fs::read_to_string(temp.path().join("current.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let record: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(record["outcome"], "error");
+        assert_eq!(record["error_class"], "bad_budget");
     }
 
     // -- serve: no unsolicited roots/list handshake ---------------------------

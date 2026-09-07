@@ -19,7 +19,7 @@ use serde::Serialize;
 
 /// Schema version for [`SearchTelemetryRecord`]. Bump when fields change
 /// in a way that breaks readers of prior records.
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// Default per-file size cap before rotation.
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -52,6 +52,8 @@ pub(crate) struct SearchTelemetryRecord {
     pub shard_state: String,
     pub client: String,
     pub worktree: String,
+    pub outcome: String,
+    pub error_class: Option<String>,
 }
 
 /// Appends content-free [`SearchTelemetryRecord`]s to a rotating JSONL log.
@@ -186,6 +188,8 @@ mod tests {
             shard_state: "warm".to_string(),
             client: "claude-code".to_string(),
             worktree: "searchv2".to_string(),
+            outcome: "ok".to_string(),
+            error_class: None,
         }
     }
 
@@ -227,6 +231,8 @@ mod tests {
             "shard_state",
             "client",
             "worktree",
+            "outcome",
+            "error_class",
         ] {
             assert!(obj.contains_key(field), "missing field {field}");
         }

@@ -28,6 +28,31 @@ const REGEX_METACHARS: &[char] = &[
 mod continuations;
 use continuations::{Follow, Target};
 
+struct SearchFailure {
+    message: String,
+    class: &'static str,
+}
+
+impl SearchFailure {
+    fn new(message: impl Into<String>, class: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            class,
+        }
+    }
+}
+
+struct SearchRun {
+    response: String,
+    route: String,
+    routes_tried: Vec<String>,
+    partial: bool,
+    timeout: bool,
+    dependency_coverage: f64,
+    shard_state: String,
+    budget_limited: bool,
+}
+
 pub(in crate::mcp) fn tool_search_v2(
     args: &Value,
     cache: &OutlineCache,
@@ -38,64 +63,139 @@ pub(in crate::mcp) fn tool_search_v2(
     worktree: &str,
 ) -> Result<String, String> {
     let start = Instant::now();
-    let cwd = require_cwd(args)?;
+    let first_call = session.search_count() == 0;
+    let run = run_search_v2(args, cache, session, bloom, client);
+    let mut record = SearchTelemetryRecord {
+        verb: "tilth_search".into(),
+        version: crate::telemetry::SCHEMA_VERSION,
+        route: "error".into(),
+        routes_tried: Vec::new(),
+        first_call,
+        latency_ms: 0,
+        result_tokens: 0,
+        partial: false,
+        timeout: false,
+        budget_limited: false,
+        dependency_coverage: 0.0,
+        shard_state: "none".into(),
+        client: client.into(),
+        worktree: worktree.into(),
+        outcome: "ok".into(),
+        error_class: None,
+    };
+    let result = match run {
+        Ok(success) => {
+            record.route = success.route;
+            record.routes_tried = success.routes_tried;
+            record.result_tokens = crate::types::estimate_tokens(success.response.len() as u64);
+            record.partial = success.partial;
+            record.timeout = success.timeout;
+            record.budget_limited = success.budget_limited;
+            record.dependency_coverage = success.dependency_coverage;
+            record.shard_state = success.shard_state;
+            Ok(success.response)
+        }
+        Err(failure) => {
+            record.route = failure.class.into();
+            record.outcome = "error".into();
+            record.error_class = Some(failure.class.into());
+            Err(failure.message)
+        }
+    };
+    record.latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let _ = telemetry.record(&record);
+    result
+}
+
+fn run_search_v2(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &BloomFilterCache,
+    client: &str,
+) -> Result<SearchRun, SearchFailure> {
     let object = args
         .as_object()
-        .ok_or("search arguments must be an object")?;
-    if object
-        .keys()
-        .any(|k| !matches!(k.as_str(), "queries" | "cwd" | "budget"))
-    {
-        return Err("search accepts only queries, cwd, and budget".into());
-    }
+        .ok_or_else(|| SearchFailure::new("search arguments must be an object", "bad_object"))?;
+    // Keep dispatch error precedence while recording rejected budgets here.
     let budget = match args.get("budget") {
         None => crate::budget::DEFAULT_BUDGET,
         Some(value) => value
             .as_u64()
             .filter(|n| *n > 0)
-            .ok_or("budget must be a positive integer")?,
+            .ok_or_else(|| SearchFailure::new("budget must be a positive integer", "bad_budget"))?,
     };
+    let cwd = require_cwd(args).map_err(|e| SearchFailure::new(e, "bad_cwd"))?;
+    if object
+        .keys()
+        .any(|k| !matches!(k.as_str(), "queries" | "cwd" | "budget"))
+    {
+        return Err(SearchFailure::new(
+            "search accepts only queries, cwd, and budget",
+            "unknown_keys",
+        ));
+    }
     let entries = args
         .get("queries")
         .and_then(Value::as_array)
-        .ok_or("missing queries")?;
-    if entries.is_empty() || entries.len() > 10 {
-        return Err(format!(
-            "queries must contain 1-10 entries; got {}",
-            entries.len()
+        .ok_or_else(|| SearchFailure::new("missing queries", "missing_queries"))?;
+    if entries.is_empty() {
+        return Err(SearchFailure::new(
+            format!("queries must contain 1-10 entries; got {}", entries.len()),
+            "empty_queries",
         ));
     }
-    // Validate the full batch before any search changes session state; each
-    // follow hint is parsed once here and reused by the execution loop.
+    if entries.len() > 10 {
+        return Err(SearchFailure::new(
+            format!("queries must contain 1-10 entries; got {}", entries.len()),
+            "oversized_queries",
+        ));
+    }
     let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
     for entry in entries {
-        let object = entry.as_object().ok_or("each entry must be an object")?;
+        let object = entry
+            .as_object()
+            .ok_or_else(|| SearchFailure::new("each entry must be an object", "bad_query_entry"))?;
         if object.contains_key("query") == object.contains_key("follow") {
-            return Err("each entry requires exactly one of query or follow".into());
+            return Err(SearchFailure::new(
+                "each entry requires exactly one of query or follow",
+                "bad_query_entry",
+            ));
         }
         if let Some(hint) = object.get("follow") {
             if object.len() != 1 {
-                return Err("follow entries accept only follow".into());
+                return Err(SearchFailure::new(
+                    "follow entries accept only follow",
+                    "bad_follow",
+                ));
             }
-            follows.push(Some(Follow::parse(hint, cwd)?));
+            follows.push(Some(
+                Follow::parse(hint, cwd).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
+            ));
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
-                return Err("query entries accept only query and glob".into());
+                return Err(SearchFailure::new(
+                    "query entries accept only query and glob",
+                    "bad_query_entry",
+                ));
             }
             if !entry["query"].is_string() {
-                return Err("query must be a string".into());
+                return Err(SearchFailure::new(
+                    "query must be a string",
+                    "bad_query_entry",
+                ));
             }
             if entry.get("glob").is_some_and(|g| !g.is_string()) {
-                return Err("glob must be a string".into());
+                return Err(SearchFailure::new(
+                    "glob must be a string",
+                    "bad_query_entry",
+                ));
             }
             crate::search::walker(cwd, entry.get("glob").and_then(Value::as_str))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| SearchFailure::new(e.to_string(), "bad_query_entry"))?;
             follows.push(None);
         }
     }
-    // `searches` has not moved yet, so this is the session's first search
-    // exactly when nothing was recorded before the execution loop below.
-    let first_call = session.search_count() == 0;
     let mut results = Vec::with_capacity(entries.len());
     let mut hints = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
@@ -103,7 +203,9 @@ pub(in crate::mcp) fn tool_search_v2(
     for (entry, follow) in entries.iter().zip(&follows) {
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
-            let result = follow.execute(cwd, bloom, client)?;
+            let result = follow
+                .execute(cwd, bloom, client)
+                .map_err(|e| SearchFailure::new(e, "follow_error"))?;
             (result, follow.kind.clone(), Vec::new(), None)
         } else {
             route_query(
@@ -113,12 +215,13 @@ pub(in crate::mcp) fn tool_search_v2(
                 cache,
                 session,
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| SearchFailure::new(e.to_string(), "route_error"))?
         };
         if result.get("target").is_some() && follow.is_none() {
-            let target: Target =
-                serde_json::from_value(result["target"].clone()).map_err(|e| e.to_string())?;
-            result["dependency_impact"] = continuations::dependencies(&target, cwd, client)?;
+            let target: Target = serde_json::from_value(result["target"].clone())
+                .map_err(|e| SearchFailure::new(e.to_string(), "dependency_error"))?;
+            result["dependency_impact"] = continuations::dependencies(&target, cwd, client)
+                .map_err(|e| SearchFailure::new(e, "dependency_error"))?;
             if result["dependency_impact"]["coverage"] != "complete" {
                 mark_partial(&mut result);
             }
@@ -130,9 +233,6 @@ pub(in crate::mcp) fn tool_search_v2(
             normalizations.push(diagnostic);
         }
     }
-    // Telemetry describes the search that ran, so every input is snapshotted
-    // here — before `reduce_response` may drop payloads and downgrade
-    // statuses. The trim is reported on its own as `budget_limited`.
     let dependency_states: Vec<(bool, bool, bool)> = results
         .iter()
         .filter_map(|r| r.get("dependency_impact"))
@@ -160,36 +260,27 @@ pub(in crate::mcp) fn tool_search_v2(
     } else {
         "open"
     };
-    // A multi-entry call has no single route; `routes_tried` keeps the detail.
     let route = if routes_tried.len() > 1 {
         "batch".to_string()
     } else {
         routes_tried[0].clone()
     };
-
-    let mut response = json!({"results": results, "hints": hints,
-        "diagnostics": if normalizations.is_empty() { json!({}) } else { json!({"normalizations": normalizations}) }});
-    let output = reduce_response(&mut response, budget)?;
+    let mut response = json!({"results": results, "hints": hints, "diagnostics": if normalizations.is_empty() { json!({}) } else { json!({"normalizations": normalizations}) }});
+    let output = reduce_response(&mut response, budget)
+        .map_err(|e| SearchFailure::new(e, "budget_error"))?;
     let budget_limited = response["results"]
         .as_array()
         .is_some_and(|results| results.iter().any(|r| r["budget_limited"] == true));
-    let _ = telemetry.record(&SearchTelemetryRecord {
-        verb: "tilth_search".into(),
-        version: 2,
+    Ok(SearchRun {
+        response: output,
         route,
         routes_tried,
-        first_call,
-        latency_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-        result_tokens: crate::types::estimate_tokens(output.len() as u64),
         partial,
         timeout,
-        budget_limited,
         dependency_coverage,
         shard_state: shard_state.into(),
-        client: client.into(),
-        worktree: worktree.into(),
-    });
-    Ok(output)
+        budget_limited,
+    })
 }
 
 /// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
@@ -1349,6 +1440,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validation_and_execution_errors_emit_one_content_free_record() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().display().to_string();
+        std::fs::write(fixture.path().join("invalid_utf8.rs"), [0xff]).unwrap();
+        let secret = "telemetry-secret-7f2e";
+        let oversized: Vec<Value> = (0..11).map(|_| json!({"query": secret})).collect();
+        let cases = vec![
+            (
+                "nonobject",
+                json!(secret),
+                "search arguments must be an object",
+                "bad_object",
+            ),
+            (
+                "missing cwd",
+                json!({"queries": [{"query": secret}]}),
+                "missing required parameter \"cwd\"",
+                "bad_cwd",
+            ),
+            (
+                "relative cwd",
+                json!({"cwd": ".", "queries": [{"query": secret}]}),
+                "is relative",
+                "bad_cwd",
+            ),
+            (
+                "unknown key",
+                json!({"cwd": root, "queries": [{"query": secret}], "extra": true}),
+                "only queries, cwd, and budget",
+                "unknown_keys",
+            ),
+            (
+                "bad budget",
+                json!({"cwd": root, "queries": [{"query": secret}], "budget": 0}),
+                "budget must be a positive integer",
+                "bad_budget",
+            ),
+            (
+                "missing queries",
+                json!({"cwd": root}),
+                "missing queries",
+                "missing_queries",
+            ),
+            (
+                "empty queries",
+                json!({"cwd": root, "queries": []}),
+                "queries must contain 1-10 entries; got 0",
+                "empty_queries",
+            ),
+            (
+                "oversized queries",
+                json!({"cwd": root, "queries": oversized}),
+                "queries must contain 1-10 entries; got 11",
+                "oversized_queries",
+            ),
+            (
+                "nonobject entry",
+                json!({"cwd": root, "queries": [secret]}),
+                "each entry must be an object",
+                "bad_query_entry",
+            ),
+            (
+                "nonstring query",
+                json!({"cwd": root, "queries": [{"query": 7}]}),
+                "query must be a string",
+                "bad_query_entry",
+            ),
+            (
+                "nonstring glob",
+                json!({"cwd": root, "queries": [{"query": secret, "glob": 7}]}),
+                "glob must be a string",
+                "bad_query_entry",
+            ),
+            (
+                "invalid follow",
+                json!({"cwd": root, "queries": [{"follow": {"kind": "fetch_unknown", "target": {}}}]}),
+                "unknown continuation",
+                "bad_follow",
+            ),
+            (
+                "route error",
+                json!({"cwd": root, "queries": [{"query": "invalid_utf8.rs"}]}),
+                "UTF-8",
+                "route_error",
+            ),
+            (
+                "budget exhaustion",
+                json!({"cwd": root, "queries": [{"query": secret}], "budget": 1}),
+                "budget 1 cannot fit required search metadata",
+                "budget_error",
+            ),
+        ];
+
+        for (name, args, expected_error, expected_class) in cases {
+            let (cache, session, bloom) = components();
+            let (telemetry, sink) = telemetry();
+            let error = tool_search_v2(
+                &args,
+                &cache,
+                &session,
+                &bloom,
+                &telemetry,
+                "test-client",
+                "test-worktree",
+            )
+            .expect_err(name);
+            assert!(
+                error.contains(expected_error),
+                "{name}: expected {expected_error:?}, got {error:?}"
+            );
+
+            let log = std::fs::read_to_string(sink.path().join("current.jsonl"))
+                .expect("telemetry file written");
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 1, "{name}: exactly one telemetry record");
+            let record: Value = serde_json::from_str(lines[0]).expect("valid telemetry record");
+            assert_eq!(record["verb"], "tilth_search", "{name}");
+            assert_eq!(
+                record["version"],
+                crate::telemetry::SCHEMA_VERSION,
+                "{name}"
+            );
+            assert_eq!(record["outcome"], "error", "{name}");
+            assert_eq!(record["error_class"], expected_class, "{name}");
+            assert_eq!(record["route"], expected_class, "{name}");
+            assert!(record.get("query").is_none(), "{name}: query field leaked");
+            assert!(!lines[0].contains(secret), "{name}: query content leaked");
+        }
+    }
+
     /// Telemetry describes the search that ran, not the trimmed envelope: a
     /// budget-trimmed batch reports `budget_limited` while `dependency_coverage`
     /// keeps its pre-trim value, `route` collapses to `batch`, and `first_call`
@@ -1389,6 +1611,11 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("valid record"))
             .collect();
         assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record["outcome"], "ok");
+            assert_eq!(record["error_class"], Value::Null);
+            assert_eq!(record["version"], crate::telemetry::SCHEMA_VERSION);
+        }
         assert_eq!(records[0]["first_call"], true);
         assert_eq!(records[1]["first_call"], false);
         assert_eq!(records[0]["route"], "batch");

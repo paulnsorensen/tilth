@@ -9,7 +9,12 @@ sources:
 # Search Continuations Before MCP Verb Removal
 
 Search continuations replace the caller-selected search kind.
+PR #231 retires v1 and the temporary `tilth_search_v2` name.
+The public `tilth_search` name now selects the v2 engine.
 MCP grok/deps remain temporarily until Part B passes its removal and graduation gates.[^1]
+
+The original PR #242 description uses an older base and incorrectly says continuations were cut.
+Preserve the shipped continuation contract when adapting its telemetry fixes.[^1]
 
 ## Context
 
