@@ -1,3 +1,11 @@
+---
+slug: post-edit-parse-check
+status: retired
+retired: 2026-09-06
+superseded_by: "#221"
+retired_reason: Targeted the renamed tilth_edit (now tilth_write); the advisory post-write parse check now lives in issue #221.
+---
+
 # Post-edit tree-sitter parse check
 
 ## Problem
