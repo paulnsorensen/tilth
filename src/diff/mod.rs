@@ -214,6 +214,19 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
             cmd.arg(r);
         }
         DiffSource::Files(fa, fb) => {
+            // The MCP tool anchors both paths to absolute before we get here,
+            // so pin the git process to a directory guaranteed to exist.
+            // Otherwise git inherits the process cwd, which a parallel test may
+            // have pointed at a since-deleted tempdir (via set_current_dir),
+            // and `git diff --no-index` aborts with "Unable to read current
+            // working directory" before it ever reads the absolute file paths.
+            // Relative CLI paths still resolve against the inherited cwd, so
+            // leave it untouched for them.
+            if fa.is_absolute() && fb.is_absolute() {
+                if let Some(parent) = fa.parent() {
+                    cmd.current_dir(parent);
+                }
+            }
             cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
         }
         // Patch and Log are handled above

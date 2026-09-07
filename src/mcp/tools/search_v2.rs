@@ -23,6 +23,27 @@ const REGEX_METACHARS: &[char] = &[
     '\\', '+', '*', '?', '(', ')', '[', ']', '|', '^', '$', '{', '}',
 ];
 
+/// Route labels — also the `resolved_as` value carried on each result.
+mod route {
+    pub const PATH: &str = "path";
+    pub const REGEX: &str = "regex";
+    pub const SYMBOL: &str = "symbol";
+    pub const AMBIGUOUS: &str = "ambiguous";
+    pub const LITERAL: &str = "literal";
+    pub const MISS: &str = "miss";
+}
+
+/// Result `status` values.
+mod status {
+    pub const OK: &str = "ok";
+    pub const AMBIGUOUS: &str = "ambiguous";
+    pub const MISS: &str = "miss";
+}
+
+/// The only `completeness`/`coverage` value this cold-partial engine emits;
+/// enrichment is always run to completion or not at all.
+const COMPLETE: &str = "complete";
+
 pub(in crate::mcp) fn tool_search_v2(
     args: &Value,
     cache: &OutlineCache,
@@ -33,21 +54,90 @@ pub(in crate::mcp) fn tool_search_v2(
     worktree: &str,
 ) -> Result<String, String> {
     let start = Instant::now();
-    let cwd = require_cwd(args)?;
+    let run = run_search_v2(args, cache, session, bloom);
+
+    // Record telemetry on EVERY exit — success or failure. Early returns
+    // (bad args, rejected queries, a routing error) are 100% of the failure
+    // surface now that v1 is gone, and exactly the signal an operator needs,
+    // so no exit may slip past the sink.
+    let (route, routes_tried, result_tokens, outcome, error_class) = match &run {
+        Ok(r) => (
+            r.primary_route.clone(),
+            r.routes_tried.clone(),
+            crate::types::estimate_tokens(r.response_str.len() as u64),
+            "ok",
+            None,
+        ),
+        Err((_, class)) => (
+            (*class).to_string(),
+            Vec::new(),
+            0,
+            "error",
+            Some((*class).to_string()),
+        ),
+    };
+    let _ = telemetry.record(&SearchTelemetryRecord {
+        verb: "search_v2".to_string(),
+        version: 1,
+        route,
+        routes_tried,
+        first_call: true,
+        latency_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        result_tokens,
+        partial: false,
+        timeout: false,
+        dependency_coverage: if error_class.is_none() { 1.0 } else { 0.0 },
+        shard_state: "none".to_string(),
+        client: client.to_string(),
+        worktree: worktree.to_string(),
+        outcome: outcome.to_string(),
+        error_class,
+    });
+
+    run.map(|r| r.response_str).map_err(|(msg, _)| msg)
+}
+
+/// A successful search-v2 run: the serialized response plus the routing
+/// labels telemetry records.
+struct SearchRun {
+    response_str: String,
+    primary_route: String,
+    routes_tried: Vec<String>,
+}
+
+/// Run the query batch. Returns the serialized response and its routing
+/// labels, or `(message, error_class)` on any failure so the caller can
+/// record telemetry on every exit.
+fn run_search_v2(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &BloomFilterCache,
+) -> Result<SearchRun, (String, &'static str)> {
+    let cwd = require_cwd(args).map_err(|e| (e, "bad_cwd"))?;
     let queries = args
         .get("queries")
         .and_then(Value::as_array)
         .ok_or_else(|| {
+            (
             "missing required parameter \"queries\": pass an array of 1-10 {query, glob?} objects."
-                .to_string()
+                .to_string(),
+            "missing_queries",
+        )
         })?;
     if queries.is_empty() {
-        return Err("\"queries\" must contain 1-10 entries; got 0.".to_string());
+        return Err((
+            "\"queries\" must contain 1-10 entries; got 0.".to_string(),
+            "empty_queries",
+        ));
     }
     if queries.len() > 10 {
-        return Err(format!(
-            "\"queries\" must contain 1-10 entries; got {}.",
-            queries.len()
+        return Err((
+            format!(
+                "\"queries\" must contain 1-10 entries; got {}.",
+                queries.len()
+            ),
+            "oversized_queries",
         ));
     }
 
@@ -57,14 +147,16 @@ pub(in crate::mcp) fn tool_search_v2(
     let mut primary_route = String::new();
 
     for entry in queries {
-        let query = entry
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "each queries entry requires a \"query\" string.".to_string())?;
+        let query = entry.get("query").and_then(Value::as_str).ok_or_else(|| {
+            (
+                "each queries entry requires a \"query\" string.".to_string(),
+                "bad_query_entry",
+            )
+        })?;
         let glob = entry.get("glob").and_then(Value::as_str);
 
-        let (result, route, mut entry_hints) =
-            route_query(query, glob, cwd, cache, session, bloom).map_err(|e| e.to_string())?;
+        let (result, route, mut entry_hints) = route_query(query, glob, cwd, cache, session, bloom)
+            .map_err(|e| (e.to_string(), "route_error"))?;
         routes_tried.push(route.clone());
         if primary_route.is_empty() {
             primary_route = route;
@@ -78,25 +170,14 @@ pub(in crate::mcp) fn tool_search_v2(
         "hints": hints,
         "diagnostics": {},
     });
-    let response_str = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+    let response_str =
+        serde_json::to_string(&response).map_err(|e| (e.to_string(), "serialize_error"))?;
 
-    let _ = telemetry.record(&SearchTelemetryRecord {
-        verb: "search_v2".to_string(),
-        version: 1,
-        route: primary_route,
+    Ok(SearchRun {
+        response_str,
+        primary_route,
         routes_tried,
-        first_call: true,
-        latency_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-        result_tokens: crate::types::estimate_tokens(response_str.len() as u64),
-        partial: false,
-        timeout: false,
-        dependency_coverage: 1.0,
-        shard_state: "none".to_string(),
-        client: client.to_string(),
-        worktree: worktree.to_string(),
-    });
-
-    Ok(response_str)
+    })
 }
 
 /// Route one query through the deterministic precedence: path -> regex ->
@@ -118,20 +199,20 @@ fn route_query(
         if candidate.is_file() {
             let target_spec = format!("{query}:1");
             let (result, hints) =
-                unique_hit(&target_spec, "path", &candidate, cwd, bloom, session)?;
+                unique_hit(&target_spec, route::PATH, &candidate, cwd, bloom, session)?;
             let result = with_query(result, query);
-            return Ok((result, "path".to_string(), hints));
+            return Ok((result, route::PATH.to_string(), hints));
         }
-        let result = base_result(query, "path", "ok");
-        return Ok((result, "path".to_string(), Vec::new()));
+        let result = base_result(query, route::PATH, status::OK);
+        return Ok((result, route::PATH.to_string(), Vec::new()));
     }
 
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
     if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
         let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
-        let mut result = base_result(query, "regex", "ok");
+        let mut result = base_result(query, route::REGEX, status::OK);
         result["preview"] = json!(crate::search::format_raw_result(&search_result, cache)?);
-        return Ok((result, "regex".to_string(), Vec::new()));
+        return Ok((result, route::REGEX.to_string(), Vec::new()));
     }
 
     // 3. symbol / ambiguous — bare identifier: prefer definitions, then reuse
@@ -144,42 +225,43 @@ fn route_query(
                 .iter()
                 .find(|m| m.is_definition)
                 .expect("definitions == 1 implies one is_definition match");
-            let (result, hints) = unique_hit(query, "symbol", &target.path, cwd, bloom, session)?;
-            return Ok((result, "symbol".to_string(), hints));
+            let (result, hints) =
+                unique_hit(query, route::SYMBOL, &target.path, cwd, bloom, session)?;
+            return Ok((result, route::SYMBOL.to_string(), hints));
         }
         if sym_result.definitions > 1 {
-            let mut result = base_result(query, "ambiguous", "ambiguous");
+            let mut result = base_result(query, route::AMBIGUOUS, status::AMBIGUOUS);
             result["candidates"] = json!(candidates(&sym_result.matches, cwd));
             let hint = json!({"kind": "disambiguate", "target": query});
-            return Ok((result, "ambiguous".to_string(), vec![hint]));
+            return Ok((result, route::AMBIGUOUS.to_string(), vec![hint]));
         }
         if sym_result.total_found > 0 {
-            let mut result = base_result(query, "literal", "ok");
+            let mut result = base_result(query, route::LITERAL, status::OK);
             result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
-            return Ok((result, "literal".to_string(), Vec::new()));
+            return Ok((result, route::LITERAL.to_string(), Vec::new()));
         }
         let content_result = crate::search::search_content_raw(query, cwd, glob)?;
         if content_result.total_found > 0 {
-            let mut result = base_result(query, "literal", "ok");
+            let mut result = base_result(query, route::LITERAL, status::OK);
             result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
-            return Ok((result, "literal".to_string(), Vec::new()));
+            return Ok((result, route::LITERAL.to_string(), Vec::new()));
         }
 
-        let result = base_result(query, "miss", "miss");
-        return Ok((result, "miss".to_string(), Vec::new()));
+        let result = base_result(query, route::MISS, status::MISS);
+        return Ok((result, route::MISS.to_string(), Vec::new()));
     }
 
     // 4. literal — content search (non-identifier phrases only).
     let content_result = crate::search::search_content_raw(query, cwd, glob)?;
     if content_result.total_found > 0 {
-        let mut result = base_result(query, "literal", "ok");
+        let mut result = base_result(query, route::LITERAL, status::OK);
         result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
-        return Ok((result, "literal".to_string(), Vec::new()));
+        return Ok((result, route::LITERAL.to_string(), Vec::new()));
     }
 
     // 5. miss — nothing matched.
-    let result = base_result(query, "miss", "miss");
-    Ok((result, "miss".to_string(), Vec::new()))
+    let result = base_result(query, route::MISS, status::MISS);
+    Ok((result, route::MISS.to_string(), Vec::new()))
 }
 
 /// Overwrite the `"query"` field of an enrichment result built against a
@@ -194,7 +276,7 @@ fn base_result(query: &str, resolved_as: &str, status: &str) -> Value {
         "query": query,
         "resolved_as": resolved_as,
         "status": status,
-        "completeness": "complete",
+        "completeness": COMPLETE,
     })
 }
 
@@ -205,7 +287,7 @@ fn candidates(matches: &[Match], cwd: &Path) -> Vec<Value> {
         .iter()
         .map(|m| {
             json!({
-                "path": display_rel(&m.path, cwd),
+                "path": crate::format::rel(&m.path, cwd),
                 "line": m.line,
                 "is_definition": m.is_definition,
                 "def_name": m.def_name,
@@ -236,10 +318,10 @@ fn unique_hit(
     let deps_result = crate::search::deps::analyze_deps(target_path, cwd, bloom)?;
     let impact = crate::search::deps::format_deps(&deps_result, cwd, None);
 
-    let mut result = base_result(query, resolved_as, "ok");
+    let mut result = base_result(query, resolved_as, status::OK);
     result["core"] = json!(core);
     result["dependency_impact"] = json!({
-        "coverage": "complete",
+        "coverage": COMPLETE,
         "impact": impact,
     });
 
@@ -261,10 +343,6 @@ fn is_identifier(query: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-fn display_rel(path: &Path, cwd: &Path) -> String {
-    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
 }
 
 #[cfg(test)]
@@ -541,5 +619,37 @@ mod tests {
             !out.contains("routes_tried"),
             "response must never carry routes_tried: {out}"
         );
+    }
+
+    #[test]
+    fn error_exit_records_telemetry_with_error_class() {
+        // Every failure exit must still write a telemetry record so an
+        // operator has a grep-able signal for rejected calls — the record is
+        // no longer the last statement gated behind success.
+        let (cache, session, bloom) = components();
+        let (telemetry, tmp) = telemetry();
+        let args = json!({
+            "cwd": repo_root().to_str().unwrap(),
+            "queries": [],
+        });
+        let err = tool_search_v2(
+            &args,
+            &cache,
+            &session,
+            &bloom,
+            &telemetry,
+            "test-client",
+            "test-worktree",
+        )
+        .unwrap_err();
+        assert!(err.contains("1-10"), "empty batch must be refused: {err}");
+
+        let log = std::fs::read_to_string(tmp.path().join("current.jsonl"))
+            .expect("error exit must still persist a telemetry record");
+        let record: Value = serde_json::from_str(log.lines().next().expect("one record"))
+            .expect("valid telemetry record");
+        assert_eq!(record["outcome"], "error");
+        assert_eq!(record["error_class"], "empty_queries");
+        assert_eq!(record["route"], "empty_queries");
     }
 }

@@ -49,6 +49,13 @@ pub(crate) struct SearchTelemetryRecord {
     pub shard_state: String,
     pub client: String,
     pub worktree: String,
+    /// `"ok"` when the tool returned a response, `"error"` when it exited on
+    /// a rejected request or routing failure. Records are written on every
+    /// exit so an operator has a grep-able signal for failed calls.
+    pub outcome: String,
+    /// Stable label for the failure that produced `outcome == "error"`
+    /// (e.g. `"empty_queries"`, `"route_error"`); `None` on success.
+    pub error_class: Option<String>,
 }
 
 /// Appends content-free [`SearchTelemetryRecord`]s to a rotating JSONL log.
@@ -182,6 +189,8 @@ mod tests {
             shard_state: "warm".to_string(),
             client: "claude-code".to_string(),
             worktree: "searchv2".to_string(),
+            outcome: "ok".to_string(),
+            error_class: None,
         }
     }
 
@@ -222,6 +231,8 @@ mod tests {
             "shard_state",
             "client",
             "worktree",
+            "outcome",
+            "error_class",
         ] {
             assert!(obj.contains_key(field), "missing field {field}");
         }
