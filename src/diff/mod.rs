@@ -215,6 +215,13 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
         }
         DiffSource::Files(fa, fb) => {
             cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
+            if fa.is_absolute() && fb.is_absolute() {
+                // Absolute paths do not need the inherited cwd, which may have been deleted.
+                // Relative paths keep the inherited cwd so CLI resolution remains unchanged.
+                if let Some(root) = fa.ancestors().last() {
+                    cmd.current_dir(root);
+                }
+            }
         }
         // Patch and Log are handled above
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
@@ -1229,6 +1236,63 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_diff_cwd_regression() {
+        const MODE: &str = "TILTH_FILE_DIFF_TEST_MODE";
+        const ROOT: &str = "TILTH_FILE_DIFF_TEST_ROOT";
+        if let Ok(mode) = std::env::var(MODE) {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let mut first = root.join("first.txt");
+            let mut second = root.join("second.txt");
+            match mode.as_str() {
+                "deleted" => fs::remove_dir(std::env::current_dir().unwrap()).unwrap(),
+                "missing" => first = root.join("missing/first.txt"),
+                "unusable" => first = root.join("not-a-directory/first.txt"),
+                "relative" => {
+                    first = PathBuf::from("first.txt");
+                    second = PathBuf::from("second.txt");
+                }
+                "mixed" => first = PathBuf::from("first.txt"),
+                _ => panic!("unknown child mode: {mode}"),
+            }
+            let result = run_git_diff(&DiffSource::Files(first, second));
+            if matches!(mode.as_str(), "missing" | "unusable") {
+                // Git uses exit 1 for inaccessible operands; preserve the existing empty result.
+                assert_eq!(result.unwrap(), "");
+            } else {
+                let diff = result.unwrap();
+                assert!(diff.contains("-one\n+two\n"), "{diff}");
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("first.txt"), "one\n").unwrap();
+        fs::write(root.join("second.txt"), "two\n").unwrap();
+        fs::write(root.join("not-a-directory"), "file\n").unwrap();
+        let deleted = root.join("deleted-cwd");
+        fs::create_dir(&deleted).unwrap();
+        for mode in ["deleted", "missing", "unusable", "relative", "mixed"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diff::tests::file_diff_cwd_regression",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .envs([(MODE, mode), (ROOT, root.to_str().unwrap())])
+                .current_dir(if mode == "deleted" { &deleted } else { &root })
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            assert!(stdout.contains("1 passed; 0 failed;"), "{mode}: {stdout}");
+        }
+    }
+
     // 17. test_log_mode
     #[test]
     fn test_log_mode() {
@@ -2012,4 +2076,3 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 }
-// test
