@@ -132,14 +132,17 @@ jobs:
           # Retry each upload: a single transient api.github.com blip on one
           # matrix runner must not fail the whole rolling nightly.
           upload() {
-            for attempt in 1 2 3 4 5; do
+            local attempts=5
+            for attempt in $(seq 1 "$attempts"); do
               if gh release upload "$NIGHTLY_TAG" "$1" --clobber; then
                 return 0
               fi
-              echo "upload of $1 failed (attempt $attempt); retrying in $((attempt * 10))s" >&2
-              sleep $((attempt * 10))
+              if [ "$attempt" -lt "$attempts" ]; then
+                echo "upload of $1 failed (attempt $attempt); retrying in $((attempt * 10))s" >&2
+                sleep $((attempt * 10))
+              fi
             done
-            echo "upload of $1 failed after 5 attempts" >&2
+            echo "upload of $1 failed after $attempts attempts" >&2
             return 1
           }
           for f in tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip tilth-${{ matrix.target }}.tar.gz.sha256 tilth-${{ matrix.target }}.zip.sha256; do
