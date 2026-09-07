@@ -129,9 +129,22 @@ jobs:
           # upload whichever exists. Use `if` (not `[ -f ] && …`) so the loop's
           # final iteration on the absent extension exits 0 instead of failing
           # the step.
+          # Retry each upload: a single transient api.github.com blip on one
+          # matrix runner must not fail the whole rolling nightly.
+          upload() {
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$NIGHTLY_TAG" "$1" --clobber; then
+                return 0
+              fi
+              echo "upload of $1 failed (attempt $attempt); retrying in $((attempt * 10))s" >&2
+              sleep $((attempt * 10))
+            done
+            echo "upload of $1 failed after 5 attempts" >&2
+            return 1
+          }
           for f in tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip tilth-${{ matrix.target }}.tar.gz.sha256 tilth-${{ matrix.target }}.zip.sha256; do
             if [ -f "$f" ]; then
-              gh release upload "$NIGHTLY_TAG" "$f" --clobber
+              upload "$f"
             fi
           done
 
