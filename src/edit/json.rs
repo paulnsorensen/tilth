@@ -171,6 +171,44 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
     })
 }
 
+/// Every valid wire-level `op` name — the [`JsonOp`] serde tag values, in
+/// declaration order. Single source of truth for anything that lists valid
+/// ops; `valid_ops_match_json_op_variants` keeps it in lockstep with the enum.
+const VALID_OPS: &[&str] = &[
+    "replace",
+    "replace_text",
+    "delete",
+    "insert_before",
+    "insert_after",
+    "prepend",
+    "append",
+    "replace_block",
+    "delete_block",
+    "insert_after_block",
+    "create_file",
+    "delete_file",
+    "move_file",
+];
+
+fn valid_ops_list() -> String {
+    VALID_OPS
+        .iter()
+        .map(|op| format!("`{op}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The most common wrong-guess op names, mapped to the right one(s). Small
+/// match, not a framework — extend only for names actually seen in the wild.
+fn suggest_op(bad: &str) -> Option<&'static str> {
+    match bad {
+        "insert" => Some("`insert_after` or `insert_before`"),
+        "replace_lines" | "swap" => Some("`replace`"),
+        "create" | "seed" | "text" => Some("`create_file` or `replace_text`"),
+        _ => None,
+    }
+}
+
 /// The teaching example appended to a per-op deserialize error, tailored to the
 /// fumbled op `verb`. `replace_text` *is* find/replace, so it gets an old/new
 /// example instead of the misleading "not find/replace" clause; the file ops
@@ -214,11 +252,29 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     };
     let mut ops = Vec::with_capacity(raw.ops.len());
     for (j, ov) in raw.ops.into_iter().enumerate() {
-        let verb = ov
-            .get("op")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>")
-            .to_string();
+        let verb = match ov.get("op").and_then(Value::as_str) {
+            None => {
+                return Err(format!(
+                    "edits[{index}].ops[{j}] (path {:?}): each op needs \"op\": one of {}. {}",
+                    raw.path,
+                    valid_ops_list(),
+                    op_error_hint("")
+                ));
+            }
+            Some(v) if !VALID_OPS.contains(&v) => {
+                let suggestion = suggest_op(v)
+                    .map(|s| format!(" Did you mean {s}?"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "edits[{index}].ops[{j}] (path {:?}): op {v:?} is not a valid op — valid \
+                     ops are {}.{suggestion} {}",
+                    raw.path,
+                    valid_ops_list(),
+                    op_error_hint(v)
+                ));
+            }
+            Some(v) => v.to_string(),
+        };
         let parsed: JsonOp = serde_json::from_value(ov).map_err(|e| {
             format!(
                 "edits[{index}].ops[{j}] op \"{verb}\": {e}. {}",
@@ -650,8 +706,138 @@ mod tests {
             "unknown verb keeps the line example: {err}"
         );
         assert!(
-            err.contains("expected one of `replace`") && err.contains("`move_file`"),
+            err.contains("valid ops are `replace`") && err.contains("`move_file`"),
             "unknown verb lists the valid op verbs: {err}"
         );
+    }
+
+    #[test]
+    fn unknown_op_value_names_field_value_and_every_valid_op_and_suggests() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "text" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown op must fail");
+        assert!(err.contains("\"op\""), "must name the op field: {err}");
+        assert!(
+            err.contains("\"text\""),
+            "must quote the offending value: {err}"
+        );
+        for op in VALID_OPS {
+            assert!(err.contains(op), "must list valid op `{op}`: {err}");
+        }
+        assert!(
+            err.contains("`create_file`") && err.contains("`replace_text`"),
+            "must suggest create_file/replace_text for `text`: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_op_insert_suggests_insert_after() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "insert", "line": 1, "content": "x" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("unknown op must fail");
+        assert!(
+            err.contains("insert_after"),
+            "must suggest insert_after: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_op_lists_every_valid_op_with_index_and_path() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "start": 1, "end": 2, "content": "x" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("missing op must fail");
+        assert!(err.contains("ops[0]"), "must name the op index: {err}");
+        assert!(err.contains("a.rs"), "must name the section path: {err}");
+        assert!(
+            err.contains("needs \"op\": one of"),
+            "must teach the required field: {err}"
+        );
+        for op in VALID_OPS {
+            assert!(err.contains(op), "must list valid op `{op}`: {err}");
+        }
+    }
+
+    #[test]
+    fn insert_after_with_start_instead_of_line_names_line() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "insert_after", "start": 1, "content": "x" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("start instead of line must fail");
+        assert!(
+            err.contains("line"),
+            "must name the expected field `line`: {err}"
+        );
+    }
+
+    #[test]
+    fn replace_with_line_instead_of_start_end_names_start_and_end() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "0000",
+            "ops": [{ "op": "replace", "line": 1, "content": "x" }]
+        }]);
+        let err = lower_edits(&edits).expect_err("line instead of start/end must fail");
+        assert!(err.contains("start"), "must name `start`: {err}");
+        assert!(err.contains("end"), "must name `end`: {err}");
+    }
+
+    #[test]
+    fn valid_ops_match_json_op_variants() {
+        fn op_name(op: &JsonOp) -> &'static str {
+            match op {
+                JsonOp::Replace { .. } => "replace",
+                JsonOp::TextSwap { .. } => "replace_text",
+                JsonOp::Delete { .. } => "delete",
+                JsonOp::InsertBefore { .. } => "insert_before",
+                JsonOp::InsertAfter { .. } => "insert_after",
+                JsonOp::Prepend { .. } => "prepend",
+                JsonOp::Append { .. } => "append",
+                JsonOp::ReplaceBlock { .. } => "replace_block",
+                JsonOp::DeleteBlock { .. } => "delete_block",
+                JsonOp::InsertAfterBlock { .. } => "insert_after_block",
+                JsonOp::CreateFile { .. } => "create_file",
+                JsonOp::DeleteFile => "delete_file",
+                JsonOp::MoveFile { .. } => "move_file",
+            }
+        }
+        let samples: Vec<(&str, Value)> = VALID_OPS
+            .iter()
+            .map(|&name| {
+                let sample = match name {
+                    "replace" => json!({ "op": "replace", "start": 1, "end": 2, "content": "x" }),
+                    "replace_text" => json!({ "op": "replace_text", "old": "a", "new": "b" }),
+                    "delete" => json!({ "op": "delete", "start": 1, "end": 2 }),
+                    "insert_before" => json!({ "op": "insert_before", "line": 1, "content": "x" }),
+                    "insert_after" => json!({ "op": "insert_after", "line": 1, "content": "x" }),
+                    "prepend" => json!({ "op": "prepend", "content": "x" }),
+                    "append" => json!({ "op": "append", "content": "x" }),
+                    "replace_block" => json!({ "op": "replace_block", "at": 1, "content": "x" }),
+                    "delete_block" => json!({ "op": "delete_block", "at": 1 }),
+                    "insert_after_block" => {
+                        json!({ "op": "insert_after_block", "at": 1, "content": "x" })
+                    }
+                    "create_file" => json!({ "op": "create_file", "content": "x" }),
+                    "delete_file" => json!({ "op": "delete_file" }),
+                    "move_file" => json!({ "op": "move_file", "dest": "b.rs" }),
+                    other => panic!("unhandled VALID_OPS entry: {other}"),
+                };
+                (name, sample)
+            })
+            .collect();
+        assert_eq!(samples.len(), VALID_OPS.len());
+        for (name, sample) in samples {
+            let op: JsonOp = serde_json::from_value(sample).expect("valid sample must deserialize");
+            assert_eq!(
+                op_name(&op),
+                name,
+                "VALID_OPS entry `{name}` must round-trip"
+            );
+        }
     }
 }
