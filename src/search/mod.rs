@@ -1263,9 +1263,22 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
     }
 }
 
+/// Cap on entries visited by the basename-fallback walk below. A pathological
+/// tree (huge monorepo, deep nesting) must not be able to consume the whole
+/// request budget just because a single-word query missed the ranked matches.
+const BASENAME_FALLBACK_WALK_CAP: usize = 20_000;
+
 /// Fallback: lightweight directory walk to find a basename-matching file
-/// when it didn't survive ranking/truncation in the match set.
+/// when it didn't survive ranking/truncation in the match set. Skips the same
+/// junk directories as the main search walker (`SKIP_DIRS`, via
+/// `skip_dir_entry`) and stops after visiting `BASENAME_FALLBACK_WALK_CAP`
+/// entries, so `node_modules`/`.git`/nested worktree checkouts can neither be
+/// matched nor stall the walk.
 fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
+    find_basename_fallback_capped(scope, query_lower, BASENAME_FALLBACK_WALK_CAP)
+}
+
+fn find_basename_fallback_capped(scope: &Path, query_lower: &str, cap: usize) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
@@ -1280,9 +1293,20 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .max_depth(Some(6))
+        .sort_by_file_name(std::cmp::Ord::cmp)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|ft| ft.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| skip_dir_entry(entry.path(), name)))
+        })
         .build();
 
-    for entry in walker.flatten() {
+    for (visited, entry) in walker.flatten().enumerate() {
+        if visited >= cap {
+            break;
+        }
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -2121,6 +2145,65 @@ mod tests {
             names.contains(&"kept.rs".to_string()),
             "plain worktrees/ source must be searchable: {names:?}"
         );
+    }
+
+    // ── basename-fallback walk unit tests ──
+
+    #[test]
+    fn find_basename_fallback_skips_junk_dirs_and_finds_real_source() {
+        // The only source hit sits under `src/`; a same-named file under
+        // `node_modules/` and a same-named file inside a nested worktree
+        // checkout must never win, even though `.worktrees` sorts first.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("widget.rs"), "fn widget() {}").unwrap();
+
+        let nm_dir = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm_dir).unwrap();
+        std::fs::write(nm_dir.join("widget.js"), "").unwrap();
+
+        let wt_dir = tmp.path().join(".worktrees").join("wt1");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+        std::fs::write(wt_dir.join(".git"), "gitdir: elsewhere").unwrap();
+        std::fs::write(wt_dir.join("widget.rs"), "fn buried() {}").unwrap();
+
+        let found = find_basename_fallback(tmp.path(), "widget");
+        assert_eq!(found, Some(src_dir.join("widget.rs")));
+    }
+
+    #[test]
+    fn find_basename_fallback_returns_none_when_only_match_is_in_skipped_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm_dir = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&nm_dir).unwrap();
+        std::fs::write(nm_dir.join("gadget.js"), "").unwrap();
+
+        let found = find_basename_fallback(tmp.path(), "gadget");
+        assert_eq!(
+            found, None,
+            "match under a skipped dir must not surface: {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_basename_fallback_stops_at_visited_cap() {
+        // `zzz_target.rs` sorts after the 30 noise files, so a walk that
+        // respects the cap gives up before ever reaching it.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(tmp.path().join(format!("noise{i:02}.rs")), "").unwrap();
+        }
+        std::fs::write(tmp.path().join("zzz_target.rs"), "fn main() {}").unwrap();
+
+        let capped = find_basename_fallback_capped(tmp.path(), "zzz_target", 5);
+        assert_eq!(
+            capped, None,
+            "walk must terminate at the cap before reaching the match: {capped:?}"
+        );
+
+        let uncapped = find_basename_fallback_capped(tmp.path(), "zzz_target", 1000);
+        assert_eq!(uncapped, Some(tmp.path().join("zzz_target.rs")));
     }
 
     #[test]
