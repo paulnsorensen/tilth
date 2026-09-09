@@ -42,10 +42,24 @@ fs.mkdirSync(binDir, { recursive: true });
 console.log(`tilth: downloading ${target} nightly binary...`);
 
 const MAX_REDIRECTS = 5;
+const MAX_ATTEMPTS = 4;
+const RETRY_BACKOFF_MS = [1000, 2000, 4000];
+
+function isRetryableStatus(code) {
+  return code === 429 || code === 404 || (code >= 500 && code < 600);
+}
+
+function retryDownload(url, depth, callback, attempt, reason) {
+  const delayMs = RETRY_BACKOFF_MS[attempt - 1];
+  console.error(
+    `tilth: download failed (${reason}), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delayMs / 1000}s`,
+  );
+  setTimeout(() => follow(url, depth, callback, attempt + 1), delayMs);
+}
 
 // HTTPS-only, depth-capped: this binary is executed after download, so never
 // let a redirect downgrade to plaintext or loop.
-function follow(url, depth, callback) {
+function follow(url, depth, callback, attempt = 1) {
   if (!url.startsWith("https:")) {
     console.error(`tilth: refusing non-HTTPS download URL: ${url}`);
     process.exit(1);
@@ -58,7 +72,10 @@ function follow(url, depth, callback) {
     if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
       res.resume();
       // Location may be relative; resolve against the current URL before recursing.
-      follow(new URL(res.headers.location, url).href, depth + 1, callback);
+      follow(new URL(res.headers.location, url).href, depth + 1, callback, attempt);
+    } else if (isRetryableStatus(res.statusCode) && attempt < MAX_ATTEMPTS) {
+      res.resume();
+      retryDownload(url, depth, callback, attempt, `HTTP ${res.statusCode}`);
     } else if (res.statusCode !== 200) {
       console.error(`tilth: download failed (HTTP ${res.statusCode})`);
       console.error(`URL: ${url}`);
@@ -69,6 +86,10 @@ function follow(url, depth, callback) {
     }
   });
   req.on("error", (err) => {
+    if (attempt < MAX_ATTEMPTS) {
+      retryDownload(url, depth, callback, attempt, err.message);
+      return;
+    }
     console.error(`tilth: download failed: ${err.message}`);
     console.error("Install manually: cargo install --git https://github.com/paulnsorensen/tilth");
     process.exit(1);
