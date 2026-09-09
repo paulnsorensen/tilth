@@ -197,8 +197,15 @@ jobs:
           # Capture exit code + both streams instead of letting `set -e` abort
           # silently on `output=$(...)`, which would swallow all diagnostics.
           set +e
-          output=$(npx --yes @paulnsorensen/tilth-nightly@latest --version 2>stderr.txt)
-          code=$?
+          for attempt in 1 2 3; do
+            output=$(npx --yes @paulnsorensen/tilth-nightly@latest --version 2>stderr.txt)
+            code=$?
+            if [ "$code" -eq 0 ] && [ -n "$output" ]; then
+              break
+            fi
+            echo "smoke test attempt $attempt/3 failed (exit=$code), retrying in 20s"
+            sleep 20
+          done
           set -e
           echo "npx exit code: $code"
           echo "--- stdout ---"
