@@ -360,9 +360,96 @@ fn find_overlay_by_path<'a>(overlays: &'a [FileOverlay], query: &str) -> Option<
     })
 }
 
-/// Build a "not found" error for `missing`, appending up to 3 similar overlay
-/// paths as a suggest-only "did you mean" clause when any score.
+const MAX_EXTENSION_MATCHES: usize = 5;
+const MAX_TOP_DIRS: usize = 8;
+
+/// Extracts the extension from an extension-shaped scope (`.tf` or `*.tf`).
+/// Returns `None` for anything that also looks like a path (contains `/`), or
+/// when an overlay's first path component equals `scope` — a dot-directory
+/// like `.github` that genuinely has changes is a directory, not a bare
+/// extension, so this falls through to the fuzzy path instead.
+fn extension_shaped<'a>(scope: &'a str, overlays: &[FileOverlay]) -> Option<&'a str> {
+    let ext = if let Some(rest) = scope.strip_prefix("*.") {
+        (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+    } else {
+        scope
+            .strip_prefix('.')
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+    }?;
+    let has_matching_dir = overlays.iter().any(|o| {
+        o.path
+            .components()
+            .next()
+            .is_some_and(|c| c.as_os_str() == scope)
+    });
+    (!has_matching_dir).then_some(ext)
+}
+
+/// True when `scope` names a directory: either a trailing slash, or (when
+/// the repo root is resolvable) an existing directory on disk under it.
+fn directory_shaped(scope: &str) -> bool {
+    if scope.ends_with('/') {
+        return true;
+    }
+    repo_root().is_some_and(|root| root.join(scope).is_dir())
+}
+
+/// Build the "extension, not a path" error, listing changed files with that
+/// extension (capped at `MAX_EXTENSION_MATCHES`, then `+N more`).
+fn extension_not_found_error(scope: &str, ext: &str, overlays: &[FileOverlay]) -> String {
+    let mut matches: Vec<String> = overlays
+        .iter()
+        .filter(|o| o.path.extension().and_then(|e| e.to_str()) == Some(ext))
+        .map(|o| o.path.to_string_lossy().into_owned())
+        .collect();
+    matches.sort();
+    let prefix = format!(
+        "'{scope}' is an extension, not a path; tilth_diff scopes are a file, file:function, or directory."
+    );
+    if matches.is_empty() {
+        format!("{prefix} no changed files have that extension")
+    } else {
+        let shown = matches.len().min(MAX_EXTENSION_MATCHES);
+        let mut list = matches[..shown].join(", ");
+        if matches.len() > shown {
+            let _ = write!(list, ", +{} more", matches.len() - shown);
+        }
+        format!("{prefix} Changed files with that extension: {list}")
+    }
+}
+
+/// Build the "no changed files under this directory" error, listing the
+/// top-level directories that do have changes (capped at `MAX_TOP_DIRS`).
+fn directory_not_found_error(scope: &str, overlays: &[FileOverlay]) -> String {
+    let trimmed = scope.trim_end_matches('/');
+    let mut top_dirs: Vec<String> = overlays
+        .iter()
+        .filter_map(|o| {
+            let mut components = o.path.components();
+            let first = components.next()?;
+            components.next()?;
+            Some(first.as_os_str().to_string_lossy().into_owned())
+        })
+        .collect();
+    top_dirs.sort();
+    top_dirs.dedup();
+    top_dirs.truncate(MAX_TOP_DIRS);
+    format!(
+        "no changed files under '{trimmed}/'; changed top-level dirs: {}",
+        top_dirs.join(", ")
+    )
+}
+
+/// Build a "not found" error for `missing`, classifying extension- and
+/// directory-shaped misses before falling back to the fuzzy "did you mean"
+/// clause (up to 3 similar overlay paths) for file-shaped misses.
 fn not_found_error(missing: &str, overlays: &[FileOverlay]) -> String {
+    if directory_shaped(missing) {
+        return directory_not_found_error(missing, overlays);
+    }
+    if let Some(ext) = extension_shaped(missing, overlays) {
+        return extension_not_found_error(missing, ext, overlays);
+    }
     let candidates: Vec<String> = overlays
         .iter()
         .map(|o| o.path.to_string_lossy().into_owned())
@@ -1554,6 +1641,145 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             !err.contains("did you mean"),
             "expected no suggestion for unrelated garbage path:\n{err}"
+        );
+    }
+
+    fn overlay_at(path: &str) -> FileOverlay {
+        FileOverlay {
+            path: PathBuf::from(path),
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+        }
+    }
+
+    // 25b. test_not_found_error_extension_shaped_lists_matches
+    #[test]
+    fn test_not_found_error_extension_shaped_lists_matches() {
+        let overlays = vec![
+            overlay_at("infra/a.tf"),
+            overlay_at("infra/b.tf"),
+            overlay_at("src/main.rs"),
+        ];
+        let err = not_found_error(".tf", &overlays);
+        assert!(
+            err.contains("'.tf' is an extension, not a path"),
+            "expected extension classification in:\n{err}"
+        );
+        assert!(
+            err.contains("tilth_diff scopes are a file, file:function, or directory"),
+            "expected scope-shape teaching in:\n{err}"
+        );
+        assert!(
+            err.contains("Changed files with that extension: infra/a.tf, infra/b.tf"),
+            "expected matching .tf files listed in:\n{err}"
+        );
+    }
+
+    // 25c. test_not_found_error_extension_shaped_no_matches
+    #[test]
+    fn test_not_found_error_extension_shaped_no_matches() {
+        let overlays = vec![overlay_at("src/main.rs")];
+        let err = not_found_error("*.tf", &overlays);
+        assert!(
+            err.contains("'*.tf' is an extension, not a path"),
+            "expected extension classification in:\n{err}"
+        );
+        assert!(
+            err.contains("no changed files have that extension"),
+            "expected no-matches clause in:\n{err}"
+        );
+    }
+
+    // 25d. test_not_found_error_extension_shaped_caps_list
+    #[test]
+    fn test_not_found_error_extension_shaped_caps_list() {
+        let overlays = vec![
+            overlay_at("a.tf"),
+            overlay_at("b.tf"),
+            overlay_at("c.tf"),
+            overlay_at("d.tf"),
+            overlay_at("e.tf"),
+            overlay_at("f.tf"),
+            overlay_at("g.tf"),
+        ];
+        let err = not_found_error(".tf", &overlays);
+        assert!(
+            err.contains("a.tf, b.tf, c.tf, d.tf, e.tf, +2 more"),
+            "expected capped list with '+2 more' in:\n{err}"
+        );
+    }
+
+    // 25d2. test_not_found_error_dot_directory_trailing_slash_no_changes
+    #[test]
+    fn test_not_found_error_dot_directory_trailing_slash_no_changes() {
+        let overlays = vec![overlay_at("src/main.rs")];
+        let err = not_found_error(".github/", &overlays);
+        assert!(
+            err.contains("no changed files under '.github/'"),
+            "expected directory classification for trailing-slash dot-dir in:\n{err}"
+        );
+        assert!(
+            !err.contains("is an extension, not a path"),
+            "must not misclassify a dot-directory as an extension:\n{err}"
+        );
+    }
+
+    // 25d3. test_not_found_error_dot_directory_with_changes_falls_through
+    #[test]
+    fn test_not_found_error_dot_directory_with_changes_falls_through() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let prev = std::env::current_dir().unwrap();
+        // An empty tempdir outside any git repo: `repo_root()` returns None,
+        // so `directory_shaped` falls back to trailing-slash-only and can't
+        // find `.github` on disk. The overlay-based guard in
+        // `extension_shaped` must still refuse to treat `.github` as an
+        // extension, since an overlay lives under `.github/`.
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let overlays = vec![overlay_at(".github/workflows/ci.yml")];
+        let err = not_found_error(".github", &overlays);
+        std::env::set_current_dir(&prev).unwrap();
+        assert!(
+            !err.contains("is an extension, not a path"),
+            "expected no extension misclassification when an overlay has changes under the dir:\n{err}"
+        );
+    }
+
+    // 25e. test_not_found_error_directory_shaped_trailing_slash
+    #[test]
+    fn test_not_found_error_directory_shaped_trailing_slash() {
+        let overlays = vec![
+            overlay_at("src/main.rs"),
+            overlay_at("tests/foo.rs"),
+            overlay_at("infra/main.tf"),
+        ];
+        let err = not_found_error("docs/", &overlays);
+        assert!(
+            err.contains("no changed files under 'docs/'"),
+            "expected directory classification in:\n{err}"
+        );
+        assert!(
+            err.contains("changed top-level dirs: infra, src, tests"),
+            "expected sorted top-level dirs in:\n{err}"
+        );
+    }
+
+    // 25f. test_not_found_error_directory_shaped_exists_on_disk
+    #[test]
+    fn test_not_found_error_directory_shaped_exists_on_disk() {
+        // No trailing slash; classified as directory-shaped because `src` is a
+        // real directory under this crate's repo root at test time. Hold
+        // CWD_LOCK so a concurrent run_diff_in test can't chdir underneath us.
+        let _lock = CWD_LOCK.lock().unwrap();
+        let overlays = vec![overlay_at("tests/foo.rs")];
+        let err = not_found_error("src", &overlays);
+        assert!(
+            err.contains("no changed files under 'src/'"),
+            "expected directory classification for an on-disk dir in:\n{err}"
+        );
+        assert!(
+            err.contains("changed top-level dirs: tests"),
+            "expected top-level dirs in:\n{err}"
         );
     }
 

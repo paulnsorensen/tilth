@@ -207,7 +207,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "File suffix or, in overview only, checkout-relative directory; log accepts files only."
+                        "description": "File, file:function, or, in overview only, checkout-relative directory; log accepts files only."
                     },
                     "a": {
                         "type": "string",
