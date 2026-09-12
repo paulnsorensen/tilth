@@ -3,10 +3,11 @@
 //! `packages/hashline/src/recovery.ts`.
 //!
 //! Strategy order:
-//! 1. Replay ops on the cached snapshot, diff snapshot→result, and apply that
-//!    delta onto the live content with EXACT context matching (diffy's
-//!    `apply` shifts position but never fuzzes context — the fuzz-0 equivalent;
-//!    it returns `Err` cleanly on no-match, never panics).
+//! 1. Replay ops on the cached snapshot, then 3-way-merge base=snapshot,
+//!    ours=result, theirs=live via `diffy::merge`. An external change to a
+//!    different region — even one sitting inside the model patch's context
+//!    window — merges cleanly; a real overlap on the same region returns a
+//!    conflict (`Err`) that recovery rejects rather than writing markers.
 //! 2. Session-chain fallback: when the snapshot was not the head, replay ops
 //!    directly onto live iff line counts match AND every anchor line is
 //!    byte-identical between snapshot and live.
@@ -103,9 +104,12 @@ fn merge_onto_live(path: &Path, snapshot: &str, live: &str, ops: &[Op]) -> Optio
     if applied.text == snapshot {
         return None;
     }
-    let patch = diffy::create_patch(snapshot, &applied.text);
-    // diffy::apply matches context exactly (fuzz-0) and returns Err on no-match.
-    let merged = diffy::apply(live, &patch).ok()?;
+    // True three-way merge: base = tagged snapshot, ours = the model result,
+    // theirs = live. External edits to lines that merely sit inside the model
+    // patch's context window (but do not touch the same region) merge cleanly;
+    // only a real overlap on the same region returns Err (conflict markers),
+    // which we reject rather than write.
+    let merged = diffy::merge(snapshot, &applied.text, live).ok()?;
     if merged == live {
         return None;
     }
@@ -308,6 +312,44 @@ mod tests {
             recovered,
             "PREPENDED\nline1\nline2\nCHANGED\nline4\nline5\n"
         );
+    }
+
+    /// The bug this fix targets: on a FRESH read (the recorded tag is still the
+    /// head, so strategy 2 never runs) an external edit to a line that merely
+    /// sits inside the model patch's context window must merge with the model
+    /// edit, not hard-reject. The old exact-context patch apply failed here
+    /// because the changed context line no longer matched live. Both op shapes
+    /// (line replace and text swap) must land both non-overlapping changes.
+    #[test]
+    fn nearby_nonoverlapping_drift_merges_on_head_tag() {
+        let snapshot =
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+        // External edit changed line 2 only; the model edits line 5.
+        let live =
+            "one\nTWO_EXTERNAL\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+        let expected = "one\nTWO_EXTERNAL\nthree\nfour\nFIVE_MODEL\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+
+        // Line-op variant: {"op":"replace","start":5,"end":5,...}.
+        let mut store = SnapshotStore::new();
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, snapshot, []).unwrap();
+        assert_eq!(store.head_tag(&key), Some(tag), "tag must be head");
+        let (recovered, _) = try_recover(&store, &p(), tag, &swap(5, "FIVE_MODEL"), live)
+            .expect("line-op nearby drift must merge");
+        assert_eq!(recovered, expected);
+        assert!(recovered.ends_with('\n'), "trailing newline preserved");
+
+        // Text-swap variant: {"op":"replace_text","old":"five",...}.
+        let mut store = SnapshotStore::new();
+        let tag = store.record(&key, snapshot, []).unwrap();
+        let ops = vec![Op::TextSwap {
+            old: "five".to_string(),
+            new: "FIVE_MODEL".to_string(),
+        }];
+        let (recovered, _) =
+            try_recover(&store, &p(), tag, &ops, live).expect("text-swap nearby drift must merge");
+        assert_eq!(recovered, expected);
+        assert!(recovered.ends_with('\n'), "trailing newline preserved");
     }
 
     #[test]

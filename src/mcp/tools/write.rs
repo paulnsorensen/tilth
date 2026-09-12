@@ -639,6 +639,54 @@ mod tests {
         );
     }
 
+    /// The #195 regression at the real read-to-write seam: one live Session
+    /// reads the file (recording the head tag), an external process changes a
+    /// nearby line, and the model edits a different line inside the same patch
+    /// context window. The old exact-context patch apply rejected this; the
+    /// 3-way merge must land BOTH non-overlapping changes. Runs both op shapes
+    /// against the same freshly-read head tag.
+    #[test]
+    fn nearby_external_drift_merges_both_changes_not_rejects() {
+        let base = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+        let external =
+            "one\nTWO_EXTERNAL\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+        let expected = "one\nTWO_EXTERNAL\nthree\nfour\nFIVE_MODEL\nsix\nseven\neight\nnine\nten\neleven\ntwelve\n";
+
+        // Both ops target line 5 and must survive the line-2 external change.
+        let cases = [
+            json!([{ "op": "replace", "start": 5, "end": 5, "content": "FIVE_MODEL" }]),
+            json!([{ "op": "replace_text", "old": "five", "new": "FIVE_MODEL" }]),
+        ];
+        for ops in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let p = root.join("nearby.txt");
+            std::fs::write(&p, base).unwrap();
+            // One Session spans the read and the write, exactly as a live
+            // process would; the external mutation lands between them.
+            let (session, bloom) = services();
+            let tag = read_for_tag(&session, &p);
+            std::fs::write(&p, external).unwrap();
+
+            let out = tool_write(
+                &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+                &session,
+                &bloom,
+            )
+            .expect("nearby drift must recover, not reject");
+            assert!(out.contains("applied"), "expected applied, got:\n{out}");
+            let final_bytes = std::fs::read_to_string(&p).unwrap();
+            assert_eq!(
+                final_bytes, expected,
+                "3-way merge must land both non-overlapping changes"
+            );
+            assert!(
+                final_bytes.ends_with('\n'),
+                "fixture trailing newline must survive"
+            );
+        }
+    }
+
     /// The drift branch must run the seen-lines gate exactly like the no-drift
     /// path: a symbol read displays only the symbol span, so after external
     /// drift an edit anchored on a never-displayed line is rejected — not
