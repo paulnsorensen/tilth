@@ -116,6 +116,9 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         return Coverage::default();
     };
     let previously_known: HashSet<String> = known_signatures.keys().cloned().collect();
+    // Package roots for absolute-import resolution are discovered once per pass
+    // from the worktree — the explicit scope — never inferred per file.
+    let roots = crate::read::imports::PyRoots::discover(worktree);
 
     let mut seen = HashSet::new();
     let mut upserts = Vec::new();
@@ -175,7 +178,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 failed = true;
                 continue;
             };
-            crate::read::imports::resolve_related_files_with_content(path, &content)
+            crate::read::imports::resolve_scoped_paths(path, &content, &roots)
                 .into_iter()
                 .filter_map(|p| {
                     p.strip_prefix(worktree)
@@ -250,6 +253,9 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
     let mut checked = 0usize;
     let mut timed_out = Instant::now() >= deadline;
     let mut failed = false;
+    // Re-verification must resolve edges the same way reconcile stored them,
+    // so a drifted consumer's absolute import is re-checked, not dropped.
+    let roots = crate::read::imports::PyRoots::discover(&handle.worktree_root);
 
     for candidate_rel in &candidates {
         if Instant::now() >= deadline {
@@ -269,7 +275,7 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         let verified = if shard.signature == live_signature {
             true
         } else if let Ok(content) = std::fs::read_to_string(&candidate_abs) {
-            crate::read::imports::resolve_related_files_with_content(&candidate_abs, &content)
+            crate::read::imports::resolve_scoped_paths(&candidate_abs, &content, &roots)
                 .iter()
                 .filter_map(|p| p.strip_prefix(&handle.worktree_root).ok())
                 .any(|r| r.to_string_lossy() == target_rel)

@@ -7,7 +7,54 @@ use std::path::{Path, PathBuf};
 use crate::lang::detect_file_type;
 use crate::types::{FileType, Lang};
 
+mod python_scope;
+
+pub(crate) use python_scope::{target_ambiguity, PyResolution, PyRoots};
+
 const MAX_SUGGESTIONS: usize = 8;
+
+/// Resolved import-edge paths for a file within an explicit `scope`, including
+/// absolute Python imports that the unscoped resolver treats as external.
+/// Non-Python code keeps the unscoped behavior. Ambiguous Python edges are
+/// omitted here — callers that must react to an ambiguous target identity use
+/// [`target_ambiguity`].
+pub(crate) fn resolve_scoped_paths(
+    file_path: &Path,
+    content: &str,
+    roots: &PyRoots,
+) -> Vec<PathBuf> {
+    match detect_file_type(file_path) {
+        FileType::Code(Lang::Python) => {
+            python_scope::resolve_python_edges(file_path, content, roots).paths()
+        }
+        _ => resolve_related_files_with_content(file_path, content),
+    }
+}
+
+/// [`resolve_scoped_paths`] for a one-off target: discovers the scope's package
+/// roots first. Loop callers should discover roots once and reuse them.
+pub(crate) fn resolve_scoped_paths_in(
+    file_path: &Path,
+    content: &str,
+    scope: &Path,
+) -> Vec<PathBuf> {
+    resolve_scoped_paths(file_path, content, &PyRoots::discover(scope))
+}
+
+/// Resolve one Python file's imports within `roots`, keeping edge evidence
+/// (module + line) and any ambiguous modules. Non-Python files yield an empty
+/// resolution.
+pub(crate) fn resolve_python_scoped(
+    file_path: &Path,
+    content: &str,
+    roots: &PyRoots,
+) -> PyResolution {
+    if matches!(detect_file_type(file_path), FileType::Code(Lang::Python)) {
+        python_scope::resolve_python_edges(file_path, content, roots)
+    } else {
+        PyResolution::default()
+    }
+}
 
 /// Extract import sources from a code file and resolve them to existing local file paths.
 /// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
