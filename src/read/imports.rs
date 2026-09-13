@@ -31,6 +31,27 @@ pub(crate) fn resolve_scoped_paths(
     }
 }
 
+/// `(resolved edge paths, re-export chain hops)` for a file within an
+/// explicit `scope` — the pair `reconcile`'s shard builder needs in one
+/// dispatch. Non-Python files keep the unscoped resolver's behavior and
+/// carry no hops; `resolve_scoped_paths` stays the paths-only contract
+/// ordinary callers use.
+pub(crate) fn resolve_scoped_paths_with_hops(
+    file_path: &Path,
+    content: &str,
+    roots: &PyRoots,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    match detect_file_type(file_path) {
+        FileType::Code(Lang::Python) => {
+            python_scope::resolve_python_edges(file_path, content, roots).into_paths_and_hops()
+        }
+        _ => (
+            resolve_related_files_with_content(file_path, content),
+            Vec::new(),
+        ),
+    }
+}
+
 /// Resolve one Python file's imports within `roots`, keeping edge evidence
 /// (module + line) and any ambiguous modules. Non-Python files yield an empty
 /// resolution.

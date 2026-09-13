@@ -55,6 +55,15 @@ pub(crate) enum Uncertainty {
 pub(crate) struct PyResolution {
     pub(crate) edges: Vec<ImportEdge>,
     pub(crate) uncertain: Vec<Uncertainty>,
+    /// Every intermediate `__init__.py` visited while proving a named
+    /// re-export's owner (`OwnerResult::Owned` only) — a superset of what's in
+    /// `edges` for chains longer than one hop. Consumed only by the persistent
+    /// index's invalidation pass (`reconcile`), which needs to find a consumer
+    /// whose resolution passed through a hop that isn't itself a stored
+    /// direct/owner edge (a "redirect"). Never part of the lean forward-edge
+    /// contract `paths()`/`edges` gives ordinary callers (`impact`, `tilth_deps`
+    /// presentation) — do not surface this anywhere else.
+    pub(crate) reexport_hops: Vec<PathBuf>,
 }
 
 impl PyResolution {
@@ -62,6 +71,15 @@ impl PyResolution {
     /// listing consume.
     pub(crate) fn paths(self) -> Vec<PathBuf> {
         self.edges.into_iter().map(|e| e.path).collect()
+    }
+
+    /// `(forward edge paths, re-export chain hops)` — currently only
+    /// `reconcile`'s shard builder needs both.
+    pub(crate) fn into_paths_and_hops(self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        (
+            self.edges.into_iter().map(|e| e.path).collect(),
+            self.reexport_hops,
+        )
     }
 }
 
@@ -190,7 +208,10 @@ pub(crate) fn resolve_python_edges(
         }
         for nm in &imp.names {
             let mut visited = HashSet::new();
-            match resolve_reexport_owner(&direct, &nm.original, roots, &mut visited) {
+            let outcome = resolve_reexport_owner(&direct, &nm.original, roots, &mut visited);
+            res.reexport_hops
+                .extend(visited.iter().map(|(path, _)| path.clone()));
+            match outcome {
                 OwnerResult::Owned(owner) => {
                     if owner != direct && seen.insert(owner.clone()) {
                         res.edges.push(ImportEdge {
@@ -210,6 +231,8 @@ pub(crate) fn resolve_python_edges(
             }
         }
     }
+    res.reexport_hops.sort();
+    res.reexport_hops.dedup();
     res
 }
 
