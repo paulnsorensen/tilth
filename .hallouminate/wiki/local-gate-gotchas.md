@@ -18,6 +18,17 @@ python3 scripts/tilth-bash-guard --self-test
 The markdown job checks `prompts/` and `AGENTS.md`.
 It also verifies that the regeneration script leaves `AGENTS.md` unchanged.[^1]
 
+
+
+Keep research worktrees outside the checkout under test.
+A nested upstream worktree under `.context/` appears in repository-wide search results despite the directory's ignored status.
+During the atomic-write fix, `detect_file_type` resolves to both the fork and the nested upstream definition.
+This causes six Rust failures and seventeen Python failures/errors unrelated to atomic replacement.
+Move the research worktree outside the checkout before rerunning the gates.
+After that move, all 1,092 Rust tests, 47 Python tests, and 77 Bash guard checks pass.[^4]
+
+[^4]: P0 verification on 2026-09-12, fork base `4895b4d9f67e9fe70832e1e53745fbe4749bb810`. The actual MCP response names `src/lang/mod.rs` and `.context/upstream-core-review/crates/tilth-core/src/lang/mod.rs`. The same production diff passes after `git worktree move` relocates the research checkout outside the tested tree.
+
 ## Historical baseline
 
 The August 2026 review of PR #144 reports a macOS batch-budget test failure.

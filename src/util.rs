@@ -3,34 +3,40 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Write `bytes` to `path` atomically: write to a temp file in the same
-/// directory, preserve the original file's permissions (if it exists), then
-/// rename into place. A crash mid-write leaves the original intact.
-///
-/// The temp name is qualified with the process ID and a process-wide counter
-/// so concurrent or batched writes in the same directory can't collide.
+/// Write `bytes` to `path` atomically: write to a same-directory temp file,
+/// preserve the original file's permissions, then persist it at `path`.
+/// A crash mid-write leaves the original intact.
 pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // Path::new("foo.txt").parent() returns Some(""), not None; filter it so
-    // we fall through to the "." default and document intent explicitly.
+    use std::io::Write as _;
+
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".tilth-tmp.{}.{n}", std::process::id()));
-    std::fs::write(&tmp, bytes).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    // Preserve original file permissions so the rename doesn't widen or strip
-    // the mode. Ignore errors — target may not exist yet or platform may not
-    // support it; the write already succeeded.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".tilth-tmp.");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let mut temp = builder.tempfile_in(dir)?;
+    temp.as_file_mut().write_all(bytes)?;
+
+    // Preserve original file permissions so the rename does not widen or strip
+    // the mode. Ignore errors because the write already succeeded.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = temp.as_file().set_permissions(meta.permissions());
+    }
+
+    match temp.persist(path) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = error.file.close();
+            Err(error.error)
+        }
+    }
 }
 
 /// Create `path` from `bytes` without replacing an existing destination, and
@@ -111,5 +117,148 @@ mod tests {
             b"fn a() {}\n",
             "existing content must survive"
         );
+    }
+
+    #[test]
+    fn atomic_write_overwrites_with_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"old").unwrap();
+
+        atomic_write_bytes(&target, b"new bytes").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+
+        atomic_write_bytes(&target, b"new bytes").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write_bytes(&target, b"new").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_uses_std_write_mode_for_missing_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("expected");
+        let actual = dir.path().join("actual");
+        std::fs::write(&expected, b"bytes").unwrap();
+
+        atomic_write_bytes(&actual, b"bytes").unwrap();
+
+        let expected_mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o7777;
+        let actual_mode = std::fs::metadata(&actual).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(actual_mode, expected_mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_replaces_target_symlink_without_changing_referent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let target = dir.path().join("target");
+        std::fs::write(&victim, b"victim").unwrap();
+        symlink(&victim, &target).unwrap();
+
+        atomic_write_bytes(&target, b"replacement").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        let metadata = std::fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn atomic_write_keeps_existing_mmap_contents() {
+        use memmap2::Mmap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"old contents").unwrap();
+        let file = std::fs::File::open(&target).unwrap();
+        let map = unsafe { Mmap::map(&file).unwrap() };
+
+        atomic_write_bytes(&target, b"new contents").unwrap();
+
+        assert_eq!(&map[..], b"old contents");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn atomic_write_cleans_temp_after_failed_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(atomic_write_bytes(&target, b"bytes").is_err());
+        assert!(target.is_dir());
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["occupied"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        if std::env::var_os("TILTH_TEMP_SYMLINK_CHILD").is_some() {
+            let dir = std::path::PathBuf::from(std::env::var_os("TILTH_TEMP_SYMLINK_DIR").unwrap());
+            let target = dir.join("target");
+            let victim = dir.join("victim");
+            let temp = dir.join(format!(".tilth-tmp.{}.0", std::process::id()));
+            symlink(&victim, &temp).unwrap();
+
+            atomic_write_bytes(&target, b"replacement").unwrap();
+
+            assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+            let metadata = std::fs::symlink_metadata(&target).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim").unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("util::tests::atomic_write_rejects_predictable_temp_symlink")
+            .arg("--nocapture")
+            .env("TILTH_TEMP_SYMLINK_CHILD", "1")
+            .env("TILTH_TEMP_SYMLINK_DIR", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "child process failed: {status}");
     }
 }
