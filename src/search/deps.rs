@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
-use crate::read::imports::{is_external, is_import_line, resolve_related_files_with_content};
+use crate::read::imports::{
+    is_external, is_import_line, resolve_python_scoped, resolve_scoped_paths, target_ambiguity,
+    PyRoots,
+};
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
 use crate::types::{FileType, OutlineKind};
@@ -44,6 +47,9 @@ pub struct Dependent {
     pub path: PathBuf,
     /// (`calling_function`, `called_symbol`, `line`) triples.
     pub symbols: Vec<(String, String, u32)>,
+    /// Direct import edges to the target: `(module, line)` pairs. A dependent
+    /// that only imports the target (never calls it) has an empty `symbols`.
+    pub imports: Vec<(String, u32)>,
     pub is_test: bool,
 }
 
@@ -80,6 +86,23 @@ pub fn analyze_deps(
             searched_count: 0,
         });
     };
+
+    // Refuse to guess when the target's own module identity is ambiguous:
+    // duplicate package roots make its dependent set unreliable, so report the
+    // module and its bounded candidates instead of a confident wrong answer.
+    if let Some(ambiguous) = target_ambiguity(path, scope) {
+        return Err(TilthError::AmbiguousModule {
+            module: ambiguous.module,
+            candidates: ambiguous
+                .candidates
+                .iter()
+                .map(|p| p.strip_prefix(scope).unwrap_or(p).display().to_string())
+                .collect(),
+        });
+    }
+    // Package roots for scoped import resolution — discovered once from the
+    // explicit scope and shared by the forward and reverse passes below.
+    let import_roots = PyRoots::discover(scope);
 
     // ── Phase 1: Extract exported symbols ────────────────────────────────────
 
@@ -130,8 +153,9 @@ pub fn analyze_deps(
     }
 
     // Merge in import-resolved files (may not have resolved callees if symbols
-    // weren't matched, but the import relationship itself is meaningful)
-    let import_files = resolve_related_files_with_content(path, &content);
+    // weren't matched, but the import relationship itself is meaningful).
+    // Scoped resolution adds absolute in-scope Python imports.
+    let import_files = resolve_scoped_paths(path, &content, &import_roots);
     for import_path in import_files {
         local_by_file.entry(import_path).or_default();
     }
@@ -170,7 +194,9 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let mut used_by = if searched_count > 0 {
+    // Call-site edges: files that invoke an exported symbol.
+    let mut calls_by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
+    if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
         let (raw_matches, _) = find_callers_batch(
             &symbols_set,
@@ -179,51 +205,55 @@ pub fn analyze_deps(
             None,
             crate::search::callers::BATCH_EARLY_QUIT,
         )?;
-
-        // Group by file path
-        let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
         for (matched_symbol, caller_match) in raw_matches {
             // Exclude calls from within the target file itself (self-references)
             if caller_match.path == *path {
                 continue;
             }
-            by_file.entry(caller_match.path).or_default().push((
+            calls_by_file.entry(caller_match.path).or_default().push((
                 caller_match.calling_function,
                 matched_symbol,
                 caller_match.line,
             ));
         }
+    }
 
-        // Build Dependent list
-        let target_dir = path.parent();
-        let mut dependents: Vec<Dependent> = by_file
-            .into_iter()
-            .map(|(dep_path, mut pairs)| {
-                pairs.sort();
-                pairs.dedup();
-                let is_test = is_test_file(&dep_path);
-                Dependent {
-                    path: dep_path,
-                    symbols: pairs,
-                    is_test,
-                }
-            })
-            .collect();
+    // Import edges: files that import the target directly, even without a call.
+    let imports_by_file = collect_import_dependents(path, scope, &import_roots);
 
-        // Sort: same directory first, non-tests before tests, then alphabetical
-        dependents.sort_by(|a, b| {
-            let a_same_dir = target_dir.is_some_and(|d| a.path.parent() == Some(d));
-            let b_same_dir = target_dir.is_some_and(|d| b.path.parent() == Some(d));
-            b_same_dir
-                .cmp(&a_same_dir)
-                .then_with(|| a.is_test.cmp(&b.is_test))
-                .then_with(|| a.path.cmp(&b.path))
-        });
+    // Union both edge kinds by file so an importer that never calls the target
+    // still surfaces, and a file that both imports and calls appears once.
+    let mut dep_paths: HashSet<PathBuf> = calls_by_file.keys().cloned().collect();
+    dep_paths.extend(imports_by_file.keys().cloned());
+    let target_dir = path.parent();
+    let mut used_by: Vec<Dependent> = dep_paths
+        .into_iter()
+        .map(|dep_path| {
+            let mut pairs = calls_by_file.get(&dep_path).cloned().unwrap_or_default();
+            pairs.sort();
+            pairs.dedup();
+            let mut imports = imports_by_file.get(&dep_path).cloned().unwrap_or_default();
+            imports.sort();
+            imports.dedup();
+            let is_test = is_test_file(&dep_path);
+            Dependent {
+                path: dep_path,
+                symbols: pairs,
+                imports,
+                is_test,
+            }
+        })
+        .collect();
 
-        dependents
-    } else {
-        Vec::new()
-    };
+    // Sort: same directory first, non-tests before tests, then alphabetical
+    used_by.sort_by(|a, b| {
+        let a_same_dir = target_dir.is_some_and(|d| a.path.parent() == Some(d));
+        let b_same_dir = target_dir.is_some_and(|d| b.path.parent() == Some(d));
+        b_same_dir
+            .cmp(&a_same_dir)
+            .then_with(|| a.is_test.cmp(&b.is_test))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     let total_dependents = used_by.len();
     used_by.truncate(MAX_DEPENDENTS);
@@ -345,6 +375,65 @@ fn collect_symbol_names(entry: &crate::types::OutlineEntry, out: &mut Vec<String
     }
 }
 
+/// Files under `scope` that import `target` directly (Python absolute or
+/// relative imports), keyed by the dependent's scope-form path with the
+/// `(module, line)` evidence for each edge. Honors the shared walker skip rules
+/// and never leaves `scope`, so a narrower scope cannot discover outside
+/// consumers.
+fn collect_import_dependents(
+    target: &Path,
+    scope: &Path,
+    roots: &PyRoots,
+) -> HashMap<PathBuf, Vec<(String, u32)>> {
+    let mut out: HashMap<PathBuf, Vec<(String, u32)>> = HashMap::new();
+    let target_canon = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    for entry in ignore::WalkBuilder::new(scope)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|ft| ft.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| crate::search::skip_dir_entry(entry.path(), name)))
+        })
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let candidate = entry.path();
+        if !matches!(
+            detect_file_type(candidate),
+            FileType::Code(crate::types::Lang::Python)
+        ) {
+            continue;
+        }
+        let candidate_canon = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        if candidate_canon == target_canon {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(candidate) else {
+            continue;
+        };
+        for edge in resolve_python_scoped(candidate, &content, roots).edges {
+            let edge_canon = edge
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| edge.path.clone());
+            if edge_canon == target_canon {
+                out.entry(candidate.to_path_buf())
+                    .or_default()
+                    .push((edge.module, edge.line));
+            }
+        }
+    }
+    out
+}
+
 /// Returns true if the name is a noise/placeholder that should be excluded
 /// from the reverse-dependency search. Also used by `fuzzy_symbol` to filter
 /// the grok suggestion candidate pool — one home for the invariant.
@@ -452,6 +541,12 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
             let loc = format!("{rel}:{line}");
             let joined = syms.join(", ");
             let _ = write!(out, "\n{loc:<30} {caller:<20} \u{2192} {joined}");
+        }
+        // Import-only edges (no call site) still name the target dependency.
+        for (module, line) in &dep.imports {
+            let loc = format!("{rel}:{line}");
+            let label = "(import)";
+            let _ = write!(out, "\n{loc:<30} {label:<20} \u{2192} {module}");
         }
     }
     out

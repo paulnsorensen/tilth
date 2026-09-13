@@ -1,8 +1,10 @@
 # adr
 
 <!-- HALLOUMINATE:INDEX-START -->
+- [python-scoped-import-deps](./python-scoped-import-deps.md) — ADR: scoped Python import dependencies (#197 part A)
 - [tilth-diff-scope-ergonomics](./tilth-diff-scope-ergonomics.md) — ADRs — tilth_diff scope ergonomics (slug: tilth-diff-scope-ergonomics)
 - [tilth-grok-ergonomics](./tilth-grok-ergonomics.md) — ADR: tilth-grok-ergonomics — curd 2 inclusion and shape
+- [python-scoped-import-deps](./python-scoped-import-deps.md) — ADR: scoped Python import dependencies (#197 part A)
 - [tilth-read-input-ergonomics](./tilth-read-input-ergonomics.md) — ADRs — tilth_read input ergonomics (slug: tilth-read-input-ergonomics)
 - [tilth-search-resilience](./tilth-search-resilience.md) — ADRs — tilth_search resilience (slug: tilth-search-resilience)
 - [tilth-search-v2-roadmap-001](./tilth-search-v2-roadmap-001.md) — Search v2 Public Discovery Topology

@@ -30,6 +30,14 @@ pub enum TilthError {
     /// message verbatim.
     #[error("{0}")]
     EditRejected(String),
+    /// A Python module name maps to more than one in-scope file (duplicate
+    /// package roots), so its dependents cannot be attributed to one file.
+    /// Carries the module and the bounded candidate paths rather than guessing.
+    #[error("ambiguous module identity for {module}: {} in-scope candidates — {}", candidates.len(), candidates.join(", "))]
+    AmbiguousModule {
+        module: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl From<crate::edit::mismatch::MismatchError> for TilthError {
@@ -54,7 +62,10 @@ impl TilthError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::NotFound { .. } | Self::IoError { .. } => 2,
-            Self::InvalidQuery { .. } | Self::ParseError { .. } | Self::EditRejected(_) => 3,
+            Self::InvalidQuery { .. }
+            | Self::ParseError { .. }
+            | Self::EditRejected(_)
+            | Self::AmbiguousModule { .. } => 3,
             Self::PermissionDenied { .. } | Self::IgnoreDenied { .. } => 4,
         }
     }
