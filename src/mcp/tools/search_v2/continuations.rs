@@ -11,8 +11,12 @@ use crate::types::is_test_file;
 
 const SECTION_CAP: usize = 30;
 /// Deps enrichment is best-effort: a cold or stale index must never block a
-/// search, so reconcile/impact get this much wall clock and then report partial.
-const DEPS_WARM_DEADLINE: Duration = Duration::from_millis(200);
+/// search, so reconcile/impact get this much wall clock and then report
+/// partial. Bounded above 200ms to keep headroom for a cold reconcile of a
+/// larger repo now that named re-export chain invalidation (hop-reverse +
+/// pending-rescan bookkeeping) adds a small, correctness-required constant
+/// cost per pass.
+const DEPS_WARM_DEADLINE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

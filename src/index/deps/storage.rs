@@ -7,7 +7,7 @@
 //! Both are `&str → &[u8]` (JSON-encoded values) so the redb types stay
 //! private to this module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -17,6 +17,11 @@ use super::DepsError;
 
 const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const REVERSE: TableDefinition<&str, &[u8]> = TableDefinition::new("reverse");
+const REEXPORT_HOP_REVERSE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("reexport_hop_reverse");
+const PENDING_RESCAN: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_rescan");
+const PENDING_RESCAN_KEY: &str = "pending";
+pub(super) const FILE_SHARD_SCHEMA_VERSION: u8 = 1;
 
 /// Cheap change signature for a file: mtime + length. Cheaper than hashing
 /// content on every reconcile scan; a mismatch triggers a real re-derive.
@@ -29,9 +34,17 @@ pub(super) struct FileSignature {
 /// A file's own resolved local dependencies (its "shard" of the index).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(super) struct FileShard {
+    #[serde(default)]
+    pub(super) schema_version: u8,
     pub(super) signature: FileSignature,
     /// Worktree-relative paths this file depends on.
     pub(super) deps: Vec<String>,
+    /// Intermediate `__init__.py` files visited while proving a named
+    /// re-export's owner — a superset of `deps` for chains longer than one
+    /// hop. Used only by `reconcile`'s invalidation pass; never surfaced by
+    /// `impact` or any presentation path.
+    #[serde(default)]
+    pub(super) reexport_hops: Vec<String>,
 }
 
 /// Current on-disk signature for `path`, or `None` if it cannot be read.
@@ -75,40 +88,62 @@ pub(super) fn read_reverse(db: &Database, rel: &str) -> Result<Vec<String>, Deps
     }
 }
 
-/// All relative paths currently tracked in the `files` table.
-#[allow(dead_code)] // introspection helper; only `all_signatures` is on the reconcile path
-pub(super) fn all_file_keys(db: &Database) -> Result<Vec<String>, DepsError> {
+pub(super) fn read_reexport_hop_reverse(
+    db: &Database,
+    rel: &str,
+) -> Result<Vec<String>, DepsError> {
     let txn = db.begin_read().map_err(redb_err)?;
-    let table = match txn.open_table(FILES) {
+    let table = match txn.open_table(REEXPORT_HOP_REVERSE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(redb_err(e)),
     };
-    let mut keys = Vec::new();
-    for entry in table.iter().map_err(redb_err)? {
-        let (k, _) = entry.map_err(redb_err)?;
-        keys.push(k.value().to_string());
+    match table.get(rel).map_err(redb_err)? {
+        Some(v) => Ok(serde_json::from_slice(v.value()).map_err(redb_err)?),
+        None => Ok(Vec::new()),
     }
-    Ok(keys)
 }
 
-/// All (relative path -> signature) pairs currently tracked in the `files`
-/// table, read in one transaction — avoids opening one read transaction per
-/// walked file during `reconcile`'s unchanged-file check.
-pub(super) fn all_signatures(db: &Database) -> Result<HashMap<String, FileSignature>, DepsError> {
+pub(super) fn read_pending_rescan(db: &Database) -> Result<Vec<String>, DepsError> {
+    let txn = db.begin_read().map_err(redb_err)?;
+    let table = match txn.open_table(PENDING_RESCAN) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    match table.get(PENDING_RESCAN_KEY).map_err(redb_err)? {
+        Some(v) => Ok(serde_json::from_slice(v.value()).map_err(redb_err)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub(super) fn file_index_state(
+    db: &Database,
+) -> Result<(HashMap<String, FileSignature>, HashSet<String>), DepsError> {
     let txn = db.begin_read().map_err(redb_err)?;
     let table = match txn.open_table(FILES) {
         Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Ok((HashMap::new(), HashSet::new()));
+        }
         Err(e) => return Err(redb_err(e)),
     };
-    let mut map = HashMap::new();
+    let mut signatures = HashMap::new();
+    let mut known = HashSet::new();
     for entry in table.iter().map_err(redb_err)? {
         let (k, v) = entry.map_err(redb_err)?;
         let shard: FileShard = serde_json::from_slice(v.value()).map_err(redb_err)?;
-        map.insert(k.value().to_string(), shard.signature);
+        let rel = k.value().to_string();
+        known.insert(rel.clone());
+        let is_python = Path::new(&rel)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("py"));
+        if is_python && shard.schema_version < FILE_SHARD_SCHEMA_VERSION {
+            continue;
+        }
+        signatures.insert(rel, shard.signature);
     }
-    Ok(map)
+    Ok((signatures, known))
 }
 
 /// One atomic reconcile write: upsert changed shards, remove deleted ones,
@@ -116,6 +151,10 @@ pub(super) fn all_signatures(db: &Database) -> Result<HashMap<String, FileSignat
 pub(super) struct ReconcileWrite {
     pub(super) upserts: Vec<(String, FileShard)>,
     pub(super) deletes: Vec<String>,
+    /// Worklist entries a partial invalidation pass could not reach before
+    /// its deadline — replaces whatever was previously pending. Empty when
+    /// this pass drained the worklist completely.
+    pub(super) pending_rescan: Vec<String>,
 }
 
 pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(), DepsError> {
@@ -123,6 +162,8 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
     {
         let mut files = txn.open_table(FILES).map_err(redb_err)?;
         let mut reverse = txn.open_table(REVERSE).map_err(redb_err)?;
+        let mut hop_reverse = txn.open_table(REEXPORT_HOP_REVERSE).map_err(redb_err)?;
+        let mut pending = txn.open_table(PENDING_RESCAN).map_err(redb_err)?;
 
         for rel in &write.deletes {
             if let Some(v) = files.get(rel.as_str()).map_err(redb_err)? {
@@ -131,18 +172,23 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
                 for dep in &old.deps {
                     remove_reverse_edge(&mut reverse, dep, rel)?;
                 }
+                for hop in &old.reexport_hops {
+                    remove_reverse_edge(&mut hop_reverse, hop, rel)?;
+                }
             }
             files.remove(rel.as_str()).map_err(redb_err)?;
         }
 
         for (rel, shard) in &write.upserts {
-            let old_deps: Vec<String> = match files.get(rel.as_str()).map_err(redb_err)? {
-                Some(v) => {
-                    let old: FileShard = serde_json::from_slice(v.value()).map_err(redb_err)?;
-                    old.deps
-                }
-                None => Vec::new(),
+            let old: Option<FileShard> = match files.get(rel.as_str()).map_err(redb_err)? {
+                Some(v) => Some(serde_json::from_slice(v.value()).map_err(redb_err)?),
+                None => None,
             };
+            let old_deps: Vec<String> = old.as_ref().map(|o| o.deps.clone()).unwrap_or_default();
+            let old_hops: Vec<String> = old
+                .as_ref()
+                .map(|o| o.reexport_hops.clone())
+                .unwrap_or_default();
             for dep in &old_deps {
                 if !shard.deps.contains(dep) {
                     remove_reverse_edge(&mut reverse, dep, rel)?;
@@ -153,10 +199,67 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
                     add_reverse_edge(&mut reverse, dep, rel)?;
                 }
             }
+            for hop in &old_hops {
+                if !shard.reexport_hops.contains(hop) {
+                    remove_reverse_edge(&mut hop_reverse, hop, rel)?;
+                }
+            }
+            for hop in &shard.reexport_hops {
+                if !old_hops.contains(hop) {
+                    add_reverse_edge(&mut hop_reverse, hop, rel)?;
+                }
+            }
             let bytes = serde_json::to_vec(shard).map_err(redb_err)?;
             files
                 .insert(rel.as_str(), bytes.as_slice())
                 .map_err(redb_err)?;
+        }
+
+        if write.pending_rescan.is_empty() {
+            pending.remove(PENDING_RESCAN_KEY).map_err(redb_err)?;
+        } else {
+            let bytes = serde_json::to_vec(&write.pending_rescan).map_err(redb_err)?;
+            pending
+                .insert(PENDING_RESCAN_KEY, bytes.as_slice())
+                .map_err(redb_err)?;
+        }
+    }
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn downgrade_shard_without_reexport_hops(
+    db: &Database,
+    rel: &str,
+) -> Result<(), DepsError> {
+    #[derive(Serialize)]
+    struct LegacyFileShard {
+        signature: FileSignature,
+        deps: Vec<String>,
+    }
+
+    let txn = db.begin_write().map_err(redb_err)?;
+    {
+        let mut files = txn.open_table(FILES).map_err(redb_err)?;
+        let Some(value) = files.get(rel).map_err(redb_err)? else {
+            return Err(DepsError::Redb(format!("missing test shard: {rel}")));
+        };
+        let shard: FileShard = serde_json::from_slice(value.value()).map_err(redb_err)?;
+        drop(value);
+        let FileShard {
+            schema_version: _schema_version,
+            signature,
+            deps,
+            reexport_hops,
+        } = shard;
+        let legacy = LegacyFileShard { signature, deps };
+        let bytes = serde_json::to_vec(&legacy).map_err(redb_err)?;
+        files.insert(rel, bytes.as_slice()).map_err(redb_err)?;
+
+        let mut hop_reverse = txn.open_table(REEXPORT_HOP_REVERSE).map_err(redb_err)?;
+        for hop in reexport_hops {
+            remove_reverse_edge(&mut hop_reverse, &hop, rel)?;
         }
     }
     txn.commit().map_err(redb_err)?;

@@ -114,16 +114,198 @@ fn is_python_init(rel: &str) -> bool {
     Path::new(rel).file_name().and_then(|n| n.to_str()) == Some("__init__.py")
 }
 
+/// Build one changed file's shard fields (deps + re-export invalidation
+/// hops) from its already-read `content`. Python files also record every
+/// intermediate `__init__.py` hop proven while resolving a named
+/// re-export; other languages keep the unscoped resolver's behavior and
+/// record no hops.
+fn resolved_shard_fields(
+    abs: &Path,
+    content: &str,
+    worktree: &Path,
+    roots: &crate::read::imports::PyRoots,
+) -> (Vec<String>, Vec<String>) {
+    let to_rel = |p: PathBuf| {
+        p.strip_prefix(worktree)
+            .ok()
+            .map(|r| r.to_string_lossy().to_string())
+    };
+    let (paths, hops) = crate::read::imports::resolve_scoped_paths_with_hops(abs, content, roots);
+    (
+        paths.into_iter().filter_map(to_rel).collect(),
+        hops.into_iter().filter_map(to_rel).collect(),
+    )
+}
+
+/// Rebuild `rel`'s shard from its current on-disk state. `None` when the
+/// file has disappeared or cannot be read. The one builder every
+/// forced-rescan site (redirect/edited/deleted-init worklist, new-init
+/// discovery, pending catch-up) shares, replacing duplicated inline blocks.
+fn rescan_shard(
+    worktree: &Path,
+    roots: &crate::read::imports::PyRoots,
+    rel: &str,
+) -> Option<(String, storage::FileShard)> {
+    let abs = worktree.join(rel);
+    let signature = storage::signature_of(&abs)?;
+    if !matches!(
+        crate::lang::detect_file_type(&abs),
+        crate::types::FileType::Code(_)
+    ) {
+        return Some((
+            rel.to_string(),
+            storage::FileShard {
+                schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
+                signature,
+                deps: Vec::new(),
+                reexport_hops: Vec::new(),
+            },
+        ));
+    }
+    let content = std::fs::read_to_string(&abs).ok()?;
+    let (deps, reexport_hops) = resolved_shard_fields(&abs, &content, worktree, roots);
+    Some((
+        rel.to_string(),
+        storage::FileShard {
+            schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
+            signature,
+            deps,
+            reexport_hops,
+        },
+    ))
+}
+
+/// The bounded set of files needing a forced shard rebuild this pass:
+/// consumers whose re-export resolution passed through a changed or
+/// deleted `__init__.py`, whether as their stored direct/owner edge
+/// (`read_reverse`) or as an intermediate hop that isn't itself a stored
+/// edge (`read_reexport_hop_reverse` — the redirect case) — plus any rel
+/// carried over from a prior pass that ran out of deadline. Bounded by
+/// (changed/deleted inits this pass × their known importers) + the
+/// carried-over pending set; never a recursive graph walk. One exception:
+/// a deadline cut mid-way through the *new-init discovery* scan (see
+/// `reconcile`) spills every not-yet-checked unchanged Python file into
+/// the carried-over pending set, since which of them will actually acquire
+/// the new init can't be known without resolving them. That's a one-time,
+/// bounded catch-up cost equal to what the interrupted scan would have
+/// spent anyway — the next pass's `drain_worklist` just rescans each
+/// unconditionally instead of re-checking `acquires_init`, so a file that
+/// doesn't acquire anything is rewritten with an identical (harmless) shard.
+fn reexport_worklist(
+    db: &Database,
+    upserts: &[(String, storage::FileShard)],
+    deletes: &[String],
+    previously_known: &HashSet<String>,
+    pending: Vec<String>,
+) -> HashSet<String> {
+    let mut worklist: HashSet<String> = pending.into_iter().collect();
+    let mut triggers: Vec<&str> = Vec::new();
+    for (rel, _) in upserts {
+        if is_python_init(rel) && previously_known.contains(rel.as_str()) {
+            triggers.push(rel.as_str());
+        }
+    }
+    for rel in deletes {
+        if is_python_init(rel) {
+            triggers.push(rel.as_str());
+        }
+    }
+    for rel in triggers {
+        if let Ok(importers) = storage::read_reverse(db, rel) {
+            worklist.extend(importers);
+        }
+        if let Ok(importers) = storage::read_reexport_hop_reverse(db, rel) {
+            worklist.extend(importers);
+        }
+    }
+    worklist
+}
+
+/// Drain `worklist` under `deadline`, rescanning each rel's shard. Returns
+/// the rebuilt shards plus whatever remained unprocessed when the deadline
+/// stopped further work — the caller persists that remainder as
+/// `pending_rescan` so the next pass resumes exactly where this one left
+/// off, instead of losing track of a still-stale consumer.
+fn drain_worklist(
+    worktree: &Path,
+    roots: &crate::read::imports::PyRoots,
+    worklist: HashSet<String>,
+    already: &HashSet<String>,
+    deadline: Instant,
+) -> (Vec<(String, storage::FileShard)>, Vec<String>) {
+    let mut forced_upserts = Vec::new();
+    let mut still_pending = Vec::new();
+    let mut iter = worklist.into_iter();
+    for rel in iter.by_ref() {
+        if already.contains(&rel) {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            still_pending.push(rel);
+            break;
+        }
+        if let Some(shard) = rescan_shard(worktree, roots, &rel) {
+            forced_upserts.push(shard);
+        }
+    }
+    still_pending.extend(iter);
+    (forced_upserts, still_pending)
+}
+
+#[derive(Clone, Copy)]
+enum WalkStatus {
+    Complete,
+    TimedOut,
+}
+
+fn rescan_reexport_importers(
+    db: &Database,
+    worktree: &Path,
+    roots: &crate::read::imports::PyRoots,
+    upserts: &[(String, storage::FileShard)],
+    deletes: &[String],
+    previously_known: &HashSet<String>,
+    pending: Vec<String>,
+    walk_status: WalkStatus,
+    deadline: Instant,
+) -> (Vec<(String, storage::FileShard)>, Vec<String>, bool) {
+    let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
+    let mut worklist = reexport_worklist(db, upserts, deletes, previously_known, pending);
+    match walk_status {
+        WalkStatus::Complete => {
+            let (forced_upserts, still_pending) =
+                drain_worklist(worktree, roots, worklist, &already, deadline);
+            let timed_out = !still_pending.is_empty();
+            (forced_upserts, still_pending, timed_out)
+        }
+        WalkStatus::TimedOut => {
+            worklist.retain(|rel| !already.contains(rel));
+            (Vec::new(), worklist.into_iter().collect(), true)
+        }
+    }
+}
+
 /// Atomically replace the per-file shards + reverse edges for every file
 /// under `worktree` whose content signature (mtime + length) changed since
 /// the last reconcile, and remove shards for files that disappeared.
 /// Stops scanning at `deadline`, in which case deletions are not inferred
 /// (an incomplete scan cannot tell "not seen" from "not yet reached").
+///
+/// Named Python re-export chains are invalidated via a bounded worklist
+/// (`reexport_worklist`): a changed or deleted `__init__.py` forces a
+/// rescan of every importer that stored it as a direct/owner edge *or*
+/// walked through it as an intermediate hop (a "redirect"), never an
+/// unbounded transitive walk. A partial pass persists whatever worklist
+/// entries it couldn't reach (`pending_rescan`) so the next reconcile
+/// resumes them even if the triggering file's own signature no longer
+/// looks changed — that signature was already committed by this pass. The
+/// deadline is checked across the initial walk, the invalidation worklist,
+/// the forced rebuild, and the write stage; `Coverage.complete` is false
+/// whenever any of those stages stops with work remaining.
 pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant) -> Coverage {
-    let Ok(known_signatures) = storage::all_signatures(&handle.db) else {
+    let Ok((known_signatures, previously_known)) = storage::file_index_state(&handle.db) else {
         return Coverage::default();
     };
-    let previously_known: HashSet<String> = known_signatures.keys().cloned().collect();
     // Package roots for absolute-import resolution are discovered once per pass
     // from the worktree — the explicit scope — never inferred per file.
     let roots = crate::read::imports::PyRoots::discover(worktree);
@@ -182,7 +364,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         // as non-UTF-8) never have imports to resolve; storing an empty-deps
         // shard for them (instead of `continue`-ing without one) records
         // their signature so they aren't re-scanned on every future pass.
-        let deps = if matches!(
+        let (deps, reexport_hops) = if matches!(
             crate::lang::detect_file_type(path),
             crate::types::FileType::Code(_)
         ) {
@@ -190,18 +372,19 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 failed = true;
                 continue;
             };
-            crate::read::imports::resolve_scoped_paths(path, &content, &roots)
-                .into_iter()
-                .filter_map(|p| {
-                    p.strip_prefix(worktree)
-                        .ok()
-                        .map(|r| r.to_string_lossy().to_string())
-                })
-                .collect()
+            resolved_shard_fields(path, &content, worktree, &roots)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        upserts.push((rel, storage::FileShard { signature, deps }));
+        upserts.push((
+            rel,
+            storage::FileShard {
+                schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
+                signature,
+                deps,
+                reexport_hops,
+            },
+        ));
     }
 
     // A cut-short scan cannot distinguish "deleted" from "not yet reached",
@@ -212,100 +395,66 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         previously_known.difference(&seen).cloned().collect()
     };
 
-    if !timed_out {
-        let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
-        let mut forced: HashSet<String> = HashSet::new();
-        let mut forced_upserts = Vec::new();
-        for (rel, _) in &upserts {
-            if !is_python_init(rel) || !previously_known.contains(rel) {
-                continue;
-            }
-            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
-                continue;
-            };
-            for importer in importers {
-                if !already.contains(&importer) {
-                    forced.insert(importer);
-                }
-            }
-        }
-        for rel in &deletes {
-            if !is_python_init(rel) {
-                continue;
-            }
-            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
-                continue;
-            };
-            for importer in importers {
-                if !already.contains(&importer) {
-                    forced.insert(importer);
-                }
-            }
-        }
-        for importer in &forced {
-            let abs = worktree.join(importer);
-            let Some(signature) = storage::signature_of(&abs) else {
-                continue;
-            };
-            let Ok(content) = std::fs::read_to_string(&abs) else {
-                continue;
-            };
-            let deps = crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
-                .into_iter()
-                .filter_map(|p| {
-                    p.strip_prefix(worktree)
-                        .ok()
-                        .map(|r| r.to_string_lossy().to_string())
-                })
-                .collect();
-            forced_upserts.push((importer.clone(), storage::FileShard { signature, deps }));
-        }
+    let pending = storage::read_pending_rescan(&handle.db).unwrap_or_default();
+    let walk_status = if timed_out {
+        WalkStatus::TimedOut
+    } else {
+        WalkStatus::Complete
+    };
+    let (mut forced_upserts, mut pending_to_write, worklist_timed_out) = rescan_reexport_importers(
+        &handle.db,
+        worktree,
+        &roots,
+        &upserts,
+        &deletes,
+        &previously_known,
+        pending,
+        walk_status,
+        deadline,
+    );
+    timed_out |= worklist_timed_out;
 
-        let mut new_inits = HashSet::new();
-        for (rel, _) in &upserts {
-            if is_python_init(rel) && !previously_known.contains(rel) {
-                new_inits.insert(rel.clone());
-            }
-        }
+    if !timed_out {
+        let new_inits: HashSet<&str> = upserts
+            .iter()
+            .filter(|(rel, _)| is_python_init(rel) && !previously_known.contains(rel.as_str()))
+            .map(|(rel, _)| rel.as_str())
+            .collect();
         if !new_inits.is_empty() {
-            for importer in unchanged_python {
-                if forced.contains(&importer) {
+            let already_forced: HashSet<String> =
+                forced_upserts.iter().map(|(rel, _)| rel.clone()).collect();
+            let mut unchanged_iter = unchanged_python.into_iter();
+            for importer in unchanged_iter.by_ref() {
+                if already_forced.contains(importer.as_str()) {
                     continue;
                 }
-                let abs = worktree.join(&importer);
-                let Some(signature) = storage::signature_of(&abs) else {
-                    continue;
-                };
-                let Ok(content) = std::fs::read_to_string(&abs) else {
-                    continue;
-                };
-                let deps: Vec<String> =
-                    crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
-                        .into_iter()
-                        .filter_map(|p| {
-                            p.strip_prefix(worktree)
-                                .ok()
-                                .map(|r| r.to_string_lossy().to_string())
-                        })
-                        .collect();
-                let mut acquires_init = false;
-                for dep in &deps {
-                    if new_inits.contains(dep) {
-                        acquires_init = true;
-                        break;
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    pending_to_write.push(importer);
+                    break;
+                }
+                if let Some((rel, shard)) = rescan_shard(worktree, &roots, &importer) {
+                    if shard.deps.iter().any(|d| new_inits.contains(d.as_str())) {
+                        forced_upserts.push((rel, shard));
                     }
                 }
-                if acquires_init {
-                    forced_upserts.push((importer, storage::FileShard { signature, deps }));
-                }
             }
+            pending_to_write.extend(unchanged_iter);
         }
-        upserts.extend(forced_upserts);
     }
-    let files_changed = upserts.len() + deletes.len();
+    upserts.extend(forced_upserts);
 
-    if storage::apply_reconcile(&handle.db, &storage::ReconcileWrite { upserts, deletes }).is_err()
-    {
+    if Instant::now() >= deadline {
+        timed_out = true;
+    }
+
+    let files_changed = upserts.len() + deletes.len();
+    let write = storage::ReconcileWrite {
+        upserts,
+        deletes,
+        pending_rescan: pending_to_write,
+    };
+    if storage::apply_reconcile(&handle.db, &write).is_err() {
         return Coverage {
             complete: false,
             files_scanned,
@@ -314,8 +463,6 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         };
     }
 
-    // `timed_out` reflects the walk only: a fully-walked pass stays complete
-    // even when the redb write phase runs past the deadline.
     Coverage {
         complete: !timed_out && !failed,
         files_scanned,
@@ -754,5 +901,305 @@ mod tests {
         let coverage = reconcile(&handle, repo.path(), Instant::now());
         assert!(coverage.timed_out);
         assert!(!coverage.complete);
+    }
+
+    /// A genuine two-hop re-export chain: `producer/__init__.py` re-exports
+    /// from `producer/ingest/__init__.py`, which itself re-exports from a
+    /// leaf module. The middle `__init__.py` is invisible to the consumer's
+    /// own direct edges — it only shows up as a `reexport_hops` entry, which
+    /// is exactly what the old code couldn't invalidate through.
+    fn two_hop_reexport_fixture(root: &Path) {
+        write_file(
+            root,
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import Thing\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .leaf1 import Thing\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/leaf1.py",
+            "class Thing:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/leaf2.py",
+            "class Thing:\n    pass\n",
+        );
+        write_file(root, "consumer/src/consumer/__init__.py", "");
+        write_file(
+            root,
+            "consumer/src/consumer/surface.py",
+            "from producer import Thing\n",
+        );
+    }
+
+    #[test]
+    fn warm_reconcile_redirects_two_hop_owner_from_leaf1_to_leaf2() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        two_hop_reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "redirect")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let leaf1 = Path::new("packages/producer/src/producer/ingest/leaf1.py");
+        let leaf2 = Path::new("packages/producer/src/producer/ingest/leaf2.py");
+        let surface_abs = repo.path().join("consumer/src/consumer/surface.py");
+        let surface = surface_abs.canonicalize().unwrap();
+        let surface_bytes_before = std::fs::read(&surface_abs).unwrap();
+
+        assert!(
+            canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(
+            !canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
+        );
+
+        // Redirect: only the middle-hop init's bytes change. Consumer is untouched.
+        write_file(
+            repo.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .leaf2 import Thing\n",
+        );
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+        assert!(!warm.timed_out);
+        // The edited ingest/__init__.py itself, plus two forced rescans: the
+        // outer producer/__init__.py (ingest/__init__.py is its own direct
+        // edge, so `read_reverse` names it) and surface.py (ingest/__init__.py
+        // is only its `reexport_hops` entry, so `read_reexport_hop_reverse`
+        // names it).
+        assert_eq!(
+            warm.files_changed, 3,
+            "expected the edited init + the two rescanned importers (producer/__init__.py and surface.py)"
+        );
+
+        assert_eq!(
+            std::fs::read(&surface_abs).unwrap(),
+            surface_bytes_before,
+            "consumer bytes must stay untouched by the redirect"
+        );
+        assert!(
+            !canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface),
+            "stale leaf1 ownership edge survived the redirect"
+        );
+        assert!(
+            canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface),
+            "redirected leaf2 ownership edge missing after warm reconcile"
+        );
+    }
+
+    #[test]
+    fn legacy_shard_without_reexport_hops_is_rescanned_before_redirect_invalidation() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        two_hop_reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "legacy-reexport-hops")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let middle = "packages/producer/src/producer/ingest/__init__.py";
+        let surface_rel = "consumer/src/consumer/surface.py";
+        storage::downgrade_shard_without_reexport_hops(&handle.db, surface_rel).unwrap();
+        assert!(!storage::read_reexport_hop_reverse(&handle.db, middle)
+            .unwrap()
+            .iter()
+            .any(|rel| rel == surface_rel));
+
+        write_file(repo.path(), middle, "from .leaf2 import Thing\n");
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let leaf1 = Path::new("packages/producer/src/producer/ingest/leaf1.py");
+        let leaf2 = Path::new("packages/producer/src/producer/ingest/leaf2.py");
+        let surface = repo.path().join(surface_rel).canonicalize().unwrap();
+        assert!(
+            !canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(
+            canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
+        );
+        assert_eq!(
+            storage::read_shard(&handle.db, surface_rel)
+                .unwrap()
+                .unwrap()
+                .schema_version,
+            storage::FILE_SHARD_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn walk_timeout_after_changed_init_preserves_unprocessed_importers() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        two_hop_reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "walk-timeout-after-init")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let middle = "packages/producer/src/producer/ingest/__init__.py";
+        write_file(repo.path(), middle, "from .leaf2 import Thing\n");
+        let roots = crate::read::imports::PyRoots::discover(repo.path());
+        let (rel, shard) = rescan_shard(repo.path(), &roots, middle).unwrap();
+        let upserts = vec![(rel, shard)];
+        let (_, previously_known) = storage::file_index_state(&handle.db).unwrap();
+        let (forced, pending, timed_out) = rescan_reexport_importers(
+            &handle.db,
+            repo.path(),
+            &roots,
+            &upserts,
+            &[],
+            &previously_known,
+            Vec::new(),
+            WalkStatus::TimedOut,
+            far_deadline(),
+        );
+
+        assert!(timed_out);
+        assert!(forced.is_empty());
+        let surface_rel = "consumer/src/consumer/surface.py";
+        assert!(pending.iter().any(|rel| rel == surface_rel));
+        storage::apply_reconcile(
+            &handle.db,
+            &storage::ReconcileWrite {
+                upserts,
+                deletes: Vec::new(),
+                pending_rescan: pending,
+            },
+        )
+        .unwrap();
+
+        let resumed = reconcile(&handle, repo.path(), far_deadline());
+        assert!(resumed.complete);
+        let leaf1 = Path::new("packages/producer/src/producer/ingest/leaf1.py");
+        let leaf2 = Path::new("packages/producer/src/producer/ingest/leaf2.py");
+        let surface = repo.path().join(surface_rel).canonicalize().unwrap();
+        assert!(
+            !canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(
+            canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn warm_reconcile_drops_two_hop_owner_edge_when_middle_init_is_deleted() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        two_hop_reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "two-hop-delete")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let leaf1 = Path::new("packages/producer/src/producer/ingest/leaf1.py");
+        let surface = repo
+            .path()
+            .join("consumer/src/consumer/surface.py")
+            .canonicalize()
+            .unwrap();
+        assert!(
+            canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface)
+        );
+
+        std::fs::remove_file(
+            repo.path()
+                .join("packages/producer/src/producer/ingest/__init__.py"),
+        )
+        .unwrap();
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        assert!(
+            !canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface),
+            "stale two-hop ownership edge survived middle-init deletion"
+        );
+    }
+
+    #[test]
+    fn partial_reexport_invalidation_resumes_on_next_reconcile() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        two_hop_reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "deadline-resume")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        // Redirect on disk, then simulate "the walk just noticed this one file
+        // changed" without racing the real walk against a deadline.
+        write_file(
+            repo.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .leaf2 import Thing\n",
+        );
+        let roots = crate::read::imports::PyRoots::discover(repo.path());
+        let init_rel = "packages/producer/src/producer/ingest/__init__.py".to_string();
+        let (rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel).unwrap();
+        let upserts = vec![(rel, new_shard)];
+        let previously_known: HashSet<String> = [init_rel.clone()].into_iter().collect();
+
+        let worklist = reexport_worklist(&handle.db, &upserts, &[], &previously_known, Vec::new());
+        let (forced, pending) = drain_worklist(
+            repo.path(),
+            &roots,
+            worklist,
+            &HashSet::new(),
+            Instant::now(),
+        );
+
+        assert!(
+            !pending.is_empty(),
+            "an already-past deadline must carry the worklist forward as pending"
+        );
+        assert!(
+            forced.is_empty(),
+            "no rescans should complete once the deadline has passed"
+        );
+        let surface_rel = "consumer/src/consumer/surface.py";
+        assert!(
+            pending.iter().any(|p| p == surface_rel),
+            "the consumer needing rescan must be carried forward as pending, not dropped: {pending:?}"
+        );
+
+        // Persist exactly what a real partial pass would have committed: the
+        // trigger's own new shard, plus the still-pending worklist.
+        storage::apply_reconcile(
+            &handle.db,
+            &storage::ReconcileWrite {
+                upserts,
+                deletes: Vec::new(),
+                pending_rescan: pending,
+            },
+        )
+        .unwrap();
+        assert!(!storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+
+        // The triggering init's signature is already committed, so it no longer
+        // "looks changed" — only the persisted pending entry can resume the work.
+        let leaf1 = Path::new("packages/producer/src/producer/ingest/leaf1.py");
+        let leaf2 = Path::new("packages/producer/src/producer/ingest/leaf2.py");
+        let resumed = reconcile(&handle, repo.path(), far_deadline());
+        assert!(resumed.complete);
+
+        let surface = repo.path().join(surface_rel).canonicalize().unwrap();
+        assert!(
+            !canonicalized(&impact(&handle, leaf1, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(
+            canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
+        );
+        assert!(
+            storage::read_pending_rescan(&handle.db).unwrap().is_empty(),
+            "pending worklist must drain once the follow-up reconcile completes it"
+        );
     }
 }
