@@ -106,6 +106,14 @@ pub(crate) fn worktree_key(cwd: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a worktree-relative path is a Python package initializer. Its
+/// re-export bindings decide the ownership edges of every file that imports it,
+/// so a change to one invalidates those importers even when their own bytes are
+/// unchanged.
+fn is_python_init(rel: &str) -> bool {
+    Path::new(rel).file_name().and_then(|n| n.to_str()) == Some("__init__.py")
+}
+
 /// Atomically replace the per-file shards + reverse edges for every file
 /// under `worktree` whose content signature (mtime + length) changed since
 /// the last reconcile, and remove shards for files that disappeared.
@@ -121,6 +129,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
     let roots = crate::read::imports::PyRoots::discover(worktree);
 
     let mut seen = HashSet::new();
+    let mut unchanged_python = Vec::new();
     let mut upserts = Vec::new();
     let mut files_scanned = 0usize;
     let mut timed_out = false;
@@ -163,6 +172,9 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             .get(&rel)
             .is_some_and(|sig| *sig == signature);
         if unchanged {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+                unchanged_python.push(rel);
+            }
             continue;
         }
 
@@ -199,6 +211,97 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
     } else {
         previously_known.difference(&seen).cloned().collect()
     };
+
+    if !timed_out {
+        let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
+        let mut forced: HashSet<String> = HashSet::new();
+        let mut forced_upserts = Vec::new();
+        for (rel, _) in &upserts {
+            if !is_python_init(rel) || !previously_known.contains(rel) {
+                continue;
+            }
+            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
+                continue;
+            };
+            for importer in importers {
+                if !already.contains(&importer) {
+                    forced.insert(importer);
+                }
+            }
+        }
+        for rel in &deletes {
+            if !is_python_init(rel) {
+                continue;
+            }
+            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
+                continue;
+            };
+            for importer in importers {
+                if !already.contains(&importer) {
+                    forced.insert(importer);
+                }
+            }
+        }
+        for importer in &forced {
+            let abs = worktree.join(importer);
+            let Some(signature) = storage::signature_of(&abs) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&abs) else {
+                continue;
+            };
+            let deps = crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
+                .into_iter()
+                .filter_map(|p| {
+                    p.strip_prefix(worktree)
+                        .ok()
+                        .map(|r| r.to_string_lossy().to_string())
+                })
+                .collect();
+            forced_upserts.push((importer.clone(), storage::FileShard { signature, deps }));
+        }
+
+        let mut new_inits = HashSet::new();
+        for (rel, _) in &upserts {
+            if is_python_init(rel) && !previously_known.contains(rel) {
+                new_inits.insert(rel.clone());
+            }
+        }
+        if !new_inits.is_empty() {
+            for importer in unchanged_python {
+                if forced.contains(&importer) {
+                    continue;
+                }
+                let abs = worktree.join(&importer);
+                let Some(signature) = storage::signature_of(&abs) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(&abs) else {
+                    continue;
+                };
+                let deps: Vec<String> =
+                    crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
+                        .into_iter()
+                        .filter_map(|p| {
+                            p.strip_prefix(worktree)
+                                .ok()
+                                .map(|r| r.to_string_lossy().to_string())
+                        })
+                        .collect();
+                let mut acquires_init = false;
+                for dep in &deps {
+                    if new_inits.contains(dep) {
+                        acquires_init = true;
+                        break;
+                    }
+                }
+                if acquires_init {
+                    forced_upserts.push((importer, storage::FileShard { signature, deps }));
+                }
+            }
+        }
+        upserts.extend(forced_upserts);
+    }
     let files_changed = upserts.len() + deletes.len();
 
     if storage::apply_reconcile(&handle.db, &storage::ReconcileWrite { upserts, deletes }).is_err()
@@ -503,6 +606,140 @@ mod tests {
             canonicalized(&after.dependents),
             canonicalized(&[repo.path().join("renamed.rs")])
         );
+    }
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The confirmed #197 src-layout fixture: a producer package re-exporting
+    /// `RankingEntry` from `rankings.py` through its `ingest/__init__.py`, plus a
+    /// direct importer and a package-surface importer.
+    fn reexport_fixture(root: &Path) {
+        write_file(root, "packages/producer/src/producer/__init__.py", "");
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\n",
+        );
+        write_file(root, "consumer/src/consumer/__init__.py", "");
+        write_file(
+            root,
+            "consumer/src/consumer/direct.py",
+            "from producer.ingest.rankings import RankingEntry\n",
+        );
+        write_file(
+            root,
+            "consumer/src/consumer/surface.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+    }
+
+    #[test]
+    fn warm_reconcile_drops_reexport_ownership_when_only_init_changes() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "reexport")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let rankings = Path::new("packages/producer/src/producer/ingest/rankings.py");
+        let surface = repo
+            .path()
+            .join("consumer/src/consumer/surface.py")
+            .canonicalize()
+            .unwrap();
+        let direct = repo
+            .path()
+            .join("consumer/src/consumer/direct.py")
+            .canonicalize()
+            .unwrap();
+
+        let before: HashSet<PathBuf> =
+            canonicalized(&impact(&handle, rankings, far_deadline()).dependents)
+                .into_iter()
+                .collect();
+        assert!(
+            before.contains(&surface),
+            "re-export ownership edge missing on warm base: {before:?}"
+        );
+        assert!(before.contains(&direct));
+
+        // Remove the re-export; leave every consumer's bytes untouched. Only
+        // __init__.py changes, so the consumer-signature skip would keep the
+        // stale surface.py -> rankings.py ownership edge without the force pass.
+        write_file(
+            repo.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "",
+        );
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let after: HashSet<PathBuf> =
+            canonicalized(&impact(&handle, rankings, far_deadline()).dependents)
+                .into_iter()
+                .collect();
+        assert!(
+            !after.contains(&surface),
+            "stale re-export ownership edge survived warm reconcile: {after:?}"
+        );
+        // The genuine direct importer is unaffected by the __init__ edit.
+        assert!(after.contains(&direct));
+    }
+
+    #[test]
+    fn warm_reconcile_drops_edges_when_init_is_deleted() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "delete-init")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let init = "packages/producer/src/producer/ingest/__init__.py";
+        let rankings = Path::new("packages/producer/src/producer/ingest/rankings.py");
+        std::fs::remove_file(repo.path().join(init)).unwrap();
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let surface = "consumer/src/consumer/surface.py";
+        let shard = storage::read_shard(&handle.db, surface).unwrap().unwrap();
+        assert!(!shard.deps.contains(&init.to_string()));
+        assert!(!shard.deps.contains(&rankings.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn warm_reconcile_discovers_importers_when_init_is_added() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let init = "packages/producer/src/producer/ingest/__init__.py";
+        std::fs::remove_file(repo.path().join(init)).unwrap();
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "add-init")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        write_file(repo.path(), init, "from .rankings import RankingEntry\n");
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let surface = "consumer/src/consumer/surface.py";
+        let rankings = "packages/producer/src/producer/ingest/rankings.py";
+        let shard = storage::read_shard(&handle.db, surface).unwrap().unwrap();
+        assert!(shard.deps.contains(&init.to_string()));
+        assert!(shard.deps.contains(&rankings.to_string()));
     }
 
     #[test]

@@ -1,9 +1,15 @@
-"""Direct Python import dependencies across src-layout packages (#197 part A).
+"""Python import dependencies across src-layout packages (#197 parts A and B).
 
 Both dependency engines must report import-only consumers of a producer file:
 `tilth_deps` (the legacy analyzer) and `fetch_dependencies` (the persistent
 index behind a real search continuation). Neither engine may borrow the other's
 result as its oracle, so each is exercised through its own MCP surface.
+
+Part B adds explicit re-export ownership: a consumer that imports a name from a
+package surface (`from producer.ingest import RankingEntry`) is associated with
+the file that defines it (`rankings.py`) when the package `__init__.py` proves
+that ownership with an explicit binding — while the direct edge to the surface
+is preserved.
 """
 import json
 import os
@@ -81,10 +87,32 @@ class PythonDeps(unittest.TestCase):
         _producer_consumer(self.cwd)
         got = self.deps_dependents(
             self.deps("packages/producer/src/producer/ingest/rankings.py"))
+        # direct.py imports rankings.py directly; __init__.py re-exports from it;
+        # surface.py reaches it through that explicit re-export (part B).
         self.assertEqual(got, {
             "consumer/src/consumer/direct.py",
+            "consumer/src/consumer/surface.py",
             "packages/producer/src/producer/ingest/__init__.py",
         })
+
+    def test_deps_reexport_alias_and_second_name_isolation(self):
+        _producer_consumer(self.cwd)
+        # A public alias in the surface: `RankingEntry as Ranked`.
+        _write(self.cwd, "packages/producer/src/producer/ingest/__init__.py",
+               "from .rankings import RankingEntry as Ranked\n"
+               "from .models import Model\n")
+        _write(self.cwd, "packages/producer/src/producer/ingest/models.py",
+               "class Model:\n    pass\n")
+        # Consumer of the aliased public name, on top of its own alias.
+        _write(self.cwd, "consumer/src/consumer/alias_user.py",
+               "from producer.ingest import Ranked as R\n")
+        # Consumer of a different re-exported name must not attach to rankings.py.
+        _write(self.cwd, "consumer/src/consumer/model_user.py",
+               "from producer.ingest import Model\n")
+        got = self.deps_dependents(
+            self.deps("packages/producer/src/producer/ingest/rankings.py"))
+        self.assertIn("consumer/src/consumer/alias_user.py", got)
+        self.assertNotIn("consumer/src/consumer/model_user.py", got)
 
     def test_deps_reports_barrel_importer(self):
         _producer_consumer(self.cwd)
@@ -167,14 +195,17 @@ class PythonDeps(unittest.TestCase):
         self.assertFalse(harness.tool_is_error(response), response)
         return json.loads(harness.tool_result_text(response))["results"][0]
 
-    def test_fetch_dependencies_direct_importer(self):
+    def test_fetch_dependencies_direct_and_reexport_importers(self):
         _producer_consumer(self.cwd)
         hint = self.dep_hint("packages/producer/src/producer/ingest/rankings.py")
         result = self.follow(hint)
         impact = result["dependency_impact"]
         self.assertEqual(impact["coverage"], "complete")
+        # The complete fixture: the direct importer, the barrel that re-exports,
+        # and the package-surface importer proven through that re-export.
         self.assertEqual(set(impact["dependents"]), {
             "consumer/src/consumer/direct.py",
+            "consumer/src/consumer/surface.py",
             "packages/producer/src/producer/ingest/__init__.py",
         })
 
@@ -195,6 +226,21 @@ class PythonDeps(unittest.TestCase):
                "value = 1\n")
         second = self.follow(hint)["dependency_impact"]
         self.assertNotIn("consumer/src/consumer/direct.py", second["dependents"])
+        self.assertEqual(second["coverage"], "complete")
+
+    def test_fetch_dependencies_warm_index_drops_reexport_on_init_edit(self):
+        _producer_consumer(self.cwd)
+        hint = self.dep_hint("packages/producer/src/producer/ingest/rankings.py")
+        first = self.follow(hint)["dependency_impact"]
+        self.assertIn("consumer/src/consumer/surface.py", first["dependents"])
+        # Remove the re-export by editing ONLY __init__.py. Every consumer's
+        # bytes stay identical, so the stale surface.py -> rankings.py ownership
+        # edge must still drop on the next warm query without clearing the index.
+        _write(self.cwd, "packages/producer/src/producer/ingest/__init__.py", "")
+        second = self.follow(hint)["dependency_impact"]
+        self.assertNotIn("consumer/src/consumer/surface.py", second["dependents"])
+        # The direct importer is unaffected by the __init__ edit.
+        self.assertIn("consumer/src/consumer/direct.py", second["dependents"])
         self.assertEqual(second["coverage"], "complete")
 
     def test_fetch_dependencies_ambiguous_identity_is_partial(self):

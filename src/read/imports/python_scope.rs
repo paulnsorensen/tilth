@@ -136,33 +136,53 @@ pub(crate) fn resolve_python_edges(
         return res;
     };
     let mut raw = Vec::new();
-    collect_imports(tree.root_node(), content.as_bytes(), &mut raw);
+    collect_python_imports(tree.root_node(), content.as_bytes(), &mut raw);
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for (module, line) in raw {
+    for imp in raw {
         if res.edges.len() >= super::MAX_SUGGESTIONS {
             break;
         }
-        if module.is_empty() {
+        if imp.module.is_empty() {
             continue;
         }
-        if module.starts_with('.') {
-            // Relative import: existing resolver owns the dot arithmetic and
-            // normalization, keeping ordinary package layouts unchanged.
-            if let Some(path) = super::resolve(dir, &module, Lang::Python) {
-                if seen.insert(path.clone()) {
-                    res.edges.push(ImportEdge { path, module, line });
-                }
+        // The imported module itself: a direct edge when it resolves to exactly
+        // one in-scope file. Zero candidates is external and more than one is
+        // ambiguous — both omitted here, never guessed. Relative modules reuse
+        // the existing dot-resolver, keeping ordinary package layouts unchanged.
+        let ModuleTarget::File(direct) = resolve_module_file(&imp.module, dir, roots) else {
+            continue;
+        };
+        if seen.insert(direct.clone()) {
+            res.edges.push(ImportEdge {
+                path: direct.clone(),
+                module: imp.module.clone(),
+                line: imp.line,
+            });
+        }
+        // Named re-export ownership: when the imported module is a package
+        // `__init__.py` that explicitly re-exports the requested name, also
+        // associate this consumer with the file that defines it. Only the
+        // specific imported name is followed, so importing one public name never
+        // attaches the consumer to every file the package re-exports.
+        if !is_init_py(&direct) {
+            continue;
+        }
+        for nm in &imp.names {
+            if res.edges.len() >= super::MAX_SUGGESTIONS {
+                break;
             }
-            continue;
-        }
-        // Exactly one in-scope candidate is a proven edge; zero is external and
-        // more than one is ambiguous — both omitted here, never guessed.
-        let mut candidates = roots.candidates(&module);
-        if candidates.len() == 1 {
-            let path = candidates.pop().unwrap();
-            if seen.insert(path.clone()) {
-                res.edges.push(ImportEdge { path, module, line });
+            let mut visited = HashSet::new();
+            if let OwnerResult::Owned(owner) =
+                resolve_reexport_owner(&direct, &nm.original, roots, &mut visited)
+            {
+                if owner != direct && seen.insert(owner.clone()) {
+                    res.edges.push(ImportEdge {
+                        path: owner,
+                        module: imp.module.clone(),
+                        line: imp.line,
+                    });
+                }
             }
         }
     }
@@ -194,16 +214,46 @@ fn parse_python(content: &str) -> Option<tree_sitter::Tree> {
     parser.parse(content, None)
 }
 
-/// Walk the tree collecting `(module_source, line)` for every import statement,
-/// using the AST so aliases and parenthesized from-imports resolve correctly.
-fn collect_imports(node: tree_sitter::Node, src: &[u8], out: &mut Vec<(String, u32)>) {
+/// One import statement in raw form: the module source, the line it sits on,
+/// and — for `from module import ...` — the names it binds. Plain `import a.b`
+/// and wildcard `from a import *` carry no traceable names.
+struct RawImport {
+    module: String,
+    line: u32,
+    names: Vec<ImportedName>,
+}
+
+/// One name bound by a `from` import. `local` is how the importing file refers
+/// to it (the alias when present); `original` is the name in the source module,
+/// which is the name the re-export chain is followed by.
+struct ImportedName {
+    local: String,
+    original: String,
+}
+
+/// Walk the tree collecting one [`RawImport`] per import statement, using the
+/// AST so aliases and parenthesized from-imports resolve correctly.
+fn collect_python_imports(node: tree_sitter::Node, src: &[u8], out: &mut Vec<RawImport>) {
     match node.kind() {
         "import_from_statement" => {
-            if let Some(module) = node.child_by_field_name("module_name") {
-                if let Ok(text) = module.utf8_text(src) {
-                    out.push((text.to_string(), module.start_position().row as u32 + 1));
+            let Some(module) = node.child_by_field_name("module_name") else {
+                return;
+            };
+            let Ok(module_text) = module.utf8_text(src) else {
+                return;
+            };
+            let mut names = Vec::new();
+            let mut cursor = node.walk();
+            for name in node.children_by_field_name("name", &mut cursor) {
+                if let Some(imported) = imported_name(name, src) {
+                    names.push(imported);
                 }
             }
+            out.push(RawImport {
+                module: module_text.to_string(),
+                line: module.start_position().row as u32 + 1,
+                names,
+            });
         }
         "import_statement" => {
             let mut cursor = node.walk();
@@ -217,7 +267,11 @@ fn collect_imports(node: tree_sitter::Node, src: &[u8], out: &mut Vec<(String, u
                 };
                 if let Some(dotted) = dotted {
                     if let Ok(text) = dotted.utf8_text(src) {
-                        out.push((text.to_string(), dotted.start_position().row as u32 + 1));
+                        out.push(RawImport {
+                            module: text.to_string(),
+                            line: dotted.start_position().row as u32 + 1,
+                            names: Vec::new(),
+                        });
                     }
                 }
             }
@@ -225,9 +279,201 @@ fn collect_imports(node: tree_sitter::Node, src: &[u8], out: &mut Vec<(String, u
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_imports(child, src, out);
+                collect_python_imports(child, src, out);
             }
         }
+    }
+}
+
+/// The `(local, original)` pair for one `from ... import` name, or `None` for a
+/// wildcard (`*`), which binds no traceable name.
+fn imported_name(node: tree_sitter::Node, src: &[u8]) -> Option<ImportedName> {
+    if node.kind() == "aliased_import" {
+        let original = node.child_by_field_name("name")?.utf8_text(src).ok()?;
+        let local = node.child_by_field_name("alias")?.utf8_text(src).ok()?;
+        Some(ImportedName {
+            local: local.to_string(),
+            original: original.to_string(),
+        })
+    } else if matches!(node.kind(), "dotted_name" | "identifier") {
+        let text = node.utf8_text(src).ok()?;
+        Some(ImportedName {
+            local: text.to_string(),
+            original: text.to_string(),
+        })
+    } else {
+        // wildcard_import and any other node bind no traceable name.
+        None
+    }
+}
+
+/// Whether a resolved path is a package initializer (`__init__.py`).
+fn is_init_py(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("__init__.py")
+}
+
+/// Where a module reference resolves within scope.
+enum ModuleTarget {
+    /// A unique in-scope file.
+    File(PathBuf),
+    /// Multiple in-scope candidates (duplicate roots): identity is unreliable.
+    Ambiguous,
+    /// No in-scope candidate: the module is external to this scope.
+    External,
+}
+
+/// Resolve one module reference — relative (`.rankings`) or absolute
+/// (`producer.ingest`) — to its in-scope file. Relative references reuse the
+/// existing dot-resolver; absolute references go through the package roots.
+fn resolve_module_file(module: &str, dir: &Path, roots: &PyRoots) -> ModuleTarget {
+    if module.starts_with('.') {
+        match super::resolve(dir, module, Lang::Python) {
+            Some(path) => ModuleTarget::File(path),
+            None => ModuleTarget::External,
+        }
+    } else {
+        let mut candidates = roots.candidates(module);
+        match candidates.len() {
+            0 => ModuleTarget::External,
+            1 => ModuleTarget::File(candidates.pop().unwrap()),
+            _ => ModuleTarget::Ambiguous,
+        }
+    }
+}
+
+/// Outcome of following a name through explicit re-export bindings.
+enum OwnerResult {
+    /// A single defining file proven by the binding chain.
+    Owned(PathBuf),
+    /// The name is not re-exported here.
+    NotFound,
+    /// The name comes from a module outside the current scope.
+    External,
+    /// A cycle or an ambiguous owner was hit; no owner is fabricated.
+    Blocked,
+}
+
+fn initializer_defines_name(init: &Path, name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(init) else {
+        return false;
+    };
+    let Some(tree) = parse_python(&content) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if python_node_defines_name(node, content.as_bytes(), name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn python_node_defines_name(node: tree_sitter::Node, src: &[u8], name: &str) -> bool {
+    let kind = node.kind();
+    if kind == "class_definition" || kind == "function_definition" || kind == "type_alias_statement"
+    {
+        return node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(src).ok())
+            == Some(name);
+    }
+    if kind == "decorated_definition" || kind == "expression_statement" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if python_node_defines_name(child, src, name) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if kind == "assignment" {
+        let Some(left) = node.child_by_field_name("left") else {
+            return false;
+        };
+        return python_node_defines_name(left, src, name);
+    }
+    if kind == "identifier" {
+        return node.utf8_text(src).ok() == Some(name);
+    }
+    if kind == "list_pattern" || kind == "tuple_pattern" || kind == "pattern_list" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if python_node_defines_name(child, src, name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Follow explicit `from ... import name` bindings in `init` (an `__init__.py`)
+/// to the single file that defines `name`. Relative and absolute re-export
+/// modules, aliases, and parenthesized lists are all supported. A `(file, name)`
+/// visited set makes cycles terminate; two bindings of the same name to
+/// different files are ambiguous and resolve to no owner rather than by order.
+fn resolve_reexport_owner(
+    init: &Path,
+    name: &str,
+    roots: &PyRoots,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> OwnerResult {
+    if !visited.insert((init.to_path_buf(), name.to_string())) {
+        return OwnerResult::Blocked; // cycle: terminate without fabricating an owner
+    }
+    let Ok(content) = std::fs::read_to_string(init) else {
+        return OwnerResult::NotFound;
+    };
+    let Some(dir) = init.parent() else {
+        return OwnerResult::NotFound;
+    };
+    let Some(tree) = parse_python(&content) else {
+        return OwnerResult::NotFound;
+    };
+    let mut raw = Vec::new();
+    collect_python_imports(tree.root_node(), content.as_bytes(), &mut raw);
+
+    let mut owners: Vec<PathBuf> = Vec::new();
+    let mut blocked = false;
+    let mut external = false;
+    for imp in &raw {
+        for nm in imp.names.iter().filter(|nm| nm.local == name) {
+            match resolve_module_file(&imp.module, dir, roots) {
+                ModuleTarget::Ambiguous => blocked = true,
+                ModuleTarget::External => external = true,
+                ModuleTarget::File(target) => {
+                    if is_init_py(&target) {
+                        match resolve_reexport_owner(&target, &nm.original, roots, visited) {
+                            OwnerResult::Owned(f) => owners.push(f),
+                            OwnerResult::NotFound => {
+                                if initializer_defines_name(&target, &nm.original) {
+                                    owners.push(target);
+                                }
+                            }
+                            OwnerResult::External => external = true,
+                            OwnerResult::Blocked => blocked = true,
+                        }
+                    } else {
+                        owners.push(target); // leaf module defines the name
+                    }
+                }
+            }
+        }
+    }
+    owners.sort();
+    owners.dedup();
+    // A duplicate owner or any blocked hop makes the identity unreliable: never
+    // resolve by traversal order, and never fabricate an owner.
+    if owners.len() > 1 || blocked || (external && !owners.is_empty()) {
+        return OwnerResult::Blocked;
+    }
+    if external {
+        return OwnerResult::External;
+    }
+    match owners.pop() {
+        Some(owner) => OwnerResult::Owned(owner),
+        None => OwnerResult::NotFound,
     }
 }
 
@@ -343,23 +589,224 @@ mod tests {
         assert_eq!(edges[0].line, 1);
     }
 
+    /// The resolved edge paths for one consumer file, sorted for comparison.
+    fn edge_paths(root: &Path, consumer: &Path) -> Vec<PathBuf> {
+        let roots = PyRoots::discover(root);
+        let mut paths: Vec<PathBuf> =
+            resolve_python_edges(consumer, &fs::read_to_string(consumer).unwrap(), &roots)
+                .edges
+                .into_iter()
+                .map(|e| e.path)
+                .collect();
+        paths.sort();
+        paths
+    }
+
     #[test]
-    fn barrel_from_import_resolves_to_package_init() {
+    fn barrel_from_import_keeps_surface_and_adds_reexport_owner() {
         let tmp = producer_consumer();
         let consumer = write(
             tmp.path(),
             "consumer/src/consumer/surface.py",
             "from producer.ingest import RankingEntry\n",
         );
-        let roots = PyRoots::discover(tmp.path());
-        let edges =
-            resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots).edges;
+        // The direct edge to the package surface is preserved, and the proven
+        // defining file is added — both, never a substitution.
+        let mut expected = vec![
+            tmp.path()
+                .join("packages/producer/src/producer/ingest/__init__.py"),
+            tmp.path()
+                .join("packages/producer/src/producer/ingest/rankings.py"),
+        ];
+        expected.sort();
+        assert_eq!(edge_paths(tmp.path(), &consumer), expected);
+    }
+
+    #[test]
+    fn reexport_owner_honors_public_and_consumer_aliases() {
+        let tmp = producer_consumer();
+        // Public alias in the package surface: `RankingEntry as Ranked`.
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry as Ranked\n",
+        );
+        // Consumer alias on top of the public alias.
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/aliased_surface.py",
+            "from producer.ingest import Ranked as R\n",
+        );
+        assert!(edge_paths(tmp.path(), &consumer).contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/rankings.py")
+        ));
+    }
+
+    #[test]
+    fn reexport_owner_follows_parenthesized_list() {
+        let tmp = producer_consumer();
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/parened.py",
+            "from producer.ingest import (\n    RankingEntry,\n)\n",
+        );
+        assert!(edge_paths(tmp.path(), &consumer).contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/rankings.py")
+        ));
+    }
+
+    #[test]
+    fn reexport_owner_follows_two_hop_init_chain() {
+        let tmp = producer_consumer();
+        // producer/__init__ re-exports from the ingest subpackage, which in turn
+        // re-exports from rankings.py: a two-hop __init__ chain.
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/two_hop.py",
+            "from producer import RankingEntry\n",
+        );
+        assert!(edge_paths(tmp.path(), &consumer).contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/rankings.py")
+        ));
+    }
+
+    #[test]
+    fn reexport_owner_preserves_external_chain_result() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import RankingEntry\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from external_package import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/external_chain.py",
+            "from producer import RankingEntry\n",
+        );
         assert_eq!(
-            edges.iter().map(|e| &e.path).collect::<Vec<_>>(),
-            vec![&tmp
+            edge_paths(tmp.path(), &consumer),
+            vec![tmp
+                .path()
+                .join("packages/producer/src/producer/__init__.py")]
+        );
+    }
+
+    #[test]
+    fn reexport_owner_accepts_name_defined_in_nested_init() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import RankingEntry\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/local_chain.py",
+            "from producer import RankingEntry\n",
+        );
+        let paths = edge_paths(tmp.path(), &consumer);
+        assert!(paths.contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/__init__.py")
+        ));
+    }
+
+    #[test]
+    fn reexport_owner_isolates_each_public_name() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/models.py",
+            "class Model:\n    pass\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\nfrom .models import Model\n",
+        );
+        // A consumer of Model must not become a dependent of rankings.py.
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/model_user.py",
+            "from producer.ingest import Model\n",
+        );
+        let paths = edge_paths(tmp.path(), &consumer);
+        assert!(paths.contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/models.py")
+        ));
+        assert!(!paths.contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/rankings.py")
+        ));
+    }
+
+    #[test]
+    fn duplicate_public_name_owner_is_not_resolved_by_order() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/other.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        // Two bindings of the same public name to different files: ambiguous.
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\nfrom .other import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/dup.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+        // Only the direct edge to the package surface survives; neither owner is
+        // guessed by traversal order.
+        assert_eq!(
+            edge_paths(tmp.path(), &consumer),
+            vec![tmp
                 .path()
                 .join("packages/producer/src/producer/ingest/__init__.py")]
         );
+    }
+
+    #[test]
+    fn cyclic_reexport_terminates_without_fabricating_owner() {
+        let tmp = producer_consumer();
+        // ingest/__init__ re-exports X from itself: a self-referential cycle.
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from . import RankingEntry\n",
+        );
+        let init = tmp
+            .path()
+            .join("packages/producer/src/producer/ingest/__init__.py");
+        let roots = PyRoots::discover(tmp.path());
+        let mut visited = HashSet::new();
+        // The resolver terminates and reports no fabricated owner.
+        assert!(matches!(
+            resolve_reexport_owner(&init, "RankingEntry", &roots, &mut visited),
+            OwnerResult::Blocked
+        ));
     }
 
     #[test]
