@@ -659,6 +659,64 @@ fn assemble(parts: &[&str]) -> String {
 mod tests {
     use super::*;
 
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn analyze_deps_reports_direct_and_reexport_importers() {
+        // The #197 src-layout fixture: rankings.py is imported directly by
+        // direct.py and, through the package surface's explicit re-export, by
+        // surface.py. Both must appear as dependents.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(root, "packages/producer/src/producer/__init__.py", "");
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\n",
+        );
+        write_file(root, "consumer/src/consumer/__init__.py", "");
+        write_file(
+            root,
+            "consumer/src/consumer/direct.py",
+            "from producer.ingest.rankings import RankingEntry\n",
+        );
+        write_file(
+            root,
+            "consumer/src/consumer/surface.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let result = analyze_deps(&target, root, &bloom).expect("analyze_deps");
+        let dependents: Vec<String> = result
+            .used_by
+            .iter()
+            .map(|d| d.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            dependents
+                .iter()
+                .any(|p| p.ends_with("consumer/src/consumer/surface.py")),
+            "re-export importer missing: {dependents:?}"
+        );
+        assert!(
+            dependents
+                .iter()
+                .any(|p| p.ends_with("consumer/src/consumer/direct.py")),
+            "direct importer missing: {dependents:?}"
+        );
+    }
+
     #[test]
     fn budget_truncation_keeps_notice_inside_budget() {
         let header = "# deps for src/lib.rs";

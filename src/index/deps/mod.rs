@@ -106,6 +106,14 @@ pub(crate) fn worktree_key(cwd: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a worktree-relative path is a Python package initializer. Its
+/// re-export bindings decide the ownership edges of every file that imports it,
+/// so a change to one invalidates those importers even when their own bytes are
+/// unchanged.
+fn is_python_init(rel: &str) -> bool {
+    Path::new(rel).file_name().and_then(|n| n.to_str()) == Some("__init__.py")
+}
+
 /// Atomically replace the per-file shards + reverse edges for every file
 /// under `worktree` whose content signature (mtime + length) changed since
 /// the last reconcile, and remove shards for files that disappeared.
@@ -190,6 +198,49 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             Vec::new()
         };
         upserts.push((rel, storage::FileShard { signature, deps }));
+    }
+
+    // Re-export ownership edges are derived from a package `__init__.py`, not
+    // from the consumer's own bytes: when such an `__init__.py` changed, its
+    // importers' ownership edges may be stale even though their signatures did
+    // not move, so the unchanged-signature skip above would keep them. Force a
+    // re-resolve of those importers this pass. Reverse edges are read from the
+    // pre-pass store; the consumer's *direct* edge to the `__init__.py` is
+    // stable across the re-export change, so the importer set is reliable.
+    if !timed_out {
+        let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
+        let mut forced: HashSet<String> = HashSet::new();
+        let mut forced_upserts = Vec::new();
+        for (rel, _) in &upserts {
+            if !is_python_init(rel) {
+                continue;
+            }
+            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
+                continue;
+            };
+            for importer in importers {
+                if already.contains(&importer) || !forced.insert(importer.clone()) {
+                    continue;
+                }
+                let abs = worktree.join(&importer);
+                let Some(signature) = storage::signature_of(&abs) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(&abs) else {
+                    continue;
+                };
+                let deps = crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
+                    .into_iter()
+                    .filter_map(|p| {
+                        p.strip_prefix(worktree)
+                            .ok()
+                            .map(|r| r.to_string_lossy().to_string())
+                    })
+                    .collect();
+                forced_upserts.push((importer, storage::FileShard { signature, deps }));
+            }
+        }
+        upserts.extend(forced_upserts);
     }
 
     // A cut-short scan cannot distinguish "deleted" from "not yet reached",
@@ -503,6 +554,95 @@ mod tests {
             canonicalized(&after.dependents),
             canonicalized(&[repo.path().join("renamed.rs")])
         );
+    }
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The confirmed #197 src-layout fixture: a producer package re-exporting
+    /// `RankingEntry` from `rankings.py` through its `ingest/__init__.py`, plus a
+    /// direct importer and a package-surface importer.
+    fn reexport_fixture(root: &Path) {
+        write_file(root, "packages/producer/src/producer/__init__.py", "");
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\n",
+        );
+        write_file(root, "consumer/src/consumer/__init__.py", "");
+        write_file(
+            root,
+            "consumer/src/consumer/direct.py",
+            "from producer.ingest.rankings import RankingEntry\n",
+        );
+        write_file(
+            root,
+            "consumer/src/consumer/surface.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+    }
+
+    #[test]
+    fn warm_reconcile_drops_reexport_ownership_when_only_init_changes() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "reexport")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let rankings = Path::new("packages/producer/src/producer/ingest/rankings.py");
+        let surface = repo
+            .path()
+            .join("consumer/src/consumer/surface.py")
+            .canonicalize()
+            .unwrap();
+        let direct = repo
+            .path()
+            .join("consumer/src/consumer/direct.py")
+            .canonicalize()
+            .unwrap();
+
+        let before: HashSet<PathBuf> =
+            canonicalized(&impact(&handle, rankings, far_deadline()).dependents)
+                .into_iter()
+                .collect();
+        assert!(
+            before.contains(&surface),
+            "re-export ownership edge missing on warm base: {before:?}"
+        );
+        assert!(before.contains(&direct));
+
+        // Remove the re-export; leave every consumer's bytes untouched. Only
+        // __init__.py changes, so the consumer-signature skip would keep the
+        // stale surface.py -> rankings.py ownership edge without the force pass.
+        write_file(
+            repo.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "",
+        );
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let after: HashSet<PathBuf> =
+            canonicalized(&impact(&handle, rankings, far_deadline()).dependents)
+                .into_iter()
+                .collect();
+        assert!(
+            !after.contains(&surface),
+            "stale re-export ownership edge survived warm reconcile: {after:?}"
+        );
+        // The genuine direct importer is unaffected by the __init__ edit.
+        assert!(after.contains(&direct));
     }
 
     #[test]
