@@ -96,11 +96,10 @@ pub(crate) fn format_overview(
         // overview is incidental output, so redact the file's signatures rather
         // than inline credential material. A deliberate `scope`-ed file/function
         // view is the diff analog of a deliberate `tilth_read` and stays intact.
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(is_secret_file)
-        {
+        if path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            is_secret_file(&name)
+        }) {
             let _ = writeln!(out, "## {rel_path} (secret — contents redacted)");
             continue;
         }
@@ -719,6 +718,31 @@ mod tests {
         assert!(
             nout.contains("def load(y)"),
             "non-secret signature must remain visible:\n{nout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_overview_lossy_secret_basename_redacted() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let overlay = FileOverlay {
+            path: PathBuf::from(OsString::from_vec(b"credentials-\xff.py".to_vec())),
+            symbol_changes: vec![make_sig_change(
+                "connect",
+                "def connect(token=\"OLD\")",
+                "def connect(token=\"SYNTHETIC_SECRET\")",
+            )],
+            attributed_hunks: Vec::new(),
+        };
+        let path = overlay.path.clone();
+        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
+        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        assert!(out.contains("redacted"), "missing redaction marker:\n{out}");
+        assert!(
+            !out.contains("SYNTHETIC_SECRET"),
+            "secret signature leaked in overview:\n{out}"
         );
     }
 
