@@ -385,10 +385,9 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     };
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
-    // `Session::nudge` resolves grok-vs-batch precedence internally.
     // `tilth_search` is exempt: its response is pure JSON and drops any tip,
-    // so observing it would break an unrelated streak and silently spend a
-    // grok emission on a response nobody can read it from.
+    // so observing it would break an unrelated streak for a response nobody
+    // can read a tip from.
     let tip = if tool == "tilth_search" {
         None
     } else {
@@ -638,9 +637,8 @@ mod tests {
     }
 
     #[test]
-    fn rejected_selectors_do_not_arm_grok_nudges() {
+    fn rejected_search_selectors_error() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
         let cwd = dir.path().to_str().unwrap();
         let services = Services::new(false);
         for selector in ["kind", "expand", "context"] {
@@ -651,13 +649,6 @@ mod tests {
             args["queries"][0][selector] = serde_json::json!("symbol");
             assert!(dispatch_tool("tilth_search", &args, &services).is_err());
         }
-        let read = dispatch_tool(
-            "tilth_read",
-            &serde_json::json!({"paths": ["a.rs"], "cwd": cwd}),
-            &services,
-        )
-        .unwrap();
-        assert!(!read.contains("TIP: tilth_grok"));
     }
 
     #[test]
