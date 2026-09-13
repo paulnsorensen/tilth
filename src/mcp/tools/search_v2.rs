@@ -1316,11 +1316,40 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(result["status"], "ok", "{followed}");
+            // The duplicate preview payload is gone; identities live only in the
+            // canonical `items`/`dependency_impact` arrays (#238).
             assert!(
-                result["preview"].as_str().unwrap().contains(expected),
+                result.get("preview").is_none(),
+                "follow result must not carry preview: {followed}"
+            );
+            let identities: Vec<String> = if hint["kind"] == "fetch_dependencies" {
+                let impact = &result["dependency_impact"];
+                impact["imports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(impact["dependents"].as_array().unwrap())
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect()
+            } else {
+                let items = result["items"].as_array().unwrap();
+                assert_eq!(
+                    result["total_found"].as_u64().unwrap() as usize,
+                    items.len()
+                );
+                items
+                    .iter()
+                    .flat_map(|item| [item.get("name"), item.get("path")])
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert!(identities.iter().any(|s| s == expected), "{followed}");
+            assert!(
+                !identities.iter().any(|s| s == "wrong_caller"),
                 "{followed}"
             );
-            assert!(!result["preview"].as_str().unwrap().contains("wrong_caller"));
             assert!(followed["hints"].as_array().unwrap().is_empty());
         }
         assert_eq!(hints[0]["target"]["line"], 2);

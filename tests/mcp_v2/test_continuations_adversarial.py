@@ -105,13 +105,24 @@ class ContinuationBoundary(unittest.TestCase):
         self.assertIn("budget", harness.tool_result_text(response).lower())
 
     def test_follow_budget_reduction_keeps_one_result_per_entry(self):
+        # Many callers make the canonical `items` array the largest droppable
+        # payload; without the removed duplicate preview a tight budget forces
+        # exactly that array out and marks the record partial (#238).
+        callers = "\n".join(
+            f"function calling_function_number_{i:02d}() {{ root(); }}" for i in range(12)
+        )
+        (self.cwd / "fixture.ts").write_text(f"export function root() {{}}\n{callers}\n")
         first = self.payload([{"query": "root"}])
-        hints = first["hints"][:2]
-        response = self.call([{"follow": hint} for hint in hints], budget=160)
+        hints = [h for h in first["hints"] if h["kind"] in ("fetch_callers", "fetch_callees")][:2]
+        response = self.call([{"follow": hint} for hint in hints], budget=200)
         self.assertFalse(harness.tool_is_error(response), response)
         payload = json.loads(harness.tool_result_text(response))
         self.assertEqual(len(payload["results"]), 2)
-        self.assertIn("partial", [result["completeness"] for result in payload["results"]])
+        trimmed = [r for r in payload["results"] if r.get("budget_limited")]
+        self.assertTrue(trimmed, payload)
+        for result in trimmed:
+            self.assertEqual(result["completeness"], "partial")
+            self.assertNotIn("items", result)
         self.assertNotIn("TIP:", json.dumps(payload))
 
 

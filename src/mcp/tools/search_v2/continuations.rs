@@ -167,7 +167,6 @@ impl Follow {
             } else if empty {
                 result["status"] = json!("no_match");
             }
-            result["preview"] = json!(deps.to_string());
             result["dependency_impact"] = deps;
             return Ok(result);
         }
@@ -285,11 +284,6 @@ impl Follow {
             result["status"] = json!("no_match");
         }
         result["total_found"] = json!(total);
-        result["preview"] = json!(items
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"));
         result["items"] = json!(items);
         Ok(result)
     }

@@ -66,6 +66,9 @@ class Continuations(unittest.TestCase):
                 self.assertEqual(result["resolved_as"], hint["kind"])
                 self.assertEqual(result["target"], hint["target"])
                 self.assertEqual(result["status"], "ok")
+                # The duplicate preview payload is dropped for every follow
+                # kind; canonical arrays carry the identities (#238).
+                self.assertNotIn("preview", result)
                 if hint["kind"] == "fetch_dependencies":
                     impact = result["dependency_impact"]
                     identities = impact["imports"] + impact["dependents"]
