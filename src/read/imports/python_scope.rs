@@ -34,13 +34,27 @@ pub(crate) struct AmbiguousTarget {
     pub(crate) candidates: Vec<PathBuf>,
 }
 
+/// Why one import could not become a proven edge: never guessed, always surfaced.
+pub(crate) enum Uncertainty {
+    /// The imported module itself has more than one in-scope candidate.
+    AmbiguousModule {
+        module: String,
+        candidates: Vec<PathBuf>,
+    },
+    /// A named re-export chain could not settle on one owner (duplicate
+    /// owners, a blocked ambiguous hop, or a cycle) — see `OwnerResult::Blocked`.
+    BlockedOwnership { module: String, name: String },
+}
+
 /// Result of resolving one Python file's imports against a scope's roots.
 /// A module with multiple in-scope candidates (ambiguous) is omitted from
 /// `edges` rather than guessed; the [`target_ambiguity`] check is how the
-/// engines surface that ambiguity to the caller.
+/// engines surface the *target's own* identity ambiguity, while `uncertain`
+/// carries this file's own unresolved forward imports.
 #[derive(Default)]
 pub(crate) struct PyResolution {
     pub(crate) edges: Vec<ImportEdge>,
+    pub(crate) uncertain: Vec<Uncertainty>,
 }
 
 impl PyResolution {
@@ -140,18 +154,24 @@ pub(crate) fn resolve_python_edges(
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for imp in raw {
-        if res.edges.len() >= super::MAX_SUGGESTIONS {
-            break;
-        }
         if imp.module.is_empty() {
             continue;
         }
         // The imported module itself: a direct edge when it resolves to exactly
-        // one in-scope file. Zero candidates is external and more than one is
-        // ambiguous — both omitted here, never guessed. Relative modules reuse
-        // the existing dot-resolver, keeping ordinary package layouts unchanged.
-        let ModuleTarget::File(direct) = resolve_module_file(&imp.module, dir, roots) else {
-            continue;
+        // one in-scope file. Zero candidates is external (silently skipped, not
+        // uncertainty) and more than one is ambiguous — surfaced, never guessed.
+        // Relative modules reuse the existing dot-resolver, keeping ordinary
+        // package layouts unchanged.
+        let direct = match resolve_module_file(&imp.module, dir, roots) {
+            ModuleTarget::File(direct) => direct,
+            ModuleTarget::Ambiguous => {
+                res.uncertain.push(Uncertainty::AmbiguousModule {
+                    module: imp.module.clone(),
+                    candidates: roots.candidates(&imp.module),
+                });
+                continue;
+            }
+            ModuleTarget::External => continue,
         };
         if seen.insert(direct.clone()) {
             res.edges.push(ImportEdge {
@@ -169,20 +189,24 @@ pub(crate) fn resolve_python_edges(
             continue;
         }
         for nm in &imp.names {
-            if res.edges.len() >= super::MAX_SUGGESTIONS {
-                break;
-            }
             let mut visited = HashSet::new();
-            if let OwnerResult::Owned(owner) =
-                resolve_reexport_owner(&direct, &nm.original, roots, &mut visited)
-            {
-                if owner != direct && seen.insert(owner.clone()) {
-                    res.edges.push(ImportEdge {
-                        path: owner,
+            match resolve_reexport_owner(&direct, &nm.original, roots, &mut visited) {
+                OwnerResult::Owned(owner) => {
+                    if owner != direct && seen.insert(owner.clone()) {
+                        res.edges.push(ImportEdge {
+                            path: owner,
+                            module: imp.module.clone(),
+                            line: imp.line,
+                        });
+                    }
+                }
+                OwnerResult::Blocked => {
+                    res.uncertain.push(Uncertainty::BlockedOwnership {
                         module: imp.module.clone(),
-                        line: imp.line,
+                        name: nm.original.clone(),
                     });
                 }
+                OwnerResult::External | OwnerResult::NotFound => {}
             }
         }
     }
@@ -894,5 +918,104 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = write(tmp.path(), "src/foo.ts", "export const x = 1;\n");
         assert!(target_ambiguity(&target, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn ambiguous_direct_module_import_is_surfaced_as_uncertainty() {
+        let tmp = producer_consumer();
+        // A second producer/ingest/rankings.py under <scope>/src makes the
+        // consumer's own direct import ambiguous.
+        write(
+            tmp.path(),
+            "src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/ambiguous_direct.py",
+            "from producer.ingest.rankings import RankingEntry\n",
+        );
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        assert!(res.edges.is_empty());
+        assert_eq!(res.uncertain.len(), 1);
+        assert!(matches!(
+            &res.uncertain[0],
+            Uncertainty::AmbiguousModule { module, candidates }
+                if module == "producer.ingest.rankings" && candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn duplicate_named_owner_is_surfaced_as_blocked_ownership() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/other.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\nfrom .other import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/dup_owner.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        assert_eq!(res.edges.len(), 1); // the direct edge to the package surface
+        assert_eq!(res.uncertain.len(), 1);
+        assert!(matches!(
+            &res.uncertain[0],
+            Uncertainty::BlockedOwnership { module, name }
+                if module == "producer.ingest" && name == "RankingEntry"
+        ));
+    }
+
+    #[test]
+    fn cyclic_reexport_is_surfaced_as_blocked_ownership() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from . import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/cyclic.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        assert_eq!(res.edges.len(), 1); // the direct edge to the package surface
+        assert_eq!(res.uncertain.len(), 1);
+        assert!(matches!(
+            &res.uncertain[0],
+            Uncertainty::BlockedOwnership { module, name }
+                if module == "producer.ingest" && name == "RankingEntry"
+        ));
+    }
+
+    #[test]
+    fn nine_distinct_local_modules_all_become_edges() {
+        use std::fmt::Write as _;
+        let tmp = producer_consumer();
+        let mut import_lines = String::new();
+        for i in 0..9 {
+            write(
+                tmp.path(),
+                &format!("packages/producer/src/producer/mod{i}.py"),
+                "x = 1\n",
+            );
+            let _ = writeln!(import_lines, "import producer.mod{i}");
+        }
+        let consumer = write(tmp.path(), "consumer/src/consumer/nine.py", &import_lines);
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        assert_eq!(res.edges.len(), 9);
+        assert!(res.uncertain.is_empty());
     }
 }

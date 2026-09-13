@@ -38,6 +38,11 @@ pub enum TilthError {
         module: String,
         candidates: Vec<String>,
     },
+    /// A named re-export could not resolve to exactly one owner (duplicate
+    /// definitions, a blocked ambiguous hop, or a re-export cycle). Never
+    /// guessed — the specific name and its containing module are reported.
+    #[error("blocked re-export ownership for `{name}` via {module}: cannot attribute to one file (duplicate owners, a cycle, or an ambiguous hop)")]
+    BlockedOwnership { module: String, name: String },
 }
 
 impl From<crate::edit::mismatch::MismatchError> for TilthError {
@@ -65,7 +70,8 @@ impl TilthError {
             Self::InvalidQuery { .. }
             | Self::ParseError { .. }
             | Self::EditRejected(_)
-            | Self::AmbiguousModule { .. } => 3,
+            | Self::AmbiguousModule { .. }
+            | Self::BlockedOwnership { .. } => 3,
             Self::PermissionDenied { .. } | Self::IgnoreDenied { .. } => 4,
         }
     }

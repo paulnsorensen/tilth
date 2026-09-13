@@ -9,7 +9,7 @@ use crate::types::{FileType, Lang};
 
 mod python_scope;
 
-pub(crate) use python_scope::{target_ambiguity, PyResolution, PyRoots};
+pub(crate) use python_scope::{target_ambiguity, PyResolution, PyRoots, Uncertainty};
 
 const MAX_SUGGESTIONS: usize = 8;
 
@@ -29,16 +29,6 @@ pub(crate) fn resolve_scoped_paths(
         }
         _ => resolve_related_files_with_content(file_path, content),
     }
-}
-
-/// [`resolve_scoped_paths`] for a one-off target: discovers the scope's package
-/// roots first. Loop callers should discover roots once and reuse them.
-pub(crate) fn resolve_scoped_paths_in(
-    file_path: &Path,
-    content: &str,
-    scope: &Path,
-) -> Vec<PathBuf> {
-    resolve_scoped_paths(file_path, content, &PyRoots::discover(scope))
 }
 
 /// Resolve one Python file's imports within `roots`, keeping edge evidence

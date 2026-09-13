@@ -307,11 +307,31 @@ fn dependencies_within(
         .canonicalize()
         .map_err(|e| e.to_string())?;
     let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
-    let mut imports: Vec<_> = crate::read::imports::resolve_scoped_paths_in(&full, &content, cwd)
-        .into_iter()
-        .filter(|p| target.allows(p, cwd))
-        .map(|p| super::display_rel(&p, cwd))
-        .collect();
+    // Discover package roots once and reuse them for both the imports list and
+    // the uncertainty check below, instead of re-walking the Python import AST
+    // a second time for the same file.
+    let py_roots = crate::read::imports::PyRoots::discover(cwd);
+    let own_uncertain;
+    let mut imports: Vec<_> = if matches!(
+        crate::lang::detect_file_type(&full),
+        crate::types::FileType::Code(crate::types::Lang::Python)
+    ) {
+        let resolution = crate::read::imports::resolve_python_scoped(&full, &content, &py_roots);
+        own_uncertain = !resolution.uncertain.is_empty();
+        resolution
+            .paths()
+            .into_iter()
+            .filter(|p| target.allows(p, cwd))
+            .map(|p| super::display_rel(&p, cwd))
+            .collect()
+    } else {
+        own_uncertain = false;
+        crate::read::imports::resolve_related_files_with_content(&full, &content)
+            .into_iter()
+            .filter(|p| target.allows(p, cwd))
+            .map(|p| super::display_rel(&p, cwd))
+            .collect()
+    };
     imports.sort();
     imports.dedup();
     let (refresh, impact, state) = match crate::index::deps::open(cwd, client) {
@@ -338,9 +358,14 @@ fn dependencies_within(
     // reverse edge set unreliable: report partial rather than a guessed
     // complete answer. This is not a timeout.
     let ambiguous_identity = crate::read::imports::target_ambiguity(&full, cwd).is_some();
+    // `own_uncertain` (computed above, alongside `imports`) covers Python's own
+    // forward imports carrying unresolved uncertainty (ambiguous module,
+    // blocked re-export ownership) that a plain path list silently drops;
+    // surface that as partial coverage rather than a guess.
     let complete = refresh.complete
         && traversal.complete
         && !ambiguous_identity
+        && !own_uncertain
         && total_imports <= SECTION_CAP
         && total_dependents <= SECTION_CAP;
     imports.truncate(SECTION_CAP);

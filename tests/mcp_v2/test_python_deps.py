@@ -83,6 +83,23 @@ class PythonDeps(unittest.TestCase):
                 seen.add(line.split(":", 1)[0].strip())
         return seen
 
+    def deps_local_uses(self, response) -> set[str]:
+        """Parse the 'Uses (local)' path set from a tilth_deps report."""
+        self.assertFalse(harness.tool_is_error(response), response)
+        text = harness.tool_result_text(response)
+        seen = set()
+        section = False
+        for line in text.splitlines():
+            if line.startswith("## Uses (local)"):
+                section = True
+                continue
+            if line.startswith("## ") or line.startswith("[~"):
+                section = False
+                continue
+            if section and line.strip():
+                seen.add(line.split()[0].strip())
+        return seen
+
     def test_deps_reports_direct_and_reexport_importers(self):
         _producer_consumer(self.cwd)
         got = self.deps_dependents(
@@ -161,6 +178,129 @@ class PythonDeps(unittest.TestCase):
         text = harness.tool_result_text(response)
         self.assertIn("producer.ingest.rankings", text)
         self.assertIn("src/producer/ingest/rankings.py", text)
+
+    def deps_external_uses(self, response) -> set[str]:
+        """Parse the 'Uses (external)' source set from a tilth_deps report."""
+        self.assertFalse(harness.tool_is_error(response), response)
+        text = harness.tool_result_text(response)
+        seen = set()
+        section = False
+        for line in text.splitlines():
+            if line.startswith("## Uses (external)"):
+                section = True
+                continue
+            if line.startswith("## ") or line.startswith("[~"):
+                section = False
+                continue
+            if section and line.strip():
+                seen.add(line.strip())
+        return seen
+
+    def test_deps_local_vs_external_classification(self):
+        _producer_consumer(self.cwd)
+        _write(self.cwd, "consumer/src/consumer/mixed.py",
+               "from producer.ingest.rankings import RankingEntry\n"
+               "import requests\n")
+        response = self.deps("consumer/src/consumer/mixed.py")
+        local = self.deps_local_uses(response)
+        external = self.deps_external_uses(response)
+        # The uniquely-resolved absolute import is local ONLY — the raw module
+        # string must not also leak into Uses (external) alongside its path.
+        self.assertIn(
+            "packages/producer/src/producer/ingest/rankings.py", local)
+        self.assertNotIn("producer.ingest.rankings", external)
+        # A genuinely external package stays external, and only there.
+        self.assertIn("requests", external)
+        self.assertNotIn("requests", local)
+
+        hint = self.dep_hint("consumer/src/consumer/mixed.py")
+        impact = self.follow(hint)["dependency_impact"]
+        self.assertIn(
+            "packages/producer/src/producer/ingest/rankings.py", impact["imports"])
+
+    def test_deps_consumer_own_import_ambiguous_errors_with_candidates(self):
+        _producer_consumer(self.cwd)
+        # Duplicate package root: a second producer/ingest/rankings.py under
+        # <scope>/src makes direct.py's own module import ambiguous.
+        _write(self.cwd, "src/producer/ingest/rankings.py",
+               "class RankingEntry:\n    pass\n")
+        response = self.deps("consumer/src/consumer/direct.py")
+        self.assertTrue(harness.tool_is_error(response), response)
+        text = harness.tool_result_text(response)
+        self.assertIn("producer.ingest.rankings", text)
+        self.assertIn("packages/producer/src/producer/ingest/rankings.py", text)
+        self.assertIn("src/producer/ingest/rankings.py", text)
+
+        hint = self.dep_hint("consumer/src/consumer/direct.py")
+        result = self.follow(hint)
+        self.assertEqual(result["completeness"], "partial")
+        self.assertEqual(result["dependency_impact"]["coverage"], "partial")
+        self.assertFalse(result["dependency_impact"]["timed_out"])
+
+    def test_deps_consumer_reexport_duplicate_owners_errors(self):
+        _producer_consumer(self.cwd)
+        _write(self.cwd, "packages/producer/src/producer/ingest/rankings2.py",
+               "class RankingEntry:\n    pass\n")
+        _write(self.cwd, "packages/producer/src/producer/ingest/__init__.py",
+               "from .rankings import RankingEntry\n"
+               "from .rankings2 import RankingEntry\n")
+        response = self.deps("consumer/src/consumer/surface.py")
+        self.assertTrue(harness.tool_is_error(response), response)
+        text = harness.tool_result_text(response)
+        self.assertIn("RankingEntry", text)
+        self.assertIn("producer.ingest", text)
+
+        hint = self.dep_hint("consumer/src/consumer/surface.py")
+        result = self.follow(hint)
+        self.assertEqual(result["completeness"], "partial")
+        self.assertEqual(result["dependency_impact"]["coverage"], "partial")
+        self.assertFalse(result["dependency_impact"]["timed_out"])
+
+    def test_deps_consumer_reexport_cycle_errors_but_keeps_proven_import(self):
+        _producer_consumer(self.cwd)
+        _write(self.cwd, "packages/cyclea/src/cyclea/__init__.py",
+               "from cycleb import Thing\n")
+        _write(self.cwd, "packages/cycleb/src/cycleb/__init__.py",
+               "from cyclea import Thing\n")
+        _write(self.cwd, "consumer/src/consumer/cycle_user.py",
+               "from producer.ingest.rankings import RankingEntry\n"
+               "from cyclea import Thing\n")
+        response = self.deps("consumer/src/consumer/cycle_user.py")
+        self.assertTrue(harness.tool_is_error(response), response)
+        text = harness.tool_result_text(response)
+        self.assertIn("Thing", text)
+        self.assertIn("cyclea", text)
+
+        hint = self.dep_hint("consumer/src/consumer/cycle_user.py")
+        result = self.follow(hint)
+        self.assertEqual(result["completeness"], "partial")
+        impact = result["dependency_impact"]
+        self.assertEqual(impact["coverage"], "partial")
+        self.assertFalse(impact["timed_out"])
+        self.assertIn(
+            "packages/producer/src/producer/ingest/rankings.py", impact["imports"])
+
+    def test_deps_nine_distinct_local_modules(self):
+        _producer_consumer(self.cwd)
+        for i in range(1, 10):
+            _write(self.cwd, f"consumer/src/consumer/mod{i}.py",
+                   f"value{i} = {i}\n")
+        imports_block = "".join(
+            f"import consumer.mod{i}\n" for i in range(1, 10))
+        _write(self.cwd, "consumer/src/consumer/many.py", imports_block)
+        expected = {f"consumer/src/consumer/mod{i}.py" for i in range(1, 10)}
+
+        local = self.deps_local_uses(self.deps("consumer/src/consumer/many.py"))
+        self.assertEqual(local, expected)
+
+        used_by = self.deps_dependents(self.deps("consumer/src/consumer/mod9.py"))
+        self.assertIn("consumer/src/consumer/many.py", used_by)
+
+        hint = self.dep_hint("consumer/src/consumer/many.py")
+        impact = self.follow(hint)["dependency_impact"]
+        self.assertEqual(impact["total_imports"], 9)
+        self.assertEqual(set(impact["imports"]), expected)
+        self.assertEqual(impact["coverage"], "complete")
 
     # ---- fetch_dependencies (persistent index via search continuation) ----
 
