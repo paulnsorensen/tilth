@@ -182,7 +182,12 @@ fn reject_leading_dash(s: &str) -> Result<(), String> {
 }
 
 /// Execute a git diff command and return raw unified diff output.
-fn run_git_diff(source: &DiffSource) -> Result<String, String> {
+///
+/// Git-backed sources (`GitUncommitted`/`GitStaged`/`GitRef`) run against
+/// `checkout` via `Command::current_dir`, so the diff reflects the caller's
+/// repository rather than the server's frozen process cwd. `Files` keeps its
+/// own path-anchored resolution.
+fn run_git_diff(source: &DiffSource, checkout: &Path) -> Result<String, String> {
     use std::process::Command;
 
     match source {
@@ -204,12 +209,15 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     match source {
         DiffSource::GitUncommitted => {
             // working tree vs HEAD (unstaged + staged)
+            cmd.current_dir(checkout);
             cmd.arg("HEAD");
         }
         DiffSource::GitStaged => {
+            cmd.current_dir(checkout);
             cmd.arg("--staged");
         }
         DiffSource::GitRef(r) => {
+            cmd.current_dir(checkout);
             reject_leading_dash(r)?;
             cmd.arg(r);
         }
@@ -237,9 +245,11 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     if !matches!(output.status.code(), Some(0 | 1)) {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let msg = match source {
-            DiffSource::GitRef(r) => {
-                append_default_branch_hint(format!("git diff failed for '{r}': {stderr}"), &stderr)
-            }
+            DiffSource::GitRef(r) => append_default_branch_hint(
+                format!("git diff failed for '{r}': {stderr}"),
+                &stderr,
+                checkout,
+            ),
             DiffSource::GitUncommitted => format!("git diff against HEAD failed: {stderr}"),
             DiffSource::GitStaged => format!("git diff --staged failed: {stderr}"),
             DiffSource::Files(fa, fb) => format!(
@@ -265,8 +275,9 @@ fn parse_origin_head_ref(s: &str) -> Option<String> {
 /// target, falling back to a local `main`/`master` branch if there is no
 /// configured remote. Returns `None` rather than guessing at an arbitrary
 /// branch.
-fn default_branch_hint() -> Option<String> {
+fn default_branch_hint(checkout: &Path) -> Option<String> {
     if let Ok(output) = Command::new("git")
+        .current_dir(checkout)
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .output()
     {
@@ -279,6 +290,7 @@ fn default_branch_hint() -> Option<String> {
     }
 
     let output = Command::new("git")
+        .current_dir(checkout)
         .args(["branch", "--format=%(refname:short)"])
         .output()
         .ok()?;
@@ -295,11 +307,11 @@ fn default_branch_hint() -> Option<String> {
 /// Append a "this repo's default branch is ..." hint to an error message when
 /// `stderr` indicates an unresolvable revision and the default branch can be
 /// detected; otherwise return `msg` unchanged.
-fn append_default_branch_hint(mut msg: String, stderr: &str) -> String {
+fn append_default_branch_hint(mut msg: String, stderr: &str, checkout: &Path) -> String {
     if !(stderr.contains("unknown revision") || stderr.contains("ambiguous argument")) {
         return msg;
     }
-    if let Some(branch) = default_branch_hint() {
+    if let Some(branch) = default_branch_hint(checkout) {
         let _ = write!(
             msg,
             "; this repo's default branch is '{branch}' — try '{branch}..HEAD'"
@@ -312,12 +324,12 @@ fn append_default_branch_hint(mut msg: String, stderr: &str) -> String {
 /// leading `./`, and trim a trailing slash. A scope equal to the repo root
 /// normalizes to the empty string. Non-absolute scopes, and scopes outside
 /// the repo root, are returned trimmed but otherwise unchanged.
-fn normalize_scope(scope: &str) -> String {
+fn normalize_scope(scope: &str, checkout: &Path) -> String {
     let trimmed = scope.trim_end_matches('/');
     let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
     let path = Path::new(trimmed);
     if path.is_absolute() {
-        if let Some(root) = repo_root() {
+        if let Some(root) = repo_root(checkout) {
             if let Ok(rel) = path.strip_prefix(&root) {
                 return rel.to_string_lossy().into_owned();
             }
@@ -326,10 +338,10 @@ fn normalize_scope(scope: &str) -> String {
     trimmed.to_string()
 }
 
-/// The repo root via `git rev-parse --show-toplevel`, run against the current
-/// process cwd.
-fn repo_root() -> Option<PathBuf> {
+/// The repo root via `git rev-parse --show-toplevel`, run against `checkout`.
+fn repo_root(checkout: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
+        .current_dir(checkout)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
@@ -387,11 +399,11 @@ fn extension_shaped<'a>(scope: &'a str, overlays: &[FileOverlay]) -> Option<&'a 
 
 /// True when `scope` names a directory: either a trailing slash, or (when
 /// the repo root is resolvable) an existing directory on disk under it.
-fn directory_shaped(scope: &str) -> bool {
+fn directory_shaped(scope: &str, checkout: &Path) -> bool {
     if scope.ends_with('/') {
         return true;
     }
-    repo_root().is_some_and(|root| root.join(scope).is_dir())
+    repo_root(checkout).is_some_and(|root| root.join(scope).is_dir())
 }
 
 /// Build the "extension, not a path" error, listing changed files with that
@@ -443,8 +455,8 @@ fn directory_not_found_error(scope: &str, overlays: &[FileOverlay]) -> String {
 /// Build a "not found" error for `missing`, classifying extension- and
 /// directory-shaped misses before falling back to the fuzzy "did you mean"
 /// clause (up to 3 similar overlay paths) for file-shaped misses.
-fn not_found_error(missing: &str, overlays: &[FileOverlay]) -> String {
-    if directory_shaped(missing) {
+fn not_found_error(missing: &str, overlays: &[FileOverlay], checkout: &Path) -> String {
+    if directory_shaped(missing, checkout) {
         return directory_not_found_error(missing, overlays);
     }
     if let Some(ext) = extension_shaped(missing, overlays) {
@@ -507,13 +519,14 @@ pub fn diff(
     blast: bool,
     _expand: usize,
     budget: Option<u64>,
+    checkout: &Path,
 ) -> Result<String, String> {
     // Log mode has its own pipeline.
     if let DiffSource::Log(range) = source {
-        return diff_log(range, scope, budget);
+        return diff_log(range, scope, budget, checkout);
     }
 
-    let raw = run_git_diff(source)?;
+    let raw = run_git_diff(source, checkout)?;
     if raw.is_empty() {
         return Ok("No changes.".to_string());
     }
@@ -530,7 +543,7 @@ pub fn diff(
     // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
-        .map(|fd| overlay::compute_overlay(fd, source))
+        .map(|fd| overlay::compute_overlay(fd, source, checkout))
         .collect();
 
     // 3. Cross-file move detection.
@@ -549,7 +562,7 @@ pub fn diff(
 
     // 6. Blast radius.
     if blast {
-        let mut blast_warnings = compute_blast(&overlays);
+        let mut blast_warnings = compute_blast(&overlays, checkout);
         warnings.append(&mut blast_warnings);
     }
 
@@ -561,7 +574,7 @@ pub fn diff(
             format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
         }
         Some(raw_scope) => {
-            let scope_norm = normalize_scope(raw_scope);
+            let scope_norm = normalize_scope(raw_scope, checkout);
             if scope_norm.is_empty() {
                 let file_meta = build_file_meta(&overlays, &file_diffs);
                 format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
@@ -570,7 +583,7 @@ pub fn diff(
                 let (file_part, fn_name) = scope_norm.split_once(':').unwrap();
                 match find_overlay_by_path(&overlays, file_part) {
                     Some(o) => format::format_function_detail(o, fn_name),
-                    None => return Err(not_found_error(file_part, &overlays)),
+                    None => return Err(not_found_error(file_part, &overlays, checkout)),
                 }
             } else if let Some(o) = find_overlay_by_path(&overlays, &scope_norm) {
                 format::format_file_detail(o, budget)
@@ -579,7 +592,7 @@ pub fn diff(
                     .iter()
                     .any(|o| path_has_scope_prefix(&o.path, &scope_norm))
                 {
-                    return Err(not_found_error(raw_scope, &overlays));
+                    return Err(not_found_error(raw_scope, &overlays, checkout));
                 }
                 overlays.retain(|o| path_has_scope_prefix(&o.path, &scope_norm));
                 let retained_names: HashSet<&str> = overlays
@@ -602,7 +615,7 @@ pub fn diff(
     if matches!(source, DiffSource::GitUncommitted) {
         let mut all_conflicts = Vec::new();
         for overlay in &overlays {
-            let conflicts = overlay::detect_conflicts(&overlay.path);
+            let conflicts = overlay::detect_conflicts(&overlay.path, checkout);
             if !conflicts.is_empty() {
                 all_conflicts.push((&overlay.path, conflicts));
             }
@@ -682,7 +695,7 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
 }
 
 /// Find callers of signature-changed symbols and return warnings.
-fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
+fn compute_blast(overlays: &[FileOverlay], checkout: &Path) -> Vec<String> {
     let sig_changed: HashSet<String> = overlays
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
@@ -694,12 +707,13 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
         return Vec::new();
     }
 
-    let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Bind the caller search to the requested checkout, not the server's
+    // process cwd, so blast reflects the repository being diffed.
     let bloom = crate::index::bloom::BloomFilterCache::new();
 
     match crate::search::callers::find_callers_batch(
         &sig_changed,
-        &scope,
+        checkout,
         &bloom,
         None,
         crate::search::callers::BATCH_EARLY_QUIT,
@@ -729,12 +743,18 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
 const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
-fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
+fn diff_log(
+    range: &str,
+    scope: Option<&str>,
+    budget: Option<u64>,
+    checkout: &Path,
+) -> Result<String, String> {
     reject_leading_dash(range)?;
-    let scope_norm = scope.map(normalize_scope);
+    let scope_norm = scope.map(|s| normalize_scope(s, checkout));
 
     // Get commit list, including parent hashes to detect root commits.
     let output = Command::new("git")
+        .current_dir(checkout)
         .args(["log", "--format=%H %at %P%x01%s%x00%an", range])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
@@ -744,6 +764,7 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         return Err(append_default_branch_hint(
             format!("git log failed: {stderr}"),
             &stderr,
+            checkout,
         ));
     }
 
@@ -779,12 +800,12 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             format!("{EMPTY_TREE_SHA1}..{hash}")
         };
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source)?;
+        let raw = run_git_diff(&commit_source, checkout)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
             .iter()
-            .map(|fd| overlay::compute_overlay(fd, &commit_source))
+            .map(|fd| overlay::compute_overlay(fd, &commit_source, checkout))
             .collect();
         overlay::cross_file_matching(&mut overlays);
 
@@ -824,10 +845,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that change process cwd.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     /// Create a test git repo with an initial commit containing a Rust file.
     fn setup_test_repo() -> tempfile::TempDir {
@@ -886,7 +903,9 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Run `diff()` from within the test repo directory, serialized via `CWD_LOCK`.
+    /// Run `diff()` against the test repo directory as the checkout. Threading
+    /// the checkout explicitly keeps these tests free of process-cwd mutation,
+    /// so they run in parallel without a lock.
     fn run_diff_in(
         dir: &Path,
         source: &DiffSource,
@@ -895,12 +914,7 @@ mod tests {
         blast: bool,
         budget: Option<u64>,
     ) -> Result<String, String> {
-        let _lock = CWD_LOCK.lock().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir).unwrap();
-        let result = diff(source, scope, search, blast, 0, budget);
-        std::env::set_current_dir(&prev).unwrap();
-        result
+        diff(source, scope, search, blast, 0, budget, dir)
     }
 
     // 1. test_empty_diff
@@ -1343,7 +1357,7 @@ diff --git a/src/main.rs b/src/main.rs
                 "mixed" => first = PathBuf::from("first.txt"),
                 _ => panic!("unknown child mode: {mode}"),
             }
-            let result = run_git_diff(&DiffSource::Files(first, second));
+            let result = run_git_diff(&DiffSource::Files(first, second), Path::new("."));
             if matches!(mode.as_str(), "missing" | "unusable") {
                 // Git uses exit 1 for inaccessible operands; preserve the existing empty result.
                 assert_eq!(result.unwrap(), "");
@@ -1660,7 +1674,7 @@ diff --git a/src/main.rs b/src/main.rs
             overlay_at("infra/b.tf"),
             overlay_at("src/main.rs"),
         ];
-        let err = not_found_error(".tf", &overlays);
+        let err = not_found_error(".tf", &overlays, Path::new("/nonexistent-tilth-checkout"));
         assert!(
             err.contains("'.tf' is an extension, not a path"),
             "expected extension classification in:\n{err}"
@@ -1679,7 +1693,7 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn test_not_found_error_extension_shaped_no_matches() {
         let overlays = vec![overlay_at("src/main.rs")];
-        let err = not_found_error("*.tf", &overlays);
+        let err = not_found_error("*.tf", &overlays, Path::new("/nonexistent-tilth-checkout"));
         assert!(
             err.contains("'*.tf' is an extension, not a path"),
             "expected extension classification in:\n{err}"
@@ -1702,7 +1716,7 @@ diff --git a/src/main.rs b/src/main.rs
             overlay_at("f.tf"),
             overlay_at("g.tf"),
         ];
-        let err = not_found_error(".tf", &overlays);
+        let err = not_found_error(".tf", &overlays, Path::new("/nonexistent-tilth-checkout"));
         assert!(
             err.contains("a.tf, b.tf, c.tf, d.tf, e.tf, +2 more"),
             "expected capped list with '+2 more' in:\n{err}"
@@ -1713,7 +1727,7 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn test_not_found_error_dot_directory_trailing_slash_no_changes() {
         let overlays = vec![overlay_at("src/main.rs")];
-        let err = not_found_error(".github/", &overlays);
+        let err = not_found_error(".github/", &overlays, Path::new("."));
         assert!(
             err.contains("no changed files under '.github/'"),
             "expected directory classification for trailing-slash dot-dir in:\n{err}"
@@ -1727,18 +1741,14 @@ diff --git a/src/main.rs b/src/main.rs
     // 25d3. test_not_found_error_dot_directory_with_changes_falls_through
     #[test]
     fn test_not_found_error_dot_directory_with_changes_falls_through() {
-        let _lock = CWD_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
-        let prev = std::env::current_dir().unwrap();
-        // An empty tempdir outside any git repo: `repo_root()` returns None,
-        // so `directory_shaped` falls back to trailing-slash-only and can't
-        // find `.github` on disk. The overlay-based guard in
+        // An empty tempdir outside any git repo: `repo_root(checkout)` returns
+        // None, so `directory_shaped` falls back to trailing-slash-only and
+        // can't find `.github` on disk. The overlay-based guard in
         // `extension_shaped` must still refuse to treat `.github` as an
         // extension, since an overlay lives under `.github/`.
-        std::env::set_current_dir(tmp.path()).unwrap();
         let overlays = vec![overlay_at(".github/workflows/ci.yml")];
-        let err = not_found_error(".github", &overlays);
-        std::env::set_current_dir(&prev).unwrap();
+        let err = not_found_error(".github", &overlays, tmp.path());
         assert!(
             !err.contains("is an extension, not a path"),
             "expected no extension misclassification when an overlay has changes under the dir:\n{err}"
@@ -1753,7 +1763,7 @@ diff --git a/src/main.rs b/src/main.rs
             overlay_at("tests/foo.rs"),
             overlay_at("infra/main.tf"),
         ];
-        let err = not_found_error("docs/", &overlays);
+        let err = not_found_error("docs/", &overlays, Path::new("."));
         assert!(
             err.contains("no changed files under 'docs/'"),
             "expected directory classification in:\n{err}"
@@ -1768,11 +1778,10 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn test_not_found_error_directory_shaped_exists_on_disk() {
         // No trailing slash; classified as directory-shaped because `src` is a
-        // real directory under this crate's repo root at test time. Hold
-        // CWD_LOCK so a concurrent run_diff_in test can't chdir underneath us.
-        let _lock = CWD_LOCK.lock().unwrap();
+        // real directory under this crate's repo root at test time. Anchor the
+        // on-disk check at this crate's dir so it never depends on process cwd.
         let overlays = vec![overlay_at("tests/foo.rs")];
-        let err = not_found_error("src", &overlays);
+        let err = not_found_error("src", &overlays, Path::new(env!("CARGO_MANIFEST_DIR")));
         assert!(
             err.contains("no changed files under 'src/'"),
             "expected directory classification for an on-disk dir in:\n{err}"
@@ -1933,7 +1942,6 @@ diff --git a/src/main.rs b/src/main.rs
     // 30. test_append_default_branch_hint_gated_by_stderr
     #[test]
     fn test_append_default_branch_hint_gated_by_stderr() {
-        let _lock = CWD_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let p = dir.path();
         git(p, &["init", "-b", "main"]);
@@ -1941,19 +1949,16 @@ diff --git a/src/main.rs b/src/main.rs
         git(p, &["config", "user.name", "Test"]);
         git(p, &["commit", "--allow-empty", "-m", "initial"]);
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(p).unwrap();
-
         let with_hint = append_default_branch_hint(
             "git diff failed".to_string(),
             "fatal: ambiguous argument 'x..HEAD': unknown revision or path not in the working tree.",
+            p,
         );
         let without_hint = append_default_branch_hint(
             "git diff failed".to_string(),
             "fatal: unrelated failure, nothing to do with revisions",
+            p,
         );
-
-        std::env::set_current_dir(&prev).unwrap();
 
         assert!(
             with_hint.contains("default branch is 'main'"),
@@ -2183,27 +2188,26 @@ diff --git a/src/main.rs b/src/main.rs
     // 38. test_normalize_scope_trims_trailing_slash
     #[test]
     fn test_normalize_scope_trims_trailing_slash() {
-        assert_eq!(normalize_scope("src/fanout/"), "src/fanout");
+        assert_eq!(normalize_scope("src/fanout/", Path::new(".")), "src/fanout");
     }
 
     // 39. test_normalize_scope_strips_leading_dot_slash
     #[test]
     fn test_normalize_scope_strips_leading_dot_slash() {
-        assert_eq!(normalize_scope("./src/fanout"), "src/fanout");
+        assert_eq!(
+            normalize_scope("./src/fanout", Path::new(".")),
+            "src/fanout"
+        );
     }
 
     // 40. test_normalize_scope_absolute_to_repo_relative_and_root_is_empty
     #[test]
     fn test_normalize_scope_absolute_to_repo_relative_and_root_is_empty() {
-        let _lock = CWD_LOCK.lock().unwrap();
         let dir = setup_test_repo();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let root = repo_root().unwrap();
+        let root = repo_root(dir.path()).unwrap();
         let abs_subdir = root.join("src/fanout").to_string_lossy().into_owned();
-        let subdir_result = normalize_scope(&abs_subdir);
-        let root_result = normalize_scope(&root.to_string_lossy());
-        std::env::set_current_dir(&prev).unwrap();
+        let subdir_result = normalize_scope(&abs_subdir, dir.path());
+        let root_result = normalize_scope(&root.to_string_lossy(), dir.path());
         assert_eq!(subdir_result, "src/fanout");
         assert_eq!(root_result, "");
     }

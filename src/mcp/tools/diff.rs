@@ -1,10 +1,11 @@
 use serde_json::Value;
 
 pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
-    // Git-based sources (working/staged/ref) run in the server's project
-    // directory, so cwd is not consumed for them. The file-path params
-    // (`patch`, `a`, `b`) ARE filesystem reads, so relative spellings anchor
-    // under cwd like every other path-taking tool.
+    // Every git-backed source (working/staged/ref/log) runs against `cwd`, so
+    // the diff reflects the caller's repository rather than the server's frozen
+    // process dir. The file-path params (`patch`, `a`, `b`) are filesystem
+    // reads, so relative spellings anchor under cwd like every other
+    // path-taking tool.
     let cwd = super::require_cwd(args)?;
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
@@ -31,7 +32,15 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
 
     let diff_source =
         crate::diff::resolve_source(source, a.as_deref(), b.as_deref(), patch.as_deref(), log)?;
-    let result = crate::diff::diff(&diff_source, scope, search, blast, expand, Some(budget))?;
+    let result = crate::diff::diff(
+        &diff_source,
+        scope,
+        search,
+        blast,
+        expand,
+        Some(budget),
+        cwd,
+    )?;
     Ok(crate::budget::apply(&result, budget))
 }
 
@@ -53,8 +62,8 @@ mod tests {
 
     #[test]
     fn relative_cwd_refused() {
-        // Git-based sources do not consume cwd, but the value is still
-        // validated: a relative cwd is refused.
+        // Git-based sources now diff against cwd, and the value is validated
+        // up front regardless: a relative cwd is refused.
         let args = serde_json::json!({ "cwd": "relative/dir", "source": "working" });
         let err = tool_diff(&args).unwrap_err();
         assert!(

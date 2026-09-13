@@ -234,6 +234,7 @@ fn main() {
                     blast,
                     expand,
                     budget_opt,
+                    &current_dir_or_log(),
                 ) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {

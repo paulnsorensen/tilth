@@ -20,7 +20,11 @@ use super::{
 ///
 /// Fetches old/new content based on `source`, outlines both versions,
 /// runs three-phase symbol matching, and attributes diff hunks to functions.
-pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
+pub(crate) fn compute_overlay(
+    file_diff: &FileDiff,
+    source: &DiffSource,
+    checkout: &Path,
+) -> FileOverlay {
     let path = &file_diff.path;
 
     // Binary or generated files — empty overlay, formatter handles display.
@@ -33,10 +37,10 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> File
     }
 
     match file_diff.status {
-        FileStatus::Modified => compute_modified(file_diff, source),
-        FileStatus::Added => compute_added(file_diff, source),
-        FileStatus::Deleted => compute_deleted(file_diff, source),
-        FileStatus::Renamed => compute_renamed(file_diff, source),
+        FileStatus::Modified => compute_modified(file_diff, source, checkout),
+        FileStatus::Added => compute_added(file_diff, source, checkout),
+        FileStatus::Deleted => compute_deleted(file_diff, source, checkout),
+        FileStatus::Renamed => compute_renamed(file_diff, source, checkout),
     }
 }
 
@@ -132,8 +136,10 @@ pub(crate) fn signature_warnings(overlays: &[FileOverlay]) -> Vec<String> {
 }
 
 /// Scan a file for merge conflict markers and extract conflict blocks.
-pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+pub(crate) fn detect_conflicts(path: &Path, checkout: &Path) -> Vec<Conflict> {
+    // The overlay path is repo-relative; read it under the requested checkout,
+    // never the server's process cwd. `join` keeps an absolute path as-is.
+    let Ok(content) = std::fs::read_to_string(checkout.join(path)) else {
         return Vec::new();
     };
 
@@ -193,9 +199,10 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
 // Per-status overlay builders
 // ---------------------------------------------------------------------------
 
-fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
+fn compute_modified(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, checkout)
+    else {
         // git error fetching old side — skip symbol analysis to avoid
         // confidently-wrong all-Added overlay.
         return FileOverlay {
@@ -204,7 +211,7 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
             attributed_hunks: Vec::new(),
         };
     };
-    let Ok(new_content) = get_new_content(path, source) else {
+    let Ok(new_content) = get_new_content(path, source, checkout) else {
         return FileOverlay {
             path: path.clone(),
             symbol_changes: Vec::new(),
@@ -239,9 +246,9 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     }
 }
 
-fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
+fn compute_added(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(new_content) = get_new_content(path, source) else {
+    let Ok(new_content) = get_new_content(path, source, checkout) else {
         return FileOverlay {
             path: path.clone(),
             symbol_changes: Vec::new(),
@@ -258,9 +265,10 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     }
 }
 
-fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
+fn compute_deleted(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, checkout)
+    else {
         return FileOverlay {
             path: path.clone(),
             symbol_changes: Vec::new(),
@@ -277,16 +285,17 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     }
 }
 
-fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
+fn compute_renamed(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
+    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, checkout)
+    else {
         return FileOverlay {
             path: path.clone(),
             symbol_changes: Vec::new(),
             attributed_hunks: Vec::new(),
         };
     };
-    let Ok(new_content) = get_new_content(path, source) else {
+    let Ok(new_content) = get_new_content(path, source, checkout) else {
         return FileOverlay {
             path: path.clone(),
             symbol_changes: Vec::new(),
@@ -326,19 +335,22 @@ fn get_old_content(
     path: &Path,
     old_path: Option<&Path>,
     source: &DiffSource,
+    checkout: &Path,
 ) -> Result<String, String> {
     let effective_path = old_path.unwrap_or(path);
     let path_str = effective_path.to_string_lossy();
 
     match source {
-        DiffSource::GitUncommitted | DiffSource::GitStaged => git_show(&format!("HEAD:{path_str}")),
+        DiffSource::GitUncommitted | DiffSource::GitStaged => {
+            git_show(&format!("HEAD:{path_str}"), checkout)
+        }
         DiffSource::GitRef(r) => {
             if let Some((left, _)) = r.split_once("..") {
-                git_show(&format!("{left}:{path_str}"))
+                git_show(&format!("{left}:{path_str}"), checkout)
             } else {
                 // `git diff <ref>` compares <ref> (old) against the working tree
                 // (new), so the old content is the file at the ref itself.
-                git_show(&format!("{r}:{path_str}"))
+                git_show(&format!("{r}:{path_str}"), checkout)
             }
         }
         DiffSource::Files(a, _) => {
@@ -368,19 +380,23 @@ fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
     }
 }
 
-fn get_new_content(path: &Path, source: &DiffSource) -> Result<String, String> {
+fn get_new_content(path: &Path, source: &DiffSource, checkout: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
 
+    // Working-tree reads use the repo-relative diff path; anchor them under the
+    // requested checkout so a bare ref or uncommitted diff reads the caller's
+    // repository, not the server's process cwd. `join` keeps absolutes as-is.
+    let read_worktree = || {
+        let full = checkout.join(path);
+        std::fs::read_to_string(&full).map_err(|e| format!("read {}: {e}", full.display()))
+    };
+
     match source {
-        DiffSource::GitUncommitted => {
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
-        }
-        DiffSource::GitStaged => git_show(&format!(":{path_str}")),
+        DiffSource::GitUncommitted => read_worktree(),
+        DiffSource::GitStaged => git_show(&format!(":{path_str}"), checkout),
         DiffSource::GitRef(r) => match resolve_git_ref_new_side(r, &path_str) {
-            GitRefNewSide::Committed(spec) => git_show(&spec),
-            GitRefNewSide::WorkingTree => {
-                std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
-            }
+            GitRefNewSide::Committed(spec) => git_show(&spec, checkout),
+            GitRefNewSide::WorkingTree => read_worktree(),
         },
         DiffSource::Files(_, b) => {
             std::fs::read_to_string(b).map_err(|e| format!("read {}: {e}", b.display()))
@@ -389,8 +405,9 @@ fn get_new_content(path: &Path, source: &DiffSource) -> Result<String, String> {
     }
 }
 
-fn git_show(spec: &str) -> Result<String, String> {
+fn git_show(spec: &str, checkout: &Path) -> Result<String, String> {
     let output = Command::new("git")
+        .current_dir(checkout)
         .args(["-c", "core.quotePath=false", "show", spec])
         .output()
         .map_err(|e| format!("git show failed: {e}"))?;
@@ -599,7 +616,7 @@ mod tests {
         // A single ref (no `..`) diffs against the working tree, so the new
         // content must come from the file on disk — not `git show HEAD:<path>`,
         // which would return empty here and silently mis-attribute the diff.
-        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()))
+        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()), dir.path())
             .expect("working-tree read must succeed");
         assert!(
             content.contains("worktree_only"),
@@ -645,6 +662,7 @@ mod tests {
             &file,
             None,
             &DiffSource::Files(missing.clone(), file.clone()),
+            dir.path(),
         );
         assert!(result.is_err(), "missing file path must yield Err, got Ok");
 
@@ -660,6 +678,7 @@ mod tests {
         let overlay = compute_modified(
             &file_diff,
             &DiffSource::Files(missing.clone(), file.clone()),
+            dir.path(),
         );
         assert!(
             overlay.symbol_changes.is_empty(),

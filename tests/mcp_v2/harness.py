@@ -52,7 +52,7 @@ class Mcp:
         return []
 
 
-def run_mcp(flags, requests, timeout=30, env=None):
+def run_mcp(flags, requests, timeout=30, env=None, cwd=None):
     stdin_text = "\n".join(json.dumps(r) for r in requests) + "\n"
     try:
         proc = subprocess.run(
@@ -61,7 +61,7 @@ def run_mcp(flags, requests, timeout=30, env=None):
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=REPO_ROOT,
+            cwd=cwd or REPO_ROOT,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
