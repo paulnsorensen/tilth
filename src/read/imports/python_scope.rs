@@ -345,10 +345,67 @@ fn resolve_module_file(module: &str, dir: &Path, roots: &PyRoots) -> ModuleTarge
 enum OwnerResult {
     /// A single defining file proven by the binding chain.
     Owned(PathBuf),
-    /// The name is not re-exported here (defined locally, or external to scope).
+    /// The name is not re-exported here.
     NotFound,
+    /// The name comes from a module outside the current scope.
+    External,
     /// A cycle or an ambiguous owner was hit; no owner is fabricated.
     Blocked,
+}
+
+fn initializer_defines_name(init: &Path, name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(init) else {
+        return false;
+    };
+    let Some(tree) = parse_python(&content) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if python_node_defines_name(node, content.as_bytes(), name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn python_node_defines_name(node: tree_sitter::Node, src: &[u8], name: &str) -> bool {
+    let kind = node.kind();
+    if kind == "class_definition" || kind == "function_definition" || kind == "type_alias_statement"
+    {
+        return node
+            .child_by_field_name("name")
+            .and_then(|node| node.utf8_text(src).ok())
+            == Some(name);
+    }
+    if kind == "decorated_definition" || kind == "expression_statement" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if python_node_defines_name(child, src, name) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if kind == "assignment" {
+        let Some(left) = node.child_by_field_name("left") else {
+            return false;
+        };
+        return python_node_defines_name(left, src, name);
+    }
+    if kind == "identifier" {
+        return node.utf8_text(src).ok() == Some(name);
+    }
+    if kind == "list_pattern" || kind == "tuple_pattern" || kind == "pattern_list" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if python_node_defines_name(child, src, name) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Follow explicit `from ... import name` bindings in `init` (an `__init__.py`)
@@ -379,17 +436,22 @@ fn resolve_reexport_owner(
 
     let mut owners: Vec<PathBuf> = Vec::new();
     let mut blocked = false;
+    let mut external = false;
     for imp in &raw {
         for nm in imp.names.iter().filter(|nm| nm.local == name) {
             match resolve_module_file(&imp.module, dir, roots) {
                 ModuleTarget::Ambiguous => blocked = true,
-                ModuleTarget::External => {} // name defined outside scope: not our owner
+                ModuleTarget::External => external = true,
                 ModuleTarget::File(target) => {
                     if is_init_py(&target) {
                         match resolve_reexport_owner(&target, &nm.original, roots, visited) {
                             OwnerResult::Owned(f) => owners.push(f),
-                            // Chain terminates in this package init: it defines the name.
-                            OwnerResult::NotFound => owners.push(target),
+                            OwnerResult::NotFound => {
+                                if initializer_defines_name(&target, &nm.original) {
+                                    owners.push(target);
+                                }
+                            }
+                            OwnerResult::External => external = true,
                             OwnerResult::Blocked => blocked = true,
                         }
                     } else {
@@ -403,8 +465,11 @@ fn resolve_reexport_owner(
     owners.dedup();
     // A duplicate owner or any blocked hop makes the identity unreliable: never
     // resolve by traversal order, and never fabricate an owner.
-    if owners.len() > 1 || blocked {
+    if owners.len() > 1 || blocked || (external && !owners.is_empty()) {
         return OwnerResult::Blocked;
+    }
+    if external {
+        return OwnerResult::External;
     }
     match owners.pop() {
         Some(owner) => OwnerResult::Owned(owner),
@@ -610,6 +675,57 @@ mod tests {
         assert!(edge_paths(tmp.path(), &consumer).contains(
             &tmp.path()
                 .join("packages/producer/src/producer/ingest/rankings.py")
+        ));
+    }
+
+    #[test]
+    fn reexport_owner_preserves_external_chain_result() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import RankingEntry\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from external_package import RankingEntry\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/external_chain.py",
+            "from producer import RankingEntry\n",
+        );
+        assert_eq!(
+            edge_paths(tmp.path(), &consumer),
+            vec![tmp
+                .path()
+                .join("packages/producer/src/producer/__init__.py")]
+        );
+    }
+
+    #[test]
+    fn reexport_owner_accepts_name_defined_in_nested_init() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/__init__.py",
+            "from .ingest import RankingEntry\n",
+        );
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/local_chain.py",
+            "from producer import RankingEntry\n",
+        );
+        let paths = edge_paths(tmp.path(), &consumer);
+        assert!(paths.contains(
+            &tmp.path()
+                .join("packages/producer/src/producer/ingest/__init__.py")
         ));
     }
 

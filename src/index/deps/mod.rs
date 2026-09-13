@@ -129,6 +129,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
     let roots = crate::read::imports::PyRoots::discover(worktree);
 
     let mut seen = HashSet::new();
+    let mut unchanged_python = Vec::new();
     let mut upserts = Vec::new();
     let mut files_scanned = 0usize;
     let mut timed_out = false;
@@ -171,6 +172,9 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             .get(&rel)
             .is_some_and(|sig| *sig == signature);
         if unchanged {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+                unchanged_python.push(rel);
+            }
             continue;
         }
 
@@ -200,18 +204,32 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         upserts.push((rel, storage::FileShard { signature, deps }));
     }
 
-    // Re-export ownership edges are derived from a package `__init__.py`, not
-    // from the consumer's own bytes: when such an `__init__.py` changed, its
-    // importers' ownership edges may be stale even though their signatures did
-    // not move, so the unchanged-signature skip above would keep them. Force a
-    // re-resolve of those importers this pass. Reverse edges are read from the
-    // pre-pass store; the consumer's *direct* edge to the `__init__.py` is
-    // stable across the re-export change, so the importer set is reliable.
+    // A cut-short scan cannot distinguish "deleted" from "not yet reached",
+    // so only infer deletions from a complete pass.
+    let deletes: Vec<String> = if timed_out || failed {
+        Vec::new()
+    } else {
+        previously_known.difference(&seen).cloned().collect()
+    };
+
     if !timed_out {
         let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
         let mut forced: HashSet<String> = HashSet::new();
         let mut forced_upserts = Vec::new();
         for (rel, _) in &upserts {
+            if !is_python_init(rel) || !previously_known.contains(rel) {
+                continue;
+            }
+            let Ok(importers) = storage::read_reverse(&handle.db, rel) else {
+                continue;
+            };
+            for importer in importers {
+                if !already.contains(&importer) {
+                    forced.insert(importer);
+                }
+            }
+        }
+        for rel in &deletes {
             if !is_python_init(rel) {
                 continue;
             }
@@ -219,7 +237,39 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 continue;
             };
             for importer in importers {
-                if already.contains(&importer) || !forced.insert(importer.clone()) {
+                if !already.contains(&importer) {
+                    forced.insert(importer);
+                }
+            }
+        }
+        for importer in &forced {
+            let abs = worktree.join(importer);
+            let Some(signature) = storage::signature_of(&abs) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&abs) else {
+                continue;
+            };
+            let deps = crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
+                .into_iter()
+                .filter_map(|p| {
+                    p.strip_prefix(worktree)
+                        .ok()
+                        .map(|r| r.to_string_lossy().to_string())
+                })
+                .collect();
+            forced_upserts.push((importer.clone(), storage::FileShard { signature, deps }));
+        }
+
+        let mut new_inits = HashSet::new();
+        for (rel, _) in &upserts {
+            if is_python_init(rel) && !previously_known.contains(rel) {
+                new_inits.insert(rel.clone());
+            }
+        }
+        if !new_inits.is_empty() {
+            for importer in unchanged_python {
+                if forced.contains(&importer) {
                     continue;
                 }
                 let abs = worktree.join(&importer);
@@ -229,27 +279,29 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 let Ok(content) = std::fs::read_to_string(&abs) else {
                     continue;
                 };
-                let deps = crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
-                    .into_iter()
-                    .filter_map(|p| {
-                        p.strip_prefix(worktree)
-                            .ok()
-                            .map(|r| r.to_string_lossy().to_string())
-                    })
-                    .collect();
-                forced_upserts.push((importer, storage::FileShard { signature, deps }));
+                let deps: Vec<String> =
+                    crate::read::imports::resolve_scoped_paths(&abs, &content, &roots)
+                        .into_iter()
+                        .filter_map(|p| {
+                            p.strip_prefix(worktree)
+                                .ok()
+                                .map(|r| r.to_string_lossy().to_string())
+                        })
+                        .collect();
+                let mut acquires_init = false;
+                for dep in &deps {
+                    if new_inits.contains(dep) {
+                        acquires_init = true;
+                        break;
+                    }
+                }
+                if acquires_init {
+                    forced_upserts.push((importer, storage::FileShard { signature, deps }));
+                }
             }
         }
         upserts.extend(forced_upserts);
     }
-
-    // A cut-short scan cannot distinguish "deleted" from "not yet reached",
-    // so only infer deletions from a complete pass.
-    let deletes: Vec<String> = if timed_out || failed {
-        Vec::new()
-    } else {
-        previously_known.difference(&seen).cloned().collect()
-    };
     let files_changed = upserts.len() + deletes.len();
 
     if storage::apply_reconcile(&handle.db, &storage::ReconcileWrite { upserts, deletes }).is_err()
@@ -643,6 +695,51 @@ mod tests {
         );
         // The genuine direct importer is unaffected by the __init__ edit.
         assert!(after.contains(&direct));
+    }
+
+    #[test]
+    fn warm_reconcile_drops_edges_when_init_is_deleted() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "delete-init")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        let init = "packages/producer/src/producer/ingest/__init__.py";
+        let rankings = Path::new("packages/producer/src/producer/ingest/rankings.py");
+        std::fs::remove_file(repo.path().join(init)).unwrap();
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let surface = "consumer/src/consumer/surface.py";
+        let shard = storage::read_shard(&handle.db, surface).unwrap().unwrap();
+        assert!(!shard.deps.contains(&init.to_string()));
+        assert!(!shard.deps.contains(&rankings.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn warm_reconcile_discovers_importers_when_init_is_added() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        let init = "packages/producer/src/producer/ingest/__init__.py";
+        std::fs::remove_file(repo.path().join(init)).unwrap();
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "add-init")
+            .unwrap();
+        reconcile(&handle, repo.path(), far_deadline());
+
+        write_file(repo.path(), init, "from .rankings import RankingEntry\n");
+        let warm = reconcile(&handle, repo.path(), far_deadline());
+        assert!(warm.complete);
+
+        let surface = "consumer/src/consumer/surface.py";
+        let rankings = "packages/producer/src/producer/ingest/rankings.py";
+        let shard = storage::read_shard(&handle.db, surface).unwrap().unwrap();
+        assert!(shard.deps.contains(&init.to_string()));
+        assert!(shard.deps.contains(&rankings.to_string()));
     }
 
     #[test]
