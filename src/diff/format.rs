@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::budget;
 use crate::format::rel;
+use crate::lang::detection::is_secret_file;
 use crate::types::estimate_tokens;
 
 use super::{
@@ -87,6 +88,20 @@ pub(crate) fn format_overview(
                 out,
                 "## {rel_path} (generated, {changed_lines} lines changed — summarized)"
             );
+            continue;
+        }
+
+        // Secret-named files: the shared `is_secret_file` policy that already
+        // suppresses incidental search previews applies here too. An unscoped
+        // overview is incidental output, so redact the file's signatures rather
+        // than inline credential material. A deliberate `scope`-ed file/function
+        // view is the diff analog of a deliberate `tilth_read` and stays intact.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_secret_file)
+        {
+            let _ = writeln!(out, "## {rel_path} (secret — contents redacted)");
             continue;
         }
 
@@ -667,6 +682,43 @@ mod tests {
         assert!(
             out.contains("2 lines changed"),
             "expected 2 changed lines:\n{out}"
+        );
+    }
+
+    // 4b. Secret-named files are redacted, never inlining signatures.
+    #[test]
+    fn test_overview_secret_redacted() {
+        let overlay = make_overlay(
+            "credentials.py",
+            vec![make_sig_change(
+                "connect",
+                "def connect(token=\"OLD\")",
+                "def connect(token=\"SYNTHETIC_SECRET\")",
+            )],
+        );
+        let path = overlay.path.clone();
+        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
+        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        assert!(
+            out.contains("credentials.py"),
+            "file must be listed:\n{out}"
+        );
+        assert!(out.contains("redacted"), "missing redaction marker:\n{out}");
+        assert!(
+            !out.contains("SYNTHETIC_SECRET"),
+            "secret signature leaked in overview:\n{out}"
+        );
+        // A non-secret file with the same change type still shows its signature.
+        let normal = make_overlay(
+            "config.py",
+            vec![make_sig_change("load", "def load(x)", "def load(y)")],
+        );
+        let npath = normal.path.clone();
+        let nmeta: Vec<(&Path, bool, bool)> = vec![(&npath, false, false)];
+        let nout = format_overview(&[normal], &nmeta, &[], "HEAD", None);
+        assert!(
+            nout.contains("def load(y)"),
+            "non-secret signature must remain visible:\n{nout}"
         );
     }
 
