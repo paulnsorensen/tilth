@@ -11,10 +11,11 @@ use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
 use crate::read::imports::{
     is_external, is_import_line, resolve_python_scoped, resolve_scoped_paths, target_ambiguity,
-    PyRoots,
+    PyRoots, Uncertainty,
 };
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
+use crate::types::Lang;
 use crate::types::{FileType, OutlineKind};
 
 /// Maximum number of exported symbols to search for in the reverse direction.
@@ -154,8 +155,40 @@ pub fn analyze_deps(
 
     // Merge in import-resolved files (may not have resolved callees if symbols
     // weren't matched, but the import relationship itself is meaningful).
-    // Scoped resolution adds absolute in-scope Python imports.
-    let import_files = resolve_scoped_paths(path, &content, &import_roots);
+    // Scoped resolution adds absolute in-scope Python imports. Python refuses
+    // to guess: any uncertain forward import (ambiguous module or blocked
+    // re-export ownership) fails the whole call rather than silently
+    // dropping the edge.
+    let mut resolved_local_modules: HashSet<String> = HashSet::new();
+    let import_files = if lang == Lang::Python {
+        let resolution = resolve_python_scoped(path, &content, &import_roots);
+        if let Some(first) = resolution.uncertain.into_iter().next() {
+            return Err(match first {
+                Uncertainty::AmbiguousModule { module, candidates } => {
+                    TilthError::AmbiguousModule {
+                        module,
+                        candidates: candidates
+                            .iter()
+                            .map(|p| p.strip_prefix(scope).unwrap_or(p).display().to_string())
+                            .collect(),
+                    }
+                }
+                Uncertainty::BlockedOwnership { module, name } => {
+                    TilthError::BlockedOwnership { module, name }
+                }
+            });
+        }
+        resolution
+            .edges
+            .into_iter()
+            .map(|edge| {
+                resolved_local_modules.insert(edge.module);
+                edge.path
+            })
+            .collect()
+    } else {
+        resolve_scoped_paths(path, &content, &import_roots)
+    };
     for import_path in import_files {
         local_by_file.entry(import_path).or_default();
     }
@@ -184,7 +217,10 @@ pub fn analyze_deps(
         if source.is_empty() {
             continue;
         }
-        if is_external(&source, lang) && !is_stdlib(&source, lang) && is_valid_module_path(&source)
+        if is_external(&source, lang)
+            && !is_stdlib(&source, lang)
+            && is_valid_module_path(&source)
+            && !(lang == Lang::Python && resolved_local_modules.contains(&source))
         {
             external_set.insert(source.clone());
         }
