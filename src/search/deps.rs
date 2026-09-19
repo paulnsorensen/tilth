@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
@@ -24,6 +27,13 @@ const MAX_EXPORTED_SYMBOLS: usize = 25;
 /// Maximum number of dependents to show before truncation.
 const MAX_DEPENDENTS: usize = 15;
 
+/// Wall-clock bound for the reverse import scan. A scan that stops here
+/// reports partial coverage; it never claims a complete dependent set.
+const IMPORT_SCAN_BUDGET: Duration = Duration::from_secs(3);
+
+/// Maximum number of unreadable or uncertain consumer paths named in the output.
+const MAX_COVERAGE_PATHS: usize = 5;
+
 /// Result of a full dependency analysis for a single file.
 pub struct DepsResult {
     pub target: PathBuf,
@@ -35,6 +45,33 @@ pub struct DepsResult {
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
+    /// What the reverse import scan could not prove.
+    pub reverse_coverage: ReverseCoverage,
+}
+
+/// Coverage of the reverse import scan. A default value means the scan saw
+/// every in-scope consumer and resolved each one without uncertainty.
+#[derive(Debug, Default)]
+pub struct ReverseCoverage {
+    /// Python consumers that could not be read.
+    pub unreadable: Vec<PathBuf>,
+    /// Python consumers with an unresolved import that can hide an edge to
+    /// the target (ambiguous module, blocked or unavailable re-export owner).
+    pub uncertain: Vec<PathBuf>,
+    /// Directory entries the walker could not visit.
+    pub walk_errors: usize,
+    /// The scan stopped at its deadline.
+    pub timed_out: bool,
+}
+
+impl ReverseCoverage {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unreadable.is_empty()
+            && self.uncertain.is_empty()
+            && self.walk_errors == 0
+            && !self.timed_out
+    }
 }
 
 /// A local file dependency with the symbols used from it.
@@ -85,13 +122,18 @@ pub fn analyze_deps(
             total_dependents: 0,
             exported_count: 0,
             searched_count: 0,
+            reverse_coverage: ReverseCoverage::default(),
         });
     };
+
+    // Package roots for scoped import resolution — discovered once from the
+    // explicit scope and shared by the ambiguity check and both passes below.
+    let import_roots = PyRoots::discover(scope);
 
     // Refuse to guess when the target's own module identity is ambiguous:
     // duplicate package roots make its dependent set unreliable, so report the
     // module and its bounded candidates instead of a confident wrong answer.
-    if let Some(ambiguous) = target_ambiguity(path, scope) {
+    if let Some(ambiguous) = target_ambiguity(path, &import_roots) {
         return Err(TilthError::AmbiguousModule {
             module: ambiguous.module,
             candidates: ambiguous
@@ -101,9 +143,6 @@ pub fn analyze_deps(
                 .collect(),
         });
     }
-    // Package roots for scoped import resolution — discovered once from the
-    // explicit scope and shared by the forward and reverse passes below.
-    let import_roots = PyRoots::discover(scope);
 
     // ── Phase 1: Extract exported symbols ────────────────────────────────────
 
@@ -175,6 +214,9 @@ pub fn analyze_deps(
                 }
                 Uncertainty::BlockedOwnership { module, name } => {
                     TilthError::BlockedOwnership { module, name }
+                }
+                Uncertainty::UnavailableOwner { module, name, path } => {
+                    TilthError::UnavailableOwner { module, name, path }
                 }
             });
         }
@@ -255,7 +297,13 @@ pub fn analyze_deps(
     }
 
     // Import edges: files that import the target directly, even without a call.
-    let imports_by_file = collect_import_dependents(path, scope, &import_roots);
+    // Only Python resolves import edges here, so other targets skip the scan.
+    let (imports_by_file, reverse_coverage) = if lang == Lang::Python {
+        let deadline = Instant::now() + IMPORT_SCAN_BUDGET;
+        collect_import_dependents(path, scope, &import_roots, deadline)?
+    } else {
+        (HashMap::new(), ReverseCoverage::default())
+    };
 
     // Union both edge kinds by file so an importer that never calls the target
     // still surfaces, and a file that both imports and calls appears once.
@@ -302,6 +350,7 @@ pub fn analyze_deps(
         total_dependents,
         exported_count,
         searched_count,
+        reverse_coverage,
     })
 }
 
@@ -325,13 +374,16 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
         .unwrap_or(&result.target)
         .display()
         .to_string();
+    // The partial marker lives in the header because the header is the one
+    // part that budget truncation never removes.
     let header = format!(
-        "# Deps: {} — {} local, {} external, {} dependent{}",
+        "# Deps: {} — {} local, {} external, {} dependent{}{}",
         rel_target,
         result.uses_local.len(),
         result.uses_external.len(),
         dep_count,
         if dep_count == 1 { "" } else { "s" },
+        partial_marker(&result.reverse_coverage),
     );
 
     let uses_local_section = format_uses_local(&result.uses_local, scope, true);
@@ -339,7 +391,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     let used_by_section = format_used_by(&prod_deps, scope, "## Used by");
     let used_by_tests_section = format_used_by(&test_deps, scope, "## Used by (tests)");
 
-    let barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
+    let mut barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
         format!(
             "\n\n> ({} of {} exports shown — barrel file detected)",
             result.searched_count, result.exported_count
@@ -347,6 +399,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     } else {
         String::new()
     };
+    barrel_note.push_str(&format_coverage_detail(&result.reverse_coverage, scope));
 
     // Full output
     let mut parts: Vec<String> = Vec::new();
@@ -411,63 +464,175 @@ fn collect_symbol_names(entry: &crate::types::OutlineEntry, out: &mut Vec<String
     }
 }
 
+/// ` (partial: …)` for the header when the reverse scan is incomplete.
+fn partial_marker(coverage: &ReverseCoverage) -> String {
+    if coverage.is_complete() {
+        return String::new();
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    if !coverage.unreadable.is_empty() {
+        reasons.push(format!("{} unreadable", coverage.unreadable.len()));
+    }
+    if !coverage.uncertain.is_empty() {
+        reasons.push(format!("{} uncertain", coverage.uncertain.len()));
+    }
+    if coverage.walk_errors > 0 {
+        reasons.push(format!("{} walk errors", coverage.walk_errors));
+    }
+    if coverage.timed_out {
+        reasons.push("scan timed out".to_string());
+    }
+    format!(" (partial: {})", reasons.join(", "))
+}
+
+/// Bounded list of the consumers behind a partial reverse scan.
+fn format_coverage_detail(coverage: &ReverseCoverage, scope: &Path) -> String {
+    let mut out = String::new();
+    for (label, paths) in [
+        ("unreadable consumers", &coverage.unreadable),
+        ("uncertain consumers", &coverage.uncertain),
+    ] {
+        if paths.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = paths
+            .iter()
+            .take(MAX_COVERAGE_PATHS)
+            .map(|p| p.strip_prefix(scope).unwrap_or(p).display().to_string())
+            .collect();
+        let more = paths.len().saturating_sub(shown.len());
+        let _ = write!(out, "\n\n> {label}: {}", shown.join(", "));
+        if more > 0 {
+            let _ = write!(out, " (+{more} more)");
+        }
+    }
+    out
+}
+
+/// Whether one consumer's unresolved import can hide an edge to `target`.
+/// An ambiguous module hides the target only when the target is one of its
+/// candidates; a blocked or unavailable re-export owner can be any file.
+fn may_hide_target(uncertainty: &Uncertainty, target_canon: &Path) -> bool {
+    match uncertainty {
+        Uncertainty::AmbiguousModule { candidates, .. } => candidates
+            .iter()
+            .any(|c| c.canonicalize().is_ok_and(|c| c == target_canon)),
+        Uncertainty::BlockedOwnership { .. } | Uncertainty::UnavailableOwner { .. } => true,
+    }
+}
+
 /// Files under `scope` that import `target` directly (Python absolute or
 /// relative imports), keyed by the dependent's scope-form path with the
-/// `(module, line)` evidence for each edge. Honors the shared walker skip rules
-/// and never leaves `scope`, so a narrower scope cannot discover outside
-/// consumers.
+/// `(module, line)` evidence for each edge, plus the coverage of the scan.
+///
+/// The scan uses the shared parallel walker policy and stops at `deadline`.
+/// A consumer whose canonical path leaves the canonical scope is skipped, so
+/// a narrower scope cannot discover outside consumers. Walker errors,
+/// unreadable consumers, and consumers with an unresolved import that can
+/// hide the target are recorded in the coverage; they are never dropped
+/// silently.
+#[allow(clippy::type_complexity)]
 fn collect_import_dependents(
     target: &Path,
     scope: &Path,
     roots: &PyRoots,
-) -> HashMap<PathBuf, Vec<(String, u32)>> {
-    let mut out: HashMap<PathBuf, Vec<(String, u32)>> = HashMap::new();
+    deadline: Instant,
+) -> Result<(HashMap<PathBuf, Vec<(String, u32)>>, ReverseCoverage), TilthError> {
     let target_canon = target
         .canonicalize()
         .unwrap_or_else(|_| target.to_path_buf());
-    for entry in ignore::WalkBuilder::new(scope)
-        .filter_entry(|entry| {
-            !(entry.file_type().is_some_and(|ft| ft.is_dir())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| crate::search::skip_dir_entry(entry.path(), name)))
-        })
-        .build()
-        .flatten()
-    {
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let candidate = entry.path();
-        if !matches!(
-            detect_file_type(candidate),
-            FileType::Code(crate::types::Lang::Python)
-        ) {
-            continue;
-        }
-        let candidate_canon = candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.to_path_buf());
-        if candidate_canon == target_canon {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(candidate) else {
-            continue;
-        };
-        for edge in resolve_python_scoped(candidate, &content, roots).edges {
-            let edge_canon = edge
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| edge.path.clone());
-            if edge_canon == target_canon {
-                out.entry(candidate.to_path_buf())
-                    .or_default()
-                    .push((edge.module, edge.line));
+    let scope_canon = scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
+    let edges: Mutex<HashMap<PathBuf, Vec<(String, u32)>>> = Mutex::new(HashMap::new());
+    let unreadable: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let uncertain: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let walk_errors = AtomicUsize::new(0);
+    let timed_out = AtomicBool::new(false);
+
+    let walker = super::walker(scope, None)?;
+    walker.run(|| {
+        let (edges, unreadable, uncertain) = (&edges, &unreadable, &uncertain);
+        let (walk_errors, timed_out) = (&walk_errors, &timed_out);
+        let (target_canon, scope_canon) = (&target_canon, &scope_canon);
+        Box::new(move |entry| {
+            if Instant::now() >= deadline {
+                timed_out.store(true, Ordering::Relaxed);
+                return ignore::WalkState::Quit;
             }
-        }
-    }
-    out
+            let Ok(entry) = entry else {
+                walk_errors.fetch_add(1, Ordering::Relaxed);
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let candidate = entry.path();
+            if !matches!(detect_file_type(candidate), FileType::Code(Lang::Python)) {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(candidate_canon) = candidate.canonicalize() else {
+                push_locked(unreadable, candidate.to_path_buf());
+                return ignore::WalkState::Continue;
+            };
+            if candidate_canon == *target_canon || !candidate_canon.starts_with(scope_canon) {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(content) = fs::read_to_string(candidate) else {
+                push_locked(unreadable, candidate.to_path_buf());
+                return ignore::WalkState::Continue;
+            };
+            let resolution = resolve_python_scoped(candidate, &content, roots);
+            let mut proven: Vec<(String, u32)> = Vec::new();
+            for edge in resolution.edges {
+                if edge.path.canonicalize().is_ok_and(|p| p == *target_canon) {
+                    proven.push((edge.module, edge.line));
+                }
+            }
+            if proven.is_empty() {
+                // A proven dependent is already reported; only an unproven
+                // consumer can be a hidden one.
+                if resolution
+                    .uncertain
+                    .iter()
+                    .any(|u| may_hide_target(u, target_canon))
+                {
+                    push_locked(uncertain, candidate.to_path_buf());
+                }
+            } else {
+                edges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(candidate.to_path_buf())
+                    .or_default()
+                    .extend(proven);
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    let into_sorted = |paths: Mutex<Vec<PathBuf>>| {
+        let mut paths = paths
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        paths.sort();
+        paths
+    };
+    let coverage = ReverseCoverage {
+        unreadable: into_sorted(unreadable),
+        uncertain: into_sorted(uncertain),
+        walk_errors: walk_errors.load(Ordering::Relaxed),
+        timed_out: timed_out.load(Ordering::Relaxed),
+    };
+    let edges = edges
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((edges, coverage))
+}
+
+fn push_locked(paths: &Mutex<Vec<PathBuf>>, path: PathBuf) {
+    paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path);
 }
 
 /// Returns true if the name is a noise/placeholder that should be excluded
@@ -849,5 +1014,150 @@ mod tests {
         // Go 1.21+ added `cmp` and `maps` to the standard library.
         assert!(is_stdlib("cmp", crate::types::Lang::Go));
         assert!(is_stdlib("maps", crate::types::Lang::Go));
+    }
+
+    /// The #197 fixture plus a second owner of `RankingEntry`, so the package
+    /// surface cannot attribute the name to one file.
+    fn blocked_ownership_fixture(root: &Path) {
+        write_file(root, "packages/producer/src/producer/__init__.py", "");
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/other.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        write_file(
+            root,
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .rankings import RankingEntry\nfrom .other import RankingEntry\n",
+        );
+        write_file(root, "consumer/src/consumer/__init__.py", "");
+        write_file(
+            root,
+            "consumer/src/consumer/direct.py",
+            "from producer.ingest.rankings import RankingEntry\n",
+        );
+        write_file(
+            root,
+            "consumer/src/consumer/surface.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+    }
+
+    #[test]
+    fn uncertain_consumer_makes_the_dependent_set_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let result = analyze_deps(&target, root, &bloom).expect("analyze_deps");
+
+        // The proven importer is reported; the blocked one is named, not dropped.
+        assert!(result
+            .used_by
+            .iter()
+            .any(|d| d.path.ends_with("consumer/src/consumer/direct.py")));
+        let uncertain: Vec<_> = result.reverse_coverage.uncertain.iter().collect();
+        assert_eq!(uncertain.len(), 1, "{uncertain:?}");
+        assert!(uncertain[0].ends_with("consumer/src/consumer/surface.py"));
+        assert!(!result.reverse_coverage.is_complete());
+
+        let full = format_deps(&result, root, None);
+        assert!(full.contains("(partial: 1 uncertain)"), "{full}");
+        assert!(
+            full.contains("uncertain consumers: consumer/src/consumer/surface.py"),
+            "{full}"
+        );
+        // The marker survives the tightest budget because it is in the header.
+        let tight = format_deps(&result, root, Some(1));
+        assert!(tight.contains("(partial: 1 uncertain)"), "{tight}");
+    }
+
+    #[test]
+    fn unreadable_consumer_makes_the_dependent_set_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        std::fs::remove_file(root.join("consumer/src/consumer/surface.py")).unwrap();
+        // Invalid UTF-8: the consumer exists but cannot be read as source.
+        std::fs::write(
+            root.join("consumer/src/consumer/broken.py"),
+            [0xff, 0xfe, 0x00],
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let result = analyze_deps(&target, root, &bloom).expect("analyze_deps");
+        let unreadable = &result.reverse_coverage.unreadable;
+        assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+        assert!(unreadable[0].ends_with("consumer/src/consumer/broken.py"));
+        assert!(format_deps(&result, root, None).contains("(partial: 1 unreadable)"));
+    }
+
+    #[test]
+    fn complete_reverse_scan_has_no_partial_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        std::fs::remove_file(root.join("consumer/src/consumer/surface.py")).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let result = analyze_deps(&target, root, &bloom).expect("analyze_deps");
+        assert!(result.reverse_coverage.is_complete());
+        assert!(!format_deps(&result, root, None).contains("partial"));
+    }
+
+    #[test]
+    fn narrower_scope_excludes_outside_consumers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let scope = root.join("packages/producer");
+        let result = analyze_deps(&target, &scope, &bloom).expect("analyze_deps");
+        let outside = |p: &PathBuf| p.to_string_lossy().contains("consumer/src");
+        assert!(!result.used_by.iter().any(|d| outside(&d.path)));
+        assert!(!result.reverse_coverage.uncertain.iter().any(outside));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_does_not_import_outside_consumers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        let scope = root.join("packages/producer");
+        std::os::unix::fs::symlink(root.join("consumer"), scope.join("linked")).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let result = analyze_deps(&target, &scope, &bloom).expect("analyze_deps");
+        assert!(
+            result
+                .used_by
+                .iter()
+                .all(|d| !d.path.starts_with(scope.join("linked"))),
+            "a consumer behind a symlink that leaves the scope must be skipped"
+        );
+        assert!(result.reverse_coverage.uncertain.is_empty());
+    }
+
+    #[test]
+    fn expired_deadline_reports_a_timed_out_reverse_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        blocked_ownership_fixture(root);
+        let target = root.join("packages/producer/src/producer/ingest/rankings.py");
+        let roots = PyRoots::discover(root);
+        let (edges, coverage) =
+            collect_import_dependents(&target, root, &roots, Instant::now()).expect("scan");
+        assert!(edges.is_empty());
+        assert!(coverage.timed_out);
+        assert_eq!(partial_marker(&coverage), " (partial: scan timed out)");
     }
 }

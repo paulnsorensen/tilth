@@ -9,7 +9,9 @@ use crate::types::{FileType, Lang};
 
 mod python_scope;
 
-pub(crate) use python_scope::{target_ambiguity, PyResolution, PyRoots, Uncertainty};
+pub(crate) use python_scope::{
+    is_init_py, target_ambiguity, PyResolution, PyRoots, ScopedShardFields, Uncertainty,
+};
 
 const MAX_SUGGESTIONS: usize = 8;
 
@@ -31,24 +33,24 @@ pub(crate) fn resolve_scoped_paths(
     }
 }
 
-/// `(resolved edge paths, re-export chain hops)` for a file within an
-/// explicit `scope` — the pair `reconcile`'s shard builder needs in one
-/// dispatch. Non-Python files keep the unscoped resolver's behavior and
-/// carry no hops; `resolve_scoped_paths` stays the paths-only contract
-/// ordinary callers use.
-pub(crate) fn resolve_scoped_paths_with_hops(
+/// Resolved edge paths, re-export chain hops, and the uncertainty flag for a
+/// file within an explicit `scope` — what `reconcile`'s shard builder needs in
+/// one dispatch. Non-Python files keep the unscoped resolver's behavior, carry
+/// no hops, and are never uncertain; `resolve_scoped_paths` stays the
+/// paths-only contract ordinary callers use.
+pub(crate) fn resolve_scoped_shard_fields(
     file_path: &Path,
     content: &str,
     roots: &PyRoots,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
+) -> ScopedShardFields {
     match detect_file_type(file_path) {
         FileType::Code(Lang::Python) => {
-            python_scope::resolve_python_edges(file_path, content, roots).into_paths_and_hops()
+            python_scope::resolve_python_edges(file_path, content, roots).into_shard_fields()
         }
-        _ => (
-            resolve_related_files_with_content(file_path, content),
-            Vec::new(),
-        ),
+        _ => ScopedShardFields {
+            paths: resolve_related_files_with_content(file_path, content),
+            ..ScopedShardFields::default()
+        },
     }
 }
 

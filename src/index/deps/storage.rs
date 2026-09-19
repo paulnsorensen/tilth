@@ -21,7 +21,11 @@ const REEXPORT_HOP_REVERSE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("reexport_hop_reverse");
 const PENDING_RESCAN: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_rescan");
 const PENDING_RESCAN_KEY: &str = "pending";
-pub(super) const FILE_SHARD_SCHEMA_VERSION: u8 = 1;
+/// Files whose stored shard is uncertain: key = relative path, empty value.
+const UNCERTAIN_SOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("uncertain_sources");
+/// Version 2 adds `FileShard::uncertain`. An older Python shard never recorded
+/// uncertainty, so `file_index_state` forces its rescan.
+pub(super) const FILE_SHARD_SCHEMA_VERSION: u8 = 2;
 
 /// Cheap change signature for a file: mtime + length. Cheaper than hashing
 /// content on every reconcile scan; a mismatch triggers a real re-derive.
@@ -45,6 +49,10 @@ pub(super) struct FileShard {
     /// `impact` or any presentation path.
     #[serde(default)]
     pub(super) reexport_hops: Vec<String>,
+    /// At least one import of this file stayed unresolved (ambiguous module,
+    /// blocked or unavailable re-export owner), so `deps` can be incomplete.
+    #[serde(default)]
+    pub(super) uncertain: bool,
 }
 
 /// Current on-disk signature for `path`, or `None` if it cannot be read.
@@ -117,6 +125,23 @@ pub(super) fn read_pending_rescan(db: &Database) -> Result<Vec<String>, DepsErro
     }
 }
 
+/// Every file whose stored shard is uncertain. Bounded by the number of such
+/// files, not by the size of the index.
+pub(super) fn read_uncertain_sources(db: &Database) -> Result<Vec<String>, DepsError> {
+    let txn = db.begin_read().map_err(redb_err)?;
+    let table = match txn.open_table(UNCERTAIN_SOURCES) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let mut sources = Vec::new();
+    for entry in table.iter().map_err(redb_err)? {
+        let (k, _) = entry.map_err(redb_err)?;
+        sources.push(k.value().to_string());
+    }
+    Ok(sources)
+}
+
 pub(super) fn file_index_state(
     db: &Database,
 ) -> Result<(HashMap<String, FileSignature>, HashSet<String>), DepsError> {
@@ -164,6 +189,7 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
         let mut reverse = txn.open_table(REVERSE).map_err(redb_err)?;
         let mut hop_reverse = txn.open_table(REEXPORT_HOP_REVERSE).map_err(redb_err)?;
         let mut pending = txn.open_table(PENDING_RESCAN).map_err(redb_err)?;
+        let mut uncertain = txn.open_table(UNCERTAIN_SOURCES).map_err(redb_err)?;
 
         for rel in &write.deletes {
             if let Some(v) = files.get(rel.as_str()).map_err(redb_err)? {
@@ -177,6 +203,7 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
                 }
             }
             files.remove(rel.as_str()).map_err(redb_err)?;
+            uncertain.remove(rel.as_str()).map_err(redb_err)?;
         }
 
         for (rel, shard) in &write.upserts {
@@ -213,6 +240,13 @@ pub(super) fn apply_reconcile(db: &Database, write: &ReconcileWrite) -> Result<(
             files
                 .insert(rel.as_str(), bytes.as_slice())
                 .map_err(redb_err)?;
+            if shard.uncertain {
+                uncertain
+                    .insert(rel.as_str(), [].as_slice())
+                    .map_err(redb_err)?;
+            } else {
+                uncertain.remove(rel.as_str()).map_err(redb_err)?;
+            }
         }
 
         if write.pending_rescan.is_empty() {
@@ -252,6 +286,7 @@ pub(super) fn downgrade_shard_without_reexport_hops(
             signature,
             deps,
             reexport_hops,
+            uncertain: _uncertain,
         } = shard;
         let legacy = LegacyFileShard { signature, deps };
         let bytes = serde_json::to_vec(&legacy).map_err(redb_err)?;
