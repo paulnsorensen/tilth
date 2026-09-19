@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-09-06
+last_verified: 2026-09-19
 confidence: high
 sources:
   - https://github.com/paulnsorensen/tilth/pull/231
@@ -66,6 +66,13 @@ The pre-merge review of PR #231 fixed four contract gaps that the tests now pin:
 
 A bare `worktrees/` directory is skipped only when an immediate child holds a `.git` entry; `.worktrees/` is skipped unconditionally. The deps reconcile walk shares that predicate with the search walker.
 
+
+
+Unique symbol enrichment must not trust a candidate line after discovery.
+The source file can change, or a cached outline can supply an older line.
+The resolver now reads source once and matches the exact name in the fresh outline before any enclosing or synthetic fallback.
+It emits the refreshed path and line.[^5]
+
 ## Alternatives Rejected
 
 - Restore kind:callers: preserves the mode-selection problem instead of implementing the planned continuation.
@@ -84,5 +91,6 @@ Additional tests cover target collisions, scope, batch order, invalid requests, 
 [^2]: [Search v2 public discovery topology](./tilth-search-v2-roadmap-001.md), lines 12–26; [Measured parallel trial](./tilth-search-v2-roadmap-004.md), lines 20–26.
 [^3]: [Deterministic search contract](./tilth-search-v2-roadmap-002.md).
 [^4]: Affinage review of PR #231, 2026-09-06 (`.cheese/affinage/pr-231.md`); deferred findings tracked in https://github.com/paulnsorensen/tilth/issues/233.
+[^5]: `src/search/grok.rs:375-438`; `src/mcp/tools/search_v2.rs:644-698`; regression test `src/mcp/tools/search_v2.rs:738-750`.
 
 _Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the initial ADR-006 caller-kind exception and permanent seven-verb conclusion._
