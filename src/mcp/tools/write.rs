@@ -639,6 +639,38 @@ mod tests {
         );
     }
 
+    /// Minimal seam for Finding 11: same line is drift-conflicted, not the
+    /// whole file. Confirms rejection preserves unrelated surrounding lines
+    /// and keeps the external change intact.
+    #[test]
+    fn same_line_drift_conflict_is_rejected_and_preserves_surrounding_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("same_line_conflict.rs");
+        std::fs::write(&p, "a\nb\nTARGET\nd\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        // External process rewrites ONLY line 3, leaving a/b/d untouched.
+        std::fs::write(&p, "a\nb\nEXTERNAL\nd\n").unwrap();
+        let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "NEW" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect_err("same-line drift must be rejected, not silently applied");
+        assert!(
+            out.contains("error:") && out.contains("changed between read and edit"),
+            "same-line drift must be a Drift rejection, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "a\nb\nEXTERNAL\nd\n",
+            "rejected edit must keep the external change and leave a/b/d untouched"
+        );
+    }
+
     /// The #195 regression at the real read-to-write seam: one live Session
     /// reads the file (recording the head tag), an external process changes a
     /// nearby line, and the model edits a different line inside the same patch

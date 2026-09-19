@@ -1297,8 +1297,13 @@ mod tests {
         .expect_err("caller-selected kind must be rejected");
         assert!(err.contains("query and glob"), "unexpected error: {err}");
     }
-    #[test]
-    fn continuation_hints_round_trip_for_every_kind() {
+    /// Build the shared fixture: a git-init tempdir with `fixture.ts` (root,
+    /// `production_caller`, sibling), `helper.ts` (leaf), `fixture.test.ts`
+    /// (`test_root`), and `other.ts` (a same-named root whose caller must
+    /// never surface), then run the initial `root` query. Returns the
+    /// tempdir (kept alive for later calls) and the initial response with
+    /// its 5 hints.
+    fn continuation_fixture() -> (tempfile::TempDir, Value) {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1323,49 +1328,58 @@ mod tests {
         let initial = call(&json!({"cwd": cwd, "queries": [{"query": "root",
             "glob": "{fixture.ts,fixture.test.ts,helper.ts}"}]}))
         .unwrap();
+        (tmp, initial)
+    }
+
+    /// The identity each hint kind must surface when followed.
+    fn expected_identity_for_kind(kind: &str) -> &'static str {
+        match kind {
+            "fetch_callers" => "production_caller",
+            "fetch_callees" => "leaf",
+            "fetch_siblings" => "sibling",
+            "fetch_tests" => "test_root",
+            "fetch_dependencies" => "helper.ts",
+            _ => unreachable!(),
+        }
+    }
+
+    /// Flatten a followed result's identities: `dependency_impact` arrays for
+    /// `fetch_dependencies`, `items[].name`/`items[].path` otherwise.
+    fn identities_from_result(hint: &Value, result: &Value) -> Vec<String> {
+        if hint["kind"] == "fetch_dependencies" {
+            let impact = &result["dependency_impact"];
+            impact["imports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(impact["dependents"].as_array().unwrap())
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        } else {
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|item| [item.get("name"), item.get("path")])
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn hint_echo_round_trip_returns_expected_identity_for_every_kind() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
         let hints = initial["hints"].as_array().unwrap();
         assert_eq!(hints.len(), 5, "{initial}");
         for hint in hints {
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
-            let expected = match hint["kind"].as_str().unwrap() {
-                "fetch_callers" => "production_caller",
-                "fetch_callees" => "leaf",
-                "fetch_siblings" => "sibling",
-                "fetch_tests" => "test_root",
-                "fetch_dependencies" => "helper.ts",
-                _ => unreachable!(),
-            };
+            let expected = expected_identity_for_kind(hint["kind"].as_str().unwrap());
             assert_eq!(result["status"], "ok", "{followed}");
-            // The duplicate preview payload is gone; identities live only in the
-            // canonical `items`/`dependency_impact` arrays (#238).
-            assert!(
-                result.get("preview").is_none(),
-                "follow result must not carry preview: {followed}"
-            );
-            let identities: Vec<String> = if hint["kind"] == "fetch_dependencies" {
-                let impact = &result["dependency_impact"];
-                impact["imports"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .chain(impact["dependents"].as_array().unwrap())
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect()
-            } else {
-                let items = result["items"].as_array().unwrap();
-                assert_eq!(
-                    result["total_found"].as_u64().unwrap() as usize,
-                    items.len()
-                );
-                items
-                    .iter()
-                    .flat_map(|item| [item.get("name"), item.get("path")])
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            };
+            let identities = identities_from_result(hint, result);
             assert!(identities.iter().any(|s| s == expected), "{followed}");
             assert!(
                 !identities.iter().any(|s| s == "wrong_caller"),
@@ -1375,6 +1389,49 @@ mod tests {
         }
         assert_eq!(hints[0]["target"]["line"], 2);
         assert_eq!(hints[0]["target"]["path"], "fixture.ts");
+    }
+
+    #[test]
+    fn followed_result_has_canonical_payload_without_preview() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
+        for hint in hints {
+            let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
+            let result = &followed["results"][0];
+            // The duplicate preview payload is gone; identities live only in
+            // the canonical `items`/`dependency_impact` arrays (#238).
+            assert!(
+                result.get("preview").is_none(),
+                "follow result must not carry preview: {followed}"
+            );
+            if hint["kind"] == "fetch_dependencies" {
+                let impact = &result["dependency_impact"];
+                assert!(impact["imports"].is_array(), "{followed}");
+                assert!(impact["dependents"].is_array(), "{followed}");
+                let identities = identities_from_result(hint, result);
+                assert!(
+                    identities
+                        .iter()
+                        .any(|s| s == expected_identity_for_kind("fetch_dependencies")),
+                    "{followed}"
+                );
+            } else {
+                let items = result["items"].as_array().unwrap();
+                assert_eq!(
+                    result["total_found"].as_u64().unwrap() as usize,
+                    items.len(),
+                    "{followed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_query_and_follow_entries_preserve_order() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
         let mixed = call(&json!({"cwd": cwd, "queries": [
             {"query": "^absent$"}, {"follow": hints[0]}, {"query": "root"}
         ]}))
@@ -1382,6 +1439,13 @@ mod tests {
         assert_eq!(mixed["results"][0]["status"], "no_match");
         assert_eq!(mixed["results"][1]["resolved_as"], "fetch_callers");
         assert_eq!(mixed["results"][2]["status"], "ambiguous");
+    }
+
+    #[test]
+    fn malformed_follow_target_is_rejected() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
         for (key, value) in [
             ("name", json!("wrong")),
             ("line", json!(0)),
