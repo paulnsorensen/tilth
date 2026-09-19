@@ -31,6 +31,11 @@ pub(crate) struct LangSpec {
     pub sibling_query: Option<&'static str>,
     /// How to recognise a stdlib import for this language (`is_stdlib`).
     pub stdlib: StdlibRule,
+    /// Whether this language resolves absolute in-scope imports through a
+    /// scoped forward/reverse resolver (`analyze_deps` forward resolution,
+    /// reverse import-dependent scan, and the schema-v2 rescan gate).
+    /// `true` only for Python today.
+    pub scoped_imports: bool,
     /// Build-manifest filenames contributed by this language (`package_root`).
     pub manifests: &'static [&'static str],
     /// Definition node kinds for AST definition detection (`DEFINITION_KINDS`).
@@ -243,6 +248,17 @@ mod tests {
                 spec(lang).has_lifetimes,
                 matches!(lang, Lang::Rust),
                 "{lang:?} lifetime flag mismatch — only Rust uses `'` for lifetime ticks"
+            );
+        }
+    }
+
+    #[test]
+    fn only_python_has_scoped_imports() {
+        for &lang in mod_all_langs_for_test() {
+            assert_eq!(
+                spec(lang).scoped_imports,
+                matches!(lang, Lang::Python),
+                "{lang:?} scoped_imports mismatch — only Python resolves absolute in-scope imports"
             );
         }
     }

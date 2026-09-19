@@ -13,6 +13,10 @@ use std::path::Path;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+use crate::lang::detect_file_type;
+use crate::lang::spec::spec;
+use crate::types::FileType;
+
 use super::DepsError;
 
 const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
@@ -160,10 +164,8 @@ pub(super) fn file_index_state(
         let shard: FileShard = serde_json::from_slice(v.value()).map_err(redb_err)?;
         let rel = k.value().to_string();
         known.insert(rel.clone());
-        let is_python = Path::new(&rel)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("py"));
-        if is_python && shard.schema_version < FILE_SHARD_SCHEMA_VERSION {
+        let has_scoped_imports = matches!(detect_file_type(Path::new(&rel)), FileType::Code(l) if spec(l).scoped_imports);
+        if has_scoped_imports && shard.schema_version < FILE_SHARD_SCHEMA_VERSION {
             continue;
         }
         signatures.insert(rel, shard.signature);

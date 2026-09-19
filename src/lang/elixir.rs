@@ -43,6 +43,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
     stdlib: StdlibRule::None,
+    scoped_imports: false,
     manifests: &["mix.exs"],
     definition_kinds: ELIXIR_DEFINITION_TARGETS,
     has_lifetimes: false,

@@ -44,6 +44,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
     stdlib: StdlibRule::PythonSegment(STDLIB_MODULES),
+    scoped_imports: true,
     manifests: &["pyproject.toml", "setup.py"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,

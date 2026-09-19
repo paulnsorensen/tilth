@@ -17,6 +17,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
     stdlib: StdlibRule::None,
+    scoped_imports: false,
     manifests: &["pom.xml", "build.gradle"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,

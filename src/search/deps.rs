@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
+use crate::lang::spec::spec;
 use crate::read::imports::{
     is_external, is_import_line, resolve_python_scoped, resolve_scoped_paths, target_ambiguity,
     PyRoots, Uncertainty,
@@ -199,7 +200,7 @@ pub fn analyze_deps(
     // re-export ownership) fails the whole call rather than silently
     // dropping the edge.
     let mut resolved_local_modules: HashSet<String> = HashSet::new();
-    let import_files = if lang == Lang::Python {
+    let import_files = if spec(lang).scoped_imports {
         let resolution = resolve_python_scoped(path, &content, &import_roots);
         if let Some(first) = resolution.uncertain.into_iter().next() {
             return Err(match first {
@@ -262,7 +263,7 @@ pub fn analyze_deps(
         if is_external(&source, lang)
             && !is_stdlib(&source, lang)
             && is_valid_module_path(&source)
-            && !(lang == Lang::Python && resolved_local_modules.contains(&source))
+            && !resolved_local_modules.contains(&source)
         {
             external_set.insert(source.clone());
         }
@@ -297,10 +298,11 @@ pub fn analyze_deps(
     }
 
     // Import edges: files that import the target directly, even without a call.
-    // Only Python resolves import edges here, so other targets skip the scan.
-    let (imports_by_file, reverse_coverage) = if lang == Lang::Python {
+    // Only languages with scoped-import resolution resolve import edges here,
+    // so other targets skip the scan.
+    let (imports_by_file, reverse_coverage) = if spec(lang).scoped_imports {
         let deadline = Instant::now() + IMPORT_SCAN_BUDGET;
-        collect_import_dependents(path, scope, &import_roots, deadline)?
+        collect_import_dependents(path, lang, scope, &import_roots, deadline)?
     } else {
         (HashMap::new(), ReverseCoverage::default())
     };
@@ -534,6 +536,7 @@ fn may_hide_target(uncertainty: &Uncertainty, target_canon: &Path) -> bool {
 #[allow(clippy::type_complexity)]
 fn collect_import_dependents(
     target: &Path,
+    lang: Lang,
     scope: &Path,
     roots: &PyRoots,
     deadline: Instant,
@@ -566,7 +569,7 @@ fn collect_import_dependents(
                 return ignore::WalkState::Continue;
             }
             let candidate = entry.path();
-            if !matches!(detect_file_type(candidate), FileType::Code(Lang::Python)) {
+            if detect_file_type(candidate) != FileType::Code(lang) {
                 return ignore::WalkState::Continue;
             }
             let Ok(candidate_canon) = candidate.canonicalize() else {
@@ -1155,7 +1158,8 @@ mod tests {
         let target = root.join("packages/producer/src/producer/ingest/rankings.py");
         let roots = PyRoots::discover(root);
         let (edges, coverage) =
-            collect_import_dependents(&target, root, &roots, Instant::now()).expect("scan");
+            collect_import_dependents(&target, Lang::Python, root, &roots, Instant::now())
+                .expect("scan");
         assert!(edges.is_empty());
         assert!(coverage.timed_out);
         assert_eq!(partial_marker(&coverage), " (partial: scan timed out)");

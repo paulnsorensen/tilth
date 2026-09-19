@@ -70,6 +70,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
     stdlib: StdlibRule::GoRoots(GO_STDLIB_ROOTS),
+    scoped_imports: false,
     manifests: &["go.mod"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
