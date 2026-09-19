@@ -234,11 +234,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": false,
                         "description": "Warn on callers of changed signatures."
                     },
-                    "expand": {
-                        "type": "number",
-                        "default": 0,
-                        "description": "Changed symbols to expand with source."
-                    },
                     "budget": {
                         "type": "number",
                         "description": "Max response tokens."
@@ -483,6 +478,16 @@ mod tests {
             !compiled.is_valid(&too_big),
             "an end above u32::MAX must fail schema validation (maximum: 4294967295)"
         );
+    }
+
+    #[test]
+    fn tilth_diff_schema_has_no_expand_property() {
+        let tools = tool_definitions(false);
+        let diff = tools
+            .iter()
+            .find(|t| t["name"] == "tilth_diff")
+            .expect("diff tool");
+        assert!(diff["inputSchema"]["properties"]["expand"].is_null());
     }
 
     /// The canonical `tilth_search` accepts one query or one unchanged follow hint per entry.
