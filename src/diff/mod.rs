@@ -109,11 +109,48 @@ pub enum MatchConfidence {
     Ambiguous(u32),
 }
 
+/// A single hunk line that no changed symbol claimed.
+///
+/// `line` is the new-file line number for `Added`/`Context` kinds and the
+/// old-file line number for `Removed`.
+#[derive(Debug, Clone)]
+pub struct UnattributedLine {
+    pub line: u32,
+    pub kind: DiffLineKind,
+    pub content: String,
+}
+
+/// Total unattributed lines kept per file overlay, across all hunks.
+pub const MAX_UNATTRIBUTED_LINES: usize = 200;
+
 #[derive(Debug)]
 pub struct FileOverlay {
     pub path: PathBuf,
     pub symbol_changes: Vec<SymbolChange>,
     pub attributed_hunks: Vec<(String, Vec<DiffLine>)>,
+    /// Hunk lines no changed symbol claimed, grouped per hunk (non-empty
+    /// groups only), capped at `MAX_UNATTRIBUTED_LINES` total.
+    pub unattributed_hunks: Vec<Vec<UnattributedLine>>,
+    pub unattributed_omitted: usize,
+    /// Raw insertion/deletion counts from the parsed patch, independent of
+    /// structural attribution.
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+impl FileOverlay {
+    /// An overlay with no changes attributed or counted yet.
+    pub(crate) fn empty(path: PathBuf) -> Self {
+        FileOverlay {
+            path,
+            symbol_changes: Vec::new(),
+            attributed_hunks: Vec::new(),
+            unattributed_hunks: Vec::new(),
+            unattributed_omitted: 0,
+            insertions: 0,
+            deletions: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -517,7 +554,6 @@ pub fn diff(
     scope: Option<&str>,
     search: Option<&str>,
     blast: bool,
-    _expand: usize,
     budget: Option<u64>,
     checkout: &Path,
 ) -> Result<String, String> {
@@ -679,7 +715,12 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
         let all_matching: HashSet<String> =
             matching_symbols.union(&matching_names).cloned().collect();
 
-        if all_matching.is_empty() {
+        let unattributed_matches = overlay.unattributed_hunks.iter().any(|hunk| {
+            hunk.iter()
+                .any(|l| l.content.to_lowercase().contains(&lower_term))
+        });
+
+        if all_matching.is_empty() && !unattributed_matches {
             return false;
         }
 
@@ -689,6 +730,10 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
         overlay
             .attributed_hunks
             .retain(|(name, _)| all_matching.contains(name));
+        overlay.unattributed_hunks.retain(|hunk| {
+            hunk.iter()
+                .any(|l| l.content.to_lowercase().contains(&lower_term))
+        });
 
         true
     });
@@ -914,7 +959,7 @@ mod tests {
         blast: bool,
         budget: Option<u64>,
     ) -> Result<String, String> {
-        diff(source, scope, search, blast, 0, budget, dir)
+        diff(source, scope, search, blast, budget, dir)
     }
 
     // 1. test_empty_diff
@@ -1659,11 +1704,7 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     fn overlay_at(path: &str) -> FileOverlay {
-        FileOverlay {
-            path: PathBuf::from(path),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        }
+        FileOverlay::empty(PathBuf::from(path))
     }
 
     // 25b. test_not_found_error_extension_shaped_lists_matches

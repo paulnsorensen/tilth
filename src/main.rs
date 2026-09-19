@@ -128,10 +128,6 @@ enum Command {
         #[arg(long)]
         blast: bool,
 
-        /// Expand top N changed symbols with full source context.
-        #[arg(long, default_value_t = 0)]
-        expand: usize,
-
         /// Max tokens in response.
         #[arg(long, default_value_t = 10000)]
         budget: u64,
@@ -207,7 +203,6 @@ fn main() {
                 log,
                 search,
                 blast,
-                expand,
                 budget,
             } => {
                 let a_str = a.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -232,7 +227,6 @@ fn main() {
                     scope.as_deref(),
                     search.as_deref(),
                     blast,
-                    expand,
                     budget_opt,
                     &current_dir_or_log(),
                 ) {

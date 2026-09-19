@@ -78,12 +78,7 @@ pub(crate) fn format_overview(
         }
 
         if is_generated {
-            let changed_lines: usize = overlay
-                .attributed_hunks
-                .iter()
-                .flat_map(|(_, lines)| lines.iter())
-                .filter(|l| l.kind != DiffLineKind::Context)
-                .count();
+            let changed_lines = overlay.insertions + overlay.deletions;
             let _ = writeln!(
                 out,
                 "## {rel_path} (generated, {changed_lines} lines changed — summarized)"
@@ -112,7 +107,15 @@ pub(crate) fn format_overview(
             .collect();
 
         let sym_count = visible.len();
-        let _ = writeln!(out, "## {rel_path} ({sym_count} symbols)");
+        if sym_count == 0 && overlay.insertions + overlay.deletions > 0 {
+            let _ = writeln!(
+                out,
+                "## {rel_path} (no symbols, +{}/−{} lines)",
+                overlay.insertions, overlay.deletions
+            );
+        } else {
+            let _ = writeln!(out, "## {rel_path} ({sym_count} symbols)");
+        }
 
         for change in &visible {
             let line = format_symbol_line(change);
@@ -225,6 +228,30 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
         // Diff lines attributed to this symbol.
         if let Some(lines) = hunk_map.get(change.name.as_str()) {
             write_diff_lines(&mut out, lines, line);
+        }
+    }
+
+    if !overlay.unattributed_hunks.is_empty() {
+        let _ = writeln!(out, "\n## [~] unattributed changes");
+        for hunk in &overlay.unattributed_hunks {
+            if let Some(first) = hunk.first() {
+                let _ = writeln!(out, "  @L{}", first.line);
+            }
+            for ul in hunk {
+                let prefix = match ul.kind {
+                    DiffLineKind::Added => '+',
+                    DiffLineKind::Removed => '-',
+                    DiffLineKind::Context => ' ',
+                };
+                let _ = writeln!(out, "  {prefix}{:>4}| {}", ul.line, ul.content);
+            }
+        }
+        if overlay.unattributed_omitted > 0 {
+            let _ = writeln!(
+                out,
+                "  … {} more unattributed lines",
+                overlay.unattributed_omitted
+            );
         }
     }
 
@@ -394,20 +421,9 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
     }
 }
 
-/// Count total insertions and deletions across all attributed hunks in an overlay.
+/// Total insertions and deletions for an overlay, from the raw parsed patch.
 pub(crate) fn count_insertions_deletions(overlay: &FileOverlay) -> (usize, usize) {
-    let mut insertions = 0usize;
-    let mut deletions = 0usize;
-    for (_, lines) in &overlay.attributed_hunks {
-        for line in lines {
-            match line.kind {
-                DiffLineKind::Added => insertions += 1,
-                DiffLineKind::Removed => deletions += 1,
-                DiffLineKind::Context => {}
-            }
-        }
-    }
-    (insertions, deletions)
+    (overlay.insertions, overlay.deletions)
 }
 
 // ---------------------------------------------------------------------------
@@ -546,15 +562,15 @@ mod tests {
     use super::*;
     use crate::diff::{
         ChangeType, Conflict, DiffLine, DiffLineKind, FileOverlay, MatchConfidence, SymbolChange,
+        UnattributedLine,
     };
     use crate::types::OutlineKind;
     use std::path::{Path, PathBuf};
 
     fn make_overlay(path: &str, changes: Vec<SymbolChange>) -> FileOverlay {
         FileOverlay {
-            path: PathBuf::from(path),
             symbol_changes: changes,
-            attributed_hunks: Vec::new(),
+            ..FileOverlay::empty(PathBuf::from(path))
         }
     }
 
@@ -653,23 +669,8 @@ mod tests {
     #[test]
     fn test_overview_generated() {
         let mut overlay = make_overlay("package-lock.json", vec![]);
-        overlay.attributed_hunks = vec![(
-            "top".to_string(),
-            vec![
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: "a".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "b".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: "c".to_string(),
-                },
-            ],
-        )];
+        overlay.insertions = 1;
+        overlay.deletions = 1;
         let path = overlay.path.clone();
         let meta: Vec<(&Path, bool, bool)> = vec![(&path, true, false)];
         let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
@@ -728,13 +729,14 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let overlay = FileOverlay {
-            path: PathBuf::from(OsString::from_vec(b"credentials-\xff.py".to_vec())),
             symbol_changes: vec![make_sig_change(
                 "connect",
                 "def connect(token=\"OLD\")",
                 "def connect(token=\"SYNTHETIC_SECRET\")",
             )],
-            attributed_hunks: Vec::new(),
+            ..FileOverlay::empty(PathBuf::from(OsString::from_vec(
+                b"credentials-\xff.py".to_vec(),
+            )))
         };
         let path = overlay.path.clone();
         let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
@@ -833,6 +835,8 @@ mod tests {
             "src/lib.rs",
             vec![make_change("foo", ChangeType::BodyChanged)],
         );
+        overlay.insertions = 2;
+        overlay.deletions = 1;
         overlay.attributed_hunks = vec![(
             "foo".to_string(),
             vec![
@@ -992,38 +996,57 @@ mod tests {
     #[test]
     fn test_count_insertions_deletions() {
         let mut overlay = make_overlay("src/lib.rs", vec![]);
-        overlay.attributed_hunks = vec![
-            (
-                "fn_a".to_string(),
-                vec![
-                    DiffLine {
-                        kind: DiffLineKind::Added,
-                        content: "a".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Added,
-                        content: "b".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Removed,
-                        content: "c".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Context,
-                        content: "d".to_string(),
-                    },
-                ],
-            ),
-            (
-                "fn_b".to_string(),
-                vec![DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "e".to_string(),
-                }],
-            ),
-        ];
+        overlay.insertions = 2;
+        overlay.deletions = 2;
         let (ins, del) = count_insertions_deletions(&overlay);
         assert_eq!(ins, 2, "insertions: {ins}");
         assert_eq!(del, 2, "deletions: {del}");
+    }
+
+    // 19. Overview — no-symbol file with raw hunk shows line counts
+    #[test]
+    fn test_overview_no_symbols_with_lines() {
+        let mut overlay = make_overlay("notes.md", vec![]);
+        overlay.insertions = 1;
+        overlay.deletions = 1;
+        let path = overlay.path.clone();
+        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
+        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        assert!(
+            out.contains("(no symbols, +1/−1 lines)"),
+            "expected no-symbols line count:\n{out}"
+        );
+    }
+
+    // 20. File detail — unattributed changes section with capped-lines note
+    #[test]
+    fn test_file_detail_unattributed_section() {
+        let mut overlay = make_overlay("notes.md", vec![]);
+        overlay.insertions = 1;
+        overlay.deletions = 1;
+        overlay.unattributed_hunks = vec![vec![
+            UnattributedLine {
+                line: 2,
+                kind: DiffLineKind::Removed,
+                content: "two".to_string(),
+            },
+            UnattributedLine {
+                line: 2,
+                kind: DiffLineKind::Added,
+                content: "CHANGED".to_string(),
+            },
+        ]];
+        overlay.unattributed_omitted = 3;
+        let out = format_file_detail(&overlay, None);
+        assert!(
+            out.contains("unattributed changes"),
+            "missing section:\n{out}"
+        );
+        assert!(out.contains("two"), "missing removed text:\n{out}");
+        assert!(out.contains("CHANGED"), "missing added text:\n{out}");
+        assert!(
+            out.contains("3 more unattributed lines"),
+            "missing omitted note:\n{out}"
+        );
     }
 }

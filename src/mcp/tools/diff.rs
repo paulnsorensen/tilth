@@ -24,7 +24,6 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
     let log = args.get("log").and_then(|v| v.as_str());
     let search = args.get("search").and_then(|v| v.as_str());
     let blast = args.get("blast").and_then(Value::as_bool).unwrap_or(false);
-    let expand = args.get("expand").and_then(Value::as_u64).unwrap_or(0) as usize;
     let budget = args
         .get("budget")
         .and_then(Value::as_u64)
@@ -32,15 +31,7 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
 
     let diff_source =
         crate::diff::resolve_source(source, a.as_deref(), b.as_deref(), patch.as_deref(), log)?;
-    let result = crate::diff::diff(
-        &diff_source,
-        scope,
-        search,
-        blast,
-        expand,
-        Some(budget),
-        cwd,
-    )?;
+    let result = crate::diff::diff(&diff_source, scope, search, blast, Some(budget), cwd)?;
     Ok(crate::budget::apply(&result, budget))
 }
 
