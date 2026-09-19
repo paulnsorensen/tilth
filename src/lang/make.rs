@@ -10,6 +10,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: None,
     sibling_query: None,
     stdlib: StdlibRule::None,
+    scoped_imports: false,
     manifests: &[],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,

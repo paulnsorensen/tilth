@@ -71,12 +71,20 @@ impl HandleState {
 
 /// Result of a `reconcile` or `impact` pass: whether it ran to completion
 /// against the whole relevant file set, or stopped early at the deadline.
+///
+/// `uncertain_sources` counts the stored Python shards with an unresolved
+/// import. Such a shard can lack an edge to a Python target. `reconcile`
+/// reports the count and keeps `complete` about the scan itself, because it
+/// does not know the queried target. `impact` knows the target: for a Python
+/// target it reports `complete: false` while any uncertain source remains.
+/// Proven edges stay available during that partial coverage.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Coverage {
     pub(crate) complete: bool,
     pub(crate) files_scanned: usize,
     pub(crate) files_changed: usize,
     pub(crate) timed_out: bool,
+    pub(crate) uncertain_sources: usize,
 }
 
 /// Dependents of a target file, verified against current on-disk state.
@@ -109,32 +117,62 @@ pub(crate) fn worktree_key(cwd: &Path) -> String {
 /// Whether a worktree-relative path is a Python package initializer. Its
 /// re-export bindings decide the ownership edges of every file that imports it,
 /// so a change to one invalidates those importers even when their own bytes are
-/// unchanged.
+/// unchanged. The predicate itself lives in the Python import module.
 fn is_python_init(rel: &str) -> bool {
-    Path::new(rel).file_name().and_then(|n| n.to_str()) == Some("__init__.py")
+    crate::read::imports::is_init_py(Path::new(rel))
 }
 
-/// Build one changed file's shard fields (deps + re-export invalidation
-/// hops) from its already-read `content`. Python files also record every
-/// intermediate `__init__.py` hop proven while resolving a named
-/// re-export; other languages keep the unscoped resolver's behavior and
-/// record no hops.
+/// One file's resolved shard content, in worktree-relative form.
+struct ShardFields {
+    deps: Vec<String>,
+    reexport_hops: Vec<String>,
+    uncertain: bool,
+}
+
+impl ShardFields {
+    fn into_shard(self, signature: storage::FileSignature) -> storage::FileShard {
+        storage::FileShard {
+            schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
+            signature,
+            deps: self.deps,
+            reexport_hops: self.reexport_hops,
+            uncertain: self.uncertain,
+        }
+    }
+
+    /// A file with no imports to resolve (non-code, binary).
+    fn empty() -> Self {
+        Self {
+            deps: Vec::new(),
+            reexport_hops: Vec::new(),
+            uncertain: false,
+        }
+    }
+}
+
+/// Build one changed file's shard fields (deps, re-export invalidation hops,
+/// and the uncertainty flag) from its already-read `content`. Python files
+/// also record every intermediate `__init__.py` hop proven while resolving a
+/// named re-export, and whether any import stayed unresolved; other languages
+/// keep the unscoped resolver's behavior, record no hops, and are never
+/// uncertain.
 fn resolved_shard_fields(
     abs: &Path,
     content: &str,
     worktree: &Path,
     roots: &crate::read::imports::PyRoots,
-) -> (Vec<String>, Vec<String>) {
+) -> ShardFields {
     let to_rel = |p: PathBuf| {
         p.strip_prefix(worktree)
             .ok()
             .map(|r| r.to_string_lossy().to_string())
     };
-    let (paths, hops) = crate::read::imports::resolve_scoped_paths_with_hops(abs, content, roots);
-    (
-        paths.into_iter().filter_map(to_rel).collect(),
-        hops.into_iter().filter_map(to_rel).collect(),
-    )
+    let fields = crate::read::imports::resolve_scoped_shard_fields(abs, content, roots);
+    ShardFields {
+        deps: fields.paths.into_iter().filter_map(to_rel).collect(),
+        reexport_hops: fields.hops.into_iter().filter_map(to_rel).collect(),
+        uncertain: fields.uncertain,
+    }
 }
 
 /// Rebuild `rel`'s shard from its current on-disk state. `None` when the
@@ -152,27 +190,11 @@ fn rescan_shard(
         crate::lang::detect_file_type(&abs),
         crate::types::FileType::Code(_)
     ) {
-        return Some((
-            rel.to_string(),
-            storage::FileShard {
-                schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
-                signature,
-                deps: Vec::new(),
-                reexport_hops: Vec::new(),
-            },
-        ));
+        return Some((rel.to_string(), ShardFields::empty().into_shard(signature)));
     }
     let content = std::fs::read_to_string(&abs).ok()?;
-    let (deps, reexport_hops) = resolved_shard_fields(&abs, &content, worktree, roots);
-    Some((
-        rel.to_string(),
-        storage::FileShard {
-            schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
-            signature,
-            deps,
-            reexport_hops,
-        },
-    ))
+    let fields = resolved_shard_fields(&abs, &content, worktree, roots);
+    Some((rel.to_string(), fields.into_shard(signature)))
 }
 
 /// The bounded set of files needing a forced shard rebuild this pass:
@@ -364,7 +386,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         // as non-UTF-8) never have imports to resolve; storing an empty-deps
         // shard for them (instead of `continue`-ing without one) records
         // their signature so they aren't re-scanned on every future pass.
-        let (deps, reexport_hops) = if matches!(
+        let fields = if matches!(
             crate::lang::detect_file_type(path),
             crate::types::FileType::Code(_)
         ) {
@@ -374,17 +396,9 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             };
             resolved_shard_fields(path, &content, worktree, &roots)
         } else {
-            (Vec::new(), Vec::new())
+            ShardFields::empty()
         };
-        upserts.push((
-            rel,
-            storage::FileShard {
-                schema_version: storage::FILE_SHARD_SCHEMA_VERSION,
-                signature,
-                deps,
-                reexport_hops,
-            },
-        ));
+        upserts.push((rel, fields.into_shard(signature)));
     }
 
     // A cut-short scan cannot distinguish "deleted" from "not yet reached",
@@ -395,7 +409,13 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         previously_known.difference(&seen).cloned().collect()
     };
 
-    let pending = storage::read_pending_rescan(&handle.db).unwrap_or_default();
+    // An uncertain shard depends on files other than its own bytes (a
+    // duplicate root, an unreadable initializer), so an unchanged signature
+    // proves nothing. Rescan every uncertain source each pass; the set is
+    // bounded by the number of such files, and a source leaves it only when
+    // its imports resolve.
+    let mut pending = storage::read_pending_rescan(&handle.db).unwrap_or_default();
+    pending.extend(storage::read_uncertain_sources(&handle.db).unwrap_or_default());
     let walk_status = if timed_out {
         WalkStatus::TimedOut
     } else {
@@ -460,14 +480,25 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
             files_scanned,
             files_changed: 0,
             timed_out,
+            uncertain_sources: 0,
         };
     }
+    let Ok(uncertain_sources) = storage::read_uncertain_sources(&handle.db).map(|s| s.len()) else {
+        return Coverage {
+            complete: false,
+            files_scanned,
+            files_changed,
+            timed_out,
+            uncertain_sources: 0,
+        };
+    };
 
     Coverage {
         complete: !timed_out && !failed,
         files_scanned,
         files_changed,
         timed_out,
+        uncertain_sources,
     }
 }
 
@@ -503,6 +534,20 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
     let mut checked = 0usize;
     let mut timed_out = Instant::now() >= deadline;
     let mut failed = false;
+    // Only a Python source can hold an unresolved import, and such an import
+    // can only hide an edge to a Python target.
+    let python_target = matches!(
+        crate::lang::detect_file_type(&target_abs),
+        crate::types::FileType::Code(crate::types::Lang::Python)
+    );
+    let uncertain_sources = match storage::read_uncertain_sources(&handle.db) {
+        Ok(sources) if python_target => sources.len(),
+        Ok(_) => 0,
+        Err(_) => {
+            failed = true;
+            0
+        }
+    };
     // Re-verification must resolve edges the same way reconcile stored them,
     // so a drifted consumer's absolute import is re-checked, not dropped.
     let roots = crate::read::imports::PyRoots::discover(&handle.worktree_root);
@@ -525,10 +570,17 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         let verified = if shard.signature == live_signature {
             true
         } else if let Ok(content) = std::fs::read_to_string(&candidate_abs) {
-            crate::read::imports::resolve_scoped_paths(&candidate_abs, &content, &roots)
+            let fields =
+                crate::read::imports::resolve_scoped_shard_fields(&candidate_abs, &content, &roots);
+            let proven = fields
+                .paths
                 .iter()
                 .filter_map(|p| p.strip_prefix(&handle.worktree_root).ok())
-                .any(|r| r.to_string_lossy() == target_rel)
+                .any(|r| r.to_string_lossy() == target_rel);
+            // A drifted source that is now uncertain cannot be dropped as a
+            // non-dependent with confidence.
+            failed |= !proven && fields.uncertain;
+            proven
         } else {
             failed = true;
             false
@@ -542,10 +594,11 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         target: target_abs,
         dependents,
         coverage: Coverage {
-            complete: !timed_out && !failed,
+            complete: !timed_out && !failed && uncertain_sources == 0,
             files_scanned: checked,
             files_changed: 0,
             timed_out,
+            uncertain_sources,
         },
     }
 }
@@ -1201,5 +1254,63 @@ mod tests {
             storage::read_pending_rescan(&handle.db).unwrap().is_empty(),
             "pending worklist must drain once the follow-up reconcile completes it"
         );
+    }
+
+    #[test]
+    fn uncertain_python_source_keeps_python_impact_partial_until_resolved() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        write_file(repo.path(), "lib.rs", "fn f() {}\n");
+        // A duplicate root makes `producer.ingest.rankings` ambiguous, so
+        // direct.py holds an unresolved import. surface.py still proves its
+        // edge through the package initializer's relative re-export.
+        write_file(
+            repo.path(),
+            "src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "uncertain")
+            .unwrap();
+        let refresh = reconcile(&handle, repo.path(), far_deadline());
+        assert!(refresh.complete, "the scan itself ran to completion");
+        assert_eq!(refresh.uncertain_sources, 1);
+
+        let rankings = Path::new("packages/producer/src/producer/ingest/rankings.py");
+        let surface = repo
+            .path()
+            .join("consumer/src/consumer/surface.py")
+            .canonicalize()
+            .unwrap();
+        let direct = repo
+            .path()
+            .join("consumer/src/consumer/direct.py")
+            .canonicalize()
+            .unwrap();
+
+        let partial = impact(&handle, rankings, far_deadline());
+        assert!(
+            canonicalized(&partial.dependents).contains(&surface),
+            "a proven edge must stay available during partial coverage"
+        );
+        assert!(
+            !partial.coverage.complete,
+            "an uncertain source can hide an edge"
+        );
+        assert_eq!(partial.coverage.uncertain_sources, 1);
+
+        // A Python import cannot hide an edge to a non-Python target.
+        let rust = impact(&handle, Path::new("lib.rs"), far_deadline());
+        assert!(rust.coverage.complete);
+
+        // Resolve the ambiguity without touching direct.py's bytes: the warm
+        // pass must re-examine the uncertain source, not trust its signature.
+        std::fs::remove_file(repo.path().join("src/producer/ingest/rankings.py")).unwrap();
+        let refresh = reconcile(&handle, repo.path(), far_deadline());
+        assert_eq!(refresh.uncertain_sources, 0);
+        let resolved = impact(&handle, rankings, far_deadline());
+        assert!(resolved.coverage.complete);
+        assert!(canonicalized(&resolved.dependents).contains(&direct));
     }
 }

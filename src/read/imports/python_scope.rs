@@ -13,8 +13,9 @@
 //! engines then refuse (`tilth_deps`) or degrade to partial (`fetch_dependencies`)
 //! instead of returning a confident but wrong edge.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
@@ -44,6 +45,13 @@ pub(crate) enum Uncertainty {
     /// A named re-export chain could not settle on one owner (duplicate
     /// owners, a blocked ambiguous hop, or a cycle) — see `OwnerResult::Blocked`.
     BlockedOwnership { module: String, name: String },
+    /// A package initializer on the re-export chain could not be read or
+    /// parsed, so the evidence is incomplete. This is not a missing export.
+    UnavailableOwner {
+        module: String,
+        name: String,
+        path: PathBuf,
+    },
 }
 
 /// Result of resolving one Python file's imports against a scope's roots.
@@ -73,14 +81,26 @@ impl PyResolution {
         self.edges.into_iter().map(|e| e.path).collect()
     }
 
-    /// `(forward edge paths, re-export chain hops)` — currently only
-    /// `reconcile`'s shard builder needs both.
-    pub(crate) fn into_paths_and_hops(self) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        (
-            self.edges.into_iter().map(|e| e.path).collect(),
-            self.reexport_hops,
-        )
+    /// The fields `reconcile`'s shard builder stores: forward edge paths,
+    /// re-export chain hops, and whether any import stayed unresolved. The
+    /// uncertainty flag keeps an incomplete edge set from being stored as a
+    /// complete one.
+    pub(crate) fn into_shard_fields(self) -> ScopedShardFields {
+        ScopedShardFields {
+            uncertain: !self.uncertain.is_empty(),
+            paths: self.edges.into_iter().map(|e| e.path).collect(),
+            hops: self.reexport_hops,
+        }
     }
+}
+
+/// What the persistent deps index stores for one file.
+#[derive(Default)]
+pub(crate) struct ScopedShardFields {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) hops: Vec<PathBuf>,
+    /// At least one import could not become a proven edge.
+    pub(crate) uncertain: bool,
 }
 
 /// Src-layout package roots discovered under one explicit scope.
@@ -95,15 +115,21 @@ pub(crate) struct PyRoots {
 impl PyRoots {
     /// Enumerate the package roots under `scope`. Directory listings honor the
     /// shared walker skip rules, so `.venv`, `node_modules`, and nested
-    /// checkouts never contribute a root.
+    /// checkouts never contribute a root. A candidate root whose canonical
+    /// path leaves the canonical scope (a symlink to another checkout) is
+    /// rejected, so scoped resolution never reads modules outside the
+    /// requested scope.
     pub(crate) fn discover(scope: &Path) -> Self {
+        let Ok(scope_canon) = scope.canonicalize() else {
+            return Self { roots: Vec::new() };
+        };
         let mut roots = Vec::new();
-        push_if_dir(&mut roots, scope.join("src"));
+        push_if_contained_dir(&mut roots, scope.join("src"), &scope_canon);
         for project in child_dirs(scope) {
-            push_if_dir(&mut roots, project.join("src"));
+            push_if_contained_dir(&mut roots, project.join("src"), &scope_canon);
         }
         for project in child_dirs(&scope.join("packages")) {
-            push_if_dir(&mut roots, project.join("src"));
+            push_if_contained_dir(&mut roots, project.join("src"), &scope_canon);
         }
         roots.sort();
         roots.dedup();
@@ -171,6 +197,9 @@ pub(crate) fn resolve_python_edges(
     collect_python_imports(tree.root_node(), content.as_bytes(), &mut raw);
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // One initializer cache per resolution pass: each `__init__.py` on a
+    // re-export chain is read and parsed once, not once per (name, hop).
+    let mut inits = InitCache::default();
     for imp in raw {
         if imp.module.is_empty() {
             continue;
@@ -208,7 +237,8 @@ pub(crate) fn resolve_python_edges(
         }
         for nm in &imp.names {
             let mut visited = HashSet::new();
-            let outcome = resolve_reexport_owner(&direct, &nm.original, roots, &mut visited);
+            let outcome =
+                resolve_reexport_owner(&direct, &nm.original, roots, &mut visited, &mut inits);
             res.reexport_hops
                 .extend(visited.iter().map(|(path, _)| path.clone()));
             match outcome {
@@ -227,6 +257,13 @@ pub(crate) fn resolve_python_edges(
                         name: nm.original.clone(),
                     });
                 }
+                OwnerResult::Unavailable(path) => {
+                    res.uncertain.push(Uncertainty::UnavailableOwner {
+                        module: imp.module.clone(),
+                        name: nm.original.clone(),
+                        path,
+                    });
+                }
                 OwnerResult::External | OwnerResult::NotFound => {}
             }
         }
@@ -239,12 +276,12 @@ pub(crate) fn resolve_python_edges(
 /// The ambiguous identity of a Python target, when its own dotted module name
 /// maps to more than one in-scope file (duplicate package roots). `None` means
 /// the identity is unique (or the target is not Python / not under a root) — the
-/// honest signal both engines key their ambiguity behavior on.
-pub(crate) fn target_ambiguity(target: &Path, scope: &Path) -> Option<AmbiguousTarget> {
+/// honest signal both engines key their ambiguity behavior on. Callers pass
+/// the `roots` they already discovered for the scope.
+pub(crate) fn target_ambiguity(target: &Path, roots: &PyRoots) -> Option<AmbiguousTarget> {
     if !matches!(detect_file_type(target), FileType::Code(Lang::Python)) {
         return None;
     }
-    let roots = PyRoots::discover(scope);
     let module = roots.module_of(target)?;
     let candidates = roots.candidates(&module);
     if candidates.len() > 1 {
@@ -264,6 +301,7 @@ fn parse_python(content: &str) -> Option<tree_sitter::Tree> {
 /// One import statement in raw form: the module source, the line it sits on,
 /// and — for `from module import ...` — the names it binds. Plain `import a.b`
 /// and wildcard `from a import *` carry no traceable names.
+#[derive(Clone)]
 struct RawImport {
     module: String,
     line: u32,
@@ -273,6 +311,7 @@ struct RawImport {
 /// One name bound by a `from` import. `local` is how the importing file refers
 /// to it (the alias when present); `original` is the name in the source module,
 /// which is the name the re-export chain is followed by.
+#[derive(Clone)]
 struct ImportedName {
     local: String,
     original: String,
@@ -354,8 +393,9 @@ fn imported_name(node: tree_sitter::Node, src: &[u8]) -> Option<ImportedName> {
     }
 }
 
-/// Whether a resolved path is a package initializer (`__init__.py`).
-fn is_init_py(path: &Path) -> bool {
+/// Whether a path is a Python package initializer (`__init__.py`). The one
+/// crate-private predicate for this check; the persistent deps index reuses it.
+pub(crate) fn is_init_py(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("__init__.py")
 }
 
@@ -398,19 +438,53 @@ enum OwnerResult {
     External,
     /// A cycle or an ambiguous owner was hit; no owner is fabricated.
     Blocked,
+    /// An initializer on the chain could not be read or parsed. The evidence
+    /// is incomplete, which is different from a name that is not re-exported.
+    Unavailable(PathBuf),
 }
 
-fn initializer_defines_name(init: &Path, name: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(init) else {
+/// One parsed package initializer: its source, syntax tree, and imports.
+struct ParsedInit {
+    content: String,
+    tree: tree_sitter::Tree,
+    imports: Vec<RawImport>,
+}
+
+/// Parsed initializers for one resolution pass. `None` records a read or
+/// parse failure so the failure is also reported once, not retried per hop.
+#[derive(Default)]
+struct InitCache {
+    files: HashMap<PathBuf, Option<Rc<ParsedInit>>>,
+}
+
+impl InitCache {
+    fn get(&mut self, init: &Path) -> Option<Rc<ParsedInit>> {
+        if let Some(cached) = self.files.get(init) {
+            return cached.clone();
+        }
+        let parsed = std::fs::read_to_string(init).ok().and_then(|content| {
+            let tree = parse_python(&content)?;
+            let mut imports = Vec::new();
+            collect_python_imports(tree.root_node(), content.as_bytes(), &mut imports);
+            Some(Rc::new(ParsedInit {
+                content,
+                tree,
+                imports,
+            }))
+        });
+        self.files.insert(init.to_path_buf(), parsed.clone());
+        parsed
+    }
+}
+
+fn initializer_defines_name(inits: &mut InitCache, init: &Path, name: &str) -> bool {
+    let Some(parsed) = inits.get(init) else {
         return false;
     };
-    let Some(tree) = parse_python(&content) else {
-        return false;
-    };
-    let root = tree.root_node();
+    let root = parsed.tree.root_node();
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
-        if python_node_defines_name(node, content.as_bytes(), name) {
+        if python_node_defines_name(node, parsed.content.as_bytes(), name) {
             return true;
         }
     }
@@ -460,46 +534,46 @@ fn python_node_defines_name(node: tree_sitter::Node, src: &[u8], name: &str) -> 
 /// modules, aliases, and parenthesized lists are all supported. A `(file, name)`
 /// visited set makes cycles terminate; two bindings of the same name to
 /// different files are ambiguous and resolve to no owner rather than by order.
+/// An initializer that cannot be read or parsed makes the chain `Unavailable`
+/// so callers do not mistake incomplete evidence for a missing export.
 fn resolve_reexport_owner(
     init: &Path,
     name: &str,
     roots: &PyRoots,
     visited: &mut HashSet<(PathBuf, String)>,
+    inits: &mut InitCache,
 ) -> OwnerResult {
     if !visited.insert((init.to_path_buf(), name.to_string())) {
         return OwnerResult::Blocked; // cycle: terminate without fabricating an owner
     }
-    let Ok(content) = std::fs::read_to_string(init) else {
-        return OwnerResult::NotFound;
+    let Some(parsed) = inits.get(init) else {
+        return OwnerResult::Unavailable(init.to_path_buf());
     };
     let Some(dir) = init.parent() else {
-        return OwnerResult::NotFound;
+        return OwnerResult::Unavailable(init.to_path_buf());
     };
-    let Some(tree) = parse_python(&content) else {
-        return OwnerResult::NotFound;
-    };
-    let mut raw = Vec::new();
-    collect_python_imports(tree.root_node(), content.as_bytes(), &mut raw);
 
     let mut owners: Vec<PathBuf> = Vec::new();
     let mut blocked = false;
     let mut external = false;
-    for imp in &raw {
+    let mut unavailable: Option<PathBuf> = None;
+    for imp in &parsed.imports {
         for nm in imp.names.iter().filter(|nm| nm.local == name) {
             match resolve_module_file(&imp.module, dir, roots) {
                 ModuleTarget::Ambiguous => blocked = true,
                 ModuleTarget::External => external = true,
                 ModuleTarget::File(target) => {
                     if is_init_py(&target) {
-                        match resolve_reexport_owner(&target, &nm.original, roots, visited) {
+                        match resolve_reexport_owner(&target, &nm.original, roots, visited, inits) {
                             OwnerResult::Owned(f) => owners.push(f),
                             OwnerResult::NotFound => {
-                                if initializer_defines_name(&target, &nm.original) {
+                                if initializer_defines_name(inits, &target, &nm.original) {
                                     owners.push(target);
                                 }
                             }
                             OwnerResult::External => external = true,
                             OwnerResult::Blocked => blocked = true,
+                            OwnerResult::Unavailable(path) => unavailable = Some(path),
                         }
                     } else {
                         owners.push(target); // leaf module defines the name
@@ -510,6 +584,10 @@ fn resolve_reexport_owner(
     }
     owners.sort();
     owners.dedup();
+    // Incomplete evidence is reported before any verdict on the owners.
+    if let Some(path) = unavailable {
+        return OwnerResult::Unavailable(path);
+    }
     // A duplicate owner or any blocked hop makes the identity unreliable: never
     // resolve by traversal order, and never fabricate an owner.
     if owners.len() > 1 || blocked || (external && !owners.is_empty()) {
@@ -547,8 +625,17 @@ fn module_from_rel(rel: &Path) -> Option<String> {
     Some(segments.join("."))
 }
 
-fn push_if_dir(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if candidate.is_dir() {
+/// Push `candidate` as a root only when it is a directory whose canonical
+/// path stays inside the canonical scope. The scope-form path is kept so
+/// resolved edges keep the caller's spelling.
+fn push_if_contained_dir(roots: &mut Vec<PathBuf>, candidate: PathBuf, scope_canon: &Path) {
+    if !candidate.is_dir() {
+        return;
+    }
+    let Ok(canon) = candidate.canonicalize() else {
+        return;
+    };
+    if canon.starts_with(scope_canon) {
         roots.push(candidate);
     }
 }
@@ -849,9 +936,10 @@ mod tests {
             .join("packages/producer/src/producer/ingest/__init__.py");
         let roots = PyRoots::discover(tmp.path());
         let mut visited = HashSet::new();
+        let mut inits = InitCache::default();
         // The resolver terminates and reports no fabricated owner.
         assert!(matches!(
-            resolve_reexport_owner(&init, "RankingEntry", &roots, &mut visited),
+            resolve_reexport_owner(&init, "RankingEntry", &roots, &mut visited, &mut inits),
             OwnerResult::Blocked
         ));
     }
@@ -921,7 +1009,8 @@ mod tests {
         let target = tmp
             .path()
             .join("packages/producer/src/producer/ingest/rankings.py");
-        let ambiguous = target_ambiguity(&target, tmp.path()).expect("should be ambiguous");
+        let roots = PyRoots::discover(tmp.path());
+        let ambiguous = target_ambiguity(&target, &roots).expect("should be ambiguous");
         assert_eq!(ambiguous.module, "producer.ingest.rankings");
         assert_eq!(ambiguous.candidates.len(), 2);
         assert!(ambiguous.candidates.iter().any(|c| c == &dup));
@@ -933,14 +1022,14 @@ mod tests {
         let target = tmp
             .path()
             .join("packages/producer/src/producer/ingest/rankings.py");
-        assert!(target_ambiguity(&target, tmp.path()).is_none());
+        assert!(target_ambiguity(&target, &PyRoots::discover(tmp.path())).is_none());
     }
 
     #[test]
     fn non_python_target_is_never_ambiguous() {
         let tmp = tempfile::tempdir().unwrap();
         let target = write(tmp.path(), "src/foo.ts", "export const x = 1;\n");
-        assert!(target_ambiguity(&target, tmp.path()).is_none());
+        assert!(target_ambiguity(&target, &PyRoots::discover(tmp.path())).is_none());
     }
 
     #[test]
@@ -1040,5 +1129,98 @@ mod tests {
         let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
         assert_eq!(res.edges.len(), 9);
         assert!(res.uncertain.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_src_outside_scope_is_never_a_root() {
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "src/secret/__init__.py", "TOKEN = 1\n");
+        let scope = tempfile::tempdir().unwrap();
+        fs::create_dir_all(scope.path().join("proj")).unwrap();
+        fs::create_dir_all(scope.path().join("packages/pkg")).unwrap();
+        for link in ["src", "proj/src", "packages/pkg/src"] {
+            std::os::unix::fs::symlink(outside.path().join("src"), scope.path().join(link))
+                .unwrap();
+        }
+        let consumer = write(scope.path(), "app.py", "import secret\n");
+
+        let roots = PyRoots::discover(scope.path());
+        assert!(roots.roots.is_empty(), "escaped roots: {:?}", roots.roots);
+        let res = resolve_python_edges(&consumer, "import secret\n", &roots);
+        assert!(res.edges.is_empty(), "scoped resolution left the scope");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_src_inside_scope_stays_a_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "real/lib/pkg/__init__.py", "");
+        std::os::unix::fs::symlink(tmp.path().join("real/lib"), tmp.path().join("src")).unwrap();
+        let roots = PyRoots::discover(tmp.path());
+        assert_eq!(roots.roots, vec![tmp.path().join("src")]);
+        assert_eq!(roots.candidates("pkg").len(), 1);
+    }
+
+    #[test]
+    fn unreadable_initializer_is_unavailable_not_a_missing_export() {
+        let tmp = producer_consumer();
+        write(
+            tmp.path(),
+            "packages/producer/src/producer/ingest/__init__.py",
+            "from .sub import RankingEntry\n",
+        );
+        // Invalid UTF-8 makes the nested initializer unreadable as text.
+        let sub = tmp
+            .path()
+            .join("packages/producer/src/producer/ingest/sub/__init__.py");
+        fs::create_dir_all(sub.parent().unwrap()).unwrap();
+        fs::write(&sub, [0xff, 0xfe, 0x00]).unwrap();
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/unavailable.py",
+            "from producer.ingest import RankingEntry\n",
+        );
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        // The proven direct edge stays; the owner is reported as unavailable.
+        assert_eq!(res.edges.len(), 1);
+        assert!(
+            matches!(
+                res.uncertain.as_slice(),
+                [Uncertainty::UnavailableOwner { module, name, path }]
+                    if module == "producer.ingest" && name == "RankingEntry" && path == &sub
+            ),
+            "expected one unavailable owner"
+        );
+    }
+
+    #[test]
+    fn name_absent_from_readable_initializer_is_not_uncertain() {
+        let tmp = producer_consumer();
+        let consumer = write(
+            tmp.path(),
+            "consumer/src/consumer/absent.py",
+            "from producer.ingest import NotExported\n",
+        );
+        let roots = PyRoots::discover(tmp.path());
+        let res = resolve_python_edges(&consumer, &fs::read_to_string(&consumer).unwrap(), &roots);
+        assert!(res.uncertain.is_empty());
+    }
+
+    #[test]
+    fn initializer_is_parsed_once_per_resolution_pass() {
+        let tmp = producer_consumer();
+        let init = tmp
+            .path()
+            .join("packages/producer/src/producer/ingest/__init__.py");
+        let mut inits = InitCache::default();
+        let first = inits.get(&init).expect("readable initializer");
+        // A later read of the same path returns the cached parse, even after
+        // the file changes on disk within the pass.
+        fs::write(&init, "").unwrap();
+        let second = inits.get(&init).expect("cached initializer");
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(second.imports.len(), 1);
     }
 }

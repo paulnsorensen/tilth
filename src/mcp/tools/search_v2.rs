@@ -649,7 +649,7 @@ fn unique_hit(
     cwd: &Path,
     glob: Option<&str>,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let (line, name, body, core_partial) = if resolved_as == "path" {
+    let (source_path, line, name, body, core_partial) = if resolved_as == "path" {
         let content = std::fs::read_to_string(target_path).map_err(|source| {
             crate::error::TilthError::IoError {
                 path: target_path.to_path_buf(),
@@ -658,10 +658,10 @@ fn unique_hit(
         })?;
         let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
         let core_partial = content.lines().count() > 60;
-        (None, None, body, core_partial)
+        (target_path.to_path_buf(), None, None, body, core_partial)
     } else {
-        let spec = format!("{}:{target_line}", target_path.display());
-        let (target, content, _) = crate::search::grok::resolve_with_source(&spec, cwd)?;
+        let (target, content, _) =
+            crate::search::grok::resolve_candidate_with_source(target_path, target_line, query)?;
         let (start, end) = (target.start_line, target.end_line);
         let body = content
             .lines()
@@ -669,20 +669,26 @@ fn unique_hit(
             .take((end - start + 1).min(60) as usize)
             .collect::<Vec<_>>()
             .join("\n");
-        (Some(start), Some(target.name), body, end - start + 1 > 60)
+        (
+            target.path,
+            Some(start),
+            Some(target.name),
+            body,
+            end - start + 1 > 60,
+        )
     };
     let target = Target {
-        path: display_rel(target_path, cwd),
+        path: display_rel(&source_path, cwd),
         line,
         name,
         scope: cwd.to_string_lossy().into(),
         glob: glob.map(str::to_string),
     };
-    if glob.is_some() && !target.allows(target_path, cwd) {
+    if glob.is_some() && !target.allows(&source_path, cwd) {
         return Ok((base_result(query, resolved_as, "no_match"), Vec::new()));
     }
     let mut result = base_result(query, resolved_as, "ok");
-    result["core"] = json!(redact_secret_text(target_path, body));
+    result["core"] = json!(redact_secret_text(&source_path, body));
     result["target"] = json!(target);
     if core_partial {
         mark_partial(&mut result);
@@ -725,6 +731,21 @@ mod tests {
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
         assert_eq!(result["core"], "fn root() {}");
+        assert_eq!(hints.len(), 5);
+    }
+
+    #[test]
+    fn unique_symbol_hit_recovers_from_stale_candidate_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.rs");
+        std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
+
+        let (result, hints) = unique_hit("root", "symbol", &path, 3, tmp.path(), None)
+            .expect("fresh symbol resolution must replace the stale candidate line");
+
+        assert_eq!(result["core"], "fn root() {}");
+        assert_eq!(result["target"]["line"], 1);
+        assert_eq!(result["target"]["name"], "root");
         assert_eq!(hints.len(), 5);
     }
 
@@ -1292,8 +1313,13 @@ mod tests {
         .expect_err("caller-selected kind must be rejected");
         assert!(err.contains("query and glob"), "unexpected error: {err}");
     }
-    #[test]
-    fn continuation_hints_round_trip_for_every_kind() {
+    /// Build the shared fixture: a git-init tempdir with `fixture.ts` (root,
+    /// `production_caller`, sibling), `helper.ts` (leaf), `fixture.test.ts`
+    /// (`test_root`), and `other.ts` (a same-named root whose caller must
+    /// never surface), then run the initial `root` query. Returns the
+    /// tempdir (kept alive for later calls) and the initial response with
+    /// its 5 hints.
+    fn continuation_fixture() -> (tempfile::TempDir, Value) {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1318,49 +1344,58 @@ mod tests {
         let initial = call(&json!({"cwd": cwd, "queries": [{"query": "root",
             "glob": "{fixture.ts,fixture.test.ts,helper.ts}"}]}))
         .unwrap();
+        (tmp, initial)
+    }
+
+    /// The identity each hint kind must surface when followed.
+    fn expected_identity_for_kind(kind: &str) -> &'static str {
+        match kind {
+            "fetch_callers" => "production_caller",
+            "fetch_callees" => "leaf",
+            "fetch_siblings" => "sibling",
+            "fetch_tests" => "test_root",
+            "fetch_dependencies" => "helper.ts",
+            _ => unreachable!(),
+        }
+    }
+
+    /// Flatten a followed result's identities: `dependency_impact` arrays for
+    /// `fetch_dependencies`, `items[].name`/`items[].path` otherwise.
+    fn identities_from_result(hint: &Value, result: &Value) -> Vec<String> {
+        if hint["kind"] == "fetch_dependencies" {
+            let impact = &result["dependency_impact"];
+            impact["imports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(impact["dependents"].as_array().unwrap())
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        } else {
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|item| [item.get("name"), item.get("path")])
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn hint_echo_round_trip_returns_expected_identity_for_every_kind() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
         let hints = initial["hints"].as_array().unwrap();
         assert_eq!(hints.len(), 5, "{initial}");
         for hint in hints {
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
-            let expected = match hint["kind"].as_str().unwrap() {
-                "fetch_callers" => "production_caller",
-                "fetch_callees" => "leaf",
-                "fetch_siblings" => "sibling",
-                "fetch_tests" => "test_root",
-                "fetch_dependencies" => "helper.ts",
-                _ => unreachable!(),
-            };
+            let expected = expected_identity_for_kind(hint["kind"].as_str().unwrap());
             assert_eq!(result["status"], "ok", "{followed}");
-            // The duplicate preview payload is gone; identities live only in the
-            // canonical `items`/`dependency_impact` arrays (#238).
-            assert!(
-                result.get("preview").is_none(),
-                "follow result must not carry preview: {followed}"
-            );
-            let identities: Vec<String> = if hint["kind"] == "fetch_dependencies" {
-                let impact = &result["dependency_impact"];
-                impact["imports"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .chain(impact["dependents"].as_array().unwrap())
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect()
-            } else {
-                let items = result["items"].as_array().unwrap();
-                assert_eq!(
-                    result["total_found"].as_u64().unwrap() as usize,
-                    items.len()
-                );
-                items
-                    .iter()
-                    .flat_map(|item| [item.get("name"), item.get("path")])
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            };
+            let identities = identities_from_result(hint, result);
             assert!(identities.iter().any(|s| s == expected), "{followed}");
             assert!(
                 !identities.iter().any(|s| s == "wrong_caller"),
@@ -1370,6 +1405,49 @@ mod tests {
         }
         assert_eq!(hints[0]["target"]["line"], 2);
         assert_eq!(hints[0]["target"]["path"], "fixture.ts");
+    }
+
+    #[test]
+    fn followed_result_has_canonical_payload_without_preview() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
+        for hint in hints {
+            let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
+            let result = &followed["results"][0];
+            // The duplicate preview payload is gone; identities live only in
+            // the canonical `items`/`dependency_impact` arrays (#238).
+            assert!(
+                result.get("preview").is_none(),
+                "follow result must not carry preview: {followed}"
+            );
+            if hint["kind"] == "fetch_dependencies" {
+                let impact = &result["dependency_impact"];
+                assert!(impact["imports"].is_array(), "{followed}");
+                assert!(impact["dependents"].is_array(), "{followed}");
+                let identities = identities_from_result(hint, result);
+                assert!(
+                    identities
+                        .iter()
+                        .any(|s| s == expected_identity_for_kind("fetch_dependencies")),
+                    "{followed}"
+                );
+            } else {
+                let items = result["items"].as_array().unwrap();
+                assert_eq!(
+                    result["total_found"].as_u64().unwrap() as usize,
+                    items.len(),
+                    "{followed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_query_and_follow_entries_preserve_order() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
         let mixed = call(&json!({"cwd": cwd, "queries": [
             {"query": "^absent$"}, {"follow": hints[0]}, {"query": "root"}
         ]}))
@@ -1377,6 +1455,13 @@ mod tests {
         assert_eq!(mixed["results"][0]["status"], "no_match");
         assert_eq!(mixed["results"][1]["resolved_as"], "fetch_callers");
         assert_eq!(mixed["results"][2]["status"], "ambiguous");
+    }
+
+    #[test]
+    fn malformed_follow_target_is_rejected() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
         for (key, value) in [
             ("name", json!("wrong")),
             ("line", json!(0)),

@@ -157,8 +157,14 @@ fn resolve_def_by_query(
         let top = definitions[0];
         let other_def_count = definitions.len() - 1;
         let start = def_start(top, query)?;
-        return enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count)
-            .map(Some);
+        return enrich_from_outline(
+            top.path.clone(),
+            start,
+            query.to_string(),
+            other_def_count,
+            false,
+        )
+        .map(Some);
     };
 
     let definitions = crate::search::symbol::all_definitions(query, scope, None)?;
@@ -179,8 +185,14 @@ fn resolve_def_by_query(
             // top match with the rest counted (preserves PR #61's labeled choice).
             let other_def_count = owner_matched.len() - 1;
             let start = def_start(top, query)?;
-            enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count)
-                .map(Some)
+            enrich_from_outline(
+                top.path.clone(),
+                start,
+                query.to_string(),
+                other_def_count,
+                false,
+            )
+            .map(Some)
         }
         None => {
             // Zero owner-match → never return a misleading body for an owner the
@@ -379,26 +391,40 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     Ok((content, lang))
 }
 
-/// Read the file at `path`, find the outline entry that starts at `start_line`
-/// (or the deepest entry enclosing it), and convert to `ResolvedTarget`.
+/// Read the file at `path`, find the outline entry that starts at `start_line`,
+/// and convert it to `ResolvedTarget`. Unique search candidates can enable
+/// `resolve_moved_name` to recover their exact name from the same fresh outline.
 fn enrich_from_outline(
     path: PathBuf,
     start_line: u32,
     name: String,
     other_def_count: usize,
+    resolve_moved_name: bool,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(&path)?;
     let entries = get_outline_entries(&content, lang);
-    let mut target = match find_by_start_line(&entries, start_line) {
-        Some(e) => target_from_entry(e, path, other_def_count),
-        None => {
-            // The outline tree caps its nesting at one container level, so a
-            // deeply-nested definition (e.g. `a::b::method`) is absent. Pull it
-            // straight from the AST before degrading to the enclosing entry.
-            match crate::lang::outline::entry_at_start_line(&content, lang, start_line) {
-                Some(e) => target_from_entry(&e, path, other_def_count),
+    let mut target = if let Some(entry) = find_by_start_line(&entries, start_line)
+        .filter(|entry| !resolve_moved_name || entry.name == name)
+    {
+        target_from_entry(entry, path, other_def_count)
+    } else {
+        // The outline tree caps its nesting at one container level, so a
+        // deeply-nested definition (e.g. `a::b::method`) can be absent.
+        let exact_entry = crate::lang::outline::entry_at_start_line(&content, lang, start_line)
+            .filter(|entry| !resolve_moved_name || entry.name == name);
+        if let Some(entry) = exact_entry {
+            target_from_entry(&entry, path, other_def_count)
+        } else {
+            let fresh_name = if resolve_moved_name {
+                crate::lang::outline::find_entry_by_name(&entries, &name)
+                    .and_then(|(line, _)| find_by_start_line(&entries, line))
+            } else {
+                None
+            };
+            match fresh_name {
+                Some(entry) => target_from_entry(entry, path, other_def_count),
                 None => match find_entry_at_line(&entries, start_line) {
-                    Some(e) => target_from_entry(e, path, other_def_count),
+                    Some(entry) => target_from_entry(entry, path, other_def_count),
                     None => ResolvedTarget {
                         name: name.clone(),
                         path,
@@ -420,6 +446,14 @@ fn enrich_from_outline(
         target.name = name;
     }
     Ok((target, content, lang))
+}
+
+pub(crate) fn resolve_candidate_with_source(
+    path: &Path,
+    start_line: u32,
+    name: &str,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    enrich_from_outline(path.to_path_buf(), start_line, name.to_string(), 0, true)
 }
 
 fn target_from_entry(
