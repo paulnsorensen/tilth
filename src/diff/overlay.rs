@@ -272,8 +272,13 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> 
 
     let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
 
+    let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
         symbol_changes,
+        unattributed_hunks,
+        unattributed_omitted,
         ..FileOverlay::empty(path.clone())
     }
 }
@@ -287,8 +292,13 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -
 
     let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
 
+    let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
         symbol_changes,
+        unattributed_hunks,
+        unattributed_omitted,
         ..FileOverlay::empty(path.clone())
     }
 }
@@ -545,14 +555,14 @@ fn attribute_hunks(hunks: &[Hunk], changes: &[SymbolChange]) -> Attribution {
                         .iter()
                         .position(|sr| sr.is_deleted && old_line >= sr.start && old_line <= sr.end)
                         .or_else(|| {
-                            sym_ranges.iter().position(|sr| {
-                                !sr.is_deleted && new_line >= sr.start && new_line <= sr.end
-                            })
-                        })
-                        .or_else(|| {
                             sym_ranges
                                 .iter()
                                 .position(|sr| !sr.is_deleted && new_line == sr.end + 1)
+                        })
+                        .or_else(|| {
+                            sym_ranges.iter().position(|sr| {
+                                !sr.is_deleted && new_line >= sr.start && new_line <= sr.end
+                            })
                         });
                     match owner {
                         Some(si) => buckets[si].push(DiffLine {

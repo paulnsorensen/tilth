@@ -730,6 +730,10 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
         overlay
             .attributed_hunks
             .retain(|(name, _)| all_matching.contains(name));
+        overlay.unattributed_hunks.retain(|hunk| {
+            hunk.iter()
+                .any(|l| l.content.to_lowercase().contains(&lower_term))
+        });
 
         true
     });
