@@ -118,3 +118,48 @@ edits, is deleted, or redirects a name to a different leaf.
   that rel from the pass without setting a `failed` flag, unlike the main
   walk loop. This is inherited unchanged from the pre-part-D forced-rescan
   code; a follow-up could align it with the walk's `failed` handling.
+
+## Part E — honest coverage for uncertain and unreadable sources (tilth-priority-review cure)
+
+The `/age` report `tilth-priority-review` found four places where the Python
+dependency engines dropped evidence and still claimed a complete answer. The
+contract is now the same in both engines: a proven edge is always reported, and
+anything that can hide an edge makes the answer partial.
+
+- **Roots never leave the scope.** `PyRoots::discover` canonicalizes the scope
+  and each candidate `src` root, and rejects a root whose canonical path is
+  outside the canonical scope. A symlinked `<scope>/src` that points at another
+  checkout is not a root. The scope-form path is kept for accepted roots, so
+  edge spelling does not change.
+- **`Uncertainty::UnavailableOwner`.** A package initializer on a re-export
+  chain that cannot be read or parsed gives `OwnerResult::Unavailable`, not
+  `NotFound`. Incomplete evidence is different from a name that is not
+  re-exported. `tilth_deps` maps it to `TilthError::UnavailableOwner` (exit 2).
+- **One initializer parse per pass.** `InitCache` lives for one
+  `resolve_python_edges` call. Each `__init__.py` is read and parsed once per
+  consumer file, including a failed read.
+- **Persistent index.** `FileShard.uncertain` (schema version 2) records that a
+  file has an unresolved import. The `uncertain_sources` redb table lists those
+  files. `reconcile` rescans every uncertain source on each pass, because its
+  resolution depends on other files (a duplicate root, an unreadable
+  initializer) and an unchanged signature proves nothing. `Coverage` carries
+  `uncertain_sources`. `reconcile` keeps `complete` about the scan, because it
+  does not know the queried target. `impact` reports `complete: false` for a
+  **Python** target while any uncertain source remains; a Python import cannot
+  hide an edge to a non-Python target. Old Python shards (version < 2) are
+  rescanned.
+- **Legacy reverse scan (`tilth_deps`).** `collect_import_dependents` uses the
+  shared parallel walker policy (`search::walker`), runs only for a Python
+  target, and stops at `IMPORT_SCAN_BUDGET` (3 s). It skips a consumer whose
+  canonical path leaves the canonical scope, because the shared walker follows
+  links. `DepsResult.reverse_coverage` records walker errors, unreadable
+  consumers, a timed-out scan, and consumers with an unresolved import that can
+  hide the target. The `(partial: …)` marker is in the header line, because
+  budget truncation never removes the header.
+- **Gotcha:** an `AmbiguousModule` consumer hides the target only when the
+  target is one of its candidates, and that state already fails the call with
+  `TilthError::AmbiguousModule`. In practice the uncertain consumers that
+  `tilth_deps` lists are blocked or unavailable re-export owners.
+- `target_ambiguity` takes the already-discovered `&PyRoots`, not a scope.
+  `is_init_py` in `read/imports/python_scope.rs` is the one `__init__.py`
+  predicate; the index wraps it for its `&str` keys.

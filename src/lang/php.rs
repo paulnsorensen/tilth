@@ -19,6 +19,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
     stdlib: StdlibRule::None,
+    scoped_imports: false,
     manifests: &["composer.json"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,

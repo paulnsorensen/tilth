@@ -43,6 +43,14 @@ pub enum TilthError {
     /// guessed — the specific name and its containing module are reported.
     #[error("blocked re-export ownership for `{name}` via {module}: cannot attribute to one file (duplicate owners, a cycle, or an ambiguous hop)")]
     BlockedOwnership { module: String, name: String },
+    /// A package initializer on a named re-export chain could not be read or
+    /// parsed. The evidence is incomplete; this is not a missing export.
+    #[error("unavailable re-export evidence for `{name}` via {module}: cannot read or parse {}", path.display())]
+    UnavailableOwner {
+        module: String,
+        name: String,
+        path: PathBuf,
+    },
 }
 
 impl From<crate::edit::mismatch::MismatchError> for TilthError {
@@ -66,7 +74,7 @@ impl TilthError {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::NotFound { .. } | Self::IoError { .. } => 2,
+            Self::NotFound { .. } | Self::IoError { .. } | Self::UnavailableOwner { .. } => 2,
             Self::InvalidQuery { .. }
             | Self::ParseError { .. }
             | Self::EditRejected(_)

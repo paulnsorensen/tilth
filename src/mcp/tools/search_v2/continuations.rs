@@ -361,7 +361,7 @@ fn dependencies_within(
     // An ambiguous target module identity (duplicate package roots) makes the
     // reverse edge set unreliable: report partial rather than a guessed
     // complete answer. This is not a timeout.
-    let ambiguous_identity = crate::read::imports::target_ambiguity(&full, cwd).is_some();
+    let ambiguous_identity = crate::read::imports::target_ambiguity(&full, &py_roots).is_some();
     // `own_uncertain` (computed above, alongside `imports`) covers Python's own
     // forward imports carrying unresolved uncertainty (ambiguous module,
     // blocked re-export ownership) that a plain path list silently drops;
@@ -377,7 +377,7 @@ fn dependencies_within(
     Ok(
         json!({"coverage": if complete { "complete" } else { "partial" },
         "index_state": state, "timed_out": refresh.timed_out || traversal.timed_out,
-        "refresh": {"complete": refresh.complete, "files_scanned": refresh.files_scanned, "files_changed": refresh.files_changed},
+        "refresh": {"complete": refresh.complete, "files_scanned": refresh.files_scanned, "files_changed": refresh.files_changed, "uncertain_sources": refresh.uncertain_sources},
         "traversal": {"complete": traversal.complete, "files_scanned": traversal.files_scanned},
         "imports": imports, "dependents": dependents,
         "total_imports": total_imports, "total_dependents": total_dependents}),
@@ -486,5 +486,54 @@ mod tests {
         assert_eq!(result["timed_out"], true);
         assert_eq!(result["refresh"]["complete"], false);
         assert_eq!(result["refresh"]["files_scanned"], 0);
+    }
+
+    #[test]
+    fn uncertain_python_consumer_keeps_dependency_coverage_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap()
+            .success());
+        for (rel, body) in [
+            (
+                "src/pkg/__init__.py",
+                "from .a import Name\nfrom .b import Name\n",
+            ),
+            ("src/pkg/a.py", "class Name:\n    pass\n"),
+            ("src/pkg/b.py", "class Name:\n    pass\n"),
+            ("src/app/__init__.py", ""),
+            ("src/app/direct.py", "from pkg.a import Name\n"),
+            ("src/app/surface.py", "from pkg import Name\n"),
+        ] {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let target = Target {
+            path: "src/pkg/a.py".into(),
+            line: Some(1),
+            name: Some("Name".into()),
+            scope: tmp.path().to_string_lossy().into(),
+            glob: None,
+        };
+        let result = dependencies_within(
+            &target,
+            tmp.path(),
+            "uncertain-consumer-test",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        // surface.py's owner is blocked, so it can be a hidden dependent.
+        assert_eq!(result["coverage"], "partial", "{result}");
+        assert_eq!(result["timed_out"], false, "{result}");
+        assert_eq!(result["refresh"]["uncertain_sources"], 1, "{result}");
+        let dependents = result["dependents"].as_array().unwrap();
+        assert!(
+            dependents.iter().any(|d| d == "src/app/direct.py"),
+            "the proven edge stays available: {result}"
+        );
     }
 }
