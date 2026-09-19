@@ -336,11 +336,30 @@ fn resolve_by_path_line(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(path)?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_entry_at_line(&entries, line).ok_or_else(|| TilthError::NotFound {
-        path: path.to_path_buf(),
-        suggestion: Some(format!("no definition encloses line {line}")),
-    })?;
-    let target = target_from_entry(entry, path.to_path_buf(), 0);
+    let enclosing = find_entry_at_line(&entries, line);
+    let python_definition_candidate = line
+        .checked_sub(1)
+        .and_then(|index| content.lines().nth(index as usize))
+        .and_then(|text| text.split_whitespace().next())
+        .is_some_and(|word| matches!(word, "def" | "class" | "async"));
+    let exact_python_definition = if lang == Lang::Python && python_definition_candidate {
+        crate::lang::outline::entry_at_start_line(&content, lang, line)
+            .filter(|entry| matches!(entry.kind, OutlineKind::Function | OutlineKind::Class))
+    } else {
+        None
+    };
+    let target = if let Some(entry) = enclosing.filter(|entry| entry.start_line == line) {
+        target_from_entry(entry, path.to_path_buf(), 0)
+    } else if let Some(entry) = exact_python_definition {
+        target_from_entry(&entry, path.to_path_buf(), 0)
+    } else if let Some(entry) = enclosing {
+        target_from_entry(entry, path.to_path_buf(), 0)
+    } else {
+        return Err(TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: Some(format!("no definition encloses line {line}")),
+        });
+    };
     Ok((target, content, lang))
 }
 
@@ -1304,6 +1323,40 @@ mod tests {
             "content should be the file body"
         );
         assert_eq!(lang, Lang::Rust);
+    }
+
+    #[test]
+    fn resolve_by_path_line_prefers_deepest_same_line_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(tmp.path(), "src/a.rs", "mod outer { fn inner() {} }\n");
+
+        let (target, _, _) = resolve_by_path_line(&path, 1).unwrap();
+        assert_eq!(target.name, "inner");
+        assert_eq!(target.kind, OutlineKind::Function);
+    }
+
+    #[test]
+    fn resolve_by_path_line_prefers_decorated_python_method_over_enclosing_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "class Handler:\n    @logged\n    async \\\n    def blocked(self) -> bool:\n        return True\n";
+        let path = write_fixture(tmp.path(), "producer.py", body);
+
+        let (target, _, lang) = resolve_by_path_line(&path, 3).unwrap();
+        assert_eq!(target.name, "blocked");
+        assert_eq!(target.kind, OutlineKind::Function);
+        assert_eq!(target.start_line, 3);
+        assert_eq!(lang, Lang::Python);
+    }
+
+    #[test]
+    fn resolve_by_path_line_keeps_import_inside_enclosing_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "def load():\n    import os\n    return os.getcwd()\n";
+        let path = write_fixture(tmp.path(), "loader.py", body);
+
+        let (target, _, _) = resolve_by_path_line(&path, 2).unwrap();
+        assert_eq!(target.name, "load");
+        assert_eq!(target.kind, OutlineKind::Function);
     }
 
     #[test]

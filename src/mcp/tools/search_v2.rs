@@ -932,11 +932,27 @@ mod tests {
     }
 
     #[test]
-    fn route_path_routes_non_code_file_to_text_search() {
-        let resp = single_query("Cargo.lock").expect("path query succeeds");
+    fn route_non_code_path_reports_bounded_content_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.json"), "{}\n").unwrap();
+        for index in 0..11 {
+            std::fs::write(
+                tmp.path().join(format!("reference-{index}.txt")),
+                "load notes.json\n",
+            )
+            .unwrap();
+        }
+
+        let resp = call(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "notes.json"}],
+        }))
+        .expect("path query succeeds");
         let result = &resp["results"][0];
         assert_eq!(result["resolved_as"], "path");
-        assert_eq!(result["status"], "ok");
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["completeness"], "partial");
+        assert!(result["total_found"].as_u64().unwrap() > 10);
     }
 
     #[test]
