@@ -649,7 +649,7 @@ fn unique_hit(
     cwd: &Path,
     glob: Option<&str>,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let (line, name, body, core_partial) = if resolved_as == "path" {
+    let (source_path, line, name, body, core_partial) = if resolved_as == "path" {
         let content = std::fs::read_to_string(target_path).map_err(|source| {
             crate::error::TilthError::IoError {
                 path: target_path.to_path_buf(),
@@ -658,10 +658,10 @@ fn unique_hit(
         })?;
         let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
         let core_partial = content.lines().count() > 60;
-        (None, None, body, core_partial)
+        (target_path.to_path_buf(), None, None, body, core_partial)
     } else {
-        let spec = format!("{}:{target_line}", target_path.display());
-        let (target, content, _) = crate::search::grok::resolve_with_source(&spec, cwd)?;
+        let (target, content, _) =
+            crate::search::grok::resolve_candidate_with_source(target_path, target_line, query)?;
         let (start, end) = (target.start_line, target.end_line);
         let body = content
             .lines()
@@ -669,20 +669,26 @@ fn unique_hit(
             .take((end - start + 1).min(60) as usize)
             .collect::<Vec<_>>()
             .join("\n");
-        (Some(start), Some(target.name), body, end - start + 1 > 60)
+        (
+            target.path,
+            Some(start),
+            Some(target.name),
+            body,
+            end - start + 1 > 60,
+        )
     };
     let target = Target {
-        path: display_rel(target_path, cwd),
+        path: display_rel(&source_path, cwd),
         line,
         name,
         scope: cwd.to_string_lossy().into(),
         glob: glob.map(str::to_string),
     };
-    if glob.is_some() && !target.allows(target_path, cwd) {
+    if glob.is_some() && !target.allows(&source_path, cwd) {
         return Ok((base_result(query, resolved_as, "no_match"), Vec::new()));
     }
     let mut result = base_result(query, resolved_as, "ok");
-    result["core"] = json!(redact_secret_text(target_path, body));
+    result["core"] = json!(redact_secret_text(&source_path, body));
     result["target"] = json!(target);
     if core_partial {
         mark_partial(&mut result);
@@ -725,6 +731,21 @@ mod tests {
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
         assert_eq!(result["core"], "fn root() {}");
+        assert_eq!(hints.len(), 5);
+    }
+
+    #[test]
+    fn unique_symbol_hit_recovers_from_stale_candidate_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.rs");
+        std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
+
+        let (result, hints) = unique_hit("root", "symbol", &path, 3, tmp.path(), None)
+            .expect("fresh symbol resolution must replace the stale candidate line");
+
+        assert_eq!(result["core"], "fn root() {}");
+        assert_eq!(result["target"]["line"], 1);
+        assert_eq!(result["target"]["name"], "root");
         assert_eq!(hints.len(), 5);
     }
 
