@@ -166,7 +166,8 @@
           ],
           "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
         }
-      }
+      },
+      "known_tilth_divergence": "Known Tilth divergence: the reexport line `pub use crate::inner::compute as reexported_compute;` starts with `pub use`, so it misses extract_import_source's `use ` branch and falls through to the generic last-whitespace-token fallback, which returns the alias `reexported_compute` rather than the reexported path `crate::inner::compute`."
     },
     {
       "id": "rust-unicode",
