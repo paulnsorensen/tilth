@@ -855,6 +855,67 @@ mod tests {
     }
 
     #[test]
+    fn deep_attributed_block_anchors_replace_only_the_method() {
+        let src = "pub mod a {\n    pub mod b {\n        #[inline]\n        pub fn method() {\n            1\n        }\n    }\n}\n";
+        let expected =
+            "pub mod a {\n    pub mod b {\n        #[cold]\n        pub fn method() { 2 }\n    }\n}\n";
+        for anchor in [
+            super::super::parser::BlockAnchor::Symbol("method".into()),
+            super::super::parser::BlockAnchor::Line(5),
+        ] {
+            let result = apply(
+                src,
+                &[Op::Block {
+                    anchor,
+                    mode: BlockMode::Swap,
+                    payload: vec![
+                        "        #[cold]".into(),
+                        "        pub fn method() { 2 }".into(),
+                    ],
+                }],
+            )
+            .unwrap();
+            assert_eq!(result.text, expected);
+        }
+    }
+
+    #[test]
+    fn exported_block_anchor_replaces_the_wrapper_and_declaration() {
+        let result = apply_ops(
+            std::path::Path::new("fixture.ts"),
+            "export default\nfunction run() { return 1; }\n",
+            &[Op::Block {
+                anchor: super::super::parser::BlockAnchor::Symbol("run".into()),
+                mode: BlockMode::Swap,
+                payload: vec![
+                    "export default".into(),
+                    "function run() { return 2; }".into(),
+                ],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            result.text,
+            "export default\nfunction run() { return 2; }\n"
+        );
+    }
+
+    #[test]
+    fn same_line_nested_declarations_keep_the_outer_tail_range() {
+        let result = apply_ops(
+            std::path::Path::new("fixture.js"),
+            "function run() { function run() {}\n    return 1;\n}\n",
+            &[Op::Block {
+                anchor: super::super::parser::BlockAnchor::Line(2),
+                mode: BlockMode::Swap,
+                payload: vec!["function run() { return 2; }".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.text, "function run() { return 2; }\n");
+    }
+
+    #[test]
     fn block_del_by_line_removes_span() {
         let src = "fn alpha() {\n    1\n}\n\nfn beta() {\n    2\n}\n";
         let r = apply(

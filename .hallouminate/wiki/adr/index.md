@@ -2,6 +2,7 @@
 
 <!-- HALLOUMINATE:INDEX-START -->
 - [python-scoped-import-deps](./python-scoped-import-deps.md) — ADR: scoped Python import dependencies (#197 part A)
+- [semantic-declaration-spans](./semantic-declaration-spans.md) — ADR: Semantic declaration spans
 - [tilth-diff-scope-ergonomics](./tilth-diff-scope-ergonomics.md) — ADRs — tilth_diff scope ergonomics (slug: tilth-diff-scope-ergonomics)
 - [tilth-grok-ergonomics](./tilth-grok-ergonomics.md) — ADR: tilth-grok-ergonomics — curd 2 inclusion and shape
 - [tilth-read-input-ergonomics](./tilth-read-input-ergonomics.md) — ADRs — tilth_read input ergonomics (slug: tilth-read-input-ergonomics)

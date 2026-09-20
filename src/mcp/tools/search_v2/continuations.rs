@@ -180,6 +180,7 @@ impl Follow {
             grok::resolve_with_source(&spec, cwd).map_err(|e| e.to_string())?;
         let mut partial = false;
         let mut items = Vec::new();
+        let target_span_start = target.span_start_line;
         match self.kind.as_str() {
             "fetch_siblings" => {
                 let entries = crate::lang::outline::get_outline_entries(&content, lang);
@@ -197,7 +198,7 @@ impl Follow {
                 let names = callees::extract_callee_names(
                     &content,
                     lang,
-                    Some((target.start_line, target.end_line)),
+                    Some((target_span_start, target.end_line)),
                 );
                 let resolved = callees::resolve_callees(&names, &full, &content, bloom);
                 // Unresolved names are not verified external calls.
@@ -260,7 +261,7 @@ impl Follow {
                         continue;
                     }
                     if caller.path == full
-                        && (target.start_line..=target.end_line).contains(&caller.line)
+                        && (target_span_start..=target.end_line).contains(&caller.line)
                     {
                         continue;
                     }

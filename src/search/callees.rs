@@ -11,7 +11,10 @@ use crate::types::{Lang, OutlineEntry};
 pub struct ResolvedCallee {
     pub name: String,
     pub file: PathBuf,
+    /// Canonical declaration anchor used for display and identity.
     pub start_line: u32,
+    /// Semantic ownership start used when slicing the callee source.
+    pub span_start_line: u32,
     pub end_line: u32,
     pub signature: Option<String>,
 }
@@ -146,6 +149,7 @@ fn resolve_from_entries(
                 name: entry.name.clone(),
                 file: file_path.to_path_buf(),
                 start_line: entry.start_line,
+                span_start_line: entry.span_start_line,
                 end_line: entry.end_line,
                 signature: entry.signature.clone(),
             });
@@ -159,6 +163,7 @@ fn resolve_from_entries(
                     name: child.name.clone(),
                     file: file_path.to_path_buf(),
                     start_line: child.start_line,
+                    span_start_line: child.span_start_line,
                     end_line: child.end_line,
                     signature: child.signature.clone(),
                 });
@@ -364,12 +369,11 @@ fn resolve_second_hop(
     let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
-
     let Ok(content) = std::fs::read_to_string(&parent.file) else {
         return Vec::new();
     };
 
-    let def_range = Some((parent.start_line, parent.end_line));
+    let def_range = Some((parent.span_start_line, parent.end_line));
     let nested_names = extract_callee_names(&content, lang, def_range);
 
     if nested_names.is_empty() {

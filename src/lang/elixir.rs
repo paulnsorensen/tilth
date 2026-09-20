@@ -53,7 +53,61 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         extract_name: extract_elixir_definition_name,
         weight: elixir_definition_weight,
     },
+    definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
+    canonical_anchor: crate::lang::spec::default_canonical_anchor,
+    attach_leading_adornment: crate::lang::elixir::attach_leading_adornment,
+    semantic_start: crate::lang::spec::default_semantic_start,
 };
+
+fn elixir_attribute_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "unary_operator" {
+        return None;
+    }
+    let operand = node.child_by_field_name("operand")?;
+    match operand.kind() {
+        "call" => operand
+            .child_by_field_name("target")
+            .map(|target| node_text_simple(target, lines, NodeTextMode::Full)),
+        "identifier" => Some(node_text_simple(operand, lines, NodeTextMode::Full)),
+        _ => None,
+    }
+}
+
+fn elixir_definition_keyword(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    node.child_by_field_name("target")
+        .map(|target| node_text_simple(target, lines, NodeTextMode::Full))
+}
+
+pub(crate) fn attach_leading_adornment(
+    adornment: tree_sitter::Node,
+    definition: Option<tree_sitter::Node>,
+    lines: &[&str],
+) -> bool {
+    let Some(attribute) = elixir_attribute_name(adornment, lines) else {
+        return false;
+    };
+    // `@dialyzer` configures module-level analysis and may name unrelated
+    // functions; it is never positional metadata for the following definition.
+    if attribute == "dialyzer" {
+        return false;
+    }
+    let Some(definition) = definition else {
+        return matches!(attribute.as_str(), "doc" | "spec" | "impl" | "deprecated");
+    };
+    let Some(keyword) = elixir_definition_keyword(definition, lines) else {
+        return false;
+    };
+    match attribute.as_str() {
+        "doc" | "spec" | "impl" | "deprecated" => matches!(
+            keyword.as_str(),
+            "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate"
+        ),
+        _ => false,
+    }
+}
 
 /// Check if a tree-sitter node is an Elixir definition.
 /// In Elixir all definitions are `call` nodes whose `target` identifier

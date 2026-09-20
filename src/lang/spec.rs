@@ -14,6 +14,109 @@ use crate::lang::treesitter::{
 };
 use crate::types::Lang;
 
+/// A language-specific predicate for a leading declaration adornment.
+///
+/// The definition is `None` while the shared outline walk is collecting a
+/// possible adornment and `Some` while it decides whether that adornment
+/// belongs to the following definition.
+pub(crate) type AttachLeadingAdornment =
+    fn(tree_sitter::Node, Option<tree_sitter::Node>, &[&str]) -> bool;
+
+/// Select the semantic ownership start for a declaration.
+///
+/// `canonical` is the language-owned declaration keyword/display anchor.
+/// Implementations may include compatible embedded annotations or modifiers
+/// when they are contiguous with that anchor.
+pub(crate) type SemanticStart = fn(tree_sitter::Node, tree_sitter::Node, &[&str]) -> u32;
+
+/// Shared default for declarations whose node starts at the canonical anchor.
+pub(crate) fn default_semantic_start(
+    node: tree_sitter::Node,
+    _canonical: tree_sitter::Node,
+    _lines: &[&str],
+) -> u32 {
+    node.start_position().row as u32 + 1
+}
+
+/// Select a declaration keyword token when a grammar exposes one.
+pub(crate) fn keyword_canonical_anchor<'tree>(
+    node: tree_sitter::Node<'tree>,
+    keywords: &[&str],
+) -> tree_sitter::Node<'tree> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if keywords.contains(&child.kind()) {
+            return child;
+        }
+    }
+    named_canonical_anchor(node)
+}
+
+/// Shared semantic-start implementation for declarations whose AST node embeds
+/// annotations, modifiers, or multiline type syntax before the canonical
+/// declaration token.
+///
+/// The declaration node bounds the valid header syntax. Blank lines and parsed
+/// comments split that header, so only the contiguous suffix ending at the
+/// canonical token belongs to the declaration.
+pub(crate) fn embedded_semantic_start(
+    node: tree_sitter::Node,
+    canonical: tree_sitter::Node,
+    lines: &[&str],
+) -> u32 {
+    let node_row = node.start_position().row;
+    let canonical_row = canonical.start_position().row;
+    if node_row >= canonical_row {
+        return canonical_row as u32 + 1;
+    }
+
+    let mut comment_rows = Vec::new();
+    collect_comment_rows(node, canonical.start_byte(), &mut comment_rows);
+
+    let mut first_row = canonical_row;
+    for row in (node_row..canonical_row).rev() {
+        if lines.get(row).is_none_or(|line| line.trim().is_empty())
+            || comment_rows
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&row))
+        {
+            break;
+        }
+        first_row = row;
+    }
+    first_row as u32 + 1
+}
+
+fn collect_comment_rows(
+    node: tree_sitter::Node,
+    before_byte: usize,
+    rows: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= before_byte {
+            break;
+        }
+        if child.kind().contains("comment") {
+            rows.push((child.start_position().row, child.end_position().row));
+        } else {
+            collect_comment_rows(child, before_byte, rows);
+        }
+    }
+}
+
+/// Recognise one of a language's AST adornment node kinds.
+pub(crate) fn adornment_kind(node: tree_sitter::Node, kinds: &[&str]) -> bool {
+    kinds.contains(&node.kind())
+}
+
+/// Select the canonical declaration anchor for a definition node.
+///
+/// The semantic span may begin at an annotation/attribute/wrapper, but the
+/// canonical anchor remains the declaration's named child (or the node itself
+/// for grammars without a named declaration child).
+pub(crate) type CanonicalAnchor = fn(tree_sitter::Node) -> tree_sitter::Node;
+
 /// All per-language data and behavior in one record. Read via `spec(lang)`.
 pub(crate) struct LangSpec {
     /// Human-readable language name (`lang_display_name`).
@@ -31,24 +134,49 @@ pub(crate) struct LangSpec {
     pub sibling_query: Option<&'static str>,
     /// How to recognise a stdlib import for this language (`is_stdlib`).
     pub stdlib: StdlibRule,
-    /// Whether this language resolves absolute in-scope imports through a
-    /// scoped forward/reverse resolver (`analyze_deps` forward resolution,
-    /// reverse import-dependent scan, and the schema-v2 rescan gate).
-    /// `true` only for Python today.
+    /// Whether imports are resolved through scoped module roots.
     pub scoped_imports: bool,
-    /// Build-manifest filenames contributed by this language (`package_root`).
+    /// Manifest filenames used for dependency discovery.
     pub manifests: &'static [&'static str],
-    /// Definition node kinds for AST definition detection (`DEFINITION_KINDS`).
+    /// Tree-sitter node kinds that represent definitions.
     pub definition_kinds: &'static [&'static str],
-    /// Whether `'` denotes a lifetime tick rather than a char delimiter
-    /// (`Lang::has_lifetimes`).
+    /// Whether this language's signatures use lifetime tick stripping.
     pub has_lifetimes: bool,
-    /// Coarse comment-syntax family for cognitive-load stripping (`StripLang`).
+    /// Comment/log stripping family.
     pub strip_family: Option<StripFamily>,
-    /// Go-only: extract the method receiver name from file content.
     pub extract_receiver: Option<fn(&str, &tree_sitter::Language) -> Option<String>>,
-    /// Definition-name extraction + weight (Elixir overrides the defaults).
+    /// Definition-name extraction + semantic weight (Elixir overrides the defaults).
     pub definitions: DefinitionOps,
+    /// Transparent definition wrapper node kinds.
+    pub definition_wrappers: &'static [&'static str],
+    /// Canonical declaration anchor policy for this language.
+    pub canonical_anchor: CanonicalAnchor,
+    /// Predicate for contiguous leading declaration adornments.
+    pub attach_leading_adornment: AttachLeadingAdornment,
+    /// Language-owned semantic ownership start for embedded adornments.
+    pub semantic_start: SemanticStart,
+}
+
+/// Shared default for declarations whose node starts at the canonical anchor.
+pub(crate) fn default_canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
+    node
+}
+
+/// Shared policy for annotation-bearing declaration nodes with a `name` field.
+pub(crate) fn named_canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
+    node.child_by_field_name("name").unwrap_or(node)
+}
+
+/// Shared default for languages without transparent wrappers or leading
+/// declaration adornments.
+pub(crate) const DEFAULT_DEFINITION_WRAPPERS: &[&str] = &[];
+
+pub(crate) fn default_attach_leading_adornment(
+    _adornment: tree_sitter::Node,
+    _definition: Option<tree_sitter::Node>,
+    _lines: &[&str],
+) -> bool {
+    false
 }
 
 /// How an import source is recognised as standard-library (and thus noise that

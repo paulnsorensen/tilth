@@ -1,15 +1,15 @@
 //! Resolve a [`BlockAnchor`] to a concrete line span, wiring to tilth's
-//! tree-sitter outline. The `#symbol` variant reuses the same resolution the
-//! `#symbol` read selector uses (`get_outline_entries` + first name match); a
-//! line anchor resolves to the outline block that begins on that line, else the
-//! innermost outline block containing it.
+//! tree-sitter outline. The `#symbol` variant resolves the deepest
+//! callable/type/container entry from one parsed tree; a line anchor resolves
+//! to the outline block that begins on that line, else the innermost outline
+//! block containing it.
 
 #![allow(dead_code)]
 
 use std::path::Path;
 
 use super::parser::BlockAnchor;
-use crate::lang::outline::{find_entry_by_name, get_outline_entries};
+use crate::lang::outline::get_deep_outline_entries;
 use crate::types::{FileType, OutlineEntry};
 
 /// A resolved 1-based inclusive line span.
@@ -23,10 +23,10 @@ pub struct BlockSpan {
 /// `path`). Returns `None` for an unknown language, an out-of-range or blank
 /// line, or a symbol/line that resolves to no block.
 pub fn resolve_block(path: &Path, text: &str, anchor: &BlockAnchor) -> Option<BlockSpan> {
-    resolve_block_in(&outline_for(path, text)?, anchor)
+    outline_for(path, text).and_then(|entries| resolve_block_in(&entries, anchor))
 }
 
-/// Outline entries for `text` under the language inferred from `path`, or
+/// Deep outline entries for `text` under the language inferred from `path`, or
 /// `None` for a non-code file. Parsing the whole file is the expensive step, so
 /// callers resolving several anchors should compute this once and reuse it via
 /// [`resolve_block_in`].
@@ -34,19 +34,34 @@ pub fn outline_for(path: &Path, text: &str) -> Option<Vec<OutlineEntry>> {
     let FileType::Code(lang) = crate::lang::detect_file_type(path) else {
         return None;
     };
-    Some(get_outline_entries(text, lang))
+    Some(get_deep_outline_entries(text, lang))
 }
 
 /// Resolve `anchor` against pre-computed outline `entries`.
 pub fn resolve_block_in(entries: &[OutlineEntry], anchor: &BlockAnchor) -> Option<BlockSpan> {
     match anchor {
         BlockAnchor::Symbol(name) => {
-            find_entry_by_name(entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
+            find_block_entry_by_name(entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
         }
         BlockAnchor::Line(line) => {
             resolve_line(entries, *line).map(|(s, e)| BlockSpan { start: s, end: e })
         }
     }
+}
+
+fn find_block_entry_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
+    for entry in entries {
+        if !crate::lang::outline::is_path_line_entry_kind(entry.kind) {
+            continue;
+        }
+        if let Some(found) = find_block_entry_by_name(&entry.children, name) {
+            return Some(found);
+        }
+        if entry.name == name {
+            return Some((entry.span_start_line, entry.end_line));
+        }
+    }
+    None
 }
 
 /// Resolve a line anchor: prefer a block that *begins* on `line` (oh-my-pi's
@@ -60,12 +75,15 @@ fn resolve_line(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
 
 fn begins_on(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
     for e in entries {
-        // Prefer the deepest child that also begins on the line.
+        if !crate::lang::outline::is_path_line_entry_kind(e.kind) {
+            continue;
+        }
+        // Prefer the deepest child that also begins on the canonical line.
         if let Some(hit) = begins_on(&e.children, line) {
             return Some(hit);
         }
         if e.start_line == line {
-            return Some((e.start_line, e.end_line));
+            return Some((e.span_start_line, e.end_line));
         }
     }
     None
@@ -73,12 +91,15 @@ fn begins_on(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
 
 fn innermost_containing(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
     for e in entries {
-        if line >= e.start_line && line <= e.end_line {
+        if !crate::lang::outline::is_path_line_entry_kind(e.kind) {
+            continue;
+        }
+        if line >= e.span_start_line && line <= e.end_line {
             // A child span is strictly inside, so prefer it if it also contains.
             if let Some(hit) = innermost_containing(&e.children, line) {
                 return Some(hit);
             }
-            return Some((e.start_line, e.end_line));
+            return Some((e.span_start_line, e.end_line));
         }
     }
     None
@@ -114,8 +135,8 @@ fn beta() {
             resolve_block(&path, SRC, &BlockAnchor::Symbol("beta".into())).expect("beta resolves");
         // The `#symbol` read selector resolves via the same outline entry, so
         // resolve_block must produce the identical (start,end).
-        let entries = get_outline_entries(SRC, crate::types::Lang::Rust);
-        let expected = find_entry_by_name(&entries, "beta").expect("beta in outline");
+        let entries = get_deep_outline_entries(SRC, crate::types::Lang::Rust);
+        let expected = find_block_entry_by_name(&entries, "beta").expect("beta in outline");
         assert_eq!((span.start, span.end), expected);
         // And the span actually covers beta's opener line (line 6).
         assert_eq!(span.start, 6);
@@ -149,5 +170,41 @@ fn beta() {
     fn non_code_file_yields_none() {
         let path = PathBuf::from("data.bin.unknownext");
         assert!(resolve_block(&path, SRC, &BlockAnchor::Line(1)).is_none());
+    }
+
+    #[test]
+    fn rust_attribute_line_resolves_semantic_block_start() {
+        let path = rs_path();
+        let source = "#[inline]\nfn alpha() {\n    let value = 1;\n}\n";
+
+        let line_span = resolve_block(&path, source, &BlockAnchor::Line(1))
+            .expect("attribute line should resolve to alpha");
+        assert_eq!((line_span.start, line_span.end), (1, 4));
+
+        let symbol_span = resolve_block(&path, source, &BlockAnchor::Symbol("alpha".into()))
+            .expect("alpha symbol should resolve");
+        assert_eq!((symbol_span.start, symbol_span.end), (1, 4));
+    }
+    #[test]
+    fn nested_attributed_method_uses_deep_semantic_span() {
+        let path = rs_path();
+        let source = "\
+mod a {
+    mod b {
+        #[inline]
+        fn method() {
+            let value = 1;
+        }
+    }
+}
+";
+
+        let line_span = resolve_block(&path, source, &BlockAnchor::Line(3))
+            .expect("attribute line should resolve to nested method");
+        assert_eq!((line_span.start, line_span.end), (3, 6));
+
+        let symbol_span = resolve_block(&path, source, &BlockAnchor::Symbol("method".into()))
+            .expect("nested method symbol should resolve");
+        assert_eq!((symbol_span.start, symbol_span.end), (3, 6));
     }
 }

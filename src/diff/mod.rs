@@ -55,6 +55,14 @@ pub struct DiffLine {
     pub content: String,
 }
 
+#[derive(Debug)]
+pub struct AttributedDiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     Context,
@@ -78,16 +86,43 @@ pub struct SymbolIdentity {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct SymbolAttributionKey {
+    pub identity: SymbolIdentity,
+    pub line: u32,
+    pub old_span: Option<(u32, u32)>,
+    pub new_span: Option<(u32, u32)>,
+}
+
 #[derive(Debug)]
 pub struct SymbolChange {
+    pub identity: SymbolIdentity,
     pub name: String,
     pub kind: OutlineKind,
     pub change: ChangeType,
     pub match_confidence: MatchConfidence,
+    /// Canonical declaration line used for display.
     pub line: u32,
+    /// Semantic ownership start used for hunk containment.
+    pub span_start_line: u32,
+    /// Old-side semantic ownership range, when the symbol existed before.
+    pub old_span: Option<(u32, u32)>,
+    /// New-side semantic ownership range, when the symbol exists after.
+    pub new_span: Option<(u32, u32)>,
     pub old_sig: Option<String>,
     pub new_sig: Option<String>,
     pub size_delta: Option<(u32, u32)>,
+}
+
+impl SymbolChange {
+    pub(crate) fn attribution_key(&self) -> SymbolAttributionKey {
+        SymbolAttributionKey {
+            identity: self.identity.clone(),
+            line: self.line,
+            old_span: self.old_span,
+            new_span: self.new_span,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +148,7 @@ pub enum MatchConfidence {
 pub struct FileOverlay {
     pub path: PathBuf,
     pub symbol_changes: Vec<SymbolChange>,
-    pub attributed_hunks: Vec<(String, Vec<DiffLine>)>,
+    pub attributed_hunks: Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)>,
 }
 
 #[derive(Debug)]
@@ -657,26 +692,26 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
 
     overlays.retain_mut(|overlay| {
         // Keep symbol changes that have matching diff lines.
-        let matching_symbols: HashSet<String> = overlay
+        let matching_symbols: HashSet<SymbolAttributionKey> = overlay
             .attributed_hunks
             .iter()
             .filter(|(_, lines)| {
                 lines
                     .iter()
-                    .any(|l| l.content.to_lowercase().contains(&lower_term))
+                    .any(|line| line.content.to_lowercase().contains(&lower_term))
             })
-            .map(|(name, _)| name.clone())
+            .map(|(key, _)| key.clone())
             .collect();
 
         // Also match on symbol names themselves.
-        let matching_names: HashSet<String> = overlay
+        let matching_names: HashSet<SymbolAttributionKey> = overlay
             .symbol_changes
             .iter()
-            .filter(|c| c.name.to_lowercase().contains(&lower_term))
-            .map(|c| c.name.clone())
+            .filter(|change| change.name.to_lowercase().contains(&lower_term))
+            .map(SymbolChange::attribution_key)
             .collect();
 
-        let all_matching: HashSet<String> =
+        let all_matching: HashSet<SymbolAttributionKey> =
             matching_symbols.union(&matching_names).cloned().collect();
 
         if all_matching.is_empty() {
@@ -685,10 +720,10 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
 
         overlay
             .symbol_changes
-            .retain(|c| all_matching.contains(&c.name));
+            .retain(|change| all_matching.contains(&change.attribution_key()));
         overlay
             .attributed_hunks
-            .retain(|(name, _)| all_matching.contains(name));
+            .retain(|(key, _)| all_matching.contains(key));
 
         true
     });

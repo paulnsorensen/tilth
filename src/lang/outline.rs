@@ -6,6 +6,13 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
     crate::lang::spec::spec(lang).grammar.map(Into::into)
 }
 
+pub(crate) fn canonical_start_line(node: tree_sitter::Node, lang: Lang) -> u32 {
+    (crate::lang::spec::spec(lang).canonical_anchor)(node)
+        .start_position()
+        .row as u32
+        + 1
+}
+
 /// Parse markdown content into a tree-sitter block tree.
 ///
 /// Returns `None` if the parser fails to set the language (should not happen
@@ -80,16 +87,87 @@ pub(crate) fn walk_top_level(
     lines: &[&str],
     lang: Lang,
 ) -> Vec<OutlineEntry> {
-    let mut entries = Vec::new();
     let mut cursor = root.walk();
+    collect_sibling_entries(root.children(&mut cursor), lines, lang, 0)
+}
 
-    for child in root.children(&mut cursor) {
-        if let Some(entry) = node_to_entry(child, lines, lang, 0) {
+/// Convert a sibling sequence into entries while associating only contiguous,
+/// language-approved leading adornments with the following declaration.
+fn collect_sibling_entries<'tree>(
+    children: impl Iterator<Item = tree_sitter::Node<'tree>>,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+) -> Vec<OutlineEntry> {
+    let policy = crate::lang::spec::spec(lang).attach_leading_adornment;
+    let mut entries = Vec::new();
+    let mut pending = Vec::new();
+
+    for child in children {
+        if let Some(mut entry) = node_to_entry(child, lines, lang, depth) {
+            let attach_pending = pending.last().is_some_and(|last| contiguous(*last, child))
+                && pending
+                    .iter()
+                    .all(|adornment| policy(*adornment, Some(child), lines));
+            if attach_pending {
+                entry.span_start_line = pending[0].start_position().row as u32 + 1;
+            }
+            pending.clear();
             entries.push(entry);
+        } else if policy(child, None, lines) {
+            if pending
+                .last()
+                .is_some_and(|previous| !contiguous(*previous, child))
+            {
+                pending.clear();
+            }
+            pending.push(child);
+        } else {
+            pending.clear();
         }
     }
 
     entries
+}
+
+fn contiguous(previous: tree_sitter::Node, next: tree_sitter::Node) -> bool {
+    previous.end_position().row + 1 == next.start_position().row
+}
+
+fn wrapper_span_start_line(
+    wrapper: tree_sitter::Node,
+    inner: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> u32 {
+    let policy = crate::lang::spec::spec(lang).attach_leading_adornment;
+    let mut pending = Vec::new();
+    let mut cursor = wrapper.walk();
+    for child in wrapper.children(&mut cursor) {
+        if child.id() == inner.id() {
+            let attached = pending.last().is_some_and(|last| contiguous(*last, child))
+                && pending
+                    .iter()
+                    .all(|adornment| policy(*adornment, Some(inner), lines));
+            return if attached {
+                pending[0].start_position().row as u32 + 1
+            } else {
+                inner.start_position().row as u32 + 1
+            };
+        }
+        if policy(child, None, lines) {
+            if pending
+                .last()
+                .is_some_and(|previous| !contiguous(*previous, child))
+            {
+                pending.clear();
+            }
+            pending.push(child);
+        } else {
+            pending.clear();
+        }
+    }
+    inner.start_position().row as u32 + 1
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
@@ -100,7 +178,17 @@ fn node_to_entry(
     depth: usize,
 ) -> Option<OutlineEntry> {
     let kind_str = node.kind();
-    let start_line = node.start_position().row as u32 + 1;
+    let spec = crate::lang::spec::spec(lang);
+    let canonical = (spec.canonical_anchor)(node);
+    let span_start_line = (spec.semantic_start)(node, canonical, lines);
+    if spec.definition_wrappers.contains(&kind_str) {
+        let inner = node.child_by_field_name("definition")?;
+        let mut entry = node_to_entry(inner, lines, lang, depth)?;
+        entry.span_start_line = wrapper_span_start_line(node, inner, lines, lang);
+        entry.end_line = entry.end_line.max(node.end_position().row as u32 + 1);
+        return Some(entry);
+    }
+    let start_line = canonical.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
 
     let (kind, name, signature) = match kind_str {
@@ -124,7 +212,7 @@ fn node_to_entry(
                         "<anonymous>".into()
                     }
                 });
-            let sig = extract_signature(node, lines);
+            let sig = extract_signature(start_line, lines);
             (OutlineKind::Function, name, Some(sig))
         }
 
@@ -199,7 +287,7 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines)
                 .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| "<property>".into());
-            let sig = extract_signature(node, lines);
+            let sig = extract_signature(start_line, lines);
             (OutlineKind::Property, name, Some(sig))
         }
 
@@ -228,9 +316,10 @@ fn node_to_entry(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if let Some(mut inner) = node_to_entry(child, lines, lang, depth) {
-                    // Extend the entry's range to cover the `export` keyword
-                    // so the outline byte range still points at the statement.
-                    inner.start_line = start_line;
+                    // `export` is an ownership adornment; keep the inner
+                    // declaration's canonical anchor and extend its span.
+                    inner.span_start_line = inner.span_start_line.min(span_start_line);
+                    inner.end_line = inner.end_line.max(node.end_position().row as u32 + 1);
                     return Some(inner);
                 }
             }
@@ -247,6 +336,7 @@ fn node_to_entry(
         // Module declarations
         "mod_item"
         | "module"
+        | "internal_module"
         | "namespace_declaration"
         | "namespace_definition"
         | "file_scoped_namespace_declaration" => {
@@ -293,7 +383,10 @@ fn node_to_entry(
     // Collect children for classes, impls, modules, traits/interfaces
     let is_namespace = matches!(
         kind_str,
-        "namespace_declaration" | "namespace_definition" | "file_scoped_namespace_declaration"
+        "internal_module"
+            | "namespace_declaration"
+            | "namespace_definition"
+            | "file_scoped_namespace_declaration"
     );
     let children = if matches!(
         kind,
@@ -315,11 +408,19 @@ fn node_to_entry(
         kind,
         name,
         start_line,
+        span_start_line,
         end_line,
         signature,
         children,
         doc,
     })
+}
+
+fn is_transparent_declaration_wrapper(node: tree_sitter::Node, lang: Lang) -> bool {
+    node.kind() == "export_statement"
+        || crate::lang::spec::spec(lang)
+            .definition_wrappers
+            .contains(&node.kind())
 }
 
 /// Canonical outline name for a single container node, with no child recursion.
@@ -331,7 +432,21 @@ pub(crate) fn container_entry_name(
     lines: &[&str],
     lang: Lang,
 ) -> Option<String> {
-    node_to_entry(node, lines, lang, 1).map(|e| e.name)
+    if is_transparent_declaration_wrapper(node, lang) {
+        return None;
+    }
+    node_to_entry(node, lines, lang, 1)
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                OutlineKind::Class
+                    | OutlineKind::Struct
+                    | OutlineKind::Interface
+                    | OutlineKind::Module
+                    | OutlineKind::Enum
+            )
+        })
+        .map(|entry| entry.name)
 }
 
 /// Collect child entries from a class/struct/impl body.
@@ -341,30 +456,23 @@ fn collect_children(
     lang: Lang,
     depth: usize,
 ) -> Vec<OutlineEntry> {
-    let mut children = Vec::new();
     let mut cursor = node.walk();
 
-    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
+    // Look for a body node first (C# uses `declaration_list` instead of
+    // `*_body`/`*_block`).
     let body = node.children(&mut cursor).find(|c| {
         let k = c.kind();
         k.contains("body") || k.contains("block") || k == "declaration_list"
     });
 
     let parent = body.unwrap_or(node);
-    let mut cursor2 = parent.walk();
-
-    for child in parent.children(&mut cursor2) {
-        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-            children.push(entry);
-        }
-    }
-
-    children
+    let mut cursor = parent.walk();
+    collect_sibling_entries(parent.children(&mut cursor), lines, lang, depth)
 }
 
-/// Extract the first line as a function signature (name + params + return type).
-fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let start_row = node.start_position().row;
+/// Extract the canonical declaration line as a signature.
+fn extract_signature(start_line: u32, lines: &[&str]) -> String {
+    let start_row = start_line.saturating_sub(1) as usize;
     if start_row < lines.len() {
         let line = lines[start_row].trim();
         // Truncate at opening brace
@@ -520,7 +628,7 @@ fn elixir_call_to_entry(
         }
         kw if ELIXIR_DEF_KEYWORDS.contains(&kw) => {
             let name = elixir_func_name(node, lines)?;
-            let sig = extract_signature(node, lines);
+            let sig = extract_signature(start_line, lines);
             (OutlineKind::Function, name, Some(sig))
         }
         "defstruct" | "defexception" => (OutlineKind::Struct, keyword.clone(), None),
@@ -553,6 +661,7 @@ fn elixir_call_to_entry(
         kind,
         name,
         start_line,
+        span_start_line: start_line,
         end_line,
         signature,
         children,
@@ -578,6 +687,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 kind: OutlineKind::TypeAlias,
                 name,
                 start_line,
+                span_start_line: start_line,
                 end_line,
                 signature: Some(sig),
                 children: Vec::new(),
@@ -591,6 +701,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 kind: OutlineKind::Function,
                 name,
                 start_line,
+                span_start_line: start_line,
                 end_line,
                 signature: Some(sig),
                 children: Vec::new(),
@@ -696,22 +807,15 @@ fn elixir_collect_children(
     lang: Lang,
     depth: usize,
 ) -> Vec<OutlineEntry> {
-    let mut children = Vec::new();
     let mut cursor = node.walk();
 
-    // Find the do_block child
+    // Find the do_block child.
     let Some(do_block) = node.children(&mut cursor).find(|c| c.kind() == "do_block") else {
-        return children;
+        return Vec::new();
     };
 
-    let mut cursor2 = do_block.walk();
-    for child in do_block.children(&mut cursor2) {
-        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-            children.push(entry);
-        }
-    }
-
-    children
+    let mut cursor = do_block.walk();
+    collect_sibling_entries(do_block.children(&mut cursor), lines, lang, depth)
 }
 
 /// Extract @doc or @moduledoc text from the previous sibling of an Elixir definition.
@@ -878,77 +982,205 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .to_string()
 }
 
-/// Outline entry for the single definition node starting at `start_line`,
-/// extracted straight from the AST. Unlike the outline tree (which caps its own
-/// nesting at one container level), this reaches a definition at any depth, so
-/// grok can enrich a deeply-nested method the tree would not surface. Returns
-/// `None` when no definition node starts at that line.
-pub(crate) fn entry_at_start_line(
-    content: &str,
-    lang: Lang,
-    start_line: u32,
-) -> Option<OutlineEntry> {
+fn parse_outline(content: &str, lang: Lang) -> Option<(tree_sitter::Tree, Vec<&str>)> {
     let ts_lang = outline_language(lang)?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&ts_lang).ok()?;
     let tree = parser.parse(content, None)?;
-    let lines: Vec<&str> = content.lines().collect();
-    node_entry_at_start_line(tree.root_node(), &lines, lang, start_line)
+    Some((tree, content.lines().collect()))
 }
 
-fn node_entry_at_start_line(
+pub(crate) fn is_path_line_entry_kind(kind: OutlineKind) -> bool {
+    matches!(
+        kind,
+        OutlineKind::Function
+            | OutlineKind::Class
+            | OutlineKind::Struct
+            | OutlineKind::Interface
+            | OutlineKind::TypeAlias
+            | OutlineKind::Enum
+            | OutlineKind::Module
+            | OutlineKind::TestSuite
+            | OutlineKind::TestCase
+    )
+}
+
+/// Return whether `entry` is a callable, type, or container path-line target.
+///
+/// Path-line and edit-block anchors intentionally ignore imports, exports,
+/// variables, and other non-block outline entries.
+fn owns_path_line(entry: &OutlineEntry, line: u32) -> bool {
+    is_path_line_entry_kind(entry.kind) && (entry.span_start_line..=entry.end_line).contains(&line)
+}
+
+/// Get structured outline entries for file content.
+pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
+    let Some((tree, lines)) = parse_outline(content, lang) else {
+        return Vec::new();
+    };
+    walk_top_level(tree.root_node(), &lines, lang)
+}
+
+/// Parse once and return every callable, type, or container entry.
+///
+/// Entries are deepest-first and flattened. Transparent wrappers replace their
+/// inner declaration entry structurally, so distinct declarations stay distinct.
+pub(crate) fn get_deep_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
+    let Some((tree, lines)) = parse_outline(content, lang) else {
+        return Vec::new();
+    };
+    deep_outline_entries(tree.root_node(), &lines, lang)
+}
+
+pub(crate) fn deep_outline_entries(
+    root: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> Vec<OutlineEntry> {
+    let mut entries = Vec::new();
+    collect_deep_outline_entries(root, lines, lang, &mut entries);
+    entries
+}
+
+fn collect_deep_outline_entries(
     node: tree_sitter::Node,
     lines: &[&str],
     lang: Lang,
-    start_line: u32,
-) -> Option<OutlineEntry> {
+    entries: &mut Vec<OutlineEntry>,
+) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.start_position().row as u32 + 1 == start_line {
-            // depth 1 keeps node_to_entry from collecting children — only the
-            // entry's own metadata (name/kind/signature/doc/range) is needed.
-            if let Some(entry) = node_to_entry(child, lines, lang, 1) {
-                return Some(entry);
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    for child in children.iter().copied() {
+        if is_transparent_declaration_wrapper(child, lang) {
+            let mut wrapper_cursor = child.walk();
+            for wrapped_child in child.children(&mut wrapper_cursor) {
+                collect_deep_outline_entries(wrapped_child, lines, lang, entries);
             }
+        } else {
+            collect_deep_outline_entries(child, lines, lang, entries);
         }
-        if let Some(found) = node_entry_at_start_line(child, lines, lang, start_line) {
-            return Some(found);
+    }
+    for mut entry in collect_sibling_entries(children.into_iter(), lines, lang, 1) {
+        if is_path_line_entry_kind(entry.kind) {
+            entry.children.clear();
+            entries.push(entry);
+        }
+    }
+}
+
+fn get_outline_entries_and_entry(
+    content: &str,
+    lang: Lang,
+    line: u32,
+    accepts: fn(&OutlineEntry, u32) -> bool,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    let Some((tree, lines)) = parse_outline(content, lang) else {
+        return (Vec::new(), None);
+    };
+    let root = tree.root_node();
+    let entry = deep_outline_entries(root, &lines, lang)
+        .into_iter()
+        .find(|entry| accepts(entry, line));
+    (walk_top_level(root, &lines, lang), entry)
+}
+
+pub(crate) fn get_outline_entries_and_entry_at_line(
+    content: &str,
+    lang: Lang,
+    line: u32,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    get_outline_entries_and_entry(content, lang, line, owns_path_line)
+}
+
+/// Parse once, return the shallow outline, and resolve the deepest converted
+/// declaration with the requested name and canonical start line. When provided,
+/// `semantic_end` distinguishes declarations that share both values. If no
+/// name-matching entry exists, retain the deepest exact identity so callers can
+/// perform explicit moved-name recovery.
+pub(crate) fn get_outline_entries_and_entry_by_name_at_start_line(
+    content: &str,
+    lang: Lang,
+    name: &str,
+    line: u32,
+    semantic_end: Option<u32>,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    let Some((tree, lines)) = parse_outline(content, lang) else {
+        return (Vec::new(), None);
+    };
+    let root = tree.root_node();
+    let mut deep_entries = deep_outline_entries(root, &lines, lang);
+    let matches_identity = |entry: &OutlineEntry| {
+        entry.start_line == line && semantic_end.is_none_or(|end| entry.end_line == end)
+    };
+    let entry_index = deep_entries
+        .iter()
+        .position(|entry| entry.name == name && matches_identity(entry))
+        .or_else(|| deep_entries.iter().position(matches_identity));
+    let entry = entry_index.map(|index| deep_entries.swap_remove(index));
+    (walk_top_level(root, &lines, lang), entry)
+}
+
+/// Resolve one raw tree-sitter definition match against a converted entry from
+/// the same parsed tree. Normal definitions use name/range identity; synthetic
+/// implementation matches use their explicit trait/interface target.
+pub(crate) fn find_entry_for_definition<'a>(
+    entries: &'a [OutlineEntry],
+    name: Option<&str>,
+    line: u32,
+    raw_range: (u32, u32),
+    impl_target: Option<&str>,
+) -> Option<&'a OutlineEntry> {
+    entries.iter().find(|entry| {
+        entry.end_line == raw_range.1
+            && converted_definition_entry_matches(entry, name, line, impl_target)
+    })
+}
+
+fn converted_definition_entry_matches(
+    entry: &OutlineEntry,
+    name: Option<&str>,
+    line: u32,
+    impl_target: Option<&str>,
+) -> bool {
+    if !(entry.span_start_line..=entry.end_line).contains(&line) {
+        return false;
+    }
+    if impl_target.is_some() {
+        return name
+            .and_then(|name| name.split_once(" implements ").map(|(class, _)| class))
+            .is_none_or(|class| entry.name == class);
+    }
+    name.is_some_and(|name| entry.name == name)
+}
+
+/// First outline entry named `name` (depth-first pre-order), returning its
+/// 1-based inclusive semantic ownership span. This is the single canonical
+/// symbol-walk shared by the `#symbol` read selector and block-anchor
+/// resolution.
+pub fn find_entry_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
+    for e in entries {
+        if e.name == name {
+            return Some((e.span_start_line, e.end_line));
+        }
+        if let Some(hit) = find_entry_by_name(&e.children, name) {
+            return Some(hit);
         }
     }
     None
 }
 
-/// Get structured outline entries for file content.
-pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
-    let Some(ts_lang) = outline_language(lang) else {
-        return Vec::new();
-    };
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
-
-    let lines: Vec<&str> = content.lines().collect();
-    walk_top_level(tree.root_node(), &lines, lang)
-}
-
-/// First outline entry named `name` (depth-first pre-order), returning its
-/// 1-based inclusive `(start_line, end_line)` span. This is the single
-/// canonical symbol-walk shared by the `#symbol` read selector
-/// (`src/mcp/tools/read.rs`) and block-anchor resolution
-/// (`src/edit/block.rs`); both previously carried their own copy.
-pub fn find_entry_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
-    for e in entries {
-        if e.name == name {
-            return Some((e.start_line, e.end_line));
+/// First outline entry whose canonical display/search anchor is `start_line`,
+/// returning the full entry so consumers can choose its semantic span.
+pub fn find_entry_by_start_line(
+    entries: &[OutlineEntry],
+    start_line: u32,
+) -> Option<&OutlineEntry> {
+    for entry in entries {
+        if entry.start_line == start_line {
+            return Some(entry);
         }
-        if let Some(hit) = find_entry_by_name(&e.children, name) {
-            return Some(hit);
+        if let Some(found) = find_entry_by_start_line(&entry.children, start_line) {
+            return Some(found);
         }
     }
     None
@@ -1235,5 +1467,296 @@ main() {
         // `source\t./lib.sh` (tab separator) must be parsed correctly.
         let result = extract_import_source("source\t./lib/utils.sh", Some(Lang::Bash));
         assert_eq!(result, "./lib/utils.sh");
+    }
+}
+
+#[cfg(test)]
+mod semantic_span_tests {
+    use super::get_outline_entries;
+    use crate::types::{Lang, OutlineKind};
+
+    #[test]
+    fn python_decorators_and_continued_headers_keep_canonical_anchor() {
+        let source = "class Handler:\n\
+                      \u{20}   @logged\n\
+                      \u{20}   async \\\n\
+                      \u{20}   def blocked(self) -> bool:\n\
+                      \u{20}       return True\n";
+        let entries = get_outline_entries(source, Lang::Python);
+        let handler = entries
+            .iter()
+            .find(|entry| entry.name == "Handler")
+            .expect("class should be outlined");
+        let blocked = handler
+            .children
+            .iter()
+            .find(|entry| entry.name == "blocked")
+            .expect("decorated method should be outlined");
+
+        assert_eq!(blocked.kind, OutlineKind::Function);
+        assert_eq!(blocked.start_line, 4);
+        assert_eq!(blocked.span_start_line, 2);
+        assert_eq!(blocked.end_line, 5);
+        assert_eq!(
+            blocked.signature.as_deref(),
+            Some("def blocked(self) -> bool")
+        );
+    }
+
+    #[test]
+    fn python_wrapper_does_not_cross_blank_or_comment_separation() {
+        let source = "@first\n\
+                      \n\
+                      # unrelated\n\
+                      @second\n\
+                      def run():\n\
+                          return 1\n";
+        let entries = get_outline_entries(source, Lang::Python);
+        let run = entries
+            .iter()
+            .find(|entry| entry.name == "run")
+            .expect("run should be outlined");
+        assert_eq!(run.start_line, 5);
+        assert_eq!(run.span_start_line, 4);
+    }
+
+    #[test]
+    fn annotation_bearing_languages_keep_canonical_and_semantic_lines() {
+        let cases = [
+            (Lang::Java, "@Deprecated\nclass Foo {}\n", "Foo", 2, 1),
+            (Lang::CSharp, "[Obsolete]\nclass Foo {}\n", "Foo", 2, 1),
+            (
+                Lang::Kotlin,
+                "@Deprecated(\"old\")\nclass Foo {}\n",
+                "Foo",
+                2,
+                1,
+            ),
+            (Lang::TypeScript, "@sealed\nclass Foo {}\n", "Foo", 2, 1),
+            (Lang::Tsx, "@sealed\nclass Foo {}\n", "Foo", 2, 1),
+            (Lang::JavaScript, "@sealed\nclass Foo {}\n", "Foo", 2, 1),
+            (
+                Lang::Php,
+                "<?php\n#[Attr]\nfunction run() {}\n",
+                "run",
+                3,
+                2,
+            ),
+            (
+                Lang::Python,
+                "@logged\ndef run():\n    return 1\n",
+                "run",
+                2,
+                1,
+            ),
+            (Lang::Rust, "#[inline]\nfn run() {}\n", "run", 2, 1),
+            (Lang::Scala, "@deprecated\nclass Foo\n", "Foo", 2, 1),
+            (
+                Lang::Swift,
+                "@available(*, deprecated)\nfunc run() {}\n",
+                "run",
+                2,
+                1,
+            ),
+            (
+                Lang::C,
+                "[[nodiscard]]\nint run() { return 0; }\n",
+                "<anonymous>",
+                2,
+                1,
+            ),
+            (
+                Lang::Cpp,
+                "[[nodiscard]]\nint run() { return 0; }\n",
+                "<anonymous>",
+                2,
+                1,
+            ),
+        ];
+
+        for (lang, source, name, start_line, span_start_line) in cases {
+            let entries = get_outline_entries(source, lang);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("{lang:?} should outline {name}"));
+            assert_eq!(entry.start_line, start_line, "{lang:?} canonical line");
+            assert_eq!(
+                entry.span_start_line, span_start_line,
+                "{lang:?} semantic line"
+            );
+        }
+    }
+    #[test]
+    fn embedded_adornments_stop_at_blank_and_comment_gaps() {
+        let cases = [
+            (
+                Lang::C,
+                "[[nodiscard]]\n\nint run() { return 0; }\n",
+                "<anonymous>",
+                3,
+                3,
+            ),
+            (
+                Lang::Cpp,
+                "[[nodiscard]]\n\nint run() { return 0; }\n",
+                "<anonymous>",
+                3,
+                3,
+            ),
+            (
+                Lang::Java,
+                "@First // unrelated\nclass Foo {}\n",
+                "Foo",
+                2,
+                2,
+            ),
+            (
+                Lang::CSharp,
+                "[First] // unrelated\nclass Foo {}\n",
+                "Foo",
+                2,
+                2,
+            ),
+            (
+                Lang::Java,
+                "@First\n\n// unrelated\n@Second\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::CSharp,
+                "[First]\n\n/* unrelated */\n[Second]\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::Kotlin,
+                "@First\n\n// unrelated\n@Second\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::Scala,
+                "@First\n\n// unrelated\n@Second\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::Swift,
+                "@available(*, deprecated)\n\n// unrelated\n@available(*, unavailable)\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::TypeScript,
+                "@first\n\n// unrelated\n@second\nclass Foo {}\n",
+                "Foo",
+                5,
+                4,
+            ),
+            (
+                Lang::Php,
+                "<?php\n#[First]\n\n/* unrelated */\n#[Second]\nclass Foo {}\n",
+                "Foo",
+                6,
+                5,
+            ),
+        ];
+
+        for (lang, source, name, start_line, span_start_line) in cases {
+            let entry = get_outline_entries(source, lang)
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("{lang:?} should outline {name}"));
+            assert_eq!(entry.start_line, start_line, "{lang:?} keyword line");
+            assert_eq!(
+                entry.span_start_line, span_start_line,
+                "{lang:?} should keep only contiguous adornments"
+            );
+        }
+    }
+
+    #[test]
+    fn keyword_anchor_survives_name_on_following_line() {
+        let entries = get_outline_entries("@sealed\nclass\nFoo {}\n", Lang::TypeScript);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.name == "Foo")
+            .expect("split class should be outlined");
+        assert_eq!(entry.start_line, 2);
+        assert_eq!(entry.span_start_line, 1);
+    }
+
+    #[test]
+    fn elixir_dialyzer_is_not_positional_definition_metadata() {
+        let source = "defmodule M do\n\
+                      @dialyzer {:nowarn_function, helper: 0}\n\
+                      def run, do: :ok\n\
+                      end\n";
+        let entries = get_outline_entries(source, Lang::Elixir);
+        let entry = super::find_entry_by_start_line(&entries, 3).expect("run should be outlined");
+        assert_eq!(entry.start_line, 3);
+        assert_eq!(entry.span_start_line, 3);
+    }
+
+    #[test]
+    fn rust_outer_attributes_extend_only_the_next_declaration() {
+        let source = "#[inline]\n\
+                      #[cfg(test)]\n\
+                      fn run() {}\n\
+                      \n\
+                      #[cold]\n\
+                      // separated from the next declaration\n\
+                      fn cold_run() {}\n";
+        let entries = get_outline_entries(source, Lang::Rust);
+        let run = entries
+            .iter()
+            .find(|entry| entry.name == "run")
+            .expect("run should be outlined");
+        let cold_run = entries
+            .iter()
+            .find(|entry| entry.name == "cold_run")
+            .expect("cold_run should be outlined");
+
+        assert_eq!(run.start_line, 3);
+        assert_eq!(run.span_start_line, 1);
+        assert_eq!(cold_run.start_line, 7);
+        assert_eq!(cold_run.span_start_line, 7);
+    }
+
+    #[test]
+    fn elixir_definition_metadata_is_conservative_and_contiguous() {
+        let source = "@doc \"run\"\n\
+                      @spec run(integer()) :: integer()\n\
+                      def run(value), do: value\n\
+                      @custom true\n\
+                      def other, do: :ok\n\
+                      @doc \"separated\"\n\
+                      \n\
+                      def split, do: :ok\n";
+        let entries = get_outline_entries(source, Lang::Elixir);
+        let run = entries
+            .iter()
+            .find(|entry| entry.name == "run")
+            .expect("run should be outlined");
+        let other = entries
+            .iter()
+            .find(|entry| entry.name == "other")
+            .expect("other should be outlined");
+        let split = entries
+            .iter()
+            .find(|entry| entry.name == "split")
+            .expect("split should be outlined");
+
+        assert_eq!(run.start_line, 3);
+        assert_eq!(run.span_start_line, 1);
+        assert_eq!(other.span_start_line, 5);
+        assert_eq!(split.span_start_line, 8);
     }
 }

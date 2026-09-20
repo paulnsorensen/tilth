@@ -51,4 +51,20 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::Python),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,
+    definition_wrappers: &["decorated_definition"],
+    canonical_anchor,
+    attach_leading_adornment,
+    semantic_start: crate::lang::spec::default_semantic_start,
 };
+
+pub(crate) fn canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
+    crate::lang::spec::keyword_canonical_anchor(node, &["def", "class"])
+}
+
+pub(crate) fn attach_leading_adornment(
+    adornment: tree_sitter::Node,
+    _definition: Option<tree_sitter::Node>,
+    _lines: &[&str],
+) -> bool {
+    adornment.kind() == "decorator"
+}

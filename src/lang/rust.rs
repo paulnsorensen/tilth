@@ -29,4 +29,16 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::Rust),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,
+    definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
+    canonical_anchor: crate::lang::spec::default_canonical_anchor,
+    attach_leading_adornment: crate::lang::rust::attach_leading_adornment,
+    semantic_start: crate::lang::spec::default_semantic_start,
 };
+
+pub(crate) fn attach_leading_adornment(
+    adornment: tree_sitter::Node,
+    _definition: Option<tree_sitter::Node>,
+    _lines: &[&str],
+) -> bool {
+    adornment.kind() == "attribute_item"
+}

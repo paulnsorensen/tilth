@@ -8,8 +8,8 @@ use crate::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::matching::{build_diff_symbols, match_symbols};
 use super::{
-    ChangeType, Conflict, DiffLine, DiffLineKind, DiffSource, FileDiff, FileOverlay, FileStatus,
-    MatchConfidence, SymbolChange,
+    AttributedDiffLine, ChangeType, Conflict, DiffLineKind, DiffSource, FileDiff, FileOverlay,
+    FileStatus, MatchConfidence, SymbolAttributionKey, SymbolChange, SymbolIdentity,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,19 +431,18 @@ fn get_entries_for_path(path: &Path, content: &str) -> Vec<OutlineEntry> {
 // ---------------------------------------------------------------------------
 
 struct SymRange {
-    name: String,
-    start: u32,
-    end: u32,
-    is_deleted: bool,
+    key: SymbolAttributionKey,
+    old_span: Option<(u32, u32)>,
+    new_span: Option<(u32, u32)>,
 }
 
 /// For each symbol change that has a line range, find which diff lines from
-/// the hunks fall within that symbol. Returns `(symbol_name, lines)` pairs.
+/// the hunks fall within that symbol. Returns `(symbol_identity, lines)` pairs.
 fn attribute_hunks(
     hunks: &[super::Hunk],
     changes: &[SymbolChange],
-) -> Vec<(String, Vec<DiffLine>)> {
-    let mut result: Vec<(String, Vec<DiffLine>)> = Vec::new();
+) -> Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)> {
+    let mut result: Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)> = Vec::new();
 
     let active_symbols: Vec<&SymbolChange> = changes
         .iter()
@@ -456,26 +455,16 @@ fn attribute_hunks(
 
     let mut sym_ranges: Vec<SymRange> = Vec::new();
     for change in &active_symbols {
-        let start = change.line;
-        let end = if let Some((old_size, new_size)) = change.size_delta {
-            if matches!(change.change, ChangeType::Deleted) {
-                start + old_size.saturating_sub(1)
-            } else {
-                start + new_size.saturating_sub(1)
-            }
-        } else {
-            start
-        };
         sym_ranges.push(SymRange {
-            name: change.name.clone(),
-            start,
-            end,
-            is_deleted: matches!(change.change, ChangeType::Deleted),
+            key: change.attribution_key(),
+            old_span: change.old_span,
+            new_span: change.new_span,
         });
     }
 
     // Pre-allocate buckets for each symbol.
-    let mut buckets: Vec<Vec<DiffLine>> = (0..sym_ranges.len()).map(|_| Vec::new()).collect();
+    let mut buckets: Vec<Vec<AttributedDiffLine>> =
+        (0..sym_ranges.len()).map(|_| Vec::new()).collect();
 
     for hunk in hunks {
         let mut old_line = hunk.old_start;
@@ -484,12 +473,17 @@ fn attribute_hunks(
         for diff_line in &hunk.lines {
             match diff_line.kind {
                 DiffLineKind::Context => {
-                    // Attribute by new-file line.
+                    // Context is attributed by new-file line.
                     for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
+                        if sr
+                            .new_span
+                            .is_some_and(|(start, end)| new_line >= start && new_line <= end)
+                        {
+                            buckets[si].push(AttributedDiffLine {
                                 kind: diff_line.kind,
                                 content: diff_line.content.clone(),
+                                old_line: Some(old_line),
+                                new_line: Some(new_line),
                             });
                         }
                     }
@@ -497,24 +491,35 @@ fn attribute_hunks(
                     new_line += 1;
                 }
                 DiffLineKind::Added => {
-                    // Attribute by new-file line.
+                    // Added lines belong to the new-file range.
                     for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
+                        if sr
+                            .new_span
+                            .is_some_and(|(start, end)| new_line >= start && new_line <= end)
+                        {
+                            buckets[si].push(AttributedDiffLine {
                                 kind: diff_line.kind,
                                 content: diff_line.content.clone(),
+                                old_line: None,
+                                new_line: Some(new_line),
                             });
                         }
                     }
                     new_line += 1;
                 }
                 DiffLineKind::Removed => {
-                    // Attribute by old-file line.
+                    // Removed lines belong to the old-file range, including
+                    // removed adornments on matched symbols.
                     for (si, sr) in sym_ranges.iter().enumerate() {
-                        if sr.is_deleted && old_line >= sr.start && old_line <= sr.end {
-                            buckets[si].push(DiffLine {
+                        if sr
+                            .old_span
+                            .is_some_and(|(start, end)| old_line >= start && old_line <= end)
+                        {
+                            buckets[si].push(AttributedDiffLine {
                                 kind: diff_line.kind,
                                 content: diff_line.content.clone(),
+                                old_line: Some(old_line),
+                                new_line: None,
                             });
                         }
                     }
@@ -527,7 +532,7 @@ fn attribute_hunks(
     // Collect non-empty buckets.
     for (si, lines) in buckets.into_iter().enumerate() {
         if !lines.is_empty() {
-            result.push((sym_ranges[si].name.clone(), lines));
+            result.push((sym_ranges[si].key.clone(), lines));
         }
     }
 
@@ -542,13 +547,14 @@ fn attribute_hunks(
 fn entries_to_changes(content: &str, path: &Path, change_type: &ChangeType) -> Vec<SymbolChange> {
     let entries = get_entries_for_path(path, content);
     let mut changes = Vec::new();
-    collect_entries_recursive(&entries, change_type, &mut changes);
+    collect_entries_recursive(&entries, change_type, "", &mut changes);
     changes
 }
 
 fn collect_entries_recursive(
     entries: &[OutlineEntry],
     change_type: &ChangeType,
+    parent_path: &str,
     out: &mut Vec<SymbolChange>,
 ) {
     for entry in entries {
@@ -564,21 +570,40 @@ fn collect_entries_recursive(
         };
 
         out.push(SymbolChange {
+            identity: SymbolIdentity {
+                kind: entry.kind,
+                parent_path: parent_path.to_string(),
+                name: entry.name.clone(),
+            },
             name: entry.name.clone(),
             kind: entry.kind,
             change: change_type.clone(),
             match_confidence: MatchConfidence::Exact,
             line: entry.start_line,
+            span_start_line: entry.span_start_line,
+            old_span: match change_type {
+                ChangeType::Added => None,
+                _ => Some((entry.span_start_line, entry.end_line)),
+            },
+            new_span: match change_type {
+                ChangeType::Deleted => None,
+                _ => Some((entry.span_start_line, entry.end_line)),
+            },
             old_sig,
             new_sig,
             size_delta: Some((
-                entry.end_line.saturating_sub(entry.start_line) + 1,
-                entry.end_line.saturating_sub(entry.start_line) + 1,
+                entry.end_line.saturating_sub(entry.span_start_line) + 1,
+                entry.end_line.saturating_sub(entry.span_start_line) + 1,
             )),
         });
 
         if !entry.children.is_empty() {
-            collect_entries_recursive(&entry.children, change_type, out);
+            let child_parent = if parent_path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{parent_path}::{}", entry.name)
+            };
+            collect_entries_recursive(&entry.children, change_type, &child_parent, out);
         }
     }
 }
@@ -590,7 +615,7 @@ fn collect_entries_recursive(
 /// Find the enclosing function for a given line number by walking the outline.
 fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String> {
     for entry in entries {
-        if line >= entry.start_line && line <= entry.end_line {
+        if line >= entry.span_start_line && line <= entry.end_line {
             // Check children first for more specific match.
             if let Some(child_name) = find_enclosing_function(&entry.children, line) {
                 return Some(child_name);
@@ -606,6 +631,15 @@ fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::DiffLine;
+
+    fn identity(name: &str) -> SymbolIdentity {
+        SymbolIdentity {
+            kind: OutlineKind::Function,
+            parent_path: String::new(),
+            name: name.into(),
+        }
+    }
 
     #[test]
     fn bare_git_ref_new_content_reads_working_tree() {
@@ -684,5 +718,92 @@ mod tests {
             overlay.symbol_changes.is_empty(),
             "overlay must be empty when old side is unavailable"
         );
+    }
+
+    #[test]
+    fn diff_attribution_includes_leading_rust_attributes() {
+        let source = "#[inline]\nfn alpha() {\n    let value = 1;\n}\n";
+        let entries = get_entries_for_path(Path::new("alpha.rs"), source);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.name == "alpha")
+            .expect("alpha should be outlined");
+
+        let changes = vec![SymbolChange {
+            identity: identity(&entry.name),
+            name: entry.name.clone(),
+            kind: entry.kind,
+            change: ChangeType::BodyChanged,
+            match_confidence: MatchConfidence::Exact,
+            line: entry.start_line,
+            span_start_line: entry.span_start_line,
+            old_span: Some((entry.span_start_line, entry.end_line)),
+            new_span: Some((entry.span_start_line, entry.end_line)),
+            old_sig: None,
+            new_sig: None,
+            size_delta: Some((entry.end_line - entry.span_start_line + 1, 3)),
+        }];
+        let hunks = vec![super::super::Hunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Added,
+                content: "#[inline]".to_string(),
+            }],
+        }];
+
+        let attributed = attribute_hunks(&hunks, &changes);
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0].0.identity.name, "alpha");
+        assert_eq!(attributed[0].1[0].content, "#[inline]");
+        assert_eq!(
+            find_enclosing_function(&entries, 1),
+            Some("alpha".to_string())
+        );
+    }
+    #[test]
+    fn diff_attribution_uses_old_and_new_ranges_for_attribute_replacement() {
+        let changes = vec![SymbolChange {
+            identity: identity("alpha"),
+            name: "alpha".to_string(),
+            kind: OutlineKind::Function,
+            change: ChangeType::BodyChanged,
+            match_confidence: MatchConfidence::Exact,
+            line: 2,
+            span_start_line: 2,
+            old_span: Some((1, 4)),
+            new_span: Some((1, 4)),
+            old_sig: None,
+            new_sig: None,
+            size_delta: Some((4, 4)),
+        }];
+        let hunks = vec![super::super::Hunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Removed,
+                    content: "#[inline]".to_string(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Added,
+                    content: "#[cold]".to_string(),
+                },
+            ],
+        }];
+
+        let attributed = attribute_hunks(&hunks, &changes);
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0].1.len(), 2);
+        assert_eq!(attributed[0].1[0].kind, DiffLineKind::Removed);
+        assert_eq!(attributed[0].1[1].kind, DiffLineKind::Added);
+        assert_eq!(attributed[0].1[0].old_line, Some(1));
+        assert_eq!(attributed[0].1[0].new_line, None);
+        assert_eq!(attributed[0].1[1].old_line, None);
+        assert_eq!(attributed[0].1[1].new_line, Some(1));
     }
 }
