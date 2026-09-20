@@ -12,6 +12,9 @@ pub(crate) const CALLEE_QUERY: &str = concat!(
 pub(crate) const SIBLING_QUERY: &str =
     "(member_expression object: (this) property: (property_identifier) @ref)\n";
 
+/// Transparent declaration wrappers shared by JavaScript, TypeScript, and TSX.
+pub(crate) const DEFINITION_WRAPPERS: &[&str] = &["export_statement"];
+
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "JavaScript",
     extensions: &["js", "jsx"],
@@ -27,7 +30,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::JsTs),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,
-    definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
+    definition_wrappers: crate::lang::javascript::DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::javascript::canonical_anchor,
     attach_leading_adornment: crate::lang::javascript::attach_leading_adornment,
     semantic_start: crate::lang::spec::embedded_semantic_start,

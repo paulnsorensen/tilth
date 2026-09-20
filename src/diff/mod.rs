@@ -84,6 +84,8 @@ pub struct SymbolIdentity {
     pub kind: OutlineKind,
     pub parent_path: String,
     pub name: String,
+    /// Deterministic occurrence within one same-name declaration bucket.
+    pub occurrence: u32,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

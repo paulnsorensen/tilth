@@ -85,6 +85,53 @@ pub(crate) fn resolve_with_source(
     }
 }
 
+/// Resolve a path/line target by its stable source-byte occurrence identity.
+/// The identity prevents same-line declarations from being re-resolved by line alone.
+pub(crate) fn resolve_with_source_occurrence(
+    spec: &str,
+    name: &str,
+    occurrence: (usize, usize),
+    scope: &Path,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    let TargetSpec::PathLine { path, line } = parse_target_spec(spec) else {
+        return Err(TilthError::InvalidQuery {
+            query: spec.to_string(),
+            reason: "occurrence-aware resolution requires a path:line target".to_string(),
+        });
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        scope.join(path)
+    };
+    let result = search_symbol_raw(name, scope, None)?;
+    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
+        path: path.clone(),
+        source,
+    })?;
+    let candidate = result.matches.iter().find(|candidate| {
+        candidate.is_definition
+            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
+            && candidate.line == line
+            && candidate.def_name.as_deref() == Some(name)
+            && candidate.def_byte_range == Some(occurrence)
+    });
+    let Some(candidate) = candidate else {
+        return Err(TilthError::NotFound {
+            path,
+            suggestion: Some("target occurrence changed; search again".to_string()),
+        });
+    };
+    enrich_from_outline(
+        candidate.path.clone(),
+        candidate.line,
+        candidate.def_range.map(|(_, end)| end),
+        name.to_string(),
+        0,
+        false,
+    )
+}
+
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     // The literal spec (`Alpha::dispatch`) never equals a bare definition name,
     // so this attempt only fires for genuinely bare targets. No qualifier to honor.
@@ -466,6 +513,42 @@ pub(crate) fn resolve_candidate_with_source(
         name.to_string(),
         0,
         true,
+    )
+}
+
+pub(crate) fn resolve_candidate_with_source_occurrence(
+    path: &Path,
+    start_line: u32,
+    semantic_end: Option<u32>,
+    name: &str,
+    occurrence: (usize, usize),
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    let scope = path.parent().unwrap_or_else(|| Path::new("."));
+    let result = search_symbol_raw(name, scope, None)?;
+    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let candidate = result.matches.iter().find(|candidate| {
+        candidate.is_definition
+            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
+            && candidate.line == start_line
+            && candidate.def_name.as_deref() == Some(name)
+            && candidate.def_byte_range == Some(occurrence)
+    });
+    let Some(candidate) = candidate else {
+        return Err(TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: Some("target occurrence changed; search again".to_string()),
+        });
+    };
+    enrich_from_outline(
+        candidate.path.clone(),
+        candidate.line,
+        semantic_end.or_else(|| candidate.def_range.map(|(_, end)| end)),
+        name.to_string(),
+        0,
+        false,
     )
 }
 
@@ -1177,20 +1260,43 @@ fn is_recursive_call_site(
 ///
 /// Skips imports/exports (noise) and the target itself. Sorted by:
 /// functions/methods first, then alphabetical.
+fn entry_matches_target(entry: &OutlineEntry, target: &ResolvedTarget) -> bool {
+    entry.start_line == target.start_line && entry.name == target.name
+}
+
+fn find_parent<'a>(
+    entries: &'a [OutlineEntry],
+    target: &ResolvedTarget,
+) -> Option<&'a OutlineEntry> {
+    for entry in entries {
+        if entry
+            .children
+            .iter()
+            .any(|child| entry_matches_target(child, target))
+        {
+            return Some(entry);
+        }
+        if let Some(parent) = find_parent(&entry.children, target) {
+            return Some(parent);
+        }
+    }
+    None
+}
+
 pub(crate) fn collect_siblings(
     entries: &[OutlineEntry],
     target: &ResolvedTarget,
 ) -> Vec<SiblingEntry> {
-    let parent = entries.iter().find(|e| {
-        e.children
-            .iter()
-            .any(|c| c.start_line == target.start_line && c.name == target.name)
-    });
-
-    let candidates: Vec<&OutlineEntry> = if let Some(p) = parent {
-        p.children.iter().collect()
-    } else {
+    // A top-level target keeps the complete top-level sibling set. For nested
+    // targets, walk the full outline tree to find the actual immediate parent.
+    // A missing target has no siblings; never substitute unrelated top-level entries.
+    let candidates: Vec<&OutlineEntry> = if entries.iter().any(|e| entry_matches_target(e, target))
+    {
         entries.iter().collect()
+    } else {
+        find_parent(entries, target)
+            .map(|parent| parent.children.iter().collect())
+            .unwrap_or_default()
     };
 
     let mut out: Vec<SiblingEntry> = candidates
@@ -2306,6 +2412,41 @@ impl<T> Foo<T> {
             vec!["peer_a", "peer_b"],
             "should pick parent children, not top-level"
         );
+    }
+
+    #[test]
+    fn siblings_doubly_nested_target_uses_immediate_parent() {
+        let mut outer = make_entry(OutlineKind::Module, "outer", 1, 50);
+        let mut inner = make_entry(OutlineKind::Class, "inner", 2, 20);
+        inner
+            .children
+            .push(make_entry(OutlineKind::Function, "target", 3, 6));
+        inner
+            .children
+            .push(make_entry(OutlineKind::Function, "peer", 8, 11));
+        outer.children.push(inner);
+        let entries = vec![
+            outer,
+            make_entry(OutlineKind::Function, "unrelated_top_level", 60, 65),
+        ];
+        let target = target_in_file("target", 3, 6, "src/a.rs");
+
+        let sibs = collect_siblings(&entries, &target);
+        let names: Vec<&str> = sibs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["peer"]);
+    }
+
+    #[test]
+    fn siblings_missing_target_do_not_fall_back_to_top_level() {
+        let entries = vec![make_entry(
+            OutlineKind::Function,
+            "unrelated_top_level",
+            60,
+            65,
+        )];
+        let target = target_in_file("missing", 3, 6, "src/a.rs");
+
+        assert!(collect_siblings(&entries, &target).is_empty());
     }
 
     #[test]

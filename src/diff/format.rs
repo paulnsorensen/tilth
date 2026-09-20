@@ -568,6 +568,7 @@ mod tests {
             kind: OutlineKind::Function,
             parent_path: String::new(),
             name: name.into(),
+            occurrence: 0,
         }
     }
 

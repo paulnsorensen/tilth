@@ -1,6 +1,6 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 /// Definition node kinds across tree-sitter grammars.
@@ -219,7 +219,8 @@ pub(crate) fn extract_implemented_interfaces(
     lines: &[&str],
 ) -> Vec<String> {
     let mut interfaces = Vec::new();
-    collect_implemented_clauses(node, lines, &mut interfaces);
+    let mut seen = HashSet::new();
+    collect_implemented_clauses(node, lines, &mut interfaces, &mut seen);
     interfaces
 }
 
@@ -227,25 +228,31 @@ fn collect_implemented_clauses(
     node: tree_sitter::Node,
     lines: &[&str],
     interfaces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "implements_clause" || child.kind() == "super_interfaces" {
-            collect_interface_types(child, lines, interfaces);
+            collect_interface_types(child, lines, interfaces, seen);
         } else if child.kind() == "class_heritage" {
-            collect_implemented_clauses(child, lines, interfaces);
+            collect_implemented_clauses(child, lines, interfaces, seen);
         }
     }
 }
 
-fn collect_interface_types(node: tree_sitter::Node, lines: &[&str], interfaces: &mut Vec<String>) {
+fn collect_interface_types(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    interfaces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if matches!(
             child.kind(),
             "implements_clause" | "super_interfaces" | "type_list"
         ) {
-            collect_interface_types(child, lines, interfaces);
+            collect_interface_types(child, lines, interfaces, seen);
             continue;
         }
         let text = node_text_simple(child, lines, NodeTextMode::Full);
@@ -256,7 +263,7 @@ fn collect_interface_types(node: tree_sitter::Node, lines: &[&str], interfaces: 
             .unwrap_or_default()
             .split_whitespace()
             .collect::<String>();
-        if !name.is_empty() && !interfaces.contains(&name) {
+        if !name.is_empty() && seen.insert(name.clone()) {
             interfaces.push(name);
         }
     }

@@ -9,7 +9,6 @@
 use std::path::Path;
 
 use super::parser::BlockAnchor;
-use crate::lang::outline::get_deep_outline_entries;
 use crate::types::{FileType, OutlineEntry};
 
 /// A resolved 1-based inclusive line span.
@@ -34,7 +33,7 @@ pub fn outline_for(path: &Path, text: &str) -> Option<Vec<OutlineEntry>> {
     let FileType::Code(lang) = crate::lang::detect_file_type(path) else {
         return None;
     };
-    Some(get_deep_outline_entries(text, lang))
+    Some(crate::lang::outline::get_deep_outline_tree(text, lang))
 }
 
 /// Resolve `anchor` against pre-computed outline `entries`.
@@ -50,18 +49,19 @@ pub fn resolve_block_in(entries: &[OutlineEntry], anchor: &BlockAnchor) -> Optio
 }
 
 fn find_block_entry_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
-    for entry in entries {
+    let mut pending: Vec<(&OutlineEntry, usize)> =
+        entries.iter().rev().map(|entry| (entry, 0)).collect();
+    let mut best = None;
+    while let Some((entry, depth)) = pending.pop() {
         if !crate::lang::outline::is_path_line_entry_kind(entry.kind) {
             continue;
         }
-        if let Some(found) = find_block_entry_by_name(&entry.children, name) {
-            return Some(found);
+        if entry.name == name && best.is_none_or(|(best_depth, _)| depth > best_depth) {
+            best = Some((depth, (entry.span_start_line, entry.end_line)));
         }
-        if entry.name == name {
-            return Some((entry.span_start_line, entry.end_line));
-        }
+        pending.extend(entry.children.iter().rev().map(|child| (child, depth + 1)));
     }
-    None
+    best.map(|(_, span)| span)
 }
 
 /// Resolve a line anchor: prefer a block that *begins* on `line` (oh-my-pi's
@@ -74,40 +74,44 @@ fn resolve_line(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
 }
 
 fn begins_on(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
-    for e in entries {
-        if !crate::lang::outline::is_path_line_entry_kind(e.kind) {
+    let mut pending: Vec<&OutlineEntry> = entries.iter().rev().collect();
+    let mut best = None;
+    while let Some(entry) = pending.pop() {
+        if !crate::lang::outline::is_path_line_entry_kind(entry.kind) {
             continue;
         }
-        // Prefer the deepest child that also begins on the canonical line.
-        if let Some(hit) = begins_on(&e.children, line) {
-            return Some(hit);
+        if (entry.start_line == line || entry.span_start_line == line)
+            && best.is_none_or(|(start, end)| entry.end_line - entry.span_start_line < end - start)
+        {
+            best = Some((entry.span_start_line, entry.end_line));
         }
-        if e.start_line == line {
-            return Some((e.span_start_line, e.end_line));
-        }
+        pending.extend(entry.children.iter().rev());
     }
-    None
+    best
 }
 
 fn innermost_containing(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
-    for e in entries {
-        if !crate::lang::outline::is_path_line_entry_kind(e.kind) {
+    let mut pending: Vec<(&OutlineEntry, usize)> =
+        entries.iter().rev().map(|entry| (entry, 0)).collect();
+    let mut best = None;
+    while let Some((entry, depth)) = pending.pop() {
+        if !crate::lang::outline::is_path_line_entry_kind(entry.kind) {
             continue;
         }
-        if line >= e.span_start_line && line <= e.end_line {
-            // A child span is strictly inside, so prefer it if it also contains.
-            if let Some(hit) = innermost_containing(&e.children, line) {
-                return Some(hit);
+        if line >= entry.span_start_line && line <= entry.end_line {
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, (entry.span_start_line, entry.end_line)));
             }
-            return Some((e.span_start_line, e.end_line));
+            pending.extend(entry.children.iter().rev().map(|child| (child, depth + 1)));
         }
     }
-    None
+    best.map(|(_, span)| span)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lang::outline::get_deep_outline_entries;
     use std::path::PathBuf;
 
     fn rs_path() -> PathBuf {
@@ -161,6 +165,28 @@ fn beta() {
     }
 
     #[test]
+    fn symbol_anchor_prefers_deepest_duplicate_in_sibling_subtrees() {
+        let path = rs_path();
+        let source = "\
+mod left {
+    fn duplicate() {}
+}
+
+mod right {
+    mod nested {
+        fn duplicate() {
+            let value = 1;
+        }
+    }
+}
+";
+
+        let span = resolve_block(&path, source, &BlockAnchor::Symbol("duplicate".into()))
+            .expect("duplicate symbol resolves");
+        assert_eq!((span.start, span.end), (7, 9));
+    }
+
+    #[test]
     fn unknown_symbol_yields_none() {
         let path = rs_path();
         assert!(resolve_block(&path, SRC, &BlockAnchor::Symbol("nonexistent".into())).is_none());
@@ -206,5 +232,33 @@ mod a {
         let symbol_span = resolve_block(&path, source, &BlockAnchor::Symbol("method".into()))
             .expect("nested method symbol should resolve");
         assert_eq!((symbol_span.start, symbol_span.end), (3, 6));
+    }
+
+    #[test]
+    fn deeply_nested_symbol_resolution_uses_iterative_hierarchy() {
+        let path = rs_path();
+        let depth = 512;
+        let mut source = String::new();
+        for _ in 0..depth {
+            source.push_str("mod m {\n");
+        }
+        source.push_str("fn target() {\n    let value = 1;\n}\n");
+        for _ in 0..depth {
+            source.push_str("}\n");
+        }
+
+        let symbol_span = resolve_block(&path, &source, &BlockAnchor::Symbol("target".into()))
+            .expect("deeply nested symbol resolves");
+        assert_eq!(
+            (symbol_span.start, symbol_span.end),
+            (depth as u32 + 1, depth as u32 + 3)
+        );
+
+        let line_span = resolve_block(&path, &source, &BlockAnchor::Line(depth as u32 + 2))
+            .expect("deeply nested body line resolves");
+        assert_eq!(
+            (line_span.start, line_span.end),
+            (depth as u32 + 1, depth as u32 + 3)
+        );
     }
 }

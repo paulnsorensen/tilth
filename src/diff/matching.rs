@@ -20,6 +20,17 @@ pub(crate) fn build_diff_symbols(
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
     build_symbols_recursive(entries, &lines, lang, "", &mut out);
+    let mut occurrences: HashMap<(OutlineKind, String, String), u32> = HashMap::new();
+    for symbol in &mut out {
+        let key = (
+            symbol.identity.kind,
+            symbol.identity.parent_path.clone(),
+            symbol.identity.name.clone(),
+        );
+        let occurrence = occurrences.entry(key).or_default();
+        symbol.identity.occurrence = *occurrence;
+        *occurrence += 1;
+    }
     out
 }
 
@@ -394,10 +405,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<SymbolIdentity, Vec<usize>> {
-    let mut map: HashMap<SymbolIdentity, Vec<usize>> = HashMap::new();
+fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<(OutlineKind, String, String), Vec<usize>> {
+    let mut map: HashMap<(OutlineKind, String, String), Vec<usize>> = HashMap::new();
     for (i, sym) in symbols.iter().enumerate() {
-        map.entry(sym.identity.clone()).or_default().push(i);
+        let key = (
+            sym.identity.kind,
+            sym.identity.parent_path.clone(),
+            sym.identity.name.clone(),
+        );
+        map.entry(key).or_default().push(i);
     }
     map
 }
@@ -418,6 +434,7 @@ fn build_symbols_recursive(
             kind: entry.kind,
             parent_path: parent_path.to_string(),
             name: entry.name.clone(),
+            occurrence: 0,
         };
 
         out.push(DiffSymbol {
@@ -605,6 +622,7 @@ mod tests {
                 kind,
                 parent_path: parent.to_string(),
                 name: name.to_string(),
+                occurrence: 0,
             },
             content_hash,
             structural_hash,
@@ -1087,5 +1105,21 @@ mod tests {
         assert_eq!(alpha.entry.start_line, 2);
         assert_eq!(alpha.entry.span_start_line, 1);
         assert!(alpha.source_text.starts_with("#[inline]\n"));
+    }
+
+    #[test]
+    fn same_line_duplicate_declarations_keep_distinct_occurrences() {
+        let source = "fn run() {} fn run() {}\n";
+        let entries = crate::lang::outline::get_outline_entries(source, Lang::Rust);
+        let symbols = build_diff_symbols(&entries, source, Lang::Rust);
+        let runs: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.identity.name == "run")
+            .collect();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].identity.occurrence, 0);
+        assert_eq!(runs[1].identity.occurrence, 1);
+        assert_ne!(runs[0].identity, runs[1].identity);
     }
 }

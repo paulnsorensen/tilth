@@ -24,6 +24,9 @@ pub(super) struct Target {
     pub(super) path: String,
     pub(super) line: Option<u32>,
     pub(super) name: Option<String>,
+    /// Optional source-byte range that distinguishes same-line declarations.
+    #[serde(default)]
+    pub(super) occurrence: Option<(usize, usize)>,
     pub(super) scope: String,
     pub(super) glob: Option<String>,
 }
@@ -105,11 +108,40 @@ impl Target {
         }
         if let Some(line) = self.line {
             let spec = format!("{}:{line}", full.display());
-            let (target, _, _) =
-                grok::resolve_with_source(&spec, cwd).map_err(|e| e.to_string())?;
+            let (target, _, _) = match (self.name.as_deref(), self.occurrence) {
+                (Some(name), Some(occurrence)) => {
+                    grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd)
+                }
+                _ => grok::resolve_with_source(&spec, cwd),
+            }
+            .map_err(|e| e.to_string())?;
             if target.start_line != line || Some(&target.name) != self.name.as_ref() {
                 return Err("follow target identity changed; search again".into());
             }
+            self.validate_occurrence(&full, cwd)?;
+        }
+        Ok(())
+    }
+
+    fn validate_occurrence(&self, full: &Path, cwd: &Path) -> Result<(), String> {
+        let Some(occurrence) = self.occurrence else {
+            return Ok(());
+        };
+        let Some(name) = self.name.as_deref() else {
+            return Err("follow occurrence requires a symbol target".into());
+        };
+        let result = crate::search::search_symbol_raw(name, cwd, self.glob.as_deref())
+            .map_err(|e| e.to_string())?;
+        let canonical = full.canonicalize().map_err(|e| e.to_string())?;
+        let matches = result.matches.iter().filter(|candidate| {
+            candidate.is_definition
+                && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
+                && candidate.line == self.line.unwrap_or_default()
+                && candidate.def_name.as_deref() == Some(name)
+                && candidate.def_byte_range == Some(occurrence)
+        });
+        if matches.count() != 1 {
+            return Err("follow target occurrence changed; search again".into());
         }
         Ok(())
     }
@@ -176,14 +208,20 @@ impl Follow {
         }
         let full = cwd.join(&self.target.path);
         let spec = format!("{}:{}", full.display(), self.target.line.unwrap());
-        let (target, content, lang) =
-            grok::resolve_with_source(&spec, cwd).map_err(|e| e.to_string())?;
+        let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
+            (Some(name), Some(occurrence)) => {
+                grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd)
+            }
+            _ => grok::resolve_with_source(&spec, cwd),
+        }
+        .map_err(|e| e.to_string())?;
+        self.target.validate_occurrence(&full, cwd)?;
         let mut partial = false;
         let mut items = Vec::new();
         let target_span_start = target.span_start_line;
         match self.kind.as_str() {
             "fetch_siblings" => {
-                let entries = crate::lang::outline::get_outline_entries(&content, lang);
+                let entries = crate::lang::outline::get_deep_outline_tree(&content, lang);
                 items = grok::collect_siblings(&entries, &target)
                     .into_iter()
                     .map(|s| {
@@ -478,6 +516,7 @@ mod tests {
             path: "root.rs".into(),
             line: Some(1),
             name: Some("root".into()),
+            occurrence: None,
             scope: tmp.path().to_string_lossy().into(),
             glob: None,
         };
@@ -517,6 +556,7 @@ mod tests {
             path: "src/pkg/a.py".into(),
             line: Some(1),
             name: Some("Name".into()),
+            occurrence: None,
             scope: tmp.path().to_string_lossy().into(),
             glob: None,
         };
@@ -535,6 +575,62 @@ mod tests {
         assert!(
             dependents.iter().any(|d| d == "src/app/direct.py"),
             "the proven edge stays available: {result}"
+        );
+    }
+
+    #[test]
+    fn stale_same_line_occurrence_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dupes.rs"), "fn run() {} fn run() {}\n").unwrap();
+        let found = crate::search::search_symbol_raw("run", tmp.path(), None).unwrap();
+        let ranges: Vec<_> = found
+            .matches
+            .iter()
+            .filter(|candidate| candidate.is_definition)
+            .filter_map(|candidate| candidate.def_byte_range)
+            .collect();
+        assert_eq!(ranges.len(), 2);
+
+        let hint = |occurrence| {
+            json!({"kind": "fetch_siblings", "target": {
+                "path": "dupes.rs", "line": 1, "name": "run", "occurrence": occurrence,
+                "scope": tmp.path().to_string_lossy(), "glob": null
+            }})
+        };
+        Follow::parse(&hint(ranges[1]), tmp.path()).expect("current occurrence is valid");
+        std::fs::write(tmp.path().join("dupes.rs"), "fn run() {}\n").unwrap();
+        let err = Follow::parse(&hint(ranges[1]), tmp.path()).unwrap_err();
+        assert!(err.contains("occurrence changed"), "{err}");
+    }
+
+    #[test]
+    fn deep_target_returns_real_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("nested.rs"),
+            "mod outer {\n    mod inner {\n        fn target() {}\n        fn sibling() {}\n    }\n}\n",
+        )
+        .unwrap();
+        let found = crate::search::search_symbol_raw("target", tmp.path(), None).unwrap();
+        let occurrence = found
+            .matches
+            .iter()
+            .find(|candidate| candidate.is_definition)
+            .and_then(|candidate| candidate.def_byte_range)
+            .expect("target occurrence");
+        let hint = json!({"kind": "fetch_siblings", "target": {
+            "path": "nested.rs", "line": 3, "name": "target", "occurrence": occurrence,
+            "scope": tmp.path().to_string_lossy(), "glob": null
+        }});
+        let result = run(tmp.path(), &hint);
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["name"] == "sibling" && item["line"] == 4 }),
+            "{result}"
         );
     }
 }

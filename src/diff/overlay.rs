@@ -636,7 +636,8 @@ fn cap_unattributed(hunks: Vec<Vec<UnattributedLine>>) -> (Vec<Vec<UnattributedL
 fn entries_to_changes(content: &str, path: &Path, change_type: &ChangeType) -> Vec<SymbolChange> {
     let entries = get_entries_for_path(path, content);
     let mut changes = Vec::new();
-    collect_entries_recursive(&entries, change_type, "", &mut changes);
+    let mut occurrences: HashMap<(OutlineKind, String, String), u32> = HashMap::new();
+    collect_entries_recursive(&entries, change_type, "", &mut occurrences, &mut changes);
     changes
 }
 
@@ -644,6 +645,7 @@ fn collect_entries_recursive(
     entries: &[OutlineEntry],
     change_type: &ChangeType,
     parent_path: &str,
+    occurrences: &mut HashMap<(OutlineKind, String, String), u32>,
     out: &mut Vec<SymbolChange>,
 ) {
     for entry in entries {
@@ -658,11 +660,14 @@ fn collect_entries_recursive(
             _ => (None, None),
         };
 
+        let occurrence_key = (entry.kind, parent_path.to_string(), entry.name.clone());
+        let occurrence = occurrences.entry(occurrence_key).or_default();
         out.push(SymbolChange {
             identity: SymbolIdentity {
                 kind: entry.kind,
                 parent_path: parent_path.to_string(),
                 name: entry.name.clone(),
+                occurrence: *occurrence,
             },
             name: entry.name.clone(),
             kind: entry.kind,
@@ -685,6 +690,7 @@ fn collect_entries_recursive(
                 entry.end_line.saturating_sub(entry.span_start_line) + 1,
             )),
         });
+        *occurrence += 1;
 
         if !entry.children.is_empty() {
             let child_parent = if parent_path.is_empty() {
@@ -692,7 +698,13 @@ fn collect_entries_recursive(
             } else {
                 format!("{parent_path}::{}", entry.name)
             };
-            collect_entries_recursive(&entry.children, change_type, &child_parent, out);
+            collect_entries_recursive(
+                &entry.children,
+                change_type,
+                &child_parent,
+                occurrences,
+                out,
+            );
         }
     }
 }
@@ -727,6 +739,7 @@ mod tests {
             kind: OutlineKind::Function,
             parent_path: String::new(),
             name: name.into(),
+            occurrence: 0,
         }
     }
 
@@ -807,6 +820,28 @@ mod tests {
             overlay.symbol_changes.is_empty(),
             "overlay must be empty when old side is unavailable"
         );
+    }
+
+    #[test]
+    fn added_and_deleted_same_line_duplicates_keep_distinct_buckets() {
+        let source = "fn run() {} fn run() {}\n";
+        let path = Path::new("dupes.rs");
+
+        for change_type in [ChangeType::Added, ChangeType::Deleted] {
+            let changes = entries_to_changes(source, path, &change_type);
+            let runs: Vec<_> = changes
+                .iter()
+                .filter(|change| change.name == "run")
+                .collect();
+
+            assert_eq!(runs.len(), 2, "both declarations must produce changes");
+            assert_eq!(runs[0].identity.occurrence, 0);
+            assert_eq!(runs[1].identity.occurrence, 1);
+            assert_ne!(
+                runs[0].identity, runs[1].identity,
+                "same-name declarations need distinct attribution buckets"
+            );
+        }
     }
 
     #[test]

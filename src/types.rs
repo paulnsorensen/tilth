@@ -121,6 +121,8 @@ pub struct Match {
     /// Populated by tree-sitter for definitions; None for usages.
     /// The start may precede `line` when leading syntax belongs to the definition.
     pub def_range: Option<(u32, u32)>,
+    /// Stable source-byte occurrence identity for declarations sharing a line/span.
+    pub def_byte_range: Option<(usize, usize)>,
     /// The defined symbol name (populated from AST during definition detection).
     pub def_name: Option<String>,
     /// Semantic weight for definition kinds. 0 for usages.

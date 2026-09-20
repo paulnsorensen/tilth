@@ -394,7 +394,7 @@ fn route_query(
             ) {
                 let target_spec = format!("{query}:1");
                 let (mut result, hints) =
-                    unique_hit(&target_spec, "path", &candidate, 1, None, cwd, glob)?;
+                    unique_hit(&target_spec, "path", &candidate, 1, None, None, cwd, glob)?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
@@ -500,8 +500,23 @@ fn route_identifier(
             .cmp(&b.path)
             .then(a.line.cmp(&b.line))
             .then(a.def_range.cmp(&b.def_range))
+            // Prefer the innermost declaration when a wrapper and its body share a span.
+            .then(b.def_byte_range.cmp(&a.def_byte_range))
     });
-    code_defs.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.def_range == b.def_range);
+    code_defs.dedup_by(|a, b| {
+        let overlapping_occurrence = match (a.def_byte_range, b.def_byte_range) {
+            (Some((a_start, a_end)), Some((b_start, b_end))) => a_start < b_end && b_start < a_end,
+            _ => a.def_byte_range == b.def_byte_range,
+        };
+        let same_declaration = a.path == b.path && a.line == b.line && a.def_range == b.def_range;
+        if same_declaration && overlapping_occurrence {
+            // Wrapper and body entries describe one declaration; retain legacy path:line hints.
+            a.def_byte_range = None;
+            true
+        } else {
+            false
+        }
+    });
     if code_defs.len() == 1 {
         let target = &code_defs[0];
         let (mut result, hints) = unique_hit(
@@ -510,6 +525,7 @@ fn route_identifier(
             &target.path,
             target.line,
             target.def_range.map(|(_, end)| end),
+            target.def_byte_range,
             cwd,
             glob,
         )?;
@@ -636,6 +652,7 @@ fn candidates(matches: &[Match], cwd: &Path) -> Vec<Value> {
                 "line": m.line,
                 "is_definition": m.is_definition,
                 "def_name": m.def_name,
+                "occurrence": m.def_byte_range,
             })
         })
         .collect()
@@ -659,6 +676,7 @@ fn unique_hit(
     target_path: &Path,
     target_line: u32,
     semantic_end: Option<u32>,
+    occurrence: Option<(usize, usize)>,
     cwd: &Path,
     glob: Option<&str>,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
@@ -673,12 +691,21 @@ fn unique_hit(
         let core_partial = content.lines().count() > 60;
         (target_path.to_path_buf(), None, None, body, core_partial)
     } else {
-        let (target, content, _) = crate::search::grok::resolve_candidate_with_source(
-            target_path,
-            target_line,
-            semantic_end,
-            query,
-        )?;
+        let (target, content, _) = match occurrence {
+            Some(occurrence) => crate::search::grok::resolve_candidate_with_source_occurrence(
+                target_path,
+                target_line,
+                semantic_end,
+                query,
+                occurrence,
+            )?,
+            None => crate::search::grok::resolve_candidate_with_source(
+                target_path,
+                target_line,
+                semantic_end,
+                query,
+            )?,
+        };
         let span_start = target.span_start_line;
         let end = target.end_line;
         let body = content
@@ -700,6 +727,7 @@ fn unique_hit(
         line,
         name,
         scope: cwd.to_string_lossy().into(),
+        occurrence,
         glob: glob.map(str::to_string),
     };
     if glob.is_some() && !target.allows(&source_path, cwd) {
@@ -758,7 +786,7 @@ mod tests {
         let path = tmp.path().join("a.rs");
         std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
 
-        let (result, hints) = unique_hit("root", "symbol", &path, 3, None, tmp.path(), None)
+        let (result, hints) = unique_hit("root", "symbol", &path, 3, None, None, tmp.path(), None)
             .expect("fresh symbol resolution must replace the stale candidate line");
 
         assert_eq!(result["core"], "fn root() {}");
@@ -1145,7 +1173,12 @@ mod tests {
         let result = &response["results"][0];
         assert_eq!(result["resolved_as"], "ambiguous");
         assert_eq!(result["status"], "ambiguous");
-        assert_eq!(result["candidates"].as_array().unwrap().len(), 2);
+        let candidates = result["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate["occurrence"].is_array()));
+        assert_ne!(candidates[0]["occurrence"], candidates[1]["occurrence"]);
     }
 
     /// Built at runtime (not a single source literal) so the query itself

@@ -182,9 +182,28 @@ fn node_to_entry(
     let canonical = (spec.canonical_anchor)(node);
     let span_start_line = (spec.semantic_start)(node, canonical, lines);
     if spec.definition_wrappers.contains(&kind_str) {
-        let inner = node.child_by_field_name("definition")?;
-        let mut entry = node_to_entry(inner, lines, lang, depth)?;
-        entry.span_start_line = wrapper_span_start_line(node, inner, lines, lang);
+        let (mut entry, inner, unnamed_wrapper) =
+            if let Some(inner) = node.child_by_field_name("definition") {
+                (node_to_entry(inner, lines, lang, depth)?, inner, false)
+            } else {
+                // Some grammars, such as JavaScript, expose wrapped declarations as unnamed children.
+                let mut cursor = node.walk();
+                let mut found = None;
+                for child in node.children(&mut cursor) {
+                    if let Some(entry) = node_to_entry(child, lines, lang, depth) {
+                        found = Some((entry, child, true));
+                        break;
+                    }
+                }
+                found?
+            };
+        entry.span_start_line = if unnamed_wrapper {
+            entry
+                .span_start_line
+                .min(span_start_line.min(wrapper_span_start_line(node, inner, lines, lang)))
+        } else {
+            wrapper_span_start_line(node, inner, lines, lang)
+        };
         entry.end_line = entry.end_line.max(node.end_position().row as u32 + 1);
         return Some(entry);
     }
@@ -204,6 +223,8 @@ fn node_to_entry(
         | "protocol_function_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
+                .or_else(|| first_identifier_text(node, lines))
+                .or_else(|| extract_definition_name(node, lines))
                 .unwrap_or_else(|| {
                     // Swift deinit has no name field — use the node kind as name
                     if kind_str == "deinit_declaration" {
@@ -417,10 +438,9 @@ fn node_to_entry(
 }
 
 fn is_transparent_declaration_wrapper(node: tree_sitter::Node, lang: Lang) -> bool {
-    node.kind() == "export_statement"
-        || crate::lang::spec::spec(lang)
-            .definition_wrappers
-            .contains(&node.kind())
+    crate::lang::spec::spec(lang)
+        .definition_wrappers
+        .contains(&node.kind())
 }
 
 /// Canonical outline name for a single container node, with no child recursion.
@@ -1032,6 +1052,102 @@ pub(crate) fn get_deep_outline_entries(content: &str, lang: Lang) -> Vec<Outline
     deep_outline_entries(tree.root_node(), &lines, lang)
 }
 
+/// Parse the full declaration tree for consumers that need deep parent/sibling context.
+/// The regular outline remains shallow for display stability.
+pub(crate) fn get_deep_outline_tree(content: &str, lang: Lang) -> Vec<OutlineEntry> {
+    let Some((tree, lines)) = parse_outline(content, lang) else {
+        return Vec::new();
+    };
+    let mut located = Vec::new();
+    collect_located_entries(tree.root_node(), &lines, lang, &mut located);
+    let mut flat = deep_outline_entries(tree.root_node(), &lines, lang);
+    reconcile_semantic_spans(&mut located, &mut flat);
+    build_located_tree(located)
+}
+
+struct LocatedEntry {
+    start_byte: usize,
+    end_byte: usize,
+    entry: OutlineEntry,
+    children: Vec<OutlineEntry>,
+}
+
+fn collect_located_entries(
+    root: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    entries: &mut Vec<LocatedEntry>,
+) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if is_transparent_declaration_wrapper(node, lang) {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            pending.extend(children.into_iter().rev());
+            continue;
+        }
+        if let Some(mut entry) = node_to_entry(node, lines, lang, 1) {
+            if is_path_line_entry_kind(entry.kind) {
+                entry.children.clear();
+                entries.push(LocatedEntry {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    entry,
+                    children: Vec::new(),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
+    }
+}
+
+fn reconcile_semantic_spans(entries: &mut [LocatedEntry], flat: &mut Vec<OutlineEntry>) {
+    for located in entries {
+        if let Some(index) = flat.iter().position(|candidate| {
+            candidate.kind == located.entry.kind
+                && candidate.name == located.entry.name
+                && candidate.start_line == located.entry.start_line
+                && candidate.end_line == located.entry.end_line
+        }) {
+            let candidate = flat.remove(index);
+            located.entry.start_line = candidate.start_line;
+            located.entry.span_start_line = candidate.span_start_line;
+            located.entry.end_line = candidate.end_line;
+            located.entry.signature = candidate.signature;
+            located.entry.doc = candidate.doc;
+        }
+    }
+}
+
+fn build_located_tree(entries: Vec<LocatedEntry>) -> Vec<OutlineEntry> {
+    let mut roots = Vec::new();
+    let mut stack: Vec<LocatedEntry> = Vec::new();
+    for located in entries {
+        while stack.last().is_some_and(|parent| {
+            located.start_byte < parent.start_byte || located.end_byte > parent.end_byte
+        }) {
+            finish_located(&mut stack, &mut roots);
+        }
+        stack.push(located);
+    }
+    while !stack.is_empty() {
+        finish_located(&mut stack, &mut roots);
+    }
+    roots
+}
+
+fn finish_located(stack: &mut Vec<LocatedEntry>, roots: &mut Vec<OutlineEntry>) {
+    let mut located = stack.pop().expect("stack is non-empty");
+    located.entry.children = located.children;
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(located.entry);
+    } else {
+        roots.push(located.entry);
+    }
+}
+
 pub(crate) fn deep_outline_entries(
     root: tree_sitter::Node,
     lines: &[&str],
@@ -1043,28 +1159,41 @@ pub(crate) fn deep_outline_entries(
 }
 
 fn collect_deep_outline_entries(
-    node: tree_sitter::Node,
+    root: tree_sitter::Node,
     lines: &[&str],
     lang: Lang,
     entries: &mut Vec<OutlineEntry>,
 ) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.children(&mut cursor).collect();
-    for child in children.iter().copied() {
-        if is_transparent_declaration_wrapper(child, lang) {
-            let mut wrapper_cursor = child.walk();
-            for wrapped_child in child.children(&mut wrapper_cursor) {
-                collect_deep_outline_entries(wrapped_child, lines, lang, entries);
+    let mut pending = vec![(root, false)];
+    while let Some((node, expanded)) = pending.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        if expanded {
+            for mut entry in collect_sibling_entries(children.into_iter(), lines, lang, 1) {
+                if is_path_line_entry_kind(entry.kind) {
+                    entry.children.clear();
+                    entries.push(entry);
+                }
             }
-        } else {
-            collect_deep_outline_entries(child, lines, lang, entries);
+            continue;
         }
-    }
-    for mut entry in collect_sibling_entries(children.into_iter(), lines, lang, 1) {
-        if is_path_line_entry_kind(entry.kind) {
-            entry.children.clear();
-            entries.push(entry);
+
+        pending.push((node, true));
+        let mut traversal_children = Vec::new();
+        for child in children {
+            if is_transparent_declaration_wrapper(child, lang) {
+                let mut wrapper_cursor = child.walk();
+                traversal_children.extend(wrapper_cursor.node().children(&mut wrapper_cursor));
+            } else {
+                traversal_children.push(child);
+            }
         }
+        pending.extend(
+            traversal_children
+                .into_iter()
+                .rev()
+                .map(|child| (child, false)),
+        );
     }
 }
 
@@ -1504,6 +1633,18 @@ mod semantic_span_tests {
     }
 
     #[test]
+    fn javascript_export_wrapper_keeps_inner_declaration_shape() {
+        let entries = get_outline_entries("export function run() {}\n", Lang::JavaScript);
+        let entry = entries
+            .first()
+            .expect("exported function should be outlined");
+        assert_eq!(entry.kind, OutlineKind::Function);
+        assert_eq!(entry.name, "run");
+        assert_eq!(entry.start_line, 1);
+        assert_eq!(entry.span_start_line, 1);
+    }
+
+    #[test]
     fn python_wrapper_does_not_cross_blank_or_comment_separation() {
         let source = "@first\n\
                       \n\
@@ -1561,14 +1702,14 @@ mod semantic_span_tests {
             (
                 Lang::C,
                 "[[nodiscard]]\nint run() { return 0; }\n",
-                "<anonymous>",
+                "run",
                 2,
                 1,
             ),
             (
                 Lang::Cpp,
                 "[[nodiscard]]\nint run() { return 0; }\n",
-                "<anonymous>",
+                "run",
                 2,
                 1,
             ),
@@ -1588,19 +1729,32 @@ mod semantic_span_tests {
         }
     }
     #[test]
+    fn deep_outline_handles_pathological_ast_depth_iteratively() {
+        let depth = 1_000;
+        let source = format!(
+            "void run() {{\n{}{}{}\n",
+            "{\n".repeat(depth),
+            "}\n".repeat(depth),
+            "}\n",
+        );
+        let entries = super::get_deep_outline_entries(&source, Lang::C);
+        assert!(entries.iter().any(|entry| entry.name == "run"));
+    }
+
+    #[test]
     fn embedded_adornments_stop_at_blank_and_comment_gaps() {
         let cases = [
             (
                 Lang::C,
                 "[[nodiscard]]\n\nint run() { return 0; }\n",
-                "<anonymous>",
+                "run",
                 3,
                 3,
             ),
             (
                 Lang::Cpp,
                 "[[nodiscard]]\n\nint run() { return 0; }\n",
-                "<anonymous>",
+                "run",
                 3,
                 3,
             ),

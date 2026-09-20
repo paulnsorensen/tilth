@@ -412,6 +412,7 @@ fn walk_for_definitions(
                     node.start_position().row as u32 + 1,
                     node.end_position().row as u32 + 1,
                 )),
+                def_byte_range: Some((node.start_byte(), node.end_byte())),
                 def_name: Some(query.to_string()),
                 def_weight: (def_ops.weight)(node, lines),
                 impl_target: None,
@@ -442,6 +443,7 @@ fn walk_for_definitions(
                             node.start_position().row as u32 + 1,
                             node.end_position().row as u32 + 1,
                         )),
+                        def_byte_range: Some((node.start_byte(), node.end_byte())),
                         def_name: Some(format!("impl {query} for {impl_type}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
@@ -470,6 +472,7 @@ fn walk_for_definitions(
                         node.start_position().row as u32 + 1,
                         node.end_position().row as u32 + 1,
                     )),
+                    def_byte_range: Some((node.start_byte(), node.end_byte())),
                     def_name: Some(format!("{class_name} implements {query}")),
                     def_weight: 80,
                     impl_target: Some(query.to_string()),
@@ -498,6 +501,7 @@ fn walk_for_definitions(
                         node.start_position().row as u32 + 1,
                         node.end_position().row as u32 + 1,
                     )),
+                    def_byte_range: Some((node.start_byte(), node.end_byte())),
                     def_name: Some(query.to_string()),
                     def_weight: (def_ops.weight)(node, lines),
                     impl_target: None,
@@ -545,6 +549,7 @@ fn find_defs_heuristic_buf(
                 file_lines,
                 mtime,
                 def_range: None,
+                def_byte_range: None,
                 def_name: Some(query.to_string()),
                 def_weight: 60,
                 impl_target: None,
@@ -625,6 +630,7 @@ fn find_usages(
                             file_lines,
                             mtime,
                             def_range: None,
+                            def_byte_range: None,
                             def_name: None,
                             def_weight: 0,
                             impl_target: None,
@@ -757,6 +763,7 @@ fn emit_md_section_match(
         // Populating def_range lets the renderer expand to the section
         // body — the markdown analogue of a code definition's body.
         def_range: Some((heading_line, section_end)),
+        def_byte_range: Some((heading.start_byte(), heading.end_byte())),
         def_name: Some(query.to_string()),
         // Soft definition — code definitions are 60-80, usages 0. Sits
         // between them so docs headings outrank passing mentions but
@@ -1632,6 +1639,7 @@ Body to end.
             file_lines: 100,
             mtime: SystemTime::now(),
             def_range: None,
+            def_byte_range: None,
             def_name: None,
             def_weight: weight,
             impl_target: None,
