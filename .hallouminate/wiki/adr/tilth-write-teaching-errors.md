@@ -150,3 +150,15 @@ Session 2026-08-02; spec at the durable corpus
   (needs an intermediate carrying byte spans; pre-existing double parse for
   block anchors); a per-op normalized-`old` list on the status line.
 
+
+
+### ADR-008: Bounded write output preserves displayed-line provenance [status: accepted]
+
+- **Context:** A one-line edit currently returns the complete file. Repeated large-file edits consume the caller's context despite bounded source reads.
+- **Decision:** Bound source and optional diff output across the write response. Preserve each section's status, path, fresh tag, and reread guidance.
+- **Safety:** Keep complete snapshot text for stale-edit recovery. Mark only source lines present in the final response as displayed.
+- **Creation:** A successful create does not prove that the caller sees every line. Undisplayed anchors still require a targeted read.
+- **Alternatives:** Raising agent context limits masks amplification. Truncating after snapshot registration falsely authorizes hidden lines.
+- **Verification:** Test large files, long lines, multiple sections, partial failures, stale recovery, and `diff: true`.[^bounded-write]
+
+[^bounded-write]: `src/mcp/tools/write.rs`; `src/edit/snapshots.rs`; `src/edit/recovery.rs`. Decision: September 19, 2026, after the measured coder context-loss investigation. The implementation PR records gate results and release status.
