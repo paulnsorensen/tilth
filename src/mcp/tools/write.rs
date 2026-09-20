@@ -23,7 +23,7 @@ use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
-use crate::edit::tag::{compute_file_hash, format_header, render_numbered_whole};
+use crate::edit::tag::{compute_file_hash, format_header, render_numbered_slice};
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
@@ -63,10 +63,17 @@ pub(crate) fn tool_write(
 ) -> Result<String, String> {
     let (sections, cwd, show_diff) = parse_write_args(args)?;
 
+    let section_count = sections.len() as u64;
+    let metadata_reserve = section_count.saturating_mul(80);
+    let section_budget = WRITE_RESPONSE_BUDGET
+        .saturating_sub(metadata_reserve)
+        .checked_div(section_count.max(1))
+        .unwrap_or(0);
     let ctx = SectionCtx {
         cwd,
         session,
         show_diff,
+        section_budget,
     };
     let mut results: Vec<String> = Vec::with_capacity(sections.len());
     let mut seen_paths: HashSet<String> = HashSet::new();
@@ -97,6 +104,7 @@ struct SectionCtx<'a> {
     cwd: &'a Path,
     session: &'a Session,
     show_diff: bool,
+    section_budget: u64,
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
@@ -186,9 +194,16 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     })?;
     session.record_read(path);
 
-    // Record the fresh snapshot so a chained edit in a later call verifies.
-    let line_count = u32::try_from(new_text.split('\n').count()).unwrap_or(u32::MAX);
-    let new_tag = session.record_snapshot(path, &new_text, 1..=line_count);
+    // Render a bounded post-edit neighborhood before recording provenance.
+    // The snapshot keeps the whole source, but only rendered lines become anchors.
+    let first_changed = first_changed_line(&live, &new_text);
+    let (numbered, seen_lines, reread_hint) = render_changed_window(
+        &new_text,
+        first_changed,
+        path,
+        ctx.section_budget.saturating_sub(WRITE_DIFF_BUDGET),
+    );
+    let new_tag = session.record_snapshot(path, &new_text, seen_lines);
 
     // Decision 5: when the exact `old` failed and the whitespace-normalized
     // fallback landed the swap, say so on the status line so the model knows its
@@ -202,7 +217,13 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     match new_tag {
         Some(tag) => {
             let header = format_header(&path.display().to_string(), tag);
-            let _ = write!(block, "\n{header}\n{}", render_numbered_whole(&new_text));
+            let _ = write!(block, "\n{header}");
+            if !numbered.is_empty() {
+                let _ = write!(block, "\n{numbered}");
+            }
+            if let Some(hint) = reread_hint {
+                let _ = write!(block, "\n{hint}");
+            }
         }
         // Over the per-file snapshot cap: no tag minted. Mirror the read side's
         // note so the model knows why it cannot re-anchor a follow-up edit.
@@ -215,7 +236,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     }
     if ctx.show_diff {
-        block.push_str(&render_text_diff(Some(&live), &new_text));
+        block.push_str(&render_bounded_diff(Some(&live), &new_text));
     }
     Ok(block)
 }
@@ -245,7 +266,7 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
 /// any file op, and whether a `replace_text` resolved through whitespace
 /// normalization. On a matched tag with intact content, the seen-lines-gated
 /// apply runs; on a drifted (or tag-collided) tag, [`recover_edit`] runs; a
-/// tagless section seeds/edits against live directly (gate skipped).
+/// tagless section seeds/edits against live with synthetic empty provenance.
 fn resolve_edit(
     section: &Section,
     path: &Path,
@@ -256,7 +277,7 @@ fn resolve_edit(
     let live_tag = compute_file_hash(live);
 
     match section.tag {
-        // Tagless [path]: seed a new file or edit live with no provenance gate.
+        // Tagless [path]: seed a new file or edit live with no source-line provenance.
         None => {
             if section
                 .ops
@@ -293,8 +314,8 @@ fn resolve_edit(
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
             }
-            // The read's snapshot was evicted: synthetic over live (tag guards
-            // content; empty provenance skips the seen-lines gate).
+            // The read's snapshot was evicted: preserve the tag and source text,
+            // but do not authorize hidden source lines.
             let snap = synthetic_snapshot(&key, live, tag);
             let r =
                 gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
@@ -400,8 +421,9 @@ fn commit_file_op(
                 }
             })?;
             session.record_read(path);
-            let line_count = u32::try_from(content.split('\n').count()).unwrap_or(u32::MAX);
-            let new_tag = session.record_snapshot(path, content, 1..=line_count);
+            // CREATE does not echo the caller's source body, so it displays no
+            // content lines under the fresh tag.
+            let new_tag = session.record_snapshot(path, content, std::iter::empty());
             let mut block = format!("## {}\ncreated{suffix}", path.display());
             if let Some(tag) = new_tag {
                 let header = format_header(&path.display().to_string(), tag);
@@ -467,8 +489,97 @@ fn commit_file_op(
     }
 }
 
-/// A provenance-free snapshot standing in for a real read: empty `seen_lines`
-/// means the seen-lines gate is skipped (the tag still guards content).
+const WRITE_RESPONSE_BUDGET: u64 = 6_000;
+const WRITE_DIFF_BUDGET: u64 = 80;
+const WRITE_CONTEXT_LINES: u32 = 2;
+
+fn first_changed_line(before: &str, after: &str) -> Option<u32> {
+    let before_rows: Vec<&str> = before.split('\n').collect();
+    let after_rows: Vec<&str> = after.split('\n').collect();
+    let total = before_rows.len().max(after_rows.len());
+    (0..total)
+        .find(|&idx| before_rows.get(idx) != after_rows.get(idx))
+        .map(|idx| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+}
+
+fn render_changed_window(
+    text: &str,
+    first_changed: Option<u32>,
+    path: &Path,
+    content_budget: u64,
+) -> (String, Vec<u32>, Option<String>) {
+    let mut rows: Vec<&str> = text.split('\n').collect();
+    if text.ends_with('\n') {
+        rows.pop();
+    }
+    let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let Some(first) = first_changed else {
+        return (String::new(), Vec::new(), None);
+    };
+    if total == 0 {
+        return (String::new(), Vec::new(), None);
+    }
+    let lo = first.saturating_sub(WRITE_CONTEXT_LINES).max(1).min(total);
+    let hi = first.saturating_add(WRITE_CONTEXT_LINES).min(total).max(lo);
+    let start = usize::try_from(lo - 1).unwrap_or(0);
+    let end = usize::try_from(hi).unwrap_or(rows.len()).min(rows.len());
+    let focus = first.clamp(lo, hi);
+    let mut candidates = vec![focus];
+    candidates.extend((lo..=hi).filter(|line| *line != focus));
+    let mut rendered_rows: Vec<(u32, String)> = Vec::new();
+    let mut seen = Vec::new();
+    for line in candidates {
+        let index = usize::try_from(line.saturating_sub(1)).unwrap_or(0);
+        let Some(row) = rows.get(index) else {
+            continue;
+        };
+        let numbered = render_numbered_slice(row, line);
+        let combined_len = rendered_rows
+            .iter()
+            .map(|(_, part)| part.len())
+            .sum::<usize>()
+            .saturating_add(numbered.len())
+            .saturating_add(rendered_rows.len());
+        if crate::types::estimate_tokens(combined_len as u64) <= content_budget {
+            rendered_rows.push((line, numbered));
+            seen.push(line);
+        }
+    }
+    rendered_rows.sort_unstable_by_key(|(line, _)| *line);
+    let rendered = rendered_rows
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omitted_window = seen.len() < end.saturating_sub(start);
+    let hint = (omitted_window || lo > 1 || hi < total).then(|| {
+        let reread_lo = if omitted_window {
+            lo
+        } else if lo > 1 {
+            1
+        } else {
+            hi + 1
+        };
+        let reread_hi = reread_lo.saturating_add(59).min(total);
+        format!(
+            "... omitted lines {}-{}; re-read {}#{}-{}",
+            reread_lo,
+            total,
+            path.display(),
+            reread_lo,
+            reread_hi
+        )
+    });
+    (rendered, seen, hint)
+}
+
+fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
+    let diff = render_text_diff(before, after);
+    crate::budget::apply_item(&diff, WRITE_DIFF_BUDGET, WRITE_RESPONSE_BUDGET)
+}
+
+/// A synthetic snapshot preserves the tag and full source after provenance
+/// eviction, but it marks no source lines as displayed.
 fn synthetic_snapshot(key: &str, text: &str, tag: u16) -> Snapshot {
     Snapshot {
         path: key.to_string(),
@@ -2284,5 +2395,408 @@ mod tests {
             "fn b() {}\n",
             "the rejected section must not touch its file"
         );
+    }
+
+    #[test]
+    fn large_one_line_edit_does_not_echo_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("large.txt");
+        let original = (1..=1031)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 1, "end": 1, "content": "changed" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert!(
+            out.contains("1:changed"),
+            "changed line must remain visible: {out}"
+        );
+        assert!(
+            !out.contains("1031:line 1031"),
+            "write output must not echo the whole file: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.len() < 20_000,
+            "bounded output grew to {} bytes",
+            out.len()
+        );
+    }
+
+    fn tag_from_output(path: &Path, output: &str) -> String {
+        let marker = format!("{}#", path.display());
+        let idx = output
+            .find(&marker)
+            .unwrap_or_else(|| panic!("write must emit [path#TAG] header, got:\n{output}"));
+        output[idx + marker.len()..].chars().take(4).collect()
+    }
+
+    #[test]
+    fn diff_output_stays_bounded_for_a_large_one_line_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("large-diff.txt");
+        let original = (1..=1031)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 1, "end": 1, "content": "changed" }])
+                ),
+                "diff": true,
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("write with diff");
+        assert!(
+            out.contains("── diff ──"),
+            "diff heading must remain visible: {out}"
+        );
+        assert!(
+            !out.contains("1031:line 1031"),
+            "diff must not echo the whole file"
+        );
+        assert!(
+            out.len() < 20_000,
+            "bounded diff output grew to {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn omitted_lines_are_not_authorized_by_the_fresh_write_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("hidden.rs");
+        let original = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let initial_tag = read_for_tag(&session, &p);
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&initial_tag),
+                    json!([{ "op": "replace", "start": 1, "end": 1, "content": "changed" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("first write");
+        let fresh_tag = tag_from_output(&p, &out);
+        let err = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&fresh_tag),
+                    json!([{ "op": "replace", "start": 50, "end": 50, "content": "hidden" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect_err("hidden line must require a reread");
+        assert!(
+            err.contains("never displayed"),
+            "expected provenance error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            format!(
+                "changed\n{}",
+                (2..=100)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        );
+    }
+
+    #[test]
+    fn create_tag_does_not_authorize_source_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("created.rs");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (session, bloom) = services();
+        let created = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    None,
+                    json!([{ "op": "create_file", "content": content }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("create");
+        let tag = tag_from_output(&p, &created);
+        let err = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 2, "end": 2, "content": "hidden" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect_err("create source body was not displayed");
+        assert!(
+            err.contains("never displayed"),
+            "expected create provenance error: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+    }
+    #[test]
+    fn huge_single_line_edit_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("huge.txt");
+        let original = "x".repeat(200_000);
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let tag = session
+            .record_snapshot(&p, &original, [1])
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 1, "end": 1, "content": "changed" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("huge line write");
+        assert!(
+            out.contains("1:changed"),
+            "changed line must remain visible: {out}"
+        );
+        assert!(
+            !out.contains(&original[..1024]),
+            "source line leaked into output"
+        );
+        assert!(
+            crate::types::estimate_tokens(out.len() as u64) <= WRITE_RESPONSE_BUDGET,
+            "single-line response exceeded budget: {} bytes",
+            out.len()
+        );
+        assert_eq!(
+            session.snapshots().head(&p).unwrap().seen_lines,
+            HashSet::from([1]),
+            "provenance must match the displayed line"
+        );
+    }
+
+    #[test]
+    fn twenty_sections_bound_source_and_diff_and_preserve_each_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let (session, bloom) = services();
+        let mut sections = Vec::new();
+        let mut paths = Vec::new();
+        for index in 0..20 {
+            let p = root.join(format!("batch-{index}.txt"));
+            let original = (1..=50)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&p, &original).unwrap();
+            let tag = session
+                .record_snapshot(&p, &original, [1])
+                .map(|tag| format!("{tag:04X}"))
+                .unwrap();
+            sections.push(json!({
+                "path": p.to_str().unwrap(),
+                "tag": tag,
+                "ops": [{ "op": "replace", "start": 1, "end": 1, "content": format!("changed {index}") }]
+            }));
+            paths.push(p);
+        }
+        let out = tool_write(
+            &json!({"edits": sections, "diff": true, "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("twenty-section write");
+        assert!(
+            crate::types::estimate_tokens(out.len() as u64) <= WRITE_RESPONSE_BUDGET,
+            "aggregate response exceeded budget: {} bytes",
+            out.len()
+        );
+        for p in paths {
+            let marker = format!("## {}\n", p.display());
+            let start = out.find(&marker).unwrap();
+            let rest = &out[start..];
+            let block = rest.split("\n\n---\n\n").next().unwrap();
+            assert!(
+                block.contains("applied"),
+                "missing success for {p:?}: {block}"
+            );
+            let fresh_tag = format!("{:04X}", session.snapshots().head(&p).unwrap().tag);
+            assert!(
+                block.contains(&format!("[{}#{}]", p.display(), fresh_tag)),
+                "missing fresh tag for {p:?}: {block}"
+            );
+            assert!(
+                block.contains("── diff ──"),
+                "missing diff for {p:?}: {block}"
+            );
+            let displayed: HashSet<u32> = block
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter_map(|(line, _)| line.parse().ok())
+                .collect();
+            assert_eq!(
+                session.snapshots().head(&p).unwrap().seen_lines,
+                displayed,
+                "seen lines must equal displayed lines for {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_failure_keeps_long_error_and_bounded_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let good = root.join("good.txt");
+        let original = "one\ntwo\nthree\n";
+        std::fs::write(&good, original).unwrap();
+        let bad = std::path::PathBuf::from(format!("{}bad.txt", "../".repeat(180)));
+        let (session, bloom) = services();
+        let tag = session
+            .record_snapshot(&good, original, [1])
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
+        let out = tool_write(
+            &json!({
+                "edits": [
+                    {"path": good.to_str().unwrap(), "tag": tag, "ops": [{"op": "replace", "start": 1, "end": 1, "content": "ONE"}]},
+                    {"path": bad.to_str().unwrap(), "tag": "0000", "ops": [{"op": "replace", "start": 1, "end": 1, "content": "bad"}]}
+                ],
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("mixed calls return successful result");
+        assert!(
+            out.contains("## "),
+            "section statuses must remain visible: {out}"
+        );
+        assert!(out.contains("applied"), "success status was lost: {out}");
+        assert!(
+            out.contains(bad.to_string_lossy().as_ref()),
+            "long error path was lost"
+        );
+        assert!(out.contains("escapes"), "failure reason was lost: {out}");
+        assert!(
+            out.len() < 20_000,
+            "successful output was not bounded: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn stale_recovery_emits_fresh_tag_and_keeps_hidden_anchors_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("stale.txt");
+        let original = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let initial_tag = session
+            .record_snapshot(&p, &original, [2])
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
+        std::fs::write(&p, format!("external\n{original}")).unwrap();
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&initial_tag),
+                    json!([{ "op": "replace", "start": 2, "end": 2, "content": "updated" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("stale edit recovers");
+        let fresh_tag = tag_from_output(&p, &out);
+        let current = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            fresh_tag,
+            format!("{:04X}", compute_file_hash(&current)),
+            "write tag must match recovered full source"
+        );
+        assert!(
+            out.contains("updated"),
+            "recovered output lost status/content: {out}"
+        );
+        let err = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&fresh_tag),
+                    json!([{ "op": "replace", "start": 90, "end": 90, "content": "hidden" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect_err("hidden stale anchor must require a reread");
+        assert!(
+            err.contains("never displayed"),
+            "missing provenance error: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), current);
     }
 }

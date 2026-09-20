@@ -39,8 +39,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// The first anchor this snapshot never displayed, or `None` if all were
-    /// seen. A snapshot with no recorded provenance (empty `seen_lines`) admits
-    /// every anchor.
+    /// seen. An empty `seen_lines` set means that no source lines were displayed.
     ///
     /// Sole owner of the seen-lines rule: the gate and the session-chain replay
     /// enforce it on different text and report it differently, but both ask
@@ -49,9 +48,6 @@ impl Snapshot {
         &self,
         anchors: impl IntoIterator<Item = u32>,
     ) -> Option<u32> {
-        if self.seen_lines.is_empty() {
-            return None;
-        }
         anchors.into_iter().find(|a| !self.seen_lines.contains(a))
     }
 

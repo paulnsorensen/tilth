@@ -150,18 +150,13 @@ fn replay_session_chain(
 }
 
 /// seenLines gate for the no-drift path: reject an edit anchored on a line the
-/// producer never displayed under this tag. A snapshot with no recorded
-/// provenance (empty `seen_lines`) skips the check.
+/// producer never displayed under this tag. An empty `seen_lines` set rejects
+/// every source anchor because the producer displayed no source lines.
 ///
 /// `replace_text` is tolerant: its resolved span need only OVERLAP the seen set
 /// by one line (the model saw part of the text it is replacing). Line, insert,
 /// and block ops stay strict — every anchored line must have been displayed.
 pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    // Whole-file / outline reads record no provenance and admit every anchor.
-    if snapshot.seen_lines.is_empty() {
-        return Ok(());
-    }
-
     check_text_swap_overlap(snapshot, ops)?;
     check_strict_anchors(snapshot, path, ops)
 }
@@ -236,9 +231,8 @@ fn reread_span(region: (u32, u32), ranges: &[(u32, u32)], total: u32) -> (u32, u
             0
         }
     });
-    // Empty provenance is filtered before the gate runs, so `nearest` is Some in
-    // every reachable call; `unwrap_or(region)` is a total fallback for a path
-    // reachable calls never take.
+    // Empty provenance has no nearest displayed range; `unwrap_or(region)` keeps
+    // the reread calculation total while still naming the anchor region.
     let (r_lo, r_hi) = nearest.copied().unwrap_or(region);
     let mut lo = a_lo.min(r_lo);
     let mut hi = a_hi.max(r_hi);
@@ -553,7 +547,8 @@ mod tests {
         let key = p().to_string_lossy().into_owned();
         // v1 (stale tag the model will anchor against).
         let v1 = "a\nb\nTARGET\nd\n";
-        let tag1 = store.record(&key, v1, []).unwrap();
+        // The stale tag displayed its target line before the later snapshot.
+        let tag1 = store.record(&key, v1, [3u32]).unwrap();
         // v2 is the head — an in-session edit changed line 2 (b → MODIFIED).
         let v2 = "a\nMODIFIED\nTARGET\nd\n";
         store.record(&key, v2, []).unwrap();
@@ -606,13 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_seen_lines_skips_gate() {
+    fn empty_seen_lines_rejects_every_anchor() {
         let mut store = SnapshotStore::new();
         let key = p().to_string_lossy().into_owned();
         let tag = store.record(&key, "l1\nl2\n", []).unwrap();
         let snap = store.by_tag(&key, tag).unwrap();
-        // No provenance recorded → gate is skipped.
-        assert!(check_seen_lines(&snap, &p(), &swap(2, "x")).is_ok());
+        // No source lines were displayed, so every anchored edit requires a reread.
+        assert!(check_seen_lines(&snap, &p(), &swap(2, "x")).is_err());
     }
 
     #[test]
