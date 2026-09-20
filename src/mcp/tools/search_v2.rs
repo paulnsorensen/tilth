@@ -394,7 +394,7 @@ fn route_query(
             ) {
                 let target_spec = format!("{query}:1");
                 let (mut result, hints) =
-                    unique_hit(&target_spec, "path", &candidate, 1, cwd, glob)?;
+                    unique_hit(&target_spec, "path", &candidate, 1, None, None, cwd, glob)?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
@@ -495,12 +495,40 @@ fn route_identifier(
         })
         .cloned()
         .collect();
-    code_defs.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    code_defs.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+    code_defs.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.def_range.cmp(&b.def_range))
+            // Prefer the innermost declaration when a wrapper and its body share a span.
+            .then(b.def_byte_range.cmp(&a.def_byte_range))
+    });
+    code_defs.dedup_by(|a, b| {
+        let overlapping_occurrence = match (a.def_byte_range, b.def_byte_range) {
+            (Some((a_start, a_end)), Some((b_start, b_end))) => a_start < b_end && b_start < a_end,
+            _ => a.def_byte_range == b.def_byte_range,
+        };
+        let same_declaration = a.path == b.path && a.line == b.line && a.def_range == b.def_range;
+        if same_declaration && overlapping_occurrence {
+            // Wrapper and body entries describe one declaration; retain legacy path:line hints.
+            a.def_byte_range = None;
+            true
+        } else {
+            false
+        }
+    });
     if code_defs.len() == 1 {
         let target = &code_defs[0];
-        let (mut result, hints) =
-            unique_hit(query, "symbol", &target.path, target.line, cwd, glob)?;
+        let (mut result, hints) = unique_hit(
+            query,
+            "symbol",
+            &target.path,
+            target.line,
+            target.def_range.map(|(_, end)| end),
+            target.def_byte_range,
+            cwd,
+            glob,
+        )?;
         if discovery_partial {
             mark_partial(&mut result);
         }
@@ -624,6 +652,7 @@ fn candidates(matches: &[Match], cwd: &Path) -> Vec<Value> {
                 "line": m.line,
                 "is_definition": m.is_definition,
                 "def_name": m.def_name,
+                "occurrence": m.def_byte_range,
             })
         })
         .collect()
@@ -646,6 +675,8 @@ fn unique_hit(
     resolved_as: &str,
     target_path: &Path,
     target_line: u32,
+    semantic_end: Option<u32>,
+    occurrence: Option<(usize, usize)>,
     cwd: &Path,
     glob: Option<&str>,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
@@ -660,21 +691,35 @@ fn unique_hit(
         let core_partial = content.lines().count() > 60;
         (target_path.to_path_buf(), None, None, body, core_partial)
     } else {
-        let (target, content, _) =
-            crate::search::grok::resolve_candidate_with_source(target_path, target_line, query)?;
-        let (start, end) = (target.start_line, target.end_line);
+        let (target, content, _) = match occurrence {
+            Some(occurrence) => crate::search::grok::resolve_candidate_with_source_occurrence(
+                target_path,
+                target_line,
+                semantic_end,
+                query,
+                occurrence,
+            )?,
+            None => crate::search::grok::resolve_candidate_with_source(
+                target_path,
+                target_line,
+                semantic_end,
+                query,
+            )?,
+        };
+        let span_start = target.span_start_line;
+        let end = target.end_line;
         let body = content
             .lines()
-            .skip(start.saturating_sub(1) as usize)
-            .take((end - start + 1).min(60) as usize)
+            .skip(span_start.saturating_sub(1) as usize)
+            .take((end - span_start + 1).min(60) as usize)
             .collect::<Vec<_>>()
             .join("\n");
         (
             target.path,
-            Some(start),
+            Some(target.start_line),
             Some(target.name),
             body,
-            end - start + 1 > 60,
+            end - span_start + 1 > 60,
         )
     };
     let target = Target {
@@ -682,6 +727,7 @@ fn unique_hit(
         line,
         name,
         scope: cwd.to_string_lossy().into(),
+        occurrence,
         glob: glob.map(str::to_string),
     };
     if glob.is_some() && !target.allows(&source_path, cwd) {
@@ -740,7 +786,7 @@ mod tests {
         let path = tmp.path().join("a.rs");
         std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
 
-        let (result, hints) = unique_hit("root", "symbol", &path, 3, tmp.path(), None)
+        let (result, hints) = unique_hit("root", "symbol", &path, 3, None, None, tmp.path(), None)
             .expect("fresh symbol resolution must replace the stale candidate line");
 
         assert_eq!(result["core"], "fn root() {}");
@@ -953,11 +999,27 @@ mod tests {
     }
 
     #[test]
-    fn route_path_routes_non_code_file_to_text_search() {
-        let resp = single_query("Cargo.lock").expect("path query succeeds");
+    fn route_non_code_path_reports_bounded_content_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.json"), "{}\n").unwrap();
+        for index in 0..11 {
+            std::fs::write(
+                tmp.path().join(format!("reference-{index}.txt")),
+                "load notes.json\n",
+            )
+            .unwrap();
+        }
+
+        let resp = call(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "notes.json"}],
+        }))
+        .expect("path query succeeds");
         let result = &resp["results"][0];
         assert_eq!(result["resolved_as"], "path");
-        assert_eq!(result["status"], "ok");
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["completeness"], "partial");
+        assert!(result["total_found"].as_u64().unwrap() > 10);
     }
 
     #[test]
@@ -1096,6 +1158,27 @@ mod tests {
     fn route_ambiguous_resolves_multi_definition_identifier() {
         let resp = single_query("run").expect("ambiguous query succeeds");
         assert_eq!(resp["results"][0]["resolved_as"], "ambiguous");
+    }
+
+    #[test]
+    fn same_line_same_name_definitions_remain_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("nested.js"),
+            "function run() { function run() {}\n  return 1;\n}\n",
+        )
+        .unwrap();
+
+        let response = call(&json!({"cwd": tmp.path(), "queries": [{"query": "run"}]})).unwrap();
+        let result = &response["results"][0];
+        assert_eq!(result["resolved_as"], "ambiguous");
+        assert_eq!(result["status"], "ambiguous");
+        let candidates = result["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate["occurrence"].is_array()));
+        assert_ne!(candidates[0]["occurrence"], candidates[1]["occurrence"]);
     }
 
     /// Built at runtime (not a single source literal) so the query itself

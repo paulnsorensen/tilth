@@ -1,6 +1,6 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 /// Definition node kinds across tree-sitter grammars.
@@ -37,6 +37,7 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "impl_item",
     "mod_item",
     "namespace_definition",
+    "internal_module",
     // Python
     "decorated_definition",
     "type_declaration",
@@ -209,28 +210,63 @@ pub(crate) fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Opti
     Some(node_text_simple(type_node, lines, NodeTextMode::Full))
 }
 
-/// Extract implemented interface names from TS/Java class declaration.
-/// Walks `implements_clause` (TS) and `super_interfaces` (Java) children.
+/// Extract implemented interface names from TypeScript and Java classes.
+///
+/// Only each top-level interface type contributes a name. Generic arguments
+/// are not themselves implemented interfaces.
 pub(crate) fn extract_implemented_interfaces(
     node: tree_sitter::Node,
     lines: &[&str],
 ) -> Vec<String> {
     let mut interfaces = Vec::new();
+    let mut seen = HashSet::new();
+    collect_implemented_clauses(node, lines, &mut interfaces, &mut seen);
+    interfaces
+}
+
+fn collect_implemented_clauses(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    interfaces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    for child in node.named_children(&mut cursor) {
         if child.kind() == "implements_clause" || child.kind() == "super_interfaces" {
-            let mut inner = child.walk();
-            for ident in child.children(&mut inner) {
-                if ident.kind().contains("identifier") {
-                    let text = node_text_simple(ident, lines, NodeTextMode::Full);
-                    if !text.is_empty() {
-                        interfaces.push(text);
-                    }
-                }
-            }
+            collect_interface_types(child, lines, interfaces, seen);
+        } else if child.kind() == "class_heritage" {
+            collect_implemented_clauses(child, lines, interfaces, seen);
         }
     }
-    interfaces
+}
+
+fn collect_interface_types(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    interfaces: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "implements_clause" | "super_interfaces" | "type_list"
+        ) {
+            collect_interface_types(child, lines, interfaces, seen);
+            continue;
+        }
+        let text = node_text_simple(child, lines, NodeTextMode::Full);
+        let base = text.split('<').next().unwrap_or_default();
+        let name = base
+            .rsplit(['.', ':'])
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<String>();
+        if !name.is_empty() && seen.insert(name.clone()) {
+            interfaces.push(name);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

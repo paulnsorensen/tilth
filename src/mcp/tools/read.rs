@@ -548,7 +548,8 @@ fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
     let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
         return SymbolLookup::PreconditionFailed;
     };
-    let entries = crate::lang::outline::get_outline_entries(&content, lang);
+    // Symbol selectors use the deep semantic index; display outlines remain shallow.
+    let entries = crate::lang::outline::get_deep_outline_entries(&content, lang);
     match find_symbol_entry(&entries, name) {
         Some((s, e)) => SymbolLookup::Found(s, e),
         None => SymbolLookup::Missing,
@@ -825,6 +826,23 @@ mod tests {
 
     fn services() -> (Session, OutlineCache) {
         (Session::new(), OutlineCache::new())
+    }
+
+    #[test]
+    fn symbol_read_resolves_doubly_nested_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.rs");
+        std::fs::write(
+            &path,
+            "mod outer {\n    mod inner {\n        fn target() {\n            let value = 1;\n        }\n    }\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_symbol_range(&path, "target"),
+            Some((3, 5)),
+            "symbol lookup must reach definitions below the shallow display outline"
+        );
     }
 
     #[test]

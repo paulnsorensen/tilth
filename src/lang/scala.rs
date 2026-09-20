@@ -28,4 +28,23 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::JavaKotlinCSharp),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,
+    definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
+    canonical_anchor: crate::lang::scala::canonical_anchor,
+    attach_leading_adornment: crate::lang::scala::attach_leading_adornment,
+    semantic_start: crate::lang::spec::embedded_semantic_start,
 };
+
+pub(crate) fn canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
+    crate::lang::spec::keyword_canonical_anchor(
+        node,
+        &["class", "trait", "object", "enum", "def", "val", "var"],
+    )
+}
+
+pub(crate) fn attach_leading_adornment(
+    adornment: tree_sitter::Node,
+    _definition: Option<tree_sitter::Node>,
+    _lines: &[&str],
+) -> bool {
+    crate::lang::spec::adornment_kind(adornment, &["annotation", "modifiers", "access_modifier"])
+}

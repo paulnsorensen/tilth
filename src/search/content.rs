@@ -116,6 +116,7 @@ pub fn search(
                             file_lines,
                             mtime,
                             def_range: None,
+                            def_byte_range: None,
                             def_name: None,
                             def_weight: 0,
                             impl_target: None,

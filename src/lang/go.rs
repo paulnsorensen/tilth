@@ -77,6 +77,10 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::Go),
     extract_receiver: Some(extract_go_receiver_name),
     definitions: DEFAULT_DEFS,
+    canonical_anchor: crate::lang::spec::default_canonical_anchor,
+    definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
+    attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
+    semantic_start: crate::lang::spec::default_semantic_start,
 };
 
 /// For Go methods, extract the receiver parameter name from the first method

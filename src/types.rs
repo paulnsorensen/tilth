@@ -117,9 +117,12 @@ pub struct Match {
     pub exact: bool,
     pub file_lines: u32,
     pub mtime: SystemTime,
-    /// Line range of the enclosing definition node (for expand).
+    /// Semantic ownership range of the resolved definition.
     /// Populated by tree-sitter for definitions; None for usages.
+    /// The start may precede `line` when leading syntax belongs to the definition.
     pub def_range: Option<(u32, u32)>,
+    /// Stable source-byte occurrence identity for declarations sharing a line/span.
+    pub def_byte_range: Option<(usize, usize)>,
     /// The defined symbol name (populated from AST during definition detection).
     pub def_name: Option<String>,
     /// Semantic weight for definition kinds. 0 for usages.
@@ -167,7 +170,10 @@ pub struct FacetTotals {
 pub struct OutlineEntry {
     pub kind: OutlineKind,
     pub name: String,
+    /// Canonical declaration anchor used for display and symbol identity.
     pub start_line: u32,
+    /// Semantic ownership start used for containment and source ranges.
+    pub span_start_line: u32,
     pub end_line: u32,
     pub signature: Option<String>,
     pub children: Vec<OutlineEntry>,

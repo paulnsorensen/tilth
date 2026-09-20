@@ -323,6 +323,33 @@ fn find_defs_treesitter(
         root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
     );
 
+    if !defs.is_empty() {
+        if let Some(lang) = lang {
+            let deep_entries = crate::lang::outline::deep_outline_entries(root, &lines, lang);
+            for definition in &mut defs {
+                let Some(raw_range) = definition.def_range else {
+                    continue;
+                };
+                let entry = crate::lang::outline::find_entry_for_definition(
+                    &deep_entries,
+                    definition.def_name.as_deref(),
+                    definition.line,
+                    raw_range,
+                    definition.impl_target.as_deref(),
+                );
+                if let Some(entry) = entry {
+                    definition.line = entry.start_line;
+                    definition.text = lines
+                        .get(entry.start_line.saturating_sub(1) as usize)
+                        .unwrap_or(&"")
+                        .trim_end()
+                        .to_string();
+                    definition.def_range = Some((entry.span_start_line, entry.end_line));
+                }
+            }
+        }
+    }
+
     defs
 }
 
@@ -385,6 +412,7 @@ fn walk_for_definitions(
                     node.start_position().row as u32 + 1,
                     node.end_position().row as u32 + 1,
                 )),
+                def_byte_range: Some((node.start_byte(), node.end_byte())),
                 def_name: Some(query.to_string()),
                 def_weight: (def_ops.weight)(node, lines),
                 impl_target: None,
@@ -415,6 +443,7 @@ fn walk_for_definitions(
                             node.start_position().row as u32 + 1,
                             node.end_position().row as u32 + 1,
                         )),
+                        def_byte_range: Some((node.start_byte(), node.end_byte())),
                         def_name: Some(format!("impl {query} for {impl_type}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
@@ -443,6 +472,7 @@ fn walk_for_definitions(
                         node.start_position().row as u32 + 1,
                         node.end_position().row as u32 + 1,
                     )),
+                    def_byte_range: Some((node.start_byte(), node.end_byte())),
                     def_name: Some(format!("{class_name} implements {query}")),
                     def_weight: 80,
                     impl_target: Some(query.to_string()),
@@ -471,6 +501,7 @@ fn walk_for_definitions(
                         node.start_position().row as u32 + 1,
                         node.end_position().row as u32 + 1,
                     )),
+                    def_byte_range: Some((node.start_byte(), node.end_byte())),
                     def_name: Some(query.to_string()),
                     def_weight: (def_ops.weight)(node, lines),
                     impl_target: None,
@@ -518,6 +549,7 @@ fn find_defs_heuristic_buf(
                 file_lines,
                 mtime,
                 def_range: None,
+                def_byte_range: None,
                 def_name: Some(query.to_string()),
                 def_weight: 60,
                 impl_target: None,
@@ -598,6 +630,7 @@ fn find_usages(
                             file_lines,
                             mtime,
                             def_range: None,
+                            def_byte_range: None,
                             def_name: None,
                             def_weight: 0,
                             impl_target: None,
@@ -730,6 +763,7 @@ fn emit_md_section_match(
         // Populating def_range lets the renderer expand to the section
         // body — the markdown analogue of a code definition's body.
         def_range: Some((heading_line, section_end)),
+        def_byte_range: Some((heading.start_byte(), heading.end_byte())),
         def_name: Some(query.to_string()),
         // Soft definition — code definitions are 60-80, usages 0. Sits
         // between them so docs headings outrank passing mentions but
@@ -899,6 +933,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
                 file_lines,
                 SystemTime::now(),
             );
+
             assert_eq!(defs.len(), 1, "{query}: expected one definition");
             let def = &defs[0];
             assert!(
@@ -914,6 +949,124 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             );
             assert_eq!(def.def_weight, 80, "{query}: const/var weight");
         }
+    }
+
+    #[test]
+    fn python_continued_header_reconciles_canonical_line_and_semantic_range() {
+        let code = "@logged\nasync \\\ndef blocked():\n    return True\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Python).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.py"),
+            "blocked",
+            &ts_lang,
+            Some(crate::types::Lang::Python),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+        let definition = defs
+            .first()
+            .expect("continued Python definition should match");
+        assert_eq!(definition.line, 3);
+        assert_eq!(definition.text, "def blocked():");
+        assert_eq!(definition.def_range, Some((1, 4)));
+    }
+
+    #[test]
+    fn deep_attributed_definition_reconciles_semantic_range() {
+        let code = "pub mod a {\n    pub mod b {\n        #[inline]\n        pub fn method() {}\n    }\n}\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.rs"),
+            "method",
+            &ts_lang,
+            Some(crate::types::Lang::Rust),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+
+        let definition = defs.first().expect("nested method should match");
+        assert_eq!(definition.line, 4);
+        assert_eq!(definition.text.trim(), "pub fn method() {}");
+        assert_eq!(definition.def_range, Some((3, 4)));
+    }
+
+    #[test]
+    fn annotated_interface_implementation_reconciles_canonical_line() {
+        let code = "@Deprecated\nclass Runner implements Task {}\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Java).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("Runner.java"),
+            "Task",
+            &ts_lang,
+            Some(crate::types::Lang::Java),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+
+        let implementation = defs.first().expect("interface implementation should match");
+        assert_eq!(implementation.line, 2);
+        assert_eq!(
+            implementation.text.trim(),
+            "class Runner implements Task {}"
+        );
+        assert_eq!(implementation.def_range, Some((1, 2)));
+    }
+
+    #[test]
+    fn generic_arguments_are_not_implemented_interfaces() {
+        let cases = [
+            (
+                crate::types::Lang::Java,
+                "Worker.java",
+                "class Worker implements Handler<Request> {}\n",
+            ),
+            (
+                crate::types::Lang::TypeScript,
+                "worker.ts",
+                "class Worker implements Handler<Request> {}\n",
+            ),
+        ];
+        for (lang, path, code) in cases {
+            let ts_lang = crate::lang::outline::outline_language(lang).unwrap();
+            let find = |query| {
+                find_defs_treesitter(
+                    std::path::Path::new(path),
+                    query,
+                    &ts_lang,
+                    Some(lang),
+                    code,
+                    code.lines().count() as u32,
+                    SystemTime::now(),
+                )
+            };
+            assert_eq!(find("Handler").len(), 1, "{lang:?} base interface");
+            assert!(find("Request").is_empty(), "{lang:?} generic argument");
+        }
+    }
+
+    #[test]
+    fn same_name_declarations_on_one_line_keep_distinct_ranges() {
+        let code = "function run() { function run() {}\n  return 1;\n}\n";
+        let lang = crate::types::Lang::JavaScript;
+        let ts_lang = crate::lang::outline::outline_language(lang).unwrap();
+        let matches = find_defs_treesitter(
+            std::path::Path::new("nested.js"),
+            "run",
+            &ts_lang,
+            Some(lang),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+        let mut ranges: Vec<_> = matches
+            .into_iter()
+            .map(|definition| definition.def_range.unwrap())
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(1, 1), (1, 3)]);
     }
 
     #[test]
@@ -1486,6 +1639,7 @@ Body to end.
             file_lines: 100,
             mtime: SystemTime::now(),
             def_range: None,
+            def_byte_range: None,
             def_name: None,
             def_weight: weight,
             impl_target: None,

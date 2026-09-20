@@ -11,7 +11,7 @@ use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
+use crate::lang::outline::{find_entry_by_start_line, get_outline_entries};
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
 use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
 use crate::search::search_symbol_raw;
@@ -23,6 +23,7 @@ pub struct ResolvedTarget {
     pub name: String,
     pub path: PathBuf,
     pub start_line: u32,
+    pub span_start_line: u32,
     pub end_line: u32,
     pub kind: OutlineKind,
     pub signature: Option<String>,
@@ -82,6 +83,53 @@ pub(crate) fn resolve_with_source(
             resolve_by_path_line(&path, line)
         }
     }
+}
+
+/// Resolve a path/line target by its stable source-byte occurrence identity.
+/// The identity prevents same-line declarations from being re-resolved by line alone.
+pub(crate) fn resolve_with_source_occurrence(
+    spec: &str,
+    name: &str,
+    occurrence: (usize, usize),
+    scope: &Path,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    let TargetSpec::PathLine { path, line } = parse_target_spec(spec) else {
+        return Err(TilthError::InvalidQuery {
+            query: spec.to_string(),
+            reason: "occurrence-aware resolution requires a path:line target".to_string(),
+        });
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        scope.join(path)
+    };
+    let result = search_symbol_raw(name, scope, None)?;
+    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
+        path: path.clone(),
+        source,
+    })?;
+    let candidate = result.matches.iter().find(|candidate| {
+        candidate.is_definition
+            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
+            && candidate.line == line
+            && candidate.def_name.as_deref() == Some(name)
+            && candidate.def_byte_range == Some(occurrence)
+    });
+    let Some(candidate) = candidate else {
+        return Err(TilthError::NotFound {
+            path,
+            suggestion: Some("target occurrence changed; search again".to_string()),
+        });
+    };
+    enrich_from_outline(
+        candidate.path.clone(),
+        candidate.line,
+        candidate.def_range.map(|(_, end)| end),
+        name.to_string(),
+        0,
+        false,
+    )
 }
 
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
@@ -160,6 +208,7 @@ fn resolve_def_by_query(
         return enrich_from_outline(
             top.path.clone(),
             start,
+            top.def_range.map(|(_, end)| end),
             query.to_string(),
             other_def_count,
             false,
@@ -188,6 +237,7 @@ fn resolve_def_by_query(
             enrich_from_outline(
                 top.path.clone(),
                 start,
+                top.def_range.map(|(_, end)| end),
                 query.to_string(),
                 other_def_count,
                 false,
@@ -205,21 +255,24 @@ fn resolve_def_by_query(
     }
 }
 
-/// Extract a definition match's `def_range` start, erroring if absent.
+/// Extract a definition match's canonical line, erroring if the AST range is
+/// absent. `def_range` is the semantic ownership range and must not identify
+/// the AST declaration.
 fn def_start(m: &crate::types::Match, query: &str) -> Result<u32, TilthError> {
-    m.def_range
-        .map(|(start, _)| start)
-        .ok_or_else(|| TilthError::ParseError {
+    if m.def_range.is_some() {
+        Ok(m.line)
+    } else {
+        Err(TilthError::ParseError {
             path: m.path.clone(),
             reason: format!("definition match for `{query}` had no def_range"),
         })
+    }
 }
-
 /// Derive a candidate definition's owning type/container name, or `None` when
 /// it is top-level (free function) or its language doesn't nest under a named
 /// owner. Nesting languages read the cached outline; Go reads the receiver type.
 fn owner_of_match(m: &crate::types::Match, cache: &OutlineCache) -> Option<String> {
-    let (start, _) = m.def_range?;
+    let start = m.line;
     let FileType::Code(lang) = detect_file_type(&m.path) else {
         return None;
     };
@@ -264,7 +317,7 @@ fn find_parent_name_inner(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.start_position().row as u32 + 1 == start_line
+        if crate::lang::outline::canonical_start_line(child, lang) == start_line
             && crate::lang::treesitter::DEFINITION_KINDS.contains(&child.kind())
         {
             return here;
@@ -347,12 +400,20 @@ fn resolve_by_path_line(
     line: u32,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(path)?;
-    let entries = get_outline_entries(&content, lang);
-    let entry = find_entry_at_line(&entries, line).ok_or_else(|| TilthError::NotFound {
-        path: path.to_path_buf(),
-        suggestion: Some(format!("no definition encloses line {line}")),
-    })?;
-    let target = target_from_entry(entry, path.to_path_buf(), 0);
+    let (entries, deep_entry) =
+        crate::lang::outline::get_outline_entries_and_entry_at_line(&content, lang, line);
+    let target = match deep_entry
+        .as_ref()
+        .or_else(|| find_entry_at_line(&entries, line))
+    {
+        Some(entry) => target_from_entry(entry, path.to_path_buf(), 0),
+        None => {
+            return Err(TilthError::NotFound {
+                path: path.to_path_buf(),
+                suggestion: Some(format!("no definition encloses line {line}")),
+            });
+        }
+    };
     Ok((target, content, lang))
 }
 
@@ -378,30 +439,39 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
 fn enrich_from_outline(
     path: PathBuf,
     start_line: u32,
+    semantic_end: Option<u32>,
     name: String,
     other_def_count: usize,
     resolve_moved_name: bool,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(&path)?;
-    let entries = get_outline_entries(&content, lang);
-    let mut target = if let Some(entry) = find_by_start_line(&entries, start_line)
-        .filter(|entry| !resolve_moved_name || entry.name == name)
-    {
+    let (entries, exact_entry) =
+        crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+            &content,
+            lang,
+            &name,
+            start_line,
+            semantic_end,
+        );
+    let mut target = if let Some(entry) = exact_entry
+        .as_ref()
+        .filter(|entry| entry.name == name)
+        .or_else(|| {
+            find_entry_by_start_line(&entries, start_line).filter(|entry| entry.name == name)
+        }) {
         target_from_entry(entry, path, other_def_count)
     } else {
         // The outline tree caps its nesting at one container level, so a
         // deeply-nested definition (e.g. `a::b::method`) can be absent.
-        let exact_entry = crate::lang::outline::entry_at_start_line(&content, lang, start_line)
-            .filter(|entry| !resolve_moved_name || entry.name == name);
+        let exact_entry = exact_entry.filter(|entry| !resolve_moved_name || entry.name == name);
         if let Some(entry) = exact_entry {
             target_from_entry(&entry, path, other_def_count)
         } else {
-            let fresh_name = if resolve_moved_name {
-                crate::lang::outline::find_entry_by_name(&entries, &name)
-                    .and_then(|(line, _)| find_by_start_line(&entries, line))
-            } else {
-                None
-            };
+            // Name recovery is only for moved/renamed definitions. Ordinary
+            // resolution must not silently substitute a same-line symbol.
+            let fresh_name = resolve_moved_name
+                .then(|| find_named_entry(&entries, &name))
+                .flatten();
             match fresh_name {
                 Some(entry) => target_from_entry(entry, path, other_def_count),
                 None => match find_entry_at_line(&entries, start_line) {
@@ -410,6 +480,7 @@ fn enrich_from_outline(
                         name: name.clone(),
                         path,
                         start_line,
+                        span_start_line: start_line,
                         end_line: start_line,
                         kind: OutlineKind::Function,
                         signature: None,
@@ -432,9 +503,53 @@ fn enrich_from_outline(
 pub(crate) fn resolve_candidate_with_source(
     path: &Path,
     start_line: u32,
+    semantic_end: Option<u32>,
     name: &str,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    enrich_from_outline(path.to_path_buf(), start_line, name.to_string(), 0, true)
+    enrich_from_outline(
+        path.to_path_buf(),
+        start_line,
+        semantic_end,
+        name.to_string(),
+        0,
+        true,
+    )
+}
+
+pub(crate) fn resolve_candidate_with_source_occurrence(
+    path: &Path,
+    start_line: u32,
+    semantic_end: Option<u32>,
+    name: &str,
+    occurrence: (usize, usize),
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    let scope = path.parent().unwrap_or_else(|| Path::new("."));
+    let result = search_symbol_raw(name, scope, None)?;
+    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let candidate = result.matches.iter().find(|candidate| {
+        candidate.is_definition
+            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
+            && candidate.line == start_line
+            && candidate.def_name.as_deref() == Some(name)
+            && candidate.def_byte_range == Some(occurrence)
+    });
+    let Some(candidate) = candidate else {
+        return Err(TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: Some("target occurrence changed; search again".to_string()),
+        });
+    };
+    enrich_from_outline(
+        candidate.path.clone(),
+        candidate.line,
+        semantic_end.or_else(|| candidate.def_range.map(|(_, end)| end)),
+        name.to_string(),
+        0,
+        false,
+    )
 }
 
 fn target_from_entry(
@@ -446,6 +561,7 @@ fn target_from_entry(
         name: entry.name.clone(),
         path,
         start_line: entry.start_line,
+        span_start_line: entry.span_start_line,
         end_line: entry.end_line,
         kind: entry.kind,
         signature: entry.signature.clone(),
@@ -454,11 +570,12 @@ fn target_from_entry(
     }
 }
 
-/// Walk the outline tree and return the deepest entry whose range contains `line`.
+/// Walk the outline tree and return the deepest entry whose semantic ownership
+/// range contains `line`.
 fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEntry> {
     let mut best: Option<&OutlineEntry> = None;
     for e in entries {
-        if line >= e.start_line && line <= e.end_line {
+        if line >= e.span_start_line && line <= e.end_line {
             if let Some(deeper) = find_entry_at_line(&e.children, line) {
                 return Some(deeper);
             }
@@ -468,14 +585,13 @@ fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
     best
 }
 
-/// Walk the outline tree and return the first entry whose `start_line == line`.
-fn find_by_start_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEntry> {
-    for e in entries {
-        if e.start_line == line {
-            return Some(e);
+fn find_named_entry<'a>(entries: &'a [OutlineEntry], name: &str) -> Option<&'a OutlineEntry> {
+    for entry in entries {
+        if entry.name == name {
+            return Some(entry);
         }
-        if let Some(child) = find_by_start_line(&e.children, line) {
-            return Some(child);
+        if let Some(found) = find_named_entry(&entry.children, name) {
+            return Some(found);
         }
     }
     None
@@ -591,9 +707,9 @@ pub struct TestMatch {
 pub struct GrokResult {
     pub target: ResolvedTarget,
     /// The target's own source body, sliced from the file. Empty when the
-    /// body span is degenerate (`start_line > end_line`) or when the target
-    /// resolution didn't surface a real outline entry. Stored as a string
-    /// so the formatter can wrap it in a fenced block without re-reading.
+    /// semantic body span is degenerate (`span_start_line > end_line`) or when
+    /// target resolution didn't surface a real outline entry. Stored as a
+    /// string so the formatter can wrap it in a fenced block without re-reading.
     pub body: String,
     pub callees_internal: Vec<ResolvedCallee>,
     pub callees_external: Vec<String>,
@@ -627,10 +743,11 @@ pub fn grok(
 ) -> Result<GrokResult, TilthError> {
     let (target, content, lang) = resolve_with_source(target_spec, scope)?;
     let entries = get_outline_entries(&content, lang);
+    let target_span_start = target.span_start_line;
 
     // --- Callees -----------------------------------------------------------
     let callee_names =
-        extract_callee_names(&content, lang, Some((target.start_line, target.end_line)));
+        extract_callee_names(&content, lang, Some((target_span_start, target.end_line)));
     let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
 
     let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
@@ -738,8 +855,8 @@ pub fn grok(
     // callee's body and attach it to the result for the formatter to render.
     // Measure the true definition span, not `body` — `body` may be a dedup-degraded
     // preview on a re-grok, which would otherwise make a large function look thin.
-    let delegate_body = if target.start_line > 0
-        && (target.end_line.saturating_sub(target.start_line) as usize + 1)
+    let delegate_body = if target_span_start > 0
+        && (target.end_line.saturating_sub(target_span_start) as usize + 1)
             <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
         && total_callees_external == 0
@@ -761,6 +878,7 @@ pub fn grok(
                     name: callee.name.clone(),
                     path: callee.file.clone(),
                     start_line: callee.start_line,
+                    span_start_line: callee.span_start_line,
                     end_line: callee.end_line,
                     kind: OutlineKind::Function,
                     signature: callee.signature.clone(),
@@ -820,7 +938,12 @@ fn body_with_dedup(
     session: &crate::session::Session,
     max_body_lines: usize,
 ) -> String {
-    let full = slice_body(content, target.start_line, target.end_line, max_body_lines);
+    let full = slice_body(
+        content,
+        target.span_start_line,
+        target.end_line,
+        max_body_lines,
+    );
     let line_count = full.lines().count();
     if line_count <= BODY_DEGRADE_THRESHOLD {
         return full;
@@ -1127,7 +1250,7 @@ fn is_recursive_call_site(
     // target body (e.g. a recursive closure with the same name) would also be
     // filtered here. Acceptable tradeoff — true self-recursion is the common case.
     m.path == canonical_target
-        && m.line >= target.start_line
+        && m.line >= target.span_start_line
         && m.line <= target.end_line
         && m.calling_function == target.name
 }
@@ -1137,20 +1260,43 @@ fn is_recursive_call_site(
 ///
 /// Skips imports/exports (noise) and the target itself. Sorted by:
 /// functions/methods first, then alphabetical.
+fn entry_matches_target(entry: &OutlineEntry, target: &ResolvedTarget) -> bool {
+    entry.start_line == target.start_line && entry.name == target.name
+}
+
+fn find_parent<'a>(
+    entries: &'a [OutlineEntry],
+    target: &ResolvedTarget,
+) -> Option<&'a OutlineEntry> {
+    for entry in entries {
+        if entry
+            .children
+            .iter()
+            .any(|child| entry_matches_target(child, target))
+        {
+            return Some(entry);
+        }
+        if let Some(parent) = find_parent(&entry.children, target) {
+            return Some(parent);
+        }
+    }
+    None
+}
+
 pub(crate) fn collect_siblings(
     entries: &[OutlineEntry],
     target: &ResolvedTarget,
 ) -> Vec<SiblingEntry> {
-    let parent = entries.iter().find(|e| {
-        e.children
-            .iter()
-            .any(|c| c.start_line == target.start_line && c.name == target.name)
-    });
-
-    let candidates: Vec<&OutlineEntry> = if let Some(p) = parent {
-        p.children.iter().collect()
-    } else {
+    // A top-level target keeps the complete top-level sibling set. For nested
+    // targets, walk the full outline tree to find the actual immediate parent.
+    // A missing target has no siblings; never substitute unrelated top-level entries.
+    let candidates: Vec<&OutlineEntry> = if entries.iter().any(|e| entry_matches_target(e, target))
+    {
         entries.iter().collect()
+    } else {
+        find_parent(entries, target)
+            .map(|parent| parent.children.iter().collect())
+            .unwrap_or_default()
     };
 
     let mut out: Vec<SiblingEntry> = candidates
@@ -1184,6 +1330,7 @@ mod tests {
             kind,
             name: name.to_string(),
             start_line: start,
+            span_start_line: start,
             end_line: end,
             signature: None,
             children: Vec::new(),
@@ -1300,14 +1447,14 @@ mod tests {
             .children
             .push(make_entry(OutlineKind::Function, "inner", 10, 25));
         let entries = vec![class];
-        let hit = find_by_start_line(&entries, 10).expect("expected inner");
+        let hit = find_entry_by_start_line(&entries, 10).expect("expected inner");
         assert_eq!(hit.name, "inner");
     }
 
     #[test]
     fn start_line_lookup_no_match_returns_none() {
         let entries = vec![make_entry(OutlineKind::Function, "foo", 10, 20)];
-        assert!(find_by_start_line(&entries, 11).is_none());
+        assert!(find_entry_by_start_line(&entries, 11).is_none());
     }
 
     // -- resolve_by_path_line — integration via tempdir ------------------
@@ -1338,6 +1485,57 @@ mod tests {
             "content should be the file body"
         );
         assert_eq!(lang, Lang::Rust);
+    }
+
+    #[test]
+    fn resolve_by_path_line_prefers_deepest_same_line_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(tmp.path(), "src/a.rs", "mod outer { fn inner() {} }\n");
+
+        let (target, _, _) = resolve_by_path_line(&path, 1).unwrap();
+        assert_eq!(target.name, "inner");
+        assert_eq!(target.kind, OutlineKind::Function);
+    }
+
+    #[test]
+    fn resolve_by_path_line_reaches_deep_semantic_span() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "mod a {\n    mod b {\n        #[inline]\n        fn method() {\n            work();\n        }\n    }\n}\n";
+        let path = write_fixture(tmp.path(), "src/deep.rs", body);
+
+        for line in [3, 4, 5] {
+            let (target, _, lang) = resolve_by_path_line(&path, line).unwrap();
+            assert_eq!(target.name, "method");
+            assert_eq!(target.start_line, 4);
+            assert_eq!(target.span_start_line, 3);
+            assert_eq!(lang, Lang::Rust);
+        }
+    }
+
+    #[test]
+    fn resolve_by_path_line_prefers_decorated_python_method_over_enclosing_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "class Handler:\n    @logged\n    async \\\n    def blocked(self) -> bool:\n        return True\n";
+        let path = write_fixture(tmp.path(), "producer.py", body);
+
+        for line in [2, 3, 4, 5] {
+            let (target, _, lang) = resolve_by_path_line(&path, line).unwrap();
+            assert_eq!(target.name, "blocked");
+            assert_eq!(target.kind, OutlineKind::Function);
+            assert_eq!(target.start_line, 4);
+            assert_eq!(lang, Lang::Python);
+        }
+    }
+
+    #[test]
+    fn resolve_by_path_line_keeps_import_inside_enclosing_function() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "def load():\n    import os\n    return os.getcwd()\n";
+        let path = write_fixture(tmp.path(), "loader.py", body);
+
+        let (target, _, _) = resolve_by_path_line(&path, 2).unwrap();
+        assert_eq!(target.name, "load");
+        assert_eq!(target.kind, OutlineKind::Function);
     }
 
     #[test]
@@ -1379,6 +1577,78 @@ mod tests {
     }
 
     #[test]
+    fn named_resolution_prefers_deep_same_line_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "fn outer() { fn inner() {} }\n";
+        write_fixture(tmp.path(), "src/a.rs", body);
+
+        let (target, _, _) = resolve_with_source("inner", tmp.path()).unwrap();
+        assert_eq!(target.name, "inner");
+        assert_eq!(target.start_line, 1);
+    }
+
+    #[test]
+    fn named_enrichment_distinguishes_same_name_same_line_declarations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "function run() { function run() {}\n  return 1;\n}\n";
+        let path = write_fixture(tmp.path(), "nested.js", body);
+
+        let (inner, _, _) =
+            enrich_from_outline(path.clone(), 1, Some(1), "run".into(), 1, false).unwrap();
+        let (outer, _, _) = enrich_from_outline(path, 1, Some(3), "run".into(), 1, false).unwrap();
+
+        assert_eq!((inner.span_start_line, inner.end_line), (1, 1));
+        assert_eq!((outer.span_start_line, outer.end_line), (1, 3));
+    }
+
+    #[test]
+    fn multiline_method_headers_resolve_by_prefix_line_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "Worker.java",
+                "class Worker {\n    public\n    Task<String>\n    run() {}\n}\n",
+                "run",
+            ),
+            (
+                "Worker.cs",
+                "class Worker {\n    public\n    Task<string>\n    Run() {}\n}\n",
+                "Run",
+            ),
+        ];
+        for (file, source, name) in cases {
+            let path = write_fixture(tmp.path(), file, source);
+            let (by_line, _, _) = resolve_by_path_line(&path, 2).unwrap();
+            assert_eq!(by_line.name, name);
+            assert_eq!(by_line.start_line, 4);
+            assert_eq!(by_line.span_start_line, 2);
+
+            let (by_name, _, _) = resolve_with_source(name, tmp.path()).unwrap();
+            assert_eq!(by_name.start_line, 4);
+            assert_eq!(by_name.span_start_line, 2);
+        }
+    }
+
+    #[test]
+    fn multiline_export_wrapper_resolves_one_semantic_span() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            tmp.path(),
+            "run.ts",
+            "export default\nfunction run() { return 1; }\n",
+        );
+        for line in [1, 2] {
+            let (target, _, _) = resolve_by_path_line(&path, line).unwrap();
+            assert_eq!(target.name, "run");
+            assert_eq!(target.start_line, 2);
+            assert_eq!(target.span_start_line, 1);
+        }
+        let (target, _, _) = resolve_with_source("run", tmp.path()).unwrap();
+        assert_eq!(target.start_line, 2);
+        assert_eq!(target.span_start_line, 1);
+    }
+
+    #[test]
     fn resolve_qualified_target_strips_type_prefix() {
         // Issue #59: `tilth_grok(target: "Executor.dispatch")` — and the
         // documented `Type::method` form — must resolve to the bare method
@@ -1403,6 +1673,27 @@ impl Executor {
                 "spec `{spec}` should resolve to method `dispatch`"
             );
             assert_eq!(target.other_def_count, 0);
+        }
+    }
+
+    #[test]
+    fn qualified_nested_wrapped_classes_keep_the_real_owner() {
+        let cases = [
+            (
+                "nested.py",
+                "class Outer:\n    @logged\n    class Inner:\n        pass\n",
+            ),
+            (
+                "nested.ts",
+                "namespace Outer {\n    export class Inner {}\n}\n",
+            ),
+        ];
+        for (file, source) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), file, source);
+            let (target, _, _) = resolve_with_source("Outer::Inner", tmp.path())
+                .unwrap_or_else(|error| panic!("{file} qualified class failed: {error}"));
+            assert_eq!(target.name, "Inner");
         }
     }
 
@@ -1857,6 +2148,23 @@ impl<T> Foo<T> {
     }
 
     #[test]
+    fn resolve_qualified_target_uses_canonical_line_for_attributed_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = "pub struct Foo;\n\n\
+                    impl Foo {\n\
+                        #[inline]\n\
+                        pub fn run(&self) {}\n\
+                    }\n";
+        write_fixture(tmp.path(), "src/foo.rs", code);
+
+        let (target, _, _) = resolve_with_source("Foo::run", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve attributed method: {e}"));
+        assert_eq!(target.name, "run");
+        assert_eq!(target.start_line, 5);
+        assert_eq!(target.span_start_line, 4);
+    }
+
+    #[test]
     fn nested_module_resolution_uses_ast_enrichment_not_bare_default() {
         // The depth-5 method `a::b::method` is absent from the outline tree (it
         // caps at one container level), so enrich_from_outline must reach it via
@@ -1883,28 +2191,72 @@ impl<T> Foo<T> {
         );
     }
 
-    // -- entry_at_start_line (AST fallback for deeply-nested defs) --------
+    // -- combined outline and deep semantic-entry parse --------------------
 
     #[test]
-    fn entry_at_start_line_reaches_doubly_nested_method() {
-        // Direct test of the outline.rs AST fallback grok relies on: the outline
-        // tree omits a depth-5 method, so this must pull it straight from the AST.
+    fn combined_outline_parse_reaches_doubly_nested_method() {
         let code = "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n";
-        let entry = crate::lang::outline::entry_at_start_line(code, Lang::Rust, 3)
-            .expect("AST fallback must find the doubly-nested method at line 3");
+        let (_, entry) = crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+            code,
+            Lang::Rust,
+            "method",
+            3,
+            None,
+        );
+        let entry = entry.expect("AST fallback must find the doubly-nested method at line 3");
         assert_eq!(entry.name, "method");
         assert_eq!(entry.start_line, 3);
         assert!(entry.signature.is_some(), "fn entry must carry a signature");
     }
 
     #[test]
-    fn entry_at_start_line_none_when_no_def_starts_there() {
-        // Line 2 is a `mod` opener, not a definition start row for any leaf def —
-        // the finder keys on the exact start row, so a non-matching line is None.
+    fn combined_outline_parse_keeps_nested_rust_attribute_span() {
+        let code = "pub mod a {\n    pub mod b {\n        #[inline]\n        pub fn method() {}\n    }\n}\n";
+        let (entries, exact) =
+            crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+                code,
+                Lang::Rust,
+                "method",
+                4,
+                None,
+            );
+        let entry = exact.expect("nested Rust method should resolve exactly");
+        assert_eq!(entry.name, "method");
+        assert_eq!(entry.start_line, 4);
+        assert_eq!(entry.span_start_line, 3);
+        assert!(
+            crate::lang::outline::find_entry_by_name(&entries, "method").is_none(),
+            "display outline must retain its nesting cap"
+        );
+    }
+
+    #[test]
+    fn combined_outline_parse_keeps_nested_elixir_metadata_span() {
+        let code = "defmodule A do\n  @doc \"run\"\n  def run, do: :ok\nend\n";
+        let (_, exact) = crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+            code,
+            Lang::Elixir,
+            "run",
+            3,
+            None,
+        );
+        let entry = exact.expect("nested Elixir function should resolve exactly");
+        assert_eq!(entry.name, "run");
+        assert_eq!(entry.start_line, 3);
+        assert_eq!(entry.span_start_line, 2);
+    }
+
+    #[test]
+    fn combined_outline_parse_has_no_exact_entry_off_declaration_line() {
         let code = "pub mod a {\n    pub fn method() {}\n}\n";
-        // The mod `a` itself starts at line 1; line 2 is the fn. A line with no
-        // definition starting on it (e.g. line 3, the closing brace) is None.
-        assert!(crate::lang::outline::entry_at_start_line(code, Lang::Rust, 3).is_none());
+        let (_, entry) = crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+            code,
+            Lang::Rust,
+            "method",
+            4,
+            None,
+        );
+        assert!(entry.is_none());
     }
 
     // -- split_qualified -------------------------------------------------
@@ -2013,6 +2365,7 @@ impl<T> Foo<T> {
             name: name.to_string(),
             path: PathBuf::from(path),
             start_line: start,
+            span_start_line: start,
             end_line: end,
             kind: OutlineKind::Function,
             signature: None,
@@ -2059,6 +2412,41 @@ impl<T> Foo<T> {
             vec!["peer_a", "peer_b"],
             "should pick parent children, not top-level"
         );
+    }
+
+    #[test]
+    fn siblings_doubly_nested_target_uses_immediate_parent() {
+        let mut outer = make_entry(OutlineKind::Module, "outer", 1, 50);
+        let mut inner = make_entry(OutlineKind::Class, "inner", 2, 20);
+        inner
+            .children
+            .push(make_entry(OutlineKind::Function, "target", 3, 6));
+        inner
+            .children
+            .push(make_entry(OutlineKind::Function, "peer", 8, 11));
+        outer.children.push(inner);
+        let entries = vec![
+            outer,
+            make_entry(OutlineKind::Function, "unrelated_top_level", 60, 65),
+        ];
+        let target = target_in_file("target", 3, 6, "src/a.rs");
+
+        let sibs = collect_siblings(&entries, &target);
+        let names: Vec<&str> = sibs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["peer"]);
+    }
+
+    #[test]
+    fn siblings_missing_target_do_not_fall_back_to_top_level() {
+        let entries = vec![make_entry(
+            OutlineKind::Function,
+            "unrelated_top_level",
+            60,
+            65,
+        )];
+        let target = target_in_file("missing", 3, 6, "src/a.rs");
+
+        assert!(collect_siblings(&entries, &target).is_empty());
     }
 
     #[test]
@@ -2220,6 +2608,7 @@ pub fn target() {
             name: "foo".into(),
             path: PathBuf::from("src/a.rs"),
             start_line: 5,
+            span_start_line: 5,
             end_line: 8,
             kind: OutlineKind::Function,
             signature: Some("fn foo()".into()),
@@ -2251,6 +2640,7 @@ pub fn target() {
             name: "f".into(),
             path: PathBuf::from("src/a.rs"),
             start_line: 1,
+            span_start_line: 1,
             end_line: 2,
             kind: OutlineKind::Function,
             signature: None,

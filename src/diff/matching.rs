@@ -20,6 +20,17 @@ pub(crate) fn build_diff_symbols(
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
     build_symbols_recursive(entries, &lines, lang, "", &mut out);
+    let mut occurrences: HashMap<(OutlineKind, String, String), u32> = HashMap::new();
+    for symbol in &mut out {
+        let key = (
+            symbol.identity.kind,
+            symbol.identity.parent_path.clone(),
+            symbol.identity.name.clone(),
+        );
+        let occurrence = occurrences.entry(key).or_default();
+        symbol.identity.occurrence = *occurrence;
+        *occurrence += 1;
+    }
     out
 }
 
@@ -97,44 +108,56 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 
                 if o.content_hash == n.content_hash {
                     changes.push(SymbolChange {
+                        identity: n.identity.clone(),
                         name: n.identity.name.clone(),
                         kind: n.identity.kind,
                         change: ChangeType::Unchanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        span_start_line: n.entry.span_start_line,
+                        old_span: Some((o.entry.span_start_line, o.entry.end_line)),
+                        new_span: Some((n.entry.span_start_line, n.entry.end_line)),
                         old_sig: None,
                         new_sig: None,
                         size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
+                            o.entry.end_line.saturating_sub(o.entry.span_start_line) + 1,
+                            n.entry.end_line.saturating_sub(n.entry.span_start_line) + 1,
                         )),
                     });
                 } else if o.entry.signature != n.entry.signature {
                     changes.push(SymbolChange {
+                        identity: n.identity.clone(),
                         name: n.identity.name.clone(),
                         kind: n.identity.kind,
                         change: ChangeType::SignatureChanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        span_start_line: n.entry.span_start_line,
+                        old_span: Some((o.entry.span_start_line, o.entry.end_line)),
+                        new_span: Some((n.entry.span_start_line, n.entry.end_line)),
                         old_sig: o.entry.signature.clone(),
                         new_sig: n.entry.signature.clone(),
                         size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
+                            o.entry.end_line.saturating_sub(o.entry.span_start_line) + 1,
+                            n.entry.end_line.saturating_sub(n.entry.span_start_line) + 1,
                         )),
                     });
                 } else {
                     changes.push(SymbolChange {
+                        identity: n.identity.clone(),
                         name: n.identity.name.clone(),
                         kind: n.identity.kind,
                         change: ChangeType::BodyChanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        span_start_line: n.entry.span_start_line,
+                        old_span: Some((o.entry.span_start_line, o.entry.end_line)),
+                        new_span: Some((n.entry.span_start_line, n.entry.end_line)),
                         old_sig: None,
                         new_sig: None,
                         size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
+                            o.entry.end_line.saturating_sub(o.entry.span_start_line) + 1,
+                            n.entry.end_line.saturating_sub(n.entry.span_start_line) + 1,
                         )),
                     });
                 }
@@ -174,6 +197,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                 old_matched[oi] = true;
                 new_matched[ni] = true;
                 changes.push(SymbolChange {
+                    identity: new[ni].identity.clone(),
                     name: new[ni].identity.name.clone(),
                     kind: new[ni].identity.kind,
                     change: ChangeType::Renamed {
@@ -181,18 +205,21 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     },
                     match_confidence: MatchConfidence::Structural,
                     line: new[ni].entry.start_line,
+                    span_start_line: new[ni].entry.span_start_line,
+                    old_span: Some((old[oi].entry.span_start_line, old[oi].entry.end_line)),
+                    new_span: Some((new[ni].entry.span_start_line, new[ni].entry.end_line)),
                     old_sig: old[oi].entry.signature.clone(),
                     new_sig: new[ni].entry.signature.clone(),
                     size_delta: Some((
                         old[oi]
                             .entry
                             .end_line
-                            .saturating_sub(old[oi].entry.start_line)
+                            .saturating_sub(old[oi].entry.span_start_line)
                             + 1,
                         new[ni]
                             .entry
                             .end_line
-                            .saturating_sub(new[ni].entry.start_line)
+                            .saturating_sub(new[ni].entry.span_start_line)
                             + 1,
                     )),
                 });
@@ -203,11 +230,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !new_matched[ni] {
                         new_matched[ni] = true;
                         changes.push(SymbolChange {
+                            identity: new[ni].identity.clone(),
                             name: new[ni].identity.name.clone(),
                             kind: new[ni].identity.kind,
                             change: ChangeType::Added,
                             match_confidence: MatchConfidence::Ambiguous(count),
                             line: new[ni].entry.start_line,
+                            span_start_line: new[ni].entry.span_start_line,
+                            old_span: None,
+                            new_span: Some((new[ni].entry.span_start_line, new[ni].entry.end_line)),
                             old_sig: None,
                             new_sig: new[ni].entry.signature.clone(),
                             size_delta: None,
@@ -218,11 +249,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !old_matched[oi] {
                         old_matched[oi] = true;
                         changes.push(SymbolChange {
+                            identity: old[oi].identity.clone(),
                             name: old[oi].identity.name.clone(),
                             kind: old[oi].identity.kind,
                             change: ChangeType::Deleted,
                             match_confidence: MatchConfidence::Ambiguous(count),
                             line: old[oi].entry.start_line,
+                            span_start_line: old[oi].entry.span_start_line,
+                            old_span: Some((old[oi].entry.span_start_line, old[oi].entry.end_line)),
+                            new_span: None,
                             old_sig: old[oi].entry.signature.clone(),
                             new_sig: None,
                             size_delta: None,
@@ -297,23 +332,27 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
         };
 
         changes.push(SymbolChange {
+            identity: new[ni].identity.clone(),
             name: new[ni].identity.name.clone(),
             kind: new[ni].identity.kind,
             change,
             match_confidence: MatchConfidence::Fuzzy(score),
             line: new[ni].entry.start_line,
+            span_start_line: new[ni].entry.span_start_line,
+            old_span: Some((old[oi].entry.span_start_line, old[oi].entry.end_line)),
+            new_span: Some((new[ni].entry.span_start_line, new[ni].entry.end_line)),
             old_sig: old[oi].entry.signature.clone(),
             new_sig: new[ni].entry.signature.clone(),
             size_delta: Some((
                 old[oi]
                     .entry
                     .end_line
-                    .saturating_sub(old[oi].entry.start_line)
+                    .saturating_sub(old[oi].entry.span_start_line)
                     + 1,
                 new[ni]
                     .entry
                     .end_line
-                    .saturating_sub(new[ni].entry.start_line)
+                    .saturating_sub(new[ni].entry.span_start_line)
                     + 1,
             )),
         });
@@ -325,11 +364,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (i, matched) in old_matched.iter().enumerate() {
         if !matched {
             changes.push(SymbolChange {
+                identity: old[i].identity.clone(),
                 name: old[i].identity.name.clone(),
                 kind: old[i].identity.kind,
                 change: ChangeType::Deleted,
                 match_confidence: MatchConfidence::Exact,
                 line: old[i].entry.start_line,
+                span_start_line: old[i].entry.span_start_line,
+                old_span: Some((old[i].entry.span_start_line, old[i].entry.end_line)),
+                new_span: None,
                 old_sig: old[i].entry.signature.clone(),
                 new_sig: None,
                 size_delta: None,
@@ -339,11 +382,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (i, matched) in new_matched.iter().enumerate() {
         if !matched {
             changes.push(SymbolChange {
+                identity: new[i].identity.clone(),
                 name: new[i].identity.name.clone(),
                 kind: new[i].identity.kind,
                 change: ChangeType::Added,
                 match_confidence: MatchConfidence::Exact,
                 line: new[i].entry.start_line,
+                span_start_line: new[i].entry.span_start_line,
+                old_span: None,
+                new_span: Some((new[i].entry.span_start_line, new[i].entry.end_line)),
                 old_sig: None,
                 new_sig: new[i].entry.signature.clone(),
                 size_delta: None,
@@ -358,10 +405,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<SymbolIdentity, Vec<usize>> {
-    let mut map: HashMap<SymbolIdentity, Vec<usize>> = HashMap::new();
+fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<(OutlineKind, String, String), Vec<usize>> {
+    let mut map: HashMap<(OutlineKind, String, String), Vec<usize>> = HashMap::new();
     for (i, sym) in symbols.iter().enumerate() {
-        map.entry(sym.identity.clone()).or_default().push(i);
+        let key = (
+            sym.identity.kind,
+            sym.identity.parent_path.clone(),
+            sym.identity.name.clone(),
+        );
+        map.entry(key).or_default().push(i);
     }
     map
 }
@@ -374,7 +426,7 @@ fn build_symbols_recursive(
     out: &mut Vec<DiffSymbol>,
 ) {
     for entry in entries {
-        let source = extract_source(lines, entry.start_line, entry.end_line);
+        let source = extract_source(lines, entry.span_start_line, entry.end_line);
         let content_hash = hash_string(&source);
         let structural_hash = compute_structural_hash(&source, &entry.name, lang);
 
@@ -382,6 +434,7 @@ fn build_symbols_recursive(
             kind: entry.kind,
             parent_path: parent_path.to_string(),
             name: entry.name.clone(),
+            occurrence: 0,
         };
 
         out.push(DiffSymbol {
@@ -409,6 +462,7 @@ fn clone_entry_shallow(entry: &OutlineEntry) -> OutlineEntry {
         kind: entry.kind,
         name: entry.name.clone(),
         start_line: entry.start_line,
+        span_start_line: entry.span_start_line,
         end_line: entry.end_line,
         signature: entry.signature.clone(),
         children: Vec::new(),
@@ -558,7 +612,8 @@ mod tests {
                 kind,
                 name: name.to_string(),
                 start_line: 1,
-                end_line: 1,
+                span_start_line: 1,
+                end_line: source.lines().count() as u32,
                 signature: sig.map(str::to_string),
                 children: Vec::new(),
                 doc: None,
@@ -567,6 +622,7 @@ mod tests {
                 kind,
                 parent_path: parent.to_string(),
                 name: name.to_string(),
+                occurrence: 0,
             },
             content_hash,
             structural_hash,
@@ -1034,5 +1090,36 @@ mod tests {
                 m.identity.parent_path
             );
         }
+    }
+
+    #[test]
+    fn diff_symbol_source_includes_leading_rust_attributes() {
+        let source = "#[inline]\nfn alpha() {\n    let value = 1;\n}\n";
+        let entries = crate::lang::outline::get_outline_entries(source, Lang::Rust);
+        let symbols = build_diff_symbols(&entries, source, Lang::Rust);
+        let alpha = symbols
+            .iter()
+            .find(|symbol| symbol.identity.name == "alpha")
+            .expect("alpha should produce a diff symbol");
+
+        assert_eq!(alpha.entry.start_line, 2);
+        assert_eq!(alpha.entry.span_start_line, 1);
+        assert!(alpha.source_text.starts_with("#[inline]\n"));
+    }
+
+    #[test]
+    fn same_line_duplicate_declarations_keep_distinct_occurrences() {
+        let source = "fn run() {} fn run() {}\n";
+        let entries = crate::lang::outline::get_outline_entries(source, Lang::Rust);
+        let symbols = build_diff_symbols(&entries, source, Lang::Rust);
+        let runs: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.identity.name == "run")
+            .collect();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].identity.occurrence, 0);
+        assert_eq!(runs[1].identity.occurrence, 1);
+        assert_ne!(runs[0].identity, runs[1].identity);
     }
 }
