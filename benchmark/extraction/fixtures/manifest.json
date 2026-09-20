@@ -38,7 +38,20 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "inner",
+              "compute"
+            ],
+            [
+              "inner",
+              "deep"
+            ],
+            [
+              "deep",
+              "compute"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {
@@ -136,7 +149,11 @@
         },
         "imports": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            "std::collections::HashMap as Map",
+            "std::fmt",
+            "reexported_compute"
+          ],
           "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
         },
         "edit_spans": {
@@ -149,8 +166,7 @@
           ],
           "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
         }
-      },
-      "known_tilth_divergence": "Known Tilth divergence: get_deep_outline_entries emits no Import-kind entries for this file's use/import statements, so the imports capability captures as an empty supported list rather than the declared import sources. The shallow get_outline_entries seam is not exercised here; not remediated in this curd."
+      }
     },
     {
       "id": "rust-unicode",
@@ -371,7 +387,24 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "Service",
+              "run"
+            ],
+            [
+              "inner",
+              "compute"
+            ],
+            [
+              "inner",
+              "deep"
+            ],
+            [
+              "deep",
+              "compute"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {
@@ -485,7 +518,10 @@
         },
         "imports": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            "fs",
+            "path"
+          ],
           "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
         },
         "edit_spans": {
@@ -498,8 +534,7 @@
           ],
           "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
         }
-      },
-      "known_tilth_divergence": "Known Tilth divergence: get_deep_outline_entries emits no Import-kind entries for this file's use/import statements, so the imports capability captures as an empty supported list rather than the declared import sources. The shallow get_outline_entries seam is not exercised here; not remediated in this curd."
+      }
     },
     {
       "id": "typescript-unicode",
@@ -712,7 +747,28 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "<module>",
+              "compute"
+            ],
+            [
+              "<module>",
+              "Inner"
+            ],
+            [
+              "Inner",
+              "compute"
+            ],
+            [
+              "Inner",
+              "Deep"
+            ],
+            [
+              "Deep",
+              "compute"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {
@@ -795,7 +851,12 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "<module>",
+              "use_join"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {
@@ -810,7 +871,9 @@
         },
         "imports": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            "sys as system"
+          ],
           "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
         },
         "edit_spans": {
@@ -824,7 +887,7 @@
           "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
         }
       },
-      "known_tilth_divergence": "Known Tilth divergence: get_deep_outline_entries emits no Import-kind entries for this file's use/import statements, so the imports capability captures as an empty supported list rather than the declared import sources. The shallow get_outline_entries seam is not exercised here; not remediated in this curd."
+      "known_tilth_divergence": "Known Tilth divergence: get_outline_entries only classifies Python's plain `import module` statements (tree-sitter import_statement) as Import-kind entries; from-module import forms (import_from_statement) are not matched, so this fixture's `from os.path import join as join_path` and `from .core import compute as compute_alias` lines are silently absent from the imports capability. Only the plain `import sys as system` line surfaces, and extract_import_source routes it through the generic JS import branch (which matches before the Python-specific branch), keeping the `as system` alias rather than isolating the module name."
     },
     {
       "id": "python-unicode",
@@ -847,7 +910,12 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "<module>",
+              "café"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {
@@ -898,7 +966,12 @@
         },
         "nesting": {
           "applicability": "applicable",
-          "expected": [],
+          "expected": [
+            [
+              "<module>",
+              "crlf_fn"
+            ]
+          ],
           "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
         },
         "signatures": {

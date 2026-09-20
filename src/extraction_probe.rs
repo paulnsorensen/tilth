@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash32;
 
-use crate::lang::outline::{extract_import_source, get_deep_outline_entries};
+use crate::lang::outline::{
+    extract_import_source, get_deep_outline_entries, get_deep_outline_tree, get_outline_entries,
+};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 const SUPPORTED_MANIFEST_VERSION: u64 = 1;
@@ -198,6 +200,8 @@ enum Capture {
     Ok {
         content: String,
         entries: Vec<OutlineEntry>,
+        tree_entries: Vec<OutlineEntry>,
+        top_level_entries: Vec<OutlineEntry>,
     },
     Error(String),
 }
@@ -225,7 +229,14 @@ fn capture_fixture(entry: &FixtureEntry) -> Capture {
     };
     let lang = parse_lang(&entry.language);
     let entries = get_deep_outline_entries(&content, lang);
-    Capture::Ok { content, entries }
+    let tree_entries = get_deep_outline_tree(&content, lang);
+    let top_level_entries = get_outline_entries(&content, lang);
+    Capture::Ok {
+        content,
+        entries,
+        tree_entries,
+        top_level_entries,
+    }
 }
 
 // ---- per-capability normalization ----
@@ -266,9 +277,12 @@ fn line_text(content: &str, line: u32) -> &str {
         .unwrap_or("")
 }
 
-fn imports_of(entries: &[OutlineEntry], lang: Lang, content: &str) -> Vec<String> {
+/// Imports are shallow, top-level declarations: walk `get_outline_entries`'
+/// entries (which, unlike `get_deep_outline_entries`, retain `Import`-kind
+/// entries) rather than the deep entry set.
+fn imports_of(top_level_entries: &[OutlineEntry], lang: Lang, content: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for entry in entries {
+    for entry in top_level_entries {
         if entry.kind == OutlineKind::Import {
             let text = line_text(content, entry.start_line);
             out.push(extract_import_source(text, Some(lang)));
@@ -320,9 +334,24 @@ fn capability_result(
 
 fn normalize(entry: &FixtureEntry, capture: &Capture) -> NormalizedRecord {
     let lang = parse_lang(&entry.language);
-    let (content, entries): (&str, &[OutlineEntry]) = match capture {
-        Capture::Ok { content, entries } => (content.as_str(), entries.as_slice()),
-        Capture::Error(_) => ("", &[]),
+    let (content, entries, tree_entries, top_level_entries): (
+        &str,
+        &[OutlineEntry],
+        &[OutlineEntry],
+        &[OutlineEntry],
+    ) = match capture {
+        Capture::Ok {
+            content,
+            entries,
+            tree_entries,
+            top_level_entries,
+        } => (
+            content.as_str(),
+            entries.as_slice(),
+            tree_entries.as_slice(),
+            top_level_entries.as_slice(),
+        ),
+        Capture::Error(_) => ("", &[], &[], &[]),
     };
 
     NormalizedRecord {
@@ -334,7 +363,7 @@ fn normalize(entry: &FixtureEntry, capture: &Capture) -> NormalizedRecord {
             || serde_json::to_value(definitions_of(entries)).expect("serialize definitions"),
         ),
         nesting: capability_result(capture, &entry.capabilities.nesting.applicability, || {
-            serde_json::to_value(nesting_of(entries, None)).expect("serialize nesting")
+            serde_json::to_value(nesting_of(tree_entries, None)).expect("serialize nesting")
         }),
         signatures: capability_result(
             capture,
@@ -342,7 +371,8 @@ fn normalize(entry: &FixtureEntry, capture: &Capture) -> NormalizedRecord {
             || serde_json::to_value(signatures_of(entries)).expect("serialize signatures"),
         ),
         imports: capability_result(capture, &entry.capabilities.imports.applicability, || {
-            serde_json::to_value(imports_of(entries, lang, content)).expect("serialize imports")
+            serde_json::to_value(imports_of(top_level_entries, lang, content))
+                .expect("serialize imports")
         }),
         edit_spans: capability_result(
             capture,
@@ -565,6 +595,117 @@ mod tests {
         assert!(
             !schema_accepts("normalized-record.v1.schema.json", &record),
             "an error status without a reason must be rejected"
+        );
+    }
+
+    fn fixture_by_id<'a>(manifest: &'a Manifest, id: &str) -> &'a FixtureEntry {
+        manifest
+            .fixtures
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap_or_else(|| panic!("manifest must declare fixture {id}"))
+    }
+
+    fn supported_value(result: &CapabilityResult) -> &serde_json::Value {
+        match result {
+            CapabilityResult::Supported(value) => value,
+            other => panic!("expected a supported capability result, got {other:?}"),
+        }
+    }
+
+    /// `get_deep_outline_entries` clears every entry's `children`, so a
+    /// nesting capability sourced from it can only ever produce an empty
+    /// list. Nesting must instead walk `get_deep_outline_tree`'s real
+    /// parent-child hierarchy: guard against regressing back onto the flat
+    /// seam by asserting real nested fixtures capture non-empty pairs.
+    #[test]
+    fn nesting_capability_reflects_real_hierarchy_not_flat_seam() {
+        let manifest = load_manifest();
+
+        let rust_entry = fixture_by_id(&manifest, "rust-core");
+        let rust_capture = capture_fixture(rust_entry);
+        let rust_normalized = normalize(rust_entry, &rust_capture);
+        let rust_nesting = supported_value(&rust_normalized.nesting);
+        assert_eq!(
+            rust_nesting,
+            &serde_json::json!([["inner", "compute"], ["inner", "deep"], ["deep", "compute"]]),
+            "rust-core nesting must reflect its real mod/fn hierarchy"
+        );
+
+        let ts_entry = fixture_by_id(&manifest, "typescript-core");
+        let ts_capture = capture_fixture(ts_entry);
+        let ts_normalized = normalize(ts_entry, &ts_capture);
+        let ts_nesting = supported_value(&ts_normalized.nesting);
+        assert_eq!(
+            ts_nesting,
+            &serde_json::json!([
+                ["Service", "run"],
+                ["inner", "compute"],
+                ["inner", "deep"],
+                ["deep", "compute"]
+            ]),
+            "typescript-core nesting must reflect its real class/namespace hierarchy"
+        );
+
+        let py_entry = fixture_by_id(&manifest, "python-core");
+        let py_capture = capture_fixture(py_entry);
+        let py_normalized = normalize(py_entry, &py_capture);
+        let py_nesting = supported_value(&py_normalized.nesting);
+        assert_eq!(
+            py_nesting,
+            &serde_json::json!([
+                ["<module>", "compute"],
+                ["<module>", "Inner"],
+                ["Inner", "compute"],
+                ["Inner", "Deep"],
+                ["Deep", "compute"]
+            ]),
+            "python-core nesting must reflect its real class hierarchy"
+        );
+    }
+
+    /// `get_deep_outline_entries` filters to `is_path_line_entry_kind`, which
+    /// excludes `OutlineKind::Import`, so an imports capability sourced from
+    /// it can only ever produce an empty list. Imports must instead walk
+    /// `get_outline_entries`, the shallow seam that retains Import-kind
+    /// entries: guard against regressing back onto the filtered seam by
+    /// asserting the declared import sources surface.
+    #[test]
+    fn imports_capability_reflects_declared_sources_not_filtered_seam() {
+        let manifest = load_manifest();
+
+        let rust_entry = fixture_by_id(&manifest, "rust-imports_exports");
+        let rust_capture = capture_fixture(rust_entry);
+        let rust_normalized = normalize(rust_entry, &rust_capture);
+        let rust_imports = supported_value(&rust_normalized.imports);
+        assert_eq!(
+            rust_imports,
+            &serde_json::json!([
+                "std::collections::HashMap as Map",
+                "std::fmt",
+                "reexported_compute"
+            ]),
+            "rust-imports_exports imports must surface its declared use sources"
+        );
+
+        let ts_entry = fixture_by_id(&manifest, "typescript-imports_exports");
+        let ts_capture = capture_fixture(ts_entry);
+        let ts_normalized = normalize(ts_entry, &ts_capture);
+        let ts_imports = supported_value(&ts_normalized.imports);
+        assert_eq!(
+            ts_imports,
+            &serde_json::json!(["fs", "path"]),
+            "typescript-imports_exports imports must surface its declared import sources"
+        );
+
+        let py_entry = fixture_by_id(&manifest, "python-imports_exports");
+        let py_capture = capture_fixture(py_entry);
+        let py_normalized = normalize(py_entry, &py_capture);
+        let py_imports = supported_value(&py_normalized.imports);
+        assert_eq!(
+            py_imports,
+            &serde_json::json!(["sys as system"]),
+            "python-imports_exports imports must surface the plain `import` source it can capture"
         );
     }
 }
