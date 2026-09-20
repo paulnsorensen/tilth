@@ -9,6 +9,8 @@ pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
 pub mod error;
+#[cfg(test)]
+mod extraction_probe;
 pub(crate) mod format;
 pub mod index;
 pub mod install;

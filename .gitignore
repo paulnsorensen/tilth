@@ -40,6 +40,7 @@ benchmark/results/*.log
 benchmark/results/streams/
 benchmark/results/configs/
 !benchmark/results/.gitkeep
+benchmark/extraction/.generated/
 
 # Local env (API keys, secrets)
 .env

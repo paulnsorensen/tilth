@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "version",
+    "fixture_id",
+    "capability",
+    "applicability",
+    "evidence"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "fixture_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "capability": {
+      "enum": [
+        "definitions",
+        "nesting",
+        "signatures",
+        "imports",
+        "edit_spans"
+      ]
+    },
+    "applicability": {
+      "enum": [
+        "applicable",
+        "inapplicable"
+      ]
+    },
+    "expected": {},
+    "evidence": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
