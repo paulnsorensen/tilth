@@ -9,7 +9,8 @@ use crate::types::{FileType, OutlineEntry, OutlineKind};
 use super::matching::{build_diff_symbols, match_symbols};
 use super::{
     AttributedDiffLine, ChangeType, Conflict, DiffLineKind, DiffSource, FileDiff, FileOverlay,
-    FileStatus, MatchConfidence, SymbolAttributionKey, SymbolChange, SymbolIdentity,
+    FileStatus, Hunk, MatchConfidence, SymbolAttributionKey, SymbolChange, SymbolIdentity,
+    UnattributedLine,
 };
 
 // ---------------------------------------------------------------------------
@@ -26,22 +27,42 @@ pub(crate) fn compute_overlay(
     checkout: &Path,
 ) -> FileOverlay {
     let path = &file_diff.path;
+    let (insertions, deletions) = raw_insertions_deletions(&file_diff.hunks);
 
     // Binary or generated files — empty overlay, formatter handles display.
     if file_diff.is_binary || file_diff.is_generated {
         return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
+            insertions,
+            deletions,
+            ..FileOverlay::empty(path.clone())
         };
     }
 
-    match file_diff.status {
+    let mut overlay = match file_diff.status {
         FileStatus::Modified => compute_modified(file_diff, source, checkout),
         FileStatus::Added => compute_added(file_diff, source, checkout),
         FileStatus::Deleted => compute_deleted(file_diff, source, checkout),
         FileStatus::Renamed => compute_renamed(file_diff, source, checkout),
+    };
+    overlay.insertions = insertions;
+    overlay.deletions = deletions;
+    overlay
+}
+
+/// Count raw insertions/deletions across all hunks, ignoring context lines.
+fn raw_insertions_deletions(hunks: &[Hunk]) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for hunk in hunks {
+        for line in &hunk.lines {
+            match line.kind {
+                DiffLineKind::Added => insertions += 1,
+                DiffLineKind::Removed => deletions += 1,
+                DiffLineKind::Context => {}
+            }
+        }
     }
+    (insertions, deletions)
 }
 
 /// Cross-file move detection: match Deleted symbols in one file with Added
@@ -205,63 +226,61 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) 
     else {
         // git error fetching old side — skip symbol analysis to avoid
         // confidently-wrong all-Added overlay.
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
     let Ok(new_content) = get_new_content(path, source, checkout) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
 
     let ft = detect_file_type(path);
-    let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
+    let (symbol_changes, attributed_hunks, unattributed) = if let FileType::Code(lang) = ft {
         let old_entries = get_outline_entries(&old_content, lang);
         let new_entries = get_outline_entries(&new_content, lang);
 
         if old_entries.is_empty() && new_entries.is_empty() {
-            // No grammar support or empty outlines — skip symbol analysis.
-            (Vec::new(), Vec::new())
+            // No grammar support or empty outlines — every line is unattributed.
+            let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+            (Vec::new(), Vec::new(), unattributed)
         } else {
             let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
             let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
             let changes = match_symbols(&old_syms, &new_syms);
-            let attributed = attribute_hunks(&file_diff.hunks, &changes);
-            (changes, attributed)
+            let (attributed, unattributed) = attribute_hunks(&file_diff.hunks, &changes);
+            (changes, attributed, unattributed)
         }
     } else {
-        // Non-code file — no symbol analysis.
-        (Vec::new(), Vec::new())
+        // Non-code file — no symbol analysis, every line is unattributed.
+        let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+        (Vec::new(), Vec::new(), unattributed)
     };
 
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
-        path: path.clone(),
         symbol_changes,
         attributed_hunks,
+        unattributed_hunks,
+        unattributed_omitted,
+        ..FileOverlay::empty(path.clone())
     }
 }
 
 fn compute_added(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -> FileOverlay {
     let path = &file_diff.path;
     let Ok(new_content) = get_new_content(path, source, checkout) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
 
     let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
 
+    let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
-        path: path.clone(),
         symbol_changes,
-        attributed_hunks: Vec::new(),
+        unattributed_hunks,
+        unattributed_omitted,
+        ..FileOverlay::empty(path.clone())
     }
 }
 
@@ -269,19 +288,19 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -
     let path = &file_diff.path;
     let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, checkout)
     else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
 
     let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
 
+    let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
-        path: path.clone(),
         symbol_changes,
-        attributed_hunks: Vec::new(),
+        unattributed_hunks,
+        unattributed_omitted,
+        ..FileOverlay::empty(path.clone())
     }
 }
 
@@ -289,37 +308,40 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource, checkout: &Path) -
     let path = &file_diff.path;
     let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, checkout)
     else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
     let Ok(new_content) = get_new_content(path, source, checkout) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-        };
+        return FileOverlay::empty(path.clone());
     };
 
     let ft = detect_file_type(path);
-    let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
+    let (symbol_changes, attributed_hunks, unattributed) = if let FileType::Code(lang) = ft {
         let old_entries = get_outline_entries(&old_content, lang);
         let new_entries = get_outline_entries(&new_content, lang);
-        let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
-        let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
-        let changes = match_symbols(&old_syms, &new_syms);
-        let attributed = attribute_hunks(&file_diff.hunks, &changes);
-        (changes, attributed)
+
+        if old_entries.is_empty() && new_entries.is_empty() {
+            let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+            (Vec::new(), Vec::new(), unattributed)
+        } else {
+            let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
+            let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
+            let changes = match_symbols(&old_syms, &new_syms);
+            let (attributed, unattributed) = attribute_hunks(&file_diff.hunks, &changes);
+            (changes, attributed, unattributed)
+        }
     } else {
-        (Vec::new(), Vec::new())
+        let (_, unattributed) = attribute_hunks(&file_diff.hunks, &[]);
+        (Vec::new(), Vec::new(), unattributed)
     };
 
+    let (unattributed_hunks, unattributed_omitted) = cap_unattributed(unattributed);
+
     FileOverlay {
-        path: path.clone(),
         symbol_changes,
         attributed_hunks,
+        unattributed_hunks,
+        unattributed_omitted,
+        ..FileOverlay::empty(path.clone())
     }
 }
 
@@ -436,22 +458,23 @@ struct SymRange {
     new_span: Option<(u32, u32)>,
 }
 
+/// Occurrence-keyed symbol lines and the hunk lines no symbol claimed.
+type Attribution = (
+    Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)>,
+    Vec<Vec<UnattributedLine>>,
+);
+
 /// For each symbol change that has a line range, find which diff lines from
-/// the hunks fall within that symbol. Returns `(symbol_identity, lines)` pairs.
-fn attribute_hunks(
-    hunks: &[super::Hunk],
-    changes: &[SymbolChange],
-) -> Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)> {
+/// the hunks fall within each symbol. Returns occurrence-keyed lines plus the
+/// hunk lines no symbol claimed, grouped per hunk.
+fn attribute_hunks(hunks: &[Hunk], changes: &[SymbolChange]) -> Attribution {
     let mut result: Vec<(SymbolAttributionKey, Vec<AttributedDiffLine>)> = Vec::new();
+    let mut unattributed: Vec<Vec<UnattributedLine>> = Vec::new();
 
     let active_symbols: Vec<&SymbolChange> = changes
         .iter()
         .filter(|c| !matches!(c.change, ChangeType::Unchanged))
         .collect();
-
-    if active_symbols.is_empty() {
-        return result;
-    }
 
     let mut sym_ranges: Vec<SymRange> = Vec::new();
     for change in &active_symbols {
@@ -462,18 +485,20 @@ fn attribute_hunks(
         });
     }
 
-    // Pre-allocate buckets for each symbol.
+    // No active symbols means every hunk line falls through as unattributed.
     let mut buckets: Vec<Vec<AttributedDiffLine>> =
         (0..sym_ranges.len()).map(|_| Vec::new()).collect();
 
     for hunk in hunks {
         let mut old_line = hunk.old_start;
         let mut new_line = hunk.new_start;
+        let mut hunk_unattributed: Vec<UnattributedLine> = Vec::new();
 
         for diff_line in &hunk.lines {
             match diff_line.kind {
                 DiffLineKind::Context => {
                     // Context is attributed by new-file line.
+                    let mut claimed = false;
                     for (si, sr) in sym_ranges.iter().enumerate() {
                         if sr
                             .new_span
@@ -485,13 +510,22 @@ fn attribute_hunks(
                                 old_line: Some(old_line),
                                 new_line: Some(new_line),
                             });
+                            claimed = true;
                         }
+                    }
+                    if !claimed {
+                        hunk_unattributed.push(UnattributedLine {
+                            line: new_line,
+                            kind: diff_line.kind,
+                            content: diff_line.content.clone(),
+                        });
                     }
                     old_line += 1;
                     new_line += 1;
                 }
                 DiffLineKind::Added => {
                     // Added lines belong to the new-file range.
+                    let mut claimed = false;
                     for (si, sr) in sym_ranges.iter().enumerate() {
                         if sr
                             .new_span
@@ -503,13 +537,22 @@ fn attribute_hunks(
                                 old_line: None,
                                 new_line: Some(new_line),
                             });
+                            claimed = true;
                         }
+                    }
+                    if !claimed {
+                        hunk_unattributed.push(UnattributedLine {
+                            line: new_line,
+                            kind: diff_line.kind,
+                            content: diff_line.content.clone(),
+                        });
                     }
                     new_line += 1;
                 }
                 DiffLineKind::Removed => {
                     // Removed lines belong to the old-file range, including
                     // removed adornments on matched symbols.
+                    let mut claimed = false;
                     for (si, sr) in sym_ranges.iter().enumerate() {
                         if sr
                             .old_span
@@ -521,11 +564,28 @@ fn attribute_hunks(
                                 old_line: Some(old_line),
                                 new_line: None,
                             });
+                            claimed = true;
                         }
+                    }
+                    if !claimed {
+                        hunk_unattributed.push(UnattributedLine {
+                            line: old_line,
+                            kind: diff_line.kind,
+                            content: diff_line.content.clone(),
+                        });
                     }
                     old_line += 1;
                 }
             }
+        }
+
+        // Context that spills past a symbol's range is not a change. Keep a
+        // leftover group only when it holds an added or removed line.
+        if hunk_unattributed
+            .iter()
+            .any(|l| l.kind != DiffLineKind::Context)
+        {
+            unattributed.push(hunk_unattributed);
         }
     }
 
@@ -536,7 +596,36 @@ fn attribute_hunks(
         }
     }
 
-    result
+    (result, unattributed)
+}
+
+/// Cap the total unattributed-line count across all hunks at
+/// `MAX_UNATTRIBUTED_LINES`, dropping lines from later hunks first.
+fn cap_unattributed(hunks: Vec<Vec<UnattributedLine>>) -> (Vec<Vec<UnattributedLine>>, usize) {
+    let mut kept: Vec<Vec<UnattributedLine>> = Vec::new();
+    let mut total = 0usize;
+    let mut omitted = 0usize;
+
+    for hunk in hunks {
+        if total >= super::MAX_UNATTRIBUTED_LINES {
+            omitted += hunk.len();
+            continue;
+        }
+        let remaining = super::MAX_UNATTRIBUTED_LINES - total;
+        if hunk.len() <= remaining {
+            total += hunk.len();
+            kept.push(hunk);
+        } else {
+            let (keep, drop) = hunk.split_at(remaining);
+            omitted += drop.len();
+            total += keep.len();
+            if !keep.is_empty() {
+                kept.push(keep.to_vec());
+            }
+        }
+    }
+
+    (kept, omitted)
 }
 
 // ---------------------------------------------------------------------------
@@ -754,10 +843,11 @@ mod tests {
             }],
         }];
 
-        let attributed = attribute_hunks(&hunks, &changes);
+        let (attributed, unattributed) = attribute_hunks(&hunks, &changes);
         assert_eq!(attributed.len(), 1);
         assert_eq!(attributed[0].0.identity.name, "alpha");
         assert_eq!(attributed[0].1[0].content, "#[inline]");
+        assert!(unattributed.is_empty());
         assert_eq!(
             find_enclosing_function(&entries, 1),
             Some("alpha".to_string())
@@ -796,7 +886,7 @@ mod tests {
             ],
         }];
 
-        let attributed = attribute_hunks(&hunks, &changes);
+        let (attributed, unattributed) = attribute_hunks(&hunks, &changes);
         assert_eq!(attributed.len(), 1);
         assert_eq!(attributed[0].1.len(), 2);
         assert_eq!(attributed[0].1[0].kind, DiffLineKind::Removed);
@@ -805,5 +895,182 @@ mod tests {
         assert_eq!(attributed[0].1[0].new_line, None);
         assert_eq!(attributed[0].1[1].old_line, None);
         assert_eq!(attributed[0].1[1].new_line, Some(1));
+        assert!(unattributed.is_empty());
+    }
+    #[test]
+    fn compute_modified_non_code_file_preserves_unattributed_hunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_file = dir.path().join("old.md");
+        let new_file = dir.path().join("notes.md");
+        std::fs::write(&old_file, "one\ntwo\nthree\n").unwrap();
+        std::fs::write(&new_file, "one\nCHANGED\nthree\n").unwrap();
+
+        let file_diff = FileDiff {
+            path: new_file.clone(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Removed,
+                        content: "two".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "CHANGED".to_string(),
+                    },
+                ],
+            }],
+            is_generated: false,
+            is_binary: false,
+        };
+
+        let overlay = compute_modified(
+            &file_diff,
+            &DiffSource::Files(old_file, new_file),
+            dir.path(),
+        );
+
+        assert!(overlay.symbol_changes.is_empty(), "markdown has no symbols");
+        assert_eq!(
+            overlay.unattributed_hunks.len(),
+            1,
+            "expected one unattributed hunk, got {:?}",
+            overlay.unattributed_hunks
+        );
+        let lines: Vec<&str> = overlay.unattributed_hunks[0]
+            .iter()
+            .map(|l| l.content.as_str())
+            .collect();
+        assert_eq!(lines, vec!["two", "CHANGED"]);
+    }
+    // An added import is an outline symbol and is attributed to it. A
+    // top-level comment belongs to no symbol, so it must stay visible.
+    #[test]
+    fn compute_modified_code_line_outside_every_symbol_stays_unattributed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_file = dir.path().join("old.rs");
+        let new_file = dir.path().join("lib.rs");
+        std::fs::write(&old_file, "fn foo() {}\n").unwrap();
+        std::fs::write(&new_file, "// top-level note\nfn foo() {}\n").unwrap();
+
+        let file_diff = FileDiff {
+            path: new_file.clone(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "// top-level note".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Context,
+                        content: "fn foo() {}".to_string(),
+                    },
+                ],
+            }],
+            is_generated: false,
+            is_binary: false,
+        };
+
+        let overlay = compute_modified(
+            &file_diff,
+            &DiffSource::Files(old_file, new_file),
+            dir.path(),
+        );
+
+        assert_eq!(
+            overlay.unattributed_hunks.len(),
+            1,
+            "expected the comment line to be unattributed, got {:?}",
+            overlay.unattributed_hunks
+        );
+        let added: Vec<&str> = overlay.unattributed_hunks[0]
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Added)
+            .map(|l| l.content.as_str())
+            .collect();
+        assert_eq!(added, vec!["// top-level note"]);
+    }
+    #[test]
+    fn context_outside_a_changed_symbol_is_not_an_unattributed_change() {
+        let change = SymbolChange {
+            identity: identity("foo"),
+            name: "foo".to_string(),
+            kind: OutlineKind::Function,
+            change: ChangeType::BodyChanged,
+            match_confidence: MatchConfidence::Exact,
+            line: 2,
+            span_start_line: 2,
+            old_span: Some((2, 2)),
+            new_span: Some((2, 2)),
+            old_sig: None,
+            new_sig: None,
+            size_delta: Some((1, 1)),
+        };
+        let line = |kind, content: &str| DiffLine {
+            kind,
+            content: content.to_string(),
+        };
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                line(DiffLineKind::Context, "// before"),
+                line(DiffLineKind::Removed, "fn foo() { 1 }"),
+                line(DiffLineKind::Added, "fn foo() { 2 }"),
+                line(DiffLineKind::Context, "// after"),
+            ],
+        };
+        // The removed line belongs to the surviving symbol at the removal
+        // position, so only context is left over and no group is kept.
+        let (attributed, unattributed) = attribute_hunks(&[hunk], &[change]);
+        assert_eq!(attributed.len(), 1);
+        assert_eq!(attributed[0].1.len(), 2, "removed and added line");
+        assert!(unattributed.is_empty(), "{unattributed:?}");
+
+        let context_only = Hunk {
+            old_start: 10,
+            old_count: 1,
+            new_start: 10,
+            new_count: 1,
+            lines: vec![line(DiffLineKind::Context, "// far away")],
+        };
+        let (_, unattributed) = attribute_hunks(&[context_only], &[]);
+        assert!(unattributed.is_empty(), "context alone is not a change");
+    }
+    #[test]
+    fn cap_unattributed_lines_caps_at_max_and_reports_omitted() {
+        let lines: Vec<DiffLine> = (0..250)
+            .map(|i| DiffLine {
+                kind: DiffLineKind::Added,
+                content: format!("line {i}"),
+            })
+            .collect();
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 250,
+            lines,
+        };
+
+        let (_, unattributed) = attribute_hunks(&[hunk], &[]);
+        let (kept, omitted) = cap_unattributed(unattributed);
+
+        let total_kept: usize = kept.iter().map(Vec::len).sum();
+        assert_eq!(total_kept, crate::diff::MAX_UNATTRIBUTED_LINES);
+        assert_eq!(omitted, 50);
     }
 }
