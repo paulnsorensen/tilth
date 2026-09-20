@@ -194,14 +194,13 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     })?;
     session.record_read(path);
 
-    // Render a bounded post-edit neighborhood before recording provenance.
-    // The snapshot keeps the whole source, but only rendered lines become anchors.
     let first_changed = first_changed_line(&live, &new_text);
     let (numbered, seen_lines, reread_hint) = render_changed_window(
         &new_text,
         first_changed,
         path,
-        ctx.section_budget.saturating_sub(WRITE_DIFF_BUDGET),
+        ctx.section_budget
+            .saturating_sub(if ctx.show_diff { WRITE_DIFF_BUDGET } else { 0 }),
     );
     let new_tag = session.record_snapshot(path, &new_text, seen_lines);
 
@@ -421,8 +420,6 @@ fn commit_file_op(
                 }
             })?;
             session.record_read(path);
-            // CREATE does not echo the caller's source body, so it displays no
-            // content lines under the fresh tag.
             let new_tag = session.record_snapshot(path, content, std::iter::empty());
             let mut block = format!("## {}\ncreated{suffix}", path.display());
             if let Some(tag) = new_tag {
@@ -494,12 +491,18 @@ const WRITE_DIFF_BUDGET: u64 = 80;
 const WRITE_CONTEXT_LINES: u32 = 2;
 
 fn first_changed_line(before: &str, after: &str) -> Option<u32> {
-    let before_rows: Vec<&str> = before.split('\n').collect();
-    let after_rows: Vec<&str> = after.split('\n').collect();
-    let total = before_rows.len().max(after_rows.len());
-    (0..total)
-        .find(|&idx| before_rows.get(idx) != after_rows.get(idx))
-        .map(|idx| u32::try_from(idx + 1).unwrap_or(u32::MAX))
+    let mut before_rows = before.split('\n');
+    let mut after_rows = after.split('\n');
+    let mut line = 1u32;
+    loop {
+        match (before_rows.next(), after_rows.next()) {
+            (Some(before_row), Some(after_row)) if before_row == after_row => {
+                line = line.saturating_add(1);
+            }
+            (None, None) => return None,
+            _ => return Some(line),
+        }
+    }
 }
 
 fn render_changed_window(
@@ -508,11 +511,9 @@ fn render_changed_window(
     path: &Path,
     content_budget: u64,
 ) -> (String, Vec<u32>, Option<String>) {
-    let mut rows: Vec<&str> = text.split('\n').collect();
-    if text.ends_with('\n') {
-        rows.pop();
-    }
-    let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let row_count = text.split('\n').count();
+    let total_rows = row_count.saturating_sub(usize::from(text.ends_with('\n')));
+    let total = u32::try_from(total_rows).unwrap_or(u32::MAX);
     let Some(first) = first_changed else {
         return (String::new(), Vec::new(), None);
     };
@@ -521,37 +522,67 @@ fn render_changed_window(
     }
     let lo = first.saturating_sub(WRITE_CONTEXT_LINES).max(1).min(total);
     let hi = first.saturating_add(WRITE_CONTEXT_LINES).min(total).max(lo);
-    let start = usize::try_from(lo - 1).unwrap_or(0);
-    let end = usize::try_from(hi).unwrap_or(rows.len()).min(rows.len());
     let focus = first.clamp(lo, hi);
-    let mut candidates = vec![focus];
-    candidates.extend((lo..=hi).filter(|line| *line != focus));
+    let mut window_rows: Vec<(u32, &str)> = Vec::new();
+    for (index, row) in text.split('\n').enumerate() {
+        let line = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        if line > total {
+            break;
+        }
+        if line >= lo && line <= hi {
+            window_rows.push((line, row));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(focus);
+    let mut line = lo;
+    loop {
+        if line != focus {
+            candidates.push(line);
+        }
+        if line == hi || line == u32::MAX {
+            break;
+        }
+        line += 1;
+    }
+
     let mut rendered_rows: Vec<(u32, String)> = Vec::new();
     let mut seen = Vec::new();
     for line in candidates {
-        let index = usize::try_from(line.saturating_sub(1)).unwrap_or(0);
-        let Some(row) = rows.get(index) else {
+        let mut row = None;
+        for (window_line, window_row) in &window_rows {
+            if *window_line == line {
+                row = Some(*window_row);
+                break;
+            }
+        }
+        let Some(row) = row else {
             continue;
         };
-        let numbered = render_numbered_slice(row, line);
-        let combined_len = rendered_rows
-            .iter()
-            .map(|(_, part)| part.len())
-            .sum::<usize>()
-            .saturating_add(numbered.len())
-            .saturating_add(rendered_rows.len());
+        let mut numbered = render_numbered_slice(row, line);
+        if numbered.is_empty() {
+            numbered = format!("{line}:");
+        }
+        let mut combined_len = numbered.len().saturating_add(rendered_rows.len());
+        for (_, part) in &rendered_rows {
+            combined_len = combined_len.saturating_add(part.len());
+        }
         if crate::types::estimate_tokens(combined_len as u64) <= content_budget {
             rendered_rows.push((line, numbered));
             seen.push(line);
         }
     }
     rendered_rows.sort_unstable_by_key(|(line, _)| *line);
-    let rendered = rendered_rows
-        .into_iter()
-        .map(|(_, row)| row)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let omitted_window = seen.len() < end.saturating_sub(start);
+    let mut rendered = String::new();
+    for (_, row) in rendered_rows {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&row);
+    }
+    let window_size = hi.saturating_sub(lo).saturating_add(1);
+    let omitted_window = seen.len() < window_size as usize;
     let hint = (omitted_window || lo > 1 || hi < total).then(|| {
         let reread_lo = if omitted_window {
             lo
@@ -575,9 +606,18 @@ fn render_changed_window(
 
 fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
     let diff = render_text_diff(before, after);
-    crate::budget::apply_item(&diff, WRITE_DIFF_BUDGET, WRITE_RESPONSE_BUDGET)
+    let bounded = crate::budget::apply_item(&diff, WRITE_DIFF_BUDGET, WRITE_RESPONSE_BUDGET);
+    let Some((prefix, suffix)) = bounded.split_once("... truncated — raise `budget`") else {
+        return bounded;
+    };
+    let remaining = match suffix.split_once("see the remaining ") {
+        Some((_, remaining)) => remaining,
+        None => "remaining output",
+    };
+    format!(
+        "{prefix}... truncated — use `tilth_diff` or reduce the batch to see the remaining {remaining}"
+    )
 }
-
 /// A synthetic snapshot preserves the tag and full source after provenance
 /// eviction, but it marks no source lines as displayed.
 fn synthetic_snapshot(key: &str, text: &str, tag: u16) -> Snapshot {
@@ -2488,6 +2528,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blank_changed_row_is_rendered_and_authorized() {
+        let (rendered, seen, _) =
+            render_changed_window("before\n\nafter", Some(2), Path::new("file"), 80);
+        let rendered_lines: Vec<u32> = rendered
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(line, _)| line.parse().ok())
+            .collect();
+        assert!(
+            rendered.lines().any(|line| line == "2:"),
+            "blank changed row must be explicit in the response: {rendered:?}"
+        );
+        let mut seen = seen;
+        let mut rendered_lines = rendered_lines;
+        seen.sort_unstable();
+        rendered_lines.sort_unstable();
+        assert_eq!(
+            seen, rendered_lines,
+            "authorized lines must match response lines"
+        );
+    }
+
+    #[test]
+    fn no_diff_write_keeps_source_budget_for_changed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("source-budget.txt");
+        let original_line = "x".repeat(4 * 5_880 - 3);
+        let replacement_line = format!("{}y", "x".repeat(4 * 5_880 - 4));
+        let original = format!("{original_line}\ncontext");
+        std::fs::write(&p, &original).unwrap();
+        let (session, bloom) = services();
+        let tag = session
+            .record_snapshot(&p, &original, [1, 2])
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
+
+        let out = tool_write(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 1, "end": 1, "content": replacement_line }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("write without diff");
+
+        assert!(
+            out.contains(&format!("1:{replacement_line}")),
+            "the changed source line must use the full no-diff budget"
+        );
+        assert_eq!(
+            session.snapshots().head(&p).unwrap().seen_lines,
+            HashSet::from([1, 2]),
+            "all rendered source lines must remain authorized"
+        );
+    }
+
+    #[test]
+    fn write_diff_truncation_names_write_specific_follow_up() {
+        let before = "a".repeat(10_000);
+        let after = "b".repeat(10_000);
+        let output = render_bounded_diff(Some(&before), &after);
+
+        assert!(
+            output.contains("use `tilth_diff` or reduce the batch"),
+            "truncated write diff must name its follow-up: {output}"
+        );
+        assert!(
+            !output.contains("raise `budget`"),
+            "write diff must not suggest an ignored budget parameter: {output}"
+        );
+    }
     #[test]
     fn omitted_lines_are_not_authorized_by_the_fresh_write_tag() {
         let dir = tempfile::tempdir().unwrap();
