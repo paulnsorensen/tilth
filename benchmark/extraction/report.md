@@ -229,12 +229,22 @@ resolution.
   the positive and blocked paths so the two fault injections are proven
   against a comparator that is otherwise permissive, not one that always
   fails.
+- `test_fixture_level_known_tilth_divergence_reaches_matrix_cell` (cure)
+  asserts a `known_tilth_divergence` set on a synthetic fixture reaches
+  its matrix cell — proves the fixture-scope read (not the forbidden
+  capability-scope read) actually surfaces the annotation.
+- `test_missing_expected_is_blocked_not_a_crash` (cure) deletes
+  `expected` from a capability (optional per schema) and asserts the
+  cell is `blocked`, not a `KeyError`.
+- `test_malformed_definitions_entry_is_blocked_not_a_crash` (cure) feeds
+  a non-pair definitions entry and asserts the cell is `blocked`, not a
+  `ValueError`.
 
 ## Gate results
 
 ```
 $ python3 -m unittest discover -s benchmark/extraction/tests
-Ran 8 tests in 0.012s
+Ran 11 tests in 0.012s
 OK
 
 $ python3 benchmark/extraction/compare.py --manifest benchmark/extraction/fixtures/manifest.json --offline
