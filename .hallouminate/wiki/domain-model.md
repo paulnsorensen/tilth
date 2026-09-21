@@ -47,3 +47,17 @@ _Code_: `src/mcp/tools/search_v2.rs`
 [^continuations]: [Search continuation decision](./adr/tilth-search-v2-roadmap-006.md); user-approved PR #231 correction, 2026-09-06.
 
 _Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: query-only request and unexecutable continuation sketches._
+
+
+**Extraction fixture** — A versioned source case with a stable ID, source hash, language, applicable capabilities, expected values, and evidence.
+_Avoid_: unversioned sample, current-output snapshot
+_Code_: NEW ENTITY (`benchmark/extraction/fixtures`)
+
+**Raw extraction capture** — Candidate or Tilth output preserved before coordinate normalization or adaptation.
+_Avoid_: normalized-only result, successful empty result
+_Code_: NEW ENTITY (`benchmark/extraction/schema`)
+
+**Capability reuse verdict** — One pass, partial, unsupported, fail, or blocked result for a candidate, language, and extraction capability.
+_Avoid_: candidate-wide score, omitted cell
+_Code_: NEW ENTITY (`benchmark/extraction/report.md`)
+

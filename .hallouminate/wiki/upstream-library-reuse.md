@@ -39,6 +39,37 @@ Treat these findings as adapter requirements, not evidence that Tree-sitter cann
 [^12]: https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/bindings/rust/lib.rs; https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/queries/tags.scm
 [^13]: https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/queries/tags.scm
 
+## Symbol analysis precedents (current fork)
+
+This follow-up covers fork commit `790bdbe9113bc86118b4ca297f64e09d44fe8b99`, checked on 2026-09-20.
+It does not change the older upstream assessment's scope or approve a migration.
+
+The language pack is not only a grammar provider.
+Version 1.17 exposes nested structure, signatures, spans, imports, exports, and symbols.
+Its source also documents empty decorator metadata and language-limited import fields.[^symbol-pack]
+The older parser-reuse report's grammar-only description must not constrain future evaluations.
+
+LSP already separates a symbol's full range from its selection range.
+It also specifies definitions, references, and call hierarchy.
+Server capabilities determine available operations.[^symbol-lsp]
+Tilth's exact canonical-anchor and ownership rules remain a compatibility requirement, not evidence of a new analysis category.
+
+The inspected fork matches caller names in call-expression syntax, not compiler-bound symbol identities.
+Current MCP continuations use that path.
+Ordinary usage search uses text matching.[^symbol-local]
+Serena supplies agent-facing symbol operations, and Aider supplies token-bounded repository context.[^symbol-research]
+The inspected benchmark modes do not compare those tools with Tilth.[^symbol-local]
+
+Keep extraction reuse, semantic resolution, and product workflow comparisons separate.
+No replacement extractor or comparative benchmark executes in this follow-up.
+
+[^symbol-pack]: https://raw.githubusercontent.com/xberg-io/tree-sitter-language-pack/v1.17.0/crates/ts-pack-core/src/intel/types.rs (checked 2026-09-20).
+[^symbol-lsp]: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/ (checked 2026-09-20).
+[^symbol-local]: `src/search/callers.rs:219-225`; `src/mcp/tools/search_v2/continuations.rs:266-269`; `src/search/symbol.rs:566-638`; `benchmark/config.py:137-159` at the fork commit above.
+[^symbol-research]: `/Users/paul/.local/share/cheese/paulnsorensen-tilth/research/tilth-symbol-analysis-existing-alternatives/tilth-symbol-analysis-existing-alternatives.md`.
+
+_Source: cited symbol-analysis research · Updated: 2026-09-20 · Supersedes: grammar-only reuse characterization, not the earlier migration decisions._
+
 ## Other candidate boundaries
 
 `tempfile` already exists as a development dependency.
