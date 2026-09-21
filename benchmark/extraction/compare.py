@@ -71,6 +71,10 @@ def values_equal(capability, expected, actual):
     before comparison (accepted PascalCase-vs-lowercase labeling
     difference). Every other capability compares its tuples exactly,
     with no normalization.
+
+    Raises ValueError if an entry does not unpack into the shape this
+    capability requires (a malformed manifest or candidate record); the
+    caller turns that into a `blocked` cell instead of a crash.
     """
     if capability == "definitions":
         norm_expected = [(str(kind).lower(), name) for kind, name in expected]
@@ -103,10 +107,16 @@ def evaluate_fixture(capability, expected, applicability, record):
     if status == "error":
         return {"outcome": "fail", "detail": f"candidate reported an extraction error: {cap.get('value')}"}
     if status == "supported":
+        if expected is None:
+            return {"outcome": "blocked", "detail": f"manifest has no 'expected' value for '{capability}'"}
         if "value" not in cap:
             return {"outcome": "blocked", "detail": f"'{capability}' status is supported but 'value' is missing"}
         actual = cap["value"]
-        if values_equal(capability, expected, actual):
+        try:
+            equal = values_equal(capability, expected, actual)
+        except (ValueError, TypeError) as exc:
+            return {"outcome": "blocked", "detail": f"malformed expected/actual entries for '{capability}': {exc}"}
+        if equal:
             return {"outcome": "match", "detail": None}
         return {"outcome": "fail", "detail": "value does not match expected"}
 
@@ -146,13 +156,11 @@ def aggregate_cell(fixture_results):
     return {"verdict": "fail", "detail": f"0/{total} applicable fixtures matched expected values"}
 
 
-def build_matrix(manifest, baseline_dir, candidate_dirs):
+def build_matrix(manifest, candidate_dirs):
     """Build the complete candidate x language x capability verdict matrix.
 
-    baseline_dir: directory of Tilth normalized records (used only to
-    surface known_tilth_divergence annotations, never to change a
-    candidate's verdict).
-    candidate_dirs: {candidate_name: directory_of_normalized_records}.
+    known_tilth_divergence annotations come straight from the manifest's
+    fixture entries; candidate_dirs: {candidate_name: directory_of_normalized_records}.
     """
     groups = fixture_language_groups(manifest)
     matrix = {"version": 1, "candidates": {}}
@@ -166,12 +174,16 @@ def build_matrix(manifest, baseline_dir, candidate_dirs):
                 for fixture in fixtures:
                     fixture_id = fixture["id"]
                     cap_manifest = fixture["capabilities"][capability]
-                    expected = cap_manifest["expected"]
+                    expected = cap_manifest.get("expected")
                     applicability = cap_manifest.get("applicability", "applicable")
                     record = load_record(Path(record_dir) / f"{fixture_id}.json")
                     result = evaluate_fixture(capability, expected, applicability, record)
                     result["fixture_id"] = fixture_id
-                    divergence = cap_manifest.get("known_tilth_divergence")
+                    # known_tilth_divergence lives at fixture scope in the manifest
+                    # (schema/manifest.v1.schema.json forbids it on capability), so
+                    # it is not specific to this one capability -- surface it on
+                    # every capability cell for the fixture it documents.
+                    divergence = fixture.get("known_tilth_divergence")
                     if divergence:
                         result["known_tilth_divergence"] = divergence
                     fixture_results.append(result)
@@ -216,10 +228,9 @@ def main(argv=None):
     manifest = load_manifest(manifest_path)
     extraction_root = manifest_path.parent.parent
 
-    baseline_dir = extraction_root / ".generated" / "normalized"
     candidate_dirs = default_candidate_dirs(extraction_root)
 
-    matrix = build_matrix(manifest, baseline_dir, candidate_dirs)
+    matrix = build_matrix(manifest, candidate_dirs)
 
     out_dir = extraction_root / ".generated"
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -85,7 +85,6 @@ class BuildMatrixTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.manifest = make_manifest()
-        self.baseline_dir = self.root / "baseline"
 
     def cell(self, matrix, capability, candidate="cand", language="rust"):
         return matrix["candidates"][candidate][language][capability]
@@ -94,7 +93,7 @@ class BuildMatrixTests(unittest.TestCase):
         cand_dir = self.root / "cand"
         write_record(cand_dir, "rust-sample", correct_record())
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         for capability in compare.CAPABILITIES:
             cell = self.cell(matrix, capability)
@@ -104,7 +103,7 @@ class BuildMatrixTests(unittest.TestCase):
         cand_dir = self.root / "cand-missing"
         # No record written at all for this fixture.
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         for capability in compare.CAPABILITIES:
             cell = self.cell(matrix, capability)
@@ -122,7 +121,7 @@ class BuildMatrixTests(unittest.TestCase):
         del record["edit_spans"]
         write_record(cand_dir, "rust-sample", record)
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         cell = self.cell(matrix, "edit_spans")
         self.assertEqual(cell["verdict"], "blocked")
@@ -143,7 +142,7 @@ class BuildMatrixTests(unittest.TestCase):
         }
         write_record(cand_dir, "rust-sample", record)
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         cell = self.cell(matrix, "edit_spans")
         self.assertEqual(cell["verdict"], "fail")
@@ -155,7 +154,7 @@ class BuildMatrixTests(unittest.TestCase):
         record["nesting"] = {"status": "unsupported"}
         write_record(cand_dir, "rust-sample", record)
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         cell = self.cell(matrix, "nesting")
         self.assertEqual(cell["verdict"], "unsupported")
@@ -166,14 +165,55 @@ class BuildMatrixTests(unittest.TestCase):
         record["definitions"] = {"status": "supported", "value": [["FUNCTION", "compute"]]}
         write_record(cand_dir, "rust-sample", record)
 
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
 
         self.assertEqual(self.cell(matrix, "definitions")["verdict"], "pass")
 
         record["definitions"] = {"status": "supported", "value": [["function", "wrong_name"]]}
         write_record(cand_dir, "rust-sample", record)
-        matrix = compare.build_matrix(self.manifest, self.baseline_dir, {"cand": cand_dir})
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
         self.assertEqual(self.cell(matrix, "definitions")["verdict"], "fail")
+
+    def test_fixture_level_known_tilth_divergence_reaches_matrix_cell(self):
+        """M1: the manifest stores known_tilth_divergence on the fixture, not
+        the capability (the schema forbids it on capability). Reading it at
+        the wrong nesting level silently drops every divergence annotation.
+        """
+        manifest = make_manifest()
+        manifest["fixtures"][0]["known_tilth_divergence"] = "synthetic divergence note"
+        cand_dir = self.root / "cand-divergence"
+        write_record(cand_dir, "rust-sample", correct_record())
+
+        matrix = compare.build_matrix(manifest, {"cand": cand_dir})
+
+        cell = self.cell(matrix, "definitions")
+        self.assertEqual(cell["fixtures"][0].get("known_tilth_divergence"), "synthetic divergence note")
+
+    def test_missing_expected_is_blocked_not_a_crash(self):
+        """L5: 'expected' is optional per schema; a manifest edited to drop it
+        must yield a blocked cell, not a KeyError."""
+        manifest = make_manifest()
+        del manifest["fixtures"][0]["capabilities"]["definitions"]["expected"]
+        cand_dir = self.root / "cand-no-expected"
+        write_record(cand_dir, "rust-sample", correct_record())
+
+        matrix = compare.build_matrix(manifest, {"cand": cand_dir})
+
+        cell = self.cell(matrix, "definitions")
+        self.assertEqual(cell["verdict"], "blocked")
+
+    def test_malformed_definitions_entry_is_blocked_not_a_crash(self):
+        """L5: a malformed (non-pair) definitions entry must not raise
+        ValueError out of the comparator; it must yield a blocked cell."""
+        cand_dir = self.root / "cand-malformed"
+        record = correct_record()
+        record["definitions"] = {"status": "supported", "value": [["function", "compute", "extra"]]}
+        write_record(cand_dir, "rust-sample", record)
+
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
+
+        cell = self.cell(matrix, "definitions")
+        self.assertEqual(cell["verdict"], "blocked")
 
 
 class ValuesEqualTests(unittest.TestCase):

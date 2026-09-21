@@ -9,10 +9,14 @@ Subcommands:
              cache. ast-grep-outline needs no provisioning: its grammars are
              statically linked, so this subcommand does nothing for it.
   capture    OFFLINE. Builds each candidate, runs its capture subcommand
-             with a poisoned proxy environment (proves no live network
-             access), validates every emitted record against the v1
-             schemas, and writes an AC-4 measurement/evidence record under
-             .generated/evidence/ (gitignored).
+             with a poisoned proxy environment (blocks proxy-honoring
+             network access; it cannot catch a direct-socket bypass), then
+             validates every emitted record against the v1 schemas and
+             writes an AC-4 measurement/evidence record under
+             .generated/evidence/ (gitignored). The real offline guarantee
+             is cache-reuse (tree-sitter-language-pack, provisioned once
+             during `provision`) and static linking (ast-grep-outline,
+             which needs no provisioning at all).
 """
 
 import argparse
@@ -90,8 +94,11 @@ def lockfile_package_version(lockfile_path, crate_name):
 
 
 def poisoned_proxy_env():
-    """Child env with bogus proxy vars: any live network access during
-    measured capture fails loudly instead of silently succeeding."""
+    """Child env with bogus proxy vars: blocks proxy-honoring network access
+    during measured capture so it fails loudly instead of silently
+    succeeding. This does not catch a direct-socket bypass; the real
+    offline guarantee is cache-reuse (tree-sitter-language-pack) or static
+    linking (ast-grep-outline), not this proxy poison alone."""
     env = os.environ.copy()
     bogus = "http://127.0.0.1:1"
     for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
@@ -422,8 +429,11 @@ def cmd_capture(args):
         "provisioning_vs_capture_separation": (
             "`provision` is a distinct, network-requiring, run-once subcommand; "
             "`capture` here runs each candidate's offline capture subcommand under a "
-            "poisoned http_proxy/https_proxy/all_proxy environment, so any live network "
-            "access during measured capture fails loudly instead of succeeding silently."
+            "poisoned http_proxy/https_proxy/all_proxy environment, which blocks "
+            "proxy-honoring network access during measured capture (it would not catch "
+            "a direct-socket bypass). The real offline guarantee is cache-reuse "
+            "(tree-sitter-language-pack, provisioned once by `provision`) or static "
+            "linking (ast-grep-outline, which needs no provisioning)."
         ),
         "candidates": results,
     }
