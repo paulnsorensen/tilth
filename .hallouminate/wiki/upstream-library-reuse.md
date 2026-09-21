@@ -70,6 +70,31 @@ No replacement extractor or comparative benchmark executes in this follow-up.
 
 _Source: cited symbol-analysis research · Updated: 2026-09-20 · Supersedes: grammar-only reuse characterization, not the earlier migration decisions._
 
+## Extraction reuse experiment result (measured)
+
+Both candidates are rejected. The experiment finds no supported maintenance savings, so the decision is do-nothing.
+This result supersedes the earlier "no benchmark executed" notes above. A benchmark now exists and ran.
+The experiment is test-only. Production behavior, exports, and dependencies stay unchanged.[^exp-branch]
+
+The experiment scores five capabilities for each candidate and language: definitions, nesting, signatures, imports, and edit_spans.
+It uses Rust, TypeScript, and Python fixtures. It compares each candidate against the Tilth baseline.[^exp-report]
+
+`tree-sitter-language-pack` 1.17.0 reaches definitions only.
+Definitions pass for Python and are partial for Rust and TypeScript.
+Nesting, signatures, and imports are unsupported for every language.
+edit_spans are partial. The verdict is reject.[^exp-report]
+
+`ast-grep-outline` 0.45.3 is partial on all five capabilities for every language.
+Its nesting is one level only, from item to member, not Tilth's arbitrary depth.
+Its owned edit_spans drop leading attributes, for example `#[inline]`.
+The verdict is reject.[^exp-report]
+
+No candidate qualifies for adoption or adaptation.
+Migration, semantic references, broader-language qualification, and agent benchmarks remain non-goals.
+
+[^exp-branch]: Branch `paulnsorensen/evaluate-tree-sitter-pack`, base `790bdbe`. The only production change is one `#[cfg(test)] mod extraction_probe;` line in `src/lib.rs` (AC-7). Checked 2026-09-20.
+[^exp-report]: `benchmark/extraction/report.md`; comparator `benchmark/extraction/compare.py --offline` over `benchmark/extraction/fixtures/manifest.json`; approved spec `tilth-extraction-reuse-comparison` (AC-1 through AC-8). Checked 2026-09-20.
+
 ## Other candidate boundaries
 
 `tempfile` already exists as a development dependency.
