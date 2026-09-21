@@ -215,6 +215,36 @@ class BuildMatrixTests(unittest.TestCase):
         cell = self.cell(matrix, "definitions")
         self.assertEqual(cell["verdict"], "blocked")
 
+    def test_candidate_error_status_is_a_fail_not_a_pass(self):
+        """AC-8: a candidate that reports an extraction error must mark the
+        cell `fail`, never `pass` or `blocked`. Guards compare.py's
+        status=='error' branch against a regression that swallows errors."""
+        cand_dir = self.root / "cand-error"
+        record = correct_record()
+        record["definitions"] = {"status": "error", "value": "parser panicked"}
+        write_record(cand_dir, "rust-sample", record)
+
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
+
+        cell = self.cell(matrix, "definitions")
+        self.assertEqual(cell["verdict"], "fail")
+        self.assertNotIn(cell["verdict"], ("pass", "blocked", "unsupported"))
+
+    def test_unrecognized_status_is_blocked_not_a_pass(self):
+        """AC-8: a candidate record with a status the comparator does not
+        recognize must yield `blocked`, never a silent `pass`. Guards
+        compare.py's terminal unrecognized-status branch."""
+        cand_dir = self.root / "cand-garbage-status"
+        record = correct_record()
+        record["definitions"] = {"status": "totally-bogus", "value": [["function", "compute"]]}
+        write_record(cand_dir, "rust-sample", record)
+
+        matrix = compare.build_matrix(self.manifest, {"cand": cand_dir})
+
+        cell = self.cell(matrix, "definitions")
+        self.assertEqual(cell["verdict"], "blocked")
+        self.assertNotEqual(cell["verdict"], "pass")
+
 
 class ValuesEqualTests(unittest.TestCase):
     def test_duplicate_counts_matter(self):
