@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use clap::{Parser as ClapArgs, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -328,6 +329,7 @@ fn capture(manifest_path: Option<PathBuf>, out_dir: Option<PathBuf>) {
         .to_path_buf();
 
     let mut blocked: BTreeMap<String, String> = BTreeMap::new();
+    let mut extraction_seconds = 0.0f64;
 
     for entry in &manifest.fixtures {
         let source_path = fixtures_root.join(&entry.source);
@@ -362,12 +364,20 @@ fn capture(manifest_path: Option<PathBuf>, out_dir: Option<PathBuf>) {
                 continue;
             }
         };
+        // Time only the parse+extract call: file IO, hashing, and record
+        // serialization/write are excluded from the AC-4 in-process figure.
+        let extraction_start = Instant::now();
         let capture = capture_fixture(&entry.language, &content);
+        extraction_seconds += extraction_start.elapsed().as_secs_f64();
         if let Capture::Error(msg) = &capture {
             blocked.insert(entry.id.clone(), msg.clone());
         }
         emit(&out_dir, entry, &capture);
     }
+
+    // AC-4: report in-process extraction time separately from process
+    // startup and IO. Printed before exit so a blocked run still reports it.
+    println!("extraction_seconds={extraction_seconds}");
 
     if blocked.is_empty() {
         println!("captured {} fixtures", manifest.fixtures.len());

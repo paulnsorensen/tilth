@@ -122,9 +122,15 @@ benchmark/extraction/candidates/ast-grep-outline/target/release/ast-grep-outline
 - `candidates.<name>.offline_capture_command` — the exact command run.
 - `candidates.<name>.clean_build_seconds` — from step 1 above.
 - `candidates.<name>.executable_size_bytes` — from step 2 above.
-- `candidates.<name>.extraction_timing` — `{samples, count, median, range}`
-  from 5 repeated offline capture runs (`statistics.median`; range is
-  `{min, max}`), or `{blocked, reason}` if capture could not run.
+- `candidates.<name>.extraction_timing` — `{count, extraction_in_process,
+  end_to_end, startup_overhead}` from `CAPTURE_REPS` repeated offline
+  capture runs, or `{blocked, reason}` if capture could not run.
+  `extraction_in_process` is the candidate's own in-process timer around
+  only its parse+extract calls (excludes process startup, manifest IO, and
+  record serialize/write). `end_to_end` times the whole subprocess.
+  `startup_overhead` is `end_to_end - extraction_in_process` per sample.
+  Each of the three is `{samples, median, range: {min, max}}`
+  (`statistics.median`).
 - `candidates.<name>.validation` — `{status: ok, fixtures_checked}` or
   `{status: failed, errors}` or `{blocked, reason}`.
 

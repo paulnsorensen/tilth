@@ -239,16 +239,34 @@ def offline_capture_command(meta, out_dir):
     return [str(binary_path(meta)), "capture", "--manifest", str(FIXTURE_MANIFEST), "--out", str(out_dir)]
 
 
+def parse_extraction_seconds(stdout):
+    """Reads the candidate's `extraction_seconds=<f64>` stdout line: the
+    in-process time spent parsing+extracting, excluding process startup,
+    manifest IO, and record serialization/write (AC-4)."""
+    for line in stdout.splitlines():
+        if line.startswith("extraction_seconds="):
+            return float(line.split("=", 1)[1])
+    raise Blocked("offline capture", "candidate stdout has no 'extraction_seconds=' line")
+
+
 def run_offline_capture(meta, out_dir):
     """Runs the candidate's offline capture subcommand once under a poisoned
-    proxy environment. Returns elapsed seconds; raises Blocked on failure."""
+    proxy environment. Returns {end_to_end, extraction_in_process} seconds;
+    raises Blocked on failure.
+
+    end_to_end times the whole subprocess (startup, manifest parse, per-fixture
+    IO, extraction, serialize, write). extraction_in_process is the narrower
+    figure the candidate reports for only its parse+extract calls -- the two
+    are reported separately per AC-4 (startup/IO overhead is not extraction).
+    """
     cmd = offline_capture_command(meta, out_dir)
     start = time.monotonic()
     result = run(cmd, env=poisoned_proxy_env())
-    elapsed = time.monotonic() - start
+    end_to_end = time.monotonic() - start
     if result.returncode != 0:
         raise Blocked("offline capture", (result.stdout + result.stderr).strip())
-    return elapsed
+    extraction_in_process = parse_extraction_seconds(result.stdout)
+    return {"end_to_end": end_to_end, "extraction_in_process": extraction_in_process}
 
 
 def validate_capture_output(out_dir):
@@ -341,10 +359,16 @@ def measure_candidate(name, meta):
 
     record["extraction_timing"] = {
         "unit": "seconds",
-        "samples": samples,
         "count": len(samples),
-        "median": statistics.median(samples),
-        "range": {"min": min(samples), "max": max(samples)},
+        # AC-4: extraction time measured inside the candidate process (parse+
+        # extract only), reported separately from end-to-end process time.
+        "extraction_in_process": _summarize_seconds([s["extraction_in_process"] for s in samples]),
+        "end_to_end": _summarize_seconds([s["end_to_end"] for s in samples]),
+        # Startup/IO overhead not attributable to extraction: end-to-end
+        # minus in-process extraction, per sample.
+        "startup_overhead": _summarize_seconds(
+            [s["end_to_end"] - s["extraction_in_process"] for s in samples]
+        ),
     }
 
     validation_errors = validate_capture_output(out_dir)
@@ -354,6 +378,14 @@ def measure_candidate(name, meta):
         else {"status": "failed", "errors": validation_errors}
     )
     return record
+
+
+def _summarize_seconds(samples):
+    return {
+        "samples": samples,
+        "median": statistics.median(samples),
+        "range": {"min": min(samples), "max": max(samples)},
+    }
 
 
 def _try_clean_build(meta, record):
@@ -453,9 +485,13 @@ def cmd_capture(args):
             exit_code = 1
         else:
             timing = record["extraction_timing"]
+            extraction = timing["extraction_in_process"]
+            end_to_end = timing["end_to_end"]
             print(
-                f"{name}: captured+validated. median={timing['median']:.4f}s "
-                f"range=[{timing['range']['min']:.4f},{timing['range']['max']:.4f}]s "
+                f"{name}: captured+validated. "
+                f"extraction_in_process median={extraction['median']:.4f}s "
+                f"range=[{extraction['range']['min']:.4f},{extraction['range']['max']:.4f}]s; "
+                f"end_to_end median={end_to_end['median']:.4f}s "
                 f"exe={record['executable_size_bytes']}B"
             )
 

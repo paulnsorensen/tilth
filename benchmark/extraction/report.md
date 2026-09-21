@@ -148,13 +148,20 @@ for every capability measured, is **non-positive**.
 
 ## AC-4 headline measurements (informing context only, no threshold applied)
 
-| Candidate | Clean build | Executable size | Extraction median (range) |
-| --- | --- | --- | --- |
-| tree-sitter-language-pack | 16.31 s | 6,061,056 bytes | 0.0630 s (0.0536–0.6765 s) |
-| ast-grep-outline | 9.65 s | 45,791,632 bytes | 0.0157 s (0.0152–1.0134 s) |
+Extraction is measured two ways: **in-process** (the candidate's own timer
+around only its parse+extract calls, excluding process startup, manifest
+IO, and record serialize/write) and **end-to-end** (the whole offline
+capture subprocess). `startup_overhead` is end-to-end minus in-process,
+per sample; it is dominated by one-time OS process/binary-load cost, not
+extraction work.
+
+| Candidate | Clean build | Executable size | Extraction in-process median (range) | End-to-end median (range) |
+| --- | --- | --- | --- | --- |
+| tree-sitter-language-pack | 15.41 s | 6,061,136 bytes | 0.0387 s (0.0376–0.0546 s) | 0.0469 s (0.0458–0.2954 s) |
+| ast-grep-outline | 9.25 s | 45,792,384 bytes | 0.0005 s (0.0005–0.0008 s) | 0.0192 s (0.0171–1.1875 s) |
 
 Source: `benchmark/extraction/.generated/evidence/ac4-measurement.json`
-(baseline commit `ab98d725516ca9d81c53b83d57a32e9c0448dd6d`). Standalone
+(baseline commit `0aaa2a04396b113ad28cbace1a36870be8d209b8`). Standalone
 binary sizes do not predict integrated production size (spec risk); these
 figures inform, they do not gate, the recommendation below.
 

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ast_grep_core::tree_sitter::LanguageExt;
 use ast_grep_language::SupportLang;
@@ -373,6 +374,7 @@ fn capture(manifest_path: Option<PathBuf>, out_dir: Option<PathBuf>) {
     }
 
     let mut blocked: BTreeMap<String, String> = BTreeMap::new();
+    let mut extraction_seconds = 0.0f64;
 
     for entry in &manifest.fixtures {
         let source_path = fixtures_root.join(&entry.source);
@@ -406,6 +408,9 @@ fn capture(manifest_path: Option<PathBuf>, out_dir: Option<PathBuf>) {
             }
         };
 
+        // Time only the parse+extract call: file IO, hashing, and record
+        // serialization/write are excluded from the AC-4 in-process figure.
+        let extraction_start = Instant::now();
         let capture = match extractors.get(&entry.language) {
             Some(Ok(combined)) => {
                 let lang = support_lang(&entry.language).expect("language already validated");
@@ -414,11 +419,16 @@ fn capture(manifest_path: Option<PathBuf>, out_dir: Option<PathBuf>) {
             Some(Err(msg)) => Capture::Error(msg.clone()),
             None => Capture::Error(format!("unsupported language {}", entry.language)),
         };
+        extraction_seconds += extraction_start.elapsed().as_secs_f64();
         if let Capture::Error(msg) = &capture {
             blocked.insert(entry.id.clone(), msg.clone());
         }
         emit(&out_dir, entry, &capture);
     }
+
+    // AC-4: report in-process extraction time separately from process
+    // startup and IO. Printed before exit so a blocked run still reports it.
+    println!("extraction_seconds={extraction_seconds}");
 
     if blocked.is_empty() {
         println!("captured {} fixtures", manifest.fixtures.len());
