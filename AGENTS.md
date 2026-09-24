@@ -16,7 +16,7 @@ BATCH related work; array parameters never accept singular values:
 ROUTE:
 
 - Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint}]`; routing is automatic. Do not add query `kind`, `expand`, or `context`.
-- Read known files/symbols/ranges → `tilth_read`.
+- Read known files/symbols/ranges → `tilth_read`; omit `mode`. DO NOT pass `mode: full` when a `path#symbol` or `path#n-m` section answers.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
 - Changes → `tilth_diff`, optional `source: "HEAD~1"`.
@@ -37,9 +37,9 @@ BATCH related work; array parameters never accept singular values:
 - `patterns: ["*.rs", "*.toml"]`
 - `edits: [{path: "src/a.rs", tag: "1A2B", ops: [...]}, {path: "src/b.rs", tag: "3C4D", ops: [...]}]`
 
-READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numbered lines. Copy its TAG and integer line numbers; NEVER invent either. A section read (`path#12-40`) carries the whole-file TAG; edit only lines it showed. `tilth_write` accepts `{path, tag?, ops}` sections. `replace_text` swaps one exact unique `old`; `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for a new file or one too large to tag. Drift is 3-way-merged; a conflict rejects that section—re-read and retry it. Sections are independent.
+READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numbered lines. Copy its TAG and integer line numbers; NEVER invent either. A section read (`path#12-40`) carries the whole-file TAG; edit only lines it showed. DO NOT use `mode: full` to edit; read the section you change. `tilth_write` accepts `{path, tag?, ops}` sections. `replace_text` swaps one exact unique `old`; `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for a new file or one too large to tag. Drift is 3-way-merged; a conflict rejects that section—re-read and retry it. Sections are independent.
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
-ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read`; importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes → `tilth_diff`; browse → `tilth_list`.
+ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read` (omit `mode`); importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes → `tilth_diff`; browse → `tilth_list`.
 DO NOT re-read expanded search content.
