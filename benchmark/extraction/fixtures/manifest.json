@@ -1,0 +1,1078 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "id": "rust-core",
+      "source": "src/rust/core.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "16861453"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Module",
+              "deep"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Module",
+              "inner"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "inner",
+              "compute"
+            ],
+            [
+              "inner",
+              "deep"
+            ],
+            [
+              "deep",
+              "compute"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "compute",
+              "pub fn compute() -> i32"
+            ],
+            [
+              "compute",
+              "pub fn compute() -> i32"
+            ],
+            [
+              "deep",
+              null
+            ],
+            [
+              "compute",
+              "pub fn compute("
+            ],
+            [
+              "inner",
+              null
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "compute",
+              "        pub fn compute() -> i32 {\n            1\n        }"
+            ],
+            [
+              "compute",
+              "    pub fn compute() -> i32 {\n        0\n    }"
+            ],
+            [
+              "deep",
+              "    pub mod deep {\n        pub fn compute() -> i32 {\n            1\n        }\n    }"
+            ],
+            [
+              "compute",
+              "#[inline]\npub fn compute(\n    a: i32,\n    b: i32,\n) -> i32 {\n    a + b\n}"
+            ],
+            [
+              "inner",
+              "pub mod inner {\n    /// Shadows the outer `compute` name.\n    pub fn compute() -> i32 {\n        0\n    }\n\n    pub mod deep {\n        pub fn compute() -> i32 {\n            1\n        }\n    }\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "rust-imports_exports",
+      "source": "src/rust/imports_exports.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "fb0c38aa"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "use_map"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "use_map",
+              "pub fn use_map() -> Map<String, i32>"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [
+            "std::collections::HashMap as Map",
+            "std::fmt",
+            "reexported_compute"
+          ],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "use_map",
+              "pub fn use_map() -> Map<String, i32> {\n    Map::new()\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      },
+      "known_tilth_divergence": "Known Tilth divergence: the reexport line `pub use crate::inner::compute as reexported_compute;` starts with `pub use`, so it misses extract_import_source's `use ` branch and falls through to the generic last-whitespace-token fallback, which returns the alias `reexported_compute` rather than the reexported path `crate::inner::compute`."
+    },
+    {
+      "id": "rust-unicode",
+      "source": "src/rust/unicode.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "e3fc4a48"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "caf\u00e9"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "pub fn caf\u00e9() -> &'static str"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "pub fn caf\u00e9() -> &'static str {\n    \"caf\u00e9\"\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "rust-crlf",
+      "source": "src/rust/crlf.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "44b857c4"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "crlf_fn"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlf_fn",
+              "pub fn crlf_fn() -> i32"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlf_fn",
+              "pub fn crlf_fn() -> i32 {\r\n    1\r\n}\r"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "rust-empty",
+      "source": "src/rust/empty.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "02cc5d05"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "rust-incomplete",
+      "source": "src/rust/incomplete.rs",
+      "language": "rust",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "bf21808a"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-core",
+      "source": "src/typescript/core.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "90cbc3e6"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "run"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Module",
+              "deep"
+            ],
+            [
+              "Module",
+              "inner"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Class",
+              "Service"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Service",
+              "run"
+            ],
+            [
+              "inner",
+              "compute"
+            ],
+            [
+              "inner",
+              "deep"
+            ],
+            [
+              "deep",
+              "compute"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "run",
+              "run(): number"
+            ],
+            [
+              "compute",
+              "export function compute(): number"
+            ],
+            [
+              "compute",
+              "export function compute(): number"
+            ],
+            [
+              "deep",
+              null
+            ],
+            [
+              "inner",
+              null
+            ],
+            [
+              "compute",
+              "function compute("
+            ],
+            [
+              "Service",
+              null
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "run",
+              "  @logged\n  run(): number {\n    return this.value;\n  }"
+            ],
+            [
+              "compute",
+              "    export function compute(): number {\n      return 1;\n    }"
+            ],
+            [
+              "compute",
+              "  export function compute(): number {\n    return 0;\n  }"
+            ],
+            [
+              "deep",
+              "  export namespace deep {\n    export function compute(): number {\n      return 1;\n    }\n  }"
+            ],
+            [
+              "inner",
+              "namespace inner {\n  /** Shadows the outer `compute` name. */\n  export function compute(): number {\n    return 0;\n  }\n\n  export namespace deep {\n    export function compute(): number {\n      return 1;\n    }\n  }\n}"
+            ],
+            [
+              "compute",
+              "function compute(\n  a: number,\n  b: number,\n): number {\n  return a + b;\n}"
+            ],
+            [
+              "Service",
+              "class Service {\n  @readonly\n  value: number = 0;\n\n  @logged\n  run(): number {\n    return this.value;\n  }\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-imports_exports",
+      "source": "src/typescript/imports_exports.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "620d585a"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "wrapped"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "wrapped",
+              "export default function wrapped(): number"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [
+            "fs",
+            "path"
+          ],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "wrapped",
+              "export default function wrapped(): number {\n  return path.sep.length + readFile.length;\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-unicode",
+      "source": "src/typescript/unicode.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "9c76af6c"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "caf\u00e9"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "export function caf\u00e9(): string"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "export function caf\u00e9(): string {\n  return \"caf\u00e9\";\n}"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-crlf",
+      "source": "src/typescript/crlf.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "7e7bf409"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "crlfFn"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlfFn",
+              "export function crlfFn(): number"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlfFn",
+              "export function crlfFn(): number {\r\n  return 1;\r\n}\r"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-empty",
+      "source": "src/typescript/empty.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "02cc5d05"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "typescript-incomplete",
+      "source": "src/typescript/incomplete.ts",
+      "language": "typescript",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "1ab15e41"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "python-core",
+      "source": "src/python/core.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "dc76795e"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Class",
+              "Deep"
+            ],
+            [
+              "Function",
+              "compute"
+            ],
+            [
+              "Class",
+              "Inner"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "<module>",
+              "compute"
+            ],
+            [
+              "<module>",
+              "Inner"
+            ],
+            [
+              "Inner",
+              "compute"
+            ],
+            [
+              "Inner",
+              "Deep"
+            ],
+            [
+              "Deep",
+              "compute"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "compute",
+              "def compute() -> int"
+            ],
+            [
+              "compute",
+              "def compute() -> int"
+            ],
+            [
+              "Deep",
+              null
+            ],
+            [
+              "compute",
+              "def compute("
+            ],
+            [
+              "Inner",
+              null
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "compute",
+              "        @staticmethod\n        def compute() -> int:\n            return 1"
+            ],
+            [
+              "compute",
+              "    @staticmethod\n    def compute() -> int:\n        \"\"\"Shadows the outer compute name.\"\"\"\n        return 0"
+            ],
+            [
+              "Deep",
+              "    class Deep:\n        @staticmethod\n        def compute() -> int:\n            return 1"
+            ],
+            [
+              "compute",
+              "def compute(\n    a: int,\n    b: int,\n) -> int:\n    \"\"\"Computes the outer value.\"\"\"\n    return a + b"
+            ],
+            [
+              "Inner",
+              "class Inner:\n    @staticmethod\n    def compute() -> int:\n        \"\"\"Shadows the outer compute name.\"\"\"\n        return 0\n\n    class Deep:\n        @staticmethod\n        def compute() -> int:\n            return 1"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "python-imports_exports",
+      "source": "src/python/imports_exports.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "07651bc6"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "use_join"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "<module>",
+              "use_join"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "use_join",
+              "def use_join() -> str"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [
+            "sys as system"
+          ],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "use_join",
+              "def use_join() -> str:\n    return join_path(\"a\", \"b\")"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      },
+      "known_tilth_divergence": "Known Tilth divergence: get_outline_entries only classifies Python's plain `import module` statements (tree-sitter import_statement) as Import-kind entries; from-module import forms (import_from_statement) are not matched, so this fixture's `from os.path import join as join_path` and `from .core import compute as compute_alias` lines are silently absent from the imports capability. Only the plain `import sys as system` line surfaces, and extract_import_source routes it through the generic JS import branch (which matches before the Python-specific branch), keeping the `as system` alias rather than isolating the module name."
+    },
+    {
+      "id": "python-unicode",
+      "source": "src/python/unicode.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "eb0d2b86"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "caf\u00e9"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "<module>",
+              "café"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "def caf\u00e9() -> str"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "caf\u00e9",
+              "def caf\u00e9() -> str:\n    return \"caf\u00e9\""
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "python-crlf",
+      "source": "src/python/crlf.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "27957c8c"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "Function",
+              "crlf_fn"
+            ]
+          ],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "<module>",
+              "crlf_fn"
+            ]
+          ],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlf_fn",
+              "def crlf_fn()"
+            ]
+          ],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [
+            [
+              "crlf_fn",
+              "def crlf_fn():\r\n    return 1\r"
+            ]
+          ],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "python-empty",
+      "source": "src/python/empty.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "02cc5d05"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    },
+    {
+      "id": "python-incomplete",
+      "source": "src/python/incomplete.py",
+      "language": "python",
+      "hash": {
+        "algorithm": "xxh32",
+        "value": "c77d8aa4"
+      },
+      "capabilities": {
+        "definitions": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the (kind, name) pairs Tilth's get_deep_outline_entries returns for this fixture, read against the source's real definition boundaries."
+        },
+        "nesting": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (parent_name, child_name) pairs derived by walking outline entry children, matching the source's real nesting structure."
+        },
+        "signatures": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are (name, signature) pairs from the outline entries' signature field, matching the source's declared parameter lists."
+        },
+        "imports": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are import-source strings from extract_import_source over each Import-kind entry's declaration line."
+        },
+        "edit_spans": {
+          "applicability": "applicable",
+          "expected": [],
+          "evidence": "Expected values are the exact owned source text for span_start_line..=end_line per entry, including attached doc comments/decorators/attributes."
+        }
+      }
+    }
+  ]
+}

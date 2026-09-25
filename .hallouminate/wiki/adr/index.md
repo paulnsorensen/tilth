@@ -4,6 +4,8 @@
 - [python-scoped-import-deps](./python-scoped-import-deps.md) — ADR: scoped Python import dependencies (#197 part A)
 - [semantic-declaration-spans](./semantic-declaration-spans.md) — ADR: Semantic declaration spans
 - [tilth-diff-scope-ergonomics](./tilth-diff-scope-ergonomics.md) — ADRs — tilth_diff scope ergonomics (slug: tilth-diff-scope-ergonomics)
+- [tilth-extraction-reuse-comparison-001](./tilth-extraction-reuse-comparison-001.md) — Compare extraction reuse before production migration
+- [tilth-extraction-reuse-comparison-002](./tilth-extraction-reuse-comparison-002.md) — Evaluate partial extraction reuse by capability
 - [tilth-grok-ergonomics](./tilth-grok-ergonomics.md) — ADR: tilth-grok-ergonomics — curd 2 inclusion and shape
 - [tilth-read-input-ergonomics](./tilth-read-input-ergonomics.md) — ADRs — tilth_read input ergonomics (slug: tilth-read-input-ergonomics)
 - [tilth-search-resilience](./tilth-search-resilience.md) — ADRs — tilth_search resilience (slug: tilth-search-resilience)

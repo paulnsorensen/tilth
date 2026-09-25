@@ -39,6 +39,62 @@ Treat these findings as adapter requirements, not evidence that Tree-sitter cann
 [^12]: https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/bindings/rust/lib.rs; https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/queries/tags.scm
 [^13]: https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/queries/tags.scm
 
+## Symbol analysis precedents (current fork)
+
+This follow-up covers fork commit `790bdbe9113bc86118b4ca297f64e09d44fe8b99`, checked on 2026-09-20.
+It does not change the older upstream assessment's scope or approve a migration.
+
+The language pack is not only a grammar provider.
+Version 1.17 exposes nested structure, signatures, spans, imports, exports, and symbols.
+Its source also documents empty decorator metadata and language-limited import fields.[^symbol-pack]
+The older parser-reuse report's grammar-only description must not constrain future evaluations.
+
+LSP already separates a symbol's full range from its selection range.
+It also specifies definitions, references, and call hierarchy.
+Server capabilities determine available operations.[^symbol-lsp]
+Tilth's exact canonical-anchor and ownership rules remain a compatibility requirement, not evidence of a new analysis category.
+
+The inspected fork matches caller names in call-expression syntax, not compiler-bound symbol identities.
+Current MCP continuations use that path.
+Ordinary usage search uses text matching.[^symbol-local]
+Serena supplies agent-facing symbol operations, and Aider supplies token-bounded repository context.[^symbol-research]
+The inspected benchmark modes do not compare those tools with Tilth.[^symbol-local]
+
+Keep extraction reuse, semantic resolution, and product workflow comparisons separate.
+No replacement extractor or comparative benchmark executes in this follow-up.
+
+[^symbol-pack]: https://raw.githubusercontent.com/xberg-io/tree-sitter-language-pack/v1.17.0/crates/ts-pack-core/src/intel/types.rs (checked 2026-09-20).
+[^symbol-lsp]: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/ (checked 2026-09-20).
+[^symbol-local]: `src/search/callers.rs:219-225`; `src/mcp/tools/search_v2/continuations.rs:266-269`; `src/search/symbol.rs:566-638`; `benchmark/config.py:137-159` at the fork commit above.
+[^symbol-research]: `/Users/paul/.local/share/cheese/paulnsorensen-tilth/research/tilth-symbol-analysis-existing-alternatives/tilth-symbol-analysis-existing-alternatives.md`.
+
+_Source: cited symbol-analysis research · Updated: 2026-09-20 · Supersedes: grammar-only reuse characterization, not the earlier migration decisions._
+
+## Extraction reuse experiment result (measured)
+
+Both candidates are rejected. The experiment finds no supported maintenance savings, so the decision is do-nothing.
+This result supersedes the earlier "no benchmark executed" notes above. A benchmark now exists and ran.
+The experiment is test-only. Production behavior, exports, and dependencies stay unchanged.[^exp-branch]
+
+The experiment scores five capabilities for each candidate and language: definitions, nesting, signatures, imports, and edit_spans.
+It uses Rust, TypeScript, and Python fixtures. It compares each candidate against the Tilth baseline.[^exp-report]
+
+`tree-sitter-language-pack` 1.17.0 reaches definitions only.
+Definitions pass for Python and are partial for Rust and TypeScript.
+Nesting, signatures, and imports are unsupported for every language.
+edit_spans are partial. The verdict is reject.[^exp-report]
+
+`ast-grep-outline` 0.45.3 is partial on all five capabilities for every language.
+Its nesting is one level only, from item to member, not Tilth's arbitrary depth.
+Its owned edit_spans drop leading attributes, for example `#[inline]`.
+The verdict is reject.[^exp-report]
+
+No candidate qualifies for adoption or adaptation.
+Migration, semantic references, broader-language qualification, and agent benchmarks remain non-goals.
+
+[^exp-branch]: Branch `paulnsorensen/evaluate-tree-sitter-pack`, base `790bdbe`. The only production change is one `#[cfg(test)] mod extraction_probe;` line in `src/lib.rs` (AC-7). Checked 2026-09-20.
+[^exp-report]: `benchmark/extraction/report.md`; comparator `benchmark/extraction/compare.py --offline` over `benchmark/extraction/fixtures/manifest.json`; approved spec `tilth-extraction-reuse-comparison` (AC-1 through AC-8). Checked 2026-09-20.
+
 ## Other candidate boundaries
 
 `tempfile` already exists as a development dependency.
