@@ -856,7 +856,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1368,
+            1458,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -881,6 +881,12 @@ mod tests {
             "v2 automatic-routing guidance must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
+            SERVER_INSTRUCTIONS.contains(
+                "DO NOT pass `mode: full` when a `path#symbol` or `path#n-m` section answers."
+            ),
+            "section-read preference over mode: full must remain in SERVER_INSTRUCTIONS"
+        );
+        assert!(
             !SERVER_INSTRUCTIONS.contains("mcp__"),
             "server instructions must use protocol tool names, not client-specific prefixes"
         );
@@ -890,7 +896,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1885,
+            1961,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -911,6 +917,11 @@ mod tests {
         assert!(
             EDIT_MODE_INSTRUCTIONS.contains("must escape tabs/newlines"),
             "control-char escape rule must remain in EDIT_MODE_INSTRUCTIONS"
+        );
+        assert!(
+            EDIT_MODE_INSTRUCTIONS
+                .contains("DO NOT use `mode: full` to edit; read the section you change."),
+            "section-read edit guidance must remain in EDIT_MODE_INSTRUCTIONS"
         );
         assert!(
             !EDIT_MODE_INSTRUCTIONS.contains("mcp__"),

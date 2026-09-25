@@ -94,7 +94,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["auto", "full", "signature", "stripped"],
                         "default": "auto",
-                        "description": "auto (default): small files full; large code signatures; large Markdown outline. full forces content; signature forces outline; stripped removes plain comments/debug logs/blank runs and is non-editable."
+                        "description": "auto (default): small files full; large code signatures; large Markdown outline. full forces whole content (costly; prefer a section); signature forces outline; stripped removes plain comments/debug logs/blank runs and is non-editable."
                     },
                     "if_modified_since": {
                         "type": "string",
