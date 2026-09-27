@@ -27,3 +27,14 @@ def test_runner_aliases_remain_stable() -> None:
     assert RUNNERS["gpt5"] == "codex"
     assert RUNNERS["o3"] == "codex"
     assert RUNNERS["gpt5mini"] == "opencode"
+
+
+def test_fable_alias_is_pinned_and_runs_through_claude() -> None:
+    assert MODELS["fable"] == "claude-fable-5-1"
+    assert RUNNERS["fable"] == "claude"
+
+
+def test_fable_has_a_pricing_entry() -> None:
+    from pricing import PRICING
+
+    assert MODELS["fable"] in PRICING

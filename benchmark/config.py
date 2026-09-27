@@ -2,7 +2,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 def resolve_tilth_bin() -> str:
@@ -32,6 +32,9 @@ MODELS = {
     # gpt-5-mini: cheapest model with frontier-family tool-calling fidelity, so it
     # stays representative of real coding agents (the thing this tool-use A/B measures).
     "gpt5mini": "openrouter/openai/gpt-5-mini",
+    # Skill-overlay spike (AC-2/AC-7): pinned Fable snapshot id, mirrored in
+    # pricing.yaml until published pricing exists for it.
+    "fable": "claude-fable-5-1",
 }
 
 # Maps model short name -> runner type
@@ -43,6 +46,7 @@ RUNNERS = {
     "gpt5": "codex",
     "o3": "codex",
     "gpt5mini": "opencode",
+    "fable": "claude",
 }
 
 
@@ -63,6 +67,8 @@ class ModeConfig:
     binary_sha256: Optional[str] = None
     tilth_version: Optional[str] = None
     rustc_version: Optional[str] = None
+    plugin_dir: Optional[str] = None
+    prompt_mode: Literal["replace", "append"] = "replace"
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -96,9 +102,13 @@ class RepoConfig:
     language: str
     description: str
     license: str = "MIT"
+    on_demand_clone: bool = False
+    path_override: Optional[Path] = None
 
     @property
     def path(self) -> Path:
+        if self.path_override is not None:
+            return self.path_override
         return REPOS_DIR / self.name
 
 

@@ -269,7 +269,11 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
     monkeypatch.setattr(run, parser_name, fake_parser)
     captured: dict[str, object] = {}
 
+    real_subprocess_run = subprocess.run
+
     def fake_subprocess_run(cmd, **kwargs):
+        if cmd[0] not in ("claude", "codex", "opencode"):
+            return real_subprocess_run(cmd, **kwargs)
         captured["cmd"] = cmd
         captured["env"] = kwargs["env"]
         captured["stdin"] = kwargs.get("stdin")
@@ -399,8 +403,11 @@ def test_claude_streaming_run_does_not_inherit_stdin(
 
     process = FakeProcess()
     captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
 
     def fake_popen(command, **kwargs):
+        if command[0] != "claude":
+            return real_popen(command, **kwargs)
         captured["command"] = command
         captured.update(kwargs)
         return process
@@ -607,3 +614,236 @@ def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
         assert record["experiment_manifest"] == str(manifest_path.resolve())
         assert record["arm_order_seed"] == 42
         assert record["arm_order"][record["arm_order_index"]] == record["mode"]
+
+
+def _write_json(path: Path, data: object) -> Path:
+    path.write_text(json.dumps(data))
+    return path
+
+
+def _synthetic_task_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Give `_RunnerTask()`'s default `synthetic` repo a real, no-op source
+    so `main()` never touches the checked-in fixture repo."""
+    monkeypatch.setattr(run, "SYNTHETIC_REPO", tmp_path / "synthetic-source")
+    (tmp_path / "synthetic-source").mkdir()
+    monkeypatch.setattr(run, "reset_repo", lambda: None)
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+
+
+def test_main_merges_tasks_json_and_modes_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """`--tasks-json` and `--modes-json` merge into the live TASKS/MODES sets
+    and the merged names are selectable via `--tasks`/`--modes`."""
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "get_repo_path", lambda repo_name: tmp_path / "repo")
+    monkeypatch.setattr(run, "ensure_repo_clean", lambda *a, **k: None)
+
+    task_id = "bench-merge-acme-1"
+    tasks_json = _write_json(tmp_path / "tasks.json", {
+        "tasks": [{
+            "id": task_id,
+            "prompt": "Fix the bug.",
+            "repo_url": "https://example.invalid/acme.git",
+            "base_sha": "0" * 40,
+            "head_sha": "1" * 40,
+            "test_patch": "",
+            "test_command": ["true"],
+        }],
+    })
+    mode_name = "bench-merge-mode"
+    modes_json = _write_json(tmp_path / "modes.json", [
+        {"name": mode_name, "tools": ["Read"], "mcp_config_path": None, "description": "merge test"},
+    ])
+
+    calls: list[tuple[str, str, str, int]] = []
+
+    def fake_run_single(task_name, mode_name, model_name, rep, **kwargs):
+        calls.append((task_name, mode_name, model_name, rep))
+        return {
+            "task": task_name, "mode": mode_name, "model": model_name,
+            "correct": True, "num_turns": 1, "context_tokens": 1,
+            "output_tokens": 1, "total_cost_usd": 0.0, "duration_ms": 1,
+            "correctness_reason": "ok",
+        }
+
+    monkeypatch.setattr(run, "run_single", fake_run_single)
+    output_file = tmp_path / "results.jsonl"
+
+    try:
+        exit_code = run.main([
+            "--tasks-json", str(tasks_json), "--tasks", task_id,
+            "--modes-json", str(modes_json), "--modes", mode_name,
+            "--models", "haiku", "--reps", "1", "--output", str(output_file),
+        ])
+    finally:
+        run.TASKS.pop(task_id, None)
+        run.MODES.pop(mode_name, None)
+
+    assert exit_code is None
+    assert calls == [(task_id, mode_name, "haiku", 0)]
+    lines = output_file.read_text().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["task"] == task_id
+    assert row["mode"] == mode_name
+
+
+def test_main_writes_to_output_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """`--output` overrides the auto-generated results path."""
+    _synthetic_task_setup(monkeypatch, tmp_path)
+    task = _RunnerTask()
+    monkeypatch.setitem(run.TASKS, "output_path_task", task)
+
+    monkeypatch.setattr(run, "run_single", lambda task_name, mode_name, model_name, rep, **kwargs: {
+        "task": task_name, "mode": mode_name, "model": model_name,
+        "correct": True, "num_turns": 1, "context_tokens": 1,
+        "output_tokens": 1, "total_cost_usd": 0.0, "duration_ms": 1,
+        "correctness_reason": "ok",
+    })
+
+    output_file = tmp_path / "custom" / "nested" / "out.jsonl"
+    exit_code = run.main([
+        "--tasks", "output_path_task", "--modes", "baseline",
+        "--models", "haiku", "--reps", "1", "--output", str(output_file),
+    ])
+
+    assert exit_code is None
+    assert output_file.exists()
+    assert len(output_file.read_text().splitlines()) >= 1
+
+
+def test_main_records_skill_unavailable_error_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A `SkillUnavailableError` from `run_single` aborts the run and writes
+    an error row with `correct: False`, not a silently-passing comparison."""
+    _synthetic_task_setup(monkeypatch, tmp_path)
+    task = _RunnerTask()
+    monkeypatch.setitem(run.TASKS, "skill_unavailable_task", task)
+
+    def raising_run_single(*args, **kwargs):
+        raise run.SkillUnavailableError("plugin skill missing")
+
+    monkeypatch.setattr(run, "run_single", raising_run_single)
+    output_file = tmp_path / "results.jsonl"
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main([
+            "--tasks", "skill_unavailable_task", "--modes", "baseline",
+            "--models", "haiku", "--reps", "1", "--output", str(output_file),
+        ])
+
+    assert excinfo.value.code == 1
+    rows = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["correct"] is False
+    assert rows[0]["error"] == "skill_unavailable: plugin skill missing"
+
+
+def test_main_validates_plugin_dir_rejects_relative_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-absolute `plugin_dir` exits before any runner call."""
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setitem(run.TASKS, "plugin_task", _RunnerTask())
+    monkeypatch.setitem(run.MODES, "rel_plugin_mode", ModeConfig(
+        name="rel_plugin_mode", tools=["Read"], mcp_config_path=None,
+        description="bad plugin_dir", plugin_dir="relative/plugin/dir",
+    ))
+    monkeypatch.setattr(run, "run_single", lambda *a, **k: pytest.fail("run_single must not be called"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--tasks", "plugin_task", "--modes", "rel_plugin_mode", "--models", "haiku", "--reps", "1"])
+
+    assert excinfo.value.code == 1
+    assert "must be an absolute path" in capsys.readouterr().err
+
+
+def test_main_validates_plugin_dir_rejects_bad_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `plugin_dir` whose manifest can't be read exits before any runner call."""
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setitem(run.TASKS, "plugin_task", _RunnerTask())
+    monkeypatch.setitem(run.MODES, "bad_manifest_mode", ModeConfig(
+        name="bad_manifest_mode", tools=["Read"], mcp_config_path=None,
+        description="bad plugin_dir", plugin_dir=str(tmp_path / "no_manifest_plugin"),
+    ))
+    monkeypatch.setattr(run, "run_single", lambda *a, **k: pytest.fail("run_single must not be called"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--tasks", "plugin_task", "--modes", "bad_manifest_mode", "--models", "haiku", "--reps", "1"])
+
+    assert excinfo.value.code == 1
+    assert "manifest failed to load" in capsys.readouterr().err
+
+
+def test_main_validates_plugin_dir_rejects_empty_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `plugin_dir` mode with an empty `tools` allowlist exits before any runner call."""
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    plugin_dir = tmp_path / "empty_tools_plugin"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "test-plugin"}))
+    monkeypatch.setitem(run.TASKS, "plugin_task", _RunnerTask())
+    monkeypatch.setitem(run.MODES, "empty_tools_mode", ModeConfig(
+        name="empty_tools_mode", tools=[], mcp_config_path=None,
+        description="bad plugin_dir", plugin_dir=str(plugin_dir),
+    ))
+    monkeypatch.setattr(run, "run_single", lambda *a, **k: pytest.fail("run_single must not be called"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--tasks", "plugin_task", "--modes", "empty_tools_mode", "--models", "haiku", "--reps", "1"])
+
+    assert excinfo.value.code == 1
+    assert "empty tools list" in capsys.readouterr().err
+
+
+def test_main_rejects_modes_json_combined_with_experiment(tmp_path: Path) -> None:
+    modes_json = _write_json(tmp_path / "modes.json", [])
+    experiment_path = tmp_path / "experiment.json"
+    experiment_path.write_text("{}")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--modes-json", str(modes_json), "--experiment", str(experiment_path)])
+
+    assert excinfo.value.code == 2
+
+
+def test_main_bad_modes_json_entry_is_parser_error_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `--modes-json` entry missing required `ModeConfig` fields becomes a
+    clean `parser.error` (argparse exit 2), never an unhandled traceback."""
+    modes_json = _write_json(tmp_path / "modes.json", [{"name": "incomplete_mode"}])
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--modes-json", str(modes_json)])
+
+    assert excinfo.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+def test_main_bad_tasks_json_entry_is_parser_error_not_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `--tasks-json` mined-shape entry missing a required field becomes a
+    clean `parser.error` (argparse exit 2), never an unhandled traceback."""
+    tasks_json = _write_json(tmp_path / "tasks.json", {
+        "tasks": [{
+            "id": "incomplete-task",
+            "repo_url": "https://example.invalid/acme.git",
+            "base_sha": "0" * 40,
+            "head_sha": "1" * 40,
+        }],
+    })
+
+    with pytest.raises(SystemExit) as excinfo:
+        run.main(["--tasks-json", str(tasks_json)])
+
+    assert excinfo.value.code == 2
+    assert "usage:" in capsys.readouterr().err
