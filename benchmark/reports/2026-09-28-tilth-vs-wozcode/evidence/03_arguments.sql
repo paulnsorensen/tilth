@@ -1,1 +1,0 @@
-SELECT arm,tool_name,k.key,count(*) n,any_value(json_type(k.value)) value_type, max(CASE WHEN json_type(k.value)='ARRAY' THEN json_array_length(k.value) END) max_array,any_value(left(k.value::VARCHAR,1200)) example FROM calls,json_each(input) k WHERE arm<>'baseline' AND tool_name<>'Bash' GROUP BY arm,tool_name,k.key ORDER BY arm,tool_name,k.key;

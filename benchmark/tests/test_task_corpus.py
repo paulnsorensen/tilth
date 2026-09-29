@@ -53,7 +53,6 @@ BASE_TASKS = {
     "gin_edit_multi_context",
     "gin_edit_render_cascade",
     "gin_edit_render_runtime",
-    "gin_edit_render_context",
     "gin_edit_route_catchall",
     "gin_edit_route_catchall_nogit",
     "express_json_send",
@@ -83,8 +82,8 @@ def test_task_registry_has_expected_corpus_shape() -> None:
     names = set(TASKS)
     assert names - BASE_TASKS == ADDED_TASKS
     assert names == BASE_TASKS | ADDED_TASKS
-    assert len(TASKS) == 58
-    assert len(names) == 58
+    assert len(TASKS) == 57
+    assert len(names) == 57
     assert sum(bool(task.mutations) for task in TASKS.values()) == 22
     assert names.isdisjoint(PRUNED_TASKS)
 

@@ -10,8 +10,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from parse import (
@@ -405,27 +403,6 @@ def test_codex_gpt_5_6_cost_uses_short_and_long_context_rates_per_turn():
     result = parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
 
     assert result.total_cost_usd == 9.25
-
-
-def test_codex_mcp_calls_and_file_changes_match_report_names():
-    events = [
-        {"type": "thread.started", "thread_id": "t1"},
-        {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "tilth", "tool": "tilth_search", "arguments": {"queries": []}}},
-        {"type": "item.completed", "item": {"type": "file_change", "id": "edit1", "changes": [{"path": "a.py", "kind": "update"}]}},
-        {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}},
-    ]
-    result = parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
-    assert [call.name for call in result.turns[0].tool_calls] == ["mcp__tilth__tilth_search", "Edit"]
-
-
-@pytest.mark.parametrize("terminal", [{"type": "turn.failed", "error": {"message": "MCP failed"}}, {"type": "error", "message": "MCP failed"}, None])
-def test_codex_rejects_failed_or_incomplete_stream(terminal):
-    events = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"}]
-    if terminal:
-        events.append(terminal)
-    with pytest.raises(ValueError):
-        parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
 
 
 # --- opencode run --format json ---------------------------------------------

@@ -2,8 +2,7 @@
   "as_of": "2026-08-08",
   "sources": {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
-    "openai": "https://developers.openai.com/api/docs/pricing",
-    "openai_luna": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
+    "openai": "https://developers.openai.com/api/docs/pricing"
   },
   "models": {
     "claude-haiku-4-5-20251001": {
@@ -65,19 +64,6 @@
         "output": 45.0
       }
     },
-    "gpt-5.6-luna": {
-      "input": 0.20,
-      "cache_creation": 0.25,
-      "cache_read": 0.02,
-      "output": 1.20,
-      "long_context_threshold": 272000,
-      "long_context": {
-        "input": 0.40,
-        "cache_creation": 0.50,
-        "cache_read": 0.04,
-        "output": 1.80
-      }
-    },
     "o3": {
       "input": 2.0,
       "cache_creation": 2.0,
@@ -97,7 +83,6 @@
     "sonnet5": "claude-sonnet-5",
     "opus": "claude-opus-5",
     "gpt5": "gpt-5.6-sol",
-    "luna56": "gpt-5.6-luna",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-5.1-codex": "gpt-5-codex",
     "gpt5mini": "gpt-5-mini",

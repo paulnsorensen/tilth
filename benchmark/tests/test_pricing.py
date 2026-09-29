@@ -90,23 +90,6 @@ def test_current_frontier_model_short_context_pricing(
     assert {key: pricing.PRICING[model][key] for key in expected} == expected
 
 
-def test_luna_5_6_standard_and_long_context_pricing() -> None:
-    assert pricing.PRICING["gpt-5.6-luna"] == {
-        "input": 0.20,
-        "cache_creation": 0.25,
-        "cache_read": 0.02,
-        "output": 1.20,
-        "long_context_threshold": 272000,
-        "long_context": {
-            "input": 0.40,
-            "cache_creation": 0.50,
-            "cache_read": 0.04,
-            "output": 1.80,
-        },
-    }
-    assert pricing.PRICING_DATA["aliases"]["luna56"] == "gpt-5.6-luna"
-
-
 def test_gpt_5_6_long_context_pricing_is_applied_per_turn() -> None:
     run = {
         "model": "gpt-5.6-sol",

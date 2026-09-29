@@ -26,7 +26,6 @@ MODELS = {
     "sonnet5": "claude-sonnet-5",
     "opus": "claude-opus-5",
     "gpt5": "gpt-5.6-sol",
-    "luna56": "gpt-5.6-luna",
     "o3": "o3",
     # opencode + OpenRouter lane. Add more OpenRouter models here as one-liners
     # (short name -> "openrouter/<provider>/<model>"); mirror in RUNNERS.
@@ -42,7 +41,6 @@ RUNNERS = {
     "sonnet5": "claude",
     "opus": "claude",
     "gpt5": "codex",
-    "luna56": "codex",
     "o3": "codex",
     "gpt5mini": "opencode",
 }
@@ -65,9 +63,6 @@ class ModeConfig:
     binary_sha256: Optional[str] = None
     tilth_version: Optional[str] = None
     rustc_version: Optional[str] = None
-    plugin_dir: Optional[str] = None
-    plugin_version: Optional[str] = None
-    plugin_git_sha: Optional[str] = None
 
 
 REPO_ROOT = Path(__file__).parent.parent
