@@ -109,37 +109,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_list",
-            "annotations": { "readOnlyHint": true },
-            "description": "List a directory tree with token-size rollups; omit patterns for a project overview. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["cwd"],
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Optional batch (max 20); omit patterns for a project overview."
-                    },
-                    "depth": {
-                        "type": "number",
-                        "description": "Maximum directory depth; 1 is top-level."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Tree root directory; defaults to the checkout."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max response tokens."
-                    },
-                    "cwd": cwd_prop.clone()
-                }
-            }
-        }),
-        serde_json::json!({
             "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
             "description": "Check a file's imports and dependent callers before changing/removing an export or relied-on behavior. DO NOT use for ordinary reads or internal edits. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/repo\").",
@@ -561,21 +530,18 @@ mod tests {
         }
     }
 
-    /// `tilth_files` was consolidated into `tilth_list`; it must no longer be
-    /// advertised so clients can't discover a removed tool.
+    /// Retired directory tools must not appear in either mode.
     #[test]
-    fn tilth_files_is_not_advertised() {
+    fn retired_directory_tools_are_not_advertised() {
         for edit_mode in [false, true] {
             let defs = tool_definitions(edit_mode);
             let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
-            assert!(
-                !names.contains(&"tilth_files"),
-                "tilth_files must not be advertised (folded into tilth_list)"
-            );
-            assert!(
-                names.contains(&"tilth_list"),
-                "tilth_list must remain advertised"
-            );
+            for retired in ["tilth_files", "tilth_list"] {
+                assert!(
+                    !names.contains(&retired),
+                    "{retired} must not be advertised"
+                );
+            }
         }
     }
 
@@ -598,12 +564,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. All seven tools in edit mode
+    /// `root` property must be gone from every tool. All six tools in edit mode
     /// (`tilth_diff` included) take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 7, "edit mode advertises 7 path-taking tools");
+        assert_eq!(tools.len(), 6, "edit mode advertises 6 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];
@@ -638,57 +604,6 @@ mod tests {
             description.contains("always set this explicitly"),
             "cwd description must tell the model to set cwd: {description}"
         );
-    }
-
-    /// `tilth_list` treats an omitted `patterns` key as a project overview,
-    /// while present arrays retain glob-tree behavior and validation.
-    #[test]
-    fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
-        let tools = tool_definitions(false);
-        let list = tools
-            .iter()
-            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_list"))
-            .expect("tilth_list tool definition present");
-        let schema = &list["inputSchema"];
-
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .expect("required array present")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(
-            required,
-            vec!["cwd"],
-            "tilth_list must require only cwd — patterns is optional"
-        );
-        assert!(
-            schema["properties"]["patterns"]["description"]
-                .as_str()
-                .expect("patterns description present")
-                .contains("omit patterns for a project overview"),
-            "patterns description must advertise the overview omission"
-        );
-
-        let compiled = jsonschema::JSONSchema::compile(schema)
-            .expect("tilth_list inputSchema must be a valid JSON Schema");
-        assert!(
-            compiled.is_valid(&serde_json::json!({"cwd": "/abs"})),
-            "a bare cwd-only call must validate: patterns is optional"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"]})),
-            "cwd stays required"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": "*.rs", "cwd": "/abs"})),
-            "non-array patterns must fail schema validation client-side"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": [], "cwd": "/abs"})),
-            "empty patterns must fail schema validation (minItems: 1)"
-        );
-        assert!(compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"], "cwd": "/abs"})));
     }
 
     /// Claude Code truncates each tool `description` at 2,048 bytes. Every

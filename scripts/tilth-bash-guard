@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook: route file exploration to tilth.
 
-Denies a Bash command when the leading command of a top-level statement is
-grep/rg/find/cat/ls aimed at files inside the project, answering with a
-message that routes to tilth_search/tilth_read/tilth_list (or tilth_write
-when the project-side target is an output redirect). Pipe filters
+Denies leading grep/rg/cat content reads on project files.
+Allows ls/find directory browsing but guards input reads, output writes,
+and find execution or write actions on project files.
+Routes guarded operations to tilth_search, tilth_read, or tilth_write. Pipe filters
 (`cargo test | grep foo`), unresolvable paths (`"$HOME/x"`), heredoc
 bodies, multi-line quoted strings, fd redirects (`2>&1`, `2>/dev/null`),
 and paths outside the project are allowed. Fails open: any internal error
@@ -25,7 +25,8 @@ import sys
 import traceback
 from pathlib import Path
 
-DENY = {"grep", "rg", "find", "cat", "ls"}
+GUARDED = {"grep", "rg", "find", "cat", "ls"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
 PATTERN_FIRST = {"grep", "rg"}  # first positional is a pattern/value, not a path
 PATTERN_OPT_LONG = {"--regexp", "--file"}
 WRAPPERS = {"command", "time", "sudo", "env", "nice", "nohup", "stdbuf"}
@@ -46,8 +47,8 @@ FIND_GLOBAL_VALUE_OPTS = {"-maxdepth", "-mindepth", "-D"}
 # script must stay a dependency-free single file.
 ROUTE_BASE = (
     "{cmd} on project files is replaced by tilth: tilth_search (grep/rg), "
-    "tilth_read (cat), tilth_list (ls/find), tilth_write (file writes). "
-    "Shell remains for tests, builds, and paths outside the project."
+    "tilth_read (content reads), tilth_write (file writes). "
+    "Shell remains for directory browsing (ls/find), tests, builds, and external paths."
 )
 GENERATED_HINT = (
     " Generated, lock, and binary files return a header only from "
@@ -102,16 +103,38 @@ def _is_generated_lock_or_binary(path):
 def tokenize(command):
     """Tokenize the whole command in a single pass, pairing each token
     with the source line (1-based) it starts on."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    # shlex drops quote identity. Protect literal punctuation until operators
+    # are parsed, using markers absent from the command to avoid collisions.
+    punctuation = "();<>|&"
+    marker_start = 0xE000
+    while any(chr(marker_start + i) in command for i in range(len(punctuation))):
+        marker_start += len(punctuation)
+    protect = str.maketrans(
+        punctuation, "".join(chr(marker_start + i) for i in range(len(punctuation)))
+    )
+    restore = {value: key for key, value in protect.items()}
+    protected = re.sub(
+        r"""#[^\n]*|'[^']*'|"(?:[^"\\]|\\.)*"|\\.""",
+        lambda match: (
+            match.group() if match.group().startswith("#")
+            else match.group().translate(protect)
+        ),
+        command,
+        flags=re.DOTALL,
+    )
+    lex = shlex.shlex(protected, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = []
     while True:
-        line = lex.lineno
         tok = lex.get_token()
         if tok is None:
             break
+        # get_token skips comments and leading whitespace before the token.
+        end = lex.instream.tell()
+        trailing_newline = protected[end - 1 : end] == "\n"
+        line = lex.lineno - tok.count("\n") - trailing_newline
         tokens.append((tok, line))
-    return tokens
+    return tokens, restore
 
 
 def heredoc_delimiters(tokens):
@@ -119,7 +142,7 @@ def heredoc_delimiters(tokens):
     in order.
 
     `<<` inside `$(( ))` arithmetic is a shift, not a heredoc; quoted `<<`
-    never surfaces as its own token under posix shlex. `<<-EOF` tokenizes
+    stays protected until operator parsing ends. `<<-EOF` tokenizes
     as `<<` + `-EOF` (shlex's punctuation set doesn't include `-`), so the
     leading dash is stripped from the recorded delimiter.
     """
@@ -137,7 +160,7 @@ def heredoc_delimiters(tokens):
     return delims
 
 
-def heredoc_body_lines(tokens, command):
+def heredoc_body_lines(tokens, command, restore):
     """Line numbers (1-based) that fall inside a heredoc body or its
     terminator line — data, never judged."""
     tokens_by_line = {}
@@ -152,7 +175,10 @@ def heredoc_body_lines(tokens, command):
             if raw.strip() == pending[0]:
                 pending.pop(0)
             continue
-        pending = heredoc_delimiters(tokens_by_line.get(lineno, []))
+        pending = [
+            delim.translate(restore)
+            for delim in heredoc_delimiters(tokens_by_line.get(lineno, []))
+        ]
     return body_lines
 
 
@@ -195,14 +221,14 @@ def leading_segments(tokens):
 
 
 def command_and_args(segment):
-    """Split a segment into (command name, args, output-redirect targets).
+    """Split a segment into command, args, output targets, and input targets.
 
     Skips leading env assignments and bare wrapper commands. Heredoc
     operator/delimiter pairs are dropped. Fd redirects `2>`/`2>>` and
     above contribute nothing; `1>`/`1>>` (stdout) still routes to
     out_targets since it's the primary write target. An input redirect's
-    target joins `args` (read semantics), an output redirect's target is
-    returned separately so `cat > notes.txt` can route to tilth_write.
+    target is returned separately from directory-browsing arguments.
+    Output targets route to tilth_write.
     """
     i = 0
     while i < len(segment) and ENV_ASSIGN.match(segment[i]):
@@ -212,9 +238,9 @@ def command_and_args(segment):
         while i < len(segment) and ENV_ASSIGN.match(segment[i]):
             i += 1
     if i >= len(segment):
-        return None, [], []
+        return None, [], [], []
     cmd = os.path.basename(segment[i])
-    args, out_targets = [], []
+    args, out_targets, in_targets = [], [], []
     rest = segment[i + 1 :]
     j = 0
     while j < len(rest):
@@ -238,14 +264,14 @@ def command_and_args(segment):
                     if is_output:
                         out_targets.append(target)
                     else:
-                        args.append(target)
+                        in_targets.append(target)
             j += 2
             continue
-        if tok and tok[0] == "(":
+        if tok and tok[0] == "(" and cmd != "find":
             break
         args.append(tok)
         j += 1
-    return cmd, args, out_targets
+    return cmd, args, out_targets, in_targets
 
 
 def looks_pathlike(tok, cwd):
@@ -327,10 +353,16 @@ def targets_project(paths, cwd, root):
     return False
 
 
-def judge(cmd, args, out_targets, cwd, root):
+def judge(cmd, args, out_targets, in_targets, cwd, root):
     """Deny reason for one leading segment, or None."""
     if cwd is None:
         return None  # cd target unresolvable — fail open
+    if targets_project(out_targets, cwd, root):
+        return WRITE_ROUTE.format(cmd=cmd)
+    if targets_project(in_targets, cwd, root):
+        return ROUTE_BASE.format(cmd=cmd)
+    if cmd == "ls" or (cmd == "find" and not FIND_ACTIONS.intersection(args)):
+        return None
     candidates = path_args(cmd, args, cwd)
     if candidates:
         if targets_project(candidates, cwd, root):
@@ -338,7 +370,7 @@ def judge(cmd, args, out_targets, cwd, root):
             if any(_is_generated_lock_or_binary(p) for p in candidates):
                 reason += GENERATED_HINT
             return reason
-    elif not out_targets:
+    elif not out_targets and not in_targets:
         # No path was supplied at all — the command defaults to cwd, which
         # only denies when that cwd is actually inside the project.
         if cwd == root or Path(cwd).is_relative_to(root):
@@ -366,7 +398,7 @@ def decide(command, root):
     """Return the deny reason, or None to allow."""
     command = LINE_CONTINUATION.sub("", command)
     try:
-        tokens = tokenize(command)
+        tokens, restore = tokenize(command)
     except ValueError as exc:
         print(
             f"tilth-bash-guard: unbalanced quote, allowing: {command[:200]!r} ({exc})",
@@ -374,17 +406,21 @@ def decide(command, root):
         )
         return None  # unbalanced quote: fail open
 
-    body_lines = heredoc_body_lines(tokens, command)
+    body_lines = heredoc_body_lines(tokens, command, restore)
     cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
     for segment in leading_segments(statement_stream(tokens, body_lines)):
-        cmd, args, out_targets = command_and_args(segment)
+        cmd, args, out_targets, in_targets = command_and_args(segment)
+        cmd = cmd.translate(restore) if cmd is not None else None
+        args = [arg.translate(restore) for arg in args]
+        out_targets = [target.translate(restore) for target in out_targets]
+        in_targets = [target.translate(restore) for target in in_targets]
         if cmd == "cd":
             cwd = resolve_cd(args, cwd)
             continue
-        if cmd in DENY:
+        if cmd in GUARDED:
             if any(a in INFO_FLAGS for a in args):
                 continue  # reads no files
-            reason = judge(cmd, args, out_targets, cwd, root)
+            reason = judge(cmd, args, out_targets, in_targets, cwd, root)
             if reason:
                 return reason
     return None
@@ -431,8 +467,8 @@ if __name__ == "__main__":
             ("cargo test | grep foo", "allow"),
             ("cat /tmp/other/file.txt", "allow"),
             ("cd sub && rg pat", "deny"),
-            ("ls", "deny"),
-            ("find . -name '*.rs'", "deny"),
+            ("ls", "allow"),
+            ("find . -name '*.rs'", "allow"),
             ("find /tmp/x -name '*.rs'", "allow"),
             ("echo hi", "allow"),
             ("git grep foo", "allow"),
@@ -461,7 +497,7 @@ if __name__ == "__main__":
             ("/usr/bin/time cat src/lib.rs", "deny"),
             ("cat /etc/hosts 2>&1", "allow"),
             ("ls /etc 2>/dev/null", "allow"),
-            ("ls 2>/dev/null", "deny"),
+            ("ls 2>/dev/null", "allow"),
             ("cat /etc/hosts > notes.txt", "deny"),
             ("cat > /tmp/out.txt", "allow"),
             ('python3 -c "\nls = 1\nprint(ls)\n"', "allow"),
@@ -471,7 +507,7 @@ if __name__ == "__main__":
             ("find -L /tmp/elsewhere -name '*.rs'", "allow"),
             ("find -maxdepth 2 /var/log", "allow"),
             ("find -maxdepth 1 /etc", "allow"),
-            ("find -name '*.rs'", "deny"),
+            ("find -name '*.rs'", "allow"),
             ("find /tmp -name x", "allow"),
             ("cd /tmp && ls", "allow"),
             ("cd /etc && cat hosts", "allow"),
@@ -482,7 +518,7 @@ if __name__ == "__main__":
             # project read. Adding -h to INFO_FLAGS would silently open a bypass.
             ("grep -h pat src/", "deny"),
             # A cd chain that returns into the project is still a project read.
-            ("cd sub && cd .. && ls", "deny"),
+            ("cd sub && cd .. && ls", "allow"),
             # Bare cd goes to $HOME, which this hook cannot resolve — fail open.
             ("cd && ls", "allow"),
             # Backslash-continued commands are a single statement; the tail after
@@ -515,6 +551,42 @@ if __name__ == "__main__":
             # fd 1 (stdout) is the primary write target, unlike fd >= 2.
             ("ls 1>/tmp/out.txt", "allow"),
             ("cat /etc/hosts 1>>notes.txt", "deny"),
+            ("command ls src/", "allow"),
+            ("find -L . -maxdepth 2 -type f", "allow"),
+            ("ls > notes.txt", "deny"),
+            ("find . -name '*.rs' > notes.txt", "deny"),
+            ("ls < README.md", "deny"),
+            ("find . -exec cat {} \\;", "deny"),
+            ("find . -delete", "deny"),
+            # Quoted punctuation is data, not a statement or argument boundary.
+            ("find . -name ';' -o -exec cat {} \\;", "deny"),
+            ('find . -name ";" -o -exec cat {} \\;', "deny"),
+            ("find . -name \\; -o -exec cat {} \\;", "deny"),
+            ("find . -name '|' -o -delete", "deny"),
+            ('find . -name "|" -o -delete', "deny"),
+            ("find . -name \\| -o -delete", "deny"),
+            ("ls '(' > notes.txt", "deny"),
+            ('ls "(" > notes.txt', "deny"),
+            ("ls \\( > notes.txt", "deny"),
+            ("ls '(notes)' < README.md", "deny"),
+            ("find . -name ';' > notes.txt", "deny"),
+            ("find . -name '|' < README.md", "deny"),
+            ("ls ';' > notes.txt", "deny"),
+            ("ls '|' < README.md", "deny"),
+            ("find . -name ';'", "allow"),
+            ("find . -name '|'", "allow"),
+            ("ls '('", "allow"),
+            ("ls '>' notes.txt", "allow"),
+            ("ls '<' README.md", "allow"),
+            ("find . -name ';' > /tmp/out.txt", "allow"),
+            ("ls '(' < /etc/hosts", "allow"),
+            ("# '\nls > notes.txt\n# '", "deny"),
+            ('# "\nfind . -delete\n# "', "deny"),
+            ("ls '\ue000' > notes.txt", "deny"),
+            ("ls '<<' README.md", "allow"),
+            ("ls ';' | grep foo", "allow"),
+            ("ls ';'; cat README.md", "deny"),
+            ("cat <<';' >/tmp/out.txt\ndata\n;\ncat README.md", "deny"),
         ]
 
         def self_test():
