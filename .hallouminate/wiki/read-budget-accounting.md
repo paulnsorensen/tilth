@@ -102,7 +102,7 @@ If it fails identically with your changes stashed, it is baseline and not yours.
 Current CI uses `cargo clippy --all-targets -- -D warnings`.
 Both the baseline and allocator change pass this gate locally.[^current-gate]
 
-[^current-gate]: .github/workflows/ci.yml:24; .context/read-budget-baseline-clippy.log; .context/read-budget-final-clippy.log
+[^current-gate]: .github/workflows/ci.yml:24; PR #279
 
 ## Batch allocation, 2026-09-28
 
@@ -113,6 +113,11 @@ Allocation uses rendered size, so it applies to plain paths, line ranges, and sy
 Output keeps input order and reserves space for separators and the missing-file footer.
 Existing truncation markers can exceed their allocated share, so the batch checks rendered size and reduces allocations before finalization.[^batch-allocation]
 
+Below about 48 tokens, `budget::truncate` renders a part as its first line plus a marker, so a smaller cap cannot shrink it.
+The reduction loop therefore stops when the rendered size does not decrease.
+If the body still overflows, the batch clips only the joined parts and then appends the missing-file footer.
+A follow-up can remove this loop: make `truncate` honor its cap, or share one allocator with `src/search/alloc.rs`.[^batch-allocation]
+
 Tests cover exact fit, unequal sizes, reversed order, UTF-8, missing files, tagged ranges, and tiny-budget safety.
 Use a fresh Session after any sizing read when testing whether the budgeted read records edit snapshots.
 Otherwise, the first read can make the write assertion pass without testing the second read.[^batch-allocation]
@@ -122,4 +127,4 @@ A truncated tagged section can lose its tag and numbered content at a blank-line
 Tiny budgets cannot necessarily contain the existing headers and truncation notices.
 These are separate limitations, not strict-cap guarantees from the allocation change.[^batch-allocation]
 
-[^batch-allocation]: src/mcp/tools/read.rs:231-289,631-659; src/budget.rs:52-104; .cheese/cook/read-batch-budget.md
+[^batch-allocation]: src/mcp/tools/read.rs:240-314,655-692; src/budget.rs:52-105; PR #279
