@@ -1,0 +1,24 @@
+## Fix Recommendations (raw signal): mcp__tilth__%  (harness=claude)
+
+### High-error tools (>=40% errors, >=3 calls) — swap or fix call shape
+|       tool_name        | calls | errors | error_pct |
+|------------------------|------:|-------:|----------:|
+| mcp__tilth__tilth_grok | 4     | 2      | 50.0      |
+
+### Allowlist adds (prefixes denied >=2 times; claude-dominant signal)
+| cmd_prefix | uses | denied |
+|------------|-----:|-------:|
+
+### Raw-bash that should route to a dedicated tool/skill
+|            swap             | uses |
+|-----------------------------|-----:|
+| find -> Glob / cheez-search | 7    |
+| grep/rg -> cheez-search     | 5    |
+
+### MCP servers — repair (high error) or retire (idle)
+|     server      | calls | errors | error_pct |
+|-----------------|------:|-------:|----------:|
+| tilth           | 146   | 4      | 2.7       |
+| plugin_woz_code | 158   | 1      | 0.6       |
+
+Advisory only: sections with <2 rows = insufficient signal; empty denial data on codex/omp is missing signal, not zero friction.

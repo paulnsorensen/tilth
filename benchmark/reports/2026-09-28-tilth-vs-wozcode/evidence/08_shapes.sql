@@ -1,0 +1,1 @@
+SELECT arm,rep,tool_name,tool_use_id,input,is_error,text FROM responses WHERE arm<>'baseline' OR (tool_name='Bash' AND is_error='true') OR (tool_name='Glob' AND is_error='true') ORDER BY arm,rep,timestamp;

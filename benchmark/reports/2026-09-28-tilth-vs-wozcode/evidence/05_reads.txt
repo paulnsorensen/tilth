@@ -1,0 +1,10 @@
+[{"shape":"plain","paths":92},
+{"shape":"numeric_range","paths":57}]
+[{"arm":"tilth","tool_name":"mcp__tilth__tilth_read","read_mode":"full","calls":5},
+{"arm":"tilth","tool_name":"mcp__tilth__tilth_read","read_mode":"omitted","calls":43},
+{"arm":"wozcode","tool_name":"mcp__plugin_woz_code__Search","read_mode":"file_paths_only","calls":13},
+{"arm":"wozcode","tool_name":"mcp__plugin_woz_code__Search","read_mode":"file_paths_with_content","calls":83},
+{"arm":"wozcode","tool_name":"mcp__plugin_woz_code__Search","read_mode":"file_paths_with_match_count","calls":3},
+{"arm":"wozcode","tool_name":"mcp__plugin_woz_code__Search","read_mode":"omitted","calls":14}]
+[{"arm":"wozcode","tool_name":"mcp__plugin_woz_code__Search","requests":198,"unique_exact_requests":171},
+{"arm":"tilth","tool_name":"mcp__tilth__tilth_read","requests":149,"unique_exact_requests":143}]
