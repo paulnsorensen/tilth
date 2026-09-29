@@ -62,3 +62,12 @@ binary's prompt surface is in question.**
 - `.cheese/notes/tilth-pr196-sonnet5-audit.md`
 - `.cheese/notes/tilth-sonnet5-cost-attribution.md`
 - PR #168 (paulnsorensen/tilth): harness + reporting fixes, commits `d4d41b5`, `f8a92c9`
+
+## External harness qualification
+
+The 2026-09-29 [FeatureBench integration investigation](featurebench-integration.md) extends these attachment and billing checks to container benchmarks.
+Native FeatureBench has failure-denominator, best-attempt, credential-metadata, and agent-specific budget pitfalls.
+Harbor requires an explicit verifier-boundary check; container execution alone does not prove fresh-state grading.
+The linked page records primary sources and proposed acceptance checks. No FeatureBench run occurs in this session.
+
+_Source: Historical investigation above; FeatureBench primary sources in [the source register](sources/benchmark-research.md) · Updated: 2026-09-29 · Supersedes: None; historical results remain unchanged._
