@@ -217,7 +217,7 @@ def statement_pipeline_segments(tokens):
             if any(segs):
                 yield segs
             segs, seg = [], []
-        elif tok == "|":
+        elif tok in {"|", "|&"}:
             segs.append(seg)
             seg = []
         else:
@@ -436,6 +436,9 @@ def xargs_inner_command(segment):
             i += 2
         elif len(tok) > 2 and tok[0] == "-" and tok[1] in {"n", "P", "d", "I"}:
             i += 1  # attached value, e.g. `-n1`, `-Ifoo`
+        elif tok == "--":
+            i += 1  # end of xargs options; the command follows
+            break
         elif tok.startswith("-"):
             return None  # unrecognized flag — fail open
         else:
@@ -502,11 +505,13 @@ def decide(command, root):
             reason = judge(cmd, args, out_targets, in_targets, cwd, root)
             if reason:
                 return reason
-            if cmd in ("ls", "find") and len(segs) > 1:
-                following = [tok.translate(restore) for tok in segs[1]]
-                reason = judge_xargs_pipe(cmd, args, following, cwd, root)
-                if reason:
-                    return reason
+            if cmd in ("ls", "find"):
+                # Any later stage may be the xargs read (`find . | sort | xargs cat`).
+                for stage in segs[1:]:
+                    following = [tok.translate(restore) for tok in stage]
+                    reason = judge_xargs_pipe(cmd, args, following, cwd, root)
+                    if reason:
+                        return reason
     return None
 
 
@@ -690,6 +695,11 @@ if __name__ == "__main__":
             ("find src -name '*.py' | xargs grep foo", "deny"),
             ("ls src | xargs cat", "deny"),
             ("find . -type f -print0 | xargs -0 rg foo", "deny"),
+            ("find . -type f |& xargs cat", "deny"),
+            ("find . -type f | xargs -- cat", "deny"),
+            ("find . -type f | sort | xargs cat", "deny"),
+            ("find /tmp -type f | sort | xargs cat", "allow"),
+            ("cargo test |& grep foo", "allow"),
             ("find . -name x | head", "allow"),
             ("find /tmp -name x | xargs cat", "allow"),
         ]
