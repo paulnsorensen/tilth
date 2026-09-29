@@ -352,6 +352,11 @@ fn tool_read_paths(
                 };
             }
         }
+        // Path lists that cannot fit collapse to counts, so the response
+        // still says how many parts were omitted and how many paths were missing.
+        if crate::types::estimate_tokens(combined.len() as u64) > body_budget {
+            combined = batch_count_summary(parts.len(), not_found.len());
+        }
         // Multi-file responses don't carry per-file view-meta.
         return Ok(finalize_response(
             Some(now),
@@ -700,6 +705,16 @@ fn count_lines(path: &Path) -> Option<u32> {
     Some(u32::try_from(total).unwrap_or(u32::MAX))
 }
 
+fn batch_count_summary(omitted: usize, not_found: usize) -> String {
+    let mut sections = Vec::new();
+    if omitted > 0 {
+        sections.push(format!("── omitted (raise budget) ──\n{omitted} parts"));
+    }
+    if not_found > 0 {
+        sections.push(format!("── not found ──\n{not_found} paths"));
+    }
+    sections.join("\n\n")
+}
 fn batch_part_caps(parts: &[String], budget: u64) -> Vec<u64> {
     let mut needs: Vec<(usize, u64)> = parts
         .iter()
@@ -1224,6 +1239,48 @@ mod tests {
             "aggregate must not clip the footer at the shrink floor: {out}"
         );
         assert!(crate::types::estimate_tokens(out.len() as u64) <= 120);
+    }
+
+    #[test]
+    fn batch_read_counts_sections_when_path_lists_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        let mut names = Vec::new();
+        for file_index in 0..6 {
+            let mut source = String::new();
+            for line in 0..400 {
+                let _ = writeln!(source, "let value_{file_index}_{line} = {line};");
+            }
+            let name = format!("large_{file_index}.rs");
+            std::fs::write(dir.path().join(&name), source).unwrap();
+            names.push(name);
+        }
+        for missing_index in 0..6 {
+            names.push(format!("absent_{missing_index}.rs"));
+        }
+        let path_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = tool_read(
+            &serde_json::json!({
+                "paths": path_refs,
+                "mode": "full",
+                "budget": 70,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.contains("── omitted (raise budget) ──\n6 parts"),
+            "{out}"
+        );
+        assert!(out.contains("── not found ──\n6 paths"), "{out}");
+        assert!(
+            !out.contains("\"truncated\":true"),
+            "aggregate must not clip the count summary: {out}"
+        );
+        assert!(crate::types::estimate_tokens(out.len() as u64) <= 70);
     }
 
     #[test]

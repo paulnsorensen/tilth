@@ -119,6 +119,7 @@ If the body still overflows, the fallback keeps whole parts in input order.
 It skips a part that does not fit and tries the next part.
 A `── omitted (raise budget) ──` section lists each skipped part by path, before the missing-file footer.
 The fallback reserves space for a list of every part path first, so both sections survive.
+If the path lists still do not fit, each section shows only a count, such as `6 parts` or `6 paths`.
 A follow-up can remove this loop: make `truncate` honor its cap, or share one allocator with `src/search/alloc.rs`.[^batch-allocation]
 
 Tests cover exact fit, unequal sizes, reversed order, UTF-8, missing files, tagged ranges, and tiny-budget safety.
@@ -127,7 +128,7 @@ Otherwise, the first read can make the write assertion pass without testing the 
 
 Shared truncation behavior remains unchanged.
 A truncated tagged section can lose its tag and numbered content at a blank-line boundary.
-Tiny budgets cannot necessarily contain the existing headers and truncation notices.
+Below the JSON header plus the count summary, no batch body fits, and `finalize_response` clips it.
 These are separate limitations, not strict-cap guarantees from the allocation change.[^batch-allocation]
 
-[^batch-allocation]: src/mcp/tools/read.rs:158-362,703-742; src/budget.rs:52-105; PR #279
+[^batch-allocation]: src/mcp/tools/read.rs:158-366,708-755; src/budget.rs:52-105; PR #279
