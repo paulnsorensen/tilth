@@ -7,13 +7,30 @@ Thanks for your interest. tilth is small and intentionally so — clean, focused
 1. Fork, branch, change.
 2. Run the gates locally:
    ```bash
-   cargo fmt --check
-   cargo clippy -- -D warnings
-   cargo test
+   just check
    ```
+   `just check` runs `scripts/verify.py`, which runs the same commands as the CI `check` job.
+   Use `just verify <command>` to run one command with the same setup, for example `just verify cargo test edit`.
 3. Open a PR. Describe what changed and how to test it.
 
-CI runs the same three commands on every push.
+## Optional local compiler caching
+
+Install `sccache` to cache compiler results across builds and worktrees:
+
+```bash
+brew install sccache   # or: cargo install sccache --locked
+```
+
+`just check` and `just verify` find `sccache` on `PATH` and set `RUSTC_WRAPPER` to its absolute path.
+They also set `CARGO_INCREMENTAL=0`, because sccache does not cache incremental builds.
+Run `sccache --show-stats` to see cache hits and misses.
+
+Set `RUSTC_WRAPPER=` to opt out, for example `RUSTC_WRAPPER= just check`.
+Any explicit Rust wrapper variable or `CARGO_INCREMENTAL=1` also stops the automatic setup.
+Direct `cargo` commands do not change.
+A wrapper set only in Cargo config is not visible to this check; export the wrapper variable to keep it.
+
+CI uses `sccache` with the GitHub Actions cache for the `check` job and the nightly native builds.
 
 ## What helps
 

@@ -68,12 +68,24 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # cross builds run rustc inside a container without sccache, so an empty
+    # RUSTC_WRAPPER disables the wrapper for those targets.
+    env:
+      RUSTC_WRAPPER: ${{ !matrix.cross && 'sccache' || '' }}
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # ratchet:mozilla-actions/sccache-action@v0.0.11
+        if: ${{ !matrix.cross }}
+        with:
+          version: v0.18.0
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
         with:
