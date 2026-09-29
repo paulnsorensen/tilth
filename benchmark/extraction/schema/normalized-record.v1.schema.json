@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "version",
+    "fixture_id",
+    "definitions",
+    "nesting",
+    "signatures",
+    "imports",
+    "edit_spans"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "fixture_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "definitions": {
+      "$ref": "#/definitions/capability_result"
+    },
+    "nesting": {
+      "$ref": "#/definitions/capability_result"
+    },
+    "signatures": {
+      "$ref": "#/definitions/capability_result"
+    },
+    "imports": {
+      "$ref": "#/definitions/capability_result"
+    },
+    "edit_spans": {
+      "$ref": "#/definitions/capability_result"
+    }
+  },
+  "definitions": {
+    "capability_result": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported",
+            "error"
+          ]
+        },
+        "value": {}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "error"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
