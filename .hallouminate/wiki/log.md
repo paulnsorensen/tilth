@@ -26,3 +26,7 @@
 
 2026-09-29 · 3e3f7cedf0c89034 · retrieval-warning · tool-batching-behavior.md · User waives the exact-query rank-one rule. “Tool-call batching” returns this page second behind adr/tilth-read-input-ergonomics.md; all other 17 frozen probes pass.
 
+
+
+2026-09-29 · 30c6e8e245716112 · merged · local-gate-gotchas.md · Record the PR #280 fingerprint language-count tie and deterministic Rust fixture. All three frozen retrieval probes return this page first.
+
