@@ -2,30 +2,32 @@
 
 ## Current diff and editing boundary
 
-The public `tilth_diff` tool reviews changes. It does not create edit tags or record seen-line provenance.[^diff-boundary]
-Tilth currently edits with a whole-file tag, not per-line hashes.[^current-tag]
+The user retires only public MCP `tilth_diff` on 2026-09-29.
+The removed adapter never created edit tags or recorded seen-line provenance.[^diff-boundary]
+Tilth edits with a whole-file tag, not per-line hashes.[^current-tag]
 Read the target section with `tilth_read` before editing it.
 A diff's line numbers refer to its selected old or new source, not necessarily the live file.[^diff-lines]
 
-The public diff pipeline runs Git or reads a patch, parses hunks, builds structural overlays, and formats overview or scoped detail.
+The retained CLI/library diff pipeline runs Git or reads a patch, parses hunks, and formats structural summaries or scoped detail.
 It identifies symbol, signature, and movement changes.
 Optional blast analysis adds caller warnings.[^diff-pipeline]
 
 The write path separately records the new snapshot and displayed source lines after applying an edit.
-Its optional `diff:true` output uses `diffy::create_patch`, not the public structural-diff pipeline.
+Its optional `diff:true` output uses `diffy::create_patch`, not the structural-diff pipeline.
 Stale-tag recovery uses `diffy::merge` against the cached snapshot and live text.
-These mechanisms do not require the `tilth_diff` MCP tool.[^write-boundary]
+These mechanisms do not require the retired MCP tool.[^write-boundary]
 
-Keep the three concepts separate: structural review, post-write patch display, and stale-tag recovery.
-Removing a public diff verb would not by itself remove the internal patch and merge machinery.
+Keep structural review, post-write patch display, and stale-tag recovery separate.
+Public diff retirement preserves the internal patch and merge machinery.
+See [[adr/tilth-search-v2-roadmap-001]] for the public-surface decision.
 
-[^diff-boundary]: `src/mcp/tools/diff.rs:3-35`; tool_diff receives arguments but no Session or SnapshotStore.
+[^diff-boundary]: User scope approval on 2026-09-29: "Retire only public tilth_diff". Pre-retirement [adapter at commit 8d149614](https://github.com/paulnsorensen/tilth/blob/8d149614bbcc2ef33eaf4b5ed9dc352317578df7/src/mcp/tools/diff.rs#L3-L35) receives arguments but no Session or SnapshotStore.
 [^current-tag]: `src/edit/tag.rs:1-7,44-49,66-93`; `src/mcp/tools/write.rs:269-333`.
 [^diff-lines]: `src/diff/format.rs:507-515` selects old lines for removals and new lines for additions.
 [^diff-pipeline]: `src/diff/mod.rs:258-339,588-675`.
 [^write-boundary]: `src/mcp/tools/write.rs:195-238,633-638`; `src/edit/recovery.rs:102-116`.
 
-_Last verified: 2026-09-29, source base 18b7534eecde023cb4a70e5d13d7de29178073de._
+_Source: source inspection and user scope approval · Updated: 2026-09-29 · Supersedes: public MCP diff availability only._
 
 ## Historical migration analysis
 

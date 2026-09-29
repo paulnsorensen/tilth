@@ -14,9 +14,7 @@ mod iso;
 mod path_suffix;
 mod tools;
 
-use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_read, tool_search_v2, tool_write,
-};
+use tools::{tool_definitions, tool_deps, tool_grok, tool_read, tool_search_v2, tool_write};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -339,6 +337,7 @@ fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
         "tilth_files" | "tilth_list" => format!(
             "retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
         ),
+        "tilth_diff" => "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.".to_string(),
         "tilth_edit" if edit_mode => {
             "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
         }
@@ -357,10 +356,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // Budget validation only applies to tools that honour the budget param.
     // tilth_write ignores budget; rejecting budget:0 for it
     // produces a confusing read-oriented error on non-read operations.
-    let budget_aware = matches!(
-        tool,
-        "tilth_read" | "tilth_deps" | "tilth_diff" | "tilth_grok"
-    );
+    let budget_aware = matches!(tool, "tilth_read" | "tilth_deps" | "tilth_grok");
     if budget_aware {
         if let Some(b) = args.get("budget") {
             if !matches!(b.as_u64(), Some(n) if n >= 1) {
@@ -376,7 +372,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_search" => dispatch_search_v2(args, services),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-        "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(unknown_tool_error(tool, edit_mode)),
     };
@@ -583,6 +578,20 @@ mod tests {
     }
 
     #[test]
+    fn retired_diff_returns_guidance_before_argument_validation() {
+        for edit_mode in [false, true] {
+            let services = Services::new(edit_mode);
+            for args in [
+                serde_json::json!({}),
+                serde_json::json!({"cwd": "/", "source": "working"}),
+                serde_json::json!({"cwd": 42, "budget": 0, "source": []}),
+            ] {
+                let err = dispatch_tool("tilth_diff", &args, &services).unwrap_err();
+                assert_eq!(err, "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.");
+            }
+        }
+    }
+    #[test]
     fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
         let services = Services::new(true);
         let args = serde_json::json!({ "cwd": "/" });
@@ -765,7 +774,6 @@ mod tests {
             ),
             ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
             ("tilth_grok", serde_json::json!({ "target": "x" })),
-            ("tilth_diff", serde_json::json!({})),
             (
                 "tilth_write",
                 serde_json::json!({ "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 1 }] }] }),
@@ -867,11 +875,11 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1381,
+            1355,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
-            "tilth — code intelligence MCP server. Replaces grep, cat, and git diff.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/git diff/git log); use `tilth_read`, `tilth_search`, `tilth_diff`. Shell is for directory browsing (ls/find), tests, builds, and non-file operations."
+            "tilth — code intelligence MCP server. Replaces grep and cat.\nDO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg); use `tilth_read` and `tilth_search`. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations."
         ));
         assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
@@ -907,11 +915,11 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1960,
+            1975,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
-            "tilth — code intelligence MCP server. Replaces grep, cat, git diff, and host edit tools.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), tests, builds, and non-file operations."
+            "tilth — code intelligence MCP server. Replaces grep, cat, and host edit tools.\nDO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations."
         ));
         assert!(EDIT_MODE_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
@@ -2070,13 +2078,7 @@ mod tests {
     /// every tool the mode offers, and the shell DO NOT lines.
     #[test]
     fn build_instructions_fit_2kb_and_carry_critical_spans() {
-        let shared_tools = [
-            "tilth_search",
-            "tilth_read",
-            "tilth_deps",
-            "tilth_grok",
-            "tilth_diff",
-        ];
+        let shared_tools = ["tilth_search", "tilth_read", "tilth_deps", "tilth_grok"];
         for edit in [false, true] {
             let s = build_instructions(edit);
             assert!(
@@ -2098,13 +2100,15 @@ mod tests {
                 );
             }
             assert!(!s.contains("tilth_list"), "retired tool in instructions");
+            assert!(!s.contains("tilth_diff"), "retired tool in instructions");
+            assert!(s.contains("shell `git diff` or `git log`"));
             assert!(s.contains("directory browsing (ls/find)"));
             assert!(
-                s.contains("DO NOT use shell for repo files or history"),
+                s.contains("DO NOT use shell for repo content reads"),
                 "missing shell DO NOT line (edit={edit})"
             );
             assert!(
-                s.contains("cat/head/tail/sed/grep/rg/git diff/git log"),
+                s.contains("cat/head/tail/sed/grep/rg)"),
                 "shell DO NOT line must enumerate the replaced commands (edit={edit})"
             );
         }

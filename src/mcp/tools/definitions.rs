@@ -161,55 +161,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_diff",
-            "annotations": { "readOnlyHint": true },
-            "description": "Structural function-level diff. DO NOT use shell git diff/log. Git sources use the server project; only patch/a/b paths anchor under cwd. Examples: tilth_diff(cwd: \"/abs/repo\"); tilth_diff(source: \"HEAD~1\", cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["cwd"],
-                "properties": {
-                    "cwd": cwd_prop.clone(),
-                    "source": {
-                        "type": "string",
-                        "description": "uncommitted (default), staged, or git ref; ignored with a/b, patch, or log."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "File, file:function, or, in overview only, checkout-relative directory; log accepts files only."
-                    },
-                    "a": {
-                        "type": "string",
-                        "description": "First file; requires b."
-                    },
-                    "b": {
-                        "type": "string",
-                        "description": "Second file; requires a."
-                    },
-                    "patch": {
-                        "type": "string",
-                        "description": "Patch-file path instead of git diff."
-                    },
-                    "log": {
-                        "type": "string",
-                        "description": "Git range for per-commit summaries, e.g. `HEAD~5..HEAD`."
-                    },
-                    "search": {
-                        "type": "string",
-                        "description": "Case-insensitive symbol/file substring filter."
-                    },
-                    "blast": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Warn on callers of changed signatures."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max response tokens."
-                    }
-                }
-            }
-        }),
     ];
 
     if edit_mode {
@@ -450,13 +401,12 @@ mod tests {
     }
 
     #[test]
-    fn tilth_diff_schema_has_no_expand_property() {
-        let tools = tool_definitions(false);
-        let diff = tools
-            .iter()
-            .find(|t| t["name"] == "tilth_diff")
-            .expect("diff tool");
-        assert!(diff["inputSchema"]["properties"]["expand"].is_null());
+    fn tilth_diff_is_not_registered_in_either_mode() {
+        for edit_mode in [false, true] {
+            assert!(!tool_definitions(edit_mode)
+                .iter()
+                .any(|tool| tool["name"] == "tilth_diff"));
+        }
     }
 
     /// The canonical `tilth_search` accepts one query or one unchanged follow hint per entry.
@@ -564,12 +514,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. All six tools in edit mode
-    /// (`tilth_diff` included) take paths and require cwd.
+    /// `root` property must be gone from every tool. All five tools in edit mode
+    /// take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 6, "edit mode advertises 6 path-taking tools");
+        assert_eq!(tools.len(), 5, "edit mode advertises 5 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];

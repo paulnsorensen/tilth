@@ -128,7 +128,7 @@ $ tilth diff HEAD~1
   [+]      fn refresh_token                    L120
 ```
 
-Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. Replaces `git diff` for AI agents.
+Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. This optional CLI view remains available. MCP clients use shell `git diff` and `git log`; the `tilth_diff` MCP tool is retired.
 
 ## Benchmarks
 

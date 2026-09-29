@@ -1,6 +1,5 @@
 mod definitions;
 mod deps;
-mod diff;
 mod grok;
 mod read;
 mod search_v2;
@@ -8,7 +7,6 @@ mod write;
 
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
-pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
 pub(super) use read::tool_read;
 pub(super) use search_v2::tool_search_v2;

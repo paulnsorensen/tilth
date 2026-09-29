@@ -1,5 +1,5 @@
-tilth — code intelligence MCP server. Replaces grep, cat, git diff, and host edit tools.
-DO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), tests, builds, and non-file operations.
+tilth — code intelligence MCP server. Replaces grep, cat, and host edit tools.
+DO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations.
 
 DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.
 
@@ -13,5 +13,5 @@ READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numb
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
-ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read` (omit `mode`); importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes → `tilth_diff`; browse directories → shell `ls` or `find`.
+ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read` (omit `mode`); importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes/history → shell `git diff` or `git log`; browse directories → shell `ls` or `find`.
 DO NOT re-read expanded search content.

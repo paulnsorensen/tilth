@@ -4,7 +4,8 @@
 
 The September session evidence supports consolidating discovery behind search.
 It does not establish a causal speed, token, or correctness advantage over Bash.
-These are recommendations, not new architecture decisions.[^september-evidence]
+The measurements inform recommendations, not causal claims.[^september-evidence]
+The user later approves MCP list and diff retirement; [[adr/tilth-search-v2-roadmap-001]] records that separate decision.
 
 ### Comparable recent usage
 
@@ -68,6 +69,37 @@ A matched per-tool ablation remains necessary before claiming current net saving
 [^september-method]: Installed session-analytics references/canonical-schema.md:13-50,112-133 and references/harness-coverage.md:45-70; verified against the September query results. Use tool_uses, not only mcp_calls. Error rates are observed flags, not proof of all failures.
 
 _Source: session-analytics reassessment · Updated: 2026-09-29 · Supersedes: July ingestion assumptions for current queries only._
+
+
+
+### Diff follow-up check
+
+The diff follow-up check covers all 168 deduplicated Claude calls in the September window.
+It uses the next five unique tool calls after each result, within 120 seconds, in the same native transcript.[^diff-follow-up]
+
+| Follow-up | Originating diff calls |
+|---|---:|
+| Bash command containing Git diff | 44 (26.2%) |
+| Another Tilth diff | 31 (18.5%) |
+| Both | 10 |
+| Either | 65 (38.7%) |
+| Neither | 103 (61.3%) |
+
+Only two originating calls have identical-argument repeats.
+The other 29 repeated calls change arguments, usually scope or options.
+Do not classify every repeated call as a retry.
+Among the 44 Git-followed calls, 31 include a patch-capable command.
+The other 13 contain only summary views.
+Command flags do not prove fallback intent, successful execution, or useful output.[^diff-follow-up]
+
+The overlap supports simplification, not a claim that agents always repeat or replace Tilth diff.
+The user chooses public MCP diff retirement while retaining CLI/library diff and internal edit recovery.
+Deps/grok retirement still requires separate search graduation evidence.[^diff-retirement]
+
+[^diff-follow-up]: Session analysis on 2026-09-29. Scan: 2,807 recent native Claude transcript files; 130 files contain all 168 matched results. Canonical origin identity uses session plus tool_use_id. Same-transcript follow-up windows overlap. Git detection matches Bash command text containing git followed by diff. Repeats compare decoded arguments. Counts describe originating calls, not total follow-up events.
+[^diff-retirement]: User approval on 2026-09-29: "Retire only public tilth_diff". See [[adr/tilth-search-v2-roadmap-001]] and [[edit-anchor-design]].
+
+_Source: native transcript follow-up analysis and user scope approval · Updated: 2026-09-29 · Supersedes: none; extends the September reassessment._
 
 ## July 2026 historical analysis
 

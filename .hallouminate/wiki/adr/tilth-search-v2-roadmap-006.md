@@ -18,7 +18,8 @@ Preserve the shipped continuation contract when adapting its telemetry fixes.[^1
 
 ## Context
 
-ADR-001 originally plans five public verbs. Its September update retires MCP list separately and uses shell directory browsing.
+ADR-001 originally plans five public verbs.
+Its September update retires MCP list and diff separately, using shell directory browsing and Git review.
 Its replacement for grok/deps combines bounded search enrichment with typed continuations.[^2]
 ADR-002 rejects caller-selected kind, expand, and context.[^3]
 
@@ -111,7 +112,7 @@ This is a schema mismatch, not an unimplemented continuation.[^hint-schema]
 
 Correct the schema and test emitted hints against `tools/list` before retiring grok/deps.
 Bounded continuation caps and reduced dependency detail require explicit replacement acceptance; neither difference alone proves a defect.
-Keep this follow-up separate from MCP list removal.
+Keep this follow-up separate from MCP list and diff removal.
 
 [^readiness]: Read-only source and GitHub inspection on 2026-09-29; https://github.com/paulnsorensen/tilth/pull/231 leaves Part B replacement and graduation evidence pending. Source base: 18b7534eecde023cb4a70e5d13d7de29178073de. Fetched main 9fa37b51fb655294f6718ff4da1a00ba52a68a53 adds no search-schema changes.
 [^hint-schema]: `src/mcp/tools/search_v2/continuations.rs:23-31,35-49`; `src/mcp/tools/definitions.rs:42-56`. Local `cargo build --bin tilth --quiet` and read-only MCP probe both exit 0 on 2026-09-29. The probe compares actual emitted keys with the advertised additional-property constraint; it does not install a schema validator.
