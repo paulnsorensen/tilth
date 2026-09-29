@@ -52,6 +52,33 @@ This finding concerns those tests, not the repository's total coverage.
 [^6]: `src/mcp/mod.rs:175-178,228-231`; `src/session.rs:125-129,145-156`; `src/mcp/tools/write.rs:306-326`.
 [^7]: `tests/mcp_v2/test_ac08_worktree.py:63-73,86-90`, inspected on 2026-09-29.
 
+## Gherkin search and edit scenarios
+
+The Rust BDD harness tests MCP search and tagged edits against isolated example files.
+Run `cargo test --test bdd`; the normal Cargo test command also includes this target.[^8]
+Cucumber stays in development dependencies and uses Cargo's compiled binary instead of an existence-only binary check.[^8]
+
+Each scenario owns one live MCP process, one temporary project, and one isolated cache.
+The driver consumes each response before it sends the next request.
+This preserves response-minted read tags and session snapshots across the edit sequence.[^9]
+The driver rejects malformed responses and imposes a 15-second request deadline.
+It terminates and waits for the child before it joins the I/O thread.[^9]
+
+The prototype checks symbol locations and source text, exact edited bytes, search refresh, independent drift, and conflicting-edit rejection.[^10]
+Undefined or skipped steps fail the runner, including steps marked `allow.skipped`.[^11]
+Keep this focused driver beside the Gherkin steps; it is not a replacement for the existing Python suite.
+
+[^8]: `Cargo.toml:127-135`; `tests/bdd/README.md:1-22`; `tests/bdd/session.rs:40`.
+[^9]: `tests/bdd/session.rs:25-91,103-149`.
+[^10]: `tests/bdd/features/edit.feature:1-81`; `tests/bdd/main.rs:51-83,138-175`.
+[^11]: `tests/bdd/main.rs:194-207`.
+
+The BDD runner accepts Cargo positional filters as literal scenario-name substrings.
+Without this custom CLI field, the documented `cargo test edit` command fails before Cucumber runs scenarios.
+Explicit Cucumber `--name` and `--tags` filters retain priority over the positional filter.[^12]
+
+[^12]: `tests/bdd/main.rs:187-207`; `tests/bdd/README.md:10-21`; `CONTRIBUTING.md:13`. Verified on 2026-09-29.
+
 ## Historical baseline
 
 The August 2026 review of PR #144 reports a macOS batch-budget test failure.
@@ -68,4 +95,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review · Updated: 2026-09-07 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review and MCP acceptance harness code · Updated: 2026-09-29 · Supersedes: August 2026 local-gate baseline guidance._
