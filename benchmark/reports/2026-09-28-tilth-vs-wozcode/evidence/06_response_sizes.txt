@@ -1,0 +1,192 @@
+|   arm    |          tool_name           | calls | total_chars | median_chars | p90_chars | max_chars |
+|----------|------------------------------|------:|------------:|-------------:|----------:|----------:|
+| baseline | Bash                         | 201   | 39320       | 273.0        | 337.0     | 1822      |
+| baseline | Edit                         | 283   | 53621       | 201.0        | 213.0     | 236       |
+| baseline | Glob                         | 36    | 7388        | 153.0        | 356.0     | 1821      |
+| baseline | Grep                         | 93    | 32276       | 99.0         | 1152.0    | 3976      |
+| baseline | Read                         | 151   | 402032      | 1144.0       | 5685.0    | 52527     |
+| baseline | Write                        | 1     | 213         | 213.0        | 213.0     | 213       |
+| tilth    | Bash                         | 131   | 20998       | 44.0         | 333.0     | 845       |
+| tilth    | mcp__tilth__tilth_diff       | 3     | 24517       | 8150.0       | 8204.0    | 8217      |
+| tilth    | mcp__tilth__tilth_grok       | 4     | 1675        | 133.0        | 1046.0    | 1389      |
+| tilth    | mcp__tilth__tilth_list       | 15    | 15398       | 325.0        | 4143.0    | 4143      |
+| tilth    | mcp__tilth__tilth_read       | 48    | 426069      | 3445.0       | 23447.0   | 45585     |
+| tilth    | mcp__tilth__tilth_search     | 38    | 119092      | 2693.0       | 6364.0    | 9936      |
+| tilth    | mcp__tilth__tilth_write      | 38    | 45925       | 513.0        | 4040.0    | 5498      |
+| wozcode  | Bash                         | 127   | 27050       | 273.0        | 337.0     | 4354      |
+| wozcode  | Search                       | 8     | 560         | 70.0         | 70.0      | 70        |
+| wozcode  | mcp__plugin_woz_code__Edit   | 45    | 16192       | 218.0        | 969.0     | 1390      |
+| wozcode  | mcp__plugin_woz_code__Search | 113   | 441533      | 1221.0       | 14453.0   | 33753     |
+|   arm   | rep |          tool_name           | chars |                                                                                                                                                                                                                                                                                                                                                                                                             preview                                                                                                                                                                                                                                                                                                                                                                                                              |
+|---------|----:|------------------------------|------:|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| tilth   | 2   | mcp__tilth__tilth_diff       | 8217  | # Diff: uncommitted — 20 files, 74 modified, 3 added (~2090 tokens)
+
+## binding/json_test.go (2 symbols)
+  [~]      import (                                 L7  (body, 14→15 lines)
+  [~]      TestCustomJsonCodec                      L41  (body, 24→24 lines)
+
+## context.go (4 symbols)
+  [~]      Render                                   L1152  (body, 15→20 lines)
+  [~]      SSEvent                                  L1318  (body, 6→6 lines)
+  [~]      import (                                 L7  (body, 22→23 lines)
+  [+]      Render                                   L1332
+
+## context_test.go (2 symbols)
+  [~]      TestContextRenderSSE                     L1399  (body, 16→16 lines)
+  [~:sig]  Render(func (*TestRender) Render(http.ResponseWriter) error) → (func (*TestRender) Render(context.Conte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| tilth   | 3   | mcp__tilth__tilth_grok       | 1389  | # grok: reset [context.go:103]
+
+## signature
+func (c *Context) reset()
+
+## doc
+**********************************/
+
+## body
+func (c *Context) reset() {
+	c.Writer = &c.writermem
+	c.Params = c.Params[:0]
+	c.handlers = nil
+	c.index = -1
+
+	c.fullPath = ""
+	c.Keys = nil
+	c.Errors = c.Errors[:0]
+	c.Accepted = nil
+	c.queryCache = nil
+	c.formCache = nil
+	c.sameSite = 0
+	*c.params = (*c.params)[:0]
+	*c.skippedNodes = (*c.skippedNodes)[:0]
+}
+
+## callers (5 of 18)
+  gin.go
+    [668]   in ServeHTTP()
+    [670]   in ServeHTTP()
+    [683]   in HandleContext()
+  test_helpers.go
+    [20]   in CreateTestContext()
+    [21]   in CreateTestContext()
+... and 13 more
+
+## siblings (context.go)
+Abort                    [207-209]   func (c *Context) Abort()
+AbortWithError           [238-241]   func (c *Context) Ab                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| tilth   | 0   | mcp__tilth__tilth_list       | 4143  | gin/      ~166.3k tokens   98 files
+├── auth.go      ~960 tokens
+├── auth_test.go      ~1.3k tokens
+├── benchmarks_test.go      ~991 tokens
+├── binding/      ~33.6k tokens   30 files
+│   ├── binding.go      ~1.1k tokens
+│   ├── binding_msgpack_test.go      ~356 tokens
+│   ├── binding_nomsgpack.go      ~956 tokens
+│   ├── binding_test.go      ~9.9k tokens
+│   ├── bson.go      ~145 tokens
+│   ├── default_validator.go      ~574 tokens
+│   ├── default_validator_benchmark_test.go      ~124 tokens
+│   ├── default_validator_test.go      ~898 tokens
+│   ├── form.go      ~340 tokens
+│   ├── form_mapping.go      ~3.4k tokens
+│   ├── form_mapping_benchmark_test.go      ~367 tokens
+│   ├── form_mapping_test.go      ~8.5k tokens
+│   ├── header.go      ~217 tokens
+│   ├── json.go      ~386 tokens
+│   ├─                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| tilth   | 4   | mcp__tilth__tilth_read       | 45585 | {"if_modified_since":"2026-09-29T04:52:17Z"}
+
+# /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-_zvw0xv1/gin/render/bson.go (35 lines, ~197 tokens) [full]
+
+[/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-_zvw0xv1/gin/render/bson.go#7092]
+1:// Copyright 2025 Gin Core Team. All rights reserved.
+2:// Use of this source code is governed by a MIT style
+3:// license that can be found in the LICENSE file.
+4:
+5:package render
+6:
+7:import (
+8:	"net/http"
+9:
+10:	"go.mongodb.org/mongo-driver/bson"
+11:)
+12:
+13:// BSON contains the given interface object.
+14:type BSON struct {
+15:	Data any
+16:}
+17:
+18:var bsonContentType = []string{"application/bson"}
+19:
+20:// Render (BSON) marshals the given interface object and writes data with custom ContentType.
+2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| tilth   | 4   | mcp__tilth__tilth_search     | 9936  | {"diagnostics":{},"hints":[],"results":[{"completeness":"complete","preview":"# Search: \"render.Render\" in /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-_zvw0xv1/gin — 3 matches\n\n### context.go:1151 [usage in function Render]\n  [1141-1148]  fn Cookie\n             func (c *Context) Cookie(name string) (string, error)  // // be returned.\n-> [1151-1165]  fn Render\n             func (c *Context) Render(code int, r render.Render)  // // Render writes the response headers and calls render.Re...\n  [1170-1173]  fn HTML\n\n### context.go:1150 [usage]\n-> [1150]   // Render writes the response headers and calls render.Render to render data.\n\n### context_test.go:46 [usage]\n-> [46]   // BAD case: func (c *Context) Render(code int, render render.Render, obj ...any |
+| tilth   | 1   | mcp__tilth__tilth_write      | 5498  | ## /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ng5lvlkm/gin/render/render.go
+applied
+[/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ng5lvlkm/gin/render/render.go#89E7]
+5:package render
+
+6:
+7:import (
+
+8:	"context"
+
+9:	"net/http"
+
+... omitted lines 1-44; re-read /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ng5lvlkm/gin/render/render.go#1-44
+
+---
+
+## /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ng5lvlkm/gin/render/json.go
+applied
+[/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ng5lvlkm/gin/render/json.go#2D0A]
+7:import (
+
+8:	"bytes"
+
+9:	"context"
+
+10:	"fmt"
+
+11:	"html/template"
+
+... omitted lines 1-213; re-read /private/var/folders/3g/jl1bhhpn2pz41rwk4g9sr                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| wozcode | 0   | mcp__plugin_woz_code__Edit   | 1390  | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-bm1cypet/gin" />
+render/render.go#7-20 (1 edit, +5 lines)
+render/json.go at #7-13, #57-63, #81-86, #100-105, #126-131, #167-172, #199-204 (7 edits, +19 lines)
+ℹ Ranges are adjusted to final file positions.
+render/msgpack.go at #9-14, #34-40 (2 edits, +4 lines)
+ℹ Ranges are adjusted to final file positions.
+render/bson.go at #7-12, #21-26 (2 edits, +4 lines)
+ℹ Ranges are adjusted to final file positions.
+render/data.go at #7-10, #18-23 (2 edits, +6 lines)
+ℹ Ranges are adjusted to final file positions.
+render/html.go at #7-13, #89-94 (2 edits, +4 lines)
+ℹ Ranges are adjusted to final file positions.
+render/protobuf.go at #7-12, #21-26 (2 edits, +4 lines)
+ℹ Ranges are adjusted to final file positions.
+render/r                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| wozcode | 3   | mcp__plugin_woz_code__Search | 33753 | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-7xnq4f58/gin" />
+<search_result if_modified_since="2026-09-29 04:30:20" />
+Reuse this if_modified_since on your next Search to skip unchanged files.
+<file path="render/bson.go" size="787B" modified="2026-09-29 04:30">
+// Copyright 2025 Gin Core Team. All rights reserved.
+// Use of this source code is governed by a MIT style
+// license that can be found in the LICENSE file.
+
+package render
+
+import (
+	"net/http"
+
+	"go.mongodb.org/mongo-driver/bson"
+)
+
+// BSON contains the given interface object.
+type BSON struct {
+	Data any
+}
+
+var bsonContentType = []string{"application/bson"}
+
+// Render (BSON) marshals the given interface object and writes data with custom ContentType.
+func (r BSON) Render(w http.ResponseWri                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |

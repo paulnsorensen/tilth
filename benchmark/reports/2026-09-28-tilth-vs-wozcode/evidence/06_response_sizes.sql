@@ -1,0 +1,2 @@
+SELECT arm,tool_name,count(*) calls,sum(chars) total_chars,round(median(chars)) median_chars,round(quantile_cont(chars,0.9)) p90_chars,max(chars) max_chars FROM responses GROUP BY arm,tool_name ORDER BY arm,tool_name;
+SELECT arm,rep,tool_name,chars,left(text,800) preview FROM responses WHERE tool_name LIKE 'mcp__%' QUALIFY row_number() OVER(PARTITION BY arm,tool_name ORDER BY chars DESC)=1 ORDER BY arm,tool_name;

@@ -1,0 +1,2 @@
+SELECT arm,tool_name,count(*) calls,sum(length(input::VARCHAR)) input_chars,sum(chars) result_chars FROM responses WHERE arm<>'baseline' GROUP BY arm,tool_name ORDER BY arm,tool_name;
+SELECT arm,rep,count(*) turns,count(*) FILTER(WHERE tool_calls>0) tool_turns,max(input_tokens+cache_read_tokens) max_without_cache_creation FROM model_turns JOIN benchmark_cells USING(sessionId) WHERE arm<>'baseline' GROUP BY arm,rep ORDER BY arm,rep;

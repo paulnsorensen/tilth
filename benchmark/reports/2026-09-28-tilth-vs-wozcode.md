@@ -51,7 +51,7 @@ The existing ADR rejects caller-selected kind/expand/context and requires the JS
 Do not add a new search mode as an incidental fix. Resolve fallback semantics explicitly before implementation.
 Regression cases must include receiver signatures, call expressions, genuine regex, expected misses, ambiguity, and incomplete scans.
 
-Evidence: .context/sonnet5-analytics/11_search_reproduction.jsonl.
+Evidence: [search reproduction](2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl).
 The probe uses target/release/tilth --mcp --edit without modifying the fixture.
 
 ## 2. Shorten paths before removing source information
@@ -169,14 +169,18 @@ No new paid benchmark runs are started for this recommendation pass.
 
 ## Evidence
 
-- Base comparison: .context/sonnet5-strict-results.md.
-- Usage report: .context/sonnet5-strict-tool-analysis.md.
-- Canonical database and queries: .context/sonnet5-analytics/.
-- New measurements: 09_cost_inputs.*, 09_usage.json, 09_repeated_line_edits.json, 10_payloads.*, 10_payload_summary.json.
-- Reproduction: 11_search_reproduction.jsonl.
-- Skill domains: tilth-mcp-health.txt, tilth-error-forensics.txt, tilth-fix-recommendations.txt.
-- Earlier matching finding: .hallouminate/wiki/model-tool-fumble-taxonomy.md:23-36.
-- Locked search contract: .hallouminate/wiki/adr/tilth-search-v2-roadmap-002.md and -006.md.
+- [Complete report archive and evidence index](2026-09-28-tilth-vs-wozcode/README.md).
+- [Full strict benchmark results](2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md).
+- [Full tool-usage analysis](2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md).
+- [All 15 scored cells](2026-09-28-tilth-vs-wozcode/evidence/strict-cell-metrics.json).
+- [Usage measurements](2026-09-28-tilth-vs-wozcode/evidence/09_usage.json) and [response measurements](2026-09-28-tilth-vs-wozcode/evidence/10_payload_summary.json).
+- [Search reproduction](2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl).
+- [MCP health](2026-09-28-tilth-vs-wozcode/evidence/tilth-mcp-health.txt), [error forensics](2026-09-28-tilth-vs-wozcode/evidence/tilth-error-forensics.txt), and [fix recommendations](2026-09-28-tilth-vs-wozcode/evidence/tilth-fix-recommendations.txt).
+- [Earlier matching finding](../../.hallouminate/wiki/model-tool-fumble-taxonomy.md).
+- Locked search contract: [deterministic routing](../../.hallouminate/wiki/adr/tilth-search-v2-roadmap-002.md) and [continuations](../../.hallouminate/wiki/adr/tilth-search-v2-roadmap-006.md).
+
+The supporting reports preserve their complete original text. The archive index maps historical local paths to published copies.
+Raw session databases and full payload dumps remain local; the index states those exclusions explicitly.
 
 ## Below the Bar
 

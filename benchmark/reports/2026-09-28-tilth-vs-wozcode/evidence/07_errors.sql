@@ -1,0 +1,3 @@
+SELECT arm,rep,tool_name,left(text,1300) result FROM responses WHERE tool_name<>'Bash' AND (is_error='true' OR regexp_matches(text,'(?i)reject|conflict|not unique|not found|truncat|budget exceeded|unread|stale')) ORDER BY arm,rep,tool_name;
+SELECT arm,rep,count(*) FILTER(WHERE is_error='true') bash_errors,count(*) FILTER(WHERE contains(text,'Bash command denied')) guard_phrase_matches FROM responses WHERE tool_name='Bash' GROUP BY arm,rep ORDER BY arm,rep;
+SELECT arm,left(text,600) result,count(*) n FROM responses WHERE tool_name='Bash' AND is_error='true' GROUP BY arm,left(text,600) ORDER BY n DESC LIMIT 12;

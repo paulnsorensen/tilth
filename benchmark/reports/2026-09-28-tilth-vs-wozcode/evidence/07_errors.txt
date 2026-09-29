@@ -1,0 +1,469 @@
+|   arm    | rep |          tool_name           |                                                                                              result                                                                                               |
+|----------|----:|------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| baseline | 0   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 0   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 0   | Glob                         | Directory does not exist: /root. Note: your current working directory is /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-nekyn5h3/gin.                                   |
+| baseline | 0   | Grep                         | Search failed — ripgrep rejected the pattern, glob, or file type without searching:
+rg: regex parse error:
+    (?:\.Render\(\|render\.Render\|Render interface\|Render(ctx\|Render(context">.*Render\()
+                                                        ^
+error: unclosed group                                                                                                                                                                             |
+| baseline | 0   | Grep                         | Search failed — ripgrep rejected the pattern, glob, or file type without searching:
+rg: regex parse error:
+    (?:type TestRender\|TestRender\)\|TestRender{}" )
+                                               ^
+error: repetition quantifier expects a valid decimal                                                                                                                                              |
+| baseline | 0   | Read                         | <tool_use_error>InputValidationError: Read was called with input that could not be parsed as JSON.
+You sent (first 135 of 135 bytes): {"file_path": "/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-nekyn5h3/gin/context.go", "offset": 1150/1, "limit": 1}
+Common causes: unescaped backslashes in file paths (use / or \\), unescaped control characters, or truncated output. Retry with valid JSON.</tool_use_error>                                      |
+| baseline | 1   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 1   | Glob                         | Directory does not exist: /root. Note: your current working directory is /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-3cicrhpg/gin.                                   |
+| baseline | 1   | Glob                         | Refusing to search /var/root: it could not be opened (EACCES) — it is unreadable, or is being replaced concurrently.                                                                              |
+| baseline | 1   | Read                         | 1	// Copyright 2014 Manu Martinez-Almeida. All rights reserved.
+2	// Use of this source code is governed by a MIT style
+3	// license that can be found in the LICENSE file.
+4	
+5	package gin
+6	
+7	import (
+8		"errors"
+9		"fmt"
+10		"io"
+11		"io/fs"
+12		"log"
+13		"maps"
+14		"math"
+15		"mime/multipart"
+16		"net"
+17		"net/http"
+18		"net/url"
+19		"os"
+20		"path/filepath"
+21		"strings"
+22		"sync"
+23		"time"
+24	
+25		"github.com/gin-contrib/sse"
+26		"github.com/gin-gonic/gin/binding"
+27		"github.com/gin-gonic/gin/render"
+28	)
+29	
+30	// Content-Type MIME of the most common data formats.
+31	const (
+32		MIMEJSON              = binding.MIMEJSON
+33		MIMEHTML              = binding.MIMEHTML
+34		MIMEXML               = binding.MIMEXML
+35		MIMEXML2              = binding.MIMEXML2
+36		MIMEPlain             = binding.MIMEPlain
+37		MIMEPOSTForm          = binding.MIMEPOSTForm
+38		MIMEMultipartPOSTForm = binding.MIMEMultipartPOSTForm
+39		MIMEYAML              = binding.MIMEYAML
+40		MIMEYAML2             = binding.MIMEYAML2
+41		MIMETOML              = binding.MIMETOML
+42		MIMEPROTOBUF          = binding.MIMEPROTOBUF
+43		MIMEBSON              = binding.MIMEBSON
+44	)
+45	
+46	// BodyBytesKey indicates a default body bytes key.
+47	const BodyBytesKey = "_gin-gonic/gin/bodybyteskey"
+48	
+49	// ContextKey is the                                                                                                                                                                      |
+| baseline | 2   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 2   | Read                         | 1120			HttpOnly: httpOnly,
+1121		})
+1122	}
+1123	
+1124	// SetCookieData adds a Set-Cookie header to the ResponseWriter's headers.
+1125	// It accepts a pointer to http.Cookie structure for more flexibility in setting cookie attributes.
+1126	// The provided cookie must have a valid Name. Invalid cookies may be silently dropped.
+1127	func (c *Context) SetCookieData(cookie *http.Cookie) {
+1128		if cookie.Path == "" {
+1129			cookie.Path = "/"
+1130		}
+1131		if cookie.SameSite == http.SameSiteDefaultMode {
+1132			cookie.SameSite = c.sameSite
+1133		}
+1134		http.SetCookie(c.Writer, cookie)
+1135	}
+1136	
+1137	// Cookie returns the named cookie provided in the request or
+1138	// ErrNoCookie if not found. And return the named cookie is unescaped.
+1139	// If multiple cookies match the given name, only one cookie will
+1140	// be returned.
+1141	func (c *Context) Cookie(name string) (string, error) {
+1142		cookie, err := c.Request.Cookie(name)
+1143		if err != nil {
+1144			return "", err
+1145		}
+1146		val, _ := url.QueryUnescape(cookie.Value)
+1147		return val, nil
+1148	}
+1149	
+1150	// Render writes the response headers and calls render.Render to render data.
+1151	func (c *Context) Render(code int, r render.Render) {
+1152		c.Status(code)
+1153	
+1154		if !bodyAllowedForStatus(code) {
+1155			r.WriteCon                                                                                                                                                                |
+| baseline | 3   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 3   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 3   | Glob                         | Directory does not exist: /root/go/pkg/mod/github.com/gin-contrib. Note: your current working directory is /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-5fq8j5fh/gin. |
+| baseline | 3   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 4   | Glob                         | Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time. Try searching a more specific path or pattern.                                         |
+| baseline | 4   | Grep                         | Search failed — ripgrep rejected the pattern, glob, or file type without searching:
+rg: regex parse error:
+    (?:\.Render\(\|render\.Render\b\|Render(w\|Render(c\|SSEvent\|sse\.Event)
+                                         ^
+error: unclosed group                                                                                                                                                                             |
+| baseline | 4   | Read                         | 1130		}
+1131		if cookie.SameSite == http.SameSiteDefaultMode {
+1132			cookie.SameSite = c.sameSite
+1133		}
+1134		http.SetCookie(c.Writer, cookie)
+1135	}
+1136	
+1137	// Cookie returns the named cookie provided in the request or
+1138	// ErrNoCookie if not found. And return the named cookie is unescaped.
+1139	// If multiple cookies match the given name, only one cookie will
+1140	// be returned.
+1141	func (c *Context) Cookie(name string) (string, error) {
+1142		cookie, err := c.Request.Cookie(name)
+1143		if err != nil {
+1144			return "", err
+1145		}
+1146		val, _ := url.QueryUnescape(cookie.Value)
+1147		return val, nil
+1148	}
+1149	
+1150	// Render writes the response headers and calls render.Render to render data.
+1151	func (c *Context) Render(code int, r render.Render) {
+1152		c.Status(code)
+1153	
+1154		if !bodyAllowedForStatus(code) {
+1155			r.WriteContentType(c.Writer)
+1156			c.Writer.WriteHeaderNow()
+1157			return
+1158		}
+1159	
+1160		if err := r.Render(c.Writer); err != nil {
+1161			// Pushing error to c.Errors
+1162			_ = c.Error(err)
+1163			c.Abort()
+1164		}
+1165	}
+1166	
+1167	// HTML renders the HTTP template specified by its file name.
+1168	// It also updates the HTTP code and sets the Content-Type as "text/html".
+1169	// See http://golang.org/doc/articles/wiki/
+1170	func (c *Cont                                                                                                                                                                             |
+| tilth    | 0   | mcp__tilth__tilth_read       | {"if_modified_since":"2026-09-29T03:28:22Z"}
+
+# /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-eap40l8v/gin/context.go (101 lines, ~893 tokens) [section]
+
+[/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-eap40l8v/gin/context.go#23BB]
+
+1130:	}
+1131:	if cookie.SameSite == http.SameSiteDefaultMode {
+1132:		cookie.SameSite = c.sameSite
+1133:	}
+1134:	http.SetCookie(c.Writer, cookie)
+1135:}
+1136:
+1137:// Cookie returns the named cookie provided in the request or
+1138:// ErrNoCookie if not found. And return the named cookie is unescaped.
+1139:// If multiple cookies match the given name, only one cookie will
+1140:// be returned.
+1141:func (c *Context) Cookie(name string) (string, error) {
+1142:	cookie, err := c.Request.Cookie(name)
+1143:	if err != nil {
+1144:		return "", err
+1145:	}
+1146:	val, _ := url.QueryUnescape(cookie.Value)
+1147:	return val, nil
+1148:}
+1149:
+1150:// Render writes the response headers and calls render.Render to render data.
+1151:func (c *Context) Render(code int, r render.Render) {
+1152:	c.Status(code)
+1153:
+1154:	if !bodyAllowedForStatus(code) {
+1155:		r.WriteContentType(c.Writer)
+1156:		c.Writer.WriteHeaderNow()
+1157:		return
+1158:	}
+1159:
+1160:	if err := r.Render(c.Writer); err != nil {
+1161:		// Pushing error to                                                                                                                                                               |
+| tilth    | 0   | mcp__tilth__tilth_read       | not found: /Users/paul/go/pkg/mod/github.com/gin-contrib/sse@v1.1.0/sse.go                                                                                                                        |
+| tilth    | 2   | mcp__tilth__tilth_read       | # /private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-laxh9g_o/gin/context.go (231 lines, ~1.9k tokens) [section]
+
+[/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-laxh9g_o/gin/context.go#23BB]
+
+1100:// SetSameSite with cookie
+1101:func (c *Context) SetSameSite(samesite http.SameSite) {
+1102:	c.sameSite = samesite
+1103:}
+1104:
+1105:// SetCookie adds a Set-Cookie header to the ResponseWriter's headers.
+1106:// The provided cookie must have a valid Name. Invalid cookies may be
+1107:// silently dropped.
+1108:func (c *Context) SetCookie(name, value string, maxAge int, path, domain string, secure, httpOnly bool) {
+1109:	if path == "" {
+1110:		path = "/"
+1111:	}
+1112:	http.SetCookie(c.Writer, &http.Cookie{
+1113:		Name:     name,
+1114:		Value:    url.QueryEscape(value),
+1115:		MaxAge:   maxAge,
+1116:		Path:     path,
+1117:		Domain:   domain,
+1118:		SameSite: c.sameSite,
+1119:		Secure:   secure,
+1120:		HttpOnly: httpOnly,
+1121:	})
+1122:}
+1123:
+1124:// SetCookieData adds a Set-Cookie header to the ResponseWriter's headers.
+1125:// It accepts a pointer to http.Cookie structure for more flexibility in setting cookie attributes.
+1126:// The provided cookie must have a valid Name. Invalid cookies may be silently dropped.
+1127:func (c *Context) Set                                                                                                                                                                        |
+| tilth    | 3   | mcp__tilth__tilth_grok       | not found: sse.Event                                                                                                                                                                              |
+| tilth    | 3   | mcp__tilth__tilth_list       | scope "/root/go/pkg/mod/github.com/gin-contrib" does not exist. Pass an existing directory or omit "scope" to use "cwd"; refusing to search a broader directory.                                  |
+| tilth    | 4   | mcp__tilth__tilth_grok       | not found: sse.Event                                                                                                                                                                              |
+| wozcode  | 0   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 0   | mcp__plugin_woz_code__Search | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-bm1cypet/gin" />
+<search_result if_modified_since="2026-09-29 03:43:54" />
+Reuse this if_modified_since on your next Search to skip unchanged files.
+<file path="binding/json_test.go" size="5.4KB" modified="2026-09-29 03:43">
+// Copyright 2019 Gin Core Team. All rights reserved.
+// Use of this source code is governed by a MIT style
+// license that can be found in the LICENSE file.
+
+package binding
+
+import (
+	"io"
+	"net/http/httptest"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/gin-gonic/gin/codec/json"
+	"github.com/gin-gonic/gin/render"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/modern-go/reflect2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestJSONBindingBindBody(t *testing.T) {
+	var s struct {
+		Foo string `json:"foo"`
+	}
+	err := jsonBinding{}.BindBody([]byte(`{"foo": "FOO"}`), &s)
+	require.NoError(t, err)
+	assert.Equal(t, "FOO", s.Foo)
+}
+
+func TestJSONBindingBindBodyMap(t *testing.T) {
+	s := make(map[string]string)
+	err := jsonBinding{}.BindBody([]byte(`{"foo": "FOO","hello":"world"}`), &s)
+	require.NoError(t, err)
+	assert.Len(t, s, 2)
+	assert.Equal(t, "FOO", s["foo"])
+	assert.Equal(t, "world", s["hello"])
+}
+
+func TestCustomJsonCodec(t *testing.                                                                                                                                                              |
+| wozcode  | 1   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 1   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 2   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 2   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 2   | mcp__plugin_woz_code__Search | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ln3_enpv/gin" />
+<search_result if_modified_since="2026-09-29 04:10:45" />
+Reuse this if_modified_since on your next Search to skip unchanged files.
+<file path="context.go" size="45.1KB" modified="2026-09-29 04:10">
+…1-1129
+	}
+	if cookie.SameSite == http.SameSiteDefaultMode {
+		cookie.SameSite = c.sameSite
+	}
+	http.SetCookie(c.Writer, cookie)
+}
+
+// Cookie returns the named cookie provided in the request or
+// ErrNoCookie if not found. And return the named cookie is unescaped.
+// If multiple cookies match the given name, only one cookie will
+// be returned.
+func (c *Context) Cookie(name string) (string, error) {
+	cookie, err := c.Request.Cookie(name)
+	if err != nil {
+		return "", err
+	}
+	val, _ := url.QueryUnescape(cookie.Value)
+	return val, nil
+}
+
+// Render writes the response headers and calls render.Render to render data.
+func (c *Context) Render(code int, r render.Render) {
+	c.Status(code)
+
+	if !bodyAllowedForStatus(code) {
+		r.WriteContentType(c.Writer)
+		c.Writer.WriteHeaderNow()
+		return
+	}
+
+	if err := r.Render(c.Writer); err != nil {
+		// Pushing error to c.Errors
+		_ = c.Error(err)
+		c.Abort()
+	}
+}
+
+// HTML renders the HTTP template specified by its file name.
+// It also updates the HTTP c                                                                                                                                                                     |
+| wozcode  | 3   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 3   | mcp__plugin_woz_code__Search | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-7xnq4f58/gin" />
+<search_result if_modified_since="2026-09-29 04:30:28" />
+Reuse this if_modified_since on your next Search to skip unchanged files.
+<file path="context.go" size="45.1KB" modified="2026-09-29 04:30">
+…1-1129
+	}
+	if cookie.SameSite == http.SameSiteDefaultMode {
+		cookie.SameSite = c.sameSite
+	}
+	http.SetCookie(c.Writer, cookie)
+}
+
+// Cookie returns the named cookie provided in the request or
+// ErrNoCookie if not found. And return the named cookie is unescaped.
+// If multiple cookies match the given name, only one cookie will
+// be returned.
+func (c *Context) Cookie(name string) (string, error) {
+	cookie, err := c.Request.Cookie(name)
+	if err != nil {
+		return "", err
+	}
+	val, _ := url.QueryUnescape(cookie.Value)
+	return val, nil
+}
+
+// Render writes the response headers and calls render.Render to render data.
+func (c *Context) Render(code int, r render.Render) {
+	c.Status(code)
+
+	if !bodyAllowedForStatus(code) {
+		r.WriteContentType(c.Writer)
+		c.Writer.WriteHeaderNow()
+		return
+	}
+
+	if err := r.Render(c.Writer); err != nil {
+		// Pushing error to c.Errors
+		_ = c.Error(err)
+		c.Abort()
+	}
+}
+
+// HTML renders the HTTP template specified by its file name.
+// It also updates the HTTP c                                                                                                                                                                     |
+| wozcode  | 4   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 4   | Search                       | <tool_use_error>Error: No such tool available: Search</tool_use_error>                                                                                                                            |
+| wozcode  | 4   | mcp__plugin_woz_code__Search | <cwd path="/private/var/folders/3g/jl1bhhpn2pz41rwk4g9srszh0000gn/T/tilth-benchmark-ji7bm8s6/gin" />
+Error: Provide content_regex, file_glob_patterns, or type parameter.                                                                                                                              |
+|   arm    | rep | bash_errors | guard_phrase_matches |
+|----------|----:|------------:|---------------------:|
+| baseline | 0   | 17          | 0                    |
+| baseline | 1   | 11          | 0                    |
+| baseline | 2   | 22          | 0                    |
+| baseline | 3   | 14          | 0                    |
+| baseline | 4   | 19          | 0                    |
+| tilth    | 0   | 10          | 0                    |
+| tilth    | 1   | 7           | 0                    |
+| tilth    | 2   | 7           | 0                    |
+| tilth    | 3   | 9           | 0                    |
+| tilth    | 4   | 8           | 0                    |
+| wozcode  | 0   | 7           | 0                    |
+| wozcode  | 1   | 9           | 0                    |
+| wozcode  | 2   | 11          | 0                    |
+| wozcode  | 3   | 12          | 0                    |
+| wozcode  | 4   | 7           | 0                    |
+|   arm    |                                 result                                  | n  |
+|----------|-------------------------------------------------------------------------|---:|
+| baseline | PreToolUse:Bash hook error: [/Users/paul/.local/share/uv/python/cpython-3.13.14-macos-aarch64-none/bin/python3.13 /Users/paul/conductor/workspaces/tilth/port-louis/benchmark/claude_bash_guard.py]: Only go test, go build, go vet, and gofmt -w on local Go files are allowed.
+                                                                        | 76 |
+| wozcode  | PreToolUse:Bash hook error: [/Users/paul/.local/share/uv/python/cpython-3.13.14-macos-aarch64-none/bin/python3.13 /Users/paul/conductor/workspaces/tilth/port-louis/benchmark/claude_bash_guard.py]: Only go test, go build, go vet, and gofmt -w on local Go files are allowed.
+                                                                        | 42 |
+| tilth    | PreToolUse:Bash hook error: [/Users/paul/.local/share/uv/python/cpython-3.13.14-macos-aarch64-none/bin/python3.13 /Users/paul/conductor/workspaces/tilth/port-louis/benchmark/claude_bash_guard.py]: Only go test, go build, go vet, and gofmt -w on local Go files are allowed.
+                                                                        | 38 |
+| baseline | Exit code 1
+# github.com/gin-gonic/gin
+./context.go:1160:21: not enough arguments in call to r.Render
+	have (ResponseWriter)
+	want (context.Context, http.ResponseWriter)
+./context.go:1313:15: cannot use sse.Event{…} (value of struct type sse.Event) as render.Render value in argument to c.Render: sse.Event does not implement render.Render (wrong type for method Render)
+		have Render(http.ResponseWriter) error
+		want Render(context.Context, http.ResponseWriter) error | 2  |
+| baseline | Exit code 1
+# github.com/gin-gonic/gin/render
+# [github.com/gin-gonic/gin/render]
+vet: render/reader_test.go:21:40: not enough arguments in call to r.Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)
+# github.com/gin-gonic/gin/binding
+# [github.com/gin-gonic/gin/binding]
+vet: binding/json_test.go:59:47: not enough arguments in call to (render.PureJSON{…}).Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)
+# github.com/gin-gonic/gin
+# [github.com/gin-gonic/gin]
+vet: ./context_test.go:1052:26: cannot use &TestRender{} (valu          | 2  |
+| tilth    | Exit code 1
+# github.com/gin-gonic/gin [github.com/gin-gonic/gin.test]
+./context_test.go:1404:15: cannot use sse.Event{…} (value of struct type sse.Event) as render.Render value in argument to c.Render: sse.Event does not implement render.Render (wrong type for method Render)
+		have Render(http.ResponseWriter) error
+		want Render(context.Context, http.ResponseWriter) error
+./middleware_test.go:243:35: cannot use sse.Event{…} (value of struct type sse.Event) as render.Render value in argument to c.Render: sse.Event does not implement render.Render (wrong type for method Render)
+		have Render(ht                                          | 1  |
+| tilth    | Exit code 1
+# github.com/gin-gonic/gin [github.com/gin-gonic/gin.test]
+./context_test.go:1052:26: cannot use &TestRender{} (value of type *TestRender) as render.Render value in argument to c.Render: *TestRender does not implement render.Render (wrong type for method Render)
+		have Render(http.ResponseWriter) error
+		want Render(context.Context, http.ResponseWriter) error
+./context_test.go:1404:15: cannot use sse.Event{…} (value of struct type sse.Event) as render.Render value in argument to c.Render: sse.Event does not implement render.Render (wrong type for method Render)
+		have Render(http.R                                      | 1  |
+| tilth    | Exit code 1
+# github.com/gin-gonic/gin/render
+# [github.com/gin-gonic/gin/render]
+vet: render/reader_test.go:21:40: not enough arguments in call to r.Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)
+# github.com/gin-gonic/gin/binding
+# [github.com/gin-gonic/gin/binding]
+vet: binding/json_test.go:59:47: not enough arguments in call to (render.PureJSON{…}).Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)
+# github.com/gin-gonic/gin
+# [github.com/gin-gonic/gin]
+vet: ./context_test.go:1052:26: cannot use &TestRender{} (valu          | 1  |
+| baseline | Exit code 1
+# github.com/gin-gonic/gin/render
+# [github.com/gin-gonic/gin/render]
+vet: render/render_msgpack_test.go:31:33: not enough arguments in call to (MsgPack{…}).Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)                     | 1  |
+| baseline | Exit code 1
+# github.com/gin-gonic/gin/render
+# [github.com/gin-gonic/gin/render]
+vet: render/reader_test.go:21:40: not enough arguments in call to r.Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)                     | 1  |
+| wozcode  | Exit code 1
+# github.com/gin-gonic/gin/render
+# [github.com/gin-gonic/gin/render]
+vet: render/reader_test.go:21:40: not enough arguments in call to r.Render
+	have (*httptest.ResponseRecorder)
+	want (context.Context, http.ResponseWriter)                     | 1  |
+| wozcode  | Exit code 1
+context_test.go:1061:61: missing parameter name                         | 1  |
