@@ -7,9 +7,9 @@ which took three passes precisely because the guard looked fine and wasn't.
 
 ## Where the budget contract lives
 
-`finalize_response` is the **only** budget gate. Every `Ok` exit of
-`tool_read_paths` routes through it, and `session.record_savings(...)` measures
-the body *before* anything downstream appends to it.
+`finalize_response` enforces the single-read and truncated-batch budgets.
+Complete batches use a separate exact-fit check that includes the JSON header and all framing.
+`session.record_savings(...)` measures the body before downstream additions.[^batch-allocation]
 
 So anything a wrapper appends to the response **after** `tool_read_paths`
 returns escapes both. That is a two-part defect, and it is easy to fix only
@@ -99,7 +99,27 @@ If it fails identically with your changes stashed, it is baseline and not yours.
 
 ## Gate note
 
-The CI clippy gate is `cargo clippy -- -D warnings` (see `.github/workflows/ci.yml`),
-**not** `--all-targets`. `cargo clippy --all-targets -- -D warnings` reports a
-pre-existing unused-variable warning in `src/mcp/tools/grok.rs` that CI does not
-enforce — do not "fix" it under the impression the branch is red.
+Current CI uses `cargo clippy --all-targets -- -D warnings`.
+Both the baseline and allocator change pass this gate locally.[^current-gate]
+
+[^current-gate]: .github/workflows/ci.yml:24; .context/read-budget-baseline-clippy.log; .context/read-budget-final-clippy.log
+
+## Batch allocation, 2026-09-28
+
+Batch reads first check whether the complete framed response fits the requested estimated-token budget.
+If it fits, they return all rendered parts without per-file truncation.
+Otherwise, small parts keep their required allocation and larger parts share the remaining budget.
+Allocation uses rendered size, so it applies to plain paths, line ranges, and symbols.
+Output keeps input order and reserves space for separators and the missing-file footer.
+Existing truncation markers can exceed their allocated share, so the batch checks rendered size and reduces allocations before finalization.[^batch-allocation]
+
+Tests cover exact fit, unequal sizes, reversed order, UTF-8, missing files, tagged ranges, and tiny-budget safety.
+Use a fresh Session after any sizing read when testing whether the budgeted read records edit snapshots.
+Otherwise, the first read can make the write assertion pass without testing the second read.[^batch-allocation]
+
+Shared truncation behavior remains unchanged.
+A truncated tagged section can lose its tag and numbered content at a blank-line boundary.
+Tiny budgets cannot necessarily contain the existing headers and truncation notices.
+These are separate limitations, not strict-cap guarantees from the allocation change.[^batch-allocation]
+
+[^batch-allocation]: src/mcp/tools/read.rs:231-289,631-659; src/budget.rs:52-104; .cheese/cook/read-batch-budget.md
