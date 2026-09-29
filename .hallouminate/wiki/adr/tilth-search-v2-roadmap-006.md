@@ -18,7 +18,8 @@ Preserve the shipped continuation contract when adapting its telemetry fixes.[^1
 
 ## Context
 
-ADR-001 plans five public verbs: search, read, list, diff, and conditional write.
+ADR-001 originally plans five public verbs.
+Its September update retires MCP list and diff separately, using shell directory browsing and Git review.
 Its replacement for grok/deps combines bounded search enrichment with typed continuations.[^2]
 ADR-002 rejects caller-selected kind, expand, and context.[^3]
 
@@ -94,3 +95,25 @@ Additional tests cover target collisions, scope, batch order, invalid requests, 
 [^5]: `src/search/grok.rs:375-438`; `src/mcp/tools/search_v2.rs:644-698`; regression test `src/mcp/tools/search_v2.rs:738-750`.
 
 _Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the initial ADR-006 caller-kind exception and permanent seven-verb conclusion._
+
+
+### September readiness check
+
+Search enrichment and executable continuations already implement the planned replacement shape.
+Do not confuse that implementation with completed removal acceptance.
+The checked source and PR evidence do not establish passage of the graduation gates.[^readiness]
+
+A live MCP probe finds an advertised-schema defect.
+Searching for `detect_file_type` emits `target.occurrence: [1833,2515]` in a `fetch_siblings` hint.
+The advertised target schema omits `occurrence` and sets `additionalProperties:false`.
+The emitted hint therefore violates that schema constraint.
+Direct server replay succeeds with status `ok` and 26 siblings.
+This is a schema mismatch, not an unimplemented continuation.[^hint-schema]
+
+Correct the schema and test emitted hints against `tools/list` before retiring grok/deps.
+Bounded continuation caps and reduced dependency detail require explicit replacement acceptance; neither difference alone proves a defect.
+Keep this follow-up separate from MCP list and diff removal.
+
+[^readiness]: Read-only source and GitHub inspection on 2026-09-29; https://github.com/paulnsorensen/tilth/pull/231 leaves Part B replacement and graduation evidence pending. Source base: 18b7534eecde023cb4a70e5d13d7de29178073de. Fetched main 9fa37b51fb655294f6718ff4da1a00ba52a68a53 adds no search-schema changes.
+[^hint-schema]: `src/mcp/tools/search_v2/continuations.rs:23-31,35-49`; `src/mcp/tools/definitions.rs:42-56`. Local `cargo build --bin tilth --quiet` and read-only MCP probe both exit 0 on 2026-09-29. The probe compares actual emitted keys with the advertised additional-property constraint; it does not install a schema validator.
+

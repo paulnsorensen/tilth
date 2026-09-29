@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook: route file exploration to tilth.
 
-Denies a Bash command when the leading command of a top-level statement is
-grep/rg/find/cat/ls aimed at files inside the project, answering with a
-message that routes to tilth_search/tilth_read/tilth_list (or tilth_write
-when the project-side target is an output redirect). Pipe filters
+Denies leading grep/rg/cat content reads on project files.
+Allows ls/find directory browsing but guards input reads, output writes,
+find execution or write actions, and browsing piped into an xargs
+grep/rg/cat stage, on project files.
+Routes guarded operations to tilth_search, tilth_read, or tilth_write. Pipe filters
 (`cargo test | grep foo`), unresolvable paths (`"$HOME/x"`), heredoc
-bodies, multi-line quoted strings, fd redirects (`2>&1`, `2>/dev/null`),
-and paths outside the project are allowed. Fails open: any internal error
+bodies, multi-line quoted strings, fd-duplication redirects (`2>&1`) and
+fd redirects outside the project (`2>/dev/null`), and paths outside the
+project are allowed. Fails open: any internal error
 allows the command (with a stderr note). A hand-rolled bash-grammar subset
 is used instead of the `bashlex` library to keep this a zero-install,
 single-file, dependency-free script — revisit only if that constraint
@@ -25,7 +27,13 @@ import sys
 import traceback
 from pathlib import Path
 
-DENY = {"grep", "rg", "find", "cat", "ls"}
+GUARDED = {"grep", "rg", "find", "cat", "ls"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+# find action operands that name an output file (routed to out_targets).
+FIND_FILE_ACTIONS = {"-fprint", "-fprint0", "-fls", "-fprintf"}
+# xargs options this guard understands when checking the piped inner command.
+XARGS_NO_VALUE = {"-0", "-r"}
+XARGS_VALUE = {"-n", "-P", "-d", "-I"}
 PATTERN_FIRST = {"grep", "rg"}  # first positional is a pattern/value, not a path
 PATTERN_OPT_LONG = {"--regexp", "--file"}
 WRAPPERS = {"command", "time", "sudo", "env", "nice", "nohup", "stdbuf"}
@@ -46,8 +54,8 @@ FIND_GLOBAL_VALUE_OPTS = {"-maxdepth", "-mindepth", "-D"}
 # script must stay a dependency-free single file.
 ROUTE_BASE = (
     "{cmd} on project files is replaced by tilth: tilth_search (grep/rg), "
-    "tilth_read (cat), tilth_list (ls/find), tilth_write (file writes). "
-    "Shell remains for tests, builds, and paths outside the project."
+    "tilth_read (content reads), tilth_write (file writes). "
+    "Shell remains for directory browsing (ls/find), tests, builds, and external paths."
 )
 GENERATED_HINT = (
     " Generated, lock, and binary files return a header only from "
@@ -102,16 +110,38 @@ def _is_generated_lock_or_binary(path):
 def tokenize(command):
     """Tokenize the whole command in a single pass, pairing each token
     with the source line (1-based) it starts on."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    # shlex drops quote identity. Protect literal punctuation until operators
+    # are parsed, using markers absent from the command to avoid collisions.
+    punctuation = "();<>|&"
+    marker_start = 0xE000
+    while any(chr(marker_start + i) in command for i in range(len(punctuation))):
+        marker_start += len(punctuation)
+    protect = str.maketrans(
+        punctuation, "".join(chr(marker_start + i) for i in range(len(punctuation)))
+    )
+    restore = {value: key for key, value in protect.items()}
+    protected = re.sub(
+        r"""#[^\n]*|'[^']*'|"(?:[^"\\]|\\.)*"|\\.""",
+        lambda match: (
+            match.group() if match.group().startswith("#")
+            else match.group().translate(protect)
+        ),
+        command,
+        flags=re.DOTALL,
+    )
+    lex = shlex.shlex(protected, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     tokens = []
     while True:
-        line = lex.lineno
         tok = lex.get_token()
         if tok is None:
             break
+        # get_token skips comments and leading whitespace before the token.
+        end = lex.instream.tell()
+        trailing_newline = protected[end - 1 : end] == "\n"
+        line = lex.lineno - tok.count("\n") - trailing_newline
         tokens.append((tok, line))
-    return tokens
+    return tokens, restore
 
 
 def heredoc_delimiters(tokens):
@@ -119,7 +149,7 @@ def heredoc_delimiters(tokens):
     in order.
 
     `<<` inside `$(( ))` arithmetic is a shift, not a heredoc; quoted `<<`
-    never surfaces as its own token under posix shlex. `<<-EOF` tokenizes
+    stays protected until operator parsing ends. `<<-EOF` tokenizes
     as `<<` + `-EOF` (shlex's punctuation set doesn't include `-`), so the
     leading dash is stripped from the recorded delimiter.
     """
@@ -137,7 +167,7 @@ def heredoc_delimiters(tokens):
     return delims
 
 
-def heredoc_body_lines(tokens, command):
+def heredoc_body_lines(tokens, command, restore):
     """Line numbers (1-based) that fall inside a heredoc body or its
     terminator line — data, never judged."""
     tokens_by_line = {}
@@ -152,7 +182,10 @@ def heredoc_body_lines(tokens, command):
             if raw.strip() == pending[0]:
                 pending.pop(0)
             continue
-        pending = heredoc_delimiters(tokens_by_line.get(lineno, []))
+        pending = [
+            delim.translate(restore)
+            for delim in heredoc_delimiters(tokens_by_line.get(lineno, []))
+        ]
     return body_lines
 
 
@@ -173,36 +206,45 @@ def statement_stream(tokens, body_lines):
     return flat
 
 
-def leading_segments(tokens):
-    """Yield the leading pipeline segment of each top-level statement."""
-    seg, in_filters = [], False
+def statement_pipeline_segments(tokens):
+    """Yield each top-level statement as its list of pipe-separated
+    segments, so callers can inspect the stage right after the leading
+    command (e.g. a browsing command piped into `xargs`)."""
+    segs, seg = [], []
     for tok in tokens:
         if tok in STATEMENT_BREAKS:
-            if seg:
-                yield seg
-            seg, in_filters = [], False
-        elif in_filters:
-            continue
-        elif tok == "|":
-            # The rest of this statement is pipe filters — not leading.
-            if seg:
-                yield seg
-            seg, in_filters = [], True
+            segs.append(seg)
+            if any(segs):
+                yield segs
+            segs, seg = [], []
+        elif tok in {"|", "|&"}:
+            segs.append(seg)
+            seg = []
         else:
             seg.append(tok)
-    if seg:
-        yield seg
+    segs.append(seg)
+    if any(segs):
+        yield segs
+
+
+def leading_segments(tokens):
+    """Yield the leading pipeline segment of each top-level statement."""
+    for segs in statement_pipeline_segments(tokens):
+        if segs[0]:
+            yield segs[0]
 
 
 def command_and_args(segment):
-    """Split a segment into (command name, args, output-redirect targets).
+    """Split a segment into command, args, output targets, and input targets.
 
     Skips leading env assignments and bare wrapper commands. Heredoc
-    operator/delimiter pairs are dropped. Fd redirects `2>`/`2>>` and
-    above contribute nothing; `1>`/`1>>` (stdout) still routes to
-    out_targets since it's the primary write target. An input redirect's
-    target joins `args` (read semantics), an output redirect's target is
-    returned separately so `cat > notes.txt` can route to tilth_write.
+    operator/delimiter pairs are dropped. Numbered fd redirects (`2>`,
+    `2>>`, ...) route their file target the same as `1>`/`1>>`; a
+    descriptor-duplication target (`2>&1`, `>&2`) is not a path and is
+    dropped. `find`'s `-fprint`/`-fprint0`/`-fls`/`-fprintf` action
+    operands route to out_targets the same way. An input redirect's
+    target is returned separately from directory-browsing arguments.
+    Output targets route to tilth_write.
     """
     i = 0
     while i < len(segment) and ENV_ASSIGN.match(segment[i]):
@@ -212,9 +254,9 @@ def command_and_args(segment):
         while i < len(segment) and ENV_ASSIGN.match(segment[i]):
             i += 1
     if i >= len(segment):
-        return None, [], []
+        return None, [], [], []
     cmd = os.path.basename(segment[i])
-    args, out_targets = [], []
+    args, out_targets, in_targets = [], [], []
     rest = segment[i + 1 :]
     j = 0
     while j < len(rest):
@@ -222,30 +264,38 @@ def command_and_args(segment):
         if tok in HEREDOC_OPENERS:
             j += 2  # skip the operator and its delimiter — not a path
             continue
+        if cmd == "find" and tok in FIND_FILE_ACTIONS:
+            args.append(tok)
+            j += 1
+            if j < len(rest):
+                out_targets.append(rest[j])
+                args.append(rest[j])
+                j += 1
+            if tok == "-fprintf" and j < len(rest):
+                args.append(rest[j])  # format string, not a path
+                j += 1
+            continue
         if tok and all(c in "<>&" for c in tok):
-            # `2> file` / `2>&1`: the fd digit was collected as an arg.
-            # fd 1 (stdout) is the primary write target and still routes;
-            # fd >= 2 keeps the no-op suppress behavior.
-            fd_redirect = bool(args) and args[-1].isdigit()
-            fd_digit = args[-1] if fd_redirect else None
-            if fd_redirect:
+            # `2> file` / `2>&1`: a preceding fd digit was collected as an
+            # arg (not a path) — drop it. A digit target (`2>&1`, `>&2`)
+            # duplicates a descriptor and is not a path either.
+            if args and args[-1].isdigit():
                 args.pop()
             if j + 1 < len(rest):
                 target = rest[j + 1]
                 is_output = ">" in tok
-                suppressed = fd_redirect and not (is_output and fd_digit == "1")
-                if not suppressed and not target.isdigit():
+                if not target.isdigit():
                     if is_output:
                         out_targets.append(target)
                     else:
-                        args.append(target)
+                        in_targets.append(target)
             j += 2
             continue
-        if tok and tok[0] == "(":
+        if tok and tok[0] == "(" and cmd != "find":
             break
         args.append(tok)
         j += 1
-    return cmd, args, out_targets
+    return cmd, args, out_targets, in_targets
 
 
 def looks_pathlike(tok, cwd):
@@ -327,10 +377,19 @@ def targets_project(paths, cwd, root):
     return False
 
 
-def judge(cmd, args, out_targets, cwd, root):
+def judge(cmd, args, out_targets, in_targets, cwd, root):
     """Deny reason for one leading segment, or None."""
     if cwd is None:
         return None  # cd target unresolvable — fail open
+    if targets_project(out_targets, cwd, root):
+        return WRITE_ROUTE.format(cmd=cmd)
+    if targets_project(in_targets, cwd, root):
+        reason = ROUTE_BASE.format(cmd=cmd)
+        if any(_is_generated_lock_or_binary(p) for p in in_targets):
+            reason += GENERATED_HINT
+        return reason
+    if cmd == "ls" or (cmd == "find" and not FIND_ACTIONS.intersection(args)):
+        return None
     candidates = path_args(cmd, args, cwd)
     if candidates:
         if targets_project(candidates, cwd, root):
@@ -338,7 +397,7 @@ def judge(cmd, args, out_targets, cwd, root):
             if any(_is_generated_lock_or_binary(p) for p in candidates):
                 reason += GENERATED_HINT
             return reason
-    elif not out_targets:
+    elif not out_targets and not in_targets:
         # No path was supplied at all — the command defaults to cwd, which
         # only denies when that cwd is actually inside the project.
         if cwd == root or Path(cwd).is_relative_to(root):
@@ -362,11 +421,63 @@ def resolve_cd(args, cwd):
     return os.path.realpath(ap)
 
 
+def xargs_inner_command(segment):
+    """The inner `(cmd, args)` an xargs segment runs, after its own
+    options, or None if the segment isn't `xargs` or its options can't
+    be parsed (fail open — the pipe stays allowed)."""
+    if not segment or os.path.basename(segment[0]) != "xargs":
+        return None
+    i = 1
+    while i < len(segment):
+        tok = segment[i]
+        if tok in XARGS_NO_VALUE:
+            i += 1
+        elif tok in XARGS_VALUE:
+            i += 2
+        elif len(tok) > 2 and tok[0] == "-" and tok[1] in {"n", "P", "d", "I"}:
+            i += 1  # attached value, e.g. `-n1`, `-Ifoo`
+        elif tok == "--":
+            i += 1  # end of xargs options; the command follows
+            break
+        elif tok.startswith("-"):
+            return None  # unrecognized flag — fail open
+        else:
+            break
+    if i >= len(segment):
+        return None
+    return os.path.basename(segment[i]), segment[i + 1 :]
+
+
+def browses_project(cmd, args, cwd, root):
+    """True when a plain ls/find segment browses inside the project: an
+    explicit root under the project, or no path argument with cwd
+    already inside the project."""
+    paths = path_args(cmd, args, cwd)
+    if paths:
+        return targets_project(paths, cwd, root)
+    return cwd == root or Path(cwd).is_relative_to(root)
+
+
+def judge_xargs_pipe(cmd, args, following, cwd, root):
+    """Deny reason when a leading ls/find browse is piped into an xargs
+    stage that runs grep/rg/cat — a content read routed around the
+    leading-segment check."""
+    inner = xargs_inner_command(following)
+    if inner is None:
+        return None
+    inner_cmd, _ = inner
+    if inner_cmd not in {"grep", "rg", "cat"}:
+        return None
+    if browses_project(cmd, args, cwd, root):
+        return ROUTE_BASE.format(cmd=inner_cmd)
+    return None
+
+
 def decide(command, root):
     """Return the deny reason, or None to allow."""
     command = LINE_CONTINUATION.sub("", command)
     try:
-        tokens = tokenize(command)
+        tokens, restore = tokenize(command)
     except ValueError as exc:
         print(
             f"tilth-bash-guard: unbalanced quote, allowing: {command[:200]!r} ({exc})",
@@ -374,19 +485,33 @@ def decide(command, root):
         )
         return None  # unbalanced quote: fail open
 
-    body_lines = heredoc_body_lines(tokens, command)
+    body_lines = heredoc_body_lines(tokens, command, restore)
     cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
-    for segment in leading_segments(statement_stream(tokens, body_lines)):
-        cmd, args, out_targets = command_and_args(segment)
+    for segs in statement_pipeline_segments(statement_stream(tokens, body_lines)):
+        segment = segs[0]
+        if not segment:
+            continue
+        cmd, args, out_targets, in_targets = command_and_args(segment)
+        cmd = cmd.translate(restore) if cmd is not None else None
+        args = [arg.translate(restore) for arg in args]
+        out_targets = [target.translate(restore) for target in out_targets]
+        in_targets = [target.translate(restore) for target in in_targets]
         if cmd == "cd":
             cwd = resolve_cd(args, cwd)
             continue
-        if cmd in DENY:
+        if cmd in GUARDED:
             if any(a in INFO_FLAGS for a in args):
                 continue  # reads no files
-            reason = judge(cmd, args, out_targets, cwd, root)
+            reason = judge(cmd, args, out_targets, in_targets, cwd, root)
             if reason:
                 return reason
+            if cmd in ("ls", "find"):
+                # Any later stage may be the xargs read (`find . | sort | xargs cat`).
+                for stage in segs[1:]:
+                    following = [tok.translate(restore) for tok in stage]
+                    reason = judge_xargs_pipe(cmd, args, following, cwd, root)
+                    if reason:
+                        return reason
     return None
 
 
@@ -431,8 +556,8 @@ if __name__ == "__main__":
             ("cargo test | grep foo", "allow"),
             ("cat /tmp/other/file.txt", "allow"),
             ("cd sub && rg pat", "deny"),
-            ("ls", "deny"),
-            ("find . -name '*.rs'", "deny"),
+            ("ls", "allow"),
+            ("find . -name '*.rs'", "allow"),
             ("find /tmp/x -name '*.rs'", "allow"),
             ("echo hi", "allow"),
             ("git grep foo", "allow"),
@@ -461,7 +586,7 @@ if __name__ == "__main__":
             ("/usr/bin/time cat src/lib.rs", "deny"),
             ("cat /etc/hosts 2>&1", "allow"),
             ("ls /etc 2>/dev/null", "allow"),
-            ("ls 2>/dev/null", "deny"),
+            ("ls 2>/dev/null", "allow"),
             ("cat /etc/hosts > notes.txt", "deny"),
             ("cat > /tmp/out.txt", "allow"),
             ('python3 -c "\nls = 1\nprint(ls)\n"', "allow"),
@@ -471,7 +596,7 @@ if __name__ == "__main__":
             ("find -L /tmp/elsewhere -name '*.rs'", "allow"),
             ("find -maxdepth 2 /var/log", "allow"),
             ("find -maxdepth 1 /etc", "allow"),
-            ("find -name '*.rs'", "deny"),
+            ("find -name '*.rs'", "allow"),
             ("find /tmp -name x", "allow"),
             ("cd /tmp && ls", "allow"),
             ("cd /etc && cat hosts", "allow"),
@@ -482,7 +607,7 @@ if __name__ == "__main__":
             # project read. Adding -h to INFO_FLAGS would silently open a bypass.
             ("grep -h pat src/", "deny"),
             # A cd chain that returns into the project is still a project read.
-            ("cd sub && cd .. && ls", "deny"),
+            ("cd sub && cd .. && ls", "allow"),
             # Bare cd goes to $HOME, which this hook cannot resolve — fail open.
             ("cd && ls", "allow"),
             # Backslash-continued commands are a single statement; the tail after
@@ -515,6 +640,68 @@ if __name__ == "__main__":
             # fd 1 (stdout) is the primary write target, unlike fd >= 2.
             ("ls 1>/tmp/out.txt", "allow"),
             ("cat /etc/hosts 1>>notes.txt", "deny"),
+            ("command ls src/", "allow"),
+            ("find -L . -maxdepth 2 -type f", "allow"),
+            ("ls > notes.txt", "deny"),
+            ("find . -name '*.rs' > notes.txt", "deny"),
+            ("ls < README.md", "deny"),
+            ("find . -exec cat {} \\;", "deny"),
+            ("find . -delete", "deny"),
+            # Quoted punctuation is data, not a statement or argument boundary.
+            ("find . -name ';' -o -exec cat {} \\;", "deny"),
+            ('find . -name ";" -o -exec cat {} \\;', "deny"),
+            ("find . -name \\; -o -exec cat {} \\;", "deny"),
+            ("find . -name '|' -o -delete", "deny"),
+            ('find . -name "|" -o -delete', "deny"),
+            ("find . -name \\| -o -delete", "deny"),
+            ("ls '(' > notes.txt", "deny"),
+            ('ls "(" > notes.txt', "deny"),
+            ("ls \\( > notes.txt", "deny"),
+            ("ls '(notes)' < README.md", "deny"),
+            ("find . -name ';' > notes.txt", "deny"),
+            ("find . -name '|' < README.md", "deny"),
+            ("ls ';' > notes.txt", "deny"),
+            ("ls '|' < README.md", "deny"),
+            ("find . -name ';'", "allow"),
+            ("find . -name '|'", "allow"),
+            ("ls '('", "allow"),
+            ("ls '>' notes.txt", "allow"),
+            ("ls '<' README.md", "allow"),
+            ("find . -name ';' > /tmp/out.txt", "allow"),
+            ("ls '(' < /etc/hosts", "allow"),
+            ("# '\nls > notes.txt\n# '", "deny"),
+            ('# "\nfind . -delete\n# "', "deny"),
+            ("ls '\ue000' > notes.txt", "deny"),
+            ("ls '<<' README.md", "allow"),
+            ("ls ';' | grep foo", "allow"),
+            ("ls ';'; cat README.md", "deny"),
+            ("cat <<';' >/tmp/out.txt\ndata\n;\ncat README.md", "deny"),
+            # find action operands (fprint family) write a project file even
+            # when the search root itself is outside the project.
+            ("find /tmp -fprint README.md", "deny"),
+            ("find /tmp -fprint0 README.md", "deny"),
+            ("find /tmp -fls README.md", "deny"),
+            ("find /tmp -fprintf README.md %p", "deny"),
+            ("find /tmp -fprint /tmp/out.txt", "allow"),
+            # Numbered fd redirects (fd >= 2) route their file target like
+            # `1>`/`1>>`; only a descriptor-duplication target is exempt.
+            ("ls missing 2> README.md", "deny"),
+            ("ls /tmp 2>> README.md", "deny"),
+            ("ls /tmp 2>/dev/null", "allow"),
+            ("cat < Cargo.lock", "deny"),
+            # A leading ls/find browse piped into an xargs grep/rg/cat stage
+            # is still a content read of the project, not a pipe filter.
+            ("find . -name '*.rs' | xargs cat", "deny"),
+            ("find src -name '*.py' | xargs grep foo", "deny"),
+            ("ls src | xargs cat", "deny"),
+            ("find . -type f -print0 | xargs -0 rg foo", "deny"),
+            ("find . -type f |& xargs cat", "deny"),
+            ("find . -type f | xargs -- cat", "deny"),
+            ("find . -type f | sort | xargs cat", "deny"),
+            ("find /tmp -type f | sort | xargs cat", "allow"),
+            ("cargo test |& grep foo", "allow"),
+            ("find . -name x | head", "allow"),
+            ("find /tmp -name x | xargs cat", "allow"),
         ]
 
         def self_test():
@@ -632,6 +819,19 @@ if __name__ == "__main__":
                 if not plain_ok:
                     failures += 1
                     print(f"FAIL plain-file hint scope leaked: {plain_reason!r}")
+                # The generated/lock hint also applies to an input-redirect target.
+                e2e_checks += 1
+                generated_in_reason = decide("cat < Cargo.lock", root)
+                generated_in_ok = (
+                    generated_in_reason is not None
+                    and "use head or sed" in generated_in_reason
+                )
+                if not generated_in_ok:
+                    failures += 1
+                    print(
+                        f"FAIL generated-file hint missing for input redirect: "
+                        f"{generated_in_reason!r}"
+                    )
                 total = len(SELF_TEST_CASES) + e2e_checks
                 print(f"self-test: {total - failures}/{total} passed")
                 return 1 if failures else 0
