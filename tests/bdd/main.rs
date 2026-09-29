@@ -1,6 +1,13 @@
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "Cucumber captures require FromStr"
+)]
+
+mod fixture_catalog;
 mod session;
 
 use cucumber::{given, then, when, World};
+use fixture_catalog::{Fixture, MatchKind};
 use serde_json::{json, Value};
 use std::fs;
 
@@ -11,6 +18,8 @@ struct TilthWorld {
     read_path: String,
     read_tag: String,
     before_write: Vec<u8>,
+    fixture: Option<Fixture>,
+    fixture_path: String,
 }
 
 impl TilthWorld {
@@ -28,6 +37,16 @@ impl TilthWorld {
             .as_str()
             .expect("MCP text result")
     }
+
+    fn search_payload(&self) -> Value {
+        serde_json::from_str(self.successful_text()).expect("search JSON envelope")
+    }
+
+    fn write_fixture(&mut self, path: &str, source: &str) {
+        let path = self.session().workspace().join(path);
+        fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
+        fs::write(path, source).expect("write fixture");
+    }
 }
 
 #[given("an example workspace")]
@@ -35,19 +54,45 @@ fn example_workspace(world: &mut TilthWorld) {
     world.session = Some(session::Session::start());
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Cucumber captures require FromStr"
-)]
+#[given(expr = "a {string} fixture at {string}")]
+fn language_fixture(world: &mut TilthWorld, language: String, path: String) {
+    let fixture = fixture_catalog::fixture(&language);
+    world.write_fixture(&path, fixture.source);
+    world.fixture = Some(fixture);
+    world.fixture_path = path;
+}
+
+#[given(expr = "the file {string} contains exactly")]
+fn file_fixture(world: &mut TilthWorld, path: String, step: &cucumber::gherkin::Step) {
+    let source = format!("{}\n", docstring(step));
+    world.write_fixture(&path, &source);
+}
+
 #[when(expr = "I search for {string}")]
 fn search(world: &mut TilthWorld, query: String) {
     world.call("tilth_search", json!({"queries": [{"query": query}]}));
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Cucumber captures require FromStr"
-)]
+#[when("I search for the fixture marker")]
+fn search_fixture(world: &mut TilthWorld) {
+    search(
+        world,
+        world.fixture.expect("language fixture").query.to_owned(),
+    );
+}
+
+#[when("I search for the updated fixture marker")]
+fn search_updated_fixture(world: &mut TilthWorld) {
+    search(
+        world,
+        world
+            .fixture
+            .expect("language fixture")
+            .replacement
+            .to_owned(),
+    );
+}
+
 #[then(expr = "the search resolves {string} in {string} at line {int}")]
 fn resolved(
     world: &mut TilthWorld,
@@ -56,26 +101,53 @@ fn resolved(
     line: u64,
     step: &cucumber::gherkin::Step,
 ) {
-    let payload: Value =
-        serde_json::from_str(world.successful_text()).expect("search JSON envelope");
-    let results = payload["results"].as_array().expect("search results");
-    assert_eq!(results.len(), 1, "{world:?}");
-    let result = &results[0];
-    assert_eq!(result["resolved_as"], "symbol", "{world:?}");
-    assert!(
-        matches!(result["status"].as_str(), Some("ok" | "partial")),
-        "{world:?}"
-    );
-    assert_eq!(result["target"]["name"], name, "{world:?}");
-    assert_eq!(result["target"]["path"], path, "{world:?}");
-    assert_eq!(result["target"]["line"], line, "{world:?}");
-    assert_eq!(result["core"], docstring(step), "{world:?}");
+    assert_symbol_result(world, &name, &path, line, &docstring(step));
+}
+
+#[then("the search resolves the fixture marker")]
+fn fixture_resolved(world: &mut TilthWorld) {
+    let fixture = world.fixture.expect("language fixture");
+    let path = world.fixture_path.clone();
+    match fixture.kind {
+        MatchKind::Symbol => {
+            assert_symbol_result(world, fixture.query, &path, fixture.line, fixture.core);
+        }
+        MatchKind::Literal => {
+            let source = fixture
+                .source
+                .lines()
+                .nth(fixture.line as usize - 1)
+                .expect("literal fixture line");
+            assert_literal_result(world, &path, fixture.line, source);
+        }
+    }
+}
+
+#[then("the search resolves the updated fixture marker")]
+fn updated_fixture_resolved(world: &mut TilthWorld) {
+    let fixture = world.fixture.expect("language fixture");
+    let path = world.fixture_path.clone();
+    let source = fixture
+        .source
+        .replacen(fixture.query, fixture.replacement, 1);
+    let core = fixture.core.replacen(fixture.query, fixture.replacement, 1);
+    match fixture.kind {
+        MatchKind::Symbol => {
+            assert_symbol_result(world, fixture.replacement, &path, fixture.line, &core);
+        }
+        MatchKind::Literal => {
+            let matched_source = source
+                .lines()
+                .nth(fixture.line as usize - 1)
+                .expect("literal fixture line");
+            assert_literal_result(world, &path, fixture.line, matched_source);
+        }
+    }
 }
 
 #[then("the search has no matches")]
 fn no_matches(world: &mut TilthWorld) {
-    let payload: Value =
-        serde_json::from_str(world.successful_text()).expect("search JSON envelope");
+    let payload = world.search_payload();
     let results = payload["results"].as_array().expect("search results");
     assert_eq!(results.len(), 1, "{world:?}");
     assert_eq!(results[0]["status"], "no_match", "{world:?}");
@@ -83,10 +155,53 @@ fn no_matches(world: &mut TilthWorld) {
     assert_eq!(results[0]["total_found"], 0, "{world:?}");
 }
 
+#[then("the original fixture marker has no matches")]
+fn original_fixture_missing(world: &mut TilthWorld) {
+    search(
+        world,
+        world.fixture.expect("language fixture").query.to_owned(),
+    );
+    no_matches(world);
+}
+
+#[then(expr = "the search is ambiguous between {string} and {string}")]
+fn ambiguous_search(world: &mut TilthWorld, first: String, second: String) {
+    let payload = world.search_payload();
+    let result = &payload["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{world:?}");
+    assert_eq!(result["resolved_as"], "ambiguous", "{world:?}");
+    let paths = result["candidates"]
+        .as_array()
+        .expect("ambiguous candidates")
+        .iter()
+        .map(|candidate| candidate["path"].as_str().expect("candidate path"))
+        .collect::<Vec<_>>();
+    assert_eq!(paths, [first.as_str(), second.as_str()], "{world:?}");
+}
+
+#[then(expr = "the content search finds {int} match in {string} at line {int}")]
+fn content_match(
+    world: &mut TilthWorld,
+    count: u64,
+    path: String,
+    line: u64,
+    step: &cucumber::gherkin::Step,
+) {
+    let payload = world.search_payload();
+    let result = &payload["results"][0];
+    assert_eq!(result["resolved_as"], "literal", "{world:?}");
+    assert_eq!(result["status"], "ok", "{world:?}");
+    assert_eq!(result["total_found"], count, "{world:?}");
+    assert_literal_preview(world, result, &path, line, &docstring(step));
+}
+
 #[when(expr = "I read {string}")]
-fn read(world: &mut TilthWorld, path: String) {
-    world.call("tilth_read", json!({"paths": [path]}));
-    let prefix = format!("[{}#", world.session().workspace().join(&path).display());
+fn read(world: &mut TilthWorld, selector: String) {
+    world.call("tilth_read", json!({"paths": [selector]}));
+    let path = selector
+        .split_once('#')
+        .map_or(selector.as_str(), |(path, _)| path);
+    let prefix = format!("[{}#", world.session().workspace().join(path).display());
     let tag = world
         .successful_text()
         .lines()
@@ -99,13 +214,97 @@ fn read(world: &mut TilthWorld, path: String) {
         "{world:?}"
     );
     world.read_tag = tag;
-    world.read_path = path;
+    path.clone_into(&mut world.read_path);
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Cucumber captures require FromStr"
-)]
+#[when("I read the fixture")]
+fn read_fixture(world: &mut TilthWorld) {
+    read(world, world.fixture_path.clone());
+}
+
+#[then("the read returns the complete fixture source")]
+fn fixture_read_source(world: &mut TilthWorld) {
+    let fixture = world.fixture.expect("language fixture");
+    assert_eq!(numbered_source(world.successful_text()), fixture.source);
+}
+
+#[then("the read returns exactly")]
+fn read_exact(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
+    assert_eq!(numbered_source(world.successful_text()), docstring(step));
+}
+
+#[then(expr = "the read returns lines {int} through {int} exactly")]
+fn read_range_exact(world: &mut TilthWorld, first: u64, last: u64, step: &cucumber::gherkin::Step) {
+    let lines = numbered_lines(world.successful_text());
+    assert_eq!(
+        lines.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+        (first..=last).collect::<Vec<_>>(),
+        "{world:?}"
+    );
+    assert_eq!(
+        lines
+            .into_iter()
+            .map(|(_, source)| source)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        docstring(step),
+        "{world:?}"
+    );
+}
+
+#[when(expr = "I grok {string}")]
+fn grok(world: &mut TilthWorld, target: String) {
+    world.call("tilth_grok", json!({"target": target, "full": true}));
+}
+
+#[then(expr = "grok resolves {string} in {string} at line {int} without ambiguity")]
+fn grok_target(
+    world: &mut TilthWorld,
+    name: String,
+    path: String,
+    line: u64,
+    step: &cucumber::gherkin::Step,
+) {
+    let text = world.successful_text();
+    let expected_header = format!("# grok: {name} [{path}:{line}]");
+    assert_eq!(
+        text.lines().next(),
+        Some(expected_header.as_str()),
+        "{world:?}"
+    );
+    assert!(!text.contains("> ambiguous:"), "{world:?}");
+    assert_eq!(grok_body(text), docstring(step), "{world:?}");
+}
+
+#[then(expr = "grok resolves {string} in {string} at line {int}")]
+fn grok_target_with_reported_ambiguity(
+    world: &mut TilthWorld,
+    name: String,
+    path: String,
+    line: u64,
+    step: &cucumber::gherkin::Step,
+) {
+    let text = world.successful_text();
+    let expected_header = format!("# grok: {name} [{path}:{line}]");
+    assert_eq!(
+        text.lines().next(),
+        Some(expected_header.as_str()),
+        "{world:?}"
+    );
+    assert_eq!(grok_body(text), docstring(step), "{world:?}");
+}
+
+#[then(expr = "grok reports {int} other definition")]
+fn grok_ambiguity(world: &mut TilthWorld, count: u64) {
+    let suffix = if count == 1 { "" } else { "s" };
+    assert!(
+        world
+            .successful_text()
+            .contains(&format!("> ambiguous: {count} other definition{suffix} ")),
+        "{world:?}"
+    );
+}
+
 #[when(expr = "another editor replaces {string} with {string} in {string}")]
 fn external_edit(world: &mut TilthWorld, old: String, new: String, path: String) {
     let path = world.session().workspace().join(path);
@@ -118,10 +317,6 @@ fn external_edit(world: &mut TilthWorld, old: String, new: String, path: String)
     fs::write(path, original.replacen(&old, &new, 1)).expect("apply external edit");
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Cucumber captures require FromStr"
-)]
 #[when(expr = "I replace {string} with {string} using the read tag")]
 fn replace(world: &mut TilthWorld, old: String, new: String) {
     let path = world.session().workspace().join(&world.read_path);
@@ -132,6 +327,16 @@ fn replace(world: &mut TilthWorld, old: String, new: String) {
             "path": world.read_path, "tag": world.read_tag,
             "ops": [{"op": "replace_text", "old": old, "new": new}]
         }]}),
+    );
+}
+
+#[when("I replace the fixture marker using the read tag")]
+fn replace_fixture(world: &mut TilthWorld) {
+    let fixture = world.fixture.expect("language fixture");
+    replace(
+        world,
+        fixture.query.to_owned(),
+        fixture.replacement.to_owned(),
     );
 }
 
@@ -164,6 +369,20 @@ fn unchanged(world: &mut TilthWorld) {
     );
 }
 
+#[then("the fixture file contains the complete edited source")]
+fn fixture_file_edited(world: &mut TilthWorld) {
+    let fixture = world.fixture.expect("language fixture");
+    let expected = fixture
+        .source
+        .replacen(fixture.query, fixture.replacement, 1);
+    let path = world.session().workspace().join(&world.fixture_path);
+    assert_eq!(fs::read(path).expect("read fixture"), expected.as_bytes());
+    assert!(
+        !expected.contains(fixture.query),
+        "old marker remains in oracle"
+    );
+}
+
 #[then(expr = "the file {string} contains exactly")]
 fn file_equals(world: &mut TilthWorld, path: String, step: &cucumber::gherkin::Step) {
     let path = world.session().workspace().join(path);
@@ -175,13 +394,89 @@ fn file_equals(world: &mut TilthWorld, path: String, step: &cucumber::gherkin::S
     );
 }
 
-fn docstring(step: &cucumber::gherkin::Step) -> &str {
-    // Gherkin keeps the newlines next to the opening and closing delimiters.
-    step.docstring
+fn assert_symbol_result(world: &TilthWorld, name: &str, path: &str, line: u64, core: &str) {
+    let payload = world.search_payload();
+    let results = payload["results"].as_array().expect("search results");
+    assert_eq!(results.len(), 1, "{world:?}");
+    let result = &results[0];
+    assert_eq!(result["resolved_as"], "symbol", "{world:?}");
+    assert!(
+        matches!(result["status"].as_str(), Some("ok" | "partial")),
+        "{world:?}"
+    );
+    assert_eq!(result["target"]["name"], name, "{world:?}");
+    assert_eq!(result["target"]["path"], path, "{world:?}");
+    assert_eq!(result["target"]["line"], line, "{world:?}");
+    assert_eq!(result["core"], core, "{world:?}");
+}
+
+fn assert_literal_result(world: &TilthWorld, path: &str, line: u64, source: &str) {
+    let payload = world.search_payload();
+    let result = &payload["results"][0];
+    assert_eq!(result["resolved_as"], "literal", "{world:?}");
+    assert_eq!(result["status"], "ok", "{world:?}");
+    assert_eq!(result["total_found"], 1, "{world:?}");
+    assert_literal_preview(world, result, path, line, source);
+}
+
+fn assert_literal_preview(world: &TilthWorld, result: &Value, path: &str, line: u64, source: &str) {
+    let preview = result["preview"].as_str().expect("literal preview");
+    let location = preview
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("### ")?
+                .split_once(" [")
+                .map(|pair| pair.0)
+        })
+        .expect("literal match location");
+    assert_eq!(location, format!("{path}:{line}"), "{world:?}");
+
+    let source_prefix = format!("-> [{line}]   ");
+    let matched_source = preview
+        .lines()
+        .find_map(|line| line.strip_prefix(&source_prefix))
+        .expect("literal matched source");
+    assert_eq!(matched_source, source, "{world:?}");
+}
+
+fn numbered_lines(text: &str) -> Vec<(u64, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let (number, source) = line.split_once(':')?;
+            number.parse::<u64>().ok().map(|number| (number, source))
+        })
+        .collect()
+}
+
+fn numbered_source(text: &str) -> String {
+    numbered_lines(text)
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn grok_body(text: &str) -> &str {
+    text.split_once("\n## body\n").map_or("", |(_, body)| {
+        body.split("\n## ").next().unwrap_or(body).trim_end()
+    })
+}
+
+fn docstring(step: &cucumber::gherkin::Step) -> String {
+    let text = step
+        .docstring
         .as_deref()
         .and_then(|text| text.strip_prefix('\n'))
         .and_then(|text| text.strip_suffix('\n'))
-        .expect("expected a docstring with delimiters on separate lines")
+        .expect("expected a docstring with delimiters on separate lines");
+    if text.lines().all(|line| line.starts_with('|')) {
+        text.lines()
+            .map(|line| line.strip_prefix('|').expect("checked marker"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text.to_owned()
+    }
 }
 
 #[derive(clap::Args)]

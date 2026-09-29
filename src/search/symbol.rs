@@ -1112,59 +1112,66 @@ const unexported = "hello";
     }
 
     #[test]
-    fn deeply_nested_definitions_detected() {
-        // Regression for the v2 depth-cap removal in walk_for_definitions.
-        // A TS `export class` method sits at AST depth 4
-        // (program → export_statement → class_declaration → class_body →
-        // method_definition) and a doubly-nested Rust module fn at depth 5 —
-        // both exceeded the old `depth > 3` cap and were misclassified as
-        // usages. They must now be detected as definitions.
-        let ts_code = "export class Alpha {\n  dispatch(): number {\n    return 1;\n  }\n}\n";
-        let ts_lang =
-            crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
-        let defs = find_defs_treesitter(
-            std::path::Path::new("test.ts"),
-            "dispatch",
-            &ts_lang,
-            Some(crate::types::Lang::TypeScript),
-            ts_code,
-            ts_code.lines().count() as u32,
-            SystemTime::now(),
-        );
-        // Pin the exact definition, not merely "some definition exists": the
-        // method sits on line 2, and it must be the only match — the cap removal
-        // must not also start surfacing the call site or duplicate the def.
-        assert_eq!(
-            defs.len(),
-            1,
-            "exactly one `dispatch` definition, got {defs:?}"
-        );
-        assert!(defs[0].is_definition);
-        assert_eq!(
-            defs[0].line, 2,
-            "TS export-class method (depth 4) must be detected at its own line"
-        );
+    fn deeply_nested_definitions_keep_raw_uniqueness() {
+        for (lang, path, query, expected_line, code) in [
+            (
+                crate::types::Lang::TypeScript,
+                "test.ts",
+                "dispatch",
+                2,
+                "export class Alpha {\n  dispatch(): number {\n    return 1;\n  }\n}\n",
+            ),
+            (
+                crate::types::Lang::Rust,
+                "test.rs",
+                "method",
+                3,
+                "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n",
+            ),
+        ] {
+            let ts_lang = crate::lang::outline::outline_language(lang).unwrap();
+            let defs = find_defs_treesitter(
+                std::path::Path::new(path),
+                query,
+                &ts_lang,
+                Some(lang),
+                code,
+                code.lines().count() as u32,
+                SystemTime::now(),
+            );
+            assert_eq!(defs.len(), 1, "{query}: expected one raw definition");
+            assert_eq!(defs[0].line, expected_line);
+            assert!(defs[0].is_definition);
+        }
+    }
 
-        let rust_code = "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n";
-        let rust_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
-        let defs = find_defs_treesitter(
-            std::path::Path::new("test.rs"),
-            "method",
-            &rust_lang,
-            Some(crate::types::Lang::Rust),
-            rust_code,
-            rust_code.lines().count() as u32,
-            SystemTime::now(),
-        );
-        assert_eq!(
-            defs.len(),
-            1,
-            "exactly one `method` definition, got {defs:?}"
-        );
-        assert!(defs[0].is_definition);
-        assert_eq!(
-            defs[0].line, 3,
-            "doubly-nested module fn (depth 5) must be detected at its own line"
+    #[test]
+    fn ruby_method_survives_the_default_display_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("marker.rb"),
+            "def language_marker\n  1\nend\n",
+        )
+        .unwrap();
+        for index in 1..=25 {
+            let docs = tmp.path().join(format!("docs{index}"));
+            std::fs::create_dir(&docs).unwrap();
+            std::fs::write(
+                docs.join("language_marker.md"),
+                "# language_marker\n\ntext\n",
+            )
+            .unwrap();
+        }
+
+        let result = search("language_marker", tmp.path(), None, None, false).unwrap();
+        assert_eq!(result.definitions, 26);
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.is_definition && m.path.ends_with("marker.rb")),
+            "Ruby method was dropped from the capped results: {:?}",
+            result.matches
         );
     }
 
@@ -1275,77 +1282,6 @@ pub mod a {
     }
 
     #[test]
-    fn elixir_definitions_detected() {
-        let code = r#"defmodule MyApp.Greeter do
-  @type t :: %{name: String.t()}
-
-  def hello(name) do
-    "Hello, #{name}!"
-  end
-
-  defp private_helper(x), do: x + 1
-
-  defmacro my_macro(expr) do
-    quote do: unquote(expr)
-  end
-end
-"#;
-        // Dotted module name
-        let defs = elixir_find(code, "MyApp.Greeter");
-        assert!(!defs.is_empty(), "should find 'MyApp.Greeter' module def");
-        assert!(defs[0].is_definition);
-
-        // Public function (block form with parens)
-        assert!(
-            !elixir_find(code, "hello").is_empty(),
-            "should find 'hello'"
-        );
-
-        // Private function (keyword form: `, do:`)
-        assert!(
-            !elixir_find(code, "private_helper").is_empty(),
-            "should find 'private_helper'"
-        );
-
-        // Macro
-        assert!(
-            !elixir_find(code, "my_macro").is_empty(),
-            "should find 'my_macro'"
-        );
-    }
-
-    #[test]
-    fn elixir_guard_clause_definitions() {
-        let code = r"defmodule Guards do
-  def safe_div(a, b) when b != 0 do
-    a / b
-  end
-
-  defp checked(x) when is_integer(x), do: x
-
-  defguard is_positive(x) when x > 0
-end
-";
-        // Guard clause with `when` — block form
-        assert!(
-            !elixir_find(code, "safe_div").is_empty(),
-            "should find 'safe_div' with guard clause"
-        );
-
-        // Guard clause with `when` — keyword form
-        assert!(
-            !elixir_find(code, "checked").is_empty(),
-            "should find 'checked' with guard clause"
-        );
-
-        // defguard
-        assert!(
-            !elixir_find(code, "is_positive").is_empty(),
-            "should find 'is_positive' defguard"
-        );
-    }
-
-    #[test]
     fn elixir_multi_clause_and_no_arg() {
         let code = r#"defmodule Dispatch do
   def handle(:ok), do: :success
@@ -1402,29 +1338,6 @@ end
         assert!(
             !elixir_find(code, "MyError").is_empty(),
             "should find 'MyError' module"
-        );
-    }
-
-    #[test]
-    fn elixir_delegate_and_nested_modules() {
-        let code = r"defmodule Outer do
-  defdelegate count(list), to: Enum
-
-  defmodule Inner do
-    def nested_func, do: :ok
-  end
-end
-";
-        // defdelegate
-        assert!(
-            !elixir_find(code, "count").is_empty(),
-            "should find 'count' defdelegate"
-        );
-
-        // Nested module
-        assert!(
-            !elixir_find(code, "Inner").is_empty(),
-            "should find nested 'Inner' module"
         );
     }
 

@@ -1649,55 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_qualified_target_strips_type_prefix() {
-        // Issue #59: `tilth_grok(target: "Executor.dispatch")` — and the
-        // documented `Type::method` form — must resolve to the bare method
-        // instead of returning `not found: Executor.dispatch`.
-        let tmp = tempfile::tempdir().unwrap();
-        let body = "\
-pub struct Executor;
-
-impl Executor {
-    pub fn dispatch(&self) -> u32 {
-        1
-    }
-}
-";
-        write_fixture(tmp.path(), "src/exec.rs", body);
-
-        for spec in ["Executor::dispatch", "Executor.dispatch"] {
-            let (target, _, _) = resolve_with_source(spec, tmp.path())
-                .unwrap_or_else(|e| panic!("grok could not resolve `{spec}`: {e}"));
-            assert_eq!(
-                target.name, "dispatch",
-                "spec `{spec}` should resolve to method `dispatch`"
-            );
-            assert_eq!(target.other_def_count, 0);
-        }
-    }
-
-    #[test]
-    fn qualified_nested_wrapped_classes_keep_the_real_owner() {
-        let cases = [
-            (
-                "nested.py",
-                "class Outer:\n    @logged\n    class Inner:\n        pass\n",
-            ),
-            (
-                "nested.ts",
-                "namespace Outer {\n    export class Inner {}\n}\n",
-            ),
-        ];
-        for (file, source) in cases {
-            let tmp = tempfile::tempdir().unwrap();
-            write_fixture(tmp.path(), file, source);
-            let (target, _, _) = resolve_with_source("Outer::Inner", tmp.path())
-                .unwrap_or_else(|error| panic!("{file} qualified class failed: {error}"));
-            assert_eq!(target.name, "Inner");
-        }
-    }
-
-    #[test]
     fn resolve_qualified_target_still_404s_when_method_absent() {
         // The trailing-segment retry must stay bounded: a qualified target whose
         // method doesn't exist must still return NotFound, not resolve to junk.
@@ -1710,39 +1661,6 @@ impl Executor {
             matches!(err, TilthError::NotFound { .. }),
             "absent method should 404, got {err:?}"
         );
-    }
-
-    #[test]
-    fn resolve_qualified_target_ambiguous_segment_resolves_named_owner() {
-        // When the trailing segment matches multiple same-named definitions in
-        // different owners, the qualifier selects which one — `Alpha::dispatch`
-        // resolves to Alpha's, `Beta::dispatch` to Beta's. The owner-matched
-        // candidate is unique, so other_def_count is 0.
-        let tmp = tempfile::tempdir().unwrap();
-        let a = "pub struct Alpha;\n\nimpl Alpha {\n    pub fn dispatch(&self) {}\n}\n";
-        let b = "pub struct Beta;\n\nimpl Beta {\n    pub fn dispatch(&self) {}\n}\n";
-        write_fixture(tmp.path(), "src/alpha.rs", a);
-        write_fixture(tmp.path(), "src/beta.rs", b);
-
-        let (target, _, _) = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap();
-        assert_eq!(target.name, "dispatch");
-        assert!(
-            target.path.ends_with("alpha.rs"),
-            "Alpha::dispatch must resolve to Alpha's dispatch, got {}",
-            target.path.display()
-        );
-        assert_eq!(
-            target.other_def_count, 0,
-            "exactly one dispatch is owned by Alpha"
-        );
-
-        let (target, _, _) = resolve_with_source("Beta::dispatch", tmp.path()).unwrap();
-        assert!(
-            target.path.ends_with("beta.rs"),
-            "Beta::dispatch must resolve to Beta's dispatch, got {}",
-            target.path.display()
-        );
-        assert_eq!(target.other_def_count, 0);
     }
 
     #[test]
@@ -1851,75 +1769,6 @@ impl<T> Foo<T> {
             "Foo::build must resolve to the generic impl on Foo, got {}",
             target.path.display()
         );
-    }
-
-    #[test]
-    fn resolve_qualified_target_typescript_class_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = "export class Alpha {\n  dispatch(): number {\n    return 1;\n  }\n}\n";
-        let b = "export class Beta {\n  dispatch(): number {\n    return 2;\n  }\n}\n";
-        write_fixture(tmp.path(), "src/alpha.ts", a);
-        write_fixture(tmp.path(), "src/beta.ts", b);
-
-        let (target, _, _) = resolve_with_source("Beta.dispatch", tmp.path())
-            .unwrap_or_else(|e| panic!("grok could not resolve `Beta.dispatch`: {e}"));
-        assert_eq!(target.name, "dispatch");
-        assert!(
-            target.path.ends_with("beta.ts"),
-            "Beta.dispatch must resolve to Beta's method, got {}",
-            target.path.display()
-        );
-    }
-
-    #[test]
-    fn resolve_qualified_target_python_class_method() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = "class Alpha:\n    def dispatch(self):\n        return 1\n";
-        let b = "class Beta:\n    def dispatch(self):\n        return 2\n";
-        write_fixture(tmp.path(), "src/alpha.py", a);
-        write_fixture(tmp.path(), "src/beta.py", b);
-
-        let (target, _, _) = resolve_with_source("Alpha.dispatch", tmp.path())
-            .unwrap_or_else(|e| panic!("grok could not resolve `Alpha.dispatch`: {e}"));
-        assert_eq!(target.name, "dispatch");
-        assert!(
-            target.path.ends_with("alpha.py"),
-            "Alpha.dispatch must resolve to Alpha's method, got {}",
-            target.path.display()
-        );
-    }
-
-    #[test]
-    fn resolve_qualified_target_go_receiver_type() {
-        // Go methods are flat top-level entries; the owner is the receiver type.
-        // `Foo.Bar` must resolve to the Bar whose receiver is Foo, not Baz's Bar.
-        let tmp = tempfile::tempdir().unwrap();
-        let foo = "package main\n\ntype Foo struct{}\n\nfunc (f *Foo) Bar() int {\n\treturn 1\n}\n";
-        let baz = "package main\n\ntype Baz struct{}\n\nfunc (b Baz) Bar() int {\n\treturn 2\n}\n";
-        write_fixture(tmp.path(), "foo.go", foo);
-        write_fixture(tmp.path(), "baz.go", baz);
-
-        let (target, _, _) = resolve_with_source("Foo.Bar", tmp.path())
-            .unwrap_or_else(|e| panic!("grok could not resolve `Foo.Bar`: {e}"));
-        assert_eq!(target.name, "Bar");
-        assert!(
-            target.path.ends_with("foo.go"),
-            "Foo.Bar must resolve to Foo's method by receiver type, got {}",
-            target.path.display()
-        );
-    }
-
-    #[test]
-    fn resolve_go_grouped_and_multi_name_declarations_use_query_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let code = "package main\n\nconst (\n\tStatusActive = 1\n\tStatusInactive = 2\n)\nvar CounterA, CounterB int\n";
-        write_fixture(tmp.path(), "consts.go", code);
-
-        for name in ["StatusInactive", "CounterB"] {
-            let (target, _, _) = resolve_with_source(name, tmp.path())
-                .unwrap_or_else(|e| panic!("grok could not resolve `{name}`: {e}"));
-            assert_eq!(target.name, name);
-        }
     }
 
     #[test]

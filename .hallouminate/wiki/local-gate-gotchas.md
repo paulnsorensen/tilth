@@ -2,6 +2,7 @@
 
 Use the current CI workflow for local gate commands.
 The August 2026 failure baseline below no longer defines the required checks.[^1]
+Cucumber BDD language coverage verifies public behavior; unit tests retain private parser invariants.[^14][^15]
 
 ## Current gates
 
@@ -70,14 +71,39 @@ Keep this focused driver beside the Gherkin steps; it is not a replacement for t
 
 [^8]: `Cargo.toml:127-135`; `tests/bdd/README.md:1-22`; `tests/bdd/session.rs:40`.
 [^9]: `tests/bdd/session.rs:25-91,103-149`.
-[^10]: `tests/bdd/features/edit.feature:1-81`; `tests/bdd/main.rs:51-83,138-175`.
-[^11]: `tests/bdd/main.rs:194-207`.
+[^10]: `tests/bdd/features/edit.feature:1-81`; `tests/bdd/main.rs:97-105,343-395`.
+[^11]: `tests/bdd/main.rs:489-503`.
 
 The BDD runner accepts Cargo positional filters as literal scenario-name substrings.
 Without this custom CLI field, the documented `cargo test edit` command fails before Cucumber runs scenarios.
 Explicit Cucumber `--name` and `--tags` filters retain priority over the positional filter.[^12]
 
-[^12]: `tests/bdd/main.rs:187-207`; `tests/bdd/README.md:10-21`; `CONTRIBUTING.md:13`. Verified on 2026-09-29.
+[^12]: `tests/bdd/main.rs:482-503`; `tests/bdd/README.md:10-21`; `CONTRIBUTING.md:13`. Verified on 2026-09-29.
+
+## Cucumber BDD language coverage
+
+Cucumber BDD language coverage follows the existing registry: 19 languages and 39 filename forms.
+The matrix contains 29 extension forms and 10 exact filenames.
+Seventeen languages provide grammars for 35 forms.
+Docker and Make supply the remaining four filename forms without structural grammars.[^13]
+
+Grammar-backed rows require a structural symbol result with an exact name, path, canonical line, and source body.
+Docker and Make rows use valid native syntax and require literal-match evidence instead.
+Every row reads, applies a tagged edit, checks complete file bytes, and searches the changed source.
+Expected values come from test fixtures, not production registry or parser output.[^14]
+
+Move a unit case into BDD only when its public assertions have exact replacements.
+Keep private invariants in units, including registry completeness, ranking weights, byte identity, cache keys, and depth limits.
+MCP search deduplicates overlapping definition candidates before it returns a unique result.
+Retain raw-definition count assertions in units; one public result cannot prove one parser match.[^15]
+A successful response alone does not prove matching, ownership, ambiguity, or source-span correctness.
+A demonstrated defect requires a failing regression before the smallest production fix.
+Do not add parsers or supported aliases as part of test migration.
+
+[^13]: `src/types.rs:20-44`; `src/lang/mod.rs:33-109`; per-language `SPEC` records.
+[^14]: `tests/bdd/features/languages.feature:1-69`; `tests/bdd/fixture_catalog.rs:1-151`; PR #283 approved migration scope.
+
+[^15]: `src/mcp/tools/search_v2.rs:506-519`; assertion-preserving migration review for PR #283.
 
 ## Historical baseline
 
@@ -95,4 +121,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review and MCP acceptance harness code · Updated: 2026-09-29 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, MCP acceptance harness code, and PR #283 language BDD scope · Updated: 2026-09-29 · Supersedes: August 2026 local-gate baseline guidance._

@@ -217,6 +217,7 @@ fn node_to_entry(
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
