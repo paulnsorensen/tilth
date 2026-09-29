@@ -14,6 +14,15 @@ use crate::session::Session;
 
 const PATHS_SHAPE_EXAMPLE: &str = "paths: [\"a.rs\", \"b.rs\"]";
 
+/// Header token pad reserved for truncation metadata (`truncated`,
+/// `truncated_at_line`, `original_line_count`) that a caller may still add
+/// after computing the body budget.
+const HEADER_META_PAD_TOKENS: u64 = 16;
+
+/// Minimum token amount the batch shrink loop removes from `available` per
+/// pass, so a tiny `excess` still makes visible progress.
+const BATCH_SHRINK_STEP_MIN: u64 = 16;
+
 fn batching_note() -> String {
     format!(
         "\n\n> Note: paths accepts an array — batch related files in one call, e.g. {PATHS_SHAPE_EXAMPLE}."
@@ -154,18 +163,24 @@ fn tool_read_paths(
         // `cache` access (DashMap). Partitioned after the join to preserve
         // input order — `par_iter().collect()` is index-stable.
         enum PerPath {
-            Content(String),
+            Content(String, String),
             NotFound(String),
         }
 
         let outcomes: Vec<PerPath> = parsed
             .par_iter()
             .map(|(path, suffix)| {
+                // Label used for the `── omitted (raise budget) ──` footer when
+                // this part's rendered body does not fit the batch budget.
+                let label = match suffix {
+                    PathSuffix::Symbol(name) => format!("{}#{}", path.display(), name),
+                    _ => path.display().to_string(),
+                };
                 if !path.exists() {
                     return PerPath::NotFound(path.display().to_string());
                 }
                 if crate::read::tilthignore_denies(path) {
-                    return PerPath::Content(crate::read::blocked_notice(path));
+                    return PerPath::Content(label, crate::read::blocked_notice(path));
                 }
                 // A `#symbol` suffix that resolves cleanly to "symbol absent
                 // from outline" is the symbol-equivalent of a missing file:
@@ -181,7 +196,10 @@ fn tool_read_paths(
                 session.record_read(path);
                 if let Some(s_ts) = since {
                     if !crate::mcp::iso::file_changed_since(path, s_ts) {
-                        return PerPath::Content(crate::mcp::iso::unchanged_stub(path, s_ts));
+                        return PerPath::Content(
+                            label,
+                            crate::mcp::iso::unchanged_stub(path, s_ts),
+                        );
                     }
                 }
                 let signature = force_signature
@@ -216,40 +234,130 @@ fn tool_read_paths(
                 {
                     crate::read::record_edit_snapshot(session, path, &spec);
                 }
-                PerPath::Content(body)
+                PerPath::Content(label, body)
             })
             .collect();
 
         let mut parts: Vec<String> = Vec::with_capacity(parsed.len());
+        let mut labels: Vec<String> = Vec::with_capacity(parsed.len());
         let mut not_found: Vec<String> = Vec::new();
         for outcome in outcomes {
             match outcome {
-                PerPath::Content(s) => parts.push(s),
+                PerPath::Content(label, s) => {
+                    labels.push(label);
+                    parts.push(s);
+                }
                 PerPath::NotFound(s) => not_found.push(s),
             }
         }
-        // Batch budget: split the total across files so every file is
-        // represented (no silent trailing drops). Only the budget is split
-        // here — each file's smart-view shaping above is left untouched.
-        // Per-file truncation cites the total budget; finalize_response
-        // applies the aggregate ceiling.
-        let per_file = crate::budget::item_budget(budget_val, parts.len().max(1));
-        let parts: Vec<String> = parts
-            .into_iter()
-            .map(|p| crate::budget::apply_item(&p, per_file, budget_val))
-            .collect();
-        let mut combined = parts.join("\n\n");
+        let mut footer = String::new();
         if !not_found.is_empty() {
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
-            }
-            combined.push_str("── not found ──");
-            for p in &not_found {
-                let _ = write!(combined, "\n{p}");
+            footer.push_str("── not found ──");
+            for path in &not_found {
+                let _ = write!(footer, "\n{path}");
             }
         }
-        // Multi-file responses don't carry per-file view-meta — the agent
-        // can read each per-file `# path (...) [mode]` header inline.
+        let join = |parts: &[String]| {
+            let mut combined = parts.join("\n\n");
+            if !footer.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(&footer);
+            }
+            combined
+        };
+        let mut combined = join(&parts);
+        let complete =
+            crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &combined);
+        if crate::types::estimate_tokens(complete.len() as u64) <= budget_val {
+            return Ok(complete);
+        }
+        let body_budget = response_body_budget(Some(now), &serde_json::Map::new(), budget_val);
+        if !parts.is_empty() {
+            let framing_bytes = join(&vec![String::new(); parts.len()]).len();
+            let mut available =
+                body_budget.saturating_sub(crate::types::estimate_tokens(framing_bytes as u64));
+            let mut rendered = parts.clone();
+            let mut prev_size = u64::MAX;
+            loop {
+                let caps = batch_part_caps(&parts, available);
+                let candidate: Vec<String> = parts
+                    .iter()
+                    .zip(caps)
+                    .map(|(part, cap)| crate::budget::apply_item(part, cap, budget_val))
+                    .collect();
+                let candidate_joined = join(&candidate);
+                let size = crate::types::estimate_tokens(candidate_joined.len() as u64);
+                if size >= prev_size {
+                    break;
+                }
+                rendered = candidate;
+                combined = candidate_joined;
+                prev_size = size;
+                let excess = size.saturating_sub(body_budget);
+                if excess == 0 || available == 0 {
+                    break;
+                }
+                available = available.saturating_sub(excess.max(BATCH_SHRINK_STEP_MIN));
+            }
+            if crate::types::estimate_tokens(combined.len() as u64) > body_budget {
+                let footer_tokens = crate::types::estimate_tokens(footer.len() as u64);
+                let sep_tokens = if footer.is_empty() {
+                    0
+                } else {
+                    crate::types::estimate_tokens(2)
+                };
+                // Reserve worst-case space for the omitted-parts footer (every
+                // label listed) before selecting whole parts, so the footer
+                // and the not-found section both survive the shrink floor.
+                let mut all_omitted = String::from("── omitted (raise budget) ──");
+                for label in &labels {
+                    let _ = write!(all_omitted, "\n{label}");
+                }
+                let omitted_reserve = crate::types::estimate_tokens(all_omitted.len() as u64)
+                    + crate::types::estimate_tokens(2);
+                let mut parts_budget =
+                    body_budget.saturating_sub(footer_tokens + sep_tokens + omitted_reserve);
+                let mut kept: Vec<&str> = Vec::new();
+                let mut omitted_labels: Vec<&str> = Vec::new();
+                for (label, part) in labels.iter().zip(rendered.iter()) {
+                    let sep = if kept.is_empty() {
+                        0
+                    } else {
+                        crate::types::estimate_tokens(2)
+                    };
+                    let cost = crate::types::estimate_tokens(part.len() as u64) + sep;
+                    if cost <= parts_budget {
+                        parts_budget -= cost;
+                        kept.push(part.as_str());
+                    } else {
+                        omitted_labels.push(label.as_str());
+                    }
+                }
+                let mut clipped_parts = kept.join("\n\n");
+                if !omitted_labels.is_empty() {
+                    if !clipped_parts.is_empty() {
+                        clipped_parts.push_str("\n\n");
+                    }
+                    clipped_parts.push_str("── omitted (raise budget) ──");
+                    for label in &omitted_labels {
+                        let _ = write!(clipped_parts, "\n{label}");
+                    }
+                }
+                combined = if footer.is_empty() {
+                    clipped_parts
+                } else {
+                    format!("{clipped_parts}\n\n{footer}")
+                };
+            }
+        }
+        // Path lists that cannot fit collapse to counts, so the response
+        // still says how many parts were omitted and how many paths were missing.
+        if crate::types::estimate_tokens(combined.len() as u64) > body_budget {
+            combined = batch_count_summary(parts.len(), not_found.len());
+        }
+        // Multi-file responses don't carry per-file view-meta.
         return Ok(finalize_response(
             Some(now),
             serde_json::Map::new(),
@@ -597,6 +705,55 @@ fn count_lines(path: &Path) -> Option<u32> {
     Some(u32::try_from(total).unwrap_or(u32::MAX))
 }
 
+fn batch_count_summary(omitted: usize, not_found: usize) -> String {
+    let mut sections = Vec::new();
+    if omitted > 0 {
+        sections.push(format!("── omitted (raise budget) ──\n{omitted} parts"));
+    }
+    if not_found > 0 {
+        sections.push(format!("── not found ──\n{not_found} paths"));
+    }
+    sections.join("\n\n")
+}
+fn batch_part_caps(parts: &[String], budget: u64) -> Vec<u64> {
+    let mut needs: Vec<(usize, u64)> = parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| (index, crate::types::estimate_tokens(part.len() as u64)))
+        .collect();
+    needs.sort_by_key(|&(index, cost)| (cost, index));
+    let mut caps = vec![0; parts.len()];
+    let mut remaining = budget;
+    for (position, &(index, cost)) in needs.iter().enumerate() {
+        let count = (needs.len() - position) as u64;
+        if cost <= remaining / count {
+            caps[index] = cost;
+            remaining -= cost;
+        } else {
+            let share = remaining / count;
+            let extra = remaining % count;
+            for (offset, &(index, _)) in needs[position..].iter().enumerate() {
+                caps[index] = share + u64::from((offset as u64) < extra);
+            }
+            break;
+        }
+    }
+    caps
+}
+
+/// Body-token budget available for content after reserving the estimated
+/// JSON header line plus `HEADER_META_PAD_TOKENS` for truncation metadata
+/// that a caller may still add.
+fn response_body_budget(
+    now: Option<SystemTime>,
+    meta: &serde_json::Map<String, Value>,
+    total_budget: u64,
+) -> u64 {
+    let header_preview = crate::mcp::iso::with_meta_header(now, meta.clone(), "");
+    let header_tokens = crate::types::estimate_tokens(header_preview.len() as u64);
+    total_budget.saturating_sub(header_tokens + HEADER_META_PAD_TOKENS)
+}
+
 /// Apply budget to `body`, then prepend a single JSON header line that
 /// combines the optional cache token (`now`) with any view-shape `meta`
 /// fields the caller built (`view`, `original_line_count`, `next_view`,
@@ -621,11 +778,8 @@ fn finalize_response(
         return crate::mcp::iso::with_meta_header(now, meta, body);
     };
 
-    let body_budget = |meta: &serde_json::Map<String, Value>| {
-        let header_preview = crate::mcp::iso::with_meta_header(now, meta.clone(), "");
-        let header_tokens = crate::types::estimate_tokens(header_preview.len() as u64);
-        total_budget.saturating_sub(header_tokens + 16)
-    };
+    let body_budget =
+        |meta: &serde_json::Map<String, Value>| response_body_budget(now, meta, total_budget);
 
     let (mut body_final, info) = crate::budget::apply_with_info(body, body_budget(&meta));
     if let Some(info) = info {
@@ -826,6 +980,372 @@ mod tests {
 
     fn services() -> (Session, OutlineCache) {
         (Session::new(), OutlineCache::new())
+    }
+
+    #[test]
+    fn batch_part_caps_share_spare_budget_across_multiple_large_parts() {
+        let parts = vec![
+            "a".repeat(16),
+            "b".repeat(80),
+            "c".repeat(120),
+            "d".repeat(200),
+        ];
+        let caps = batch_part_caps(&parts, 64);
+        assert_eq!(caps, [4, 20, 20, 20]);
+        assert_eq!(caps.iter().sum::<u64>(), 64);
+        assert_eq!(batch_part_caps(&parts, 25), [4, 7, 7, 7]);
+        // Remainder branch: an uneven split hands the leftover token to the
+        // earliest-sorted parts still being shared.
+        assert_eq!(batch_part_caps(&parts, 65), [4, 20, 21, 20]);
+        // Below-count branch: fewer spare tokens than parts still assigns
+        // one token each to the earliest-sorted parts, none to the rest.
+        let big_parts = vec!["a".repeat(80), "b".repeat(120), "c".repeat(200)];
+        assert_eq!(batch_part_caps(&big_parts, 2), [1, 1, 0]);
+        // Unsorted input: caps track each part's original index, not input order.
+        let reversed: Vec<String> = parts.iter().rev().cloned().collect();
+        assert_eq!(batch_part_caps(&reversed, 64), [20, 20, 20, 4]);
+    }
+
+    #[test]
+    fn batch_read_uses_spare_budget_before_clipping_a_large_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.rs");
+        let large = dir.path().join("large.rs");
+        std::fs::write(&small, "fn small() {}\n").unwrap();
+        let mut source = String::new();
+        for line in 0..120 {
+            let _ = writeln!(source, "let value_{line} = {line};");
+        }
+        std::fs::write(&large, &source).unwrap();
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": ["small.rs", "large.rs"],
+            "mode": "full",
+            "budget": 10_000,
+            "cwd": dir.path().to_str().unwrap()
+        });
+        let full = tool_read(&args, &cache, &session, false).unwrap();
+        let budget = crate::types::estimate_tokens(full.len() as u64);
+        let budgeted = tool_read(
+            &serde_json::json!({
+                "paths": ["small.rs", "large.rs"],
+                "mode": "full",
+                "budget": budget,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !budgeted.contains("... truncated"),
+            "a batch that fits must return both parts without clipping: {budgeted}"
+        );
+        assert!(budgeted.contains("let value_119 = 119;"), "{budgeted}");
+        assert!(
+            budgeted.find("fn small()").unwrap() < budgeted.find("let value_119").unwrap(),
+            "input order must survive parallel rendering: {budgeted}"
+        );
+        let under = tool_read(
+            &serde_json::json!({
+                "paths": ["small.rs", "large.rs"],
+                "mode": "full",
+                "budget": budget - 1,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(
+            under.contains("... truncated") || under.contains("\"truncated\":true"),
+            "one token under the exact-fit budget must truncate: {under}"
+        );
+    }
+
+    #[test]
+    fn batch_read_redistributes_over_budget_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn small() {}\n").unwrap();
+        let mut source = String::new();
+        for line in 0..200 {
+            let _ = writeln!(source, "let value_{line} = {line};");
+        }
+        // Multibyte text sits past the truncation cut, so this exercises
+        // char-boundary-safe clipping of a part that gets dropped, not one
+        // that survives untouched.
+        source.push_str("const CAFÉ: &str = \"café\";\n");
+        std::fs::write(dir.path().join("large.rs"), source).unwrap();
+        let (session, cache) = services();
+        for paths in [["small.rs", "large.rs"], ["large.rs", "small.rs"]] {
+            let out = tool_read(
+                &serde_json::json!({
+                    "paths": paths,
+                    "mode": "full",
+                    "budget": 500,
+                    "cwd": dir.path().to_str().unwrap()
+                }),
+                &cache,
+                &session,
+                false,
+            )
+            .unwrap();
+            assert!(
+                out.contains("fn small()"),
+                "small part must remain complete: {out}"
+            );
+            assert!(
+                out.contains("let value_50 = 50;"),
+                "large part must receive spare budget: {out}"
+            );
+            assert!(
+                out.contains("... truncated"),
+                "over-budget part must be marked: {out}"
+            );
+            assert!(
+                !out.contains("café"),
+                "multibyte text past the cut must be dropped, not corrupted: {out}"
+            );
+            assert!(
+                !out.contains("\"truncated\":true"),
+                "aggregate must not be clipped: {out}"
+            );
+            let small_at = out.find("fn small()").unwrap();
+            let large_at = out.find("let value_50").unwrap();
+            assert_eq!(small_at < large_at, paths[0] == "small.rs");
+            assert!(crate::types::estimate_tokens(out.len() as u64) <= 500);
+        }
+    }
+
+    #[test]
+    fn batch_read_complete_range_keeps_tag_and_edit_guard() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.rs");
+        let mut source = String::new();
+        for line in 1..=120 {
+            let _ = writeln!(source, "let value_{line} = {line};");
+        }
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn small() {}\n").unwrap();
+        let (session, cache) = services();
+        let sizing_session = Session::new();
+        let mut args = serde_json::json!({
+            "paths": ["small.rs", "range.rs#20-80", "absent.rs"],
+            "budget": 10_000,
+            "cwd": dir.path().to_str().unwrap()
+        });
+        let full = tool_read(&args, &cache, &sizing_session, true).unwrap();
+        args["budget"] = Value::from(crate::types::estimate_tokens(full.len() as u64));
+        let out = tool_read(&args, &cache, &session, true).unwrap();
+        assert!(out.contains("20:let value_20 = 20;"), "{out}");
+        assert!(out.contains("80:let value_80 = 80;"), "{out}");
+        assert!(out.contains("── not found ──"), "{out}");
+        assert!(out.contains("absent.rs"), "{out}");
+        assert!(!out.contains("... truncated"), "{out}");
+
+        let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(&source));
+        assert!(out.contains(&format!("[{}#{tag}]", path.display())));
+        let bloom = Arc::new(BloomFilterCache::new());
+        let write = |line| {
+            crate::mcp::tools::tool_write(
+                &serde_json::json!({
+                    "edits": [{"path": path.to_str().unwrap(), "tag": tag, "ops": [{"op": "replace", "start": line, "end": line, "content": "changed"}]}],
+                    "cwd": dir.path().to_str().unwrap()
+                }),
+                &session,
+                &bloom,
+            )
+        };
+        assert!(write(2).unwrap_err().contains("never displayed"));
+        assert!(write(20).unwrap().contains("applied"));
+    }
+
+    #[test]
+    fn batch_read_over_budget_reserves_missing_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn small() {}\n").unwrap();
+        let mut source = String::new();
+        for line in 0..300 {
+            let _ = writeln!(source, "let value_{line} = {line};");
+        }
+        std::fs::write(dir.path().join("large.rs"), source).unwrap();
+        let (session, cache) = services();
+        let out = tool_read(
+            &serde_json::json!({
+                "paths": ["small.rs", "large.rs", "absent.rs"],
+                "mode": "full",
+                "budget": 500,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("fn small() {}"), "{out}");
+        assert!(out.contains("... truncated"), "{out}");
+        assert!(out.contains("── not found ──"), "{out}");
+        assert!(out.contains("absent.rs"), "{out}");
+        assert!(
+            !out.contains("\"truncated\":true"),
+            "aggregate must not clip the footer: {out}"
+        );
+        assert!(crate::types::estimate_tokens(out.len() as u64) <= 500);
+    }
+
+    #[test]
+    fn batch_read_shrink_floor_keeps_not_found_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        let mut names = Vec::new();
+        for file_index in 0..6 {
+            let mut source = String::new();
+            for line in 0..400 {
+                let _ = writeln!(source, "let value_{file_index}_{line} = {line};");
+            }
+            let name = format!("large_{file_index}.rs");
+            std::fs::write(dir.path().join(&name), source).unwrap();
+            names.push(name);
+        }
+        names.push("absent.rs".to_string());
+        let path_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = tool_read(
+            &serde_json::json!({
+                "paths": path_refs,
+                "mode": "full",
+                "budget": 120,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("── not found ──"), "{out}");
+        assert!(out.contains("absent.rs"), "{out}");
+        for name in &names[..6] {
+            assert!(
+                out.contains(name.as_str()),
+                "missing {name} as a part header or omitted-section entry: {out}"
+            );
+        }
+        assert!(
+            !out.contains("\"truncated\":true"),
+            "aggregate must not clip the footer at the shrink floor: {out}"
+        );
+        assert!(crate::types::estimate_tokens(out.len() as u64) <= 120);
+    }
+
+    #[test]
+    fn batch_read_counts_sections_when_path_lists_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        let mut names = Vec::new();
+        for file_index in 0..6 {
+            let mut source = String::new();
+            for line in 0..400 {
+                let _ = writeln!(source, "let value_{file_index}_{line} = {line};");
+            }
+            let name = format!("large_{file_index}.rs");
+            std::fs::write(dir.path().join(&name), source).unwrap();
+            names.push(name);
+        }
+        for missing_index in 0..6 {
+            names.push(format!("absent_{missing_index}.rs"));
+        }
+        let path_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = tool_read(
+            &serde_json::json!({
+                "paths": path_refs,
+                "mode": "full",
+                "budget": 70,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.contains("── omitted (raise budget) ──\n6 parts"),
+            "{out}"
+        );
+        assert!(out.contains("── not found ──\n6 paths"), "{out}");
+        assert!(
+            !out.contains("\"truncated\":true"),
+            "aggregate must not clip the count summary: {out}"
+        );
+        assert!(crate::types::estimate_tokens(out.len() as u64) <= 70);
+    }
+
+    #[test]
+    fn batch_read_second_shrink_pass_still_fits_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        for (name, lines) in [("a.rs", 150), ("b.rs", 250), ("c.rs", 350)] {
+            let mut source = String::new();
+            for line in 0..lines {
+                let _ = writeln!(source, "let value_{name}_{line} = {line};");
+            }
+            std::fs::write(dir.path().join(name), source).unwrap();
+        }
+        let out = tool_read(
+            &serde_json::json!({
+                "paths": ["a.rs", "b.rs", "c.rs"],
+                "mode": "full",
+                "budget": 300,
+                "cwd": dir.path().to_str().unwrap()
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("\"truncated\":true"),
+            "second shrink pass must still fit the budget: {out}"
+        );
+        assert!(crate::types::estimate_tokens(out.len() as u64) <= 300);
+    }
+
+    #[test]
+    fn batch_read_tiny_budgets_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("one.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(dir.path().join("two.rs"), "fn two() {}\n").unwrap();
+        let (session, cache) = services();
+        for budget in [0, 1, 2, 16] {
+            let out = tool_read(
+                &serde_json::json!({
+                    "paths": ["one.rs", "two.rs"],
+                    "budget": budget,
+                    "cwd": dir.path().to_str().unwrap()
+                }),
+                &cache,
+                &session,
+                false,
+            )
+            .unwrap();
+            assert!(!out.is_empty());
+            let header_line = out.lines().next().unwrap();
+            let header: Value = serde_json::from_str(header_line)
+                .unwrap_or_else(|e| panic!("header line must be JSON: {header_line}: {e}"));
+            let truncated = header
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            for name in ["one.rs", "two.rs"] {
+                assert!(
+                    out.contains(name) || truncated,
+                    "budget {budget}: {name} must be represented or truncation flagged: {out}"
+                );
+            }
+        }
     }
 
     #[test]
