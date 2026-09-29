@@ -140,6 +140,14 @@ It does not implement them or establish their causal effect.
 Do not transfer the August fixed-prefix attribution to this September task.
 For Luna's different model and hybrid harness, see [batching observations](tool-batching-behavior.md).
 
+## External benchmark planning
+
+This page reports the historical Sonnet 5 experiment, not a forecast for larger feature or issue-resolution tasks.
+See [benchmark cost planning](benchmark-cost-planning.md) for the 2026-09-29 Sonnet 5.5 scenarios and paired-panel arithmetic.
+Those scenarios use CLI-reported inference costs, not billing audits.
+The Sonnet 5.5 scenarios do not match the local `sonnet` or `sonnet5` aliases.
+No new model-cost measurement supersedes this historical result.
+
 [^sept-cost]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
 [^sept-overhead]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/09_usage.json; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/10_payload_summary.json
 

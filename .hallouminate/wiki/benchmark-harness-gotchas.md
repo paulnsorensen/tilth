@@ -122,6 +122,13 @@ Retarget report links to the rebased archive commit, which remains in the PR his
 [^sept-large]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md
 [^sept-strict]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-plan.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-auth-failure.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-hybrid-stopped-results.md
 
+## External harness qualification
+
+The [FeatureBench integration page](featurebench-integration.md) records the native Lite Level 1 runner on main.
+It extends these attachment and billing checks to that runner.
+Native FeatureBench has failure-denominator, best-attempt, credential-metadata, and agent-specific budget pitfalls.
+The page records primary sources and acceptance checks. This page documents no FeatureBench run.
+
 ## Related GEPA gotchas
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.
