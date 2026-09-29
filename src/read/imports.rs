@@ -246,6 +246,20 @@ fn find_src_ancestor(start: &Path) -> Option<&Path> {
 
 fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
     let base = dir.join(source);
+    if matches!(
+        base.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "jsx")
+    ) {
+        if base.is_file() {
+            return Some(base);
+        }
+        for ext in ["ts", "tsx"] {
+            let candidate = base.with_extension(ext);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     // Try with extensions
     for ext in &[".ts", ".tsx", ".js", ".jsx"] {
         let candidate = PathBuf::from(format!("{}{ext}", base.display()));
@@ -384,6 +398,28 @@ mod tests {
             from_sibling, from_cousin,
             "different spellings should normalize to the same PathBuf"
         );
+    }
+
+    #[test]
+    fn js_specifier_falls_back_to_typescript_when_javascript_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("types.ts"), "").unwrap();
+
+        assert_eq!(resolve_js(root, "./types.js"), Some(root.join("types.ts")));
+
+        fs::write(root.join("types.js"), "").unwrap();
+        assert_eq!(resolve_js(root, "./types.js"), Some(root.join("types.js")));
+    }
+
+    #[test]
+    fn js_specifier_skips_typescript_directory_and_finds_tsx_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("view.ts")).unwrap();
+        fs::write(root.join("view.tsx"), "").unwrap();
+
+        assert_eq!(resolve_js(root, "./view.jsx"), Some(root.join("view.tsx")));
     }
 
     #[test]

@@ -11,11 +11,15 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
-    "method", // Ruby
+    "method",           // Ruby
+    "singleton_method", // Ruby
     // Classes, structs & Kotlin objects
     "class_declaration",
     "class_definition",
+    "class",           // Ruby
+    "class_specifier", // C++
     "struct_item",
+    "struct_specifier", // C++
     "object_declaration",
     // Interfaces & types (TS)
     "interface_declaration",
@@ -108,7 +112,10 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
 fn declarator_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let mut pending = vec![node];
     while let Some(current) = pending.pop() {
-        if matches!(current.kind(), "identifier" | "field_identifier") {
+        if matches!(
+            current.kind(),
+            "identifier" | "field_identifier" | "operator_name"
+        ) {
             return Some(node_text_simple(current, lines, NodeTextMode::Full));
         }
         if current.kind() == "parenthesized_declarator" {
@@ -336,9 +343,13 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "method_definition"
         | "method_declaration"
         | "method"
+        | "singleton_method"
         | "class_declaration"
         | "class_definition"
+        | "class"
+        | "class_specifier"
         | "struct_item"
+        | "struct_specifier"
         | "interface_declaration"
         | "trait_declaration"
         | "trait_item"

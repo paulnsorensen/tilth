@@ -20,3 +20,10 @@
 
 2026-09-29 · 6e526361d2d881a3 · merged · local-gate-gotchas.md · Explain why MCP deduplication requires retained raw-definition unit counts. Exact and first natural probes rank first; Docker/Make probe ranks second.
 
+
+2026-09-29 · 7cdf8b86dc022eb29 · merged · local-gate-gotchas.md · Record exact cold/warm caller sets, dependency paths, bare C++ identity, and retained private lexer invariants. Keep JavaScript import-only reverse scanning out of scope. Exact and both natural probes rank first.
+
+
+
+2026-09-29 · a795796f35aea5f2 · merged · local-gate-gotchas.md · Record LF/CRLF/CR lexer invariants and byte-identity ownership for same-line declarations. Exact and both natural retrieval probes rank first.
+

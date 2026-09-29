@@ -16,7 +16,10 @@ use crate::lang::treesitter::{
 const TYPE_KINDS: &[&str] = &[
     "class_declaration",
     "class_definition",
+    "class",
+    "class_specifier",
     "struct_item",
+    "struct_specifier",
     "impl_item",
     "interface_declaration",
     "trait_item",
@@ -134,9 +137,11 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
+        | "singleton_method"
         | "decorated_definition" => "function",
-        "class_declaration" | "class_definition" => "class",
-        "struct_item" => "struct",
+        "class_declaration" | "class_definition" | "class" | "class_specifier" => "class",
+        "struct_item" | "struct_specifier" => "struct",
         "interface_declaration" => "interface",
         "trait_declaration" | "trait_item" => "trait",
         "type_alias_declaration" | "type_item" | "type_declaration" => "type",

@@ -54,6 +54,8 @@ Runner API: [Cucumber Rust](https://docs.rs/cucumber/latest/cucumber/).
 
 `history.feature` records each regression family with commit or pull-request tags. Expected paths, canonical lines, names, ambiguity, and bodies are fixture literals. Tests do not read the production registry or parser tables to build an oracle.
 
+`upstream.feature` covers reported Python caller loss, Ruby declarations, C++ ownership and operators, and JavaScript-to-TypeScript import resolution. Caller checks compare exact locations on cold and warm requests. Dependency checks compare resolved paths and existing reverse call-site dependents. These regressions use the existing grammars and filename registry.
+
 A leading vertical bar in an expected docstring preserves source indentation. The step implementation removes only that marker before exact comparison.
 
 ## Unit migration parity

@@ -142,11 +142,15 @@ enum ScanState {
     Code,
     /// Inside a double-quoted string.
     StringDouble,
+    /// Inside a Python triple-double-quoted string.
+    StringTripleDouble,
     /// Inside a single-quoted string/char.
     StringSingle,
+    /// Inside a Python triple-single-quoted string.
+    StringTripleSingle,
     /// Inside a backtick string (JS template literals, Go raw strings).
     StringBacktick,
-    /// Inside a line comment (// ...).
+    /// Inside a line comment (`//`, or Python `#`).
     LineComment,
     /// Inside a block comment (/* ... */).
     BlockComment,
@@ -187,11 +191,25 @@ impl<'a> Iterator for IdentifierIter<'a> {
                 ScanState::Code => {
                     // Check for start of string literals
                     if b == b'"' {
-                        self.state = ScanState::StringDouble;
-                        self.pos += 1;
+                        if self.lang == Some(Lang::Python)
+                            && bytes.get(i..i + 3) == Some(b"\"\"\"".as_slice())
+                        {
+                            self.state = ScanState::StringTripleDouble;
+                            self.pos += 3;
+                        } else {
+                            self.state = ScanState::StringDouble;
+                            self.pos += 1;
+                        }
                         continue;
                     }
                     if b == b'\'' {
+                        if self.lang == Some(Lang::Python)
+                            && bytes.get(i..i + 3) == Some(b"'''".as_slice())
+                        {
+                            self.state = ScanState::StringTripleSingle;
+                            self.pos += 3;
+                            continue;
+                        }
                         // Distinguish a Rust lifetime (`'a`, `'static`) from a char
                         // literal (`'a'`, `'\n'`). A char literal has a closing quote
                         // right after a single char/escape; a lifetime is a tick
@@ -222,6 +240,11 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     }
 
                     // Check for comments
+                    if b == b'#' && self.lang == Some(Lang::Python) {
+                        self.state = ScanState::LineComment;
+                        self.pos += 1;
+                        continue;
+                    }
                     if b == b'/' && i + 1 < len {
                         if bytes[i + 1] == b'/' {
                             self.state = ScanState::LineComment;
@@ -260,12 +283,34 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     }
                 }
 
+                ScanState::StringTripleDouble => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2;
+                    } else if bytes.get(i..i + 3) == Some(b"\"\"\"".as_slice()) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
                 ScanState::StringSingle => {
                     if b == b'\\' && i + 1 < len {
                         self.pos += 2; // skip escaped character
                     } else if b == b'\'' {
                         self.state = ScanState::Code;
                         self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringTripleSingle => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2;
+                    } else if bytes.get(i..i + 3) == Some(b"'''".as_slice()) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
                     } else {
                         self.pos += 1;
                     }
@@ -283,7 +328,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                 }
 
                 ScanState::LineComment => {
-                    if b == b'\n' {
+                    if matches!(b, b'\n' | b'\r') {
                         self.state = ScanState::Code;
                     }
                     self.pos += 1;
@@ -371,6 +416,39 @@ mod tests {
         );
         assert!(idents.contains(&"let"), "got {idents:?}");
         assert!(idents.contains(&"x"), "got {idents:?}");
+    }
+
+    #[test]
+    fn python_triple_strings_and_hash_comments_preserve_following_identifiers() {
+        let source = "FIXTURE = \"\"\"\n{\\\"prompt\\\": \\\"count ripgrep's lines\\\"}\n\"\"\"\ndef after_double(): pass\nOTHER = '''owner's value'''\ndef after_single(): pass\n# caller's note\ndef after_hash(): pass\n";
+        let identifiers: Vec<&str> = extract_identifiers(source, Some(Lang::Python)).collect();
+        assert_eq!(
+            identifiers,
+            [
+                "FIXTURE",
+                "def",
+                "after_double",
+                "pass",
+                "OTHER",
+                "def",
+                "after_single",
+                "pass",
+                "def",
+                "after_hash",
+                "pass",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_hash_comments_end_at_any_line_ending() {
+        for line_ending in ["\n", "\r\n", "\r"] {
+            let source =
+                format!("# hidden_comment{line_ending}def visible_name(): pass{line_ending}");
+            let identifiers: Vec<&str> = extract_identifiers(&source, Some(Lang::Python)).collect();
+
+            assert_eq!(identifiers, ["def", "visible_name", "pass"]);
+        }
     }
 
     #[test]

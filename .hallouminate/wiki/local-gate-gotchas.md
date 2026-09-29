@@ -100,6 +100,20 @@ A successful response alone does not prove matching, ownership, ambiguity, or so
 A demonstrated defect requires a failing regression before the smallest production fix.
 Do not add parsers or supported aliases as part of test migration.
 
+Upstream language matching regressions belong in `upstream.feature`.
+Compare exact caller paths, lines, and owners on cold and warm requests.
+Compare exact dependency paths and existing reverse call-site edges.
+Keep private lexer-token assertions because Bloom false positives can hide omitted identifiers.
+Check LF, CRLF, and CR comments without admitting comment tokens.[^16]
+C++ qualified queries retain bare canonical names and select the immediate explicit owner before an enclosing namespace.
+Use exact declaration byte identity to distinguish same-line classes and methods.
+Use canonical-line matching only when byte identity is absent.[^17]
+JavaScript source-extension fallback does not add import-only reverse scanning; that scan remains limited to scoped-import languages.[^18]
+
+[^16]: `tests/bdd/features/upstream.feature:6-55,214-249`; `tests/bdd/main.rs:313-406`; `src/index/bloom.rs:421-452`.
+[^17]: `src/search/grok.rs:274-385`; `tests/bdd/features/upstream.feature:97-212`; `src/types.rs:124-125`.
+[^18]: `src/read/imports.rs:247-282`; `src/search/deps.rs:300-307,530-631`.
+
 [^13]: `src/types.rs:20-44`; `src/lang/mod.rs:33-109`; per-language `SPEC` records.
 [^14]: `tests/bdd/features/languages.feature:1-69`; `tests/bdd/fixture_catalog.rs:1-151`; PR #283 approved migration scope.
 
@@ -121,4 +135,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, MCP acceptance harness code, and PR #283 language BDD scope · Updated: 2026-09-29 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, MCP acceptance harness code, and PR #283 language BDD scope and upstream regressions · Updated: 2026-09-29 · Supersedes: August 2026 local-gate baseline guidance._

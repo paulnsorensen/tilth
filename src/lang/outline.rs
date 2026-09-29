@@ -218,14 +218,15 @@ fn node_to_entry(
         | "method_definition"
         | "method_declaration"
         | "method"
+        | "singleton_method"
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
         | "protocol_function_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
-                .or_else(|| first_identifier_text(node, lines))
                 .or_else(|| extract_definition_name(node, lines))
+                .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| {
                     // Swift deinit has no name field — use the node kind as name
                     if kind_str == "deinit_declaration" {
@@ -239,13 +240,13 @@ fn node_to_entry(
         }
 
         // Classes & structs
-        "class_declaration" | "class_definition" => {
+        "class_declaration" | "class_definition" | "class" | "class_specifier" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Class, name, None)
         }
-        "struct_item" | "struct_declaration" => {
+        "struct_item" | "struct_declaration" | "struct_specifier" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Struct, name, None)
         }

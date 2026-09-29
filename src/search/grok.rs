@@ -281,13 +281,19 @@ fn owner_of_match(m: &crate::types::Match, cache: &OutlineCache) -> Option<Strin
     }
     let parsed = cache.get_or_parse(&m.path)?;
     let lines: Vec<&str> = parsed.content.lines().collect();
-    find_parent_name(parsed.tree.root_node(), &lines, lang, start)
+    find_parent_name(
+        parsed.tree.root_node(),
+        &lines,
+        lang,
+        start,
+        m.def_byte_range,
+    )
 }
 
 /// Name of the nearest enclosing named container (class/struct/impl/module) of
-/// the definition node starting at `start_line`, derived from the AST. `None`
-/// when the target is top-level or not found. The innermost container wins, so
-/// `a::b::method` resolves against `b`, not `a`.
+/// the target definition node. Byte identity takes precedence when present.
+/// The canonical line is a fallback for matches without byte identity. `None`
+/// means the target is top-level or absent. The innermost container wins.
 ///
 /// Reads the AST directly rather than the outline tree: the outline caps its own
 /// nesting at one container level (`node_to_entry`'s `depth < 1`), which would
@@ -298,8 +304,9 @@ fn find_parent_name(
     lines: &[&str],
     lang: Lang,
     start_line: u32,
+    definition_byte_range: Option<(usize, usize)>,
 ) -> Option<String> {
-    find_parent_name_inner(root, lines, lang, start_line, None)
+    find_parent_name_inner(root, lines, lang, start_line, definition_byte_range, None)
 }
 
 /// Descend toward the definition node, carrying the nearest enclosing container
@@ -311,19 +318,55 @@ fn find_parent_name_inner(
     lines: &[&str],
     lang: Lang,
     start_line: u32,
+    definition_byte_range: Option<(usize, usize)>,
     enclosing: Option<String>,
 ) -> Option<String> {
     let here = crate::lang::outline::container_entry_name(node, lines, lang).or(enclosing);
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if crate::lang::outline::canonical_start_line(child, lang) == start_line
-            && crate::lang::treesitter::DEFINITION_KINDS.contains(&child.kind())
-        {
-            return here;
+        let matches_target = definition_byte_range.map_or_else(
+            || crate::lang::outline::canonical_start_line(child, lang) == start_line,
+            |(start, end)| child.start_byte() == start && child.end_byte() == end,
+        );
+        if matches_target && crate::lang::treesitter::DEFINITION_KINDS.contains(&child.kind()) {
+            return qualified_definition_owner(child, lines).or(here);
         }
-        if let Some(found) = find_parent_name_inner(child, lines, lang, start_line, here.clone()) {
+        if let Some(found) = find_parent_name_inner(
+            child,
+            lines,
+            lang,
+            start_line,
+            definition_byte_range,
+            here.clone(),
+        ) {
             return Some(found);
+        }
+    }
+    None
+}
+
+fn qualified_definition_owner(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut pending = vec![node.child_by_field_name("declarator")?];
+    while let Some(current) = pending.pop() {
+        if current.kind() == "qualified_identifier" {
+            if let Some(name) = current.child_by_field_name("name") {
+                if name.kind() == "qualified_identifier" {
+                    pending.push(name);
+                    continue;
+                }
+            }
+            let scope = current.child_by_field_name("scope")?;
+            return Some(crate::lang::treesitter::node_text_simple(
+                scope,
+                lines,
+                crate::lang::treesitter::NodeTextMode::Full,
+            ));
+        }
+        for field in ["name", "declarator"].into_iter().rev() {
+            if let Some(child) = current.child_by_field_name(field) {
+                pending.push(child);
+            }
         }
     }
     None
@@ -2177,7 +2220,7 @@ impl<T> Foo<T> {
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(code, None).unwrap();
         let lines: Vec<&str> = code.lines().collect();
-        find_parent_name(tree.root_node(), &lines, lang, start_line)
+        find_parent_name(tree.root_node(), &lines, lang, start_line, None)
     }
 
     #[test]
