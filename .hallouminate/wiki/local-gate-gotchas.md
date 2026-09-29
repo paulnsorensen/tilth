@@ -29,6 +29,29 @@ After that move, all 1,092 Rust tests, 47 Python tests, and 77 Bash guard checks
 
 [^4]: P0 verification on 2026-09-12, fork base `4895b4d9f67e9fe70832e1e53745fbe4749bb810`. The actual MCP response names `src/lang/mod.rs` and `.context/upstream-core-review/crates/tilth-core/src/lang/mod.rs`. The same production diff passes after `git worktree move` relocates the research checkout outside the tested tree.
 
+## MCP acceptance harness constraints
+
+The Python harness is a batch client, not an interactive MCP client.
+It sends all requests before it collects responses.[^5]
+A scenario cannot consume a returned read tag and then construct its write request through this helper.
+Starting another process also creates another snapshot store.[^6]
+Read-to-write acceptance scenarios therefore need one live process and response-dependent requests.
+This is a harness requirement, not a reason to select one Gherkin runner.
+
+The binary existence check does not establish build freshness.[^5]
+A local behavior run can exercise an older binary after source changes.
+The helper also ignores stdout lines that fail JSON parsing.
+Successful response assertions alone therefore do not establish clean protocol output.[^5]
+
+Use isolated fixture repositories when testing repository changes.
+Some worktree-named tests only inspect the current repository's coverage field.
+They do not perform the branch, revert, rename, delete, or untracked-file actions named by those tests.[^7]
+This finding concerns those tests, not the repository's total coverage.
+
+[^5]: `tests/mcp_v2/harness.py:6-7,24-26,55-80`, inspected at `7005d6ab912843456dec498266fc3644fbcd4ea4` on 2026-09-29.
+[^6]: `src/mcp/mod.rs:175-178,228-231`; `src/session.rs:125-129,145-156`; `src/mcp/tools/write.rs:306-326`.
+[^7]: `tests/mcp_v2/test_ac08_worktree.py:63-73,86-90`, inspected on 2026-09-29.
+
 ## Historical baseline
 
 The August 2026 review of PR #144 reports a macOS batch-budget test failure.
