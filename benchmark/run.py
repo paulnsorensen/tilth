@@ -111,15 +111,20 @@ def wozcode_mode(plugin_dir: Path) -> ModeConfig:
     server = plugin_dir / "servers" / "code-server.cjs"
     if not server.is_file():
         raise ValueError(f"Woz MCP server not found: {server}")
-    revision = subprocess.run(
-        ["git", "-C", str(plugin_dir), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(plugin_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        plugin_git_sha = None
+    else:
+        plugin_git_sha = revision.stdout.strip() if revision.returncode == 0 else None
     return ModeConfig(
         name="wozcode", tools=list(MODES["baseline"].tools),
         mcp_config_path=str(manifest_path), description="Built-ins + Woz Code plugin",
         plugin_dir=str(plugin_dir), plugin_version=version,
-        plugin_git_sha=revision.stdout.strip() if revision.returncode == 0 else None,
+        plugin_git_sha=plugin_git_sha,
     )
 
 
@@ -368,6 +373,23 @@ class McpUnavailableError(RuntimeError):
     """A mode expected an MCP server that the session did not expose."""
 
 
+def _copy_private(source: Path, destination: Path) -> None:
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        dir=destination.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        shutil.copyfile(source, temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 @contextmanager
 def _cell_claude_config(model_name: str, mode: ModeConfig):
     if RUNNERS[model_name] != "claude":
@@ -387,14 +409,12 @@ def _cell_claude_config(model_name: str, mode: ModeConfig):
         cell_auth = config_dir / "wozcode" / "auth.json"
         if mode.plugin_dir:
             cell_auth.parent.mkdir()
-            shutil.copyfile(seed_auth, cell_auth)
-            cell_auth.chmod(0o600)
+            _copy_private(seed_auth, cell_auth)
         try:
             yield config_dir
         finally:
             if mode.plugin_dir and cell_auth.is_file():
-                shutil.copyfile(cell_auth, seed_auth)
-                seed_auth.chmod(0o600)
+                _copy_private(cell_auth, seed_auth)
 
 _STRICT_NATIVE_FILE_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "NotebookEdit", "LS"})
 _STRICT_BASELINE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash")

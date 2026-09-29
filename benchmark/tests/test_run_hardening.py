@@ -993,6 +993,7 @@ def test_wozcode_mode_config_uses_explicit_mcp_and_plugin_identity(tmp_path: Pat
     mode = run.wozcode_mode(plugin)
     assert mode.name == "wozcode"
     assert mode.plugin_version == "0.3.92"
+    assert mode.plugin_git_sha is None
     config = run.claude_mcp_config(mode)
     server = config["mcpServers"]["plugin_woz_code"]
     assert server["command"] == "node"
@@ -1005,6 +1006,37 @@ def test_wozcode_mode_config_uses_explicit_mcp_and_plugin_identity(tmp_path: Pat
 def test_wozcode_rejects_missing_manifest(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="plugin manifest"):
         run.wozcode_mode(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(subprocess.TimeoutExpired(["git"], 5), id="timeout"),
+        pytest.param(FileNotFoundError("git"), id="missing-git"),
+    ],
+)
+def test_wozcode_mode_ignores_unavailable_git_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    plugin = tmp_path / "wozcode"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "wozcode", "version": "0.3.92"})
+    )
+    (plugin / "servers").mkdir()
+    (plugin / "servers" / "code-server.cjs").write_text("// fixture")
+
+    def unavailable_git(cmd, **kwargs):
+        assert cmd[:2] == ["git", "-C"]
+        assert kwargs["timeout"] == 5
+        raise error
+
+    monkeypatch.setattr(run.subprocess, "run", unavailable_git)
+    mode = run.wozcode_mode(plugin)
+
+    assert mode.plugin_git_sha is None
 
 
 def test_wozcode_claude_command_requires_its_mcp_tools(
@@ -1045,17 +1077,75 @@ def test_claude_cell_config_copies_only_woz_auth_and_refreshes_seed(
     (seed / "wozcode").mkdir(parents=True)
     auth = seed / "wozcode" / "auth.json"
     auth.write_text("old-test-auth")
+    auth.chmod(0o666)
     (seed / "settings.json").write_text("do-not-copy")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(seed))
     mode = ModeConfig("wozcode", [], "manifest", "test", plugin_dir=str(tmp_path))
+    copyfile = run.shutil.copyfile
+    destination_modes = []
+
+    def checked_copyfile(source, destination):
+        destination = Path(destination)
+        destination_modes.append(
+            destination.stat().st_mode & 0o777 if destination.exists() else None
+        )
+        return copyfile(source, destination)
+
+    monkeypatch.setattr(run.shutil, "copyfile", checked_copyfile)
     with run._cell_claude_config("sonnet5", mode) as cell:
         assert isinstance(cell, Path)
         assert cell != seed
-        assert (cell / "wozcode" / "auth.json").read_text() == "old-test-auth"
+        cell_auth = cell / "wozcode" / "auth.json"
+        assert cell_auth.read_text() == "old-test-auth"
+        assert cell_auth.stat().st_mode & 0o777 == 0o600
         assert sorted(str(path.relative_to(cell)) for path in cell.rglob("*") if path.is_file()) == ["wozcode/auth.json"]
-        (cell / "wozcode" / "auth.json").write_text("refreshed-test-auth")
+        cell_auth.write_text("refreshed-test-auth")
     assert auth.read_text() == "refreshed-test-auth"
     assert auth.stat().st_mode & 0o777 == 0o600
+    assert destination_modes == [0o600, 0o600]
+
+
+def test_claude_cell_config_recreates_removed_auth_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    (seed / "wozcode").mkdir(parents=True)
+    auth = seed / "wozcode" / "auth.json"
+    auth.write_text("old-test-auth")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(seed))
+    mode = ModeConfig("wozcode", [], "manifest", "test", plugin_dir=str(tmp_path))
+
+    with run._cell_claude_config("sonnet5", mode) as cell:
+        (cell / "wozcode" / "auth.json").write_text("refreshed-test-auth")
+        auth.unlink()
+
+    assert auth.read_text() == "refreshed-test-auth"
+    assert auth.stat().st_mode & 0o777 == 0o600
+
+
+def test_claude_cell_config_preserves_seed_when_refresh_copy_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    auth_dir = seed / "wozcode"
+    auth_dir.mkdir(parents=True)
+    auth = auth_dir / "auth.json"
+    auth.write_text("old-test-auth")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(seed))
+    mode = ModeConfig("wozcode", [], "manifest", "test", plugin_dir=str(tmp_path))
+
+    with pytest.raises(OSError, match="copy failed"):
+        with run._cell_claude_config("sonnet5", mode) as cell:
+            (cell / "wozcode" / "auth.json").write_text("refreshed-test-auth")
+
+            def fail_copyfile(_source, destination):
+                Path(destination).write_text("partial-test-auth")
+                raise OSError("copy failed")
+
+            monkeypatch.setattr(run.shutil, "copyfile", fail_copyfile)
+
+    assert auth.read_text() == "old-test-auth"
+    assert {path.name for path in auth_dir.iterdir()} == {"auth.json"}
 
 
 def test_legacy_claude_keeps_existing_oauth_config_without_seed(
