@@ -81,6 +81,24 @@ the design history.
 `<certain>` `old_string` whitespace mismatches ×2 — generic model fumble, not
 tilth-specific.
 
+## Strict Sonnet migration follow-up, 2026-09-28
+
+All five strict tilth runs query `func (c *Context) Render` and receive regex no_match.[^strict-search]
+The pinned fixture contains this exact prefix at context.go:1151.
+The frozen benchmark binary reproduces the miss; an escaped regex finds one match.
+`.Render(c.Writer)` also misses while its escaped form finds the existing call.
+
+The current router selects regex before declaration normalization.
+Normalization only accepts a keyword and one identifier, not a Go receiver signature.
+These are verified false negatives, although the observed 29 total no_match results also include legitimate absence checks.
+An MCP error-rate dashboard alone misses this failure class.
+
+Candidate fixes must preserve the server-owned routing contract and genuine regex behavior.
+Use narrow declaration recognition or a clearly labeled literal alternative; do not silently broaden the search scope.
+No production fix ships during this investigation.
+
+[^strict-search]: .context/sonnet5-analytics/11_search_reproduction.jsonl; benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615; benchmark/results/streams/20260928_202801/
+
 ## Related
 
 - `.cheese/notes/tilth-pr196-sonnet5-audit.md`
