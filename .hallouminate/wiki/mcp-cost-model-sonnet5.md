@@ -95,6 +95,26 @@ caught missing (MD032 fix, N:-prefix guard, kind grammar, `#n` gloss,
 `next_view` semantics, anti-patterns section). See
 [Multi-agent workflow notes](multi-agent-workflow-notes.md) for the review process.
 
+## Strict migration comparison with WOZCODE, 2026-09-28
+
+The newer one-task comparison does not reproduce the older prefix explanation.[^strict-cost]
+Tilth starts at a mean 11,840 context tokens; WOZCODE starts at 13,600.
+Both pass five of five cells, but WOZCODE uses 18.42% less processed context and costs 17.22% less.
+Tilth has 250 distinct assistant messages versus 233 and returns 632,676 MCP response characters versus 457,725.
+These counts do not isolate causality or establish a general product ranking.
+
+Repeated checkout prefixes account for 51,944 characters in tilth read and write responses.
+An offline relative-path substitution removes 8.21% of tilth MCP response characters without removing source text.
+This is not a measured token or dollar saving. The long disposable checkout paths magnify the opportunity.
+Write receipts explain only 17.00% of the response-character gap; read plus search explain 59.23%.
+Do not assume receipt shrinking alone closes the cost gap.
+
+The recommendation pass prioritizes verified signature-search misses, relative display paths, counted bulk replacement, and compact safe receipts.
+No production changes or paid reruns occur during that pass.
+Preserve canonical snapshot keys, seen-line checks, and search continuation contracts when testing these candidates.
+
+[^strict-cost]: benchmark/reports/2026-09-28-tilth-vs-wozcode.md; .context/sonnet5-strict-results.md; .context/sonnet5-analytics/09_usage.json; .context/sonnet5-analytics/10_payload_summary.json
+
 ## Related
 
 - `.cheese/notes/tilth-sonnet5-cost-attribution.md`
