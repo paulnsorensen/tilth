@@ -3,11 +3,13 @@
 
 Denies leading grep/rg/cat content reads on project files.
 Allows ls/find directory browsing but guards input reads, output writes,
-and find execution or write actions on project files.
+find execution or write actions, and browsing piped into an xargs
+grep/rg/cat stage, on project files.
 Routes guarded operations to tilth_search, tilth_read, or tilth_write. Pipe filters
 (`cargo test | grep foo`), unresolvable paths (`"$HOME/x"`), heredoc
-bodies, multi-line quoted strings, fd redirects (`2>&1`, `2>/dev/null`),
-and paths outside the project are allowed. Fails open: any internal error
+bodies, multi-line quoted strings, fd-duplication redirects (`2>&1`) and
+fd redirects outside the project (`2>/dev/null`), and paths outside the
+project are allowed. Fails open: any internal error
 allows the command (with a stderr note). A hand-rolled bash-grammar subset
 is used instead of the `bashlex` library to keep this a zero-install,
 single-file, dependency-free script — revisit only if that constraint
@@ -27,6 +29,11 @@ from pathlib import Path
 
 GUARDED = {"grep", "rg", "find", "cat", "ls"}
 FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+# find action operands that name an output file (routed to out_targets).
+FIND_FILE_ACTIONS = {"-fprint", "-fprint0", "-fls", "-fprintf"}
+# xargs options this guard understands when checking the piped inner command.
+XARGS_NO_VALUE = {"-0", "-r"}
+XARGS_VALUE = {"-n", "-P", "-d", "-I"}
 PATTERN_FIRST = {"grep", "rg"}  # first positional is a pattern/value, not a path
 PATTERN_OPT_LONG = {"--regexp", "--file"}
 WRAPPERS = {"command", "time", "sudo", "env", "nice", "nohup", "stdbuf"}
@@ -199,34 +206,43 @@ def statement_stream(tokens, body_lines):
     return flat
 
 
-def leading_segments(tokens):
-    """Yield the leading pipeline segment of each top-level statement."""
-    seg, in_filters = [], False
+def statement_pipeline_segments(tokens):
+    """Yield each top-level statement as its list of pipe-separated
+    segments, so callers can inspect the stage right after the leading
+    command (e.g. a browsing command piped into `xargs`)."""
+    segs, seg = [], []
     for tok in tokens:
         if tok in STATEMENT_BREAKS:
-            if seg:
-                yield seg
-            seg, in_filters = [], False
-        elif in_filters:
-            continue
+            segs.append(seg)
+            if any(segs):
+                yield segs
+            segs, seg = [], []
         elif tok == "|":
-            # The rest of this statement is pipe filters — not leading.
-            if seg:
-                yield seg
-            seg, in_filters = [], True
+            segs.append(seg)
+            seg = []
         else:
             seg.append(tok)
-    if seg:
-        yield seg
+    segs.append(seg)
+    if any(segs):
+        yield segs
+
+
+def leading_segments(tokens):
+    """Yield the leading pipeline segment of each top-level statement."""
+    for segs in statement_pipeline_segments(tokens):
+        if segs[0]:
+            yield segs[0]
 
 
 def command_and_args(segment):
     """Split a segment into command, args, output targets, and input targets.
 
     Skips leading env assignments and bare wrapper commands. Heredoc
-    operator/delimiter pairs are dropped. Fd redirects `2>`/`2>>` and
-    above contribute nothing; `1>`/`1>>` (stdout) still routes to
-    out_targets since it's the primary write target. An input redirect's
+    operator/delimiter pairs are dropped. Numbered fd redirects (`2>`,
+    `2>>`, ...) route their file target the same as `1>`/`1>>`; a
+    descriptor-duplication target (`2>&1`, `>&2`) is not a path and is
+    dropped. `find`'s `-fprint`/`-fprint0`/`-fls`/`-fprintf` action
+    operands route to out_targets the same way. An input redirect's
     target is returned separately from directory-browsing arguments.
     Output targets route to tilth_write.
     """
@@ -248,19 +264,27 @@ def command_and_args(segment):
         if tok in HEREDOC_OPENERS:
             j += 2  # skip the operator and its delimiter — not a path
             continue
+        if cmd == "find" and tok in FIND_FILE_ACTIONS:
+            args.append(tok)
+            j += 1
+            if j < len(rest):
+                out_targets.append(rest[j])
+                args.append(rest[j])
+                j += 1
+            if tok == "-fprintf" and j < len(rest):
+                args.append(rest[j])  # format string, not a path
+                j += 1
+            continue
         if tok and all(c in "<>&" for c in tok):
-            # `2> file` / `2>&1`: the fd digit was collected as an arg.
-            # fd 1 (stdout) is the primary write target and still routes;
-            # fd >= 2 keeps the no-op suppress behavior.
-            fd_redirect = bool(args) and args[-1].isdigit()
-            fd_digit = args[-1] if fd_redirect else None
-            if fd_redirect:
+            # `2> file` / `2>&1`: a preceding fd digit was collected as an
+            # arg (not a path) — drop it. A digit target (`2>&1`, `>&2`)
+            # duplicates a descriptor and is not a path either.
+            if args and args[-1].isdigit():
                 args.pop()
             if j + 1 < len(rest):
                 target = rest[j + 1]
                 is_output = ">" in tok
-                suppressed = fd_redirect and not (is_output and fd_digit == "1")
-                if not suppressed and not target.isdigit():
+                if not target.isdigit():
                     if is_output:
                         out_targets.append(target)
                     else:
@@ -360,7 +384,10 @@ def judge(cmd, args, out_targets, in_targets, cwd, root):
     if targets_project(out_targets, cwd, root):
         return WRITE_ROUTE.format(cmd=cmd)
     if targets_project(in_targets, cwd, root):
-        return ROUTE_BASE.format(cmd=cmd)
+        reason = ROUTE_BASE.format(cmd=cmd)
+        if any(_is_generated_lock_or_binary(p) for p in in_targets):
+            reason += GENERATED_HINT
+        return reason
     if cmd == "ls" or (cmd == "find" and not FIND_ACTIONS.intersection(args)):
         return None
     candidates = path_args(cmd, args, cwd)
@@ -394,6 +421,55 @@ def resolve_cd(args, cwd):
     return os.path.realpath(ap)
 
 
+def xargs_inner_command(segment):
+    """The inner `(cmd, args)` an xargs segment runs, after its own
+    options, or None if the segment isn't `xargs` or its options can't
+    be parsed (fail open — the pipe stays allowed)."""
+    if not segment or os.path.basename(segment[0]) != "xargs":
+        return None
+    i = 1
+    while i < len(segment):
+        tok = segment[i]
+        if tok in XARGS_NO_VALUE:
+            i += 1
+        elif tok in XARGS_VALUE:
+            i += 2
+        elif len(tok) > 2 and tok[0] == "-" and tok[1] in {"n", "P", "d", "I"}:
+            i += 1  # attached value, e.g. `-n1`, `-Ifoo`
+        elif tok.startswith("-"):
+            return None  # unrecognized flag — fail open
+        else:
+            break
+    if i >= len(segment):
+        return None
+    return os.path.basename(segment[i]), segment[i + 1 :]
+
+
+def browses_project(cmd, args, cwd, root):
+    """True when a plain ls/find segment browses inside the project: an
+    explicit root under the project, or no path argument with cwd
+    already inside the project."""
+    paths = path_args(cmd, args, cwd)
+    if paths:
+        return targets_project(paths, cwd, root)
+    return cwd == root or Path(cwd).is_relative_to(root)
+
+
+def judge_xargs_pipe(cmd, args, following, cwd, root):
+    """Deny reason when a leading ls/find browse is piped into an xargs
+    stage that runs grep/rg/cat — a content read routed around the
+    leading-segment check."""
+    inner = xargs_inner_command(following)
+    if inner is None:
+        return None
+    inner_cmd, _ = inner
+    if inner_cmd not in {"grep", "rg", "cat"}:
+        return None
+    if browses_project(cmd, args, cwd, root):
+        return ROUTE_BASE.format(cmd=inner_cmd)
+    return None
+
+
 def decide(command, root):
     """Return the deny reason, or None to allow."""
     command = LINE_CONTINUATION.sub("", command)
@@ -408,7 +484,10 @@ def decide(command, root):
 
     body_lines = heredoc_body_lines(tokens, command, restore)
     cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
-    for segment in leading_segments(statement_stream(tokens, body_lines)):
+    for segs in statement_pipeline_segments(statement_stream(tokens, body_lines)):
+        segment = segs[0]
+        if not segment:
+            continue
         cmd, args, out_targets, in_targets = command_and_args(segment)
         cmd = cmd.translate(restore) if cmd is not None else None
         args = [arg.translate(restore) for arg in args]
@@ -423,6 +502,11 @@ def decide(command, root):
             reason = judge(cmd, args, out_targets, in_targets, cwd, root)
             if reason:
                 return reason
+            if cmd in ("ls", "find") and len(segs) > 1:
+                following = [tok.translate(restore) for tok in segs[1]]
+                reason = judge_xargs_pipe(cmd, args, following, cwd, root)
+                if reason:
+                    return reason
     return None
 
 
@@ -587,6 +671,27 @@ if __name__ == "__main__":
             ("ls ';' | grep foo", "allow"),
             ("ls ';'; cat README.md", "deny"),
             ("cat <<';' >/tmp/out.txt\ndata\n;\ncat README.md", "deny"),
+            # find action operands (fprint family) write a project file even
+            # when the search root itself is outside the project.
+            ("find /tmp -fprint README.md", "deny"),
+            ("find /tmp -fprint0 README.md", "deny"),
+            ("find /tmp -fls README.md", "deny"),
+            ("find /tmp -fprintf README.md %p", "deny"),
+            ("find /tmp -fprint /tmp/out.txt", "allow"),
+            # Numbered fd redirects (fd >= 2) route their file target like
+            # `1>`/`1>>`; only a descriptor-duplication target is exempt.
+            ("ls missing 2> README.md", "deny"),
+            ("ls /tmp 2>> README.md", "deny"),
+            ("ls /tmp 2>/dev/null", "allow"),
+            ("cat < Cargo.lock", "deny"),
+            # A leading ls/find browse piped into an xargs grep/rg/cat stage
+            # is still a content read of the project, not a pipe filter.
+            ("find . -name '*.rs' | xargs cat", "deny"),
+            ("find src -name '*.py' | xargs grep foo", "deny"),
+            ("ls src | xargs cat", "deny"),
+            ("find . -type f -print0 | xargs -0 rg foo", "deny"),
+            ("find . -name x | head", "allow"),
+            ("find /tmp -name x | xargs cat", "allow"),
         ]
 
         def self_test():
@@ -704,6 +809,19 @@ if __name__ == "__main__":
                 if not plain_ok:
                     failures += 1
                     print(f"FAIL plain-file hint scope leaked: {plain_reason!r}")
+                # The generated/lock hint also applies to an input-redirect target.
+                e2e_checks += 1
+                generated_in_reason = decide("cat < Cargo.lock", root)
+                generated_in_ok = (
+                    generated_in_reason is not None
+                    and "use head or sed" in generated_in_reason
+                )
+                if not generated_in_ok:
+                    failures += 1
+                    print(
+                        f"FAIL generated-file hint missing for input redirect: "
+                        f"{generated_in_reason!r}"
+                    )
                 total = len(SELF_TEST_CASES) + e2e_checks
                 print(f"self-test: {total - failures}/{total} passed")
                 return 1 if failures else 0
