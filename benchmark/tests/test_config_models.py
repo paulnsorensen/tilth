@@ -19,6 +19,11 @@ def test_openai_frontier_id_is_pinned() -> None:
     assert MODELS["gpt5"] == "gpt-5.6-sol"
 
 
+
+def test_luna_5_6_alias_uses_codex() -> None:
+    assert MODELS["luna56"] == "gpt-5.6-luna"
+    assert RUNNERS["luna56"] == "codex"
+
 def test_runner_aliases_remain_stable() -> None:
     assert RUNNERS["haiku"] == "claude"
     assert RUNNERS["sonnet"] == "claude"
