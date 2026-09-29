@@ -132,3 +132,30 @@ Below the JSON header plus the count summary, no batch body fits, and `finalize_
 These are separate limitations, not strict-cap guarantees from the allocation change.[^batch-allocation]
 
 [^batch-allocation]: src/mcp/tools/read.rs:158-366,708-755; src/budget.rs:52-105; PR #279
+
+## Patched Luna read-budget benchmark, September 2026
+
+The read-budget follow-up in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md) removes observed truncation without establishing an overall performance improvement.[^sept-read]
+The earlier larger-task run truncates six of 25 reads.
+Equal per-file shares leave small-file budget unused while larger files lose requested content.
+The tested local allocator redistributes unused shares and preserves complete batches that fit the framed budget.
+The patched binary records zero truncation notices across 24 reads, including the timeout trace.
+Its SHA-256 is `67385086492d457aaadea0e2caa225fccb935ac3d653dfb1d1fbe52ddbc0060d`.
+This binary includes an uncommitted read allocation change; benchmark extraction does not ship that Rust change.
+
+Native passes 3/3; patched tilth passes 2/3 and times out once after 600 seconds.
+Mean native time is 391.535 seconds; tilth's timeout-inclusive mean is at least 490.445 seconds.
+The two completed matched pairs average 412.692 versus 435.668 seconds.
+That subset does not replace the overall result.
+The timeout has no completed turn, trusted grade, or final usage. Candidate test success does not make it correct.
+Missing cost and token fields remain unknown.
+
+The timeout contains four wholly failed writes and one partial write, rejecting 18 file sections.
+Some replacement strings contain literal backslash-n/backslash-t sequences; other calls fail the unread-line guard.
+Corrections and retries remain included.
+Old and patched binaries are not interleaved; fixed arm order, shared caches, and model variation prevent causal speed claims.
+The reader already uses Rayon; this evidence does not establish serial file reads as the bottleneck.
+
+[^sept-read]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/read-budget-benchmark-results.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; src/mcp/tools/read.rs:149-163,231-240 at 18b7534eecde023cb4a70e5d13d7de29178073de
+
+_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

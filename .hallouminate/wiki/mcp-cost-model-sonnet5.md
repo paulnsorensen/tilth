@@ -1,10 +1,10 @@
-# MCP cost model: why tilth costs more per correct answer on Sonnet 5
+# MCP cost model: workload-specific benchmark evidence
 
 From the valid three-way sonnet5 re-run (`benchmark_20260808_030838_sonnet5.jsonl`,
 243 rows, 0 errors, tilth attached 81/81 pinned-arm cells). Full data in
 `.cheese/notes/tilth-sonnet5-cost-attribution.md`.
 
-## Headline result
+## Historical Sonnet result, August 2026
 
 On gin/fastapi tasks, `<certain>` tilth arms cost **18-21% more per correct
 answer** than no-tilth, with **no accuracy gain**:
@@ -95,29 +95,52 @@ caught missing (MD032 fix, N:-prefix guard, kind grammar, `#n` gloss,
 `next_view` semantics, anti-patterns section). See
 [Multi-agent workflow notes](multi-agent-workflow-notes.md) for the review process.
 
-## Strict migration comparison with WOZCODE, 2026-09-28
-
-The newer one-task comparison does not reproduce the older prefix explanation.[^strict-cost]
-Tilth starts at a mean 11,840 context tokens; WOZCODE starts at 13,600.
-Both pass five of five cells, but WOZCODE uses 18.42% less processed context and costs 17.22% less.
-Tilth has 250 distinct assistant messages versus 233 and returns 632,676 MCP response characters versus 457,725.
-These counts do not isolate causality or establish a general product ranking.
-
-Repeated checkout prefixes account for 51,944 characters in tilth read and write responses.
-An offline relative-path substitution removes 8.21% of tilth MCP response characters without removing source text.
-This is not a measured token or dollar saving. The long disposable checkout paths magnify the opportunity.
-Write receipts explain only 17.00% of the response-character gap; read plus search explain 59.23%.
-Do not assume receipt shrinking alone closes the cost gap.
-
-The recommendation pass prioritizes verified signature-search misses, relative display paths, counted bulk replacement, and compact safe receipts.
-No production changes or paid reruns occur during that pass.
-Preserve canonical snapshot keys, seen-line checks, and search continuation contracts when testing these candidates.
-
-[^strict-cost]: benchmark/reports/2026-09-28-tilth-vs-wozcode.md; .context/sonnet5-strict-results.md; .context/sonnet5-analytics/09_usage.json; .context/sonnet5-analytics/10_payload_summary.json
-
 ## Related
 
 - `.cheese/notes/tilth-sonnet5-cost-attribution.md`
 - [Benchmark harness gotchas](benchmark-harness-gotchas.md)
 - [Model-tool fumble taxonomy](model-tool-fumble-taxonomy.md)
 - PR #168 (harness fix), PR #171 (surface shrink), upstream PR #196
+
+## Strict Sonnet cost comparison, September 2026
+
+The MCP cost model is workload-specific: [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md) does not reproduce the older prefix explanation.[^sept-cost]
+Both MCP arms pass 5/5; native passes 4/5 with one 600-second timeout.
+The strict run uses Sonnet 5 high, five shuffled repetition blocks, seed 20260929, and a $10 per-cell cap.
+
+| Arm | Mean agent seconds | Mean reported cost | Mean processed context |
+|---|---:|---:|---:|
+| Native | At least 519.69, timeout floor included | $2.2195, four completed cells only | 7,266,408, four completed cells only |
+| Tilth | 351.27 | $1.5137 | 3,959,322 |
+| WOZCODE | 321.38 | $1.2529 | 3,230,145 |
+
+Across four completed matched triplets, tilth reduces time 28.77%, context 44.62%, and cost 30.93% versus native.
+WOZCODE reduces those measures 31.78%, 51.31%, and 39.74%.
+Across all five matched MCP repetitions, WOZCODE uses 18.42% less context and costs 17.22% less than tilth.
+Its mean time is 8.51% lower. Do not replace the native timeout or treat missing usage as zero.
+
+Sonnet costs are CLI-reported inference costs, not a full account-billing audit.
+Agent duration excludes trusted grading.
+Processed context sums input, cache creation, and cache reads; it is not unique source content.
+One task, shared caches, restrictive guards, and product-specific hooks limit generalization.
+
+## Response overhead is not causal attribution
+
+The September response analysis finds a smaller initial context for tilth: 11,840 tokens versus WOZCODE's 13,600.[^sept-overhead]
+Tilth emits 277 calls and 250 assistant messages; WOZCODE emits 293 calls and 233 messages.
+Fewer calls therefore do not establish fewer model round trips.
+MCP responses contain 632,676 tilth characters versus 457,725 WOZCODE characters.
+Read plus search explain 59.23% of this character gap; write receipts explain 17.00%.
+Repeated checkout prefixes contribute 51,944 read/write characters.
+Offline relative-path substitution removes 8.21% of tilth MCP characters, not a measured token or dollar amount.
+Long disposable paths magnify that opportunity.
+
+The report proposes independent search, relative-path, counted-replacement, and receipt experiments.
+It does not implement them or establish their causal effect.
+Do not transfer the August fixed-prefix attribution to this September task.
+For Luna's different model and hybrid harness, see [batching observations](tool-batching-behavior.md).
+
+[^sept-cost]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
+[^sept-overhead]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/09_usage.json; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/10_payload_summary.json
+
+_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

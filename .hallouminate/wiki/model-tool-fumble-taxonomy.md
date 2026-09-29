@@ -81,24 +81,6 @@ the design history.
 `<certain>` `old_string` whitespace mismatches ×2 — generic model fumble, not
 tilth-specific.
 
-## Strict Sonnet migration follow-up, 2026-09-28
-
-All five strict tilth runs query `func (c *Context) Render` and receive regex no_match.[^strict-search]
-The pinned fixture contains this exact prefix at context.go:1151.
-The frozen benchmark binary reproduces the miss; an escaped regex finds one match.
-`.Render(c.Writer)` also misses while its escaped form finds the existing call.
-
-The current router selects regex before declaration normalization.
-Normalization only accepts a keyword and one identifier, not a Go receiver signature.
-These are verified false negatives, although the observed 29 total no_match results also include legitimate absence checks.
-An MCP error-rate dashboard alone misses this failure class.
-
-Candidate fixes must preserve the server-owned routing contract and genuine regex behavior.
-Use narrow declaration recognition or a clearly labeled literal alternative; do not silently broaden the search scope.
-No production fix ships during this investigation.
-
-[^strict-search]: .context/sonnet5-analytics/11_search_reproduction.jsonl; benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615; benchmark/results/streams/20260928_202801/
-
 ## Related
 
 - `.cheese/notes/tilth-pr196-sonnet5-audit.md`
@@ -106,3 +88,25 @@ No production fix ships during this investigation.
 - [Edit-anchor design](edit-anchor-design.md)
 - [MCP cost model: why tilth costs more per correct answer](mcp-cost-model-sonnet5.md)
 - Fix commit `9b17e8e` (Go type_declaration name resolution)
+
+## Strict benchmark search failures beyond four explicit MCP errors
+
+Four explicit MCP errors do not capture the strict benchmark search failures: all five runs miss existing Go receiver signatures.
+The strict Sonnet search reproduction in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md) verifies false negatives beyond explicit MCP errors.[^sept-search]
+All five tilth runs submit `func (c *Context) Render` and receive regex `no_match`.
+The pinned Gin fixture contains that prefix at `context.go:1151`; escaped regex finds it.
+The frozen binary also misses `.Render(c.Writer)` while its escaped form finds the call.
+Of 97 query entries, 29 return `no_match`, including 24 regex misses.
+Not all misses are wrong: some queries deliberately check removed code.
+Four explicit MCP errors therefore understate measured search friction.
+
+The benchmarked router selects regex before declaration normalization.
+Its normalizer accepts a declaration keyword and identifier, not a Go receiver signature.
+Narrow declaration recognition or a labeled bounded literal alternative are proposals, not shipped fixes.
+Preserve receiver/glob scope, genuine regex behavior, diagnostics, ordered results, and completeness.
+Do not add caller-selected routing or remove [continuation contracts](adr/tilth-search-v2-roadmap-006.md) incidentally.
+Test genuine misses, ambiguity, and incomplete scans alongside pasted signatures.
+
+[^sept-search]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615 at 18b7534eecde023cb4a70e5d13d7de29178073de
+
+_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

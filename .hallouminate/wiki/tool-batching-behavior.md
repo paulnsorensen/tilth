@@ -1,10 +1,11 @@
-# Tool-call batching: Sonnet 5 essentially never batches unprompted
+# Tool-call batching
 
-Findings from the sonnet5 investigation on whether models batch multiple
-tool calls per turn, and what shipped in response. Source:
-`.cheese/notes/tilth-pr196-sonnet5-audit.md`.
+Tool-call batching combines several read paths, search queries, or file edits in one tool request.
+Historical Sonnet traces rarely batch; instructed Luna and strict Sonnet migration runs demonstrate effective multi-file batching.
+Batching and separate multi-call messages do not establish parallel execution or faster completion.
+The August evidence is `.cheese/notes/tilth-pr196-sonnet5-audit.md`; September measurements and limits appear below.
 
-## The finding
+## Historical unprompted finding, August 2026
 
 `<certain>` Across all three benchmark arms, Sonnet 5 batches **1-2%** of the
 time it plausibly could, and emits **zero parallel tool-use turns**:
@@ -50,115 +51,70 @@ haiku (run #12 in the working notes) after all three PRs merge, which will
 measure both #171's example-compression effect and #170's nudge effect,
 using #169's new batch-rate metric. This has not run as of 2026-08-08.
 
-## Luna 5.6 edit diagnostic, 2026-09-28
-
-An instructed Codex run demonstrates batching but no performance gain on two Gin edit tasks.
-Three repetitions per arm produce twelve correct cells: baseline 6/6 and tilth 6/6.[^luna-edit]
-All six tilth cells use successful batched MCP reads and writes; none reads host skills.
-Eleven of fourteen reads and six of seven writes contain multiple items.
-Mean agent time rises from 80.52 seconds to 101.75 seconds with tilth.
-Processed context rises from 1,335,878 to 2,731,343 tokens.
-This small, fixed-order diagnostic does not isolate the causal effect of batching alone.
-Six diff calls fail because Git metadata is intentionally hidden; two search continuation calls also fail.
-Do not generalize the older unprompted Sonnet finding to this explicitly instructed Luna run.
-
-[^luna-edit]: benchmark/results/benchmark_20260928_131346_luna56.jsonl; benchmark/results/streams/20260928_131346/; .context/luna56-fixed-results.md
-
-## Larger Luna migration, 2026-09-28
-
-A context-aware renderer migration changes 20 reference files across 90 line-diff edit sites.
-The corrected six-cell run uses Luna 5.6 at xhigh, with three repetitions per arm.
-Both arms pass all three cells.[^luna-large]
-
-Tilth uses 116 tool calls versus 150 for baseline, a 22.67% reduction.
-Mean agent time rises from 431.49 to 448.65 seconds, a 3.98% increase.
-Processed context rises from 5,977,630 to 8,940,423 tokens, a 49.56% increase.
-All three matched tilth runs take longer than baseline.
-
-Seventeen of 25 MCP reads contain multiple paths; the maximum is 20 paths.
-Twenty of 23 write attempts apply a section, including eight multi-file calls; the largest applies 14 files.
-Three write calls fail outright; two others partly apply and reject another section.
-The tilth runs use no native edit fallback. Baseline also uses multi-file native patches.
-Tool batching works, but this diagnostic does not show a speed benefit.
-
-One earlier setup attempt is invalid because the grader omits a binding-package caller.
-The corrected run adds that caller and uses a writable prewarmed temporary Go cache.
-Its fixed arm order, shared cache, and one-task scope limit generalization.
-Do not attribute the smaller slowdown versus the tiny tasks to edit size alone.[^luna-large]
-
-[^luna-large]: benchmark/results/benchmark_20260928_154153_luna56.jsonl; benchmark/results/streams/20260928_154153/; .context/luna56-render-context-results.md; .context/luna56-render-context-invalid-attempt.md
-
-### Trace diagnosis
-
-Six of 25 tilth read calls contain truncation notices, followed by reads for missing sections.
-The benchmarked reader divides its output budget equally and does not redistribute unused shares before truncation.
-For example, 20 paths with a 30,000-token budget receive 1,500 tokens each.
-Small files can leave budget unused while large files lose required content.
-Batch file processing already uses Rayon parallel iteration; serial file reads are not the demonstrated bottleneck.[^luna-budget]
-
-Baseline also overlaps native reads, with up to 19 command events in flight.
-Fewer tool calls therefore do not establish fewer serial waits.
-Tilth uncached input rises 37.24%, cached input rises 50.29%, and generated output rises 3.38%.
-The processed-context increase is not a measurement of additional unique source content.
-Raw streams lack per-call timestamps, so they cannot assign the 17.17-second mean gap to individual causes.
-Redistributing unused read budget is a concrete fix candidate, not a proven explanation for the entire slowdown.[^luna-large]
-
-[^luna-budget]: src/mcp/tools/read.rs:149-163,231-240 at 18b7534eecde023cb4a70e5d13d7de29178073de; src/budget.rs:34-45; benchmark/results/streams/20260928_154153/
-
-### Read shapes and allocation follow-up
-
-The 25 tilth reads contain 156 path requests: 78 numeric ranges, 63 plain paths, and 15 symbols.
-Twenty-three calls contain a numeric range. Twenty-four calls use automatic mode; one uses full mode.
-Plain paths can return automatic outlines rather than complete files.
-These counts describe this Luna task, not agents generally.[^luna-large]
-
-The local allocator change redistributes unused shares and returns complete batches when their framed response fits.
-See [read budget accounting](read-budget-accounting.md#batch-allocation-2026-09-28).
-A six-cell rerun uses the patched release binary, with SHA-256 beginning `67385086492d`.
-Native baseline passes 3/3; patched tilth passes 2/3 and times out after 600 seconds on the third cell.
-The timeout remains included, so this run does not show an overall speed benefit.[^patched-luna]
-
-Read-budget truncation falls from 6/25 calls in the earlier run to 0/24 calls in the patched run.
-The timeout trace contains four failed write calls and one partial write, including escaped-text mismatches and unread-line rejections.
-Its candidate checks pass before timeout, but no completed turn or trusted grade exists.
-Do not classify it as correct or treat its missing token usage as zero.[^patched-luna]
-
-[^patched-luna]: .context/read-budget-benchmark-results.md; .context/read-budget-benchmark-inputs.sha256; benchmark/results/benchmark_20260928_173414_luna56.jsonl; benchmark/results/streams/20260928_173414/
-
-## Strict Sonnet 5 migration, 2026-09-28
-
-A five-repetition, three-arm run uses Sonnet 5 high on the same Gin renderer migration.[^strict-sonnet]
-Both MCP arms restrict file work to their own tools. All arms share a Go-only Bash guard.
-Tilth and WOZCODE pass 5/5. Native passes 4/5 and times out once after 600 seconds.
-On the four completed matched repetitions, tilth reduces processed context 44.62% and reported cost 30.93% versus native.
-WOZCODE reduces those measures 51.31% and 39.74%.
-The timeout remains in correctness totals; its missing usage is not zero.
-
-Tilth batches 26/48 reads, 31/38 searches, and 15/38 writes.
-Its 104 write sections all report applied. WOZCODE uses 12 multi-file edit calls, covering 110 file targets across calls.
-Separate multi-call assistant messages occur 23 times for tilth and 54 times for WOZCODE.
-These results supersede any blanket claim that instructed Sonnet never batches.
-They do not isolate the effect of earlier prompt or schema changes.
-
-Tilth reads use 92 plain paths and 57 numeric ranges, with no symbol suffixes.
-Tilth returns 632,676 MCP response characters; WOZCODE returns 457,725.
-WOZCODE returns compact edit summaries and uses 20 replace_all operations.
-Tilth write receipts include tags and excerpts; all 38 contain omitted-line notices.
-No inspected read response contains truncation or next_view markers.
-This distinguishes abbreviated write receipts from truncated reads.
-
-Both arms have no successful native file-tool fallback. WOZCODE makes eight failed short-name Search attempts.
-Native incurs eight Glob timeouts. All arms incur guard denials.
-The strict guard, one-task scope, and product-specific hooks limit generalization.
-Do not attribute the full performance gap to batching or response size alone.
-The benchmark-only session-analytics database joins all 1,335 calls to results across 15 sessions.
-Its permission_denials table misses this hook wording; full response inspection finds the denials.
-
-[^strict-sonnet]: benchmark/results/benchmark_20260928_202801_sonnet5.jsonl; .context/sonnet5-strict-results.md; .context/sonnet5-strict-tool-analysis.md; .context/sonnet5-analytics/
-
 ## Related
 
 - `.cheese/notes/tilth-pr196-sonnet5-audit.md`
 - [MCP cost model: why tilth costs more per correct answer](mcp-cost-model-sonnet5.md)
 - [Model-tool fumble taxonomy](model-tool-fumble-taxonomy.md)
 - [Multi-agent workflow notes](multi-agent-workflow-notes.md)
+
+## Instructed Luna batching, September 2026
+
+The Luna results in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md) show effective batching without an overall speed benefit.[^sept-luna]
+These Codex runs use Luna 5.6 xhigh, fixed baseline-first order, and three repetitions per arm.
+
+| Task set | Correct, native / tilth | Mean seconds, native / tilth | Processed context, native / tilth |
+|---|---|---|---|
+| Two small Gin repairs | 6/6 / 6/6 | 80.52 / 101.75 | 1,335,878 / 2,731,343 |
+| Larger renderer migration | 3/3 / 3/3 | 431.49 / 448.65 | 5,977,630 / 8,940,423 |
+
+Small-task estimates total $0.12577 native versus $0.24644 tilth; larger-task estimates total $0.46619 versus $0.63264.
+These are harness estimates, not verified billing.
+The small-task tilth arm batches 11/14 successful reads and 6/7 writes.
+Six diff calls fail against intentionally hidden Git metadata; two continuation calls also fail.
+These failures remain measured.
+
+The larger tilth arm uses 116 calls versus 150 native calls, but all three matched runs take longer.
+It batches 17/25 reads, reaching 20 paths.
+Twenty of 23 write attempts apply at least one section; eight successful calls span multiple files, reaching 14 files.
+Three writes fail outright and two partly apply. Completion of an MCP event does not prove every section applied.
+No tilth trace uses native edit fallback; native also batches patches.
+The larger reads request 156 paths: 78 ranges, 63 plain paths, and 15 symbols.
+Twenty-four reads use automatic mode and one uses full mode.
+Six reads truncate; see [read-budget follow-up](read-budget-accounting.md#patched-luna-read-budget-benchmark-september-2026).
+Raw events lack per-call timestamps. Fixed order, shared caches, and different task setups prevent causal batching or size claims.
+
+## Strict Sonnet batching, September 2026
+
+The strict Sonnet migration demonstrates instructed batching and multi-call messages, unlike the historical unprompted traces.[^sept-batch]
+These measurements do not isolate the effect of the earlier prompt or schema changes.
+
+| Operation | Calls | Multi-item calls | Items | Largest batch |
+|---|---:|---:|---:|---:|
+| Tilth read | 48 | 26 | 149 paths | 16 |
+| Tilth search | 38 | 31 | 97 queries | 6 |
+| Tilth write | 38 | 15 | 104 file sections | 13 |
+| WOZCODE Search | 113 | 30 | 198 patterns | 13 |
+| WOZCODE Edit | 45 | 34 | 242 replacements | 30 |
+
+All 104 tilth file sections apply. WOZCODE makes 12 multi-file edits covering 110 file targets across calls.
+Tilth emits 300 text swaps and 123 line replacements; WOZCODE emits 222 single replacements and 20 `replace_all` operations.
+These operation units are not equivalent.
+Tilth emits 23 multi-call messages; WOZCODE emits 54. Neither count proves concurrent server execution.
+Tilth reads request 92 plain paths and 57 ranges, with no symbol suffixes or custom budgets.
+Forty-three reads omit mode and five request full mode.
+All 38 tilth write receipts abbreviate source, but no inspected read shows truncation markers.
+Six tilth paths and 27 WOZCODE patterns repeat within sessions; these are not automatic waste estimates.
+
+The analytics database joins all 1,335 calls across 15 sessions.
+Its 500-character result summaries cannot measure complete responses; the analysis uses full raw entries.
+Guard denials total 38 tilth, 42 WOZCODE, and 76 native calls.
+The derived permission-denials table misses this hook wording; zero there does not mean no denials.
+Native also incurs eight Glob timeouts; WOZCODE makes eight unavailable short-name Search attempts.
+Neither MCP arm successfully falls back to native file tools.
+Keep these recovery costs in the results; do not infer an exact server latency from trace emission times.
+
+[^sept-luna]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md
+[^sept-batch]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md
+
+_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
