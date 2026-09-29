@@ -101,3 +101,11 @@ caught missing (MD032 fix, N:-prefix guard, kind grammar, `#n` gloss,
 - [Benchmark harness gotchas](benchmark-harness-gotchas.md)
 - [Model-tool fumble taxonomy](model-tool-fumble-taxonomy.md)
 - PR #168 (harness fix), PR #171 (surface shrink), upstream PR #196
+
+## External benchmark planning
+
+This page reports the historical Sonnet 5 experiment, not a forecast for larger feature or issue-resolution tasks.
+See [benchmark cost planning](benchmark-cost-planning.md) for the 2026-09-29 Sonnet scenario, exact-model warning, and paired-panel arithmetic.
+No new model-cost measurement supersedes this historical result.
+
+Source: Historical experiment above; dated planning sources on the linked page · Updated: 2026-09-29 · Supersedes: None.

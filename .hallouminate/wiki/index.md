@@ -8,13 +8,19 @@ under `.cheese/`.
 
 ## Topics
 
+- [Benchmark cost planning](benchmark-cost-planning.md) — Sonnet model identity, paired-run budget scenarios, and unmeasured costs.
+- [Benchmark Gin render-context task](benchmark-gin-render-context.md) — Migration contract, protected grading, recorded controls, and comparison limits.
 - [Benchmark harness gotchas (Sonnet 5 investigation)](benchmark-harness-gotchas.md) — `--safe-mode` silently strips all MCP servers including `--mcp-config` ones (invalidated a full sonnet5 run); the PR #168 guards (available_tools/mcp_servers/model_usage recording, McpUnavailableError abort); pricing.yaml drift vs native billing; the stale `~/.local/bin/tilth` binary that made byte-size, not `--version`, the only trustworthy staleness check.
+- [Benchmark selection and rigor](benchmark-selection-and-rigor.md) — Small external panels, Pro variant distinctions, trusted grading, and statistical limits.
+- [Benchmark task inventory](benchmark-task-inventory.md) — All 58 current tasks, the original 57-task snapshot, and proposed grader improvements.
+- [Benchmark research sources](sources/index.md) — Dated primary evidence for the benchmark investigation.
 
 - [Diff: git ref resolution and exit-code handling](diff-git-ref-resolution.md) — why the root commit needs git's empty-tree hash rather than `{hash}^..{hash}`, why `^!` looks right and is not (it degrades to a working-tree diff and breaks `overlay.rs`'s `..`-splitting), git diff's 0-or-1 success convention, and the three constraints on default-branch teaching hints.
 - [Diff: symbol output order is not deterministic](diff-symbol-order-nondeterminism.md) — open bug: `match_symbols` iterates a `HashMap`, so formatted symbol line order varies between `diff()` calls; how to write tests around it and what the workaround costs.
 
 
 - [Edit-anchor design: per-line hash vs whole-file tag](edit-anchor-design.md) — why tilth originally anchored edits with a per-line content hash, the FNV low-bit-mask bug, the measured ~25% per-read token tax vs oh-my-pi's O(1) whole-file tag, and the analysis behind the since-shipped switch to the whole-file-tag model.
+- [FeatureBench integration](featurebench-integration.md) — Native and Harbor harnesses, required adapter work, isolation, resources, and qualification gates.
 - [Go grouped declaration resolution](go-declaration-resolution.md) — why definition search uses each matched identifier line while keeping the enclosing declaration range, and why grok replaces the outline's first-name label for later const and var members.
 - [Local gate gotchas (macOS)](local-gate-gotchas.md) — current CI commands and historical failure guidance that no longer defines the baseline.
 - [MCP cost model: why tilth costs more per correct answer on Sonnet 5](mcp-cost-model-sonnet5.md) — valid three-way benchmark result (+18-21% cost per correct, no accuracy gain at a 97.5% ceiling); the cost is a ~5,350-token fixed MCP prefix cache-written per cell, not per-call output volume; why mixed tool adoption (28 tilth→native fallbacks) is the worst posture.
@@ -38,3 +44,5 @@ belongs in a topic file — one topic per file.
 If you read this index and don't see the topic you need, run `list_files`
 against the `repo:tilth:wiki` corpus first — the index may be out of date
 relative to the directory.
+
+Source: Benchmark research session and existing topic index · Updated: 2026-09-29.
