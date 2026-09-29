@@ -51,6 +51,7 @@ from parse import (
     tool_op_kinds,
 )
 from tasks import TASKS
+from tasks.json_tasks import ensure_mined_repo_cloned, load_json_tasks
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -95,7 +96,10 @@ def get_repo_path(repo_name: str) -> Path:
     """Resolve working directory for a task's repo."""
     if repo_name == "synthetic":
         return SYNTHETIC_REPO
-    return REPOS[repo_name].path
+    repo_cfg = REPOS[repo_name]
+    if repo_cfg.on_demand_clone:
+        ensure_mined_repo_cloned(repo_cfg)
+    return repo_cfg.path
 
 
 _RUNTIME_ENV_KEYS = frozenset(
@@ -242,6 +246,72 @@ class McpUnavailableError(RuntimeError):
     """A mode expected an MCP server that the session did not expose."""
 
 
+class SkillUnavailableError(RuntimeError):
+    """A plugin-armed mode expected a skill that the session did not load."""
+
+
+def _expected_plugin_skills(plugin_dir: str) -> list[str]:
+    """Return the fully-qualified skill names a `--plugin-dir` should load."""
+    manifest_path = Path(plugin_dir) / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    return [
+        f"{manifest['name']}:{Path(skill).name}"
+        for skill in manifest.get("skills", [])
+    ]
+
+
+_WORKSPACE_DIFF_CAP = 20000
+
+
+def _snapshot_workspace(repo_path: Path, dest: Path) -> Path:
+    """Copy `repo_path` (minus `.git`) to `dest` for erosion-guard diffing."""
+    shutil.copytree(
+        repo_path, dest,
+        ignore=shutil.ignore_patterns(".git", ".git_hidden"),
+    )
+    return dest
+
+
+def _workspace_diff(before: Path, after: Path) -> tuple[Optional[str], Optional[int]]:
+    """Return (diff text capped at 20000 chars, changed-line count) between a
+    pre-agent snapshot and the post-agent workspace, including new files.
+
+    Both trees are `.git`-free copies, so `git diff --no-index` needs no
+    `.git` in either one; this works for `hide_git` tasks too.
+    """
+    result = subprocess.run(
+        ["git", "diff", "--no-index", "--", str(before), str(after)],
+        capture_output=True, text=True,
+    )
+    diff = result.stdout
+    changed_lines = sum(
+        1 for line in diff.splitlines()
+        if (line.startswith("+") or line.startswith("-"))
+        and not (line.startswith("+++") or line.startswith("---"))
+    )
+    return diff[:_WORKSPACE_DIFF_CAP], changed_lines
+
+
+def _run_lint_command(task, repo_path: Path) -> Optional[bool]:
+    """Run `task.lint_command` against `repo_path`. None with no lint_command."""
+    command = getattr(task, "lint_command", [])
+    if not command:
+        return None
+    result = subprocess.run(
+        command, cwd=str(repo_path), capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def _resolve_lint_ok(task, lint_before: Optional[bool], repo_path: Path) -> Optional[bool]:
+    """False only when lint passed before the agent and fails after; None
+    with no lint_command, or when the pre-agent baseline already failed.
+    """
+    if lint_before is not True:
+        return None
+    return _run_lint_command(task, repo_path)
+
+
 def run_single(
     task_name: str,
     mode_name: str,
@@ -288,6 +358,12 @@ def _run_single_in_repo(
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
     opencode_config: Optional[str] = None
+
+    # Snapshot the pre-agent workspace and lint baseline now, before the
+    # agent (and later grading) can touch tracked or untracked files.
+    before_snapshot = Path(tempfile.mkdtemp(prefix="tilth-benchmark-snap-before-"))
+    _snapshot_workspace(repo_path, before_snapshot / repo_path.name)
+    lint_before = _run_lint_command(task, repo_path)
 
     # Build command based on runner
     if runner == "codex":
@@ -344,8 +420,15 @@ def _run_single_in_repo(
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--strict-mcp-config",
-            "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
+
+        # replace (default): our own system prompt entirely replaces claude's
+        # built-in one. append: keep claude's built-in system prompt (and its
+        # native skill-loading behavior) and only append the cwd line.
+        if mode.prompt_mode == "append":
+            cmd += ["--append-system-prompt", f"Your current working directory is: {repo_path}"]
+        else:
+            cmd += ["--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}"]
 
         # --setting-sources "" loads no user/project/local settings (hooks, env,
         # user MCP servers) while retaining OAuth/keychain auth and honoring
@@ -356,6 +439,11 @@ def _run_single_in_repo(
             cmd += ["--setting-sources", ""]
 
         tools_list = list(mode.tools)
+
+        if mode.plugin_dir:
+            cmd += ["--plugin-dir", mode.plugin_dir]
+            if tools_list and "Skill" not in tools_list:
+                tools_list.append("Skill")
 
         # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
         if tools_list:
@@ -483,9 +571,35 @@ def _run_single_in_repo(
                 f"mcp_servers={run_result.mcp_servers})"
             )
 
+    # A plugin-armed claude cell whose init event never lists the plugin's
+    # skill silently ran without it (skills can fail to load under
+    # --setting-sources ""). Fail loudly instead of scoring a degraded cell.
+    if runner == "claude" and mode.plugin_dir:
+        missing = [
+            skill for skill in _expected_plugin_skills(mode.plugin_dir)
+            if skill not in run_result.skills
+        ]
+        if missing:
+            raise SkillUnavailableError(
+                f"mode '{mode_name}' expects plugin_dir '{mode.plugin_dir}' to "
+                f"load {missing} but the session's skills were "
+                f"{run_result.skills}"
+            )
+
     # Override duration if needed (subprocess timing may be more accurate)
     if run_result.duration_ms == 0:
         run_result.duration_ms = elapsed_ms
+
+    # Measure erosion telemetry against the pre-agent snapshot before grading
+    # runs `test_command`, which can itself touch tracked files.
+    after_snapshot = Path(tempfile.mkdtemp(prefix="tilth-benchmark-snap-after-"))
+    _snapshot_workspace(repo_path, after_snapshot / repo_path.name)
+    workspace_diff, workspace_diff_lines = _workspace_diff(
+        before_snapshot / repo_path.name, after_snapshot / repo_path.name,
+    )
+    lint_ok = _resolve_lint_ok(task, lint_before, repo_path)
+    shutil.rmtree(before_snapshot, ignore_errors=True)
+    shutil.rmtree(after_snapshot, ignore_errors=True)
 
     # Check correctness
     correct, reason = task.check_correctness(
@@ -506,7 +620,6 @@ def _run_single_in_repo(
     reported_version = mode.tilth_version or (
         _tilth_version(mode.binary_path) if mode.binary_path else None
     )
-
     # Return JSON-serializable dict
     return {
         "task": task_name,
@@ -554,6 +667,14 @@ def _run_single_in_repo(
         "tool_sequence": _compact_tool_sequence(run_result),
         "available_tools": run_result.available_tools,
         "mcp_servers": run_result.mcp_servers,
+        "skills": run_result.skills,
+        "plugins": run_result.plugins,
+        "plugin_dir": mode.plugin_dir,
+        "prompt_mode": mode.prompt_mode,
+        "workspace_diff_lines": workspace_diff_lines,
+        "workspace_diff": workspace_diff,
+        "reference_changed_lines": getattr(task, "reference_changed_lines", 0),
+        "lint_ok": lint_ok,
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
         "op_kinds": tool_op_kinds(run_result),
@@ -594,7 +715,7 @@ def enforce_cell_ceiling(planned: int, *, maximum: int | None) -> None:
 
 
 
-def main():
+def main(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -625,6 +746,23 @@ Examples:
         "--tasks",
         default="all",
         help="Comma-separated task names or 'all' (default: all)",
+    )
+    parser.add_argument(
+        "--tasks-json",
+        type=Path,
+        help="JSON file of task definitions (mutation or mined shape) merged "
+             "into the task set; restricts --tasks all to just these tasks",
+    )
+    parser.add_argument(
+        "--modes-json",
+        type=Path,
+        help="JSON file with a list of ModeConfig dicts merged into the mode "
+             "set; select one with --modes",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Override the auto-generated results JSONL path",
     )
     arm_group = parser.add_mutually_exclusive_group()
     arm_group.add_argument(
@@ -659,7 +797,9 @@ Examples:
              "codex: always resets mcp_servers through CLI overrides.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.modes_json and args.experiment:
+        parser.error("--modes-json cannot be combined with --experiment")
     if args.reps < 1:
         parser.error("--reps must be at least 1")
     if args.max_cells is not None and args.max_cells < 1:
@@ -670,7 +810,16 @@ Examples:
     experiment = None
     try:
         models = parse_comma_list(args.models, MODELS, "models")
-        tasks_list = parse_comma_list(args.tasks, TASKS, "tasks")
+        if args.modes_json:
+            for entry in json.loads(args.modes_json.read_text()):
+                MODES[entry["name"]] = ModeConfig(**entry)
+        if args.tasks_json:
+            json_tasks = load_json_tasks(args.tasks_json)
+            TASKS.update(json_tasks)
+            task_universe = json_tasks
+        else:
+            task_universe = TASKS
+        tasks_list = parse_comma_list(args.tasks, task_universe, "tasks")
         if args.experiment:
             experiment = load_experiment(args.experiment)
             configured_modes = experiment_modes(
@@ -686,8 +835,31 @@ Examples:
             modes = [variant.name for variant in experiment.variants]
         else:
             modes = parse_comma_list(args.modes or "all", MODES, "modes")
-    except ValueError as error:
+    except (ValueError, TypeError, KeyError) as error:
         parser.error(str(error))
+
+    # Validate every plugin_dir referenced by selected modes up front (absolute
+    # path, manifest loads, non-empty tools), before spending a paid agent run
+    # on a misconfigured mode.
+    for mode_name in modes:
+        plugin_dir = MODES[mode_name].plugin_dir
+        if not plugin_dir:
+            continue
+        if not os.path.isabs(plugin_dir):
+            print(f"ERROR: mode '{mode_name}' plugin_dir must be an absolute path: {plugin_dir}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            _expected_plugin_skills(plugin_dir)
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            print(f"ERROR: mode '{mode_name}' plugin_dir manifest failed to load: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not MODES[mode_name].tools:
+            print(
+                f"ERROR: mode '{mode_name}' has plugin_dir set but an empty tools list; "
+                "the Skill tool can't be added to an unrestricted allowlist.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Verify every MCP server referenced by selected modes can actually spawn.
     # Catches stale absolute paths in mcp config files (e.g. /Users/<other-user>/...).
@@ -746,13 +918,17 @@ Examples:
             )
         reset_repo()
 
-    # Validate real-world repos exist (for selected tasks)
+    # Validate real-world repos exist (for selected tasks). On-demand repos
+    # (mined tasks) clone here instead of requiring a prior setup_repos.py run.
     selected_repos = set(TASKS[t].repo for t in tasks_list) - {"synthetic"}
     for repo_name in selected_repos:
-        repo_path = REPOS[repo_name].path
-        if not repo_path.exists():
+        repo_cfg = REPOS[repo_name]
+        if repo_cfg.on_demand_clone:
+            get_repo_path(repo_name)
+            continue
+        if not repo_cfg.path.exists():
             print(f"ERROR: Repo '{repo_name}' not cloned.")
-            print(f"Expected at: {repo_path}")
+            print(f"Expected at: {repo_cfg.path}")
             print("Run setup_repos.py to clone repositories:")
             print("  python benchmark/fixtures/setup_repos.py")
             sys.exit(1)
@@ -767,7 +943,11 @@ Examples:
 
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
-    output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
+    if args.output:
+        output_file = args.output
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
     stream_log_dir = RESULTS_DIR / "streams" / timestamp
 
     # Print configuration summary
@@ -879,6 +1059,23 @@ Examples:
                             output.write(json.dumps(error_result) + "\n")
                             output.flush()
                             print("\nAborting run: the MCP-armed mode is "
+                                  "misconfigured; fix it and re-run.")
+                            sys.exit(1)
+
+                        except SkillUnavailableError as error:
+                            # Same class of config-level failure as an
+                            # unavailable MCP server: abort instead of
+                            # burning budget on an invalid comparison.
+                            print(f"  ✗ SKILL UNAVAILABLE: {error}")
+                            error_result = {
+                                **record_metadata,
+                                "error": f"skill_unavailable: {error}",
+                                "correct": False,
+                                "correctness_reason": f"Exception: {error}",
+                            }
+                            output.write(json.dumps(error_result) + "\n")
+                            output.flush()
+                            print("\nAborting run: the plugin-armed mode is "
                                   "misconfigured; fix it and re-run.")
                             sys.exit(1)
 

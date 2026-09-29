@@ -56,6 +56,8 @@ class RunResult:
     correctness_reason: str = ""
     available_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    plugins: list[dict] = field(default_factory=list)
     model_usage: dict[str, dict] = field(default_factory=dict)
 
 
@@ -103,6 +105,8 @@ def parse_stream_json(raw_output: str) -> RunResult:
     final_summary = {}
     available_tools: list[str] = []
     mcp_servers: list[dict] = []
+    skills: list[str] = []
+    plugins: list[dict] = []
 
     for event in events:
         event_type = event.get("type")
@@ -112,6 +116,8 @@ def parse_stream_json(raw_output: str) -> RunResult:
             if event.get("subtype") == "init":
                 available_tools = event.get("tools", [])
                 mcp_servers = event.get("mcp_servers", [])
+                skills = event.get("skills", [])
+                plugins = event.get("plugins", [])
 
         elif event_type == "assistant":
             message = event.get("message", {})
@@ -186,6 +192,8 @@ def parse_stream_json(raw_output: str) -> RunResult:
         result_text="\n".join(result_text_parts),
         available_tools=available_tools,
         mcp_servers=mcp_servers,
+        skills=skills,
+        plugins=plugins,
         model_usage=_trim_model_usage(final_summary.get("modelUsage")),
     )
 

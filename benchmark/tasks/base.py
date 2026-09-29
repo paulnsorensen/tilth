@@ -103,6 +103,16 @@ class Task(ABC):
         return []
 
     @property
+    def reference_changed_lines(self) -> int:
+        """Changed-line count of the reference fix, for erosion-guard scoring."""
+        return 0
+
+    @property
+    def lint_command(self) -> list[str]:
+        """Command to lint the workspace. Empty = no lint-based scoring."""
+        return []
+
+    @property
     def hide_git(self) -> bool:
         """Hide repository history for fix tasks unless the task opts out."""
         return self.capability == "fix" and bool(self.mutations)
