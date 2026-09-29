@@ -163,18 +163,24 @@ fn tool_read_paths(
         // `cache` access (DashMap). Partitioned after the join to preserve
         // input order — `par_iter().collect()` is index-stable.
         enum PerPath {
-            Content(String),
+            Content(String, String),
             NotFound(String),
         }
 
         let outcomes: Vec<PerPath> = parsed
             .par_iter()
             .map(|(path, suffix)| {
+                // Label used for the `── omitted (raise budget) ──` footer when
+                // this part's rendered body does not fit the batch budget.
+                let label = match suffix {
+                    PathSuffix::Symbol(name) => format!("{}#{}", path.display(), name),
+                    _ => path.display().to_string(),
+                };
                 if !path.exists() {
                     return PerPath::NotFound(path.display().to_string());
                 }
                 if crate::read::tilthignore_denies(path) {
-                    return PerPath::Content(crate::read::blocked_notice(path));
+                    return PerPath::Content(label, crate::read::blocked_notice(path));
                 }
                 // A `#symbol` suffix that resolves cleanly to "symbol absent
                 // from outline" is the symbol-equivalent of a missing file:
@@ -190,7 +196,10 @@ fn tool_read_paths(
                 session.record_read(path);
                 if let Some(s_ts) = since {
                     if !crate::mcp::iso::file_changed_since(path, s_ts) {
-                        return PerPath::Content(crate::mcp::iso::unchanged_stub(path, s_ts));
+                        return PerPath::Content(
+                            label,
+                            crate::mcp::iso::unchanged_stub(path, s_ts),
+                        );
                     }
                 }
                 let signature = force_signature
@@ -225,15 +234,19 @@ fn tool_read_paths(
                 {
                     crate::read::record_edit_snapshot(session, path, &spec);
                 }
-                PerPath::Content(body)
+                PerPath::Content(label, body)
             })
             .collect();
 
         let mut parts: Vec<String> = Vec::with_capacity(parsed.len());
+        let mut labels: Vec<String> = Vec::with_capacity(parsed.len());
         let mut not_found: Vec<String> = Vec::new();
         for outcome in outcomes {
             match outcome {
-                PerPath::Content(s) => parts.push(s),
+                PerPath::Content(label, s) => {
+                    labels.push(label);
+                    parts.push(s);
+                }
                 PerPath::NotFound(s) => not_found.push(s),
             }
         }
@@ -295,8 +308,43 @@ fn tool_read_paths(
                 } else {
                     crate::types::estimate_tokens(2)
                 };
-                let parts_budget = body_budget.saturating_sub(footer_tokens + sep_tokens);
-                let clipped_parts = crate::budget::apply(&rendered.join("\n\n"), parts_budget);
+                // Reserve worst-case space for the omitted-parts footer (every
+                // label listed) before selecting whole parts, so the footer
+                // and the not-found section both survive the shrink floor.
+                let mut all_omitted = String::from("── omitted (raise budget) ──");
+                for label in &labels {
+                    let _ = write!(all_omitted, "\n{label}");
+                }
+                let omitted_reserve = crate::types::estimate_tokens(all_omitted.len() as u64)
+                    + crate::types::estimate_tokens(2);
+                let mut parts_budget =
+                    body_budget.saturating_sub(footer_tokens + sep_tokens + omitted_reserve);
+                let mut kept: Vec<&str> = Vec::new();
+                let mut omitted_labels: Vec<&str> = Vec::new();
+                for (label, part) in labels.iter().zip(rendered.iter()) {
+                    let sep = if kept.is_empty() {
+                        0
+                    } else {
+                        crate::types::estimate_tokens(2)
+                    };
+                    let cost = crate::types::estimate_tokens(part.len() as u64) + sep;
+                    if cost <= parts_budget {
+                        parts_budget -= cost;
+                        kept.push(part.as_str());
+                    } else {
+                        omitted_labels.push(label.as_str());
+                    }
+                }
+                let mut clipped_parts = kept.join("\n\n");
+                if !omitted_labels.is_empty() {
+                    if !clipped_parts.is_empty() {
+                        clipped_parts.push_str("\n\n");
+                    }
+                    clipped_parts.push_str("── omitted (raise budget) ──");
+                    for label in &omitted_labels {
+                        let _ = write!(clipped_parts, "\n{label}");
+                    }
+                }
                 combined = if footer.is_empty() {
                     clipped_parts
                 } else {
@@ -1165,6 +1213,12 @@ mod tests {
         .unwrap();
         assert!(out.contains("── not found ──"), "{out}");
         assert!(out.contains("absent.rs"), "{out}");
+        for name in &names[..6] {
+            assert!(
+                out.contains(name.as_str()),
+                "missing {name} as a part header or omitted-section entry: {out}"
+            );
+        }
         assert!(
             !out.contains("\"truncated\":true"),
             "aggregate must not clip the footer at the shrink floor: {out}"

@@ -115,7 +115,10 @@ Existing truncation markers can exceed their allocated share, so the batch check
 
 Below about 48 tokens, `budget::truncate` renders a part as its first line plus a marker, so a smaller cap cannot shrink it.
 The reduction loop therefore stops when the rendered size does not decrease.
-If the body still overflows, the batch clips only the joined parts and then appends the missing-file footer.
+If the body still overflows, the fallback keeps whole parts in input order.
+It skips a part that does not fit and tries the next part.
+A `── omitted (raise budget) ──` section lists each skipped part by path, before the missing-file footer.
+The fallback reserves space for a list of every part path first, so both sections survive.
 A follow-up can remove this loop: make `truncate` honor its cap, or share one allocator with `src/search/alloc.rs`.[^batch-allocation]
 
 Tests cover exact fit, unequal sizes, reversed order, UTF-8, missing files, tagged ranges, and tiny-budget safety.
@@ -127,4 +130,4 @@ A truncated tagged section can lose its tag and numbered content at a blank-line
 Tiny budgets cannot necessarily contain the existing headers and truncation notices.
 These are separate limitations, not strict-cap guarantees from the allocation change.[^batch-allocation]
 
-[^batch-allocation]: src/mcp/tools/read.rs:240-314,655-692; src/budget.rs:52-105; PR #279
+[^batch-allocation]: src/mcp/tools/read.rs:158-362,703-742; src/budget.rs:52-105; PR #279
