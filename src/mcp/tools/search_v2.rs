@@ -250,6 +250,7 @@ fn run_search_v2(
             (result, follow.kind.clone(), Vec::new(), None)
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
             let language = entry["language"].as_str().unwrap();
+            session.record_structural_search();
             let scan = structural
                 .search(
                     language,
@@ -1017,7 +1018,7 @@ mod tests {
         )
         .unwrap();
         let (cache, session, bloom) = components();
-        let (telemetry, _telemetry_dir) = telemetry();
+        let (telemetry, telemetry_dir) = telemetry();
         let args = json!({"cwd": tmp.path(), "budget": 10000, "queries": [
             {"pattern": "structural_witness_unique($A)", "language": "python"},
             {"pattern": "structural_witness_unique($A)", "language": "python"},
@@ -1039,6 +1040,21 @@ mod tests {
             );
             assert_eq!(crate::search::compilation_count() - before, request * 2);
         }
+        assert_eq!(session.search_count(), 6);
+        assert!(
+            !session.summary().contains("structural_witness_unique($A)"),
+            "structural patterns must not leak into the session summary"
+        );
+        let records: Vec<Value> =
+            std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
+                .expect("telemetry file written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid telemetry record"))
+                .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["first_call"], true);
+        assert_eq!(records[1]["first_call"], false);
+
         let retained = cache.get_or_parse(&first).unwrap();
         let again = cache.get_or_parse(&first).unwrap();
         assert!(std::sync::Arc::ptr_eq(&retained, &again));

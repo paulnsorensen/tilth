@@ -205,6 +205,11 @@ impl Session {
         *syms.entry(query.to_string()).or_insert(0) += 1;
     }
 
+    /// Counts one structural search execution without retaining its raw pattern.
+    pub(crate) fn record_structural_search(&self) {
+        self.searches.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Counts one continuation (`follow`) execution toward the search tally.
     /// A follow carries no query text, so it moves only `searches`, not the
     /// `symbols`/`summary()` reporting map.
