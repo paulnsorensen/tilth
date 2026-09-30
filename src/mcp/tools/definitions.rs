@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Find/explore code with automatic routing. Batch entries use {query, glob?} or {follow: hint}; do not select kind, expand, or context.",
+            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: 'Some($A)', language, glob?}. Languages: rust, typescript (.ts only), python. No kind/expand/context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -18,21 +18,27 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "type": "object",
                             "oneOf": [
                                 {
-                                    "type": "object",
                                     "required": ["query"],
                                     "properties": {
-                                        "query": { "type": "string", "description": "Symbol, text, or regex." },
-                                        "glob": { "type": "string", "description": "Glob filter for this query." }
+                                        "query": { "type": "string" },
+                                        "glob": { "type": "string" }
                                     },
                                     "additionalProperties": false
                                 },
                                 {
-                                    "type": "object",
+                                    "required": ["pattern", "language"],
+                                    "properties": {
+                                        "pattern": { "type": "string", "minLength": 1 },
+                                        "language": { "enum": ["rust", "typescript", "python"] },
+                                        "glob": { "type": "string" }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                {
                                     "required": ["follow"],
                                     "properties": {
                                         "follow": {
                                             "type": "object",
-                                            "description": "One unchanged server-emitted continuation hint.",
                                             "required": ["kind", "target"],
                                             "additionalProperties": false,
                                             "if": {"properties": {"kind": {"not": {"const": "fetch_dependencies"}}}},
@@ -63,8 +69,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             ]
                         },
                         "minItems": 1,
-                        "maxItems": 10,
-                        "description": "Required batch of 1-10 query or follow entries."
+                        "maxItems": 10
                     },
                     "budget": {
                         "type": "integer", "minimum": 1,
@@ -490,7 +495,7 @@ mod tests {
         assert!(diff["inputSchema"]["properties"]["expand"].is_null());
     }
 
-    /// The canonical `tilth_search` accepts one query or one unchanged follow hint per entry.
+    /// Each search entry contains one query, follow hint, or structural pattern.
     #[test]
     fn tilth_search_schema_matches_v2_contract_and_requires_queries_and_cwd() {
         let tools = tool_definitions(false);
@@ -526,6 +531,24 @@ mod tests {
         assert!(!compiled.is_valid(
             &serde_json::json!({"queries": [{"query": "x", "follow": {}}], "cwd": "/abs"})
         ));
+        for language in ["rust", "typescript", "python"] {
+            assert!(compiled.is_valid(&serde_json::json!({"queries": [
+                {"pattern": "wrap($A)", "language": language, "glob": "src/**"}
+            ], "cwd": "/abs"})));
+        }
+        for entry in [
+            serde_json::json!({"pattern": "wrap($A)"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "go"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "tsx"}),
+            serde_json::json!({"pattern": "", "language": "python"}),
+            serde_json::json!({"pattern": 7, "language": "python"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "python", "query": "wrap"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "python", "follow": {}}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "python", "extra": true}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "python", "glob": 7}),
+        ] {
+            assert!(!compiled.is_valid(&serde_json::json!({"queries": [entry], "cwd": "/abs"})));
+        }
         assert!(!compiled.is_valid(
             &serde_json::json!({"queries": [{"query": "x", "kind": "callers"}], "cwd": "/abs"})
         ));

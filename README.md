@@ -64,7 +64,7 @@ tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
 tilth handleAuth --scope src/ --expand=5     # top 5
 ```
 
-In MCP mode, `expand` defaults to 2 — no flag needed.
+In MCP mode, `tilth_search` routes each `query` automatically. Do not pass `expand`, `kind`, or `context`.
 
 ### Multi-symbol search
 
@@ -88,7 +88,41 @@ $ tilth isTrustedProxy --callers --scope .
 → trusted = c.engine.isTrustedProxy(remoteIP)
 ```
 
-In MCP mode, use `kind: "callers"` on `tilth_search` instead.
+In MCP mode, pass an unchanged `fetch_callers` hint from a search response as a `follow` entry.
+
+### Structural patterns in MCP
+
+Use an explicit pattern entry to match syntax, rather than literal text or regular expressions:
+
+```json
+{
+  "cwd": "/absolute/project",
+  "queries": [
+    {"pattern": "Some($A)", "language": "rust", "glob": "src/*.rs"},
+    {"pattern": "wrap($A)", "language": "typescript"},
+    {"pattern": "wrap($$$ARGS)", "language": "python"}
+  ]
+}
+```
+
+Supported languages are Rust, TypeScript (`.ts`, not `.tsx`), and Python.
+Each entry contains exactly one of `query`, `follow`, or `pattern`.
+Pattern entries require `language` and accept only an optional `glob`.
+Invalid patterns and unsupported languages fail without a text-search fallback.
+
+Each structural result contains `items` with a relative `path`, a match `range`, and named `captures`.
+Ranges use zero-based, half-open byte offsets and one-based endpoint line numbers.
+The end line identifies the exclusive end position, including the next line when the range ends after a newline.
+Captures map names to lists of ranges.
+Multi-captures retain matched punctuation, such as commas, in source order.
+Results contain owned ranges, not source text or borrowed syntax nodes.
+
+Structural search uses the same scope, ignore, secret-file, and response-budget policies as other search entries.
+Matching reuses cached source and trees.
+Each distinct language/pattern pair compiles once per request.
+The scan retains at most 1,000 matches and marks limited or skipped-file scans as partial.
+Files above the existing 500,000-byte parse limit are skipped.
+Response-budget reduction can remove items and sets `budget_limited`.
 
 ### Blast-radius deps
 

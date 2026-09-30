@@ -10,8 +10,12 @@ pub mod grok;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
+mod structural;
 pub mod symbol;
 pub mod truncate;
+#[cfg(test)]
+pub(crate) use structural::compilation_count;
+pub(crate) use structural::StructuralPatterns;
 
 mod bloom_walk;
 mod callee_query;

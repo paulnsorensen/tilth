@@ -152,13 +152,23 @@ fn run_search_v2(
         ));
     }
     let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
+    let mut structural = crate::search::StructuralPatterns::default();
     for entry in entries {
         let object = entry
             .as_object()
             .ok_or_else(|| SearchFailure::new("each entry must be an object", "bad_query_entry"))?;
-        if object.contains_key("query") == object.contains_key("follow") {
+        if ["query", "follow", "pattern"]
+            .iter()
+            .filter(|key| object.contains_key(**key))
+            .count()
+            != 1
+        {
             return Err(SearchFailure::new(
-                "each entry requires exactly one of query or follow",
+                if object.contains_key("pattern") {
+                    "each entry requires exactly one of query, follow, or pattern"
+                } else {
+                    "each entry requires exactly one of query or follow"
+                },
                 "bad_query_entry",
             ));
         }
@@ -172,6 +182,37 @@ fn run_search_v2(
             follows.push(Some(
                 Follow::parse(hint, cwd, cache).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
             ));
+        } else if object.contains_key("pattern") {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "pattern" | "language" | "glob"))
+            {
+                return Err(SearchFailure::new(
+                    "structural entries accept only pattern, language, and glob",
+                    "bad_structural",
+                ));
+            }
+            let pattern = entry["pattern"]
+                .as_str()
+                .ok_or_else(|| SearchFailure::new("pattern must be a string", "bad_structural"))?;
+            let language = entry["language"].as_str().ok_or_else(|| {
+                SearchFailure::new(
+                    "language must be rust, typescript, or python",
+                    "bad_structural",
+                )
+            })?;
+            if entry.get("glob").is_some_and(|glob| !glob.is_string()) {
+                return Err(SearchFailure::new(
+                    "glob must be a string",
+                    "bad_structural",
+                ));
+            }
+            crate::search::walker(cwd, entry.get("glob").and_then(Value::as_str))
+                .map_err(|error| SearchFailure::new(error.to_string(), "bad_structural"))?;
+            structural
+                .prepare(language, pattern)
+                .map_err(|error| SearchFailure::new(error, "bad_structural"))?;
+            follows.push(None);
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
                 return Err(SearchFailure::new(
@@ -207,6 +248,38 @@ fn run_search_v2(
                 .execute(cwd, bloom, client, cache)
                 .map_err(|e| SearchFailure::new(e, "follow_error"))?;
             (result, follow.kind.clone(), Vec::new(), None)
+        } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
+            let language = entry["language"].as_str().unwrap();
+            let scan = structural
+                .search(
+                    language,
+                    pattern,
+                    cwd,
+                    entry.get("glob").and_then(Value::as_str),
+                    cache,
+                )
+                .map_err(|error| SearchFailure::new(error.to_string(), "structural_error"))?;
+            let mut result = base_result(
+                pattern,
+                "structural",
+                if scan.items.is_empty() {
+                    "no_match"
+                } else {
+                    "ok"
+                },
+            );
+            result["language"] = json!(language);
+            result["items"] = json!(scan.items);
+            if scan.skipped_files > 0 {
+                result["skipped_files"] = json!(scan.skipped_files);
+            }
+            if scan.limited {
+                result["match_limited"] = json!(true);
+            }
+            if scan.limited || scan.skipped_files > 0 {
+                mark_partial(&mut result);
+            }
+            (result, "structural".into(), Vec::new(), None)
         } else {
             route_query(
                 entry["query"].as_str().unwrap(),
@@ -928,6 +1001,47 @@ mod tests {
         assert_eq!(parsed["results"][0]["status"], "ambiguous");
         assert_eq!(parsed["results"][0]["completeness"], "partial");
         assert_eq!(parsed["results"][0]["budget_limited"], true);
+    }
+
+    #[test]
+    fn structural_requests_reuse_documents_and_compile_once_per_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "structural_witness_unique(value)\n";
+        let witness = crate::lang::treesitter::ParseWitness::new(source);
+        let first = tmp.path().join("first.py");
+        std::fs::write(&first, source).unwrap();
+        std::fs::write(tmp.path().join("second.py"), source).unwrap();
+        std::fs::write(
+            tmp.path().join("source.ts"),
+            "structural_witness_unique(value);\n",
+        )
+        .unwrap();
+        let (cache, session, bloom) = components();
+        let (telemetry, _telemetry_dir) = telemetry();
+        let args = json!({"cwd": tmp.path(), "budget": 10000, "queries": [
+            {"pattern": "structural_witness_unique($A)", "language": "python"},
+            {"pattern": "structural_witness_unique($A)", "language": "python"},
+            {"pattern": "structural_witness_unique($A)", "language": "typescript"}
+        ]});
+        let before = crate::search::compilation_count();
+        for request in 1..=2 {
+            let response =
+                tool_search_v2(&args, &cache, &session, &bloom, &telemetry, "test", "test")
+                    .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["results"][0]["items"].as_array().unwrap().len(), 2);
+            assert_eq!(response["results"][0], response["results"][1]);
+            assert_eq!(response["results"][2]["items"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                witness.count(),
+                2,
+                "candidate files parse once across requests"
+            );
+            assert_eq!(crate::search::compilation_count() - before, request * 2);
+        }
+        let retained = cache.get_or_parse(&first).unwrap();
+        let again = cache.get_or_parse(&first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retained, &again));
     }
 
     #[test]
