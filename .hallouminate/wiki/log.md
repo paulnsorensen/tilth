@@ -26,4 +26,5 @@
 
 
 2026-09-29 · a795796f35aea5f2 · merged · local-gate-gotchas.md · Record LF/CRLF/CR lexer invariants and byte-identity ownership for same-line declarations. Exact and both natural retrieval probes rank first.
+2026-09-29 · e31a01c7fa98829a · merged · adr/tilth-search-v2-roadmap-001.md; adr/tilth-search-v2-roadmap-006.md; edit-anchor-design.md; usage-analytics-2026-07.md · Record public-only MCP diff retirement, retained internal edit behavior, and calibrated diff follow-up counts. Exact and natural retrieval probes pass.
 
