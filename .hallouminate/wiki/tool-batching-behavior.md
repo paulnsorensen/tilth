@@ -114,7 +114,7 @@ Native also incurs eight Glob timeouts; WOZCODE makes eight unavailable short-na
 Neither MCP arm successfully falls back to native file tools.
 Keep these recovery costs in the results; do not infer an exact server latency from trace emission times.
 
-[^sept-luna]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md
-[^sept-batch]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md
+[^sept-luna]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md
+[^sept-batch]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md
 
-_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

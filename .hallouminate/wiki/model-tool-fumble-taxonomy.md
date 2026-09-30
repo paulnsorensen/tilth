@@ -107,6 +107,6 @@ Preserve receiver/glob scope, genuine regex behavior, diagnostics, ordered resul
 Do not add caller-selected routing or remove [continuation contracts](adr/tilth-search-v2-roadmap-006.md) incidentally.
 Test genuine misses, ambiguity, and incomplete scans alongside pasted signatures.
 
-[^sept-search]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615 at 18b7534eecde023cb4a70e5d13d7de29178073de
+[^sept-search]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615 at 18b7534eecde023cb4a70e5d13d7de29178073de
 
-_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

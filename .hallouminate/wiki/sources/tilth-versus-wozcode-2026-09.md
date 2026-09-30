@@ -1,8 +1,8 @@
 # Tool Efficiency Report: tilth versus WOZCODE
 
 Paul Sorensen's repository benchmark report, dated 2026-09-28 and ingested 2026-09-29, identifies four candidates for controlled efficiency tests.
-Canonical source: [Tool Efficiency Report: tilth versus WOZCODE](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md).
-The source commit is `1406d0dfb36aff01dc47d325ec2d7bee1acbceec`.
+Canonical source: [Tool Efficiency Report: tilth versus WOZCODE](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md).
+The source commit is `2b17c3755589a4e89eccaf89c3309ea9591aaa82`.
 PR #278 now holds curated wiki knowledge. The benchmark implementation has a separate review unit.
 Original reports and evidence remain available at this immutable commit, not the changing PR branch.
 
@@ -55,32 +55,32 @@ The efficiency report's evidence extends existing wiki topics rather than replac
 
 The archived plans describe earlier states. Final corrected results supersede their progress statements.[^archive]
 
-- [Selection: Luna edit-only batching](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-curated-selection.md)
-- [Corrected Luna small-task results](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md)
-- [Luna larger-task plan](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-plan.md)
-- [Invalid larger-task attempt](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md)
-- [Corrected larger-task results](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md)
-- [Patched read-budget results](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/read-budget-benchmark-results.md)
-- [Sonnet three-way plan](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-three-way-plan.md)
-- [Stopped asymmetric Sonnet run](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-hybrid-stopped-results.md)
-- [Strict Sonnet plan](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-plan.md)
-- [Authentication-invalid strict run](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-auth-failure.md)
-- [Final strict results](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md)
-- [Strict tool-usage analysis](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md)
+- [Selection: Luna edit-only batching](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-curated-selection.md)
+- [Corrected Luna small-task results](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md)
+- [Luna larger-task plan](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-plan.md)
+- [Invalid larger-task attempt](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md)
+- [Corrected larger-task results](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md)
+- [Patched read-budget results](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/read-budget-benchmark-results.md)
+- [Sonnet three-way plan](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-three-way-plan.md)
+- [Stopped asymmetric Sonnet run](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-hybrid-stopped-results.md)
+- [Strict Sonnet plan](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-plan.md)
+- [Authentication-invalid strict run](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-auth-failure.md)
+- [Final strict results](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md)
+- [Strict tool-usage analysis](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-tool-analysis.md)
 
 ## Evidence coverage and limits
 
 The immutable archive includes the recommendation, twelve supporting reports, SQL, query outputs, summary JSON, a hash manifest, and search reproduction.[^archive]
-[All 15 scored cells](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/strict-cell-metrics.json) preserve null timeout metrics.
-The [SHA-256 manifest](https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/manifest.json) records copied artifact identities.
+[All 15 scored cells](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/strict-cell-metrics.json) preserve null timeout metrics.
+The [SHA-256 manifest](https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/manifest.json) records copied artifact identities.
 Thirteen evidence files gain a final newline; report copies preserve their original bytes.
 The archive excludes the session database, full raw streams, raw payload extracts, runtime logs, credentials, plugins, environments, and binaries.
 SQL and published outputs do not reconstruct those missing raw sessions.
 Historical local paths identify provenance only. They do not promise downloadable files.
 This ingest starts no paid inference and implements none of the proposed optimizations.
 
-[^report]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md
-[^results]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
-[^archive]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/README.md
+[^report]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md
+[^results]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
+[^archive]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/README.md
 
-_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: mutable branch links for this report set_
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: mutable branch links for this report set_

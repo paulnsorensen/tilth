@@ -140,7 +140,7 @@ It does not implement them or establish their causal effect.
 Do not transfer the August fixed-prefix attribution to this September task.
 For Luna's different model and hybrid harness, see [batching observations](tool-batching-behavior.md).
 
-[^sept-cost]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
-[^sept-overhead]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/09_usage.json; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/10_payload_summary.json
+[^sept-cost]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-results.md
+[^sept-overhead]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/09_usage.json; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/10_payload_summary.json
 
-_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

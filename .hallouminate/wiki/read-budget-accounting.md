@@ -156,6 +156,6 @@ Corrections and retries remain included.
 Old and patched binaries are not interleaved; fixed arm order, shared caches, and model variation prevent causal speed claims.
 The reader already uses Rayon; this evidence does not establish serial file reads as the bottleneck.
 
-[^sept-read]: https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/read-budget-benchmark-results.md; https://github.com/paulnsorensen/tilth/blob/1406d0dfb36aff01dc47d325ec2d7bee1acbceec/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; src/mcp/tools/read.rs:149-163,231-240 at 18b7534eecde023cb4a70e5d13d7de29178073de
+[^sept-read]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/read-budget-benchmark-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; src/mcp/tools/read.rs:149-163,231-240 at 18b7534eecde023cb4a70e5d13d7de29178073de
 
-_Source: PR #278 at 1406d0dfb36aff01dc47d325ec2d7bee1acbceec · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
