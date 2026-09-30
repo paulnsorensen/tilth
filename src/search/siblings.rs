@@ -76,7 +76,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
             // For Python: verify @obj == "self"
             if lang == Lang::Python {
                 if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures.iter().any(|c| {
+                    let obj_ok = m.captures().iter().any(|c| {
                         c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "self")
                     });
                     if !obj_ok {
@@ -88,7 +88,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
             // For Scala: verify @obj == "this"
             if lang == Lang::Scala {
                 if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures.iter().any(|c| {
+                    let obj_ok = m.captures().iter().any(|c| {
                         c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "this")
                     });
                     if !obj_ok {
@@ -100,7 +100,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
             // For Go: verify @recv matches the receiver parameter name
             if lang == Lang::Go {
                 if let (Some(ri), Some(ref recv_name)) = (recv_idx, &go_receiver) {
-                    let recv_ok = m.captures.iter().any(|c| {
+                    let recv_ok = m.captures().iter().any(|c| {
                         c.index == ri
                             && c.node
                                 .utf8_text(bytes)
@@ -115,7 +115,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
                 }
             }
 
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index != ref_idx {
                     continue;
                 }

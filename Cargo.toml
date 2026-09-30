@@ -39,7 +39,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Tree-sitter (AST outlines)
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 # Re-exported LanguageFn type for the per-language spec table (transitive via
 # every tree-sitter grammar; pinned directly so spec.rs can name the type).
 tree-sitter-language = "0.1"

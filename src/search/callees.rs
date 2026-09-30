@@ -67,7 +67,7 @@ pub fn extract_callee_names(
         let mut names: Vec<String> = Vec::new();
 
         while let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index != callee_idx {
                     continue;
                 }
