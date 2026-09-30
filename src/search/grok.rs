@@ -380,13 +380,13 @@ fn receiver_type(
         let mut cursor = tree_sitter::QueryCursor::new();
         let mut matches = cursor.matches(query, parsed.tree.root_node(), bytes);
         while let Some(m) = matches.next() {
-            let starts_here = m.captures.iter().any(|c| {
+            let starts_here = m.captures().iter().any(|c| {
                 c.index == method_idx && c.node.start_position().row as u32 + 1 == start_line
             });
             if !starts_here {
                 continue;
             }
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index == ty_idx {
                     return cap.node.utf8_text(bytes).ok().map(String::from);
                 }

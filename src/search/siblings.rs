@@ -76,7 +76,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
 
         while let Some(m) = matches.next() {
             if let (Some(expected), Some(object_index)) = (expected_object, obj_idx) {
-                let object_matches = m.captures.iter().any(|capture| {
+                let object_matches = m.captures().iter().any(|capture| {
                     capture.index == object_index
                         && capture
                             .node
@@ -93,7 +93,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
                 else {
                     continue;
                 };
-                let receiver_matches = m.captures.iter().any(|capture| {
+                let receiver_matches = m.captures().iter().any(|capture| {
                     capture.index == receiver_index
                         && capture
                             .node
@@ -105,7 +105,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
                 }
             }
 
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index != ref_idx {
                     continue;
                 }
