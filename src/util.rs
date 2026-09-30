@@ -1,7 +1,125 @@
-//! Shared utilities used by both `edit` and `install`.
+//! Shared utilities: atomic file writes, and the `FileRevision` disk
+//! freshness signature used by the outline/parse caches and the deps index.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A cheap disk revision. Unix identity detects replacement and restored mtimes.
+/// Coarse or unreliable filesystem change times cannot prove snapshot consistency.
+/// Other platforms verify content because mtime and length alone are insufficient.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct FileRevision {
+    mtime_nanos: i128,
+    len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ctime_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_hash: Option<u64>,
+}
+
+fn system_time_nanos(mtime: std::time::SystemTime) -> i128 {
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+impl FileRevision {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Self::from_metadata(path, &meta)
+    }
+
+    /// True when `path`'s current on-disk revision still matches `self`.
+    pub(crate) fn is_current(&self, path: &Path) -> bool {
+        Self::of(path).as_ref() == Some(self)
+    }
+
+    pub(crate) fn from_metadata(_path: &Path, meta: &std::fs::Metadata) -> Option<Self> {
+        let mtime_nanos = system_time_nanos(meta.modified().ok()?);
+        #[cfg(unix)]
+        let (dev, ino, ctime_nanos, content_hash) = {
+            use std::os::unix::fs::MetadataExt;
+            let ctime_nanos =
+                i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec());
+            (Some(meta.dev()), Some(meta.ino()), Some(ctime_nanos), None)
+        };
+        #[cfg(not(unix))]
+        let (dev, ino, ctime_nanos, content_hash) =
+            (None, None, None, Some(file_fingerprint(_path).ok()?));
+        Some(Self {
+            mtime_nanos,
+            len: meta.len(),
+            dev,
+            ino,
+            ctime_nanos,
+            content_hash,
+        })
+    }
+}
+
+/// Fingerprint bytes already available to the caller, without another disk read.
+pub(crate) fn content_fingerprint(content: &[u8]) -> u64 {
+    twox_hash::XxHash3_64::oneshot(content)
+}
+
+/// Stream fallback verification with bounded allocation.
+/// Non-Unix warm hits still read the file because metadata alone is insufficient.
+#[cfg(any(not(unix), test))]
+fn file_fingerprint(path: &Path) -> std::io::Result<u64> {
+    use std::hash::Hasher as _;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = twox_hash::XxHash3_64::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(hasher.finish());
+        }
+        hasher.write(&buffer[..count]);
+    }
+}
+
+/// Restore `path`'s mtime to `mtime` without touching its content.
+#[cfg(test)]
+pub(crate) fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+}
+
+/// Run `write`, restore the file's mtime to `mtime`, and loop until the
+/// file's revision actually changes. Coarse or cached filesystem change
+/// times can otherwise leave a just-written file looking unchanged, which
+/// would make a freshness test pass without exercising staleness.
+#[cfg(test)]
+pub(crate) fn rewrite_with_restored_mtime(
+    path: &Path,
+    mtime: std::time::SystemTime,
+    mut write: impl FnMut(),
+) {
+    let before = FileRevision::of(path);
+    for _ in 0..200 {
+        write();
+        set_mtime(path, mtime);
+        if FileRevision::of(path) != before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("revision did not change after rewrite with restored mtime at {path:?}");
+}
 
 /// Write `bytes` to `path` atomically: write to a same-directory temp file,
 /// preserve the original file's permissions, then persist it at `path`.
@@ -76,6 +194,31 @@ pub(crate) fn atomic_create_bytes_no_replace(path: &Path, bytes: &[u8]) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_nanos_preserves_epoch_and_fractional_pre_epoch_times() {
+        use std::time::{Duration, SystemTime};
+
+        assert_eq!(system_time_nanos(SystemTime::UNIX_EPOCH), 0);
+        let before_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(1, 500_000_000))
+            .expect("1968 timestamp is representable");
+        assert_eq!(system_time_nanos(before_epoch), -1_500_000_000);
+    }
+
+    #[test]
+    fn freshness_streamed_fingerprint_matches_supplied_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        for size in [0, 8191, 8192, 8193, 500_001] {
+            let bytes = vec![b'x'; size];
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                file_fingerprint(&path).unwrap(),
+                content_fingerprint(&bytes)
+            );
+        }
+    }
 
     /// The destination must never appear unless it appears complete. A create
     /// that fails has to leave nothing behind, or the agent's retry hits

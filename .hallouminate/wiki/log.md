@@ -33,3 +33,8 @@
 
 2026-09-30 · 9c12cd46ebe199e5 · merged · local-gate-gotchas.md; index.md · Link the policy registry and update the moved JavaScript resolver citation.
 
+2026-09-30 · bae2d01722b96182 · merged · adr/tilth-search-v2-roadmap-003.md · Record signed pre-epoch file revisions and verified cache regressions.
+
+
+2026-09-30 · 4dc44c4cc26672e18 · merged · language-policy-registry.md · Refresh the lexer citation after the cache-freshness merge. Policy behavior stays unchanged. Exact and natural retrieval probes pass.
+

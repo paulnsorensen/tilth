@@ -57,7 +57,7 @@ Policy changes do not authorize new parsers, languages, or filename aliases.
 [^1]: `src/types.rs:20-44`; `tests/bdd/features/languages.feature:1-69`.
 [^2]: `src/lang/spec.rs:122-260,388-412`; per-language SPEC records.
 [^3]: `src/lang/spec.rs:333-386`; `src/lang/cpp.rs:6-36`; `src/lang/go.rs:67-109`.
-[^4]: `src/index/bloom.rs:159-181`.
+[^4]: `src/index/bloom.rs:180-203` (`IdentifierIter::new` after the main cache-freshness merge).
 [^5]: `src/read/imports.rs:23-68`; `src/read/imports/python_scope.rs:281-299`.
 [^6]: `src/lang/mod.rs:76-118`.
 [^7]: `src/lang/javascript.rs:35-42`; `src/search/mod.rs` source-priority and basename characterization tests.

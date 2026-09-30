@@ -763,6 +763,9 @@ pub fn grok(
     caps: GrokCaps,
 ) -> Result<GrokResult, TilthError> {
     let (target, content, lang) = resolve_with_source(target_spec, scope)?;
+    // Captured immediately after the read above, so the revision reflects
+    // the bytes in `content` as closely as a follow-up stat can.
+    let target_revision = crate::util::FileRevision::of(&target.path);
     let entries = get_outline_entries(&content, lang);
     let target_span_start = target.span_start_line;
 
@@ -857,16 +860,22 @@ pub fn grok(
     // Slice the body only once the fallible work above has succeeded: the
     // slice claims the session's dedup slot for this target, and a claim made
     // before a `?` would mark a body that the caller never received.
-    let body = body_with_dedup(&target, &content, session, caps.max_body_lines);
+    let body = body_with_dedup(
+        &target,
+        &content,
+        session,
+        caps.max_body_lines,
+        target_revision.as_ref(),
+    );
 
     // Record this expansion so a same-session repeat-grok of the same target
     // degrades to a preview rather than re-inlining the full body. Bodies at
     // or below the degrade threshold never reach the claim inside
     // `body_with_dedup`, so this is what marks them for `tilth_search`'s own
-    // dedup. Silently skipped on metadata failure — the next call will just
-    // re-inline normally.
-    if let Ok(mtime) = std::fs::metadata(&target.path).and_then(|md| md.modified()) {
-        session.record_expand(&target.path, target.start_line, mtime);
+    // dedup. Silently skipped when the revision above could not be built —
+    // the next call will just re-inline normally.
+    if let Some(revision) = &target_revision {
+        session.record_expand(&target.path, target.start_line, revision.clone());
     }
 
     // --- Thin-wrapper auto-expansion --------------------------------------
@@ -887,6 +896,14 @@ pub fn grok(
         // degenerate/unresolved target (line numbers are 1-based; 0 means
         // unresolved), mirroring `slice_body`.
         lone_internal_callee.as_ref().and_then(|callee| {
+            // Stat the callee before reading it, mirroring the target's
+            // capture above; reuse the target's revision when they are the
+            // same file to avoid a redundant stat.
+            let callee_revision = if callee.file == target.path {
+                target_revision.clone()
+            } else {
+                crate::util::FileRevision::of(&callee.file)
+            };
             let callee_content = read_delegate_content(
                 &callee.file,
                 &target.path,
@@ -906,11 +923,17 @@ pub fn grok(
                     doc: None,
                     other_def_count: 0,
                 };
-                let sliced = body_with_dedup(&callee_target, &cc, session, caps.max_body_lines);
+                let sliced = body_with_dedup(
+                    &callee_target,
+                    &cc,
+                    session,
+                    caps.max_body_lines,
+                    callee_revision.as_ref(),
+                );
                 // Record the callee expansion so repeat-grok of the callee
                 // degrades correctly (same protocol as the target recording above).
-                if let Ok(mtime) = std::fs::metadata(&callee.file).and_then(|md| md.modified()) {
-                    session.record_expand(&callee.file, callee.start_line, mtime);
+                if let Some(revision) = &callee_revision {
+                    session.record_expand(&callee.file, callee.start_line, revision.clone());
                 }
                 (callee.clone(), sliced)
             })
@@ -958,6 +981,7 @@ fn body_with_dedup(
     content: &str,
     session: &crate::session::Session,
     max_body_lines: usize,
+    revision: Option<&crate::util::FileRevision>,
 ) -> String {
     let full = slice_body(
         content,
@@ -969,13 +993,10 @@ fn body_with_dedup(
     if line_count <= BODY_DEGRADE_THRESHOLD {
         return full;
     }
-    let Some(current_mtime) = std::fs::metadata(&target.path)
-        .ok()
-        .and_then(|md| md.modified().ok())
-    else {
+    let Some(revision) = revision else {
         return full;
     };
-    if !session.claim_expand(&target.path, target.start_line, current_mtime) {
+    if !session.claim_expand(&target.path, target.start_line, revision) {
         return full;
     }
     let mut preview = String::new();
