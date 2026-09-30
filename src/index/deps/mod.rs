@@ -194,6 +194,9 @@ fn rescan_shard(
     }
     let content = std::fs::read_to_string(&abs).ok()?;
     let fields = resolved_shard_fields(&abs, &content, worktree, roots);
+    if storage::signature_of(&abs).as_ref() != Some(&signature) {
+        return None;
+    }
     Some((rel.to_string(), fields.into_shard(signature)))
 }
 
@@ -398,6 +401,10 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         } else {
             ShardFields::empty()
         };
+        if storage::signature_of(path).as_ref() != Some(&signature) {
+            failed = true;
+            continue;
+        }
         upserts.push((rel, fields.into_shard(signature)));
     }
 
@@ -585,6 +592,10 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
             failed = true;
             false
         };
+        if storage::signature_of(&candidate_abs).as_ref() != Some(&live_signature) {
+            failed = true;
+            continue;
+        }
         if verified {
             dependents.push(candidate_abs);
         }
@@ -609,6 +620,125 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn freshness_deps_preserved_mtime_and_selective_rebuild() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        for name in ["alpha", "bravo"] {
+            std::fs::write(repo.path().join(format!("{name}.rs")), "pub fn f() {}\n").unwrap();
+        }
+        let source = repo.path().join("dep.rs");
+        std::fs::write(&source, "use self::alpha;\n").unwrap();
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let handles = DepsIndexHandles::new();
+        let handle = handles.open(repo.path(), "client").unwrap();
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            3
+        );
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            0
+        );
+        std::fs::write(&source, "use self::bravo;\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert!(impact(&handle, Path::new("alpha.rs"), far_deadline())
+            .dependents
+            .is_empty());
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            1
+        );
+        assert_eq!(
+            impact(&handle, Path::new("bravo.rs"), far_deadline())
+                .dependents
+                .len(),
+            1
+        );
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            0
+        );
+
+        for (remove_first, target, obsolete) in [
+            (false, "alpha.rs", "bravo.rs"),
+            (true, "bravo.rs", "alpha.rs"),
+        ] {
+            if remove_first {
+                std::fs::remove_file(&source).unwrap();
+            }
+            let content = format!("use self::{};\n", target.trim_end_matches(".rs"));
+            crate::util::atomic_write_bytes(&source, content.as_bytes()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(mtime))
+                .unwrap();
+            assert!(impact(&handle, Path::new(obsolete), far_deadline())
+                .dependents
+                .is_empty());
+            assert_eq!(
+                reconcile(&handle, repo.path(), far_deadline()).files_changed,
+                1
+            );
+            assert_eq!(
+                impact(&handle, Path::new(target), far_deadline()).dependents,
+                vec![source.canonicalize().unwrap()]
+            );
+        }
+        let moved = repo.path().join("moved.rs");
+        std::fs::rename(&source, &moved).unwrap();
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            2
+        );
+        assert_eq!(
+            impact(&handle, Path::new("bravo.rs"), far_deadline()).dependents,
+            vec![moved.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn freshness_legacy_signature_forces_refresh() {
+        let repo = init_git_repo();
+        let path = repo.path().join("source.rs");
+        std::fs::write(&path, "fn alpha() {}").unwrap();
+        let current = storage::signature_of(&path).unwrap();
+        let legacy: storage::FileSignature = serde_json::from_value(serde_json::json!({
+            "mtime_nanos": current.mtime_nanos, "len": current.len
+        }))
+        .unwrap();
+        assert_ne!(legacy, current);
+        let handles = DepsIndexHandles::new();
+        let handle = handles.open(repo.path(), "legacy-test").unwrap();
+        storage::apply_reconcile(
+            &handle.db,
+            &storage::ReconcileWrite {
+                upserts: vec![(
+                    "source.rs".to_string(),
+                    ShardFields::empty().into_shard(legacy),
+                )],
+                deletes: Vec::new(),
+                pending_rescan: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            1
+        );
+        assert_eq!(
+            reconcile(&handle, repo.path(), far_deadline()).files_changed,
+            0
+        );
+    }
 
     fn init_git_repo() -> TempDir {
         let dir = tempfile::tempdir().unwrap();

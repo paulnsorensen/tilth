@@ -3,6 +3,91 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A cheap disk revision. Unix identity detects replacement and restored mtimes.
+/// Coarse or unreliable filesystem change times cannot prove snapshot consistency.
+/// Other platforms verify content because mtime and length alone are insufficient.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct FileRevision {
+    pub(crate) mtime_nanos: i128,
+    pub(crate) len: u64,
+    #[serde(default)]
+    identity: Option<[i128; 4]>,
+    #[serde(default)]
+    content_hash: Option<u64>,
+}
+
+fn system_time_nanos(mtime: std::time::SystemTime) -> i128 {
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+impl FileRevision {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Self::from_metadata(path, &meta)
+    }
+
+    pub(crate) fn matches_mtime(&self, mtime: std::time::SystemTime) -> bool {
+        system_time_nanos(mtime) == self.mtime_nanos
+    }
+
+    pub(crate) fn from_metadata(_path: &Path, meta: &std::fs::Metadata) -> Option<Self> {
+        let mtime_nanos = system_time_nanos(meta.modified().ok()?);
+        #[cfg(unix)]
+        let (identity, content_hash) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                Some([
+                    i128::from(meta.dev()),
+                    i128::from(meta.ino()),
+                    i128::from(meta.ctime()),
+                    i128::from(meta.ctime_nsec()),
+                ]),
+                None,
+            )
+        };
+        #[cfg(not(unix))]
+        let (identity, content_hash) = (None, Some(file_fingerprint(_path).ok()?));
+        Some(Self {
+            mtime_nanos,
+            len: meta.len(),
+            identity,
+            content_hash,
+        })
+    }
+}
+
+/// Fingerprint bytes already available to the caller, without another disk read.
+pub(crate) fn content_fingerprint(content: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(content);
+    hasher.finish()
+}
+
+/// Stream fallback verification with bounded allocation.
+/// Non-Unix warm hits still read the file because metadata alone is insufficient.
+#[cfg(any(not(unix), test))]
+fn file_fingerprint(path: &Path) -> std::io::Result<u64> {
+    use std::hash::{DefaultHasher, Hasher};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(hasher.finish());
+        }
+        hasher.write(&buffer[..count]);
+    }
+}
+
 /// Write `bytes` to `path` atomically: write to a same-directory temp file,
 /// preserve the original file's permissions, then persist it at `path`.
 /// A crash mid-write leaves the original intact.
@@ -76,6 +161,31 @@ pub(crate) fn atomic_create_bytes_no_replace(path: &Path, bytes: &[u8]) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_nanos_preserves_epoch_and_fractional_pre_epoch_times() {
+        use std::time::{Duration, SystemTime};
+
+        assert_eq!(system_time_nanos(SystemTime::UNIX_EPOCH), 0);
+        let before_epoch = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(1, 500_000_000))
+            .expect("1968 timestamp is representable");
+        assert_eq!(system_time_nanos(before_epoch), -1_500_000_000);
+    }
+
+    #[test]
+    fn freshness_streamed_fingerprint_matches_supplied_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        for size in [0, 8191, 8192, 8193, 500_001] {
+            let bytes = vec![b'x'; size];
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                file_fingerprint(&path).unwrap(),
+                content_fingerprint(&bytes)
+            );
+        }
+    }
 
     /// The destination must never appear unless it appears complete. A create
     /// that fails has to leave nothing behind, or the agent's retry hits

@@ -1356,11 +1356,8 @@ fn basename_file_outline(
     // Read file and generate outline
     let content = std::fs::read_to_string(&matched_path).ok()?;
     let file_type = crate::lang::detect_file_type(&matched_path);
-    let mtime = std::fs::metadata(&matched_path)
-        .and_then(|m| m.modified())
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    let outline = cache.get_or_compute(&matched_path, mtime, || {
+    let outline = cache.get_or_compute(&matched_path, content.as_bytes(), false, || {
         crate::read::outline::generate(
             &matched_path,
             file_type,
@@ -1745,11 +1742,10 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     if meta.len() > 500_000 {
         return None;
     }
-    Some(cache.get_or_compute(path, mtime, || {
+    Some(cache.get_or_compute_disk(path, false, || {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let buf = content.as_bytes();
         read::outline::generate(path, file_type, &content, buf, false)

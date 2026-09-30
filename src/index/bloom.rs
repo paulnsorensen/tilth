@@ -30,13 +30,15 @@ use crate::types::{FileType, Lang};
 const MAX_BLOOM_ENTRIES: usize = 2000;
 
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
-/// by mtime. Stale entries are automatically rebuilt on access.
+/// by supplied content. Stale entries are rebuilt on access.
 ///
 /// `clru::CLruCache` is not thread-safe (unlike the `DashMap` this replaces),
 /// so it is wrapped in a `Mutex` while keeping the external `&self` API
 /// unchanged.
 pub struct BloomFilterCache {
-    filters: Mutex<CLruCache<PathBuf, (BloomFilter, SystemTime)>>,
+    filters: Mutex<CLruCache<PathBuf, (BloomFilter, u64)>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for BloomFilterCache {
@@ -53,39 +55,45 @@ impl BloomFilterCache {
             filters: Mutex::new(CLruCache::new(
                 NonZeroUsize::new(MAX_BLOOM_ENTRIES).unwrap(),
             )),
+            #[cfg(test)]
+            builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Check if `symbol` might appear in the file at `path`.
     ///
-    /// - If a cached filter exists with matching `mtime`, queries it directly.
+    /// - If a cached filter matches the supplied bytes, queries it directly.
     /// - Otherwise, builds a new filter from `content`, caches it, then queries.
     ///
     /// Returns `true` if the symbol MIGHT be in the file (possible false positive),
     /// `false` if it is DEFINITELY absent.
     #[must_use]
-    pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
+    pub fn contains(&self, path: &Path, _mtime: SystemTime, content: &str, symbol: &str) -> bool {
+        let fingerprint = crate::util::content_fingerprint(content.as_bytes());
         // Fast path: check existing cached entry
         {
             let mut filters = self
                 .filters
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((filter, cached_mtime)) = filters.get(path) {
-                if *cached_mtime == mtime {
+            if let Some((filter, cached_fingerprint)) = filters.get(path) {
+                if *cached_fingerprint == fingerprint {
                     return filter.contains(symbol);
                 }
             }
         }
 
         // Cache miss or stale: build and cache a new filter
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let filter = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
         let mut filters = self
             .filters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        filters.put(path.to_path_buf(), (filter, mtime));
+        filters.put(path.to_path_buf(), (filter, fingerprint));
         result
     }
 }
@@ -323,6 +331,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn freshness_bloom_uses_supplied_content() {
+        let cache = BloomFilterCache::new();
+        let path = Path::new("source.rs");
+        let mtime = SystemTime::UNIX_EPOCH;
+        assert!(!cache.contains(path, mtime, "            ", "fresh_symbol"));
+        assert!(cache.contains(path, mtime, "fresh_symbol", "fresh_symbol"));
+        assert!(cache.contains(path, mtime, "fresh_symbol", "fresh_symbol"));
+        assert_eq!(cache.builds.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn test_basic_membership() {
         let mut bf = BloomFilter::with_false_pos(0.01).expected_items(100);
         bf.insert("foo");
@@ -484,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_mtime_invalidation() {
+    fn test_cache_content_invalidation_with_preserved_or_changed_mtime() {
         let cache = BloomFilterCache::new();
         let path = Path::new("/tmp/test_bloom.rs");
 
@@ -498,13 +517,15 @@ mod tests {
         assert!(cache.contains(path, mtime_old, old_content, "old_function"));
         assert!(!cache.contains(path, mtime_old, old_content, "new_function"));
 
-        // Same mtime: should use cached filter (old content), even though
-        // we pass new content -- the cache trusts the mtime.
-        assert!(cache.contains(path, mtime_old, new_content, "old_function"));
+        // Supplied bytes take precedence over an unchanged timestamp.
+        assert!(cache.contains(path, mtime_old, new_content, "new_function"));
+        assert!(!cache.contains(path, mtime_old, new_content, "old_function"));
+        assert_eq!(cache.builds.load(std::sync::atomic::Ordering::Relaxed), 2);
 
-        // Different mtime: should rebuild from new content
+        // A timestamp-only change retains the filter for identical bytes.
         assert!(cache.contains(path, mtime_new, new_content, "new_function"));
         assert!(!cache.contains(path, mtime_new, new_content, "old_function"));
+        assert_eq!(cache.builds.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

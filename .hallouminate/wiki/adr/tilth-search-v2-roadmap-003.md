@@ -42,3 +42,38 @@ The concrete redb spike must cover atomic replacement, concurrent readers/serial
 ## Consequences
 
 Indexes are duplicated across harnesses and worktrees. This spends disk to preserve isolation and zero daemon operations. Removed/moved worktrees require bounded cache garbage collection. Search correctness remains independent of index availability.
+
+
+
+## Freshness implementation audit: 2026-09-29
+
+The roadmap's content-fingerprint wording is an intended design, not the initial implementation.
+Revision `7005d6ab912843456dec498266fc3644fbcd4ea4` stores only mtime and length.
+Reconciliation and impact verification trust matching signatures.
+Equal-length edits that restore mtime can therefore retain stale dependency edges.[^freshness-before]
+
+The authorized fix uses a per-file revision with richer Unix change metadata.
+It preserves cheap warm scans and selective shard replacement.
+Platforms without that metadata use a content fingerprint.
+Legacy signatures remain readable but cannot count as fresh revisions.[^freshness-fix]
+
+This approach does not establish a transactional repository snapshot.
+Filesystems with coarse or unreliable change metadata remain a stated limitation.
+Do not describe metadata equality as a universal proof of content equality.
+Compiled grammar/query caches do not depend on file contents and need no edit-triggered flush.[^freshness-limits]
+
+[^freshness-before]: https://github.com/paulnsorensen/tilth/blob/7005d6ab912843456dec498266fc3644fbcd4ea4/src/index/deps/storage.rs#L34-L70; https://github.com/paulnsorensen/tilth/blob/7005d6ab912843456dec498266fc3644fbcd4ea4/src/index/deps/mod.rs#L555-L590
+[^freshness-fix]: src/util.rs::FileRevision; src/index/deps/storage.rs::signature_of; src/index/deps/mod.rs::reconcile; implementation contract: /home/paul/.local/share/cheese/paulnsorensen-tilth/research/tilth-search-ripgrep-tree-sitter/cache-freshness-contract.md
+[^freshness-limits]: src/util.rs::FileRevision; src/search/callee_query.rs::with_callee_query; src/lang/treesitter.rs::with_query; https://doc.rust-lang.org/std/os/unix/fs/trait.MetadataExt.html
+
+
+
+File revisions represent modification times as signed nanoseconds, including pre-1970 timestamps.
+Revision creation and mtime comparison use the same conversion.
+Rejecting negative durations prevents valid source files from entering the parsed cache.
+Regression tests cover fractional pre-epoch times, warm reuse, and restored-mtime invalidation.[^pre-epoch]
+
+[^pre-epoch]: src/util.rs:19-37,165-174; src/cache.rs:236-269. Verified by `python3 scripts/verify.py` on 2026-09-30: 1208 library tests, 4 binary tests, 67 MCP tests, 6 script tests, and 77 bash-guard checks pass.
+
+_Source: cache-freshness publication review and signed-timestamp regression tests · Updated: 2026-09-30_
+
