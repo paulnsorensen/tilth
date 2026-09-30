@@ -62,3 +62,64 @@ binary's prompt surface is in question.**
 - `.cheese/notes/tilth-pr196-sonnet5-audit.md`
 - `.cheese/notes/tilth-sonnet5-cost-attribution.md`
 - PR #168 (paulnsorensen/tilth): harness + reporting fixes, commits `d4d41b5`, `f8a92c9`
+
+## September 2026 Codex isolation and trusted grading
+
+The September benchmark adds explicit Codex isolation and a forward-migration grader, documented in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md).[^sept-harness]
+These are properties of the extracted harness commit, not claims that every installed runner supports them.
+Codex scheduling rejects other providers and `tilth_forced` before inference.
+The runner disables discovered skills explicitly; `skip_host_skill_discovery` alone is insufficient in CLI 0.154.0.
+It disables skill search, plugins, hooks, apps, and delegation for the measured invocation.
+The tilth server is required. A missing successful MCP call or detected skill-access attempt invalidates the run.
+Codex lacks Claude's init inventory, so an empty `available_tools` field does not prove MCP absence.
+The tilth arm retains native tools and receives explicit MCP-first guidance.
+Invocation-only write approval enables `tilth_write`; it neither changes global settings nor confines MCP paths.
+
+The small Luna selection uses two test-graded Gin repairs and excludes read-only, single-file, history-only, and keyword-graded tasks.
+It excludes `express_diff_multi_mutation`: the supposedly harmless rename leaves an unresolved `app` reference.
+Passing mutation preflight alone does not establish a valid task specification.[^sept-selection]
+
+The larger `gin_edit_render_context` reference changes 20 files across 90 edit sites: 14 production files and six original test files.
+It migrates 17 renderers, request-context dispatch, nil-request behavior, cancellation-before-side-effects, and private SSE adaptation.
+Cancellation of blocking IO after entry is outside the task contract.
+The grader copies candidate source into a clean pinned fixture, restores original assertions, and injects held-out tests after inference.
+It accepts new local helpers and tests, then checks the candidate suite separately.
+Both default and `nomsgpack` grades run full render/binding suites, selected root regressions, and all-package compilation.
+Preflight accepts the reference and rejects incomplete migration, omitted cancellation, premature headers, lost dispatch, and weakened assertions.
+The first grader misses `binding/json_test.go:59`; that setup attempt stays excluded.
+Unrelated network tests stay outside grading because the pinned Unix-socket readiness test races.
+An explicit writable temporary `GOCACHE` prevents unrelated global-cache failures.[^sept-large]
+
+## September 2026 strict arms and invalid attempts
+
+The strict Sonnet benchmark matches tool restrictions, not operating-system confinement.[^sept-strict]
+Native retains file tools. Each MCP arm uses only its own file tools and Bash.
+All arms share a fail-closed Go test/build/vet/formatting guard, with no delegation.
+WOZCODE hooks remain active. Explicit `plugin_woz_code` registration is necessary under `--strict-mcp-config`.
+Verify tool inventory and a successful edit before scored inference.
+Fresh per-cell Claude configuration copies authentication only and preserves refreshed credentials between cells.
+Without an explicit seed, legacy Claude authentication keeps its original path.
+Require successful completion and `is_error: false` before grading.
+
+| Excluded attempt | Reason | Disposition |
+|---|---|---|
+| Luna `20260928_152154` | Grader rejects a valid binding caller migration | Preserve timeout and interrupted trace; fix grader before a fresh schedule |
+| Sonnet `20260928_191916` | Tilth uses 47 native edits while WOZCODE has different restrictions | Preserve stopped outcomes; restart all arms under strict tools |
+| Sonnet `20260928_201559` | One pass followed by 14 revoked-token errors | Authentication-invalid, not task failures; restart all 15 cells |
+
+The valid strict retry is `20260928_202801`.
+Its wrapper checks credential lifetime and stops on authentication failure.
+Do not copy an interactive access token and assume it survives an unattended schedule.
+Keep credentials out of reports and logs.
+Historical test results are evidence for their original tree, not substitutes for testing an extracted branch.
+
+When rebasing this wiki-only PR after #280, retain the benchmark tree from `main`.
+The split commit removes earlier benchmark files, not #280's replacement.
+Retarget report links to the rebased archive commit, which remains in the PR history.
+
+[^sept-harness]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/run.py
+[^sept-selection]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-curated-selection.md
+[^sept-large]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md
+[^sept-strict]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-plan.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-auth-failure.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-hybrid-stopped-results.md
+
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
