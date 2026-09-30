@@ -88,3 +88,25 @@ tilth-specific.
 - [Edit-anchor design](edit-anchor-design.md)
 - [MCP cost model: why tilth costs more per correct answer](mcp-cost-model-sonnet5.md)
 - Fix commit `9b17e8e` (Go type_declaration name resolution)
+
+## Strict benchmark search failures beyond four explicit MCP errors
+
+Four explicit MCP errors do not capture the strict benchmark search failures: all five runs miss existing Go receiver signatures.
+The strict Sonnet search reproduction in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md) verifies false negatives beyond explicit MCP errors.[^sept-search]
+All five tilth runs submit `func (c *Context) Render` and receive regex `no_match`.
+The pinned Gin fixture contains that prefix at `context.go:1151`; escaped regex finds it.
+The frozen binary also misses `.Render(c.Writer)` while its escaped form finds the call.
+Of 97 query entries, 29 return `no_match`, including 24 regex misses.
+Not all misses are wrong: some queries deliberately check removed code.
+Four explicit MCP errors therefore understate measured search friction.
+
+The benchmarked router selects regex before declaration normalization.
+Its normalizer accepts a declaration keyword and identifier, not a Go receiver signature.
+Narrow declaration recognition or a labeled bounded literal alternative are proposals, not shipped fixes.
+Preserve receiver/glob scope, genuine regex behavior, diagnostics, ordered results, and completeness.
+Do not add caller-selected routing or remove [continuation contracts](adr/tilth-search-v2-roadmap-006.md) incidentally.
+Test genuine misses, ambiguity, and incomplete scans alongside pasted signatures.
+
+[^sept-search]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/evidence/11_search_reproduction.jsonl; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode.md; src/mcp/tools/search_v2.rs:408-432,588-615 at 18b7534eecde023cb4a70e5d13d7de29178073de
+
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

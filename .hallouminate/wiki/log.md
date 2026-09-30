@@ -23,6 +23,8 @@
 
 2026-09-29 · 7cdf8b86dc022eb29 · merged · local-gate-gotchas.md · Record exact cold/warm caller sets, dependency paths, bare C++ identity, and retained private lexer invariants. Keep JavaScript import-only reverse scanning out of scope. Exact and both natural probes rank first.
 
+2026-09-28 · f436574c8bddc064 · merged · benchmark-harness-gotchas.md · Record Codex-only scheduling, MCP isolation, and availability evidence limits.
+
 
 
 2026-09-29 · a795796f35aea5f2 · merged · local-gate-gotchas.md · Record LF/CRLF/CR lexer invariants and byte-identity ownership for same-line declarations. Exact and both natural retrieval probes rank first.
@@ -37,4 +39,22 @@
 
 
 2026-09-30 · 4dc44c4cc26672e18 · merged · language-policy-registry.md · Refresh the lexer citation after the cache-freshness merge. Policy behavior stays unchanged. Exact and natural retrieval probes pass.
+
+2026-09-29 · 3e3f7cedf0c89034 · merged · benchmark-harness-gotchas.md · Ingest September benchmark findings with immutable report citations.
+
+2026-09-29 · 3e3f7cedf0c89034 · merged · mcp-cost-model-sonnet5.md · Ingest September benchmark findings with immutable report citations.
+
+2026-09-29 · 3e3f7cedf0c89034 · merged · tool-batching-behavior.md · Ingest September benchmark findings with immutable report citations.
+
+2026-09-29 · 3e3f7cedf0c89034 · merged · model-tool-fumble-taxonomy.md · Ingest September benchmark findings with immutable report citations.
+
+2026-09-29 · 3e3f7cedf0c89034 · merged · read-budget-accounting.md · Ingest September benchmark findings with immutable report citations.
+
+2026-09-29 · 3e3f7cedf0c89034 · new-page · sources/tilth-versus-wozcode-2026-09.md · Preserve the report inventory, proposals, caveats, and source commit.
+
+2026-09-29 · 3e3f7cedf0c89034 · retrieval-warning · tool-batching-behavior.md · User waives the exact-query rank-one rule. “Tool-call batching” returns this page second behind adr/tilth-read-input-ergonomics.md; all other 17 frozen probes pass.
+
+
+
+2026-09-29 · 30c6e8e245716112 · merged · local-gate-gotchas.md · Record the PR #280 fingerprint language-count tie and deterministic Rust fixture. All three frozen retrieval probes return this page first.
 

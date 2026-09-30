@@ -1,4 +1,4 @@
-# Local gate gotchas (macOS)
+# Local gate gotchas
 
 Use the current CI workflow for local gate commands.
 The August 2026 failure baseline below no longer defines the required checks.[^1]
@@ -120,6 +120,20 @@ JavaScript source-extension fallback does not add import-only reverse scanning; 
 
 [^15]: `src/mcp/tools/search_v2.rs:506-519`; assertion-preserving migration review for PR #283.
 
+## Fingerprint language ties after benchmark additions
+
+The fingerprint CI test can fail when benchmark files tie the checkout's sampled language counts.
+At PR #280 revision `50300a2`, the depth-two sample contains 84 Rust files and 84 Python files.
+The fingerprint chooses a maximum from a `HashMap`, so either language can win that tie.
+The live-checkout test requires Rust and fails three of five isolated reruns.[^19]
+
+Use a temporary Rust project for the language assertion instead of the changing repository.
+The replacement test keeps the manifest, project-name, nonempty-output, and token-budget checks.
+It passes 20 consecutive runs without changing runtime language selection.[^20]
+
+[^19]: [Failed PR #280 CI run](https://github.com/paulnsorensen/tilth/actions/runs/36541092921/job/109316414746); `src/overview.rs:35-46,259-354,819-838` at `50300a271a897e88426f5841b948d78639a90e52`. Local reproduction on 2026-09-29 uses five isolated executions of `cargo test -q --lib overview::tests::test_fingerprint_on_tilth -- --exact --nocapture`.
+[^20]: [PR #280 fingerprint fixture correction](https://github.com/paulnsorensen/tilth/pull/280); `src/overview.rs::tests::test_fingerprint_detects_rust_project`. Local verification on 2026-09-29: 20/20 focused executions and all three overview tests pass.
+
 ## Historical baseline
 
 The August 2026 review of PR #144 reports a macOS batch-budget test failure.
@@ -136,4 +150,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, MCP acceptance harness code, and PR #283 language BDD scope and upstream regressions · Updated: 2026-09-30 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, and PR #283 language BDD scope and upstream regressions · Updated: 2026-09-30 · Supersedes: August 2026 local-gate baseline guidance._

@@ -8,6 +8,13 @@ under `.cheese/`.
 
 ## Topics
 
+The [September benchmark source](sources/tilth-versus-wozcode-2026-09.md) links the preserved reports and updated topic pages.
+The cost and batching glosses below summarize August measurements, not universal behavior.
+September results document instructed batching and workload-specific cost differences.
+
+_Source: PR #278 benchmark ingestion · Updated: 2026-09-29_
+
+
 - [Benchmark harness gotchas (Sonnet 5 investigation)](benchmark-harness-gotchas.md) — `--safe-mode` silently strips all MCP servers including `--mcp-config` ones (invalidated a full sonnet5 run); the PR #168 guards (available_tools/mcp_servers/model_usage recording, McpUnavailableError abort); pricing.yaml drift vs native billing; the stale `~/.local/bin/tilth` binary that made byte-size, not `--version`, the only trustworthy staleness check.
 
 - [Diff: git ref resolution and exit-code handling](diff-git-ref-resolution.md) — why the root commit needs git's empty-tree hash rather than `{hash}^..{hash}`, why `^!` looks right and is not (it degrades to a working-tree diff and breaks `overlay.rs`'s `..`-splitting), git diff's 0-or-1 success convention, and the three constraints on default-branch teaching hints.
