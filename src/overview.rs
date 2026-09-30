@@ -817,9 +817,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fingerprint_on_tilth() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let output = fingerprint(root);
+    fn test_fingerprint_detects_rust_project() {
+        let tmp = tempfile::tempdir().expect("temporary project should be created");
+        std::fs::create_dir(tmp.path().join("src")).expect("source directory should be created");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "tilth"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("manifest should be written");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn example() {}\n")
+            .expect("Rust source should be written");
+
+        let output = fingerprint(tmp.path());
 
         assert!(!output.is_empty(), "fingerprint should not be empty");
         assert!(
@@ -827,7 +840,10 @@ mod tests {
             "should detect Rust as primary language"
         );
         assert!(output.contains("Cargo.toml"), "should detect manifest");
-        assert!(output.contains("tilth"), "should find project name");
+        assert!(
+            output.contains("Cargo.toml (tilth"),
+            "should find project name in manifest summary"
+        );
 
         // Token budget: output should be compact
         let estimated_tokens = output.len() / 4;

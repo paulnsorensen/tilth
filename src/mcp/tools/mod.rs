@@ -1,17 +1,13 @@
 mod definitions;
 mod deps;
-mod diff;
 mod grok;
-mod list;
 mod read;
 mod search_v2;
 mod write;
 
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
-pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
-pub(super) use list::tool_list;
 pub(super) use read::tool_read;
 pub(super) use search_v2::tool_search_v2;
 pub(super) use write::tool_write;
@@ -104,13 +100,6 @@ pub(super) fn resolve_scope(args: &Value, cwd: &std::path::Path) -> Result<PathB
     std::fs::read_dir(&resolved).map_err(&access_error)?;
     std::fs::metadata(resolved.join(".")).map_err(access_error)?;
     Ok(resolved)
-}
-
-pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
-    match budget {
-        Some(b) => crate::budget::apply(output, b),
-        None => crate::budget::apply(output, crate::budget::DEFAULT_BUDGET),
-    }
 }
 
 #[cfg(test)]
@@ -329,27 +318,6 @@ mod tests {
             err.contains("cannot be accessed")
                 && err.contains("refusing to search a broader directory"),
             "scope without execute permission must return a teaching error: {err}"
-        );
-    }
-
-    #[test]
-    fn apply_budget_none_caps_at_default() {
-        // An output far larger than DEFAULT_BUDGET must be truncated even with
-        // no explicit budget — otherwise a broad read/regex/diff blows the host
-        // ~25K tool-response limit.
-        let oversized = format!(
-            "# header line\n{}",
-            "filler content that repeats and repeats\n".repeat(20_000)
-        );
-        let capped = apply_budget(&oversized, None);
-        assert!(
-            capped.len() < oversized.len(),
-            "output should be truncated below the default budget"
-        );
-        assert!(
-            capped.contains("truncated"),
-            "truncation notice should be present: {}",
-            &capped[capped.len().saturating_sub(120)..]
         );
     }
 }

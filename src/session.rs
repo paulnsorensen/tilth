@@ -16,7 +16,6 @@ const NUDGE_MAX_CHARS: usize = 120;
 enum BatchTool {
     Read,
     Search,
-    List,
 }
 
 impl BatchTool {
@@ -24,7 +23,6 @@ impl BatchTool {
         match name {
             "tilth_read" => Some(Self::Read),
             "tilth_search" => Some(Self::Search),
-            "tilth_list" => Some(Self::List),
             _ => None,
         }
     }
@@ -33,7 +31,6 @@ impl BatchTool {
         match self {
             Self::Read => "paths",
             Self::Search => "queries",
-            Self::List => "patterns",
         }
     }
 
@@ -41,7 +38,6 @@ impl BatchTool {
         match self {
             Self::Read => 0,
             Self::Search => 1,
-            Self::List => 2,
         }
     }
 
@@ -51,7 +47,6 @@ impl BatchTool {
             Self::Search => {
                 "TIP: batch into one call — queries: [{\"query\":\"foo\"}, {\"query\":\"bar\"}]."
             }
-            Self::List => "TIP: batch into one call — patterns: [\"*.rs\", \"*.toml\"].",
         }
     }
 }
@@ -59,7 +54,7 @@ impl BatchTool {
 #[derive(Default)]
 struct BatchNudgeState {
     previous: Option<(BatchTool, Value)>,
-    emissions: [u8; 3],
+    emissions: [u8; 2],
 }
 
 impl BatchNudgeState {
@@ -481,38 +476,19 @@ mod tests {
     #[test]
     fn multi_item_call_resets_batch_nudge_streak() {
         let session = Session::new();
-
+        for paths in [
+            serde_json::json!(["a.rs"]),
+            serde_json::json!(["a.rs", "b.rs"]),
+            serde_json::json!(["c.rs"]),
+        ] {
+            assert_eq!(
+                session.batch_nudge("tilth_read", &serde_json::json!({"paths": paths}), true),
+                None
+            );
+        }
         assert_eq!(
-            session.batch_nudge(
-                "tilth_list",
-                &serde_json::json!({ "patterns": ["*.rs"] }),
-                true
-            ),
-            None
-        );
-        assert_eq!(
-            session.batch_nudge(
-                "tilth_list",
-                &serde_json::json!({ "patterns": ["*.rs", "*.toml"] }),
-                true,
-            ),
-            None
-        );
-        assert_eq!(
-            session.batch_nudge(
-                "tilth_list",
-                &serde_json::json!({ "patterns": ["*.md"] }),
-                true
-            ),
-            None
-        );
-        assert_eq!(
-            session.batch_nudge(
-                "tilth_list",
-                &serde_json::json!({ "patterns": ["*.txt"] }),
-                true
-            ),
-            Some("TIP: batch into one call — patterns: [\"*.md\", \"*.txt\"].".to_string())
+            session.batch_nudge("tilth_read", &serde_json::json!({"paths": ["d.rs"]}), true),
+            Some("TIP: batch into one call — paths: [\"c.rs\", \"d.rs\"].".to_string())
         );
     }
 

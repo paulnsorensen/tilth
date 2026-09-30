@@ -1,5 +1,109 @@
 # tilth MCP usage analytics — July 2026
 
+## September 2026 value reassessment
+
+The September session evidence supports consolidating discovery behind search.
+It does not establish a causal speed, token, or correctness advantage over Bash.
+The measurements inform recommendations, not causal claims.[^september-evidence]
+The user later approves MCP list and diff retirement; [[adr/tilth-search-v2-roadmap-001]] records that separate decision.
+
+### Comparable recent usage
+
+The measurement window starts on 2026-08-29 and ends before 2026-09-29 07:55 UTC.
+Deduplication uses harness, session identifier, and tool-use identifier.
+
+| Tool | Claude calls | Claude flagged failures | Codex wrappers containing call syntax |
+|---|---:|---:|---:|
+| deps | 58 | 3 | 95 |
+| grok | 220 | 26 | 13 |
+| list | 269 | 2 | 242 |
+| diff | 168 | 3 | 847 |
+
+Codex wrappers are not individual invocations.
+One wrapper can batch calls, contain a loop, fail before execution, or contain quoted code.
+The detection uses call syntax, not bare tool-name mentions.
+The Claude sample has joined results for every counted call.[^september-evidence]
+
+### Capability value and replacement limits
+
+- Deps returns positive dependent counts in 40 of 49 results with parseable count headers.
+  Keep this capability; the evidence does not justify deleting it.
+- Grok includes caller sections in 163 calls.
+  It also returns 31 ambiguity warnings and 26 flagged failures.
+  The failures include 13 unresolved targets, ten rejected scopes, and two missing targets.
+  Search consolidation can remove a separate target-selection interface.
+- List reports zero source files in 42 calls.
+  Sixteen of these calls precede a Bash listing command.
+  Pattern-based tree output and token rollups remain distinct benefits.
+- Diff precedes a Bash command containing `git diff` in 44 calls.
+  One sampled Markdown review receives only a zero-symbol overview, then requests changed lines through Git.
+  Keep structural summaries as an optional view, not a complete replacement for raw patches.[^september-evidence]
+
+Follow-up means the next five tool calls in the same native transcript, within 120 seconds after the result.
+The follow-up windows can overlap.
+A follow-up is not automatically a failure or wasted work.
+Git checks can validate staging; reads can obtain edit tags.
+These counts show coexistence, not causal inferiority.[^september-evidence]
+
+The existing topology decision already moves grok/deps behind search.
+The shipped continuation decision retains the separate verbs until replacement and graduation gates pass.
+This analysis does not prove those gates pass.
+See [[adr/tilth-search-v2-roadmap-001]] and [[adr/tilth-search-v2-roadmap-006]].
+
+### Current analytics cautions
+
+The July ingestion cautions below describe that historical database, not the current schema.
+Current ingestion backfills absent error flags to false.
+Recent Codex calls usually appear inside `exec`, so direct MCP-name counts omit much of its use.
+The September raw counts include duplicate tool-use rows: deps has 68 rows but 58 distinct session-scoped calls.
+Deduplicate before calculating frequencies.
+The canonical result table keeps only 500 characters.
+Use full canonical result blocks or native transcripts for output-content measurements.[^september-method]
+
+Instructions require Tilth use in some projects.
+Usage therefore does not establish user preference or comparative efficiency.
+The historical [[mcp-cost-model-sonnet5]] benchmark also does not isolate these four tools.
+A matched per-tool ablation remains necessary before claiming current net savings.
+
+[^september-evidence]: Session-analytics run on 2026-09-29 against the local sessions.duckdb cache. Window: 2026-08-29 inclusive to 2026-09-29T07:55:00 exclusive. Direct Claude calls deduplicate by harness, sessionId, tool_use_id. Full-result inspection covers all 715 calls in the four-tool sample. Native follow-up inspection locates all 715 results across 1,133 transcript files. Codex wrapper detection matches tools.<normalized Tilth name>( in the decoded exec source and counts distinct wrappers per tool.
+[^september-method]: Installed session-analytics references/canonical-schema.md:13-50,112-133 and references/harness-coverage.md:45-70; verified against the September query results. Use tool_uses, not only mcp_calls. Error rates are observed flags, not proof of all failures.
+
+_Source: session-analytics reassessment · Updated: 2026-09-29 · Supersedes: July ingestion assumptions for current queries only._
+
+
+
+### Diff follow-up check
+
+The diff follow-up check covers all 168 deduplicated Claude calls in the September window.
+It uses the next five unique tool calls after each result, within 120 seconds, in the same native transcript.[^diff-follow-up]
+
+| Follow-up | Originating diff calls |
+|---|---:|
+| Bash command containing Git diff | 44 (26.2%) |
+| Another Tilth diff | 31 (18.5%) |
+| Both | 10 |
+| Either | 65 (38.7%) |
+| Neither | 103 (61.3%) |
+
+Only two originating calls have identical-argument repeats.
+The other 29 repeated calls change arguments, usually scope or options.
+Do not classify every repeated call as a retry.
+Among the 44 Git-followed calls, 31 include a patch-capable command.
+The other 13 contain only summary views.
+Command flags do not prove fallback intent, successful execution, or useful output.[^diff-follow-up]
+
+The overlap supports simplification, not a claim that agents always repeat or replace Tilth diff.
+The user chooses public MCP diff retirement while retaining CLI/library diff and internal edit recovery.
+Deps/grok retirement still requires separate search graduation evidence.[^diff-retirement]
+
+[^diff-follow-up]: Session analysis on 2026-09-29. Scan: 2,807 recent native Claude transcript files; 130 files contain all 168 matched results. Canonical origin identity uses session plus tool_use_id. Same-transcript follow-up windows overlap. Git detection matches Bash command text containing git followed by diff. Repeats compare decoded arguments. Counts describe originating calls, not total follow-up events.
+[^diff-retirement]: User approval on 2026-09-29: "Retire only public tilth_diff". See [[adr/tilth-search-v2-roadmap-001]] and [[edit-anchor-design]].
+
+_Source: native transcript follow-up analysis and user scope approval · Updated: 2026-09-29 · Supersedes: none; extends the September reassessment._
+
+## July 2026 historical analysis
+
+
 Full error/usage analysis of tilth's MCP surface from one month of real agent
 sessions (2026-07-02 → 2026-08-02), across three harnesses, benchmarked
 against oh-my-pi's built-in tools to separate "table stakes" failure rates
