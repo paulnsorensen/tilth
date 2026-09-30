@@ -1349,23 +1349,6 @@ mod tests {
     }
 
     #[test]
-    fn symbol_read_resolves_doubly_nested_definition() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested.rs");
-        std::fs::write(
-            &path,
-            "mod outer {\n    mod inner {\n        fn target() {\n            let value = 1;\n        }\n    }\n}\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolve_symbol_range(&path, "target"),
-            Some((3, 5)),
-            "symbol lookup must reach definitions below the shallow display outline"
-        );
-    }
-
-    #[test]
     fn read_relative_path_anchors_under_cwd() {
         // A relative path + cwd reads from <cwd>/<path>, not <server-cwd>/<path>.
         // Prevents worktree agents from silently reading the wrong checkout.

@@ -1,6 +1,6 @@
 //! Scala language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call_expression function: (identifier) @callee)\n",
@@ -23,7 +23,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &["build.sbt"],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),
     extract_receiver: None,
@@ -31,6 +30,15 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::scala::canonical_anchor,
     attach_leading_adornment: crate::lang::scala::attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        outline_label,
+        sibling_object: Some("this"),
+        search_priority: 9,
+        search_extensions: &["scala"],
+        basename_extensions: &["scala"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::embedded_semantic_start,
 };
 
@@ -47,4 +55,18 @@ pub(crate) fn attach_leading_adornment(
     _lines: &[&str],
 ) -> bool {
     crate::lang::spec::adornment_kind(adornment, &["annotation", "modifiers", "access_modifier"])
+}
+
+fn import_line(line: &str) -> bool {
+    line.trim_start().starts_with("import ")
+}
+
+fn outline_label(kind: crate::types::OutlineKind) -> Option<&'static str> {
+    match kind {
+        crate::types::OutlineKind::Function => Some("def"),
+        crate::types::OutlineKind::Interface => Some("trait"),
+        crate::types::OutlineKind::Variable => Some("var"),
+        crate::types::OutlineKind::Module => Some("object"),
+        _ => None,
+    }
 }

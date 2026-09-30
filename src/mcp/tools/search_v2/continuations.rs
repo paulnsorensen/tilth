@@ -357,7 +357,7 @@ fn dependencies_within(
     let own_uncertain;
     let mut imports: Vec<_> = if matches!(
         crate::lang::detect_file_type(&full),
-        crate::types::FileType::Code(crate::types::Lang::Python)
+        crate::types::FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports
     ) {
         let resolution = crate::read::imports::resolve_python_scoped(&full, &content, &py_roots);
         own_uncertain = !resolution.uncertain.is_empty();

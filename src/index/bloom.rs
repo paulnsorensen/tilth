@@ -150,9 +150,8 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
 /// This is intentionally approximate -- it does not understand all language
 /// syntaxes perfectly, but is fast and good enough for Bloom filter population.
 ///
-/// `lang` gates language-specific lexing: the Rust lifetime heuristic only
-/// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
-/// opens a single-quoted string, matching their actual syntax.
+/// `lang` selects language-owned lexer capabilities. Without the lifetime
+/// capability, a `'` opens a single-quoted string.
 fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
     IdentifierIter::new(content, lang)
 }
@@ -164,11 +163,15 @@ enum ScanState {
     Code,
     /// Inside a double-quoted string.
     StringDouble,
+    /// Inside a Python triple-double-quoted string.
+    StringTripleDouble,
     /// Inside a single-quoted string/char.
     StringSingle,
+    /// Inside a Python triple-single-quoted string.
+    StringTripleSingle,
     /// Inside a backtick string (JS template literals, Go raw strings).
     StringBacktick,
-    /// Inside a line comment (// ...).
+    /// Inside a line comment (`//`, or Python `#`).
     LineComment,
     /// Inside a block comment (/* ... */).
     BlockComment,
@@ -179,17 +182,22 @@ struct IdentifierIter<'a> {
     src: &'a str,
     pos: usize,
     state: ScanState,
-    lang: Option<Lang>,
+    triple_quoted_strings: bool,
+    hash_line_comments: bool,
+    has_lifetimes: bool,
 }
 
 impl<'a> IdentifierIter<'a> {
     fn new(content: &'a str, lang: Option<Lang>) -> Self {
+        let policy = lang.map(crate::lang::spec::spec);
         Self {
             bytes: content.as_bytes(),
             src: content,
             pos: 0,
             state: ScanState::Code,
-            lang,
+            triple_quoted_strings: policy.is_some_and(|spec| spec.policy.triple_quoted_strings),
+            hash_line_comments: policy.is_some_and(|spec| spec.policy.hash_line_comments),
+            has_lifetimes: lang.is_some_and(Lang::has_lifetimes),
         }
     }
 }
@@ -209,11 +217,25 @@ impl<'a> Iterator for IdentifierIter<'a> {
                 ScanState::Code => {
                     // Check for start of string literals
                     if b == b'"' {
-                        self.state = ScanState::StringDouble;
-                        self.pos += 1;
+                        if self.triple_quoted_strings
+                            && bytes.get(i..i + 3) == Some(b"\"\"\"".as_slice())
+                        {
+                            self.state = ScanState::StringTripleDouble;
+                            self.pos += 3;
+                        } else {
+                            self.state = ScanState::StringDouble;
+                            self.pos += 1;
+                        }
                         continue;
                     }
                     if b == b'\'' {
+                        if self.triple_quoted_strings
+                            && bytes.get(i..i + 3) == Some(b"'''".as_slice())
+                        {
+                            self.state = ScanState::StringTripleSingle;
+                            self.pos += 3;
+                            continue;
+                        }
                         // Distinguish a Rust lifetime (`'a`, `'static`) from a char
                         // literal (`'a'`, `'\n'`). A char literal has a closing quote
                         // right after a single char/escape; a lifetime is a tick
@@ -225,7 +247,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                         // single-quoted string, so the heuristic is gated on
                         // `has_lifetimes` to avoid swallowing identifiers after a
                         // `'foo'` string there.
-                        let is_lifetime = self.lang.is_some_and(Lang::has_lifetimes)
+                        let is_lifetime = self.has_lifetimes
                             && i + 1 < len
                             && is_ident_start(bytes[i + 1])
                             && !(i + 2 < len && bytes[i + 2] == b'\'');
@@ -244,6 +266,11 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     }
 
                     // Check for comments
+                    if b == b'#' && self.hash_line_comments {
+                        self.state = ScanState::LineComment;
+                        self.pos += 1;
+                        continue;
+                    }
                     if b == b'/' && i + 1 < len {
                         if bytes[i + 1] == b'/' {
                             self.state = ScanState::LineComment;
@@ -282,12 +309,34 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     }
                 }
 
+                ScanState::StringTripleDouble => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2;
+                    } else if bytes.get(i..i + 3) == Some(b"\"\"\"".as_slice()) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
                 ScanState::StringSingle => {
                     if b == b'\\' && i + 1 < len {
                         self.pos += 2; // skip escaped character
                     } else if b == b'\'' {
                         self.state = ScanState::Code;
                         self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringTripleSingle => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2;
+                    } else if bytes.get(i..i + 3) == Some(b"'''".as_slice()) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
                     } else {
                         self.pos += 1;
                     }
@@ -305,7 +354,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                 }
 
                 ScanState::LineComment => {
-                    if b == b'\n' {
+                    if matches!(b, b'\n' | b'\r') {
                         self.state = ScanState::Code;
                     }
                     self.pos += 1;
@@ -403,6 +452,39 @@ mod tests {
         );
         assert!(idents.contains(&"let"), "got {idents:?}");
         assert!(idents.contains(&"x"), "got {idents:?}");
+    }
+
+    #[test]
+    fn python_triple_strings_and_hash_comments_preserve_following_identifiers() {
+        let source = "FIXTURE = \"\"\"\n{\\\"prompt\\\": \\\"count ripgrep's lines\\\"}\n\"\"\"\ndef after_double(): pass\nOTHER = '''owner's value'''\ndef after_single(): pass\n# caller's note\ndef after_hash(): pass\n";
+        let identifiers: Vec<&str> = extract_identifiers(source, Some(Lang::Python)).collect();
+        assert_eq!(
+            identifiers,
+            [
+                "FIXTURE",
+                "def",
+                "after_double",
+                "pass",
+                "OTHER",
+                "def",
+                "after_single",
+                "pass",
+                "def",
+                "after_hash",
+                "pass",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_hash_comments_end_at_any_line_ending() {
+        for line_ending in ["\n", "\r\n", "\r"] {
+            let source =
+                format!("# hidden_comment{line_ending}def visible_name(): pass{line_ending}");
+            let identifiers: Vec<&str> = extract_identifiers(&source, Some(Lang::Python)).collect();
+
+            assert_eq!(identifiers, ["def", "visible_name", "pass"]);
+        }
     }
 
     #[test]

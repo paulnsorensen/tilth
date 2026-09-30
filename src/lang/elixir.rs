@@ -2,9 +2,9 @@
 //! every definition is a `call` node whose `target` identifier is the keyword
 //! (`def`, `defmodule`, …), so the default field-name extractor does not apply.
 //! The definition detection + name extraction + weight live here and are wired
-//! into [`SPEC`] via its `definition_kinds` / `definitions` fields.
+//! into [`SPEC`] via its `definitions` field.
 
-use crate::lang::spec::{DefinitionOps, LangSpec, StdlibRule};
+use crate::lang::spec::{DefinitionOps, LangSpec, StdlibRule, DEFAULT_DEFS};
 use crate::lang::treesitter::{
     elixir_arguments, elixir_extract_func_head_name, node_text_simple, NodeTextMode,
 };
@@ -45,17 +45,27 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &["mix.exs"],
-    definition_kinds: ELIXIR_DEFINITION_TARGETS,
     has_lifetimes: false,
     strip_family: None,
     extract_receiver: None,
     definitions: DefinitionOps {
+        is_definition: is_elixir_definition,
         extract_name: extract_elixir_definition_name,
+        is_container: is_elixir_definition,
+        kind_label: elixir_kind_label,
         weight: elixir_definition_weight,
+        ..DEFAULT_DEFS
     },
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::spec::default_canonical_anchor,
     attach_leading_adornment: crate::lang::elixir::attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        import_source: Some(crate::lang::outline::elixir_import_source),
+        special_outline: crate::lang::outline::elixir_special_outline,
+        callee_allowed,
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::default_semantic_start,
 };
 
@@ -187,4 +197,47 @@ pub(crate) fn elixir_definition_weight(node: tree_sitter::Node, lines: &[&str]) 
         "defstruct" | "defexception" => 80,
         _ => 50,
     }
+}
+
+fn import_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["alias ", "import ", "use ", "require "]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn callee_allowed(name: &str) -> bool {
+    !matches!(
+        name,
+        "def"
+            | "defp"
+            | "defmodule"
+            | "defmacro"
+            | "defmacrop"
+            | "defguard"
+            | "defguardp"
+            | "defdelegate"
+            | "defstruct"
+            | "defexception"
+            | "defprotocol"
+            | "defimpl"
+            | "defoverridable"
+            | "use"
+            | "import"
+            | "alias"
+            | "require"
+    )
+}
+
+fn elixir_kind_label(node: tree_sitter::Node, lines: &[&str]) -> Option<&'static str> {
+    Some(match elixir_definition_keyword(node, lines)?.as_str() {
+        "defmodule" => "module",
+        "defprotocol" => "protocol",
+        "defimpl" => "impl",
+        "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate" => {
+            "function"
+        }
+        "defstruct" | "defexception" => "struct",
+        _ => "definition",
+    })
 }

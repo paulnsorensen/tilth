@@ -583,12 +583,12 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
     let mut failed = false;
     // Only a Python source can hold an unresolved import, and such an import
     // can only hide an edge to a Python target.
-    let python_target = matches!(
+    let scoped_target = matches!(
         crate::lang::detect_file_type(&target_abs),
-        crate::types::FileType::Code(crate::types::Lang::Python)
+        crate::types::FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports
     );
     let uncertain_sources = match storage::read_uncertain_sources(&handle.db) {
-        Ok(sources) if python_target => sources.len(),
+        Ok(sources) if scoped_target => sources.len(),
         Ok(_) => 0,
         Err(_) => {
             failed = true;

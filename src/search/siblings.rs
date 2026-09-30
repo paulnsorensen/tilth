@@ -41,9 +41,11 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     // avoid re-entrancy on `QUERY_CACHE` (the receiver extractor also uses it).
     // The extractor is supplied per-language via `spec(lang).extract_receiver`
     // (only Go has one).
-    let go_receiver = crate::lang::spec::spec(lang)
+    let language = crate::lang::spec::spec(lang);
+    let receiver = language
         .extract_receiver
         .and_then(|extract| extract(content, &ts_lang));
+    let expected_object = language.policy.sibling_object;
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&ts_lang).is_err() {
@@ -73,44 +75,32 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
         let mut names: Vec<String> = Vec::new();
 
         while let Some(m) = matches.next() {
-            // For Python: verify @obj == "self"
-            if lang == Lang::Python {
-                if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures.iter().any(|c| {
-                        c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "self")
-                    });
-                    if !obj_ok {
-                        continue;
-                    }
+            if let (Some(expected), Some(object_index)) = (expected_object, obj_idx) {
+                let object_matches = m.captures.iter().any(|capture| {
+                    capture.index == object_index
+                        && capture
+                            .node
+                            .utf8_text(bytes)
+                            .is_ok_and(|text| text == expected)
+                });
+                if !object_matches {
+                    continue;
                 }
             }
 
-            // For Scala: verify @obj == "this"
-            if lang == Lang::Scala {
-                if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures.iter().any(|c| {
-                        c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "this")
-                    });
-                    if !obj_ok {
-                        continue;
-                    }
-                }
-            }
-
-            // For Go: verify @recv matches the receiver parameter name
-            if lang == Lang::Go {
-                if let (Some(ri), Some(ref recv_name)) = (recv_idx, &go_receiver) {
-                    let recv_ok = m.captures.iter().any(|c| {
-                        c.index == ri
-                            && c.node
-                                .utf8_text(bytes)
-                                .is_ok_and(|t| t == recv_name.as_str())
-                    });
-                    if !recv_ok {
-                        continue;
-                    }
-                } else if lang == Lang::Go {
-                    // No receiver found — can't determine self references
+            if language.extract_receiver.is_some() {
+                let (Some(receiver_index), Some(receiver_name)) = (recv_idx, receiver.as_deref())
+                else {
+                    continue;
+                };
+                let receiver_matches = m.captures.iter().any(|capture| {
+                    capture.index == receiver_index
+                        && capture
+                            .node
+                            .utf8_text(bytes)
+                            .is_ok_and(|text| text == receiver_name)
+                });
+                if !receiver_matches {
                     continue;
                 }
             }
@@ -321,5 +311,35 @@ mod tests {
             vec![child(OutlineKind::Function, "method", None, 20)],
         )];
         assert!(find_parent_entry(&entries, 999).is_none());
+    }
+
+    #[test]
+    fn extracts_only_python_self_members() {
+        let content = "class Box:\n    def run(self, other):\n        self.keep()\n        self.value\n        other.drop()\n        other.value\n";
+
+        assert_eq!(
+            extract_sibling_references(content, Lang::Python, (2, 6)),
+            vec!["keep", "value"]
+        );
+    }
+
+    #[test]
+    fn extracts_only_scala_this_members() {
+        let content = "class Box {\n  def run(other: Box): Unit = {\n    this.keep()\n    this.value\n    other.drop()\n    other.value\n  }\n}\n";
+
+        assert_eq!(
+            extract_sibling_references(content, Lang::Scala, (2, 7)),
+            vec!["keep", "value"]
+        );
+    }
+
+    #[test]
+    fn extracts_only_go_receiver_members() {
+        let content = "package sample\n\ntype Box struct{}\n\nfunc (box *Box) run(other *Box) {\n    box.keep()\n    box.value\n    other.drop()\n    other.value\n}\n";
+
+        assert_eq!(
+            extract_sibling_references(content, Lang::Go, (5, 10)),
+            vec!["keep", "value"]
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Java language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = "(method_invocation name: (identifier) @callee)\n";
 
@@ -19,7 +19,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &["pom.xml", "build.gradle"],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),
     extract_receiver: None,
@@ -27,6 +26,13 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::java::canonical_anchor,
     attach_leading_adornment: crate::lang::java::attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        search_priority: 9,
+        search_extensions: &["java"],
+        basename_extensions: &["java"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::embedded_semantic_start,
 };
 
@@ -43,4 +49,8 @@ fn attach_leading_adornment(
     _lines: &[&str],
 ) -> bool {
     crate::lang::spec::adornment_kind(adornment, &["modifiers", "annotation", "marker_annotation"])
+}
+
+fn import_line(line: &str) -> bool {
+    line.trim_start().starts_with("import ")
 }

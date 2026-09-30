@@ -25,11 +25,11 @@ pub(crate) fn resolve_scoped_paths(
     content: &str,
     roots: &PyRoots,
 ) -> Vec<PathBuf> {
-    match detect_file_type(file_path) {
-        FileType::Code(Lang::Python) => {
-            python_scope::resolve_python_edges(file_path, content, roots).paths()
-        }
-        _ => resolve_related_files_with_content(file_path, content),
+    if matches!(detect_file_type(file_path), FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports)
+    {
+        python_scope::resolve_python_edges(file_path, content, roots).paths()
+    } else {
+        resolve_related_files_with_content(file_path, content)
     }
 }
 
@@ -43,14 +43,14 @@ pub(crate) fn resolve_scoped_shard_fields(
     content: &str,
     roots: &PyRoots,
 ) -> ScopedShardFields {
-    match detect_file_type(file_path) {
-        FileType::Code(Lang::Python) => {
-            python_scope::resolve_python_edges(file_path, content, roots).into_shard_fields()
-        }
-        _ => ScopedShardFields {
+    if matches!(detect_file_type(file_path), FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports)
+    {
+        python_scope::resolve_python_edges(file_path, content, roots).into_shard_fields()
+    } else {
+        ScopedShardFields {
             paths: resolve_related_files_with_content(file_path, content),
             ..ScopedShardFields::default()
-        },
+        }
     }
 }
 
@@ -62,7 +62,8 @@ pub(crate) fn resolve_python_scoped(
     content: &str,
     roots: &PyRoots,
 ) -> PyResolution {
-    if matches!(detect_file_type(file_path), FileType::Code(Lang::Python)) {
+    if matches!(detect_file_type(file_path), FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports)
+    {
         python_scope::resolve_python_edges(file_path, content, roots)
     } else {
         PyResolution::default()
@@ -110,58 +111,16 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 }
 
 pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
-    let trimmed = line.trim_start();
-    match lang {
-        Lang::Rust => trimmed.starts_with("use "),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
-            trimmed.starts_with("import ") || trimmed.starts_with("import{")
-        }
-        Lang::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
-        Lang::Go | Lang::Java | Lang::Scala | Lang::Kotlin => trimmed.starts_with("import "),
-        Lang::C | Lang::Cpp => trimmed.starts_with("#include"),
-        Lang::Elixir => {
-            trimmed.starts_with("alias ")
-                || trimmed.starts_with("import ")
-                || trimmed.starts_with("use ")
-                || trimmed.starts_with("require ")
-        }
-        Lang::Bash => trimmed
-            .strip_prefix("source")
-            .or_else(|| trimmed.strip_prefix('.'))
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace)),
-        _ => false,
-    }
+    (crate::lang::spec::spec(lang).policy.import_line)(line)
 }
 
 pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
-    match lang {
-        Lang::Rust => {
-            !(source.starts_with("crate::")
-                || source.starts_with("self::")
-                || source.starts_with("super::"))
-        }
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
-            !(source.starts_with('.') || source.starts_with("@/") || source.starts_with("~/"))
-        }
-        // Bash: dot-relative paths are local; anything else (bare name, /abs/path) is external.
-        Lang::Python | Lang::Bash => !source.starts_with('.'),
-        Lang::C | Lang::Cpp => !source.starts_with('"'),
-        // Elixir, Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
-        _ => true,
-    }
+    (crate::lang::spec::spec(lang).policy.import_external)(source)
 }
 
 fn resolve(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
-    let raw = match lang {
-        Lang::Rust => resolve_rust(dir, source),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
-        Lang::Python => resolve_python(dir, source),
-        Lang::C | Lang::Cpp => resolve_c_include(dir, source),
-        Lang::Bash => resolve_bash(dir, source),
-        // Elixir, Go, Java, etc. — module-to-file mapping requires build system conventions.
-        _ => None,
-    };
-    raw.map(|p| normalize_path(&p))
+    (crate::lang::spec::spec(lang).policy.import_resolver)(dir, source)
+        .map(|path| normalize_path(&path))
 }
 
 /// Lexically collapse `.` and `..` components without touching the filesystem.
@@ -191,134 +150,9 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-// --- Rust ---
-
-fn resolve_rust(dir: &Path, source: &str) -> Option<PathBuf> {
-    if let Some(rest) = source.strip_prefix("crate::") {
-        let src_dir = find_src_ancestor(dir)?;
-        try_rust_path(src_dir, rest)
-    } else if let Some(rest) = source.strip_prefix("self::") {
-        try_rust_path(dir, rest)
-    } else if let Some(rest) = source.strip_prefix("super::") {
-        try_rust_path(dir.parent()?, rest)
-    } else {
-        None
-    }
-}
-
-/// Try progressively shorter paths until one resolves.
-/// `cache::OutlineCache` → try cache/OutlineCache.rs (no) → cache.rs (yes).
-/// `read::imports` → try read/imports.rs (yes) → stop.
-fn try_rust_path(base: &Path, rest: &str) -> Option<PathBuf> {
-    let segments: Vec<&str> = rest.split("::").collect();
-    for len in (1..=segments.len()).rev() {
-        let rel: PathBuf = segments[..len].iter().collect();
-        if let Some(found) = try_rust_module(&base.join(&rel)) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn try_rust_module(base: &Path) -> Option<PathBuf> {
-    let with_rs = base.with_extension("rs");
-    if with_rs.exists() {
-        return Some(with_rs);
-    }
-    let mod_rs = base.join("mod.rs");
-    if mod_rs.exists() {
-        return Some(mod_rs);
-    }
-    None
-}
-
-fn find_src_ancestor(start: &Path) -> Option<&Path> {
-    let mut current = start;
-    loop {
-        if current.file_name().and_then(|n| n.to_str()) == Some("src") {
-            return Some(current);
-        }
-        current = current.parent()?;
-    }
-}
-
-// --- JS/TS ---
-
+#[cfg(test)]
 fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
-    let base = dir.join(source);
-    // Try with extensions
-    for ext in &[".ts", ".tsx", ".js", ".jsx"] {
-        let candidate = PathBuf::from(format!("{}{ext}", base.display()));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    // Already has extension
-    if base.exists() && base.is_file() {
-        return Some(base);
-    }
-    // Index files
-    for name in &["index.ts", "index.tsx", "index.js", "index.jsx"] {
-        let candidate = base.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-// --- Python ---
-
-fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
-    let dots = source.bytes().take_while(|&b| b == b'.').count();
-    if dots == 0 {
-        return None;
-    }
-    // Each dot beyond the first goes up one directory.
-    let mut base = dir.to_path_buf();
-    for _ in 1..dots {
-        base = base.parent()?.to_path_buf();
-    }
-    let module_part = &source[dots..];
-    if module_part.is_empty() {
-        // Bare `from . import X`
-        let init = base.join("__init__.py");
-        return if init.exists() { Some(init) } else { None };
-    }
-    let rel = module_part.replace('.', "/");
-    let as_file = base.join(format!("{rel}.py"));
-    if as_file.exists() {
-        return Some(as_file);
-    }
-    let as_pkg = base.join(&rel).join("__init__.py");
-    if as_pkg.exists() {
-        return Some(as_pkg);
-    }
-    None
-}
-
-// --- C/C++ ---
-
-fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
-    let clean = source.trim_matches('"');
-    let candidate = dir.join(clean);
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-// --- Bash ---
-
-fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
-    // Only resolve literal relative paths — no extension inference. A single
-    // metadata() stat avoids the exists()+is_file() two-call TOCTOU; resolution
-    // is best-effort, so a stale result only ever costs a related-file hint.
-    let candidate = dir.join(source);
-    std::fs::metadata(&candidate)
-        .is_ok_and(|m| m.is_file())
-        .then_some(candidate)
+    crate::lang::javascript::resolve_import(dir, source)
 }
 
 #[cfg(test)]
@@ -384,6 +218,28 @@ mod tests {
             from_sibling, from_cousin,
             "different spellings should normalize to the same PathBuf"
         );
+    }
+
+    #[test]
+    fn js_specifier_falls_back_to_typescript_when_javascript_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("types.ts"), "").unwrap();
+
+        assert_eq!(resolve_js(root, "./types.js"), Some(root.join("types.ts")));
+
+        fs::write(root.join("types.js"), "").unwrap();
+        assert_eq!(resolve_js(root, "./types.js"), Some(root.join("types.js")));
+    }
+
+    #[test]
+    fn js_specifier_skips_typescript_directory_and_finds_tsx_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("view.ts")).unwrap();
+        fs::write(root.join("view.tsx"), "").unwrap();
+
+        assert_eq!(resolve_js(root, "./view.jsx"), Some(root.join("view.tsx")));
     }
 
     #[test]
