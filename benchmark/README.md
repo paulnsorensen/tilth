@@ -2,6 +2,89 @@
 
 Automated evaluation of tilth's impact on AI agent code navigation.
 
+## Codex headless benchmark
+
+Use `--runner codex` to exclude Claude and OpenCode model calls.
+It defaults to `gpt5` (`gpt-5.6-sol`) and the `baseline,tilth` arms.
+`--models all` selects only Codex models.
+The runner rejects other providers and `tilth_forced` before any model call.
+Codex cannot enforce the forced arm's tool restrictions.
+
+Install and authenticate Codex CLI 0.154.0 (`codex login`).
+The [Codex non-interactive guide](https://learn.chatgpt.com/docs/non-interactive-mode) describes headless execution.
+The runner explicitly disables discovered host and project skills through Codex skill configuration.
+Install Python 3.12+ and a tilth binary.
+For pinned repository tasks, run `python benchmark/fixtures/setup_repos.py`.
+For synthetic tasks, run `python benchmark/fixtures/setup.py`.
+Set `TILTH_BIN` to select a specific binary.
+The runner preserves saved Codex authentication and `CODEX_HOME`.
+It ignores user config and rules and disables skill search, plugins, hooks, apps, and multi-agent support.
+It preserves `HOME`, `CODEX_HOME`, and saved authentication.
+It sets the disposable project to untrusted and omits project instructions.
+Both arms get the same task and guidance to batch independent reads.
+The tilth arm also gets explicit tilth-first guidance for source work. Native tools remain available.
+Each tilth arm configures only its selected MCP binary and requires at least one successful tilth MCP call.
+The Codex tilth arm approves only `tilth_write` through invocation-only tool configuration.
+Benchmark tasks target disposable repository copies. Native shell commands retain the `workspace-write` sandbox.
+This MCP approval does not confine tilth access to those copies or restrict absolute paths.
+This setting does not change global approvals, other MCP tools, or the untrusted project policy.
+A host-skill access attempt or tilth arm without successful use invalidates the cell and stops the schedule.
+
+Run a bounded synthetic check without Claude calls:
+
+```bash
+python benchmark/run.py --runner codex --tasks find_definition \
+  --models gpt5 --modes baseline,tilth --reps 1 --max-cells 2
+```
+
+Run the curated, edit-only Luna 5.6 comparison at xhigh after setup and authentication:
+
+```bash
+python benchmark/run.py --runner codex --models luna56 \
+  --reasoning-effort xhigh \
+  --tasks gin_edit_render_cascade,gin_edit_render_runtime \
+  --modes baseline,tilth --reps 3 --max-cells 12
+```
+
+This schedule has two tasks and 12 cells. Both tasks require cross-file repairs and use test-based grading.
+The selection targets batched file access: a shared-helper contract repair and three independent renderer repairs.
+It excludes read-only tasks, single-file repairs, and the invalid Express multi-mutation task.
+Select tasks before inspecting results. This small Gin-only suite does not measure general coding performance.
+Check raw tool calls and `batch_sizes` for actual batching; one successful MCP call does not demonstrate batching.
+The cell cap limits calls, not spending. The runner records the selected effort in each result row.
+
+The output path appears in the run summary under `benchmark/results/`. Raw Codex JSONL and adjacent `.stderr` files appear in the matching `benchmark/results/streams/` directory, including failed cells. `--max-cells` and the per-cell 600-second timeout bound the run size. Codex has no dollar-budget cap in this harness. The result's cost is an estimate from token usage, not a spending limit.
+
+## Larger Luna edit task
+
+`gin_edit_render_context` migrates Gin's renderer API to accept request context.
+The reference changes 20 files across 90 edit sites: 165 added lines and 72 removed lines.
+It includes cancellation checks, request-context dispatch, a private SSE adapter, and caller/test migration.
+The grader injects held-out tests after inference and restores pinned regression assertions in a separate copy.
+It also validates the candidate's migrated tests.
+It runs full render and binding suites, relevant root tests, and all-package compilation under default and `nomsgpack` builds.
+Unrelated network integration tests are outside the grade because the pinned Unix-socket test has a timing failure.
+
+Validate the reference and negative controls before running inference:
+
+```bash
+mise exec go@1.24.7 -- python3 benchmark/tasks/gin_render_context_fixtures/preflight.py
+```
+
+Set `GOCACHE` to a writable temporary directory outside the candidate repository before running either arm.
+The runner forwards it without changing the sandbox. Prewarm dependencies before measuring agent time.
+Run three repetitions per arm, with no Claude calls:
+
+```bash
+TILTH_BIN="$PWD/target/release/tilth" mise exec go@1.24.7 -- \
+  python benchmark/run.py --runner codex --models luna56 \
+  --reasoning-effort xhigh --tasks gin_edit_render_context \
+  --modes baseline,tilth --reps 3 --max-cells 6
+```
+
+This forward task retains Git metadata. Reference tests and solution files stay outside the candidate workspace.
+See `benchmark/tasks/gin_render_context_fixtures/evidence.md` for reference size and grader checks.
+
 ## Results — v0.5.0
 
 | Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
@@ -180,9 +263,10 @@ Each run invokes `claude -p` (Claude Code headless mode) with a code navigation 
 
 - **Baseline** — Claude Code built-in tools: Read, Edit, Grep, Glob, Bash
 - **tilth** — Built-in tools + tilth MCP server (hybrid mode)
-- **tilth_forced** — tilth MCP + Read/Edit only (Bash, Grep, Glob removed)
+- **tilth_forced** — tilth MCP only; no built-in tools
+- **wozcode** — Built-in tools + Woz Code plugin and its explicit MCP server; requires `--wozcode-plugin-dir`
 
-All modes use the same system prompt, $1.00 budget cap, and model. The agent explores the codebase and returns a natural-language answer. Correctness is checked against ground-truth strings that must appear in the response.
+All selected modes use the same system prompt, model, and per-cell budget cap (default $1.00). The agent explores the codebase and returns a natural-language answer. Correctness is checked against ground-truth strings that must appear in the response.
 
 **Grading semantics**: correctness is a case-insensitive, backtick-stripped substring match — every `required_strings` entry for a task must appear somewhere in the graded text (`benchmark/tasks/base.py`'s `check_correctness`). The graded text is the agent's text output *accumulated across every assistant turn in the run*, not just the final one — a short wrap-up turn at the end of a run adds to, rather than replaces, the substantive answer from an earlier turn (`benchmark/parse.py`'s `parse_stream_json`).
 
@@ -256,9 +340,22 @@ python benchmark/run.py \
   --tasks fastapi_depends_processing,gin_middleware_chain \
   --models sonnet --reps 1 --modes baseline,tilth
 
+# Local three-way Sonnet 5 comparison: one Gin renderer task, five matched repetitions.
+# Set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
+# only its wozcode/auth.json is copied into each temporary Woz cell.
+TILTH_BIN=/absolute/path/to/target/release/tilth \
+CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \
+python benchmark/run.py \
+  --tasks gin_edit_render_context --models sonnet5 --reasoning-effort high \
+  --modes baseline,tilth,wozcode --wozcode-plugin-dir /absolute/path/to/wozcode \
+  --reps 5 --max-cells 15 --max-budget-usd 10 --arm-order-seed 20260929 \
+  --strict-file-tools
+
 # Diagnostic only: remove built-in search tools and force the local tilth MCP
 python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced
 ```
+
+`--strict-file-tools` gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms use the same invocation-only Bash hook. It permits only `go test`, `go build`, `go vet`, and `gofmt -w` with checked local arguments. It denies shell composition, file inspection, and delegation. This controls tool use, not code run by Go tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools` and denied Bash counts.
 
 **Analyze:**
 
@@ -284,7 +381,7 @@ python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 python benchmark/regrade.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 ```
 
-Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line records the task/model/repetition cell, randomized arm order, manifest seed, requested variant Git ref and resolved SHA, repository, absolute binary path and SHA-256, tilth/rustc versions, cost, tokens, correctness, and tool sequence. Every cell runs in a fresh disposable copy or Git worktree.
+Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each row records the task/model/repetition cell, arm order and seed, tool identities, budget, effort, cost, tokens, correctness, and wall duration. Variant rows also record the tilth binary and Woz plugin identity. Raw Claude streams remain under `benchmark/results/streams/`. A Claude error or missing success result produces a failure row, even when its text matches the grader. Every cell runs in a fresh disposable copy or Git worktree. When `CLAUDE_CONFIG_DIR` names an explicit auth seed, each Claude cell gets a fresh config directory. Woz Code requires this seed. Legacy runs without a seed keep Claude's normal OAuth configuration.
 
 ### Task definitions
 

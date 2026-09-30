@@ -1,6 +1,6 @@
 //! C# language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(invocation_expression function: (identifier) @callee)\n",
@@ -22,7 +22,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &[],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),
     extract_receiver: None,
@@ -30,6 +29,12 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::csharp::canonical_anchor,
     attach_leading_adornment: crate::lang::csharp::attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        search_priority: 9,
+        search_extensions: &["cs"],
+        basename_extensions: &["cs"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::embedded_semantic_start,
 };
 

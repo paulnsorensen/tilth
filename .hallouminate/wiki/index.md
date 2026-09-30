@@ -8,6 +8,13 @@ under `.cheese/`.
 
 ## Topics
 
+The [September benchmark source](sources/tilth-versus-wozcode-2026-09.md) links the preserved reports and updated topic pages.
+The cost and batching glosses below summarize August measurements, not universal behavior.
+September results document instructed batching and workload-specific cost differences.
+
+_Source: PR #278 benchmark ingestion · Updated: 2026-09-29_
+
+
 - [Benchmark harness gotchas (Sonnet 5 investigation)](benchmark-harness-gotchas.md) — `--safe-mode` silently strips all MCP servers including `--mcp-config` ones (invalidated a full sonnet5 run); the PR #168 guards (available_tools/mcp_servers/model_usage recording, McpUnavailableError abort); pricing.yaml drift vs native billing; the stale `~/.local/bin/tilth` binary that made byte-size, not `--version`, the only trustworthy staleness check.
 
 - [Diff: git ref resolution and exit-code handling](diff-git-ref-resolution.md) — why the root commit needs git's empty-tree hash rather than `{hash}^..{hash}`, why `^!` looks right and is not (it degrades to a working-tree diff and breaks `overlay.rs`'s `..`-splitting), git diff's 0-or-1 success convention, and the three constraints on default-branch teaching hints.
@@ -16,6 +23,7 @@ under `.cheese/`.
 
 - [Edit-anchor design: per-line hash vs whole-file tag](edit-anchor-design.md) — why tilth originally anchored edits with a per-line content hash, the FNV low-bit-mask bug, the measured ~25% per-read token tax vs oh-my-pi's O(1) whole-file tag, and the analysis behind the since-shipped switch to the whole-file-tag model.
 - [Go grouped declaration resolution](go-declaration-resolution.md) — why definition search uses each matched identifier line while keeping the enclosing declaration range, and why grok replaces the outline's first-name label for later const and var members.
+- [Language policy registry](language-policy-registry.md) — LangSpec owns shared language decisions; source ranking remains separate from language detection.
 - [Local gate gotchas (macOS)](local-gate-gotchas.md) — current CI commands and historical failure guidance that no longer defines the baseline.
 - [MCP cost model: why tilth costs more per correct answer on Sonnet 5](mcp-cost-model-sonnet5.md) — valid three-way benchmark result (+18-21% cost per correct, no accuracy gain at a 97.5% ceiling); the cost is a ~5,350-token fixed MCP prefix cache-written per cell, not per-call output volume; why mixed tool adoption (28 tilth→native fallbacks) is the worst posture.
 - [MCP cwd / workspace-root binding](mcp-cwd-root-binding.md) — why tilth uses a required per-call `cwd` param (renamed from `root` in PR #113, hook removed in #144; not the MCP `roots` capability) to resolve paths to the right git-worktree checkout; the silent worktree gotcha; 8-harness client survey.
@@ -38,3 +46,5 @@ belongs in a topic file — one topic per file.
 If you read this index and don't see the topic you need, run `list_files`
 against the `repo:tilth:wiki` corpus first — the index may be out of date
 relative to the directory.
+
+_Source: Repository wiki topic inventory · Updated: 2026-09-30._

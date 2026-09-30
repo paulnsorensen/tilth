@@ -615,7 +615,7 @@ fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
         None => "remaining output",
     };
     format!(
-        "{prefix}... truncated — use `tilth_diff` or reduce the batch to see the remaining {remaining}"
+        "{prefix}... truncated ({remaining}) — use shell `git diff` to review Git changes; it may differ from this write patch."
     )
 }
 /// A synthetic snapshot preserves the tag and full source after provenance
@@ -2598,7 +2598,9 @@ mod tests {
         let output = render_bounded_diff(Some(&before), &after);
 
         assert!(
-            output.contains("use `tilth_diff` or reduce the batch"),
+            output.contains(
+                "use shell `git diff` to review Git changes; it may differ from this write patch."
+            ),
             "truncated write diff must name its follow-up: {output}"
         );
         assert!(

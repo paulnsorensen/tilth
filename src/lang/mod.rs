@@ -32,7 +32,7 @@ use crate::types::{FileType, Lang};
 
 /// Every `Lang` variant, in declaration order. Used to scan per-language
 /// `spec(lang)` data when building extension / filename / manifest lookups.
-const ALL_LANGS: &[Lang] = &[
+pub(crate) const ALL_LANGS: &[Lang] = &[
     Lang::Rust,
     Lang::TypeScript,
     Lang::Tsx,
@@ -72,6 +72,50 @@ static EXT_TO_LANG: LazyLock<HashMap<&'static str, Lang>> = LazyLock::new(|| {
     }
     map
 });
+
+#[derive(Clone, Copy)]
+struct SearchExtensionPolicy {
+    priority: u8,
+    basename_eligible: bool,
+}
+
+/// Search-only extension policy. This registry does not affect language detection.
+static SEARCH_EXTENSION_POLICY: LazyLock<HashMap<&'static str, SearchExtensionPolicy>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::new();
+        for &lang in ALL_LANGS {
+            let policy = &spec::spec(lang).policy;
+            for &ext in policy.search_extensions {
+                map.entry(ext).or_insert(SearchExtensionPolicy {
+                    priority: policy.search_priority,
+                    basename_eligible: false,
+                });
+            }
+            for &ext in policy.basename_extensions {
+                map.entry(ext)
+                    .and_modify(|entry| entry.basename_eligible = true)
+                    .or_insert(SearchExtensionPolicy {
+                        priority: policy.search_priority,
+                        basename_eligible: true,
+                    });
+            }
+        }
+        map
+    });
+
+pub(crate) fn search_priority(path: &Path) -> u8 {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| SEARCH_EXTENSION_POLICY.get(ext))
+        .map_or(3, |policy| policy.priority)
+}
+
+pub(crate) fn is_basename_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| SEARCH_EXTENSION_POLICY.get(ext))
+        .is_some_and(|policy| policy.basename_eligible)
+}
 
 /// Detect file type by extension, then by name.
 pub fn detect_file_type(path: &Path) -> FileType {

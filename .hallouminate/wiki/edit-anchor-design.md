@@ -1,5 +1,37 @@
 # Edit-anchor design: per-line hash vs whole-file tag (tilth vs oh-my-pi)
 
+## Current diff and editing boundary
+
+The user retires only public MCP `tilth_diff` on 2026-09-29.
+The removed adapter never created edit tags or recorded seen-line provenance.[^diff-boundary]
+Tilth edits with a whole-file tag, not per-line hashes.[^current-tag]
+Read the target section with `tilth_read` before editing it.
+A diff's line numbers refer to its selected old or new source, not necessarily the live file.[^diff-lines]
+
+The retained CLI/library diff pipeline runs Git or reads a patch, parses hunks, and formats structural summaries or scoped detail.
+It identifies symbol, signature, and movement changes.
+Optional blast analysis adds caller warnings.[^diff-pipeline]
+
+The write path separately records the new snapshot and displayed source lines after applying an edit.
+Its optional `diff:true` output uses `diffy::create_patch`, not the structural-diff pipeline.
+Stale-tag recovery uses `diffy::merge` against the cached snapshot and live text.
+These mechanisms do not require the retired MCP tool.[^write-boundary]
+
+Keep structural review, post-write patch display, and stale-tag recovery separate.
+Public diff retirement preserves the internal patch and merge machinery.
+See [[adr/tilth-search-v2-roadmap-001]] for the public-surface decision.
+
+[^diff-boundary]: User scope approval on 2026-09-29: "Retire only public tilth_diff". Pre-retirement [adapter at commit 8d149614](https://github.com/paulnsorensen/tilth/blob/8d149614bbcc2ef33eaf4b5ed9dc352317578df7/src/mcp/tools/diff.rs#L3-L35) receives arguments but no Session or SnapshotStore.
+[^current-tag]: `src/edit/tag.rs:1-7,44-49,66-93`; `src/mcp/tools/write.rs:269-333`.
+[^diff-lines]: `src/diff/format.rs:507-515` selects old lines for removals and new lines for additions.
+[^diff-pipeline]: `src/diff/mod.rs:258-339,588-675`.
+[^write-boundary]: `src/mcp/tools/write.rs:195-238,633-638`; `src/edit/recovery.rs:102-116`.
+
+_Source: source inspection and user scope approval · Updated: 2026-09-29 · Supersedes: public MCP diff availability only._
+
+## Historical migration analysis
+
+
 > **Historical.** This analysis informed the decision and has since been acted on: tilth migrated from the per-line hash model to the whole-file-tag model (PRs #96-#99; `src/edit/tag.rs` et al.). Code referents below describe the *pre-migration* tree and no longer resolve against `main`. The analysis is kept as the record of *why* the switch was made.
 
 Why tilth originally anchored edits with a per-line content hash, what that cost in tokens, and the strategic question of whether to switch to oh-my-pi's whole-file-tag model -- the question this analysis fed, since decided in favour of the switch. Full comparison in `.cheese/notes/oh-my-pi-comparison.md` (§3, §9); hash research in `.cheese/research/{hash-anchor-collision-design,fnv1a-line-hash-anchor,xxhash32-vs-fnv1a-truncation}/` (local, gitignored). Related: [[mcp-cwd-root-binding]].

@@ -177,6 +177,11 @@ fn node_to_entry(
     lang: Lang,
     depth: usize,
 ) -> Option<OutlineEntry> {
+    if let Some(entry) =
+        (crate::lang::spec::spec(lang).policy.special_outline)(node, lines, lang, depth)
+    {
+        return Some(entry);
+    }
     let kind_str = node.kind();
     let spec = crate::lang::spec::spec(lang);
     let canonical = (spec.canonical_anchor)(node);
@@ -217,14 +222,16 @@ fn node_to_entry(
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
+        | "singleton_method"
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
         | "protocol_function_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
-                .or_else(|| first_identifier_text(node, lines))
                 .or_else(|| extract_definition_name(node, lines))
+                .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| {
                     // Swift deinit has no name field — use the node kind as name
                     if kind_str == "deinit_declaration" {
@@ -238,13 +245,13 @@ fn node_to_entry(
         }
 
         // Classes & structs
-        "class_declaration" | "class_definition" => {
+        "class_declaration" | "class_definition" | "class" | "class_specifier" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Class, name, None)
         }
-        "struct_item" | "struct_declaration" => {
+        "struct_item" | "struct_declaration" | "struct_specifier" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Struct, name, None)
         }
@@ -363,39 +370,6 @@ fn node_to_entry(
         | "file_scoped_namespace_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
             (OutlineKind::Module, name, None)
-        }
-
-        // Elixir: all definitions are `call` nodes distinguished by target identifier
-        "call" if lang == Lang::Elixir => {
-            return elixir_call_to_entry(node, lines, lang, depth);
-        }
-
-        // Elixir: @type, @typep, @opaque are unary_operator nodes
-        "unary_operator" if lang == Lang::Elixir => {
-            return elixir_attr_to_entry(node, lines);
-        }
-
-        // Bash: top-level variable assignments (`MY_VAR=value`, `ARR[0]=value`)
-        "variable_assignment" if lang == Lang::Bash => {
-            let name = assignment_name(node, lines).unwrap_or_else(|| "<var>".into());
-            (OutlineKind::Variable, name, None)
-        }
-
-        // Bash: top-level `export` / `declare` / `readonly` declarations. The name
-        // is the `name` of the inner variable_assignment (`export FOO=bar`) or a
-        // bare variable_name child (`export FOO`). Function-local `local`
-        // declarations are nested in function bodies, so walk_top_level never
-        // reaches them here. Multi-variable declarations surface their first name.
-        "declaration_command" if lang == Lang::Bash => {
-            let mut cursor = node.walk();
-            let name = node
-                .children(&mut cursor)
-                .find_map(|child| match child.kind() {
-                    "variable_assignment" => assignment_name(child, lines),
-                    "variable_name" => Some(node_text(child, lines)),
-                    _ => None,
-                })?;
-            (OutlineKind::Variable, name, None)
         }
 
         _ => return None,
@@ -918,6 +892,77 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
     None
 }
 
+pub(crate) fn bash_special_outline(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    _lang: Lang,
+    _depth: usize,
+) -> Option<OutlineEntry> {
+    let name = match node.kind() {
+        "variable_assignment" => assignment_name(node, lines).unwrap_or_else(|| "<var>".into()),
+        "declaration_command" => {
+            let mut cursor = node.walk();
+            let found = node
+                .children(&mut cursor)
+                .find_map(|child| match child.kind() {
+                    "variable_assignment" => assignment_name(child, lines),
+                    "variable_name" => Some(node_text(child, lines)),
+                    _ => None,
+                });
+            found?
+        }
+        _ => return None,
+    };
+    Some(OutlineEntry {
+        kind: OutlineKind::Variable,
+        name,
+        start_line: node.start_position().row as u32 + 1,
+        span_start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        signature: None,
+        children: Vec::new(),
+        doc: extract_doc(node, lines),
+    })
+}
+
+pub(crate) fn elixir_special_outline(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+) -> Option<OutlineEntry> {
+    match node.kind() {
+        "call" => elixir_call_to_entry(node, lines, lang, depth),
+        "unary_operator" => elixir_attr_to_entry(node, lines),
+        _ => None,
+    }
+}
+
+pub(crate) fn bash_import_source(text: &str) -> String {
+    let trimmed = text.trim().trim_end_matches(';');
+    let after = trimmed
+        .strip_prefix("source")
+        .or_else(|| trimmed.strip_prefix('.'))
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map_or(trimmed, str::trim_start);
+    if after.contains('$') {
+        return String::new();
+    }
+    after
+        .trim_matches(|character| character == '"' || character == '\'')
+        .to_string()
+}
+
+pub(crate) fn elixir_import_source(text: &str) -> String {
+    let trimmed = text.trim().trim_end_matches(';');
+    for prefix in ["use ", "import ", "alias ", "require "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.split(',').next().unwrap_or(rest).trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Extract the source module name from an import statement text.
 /// Handles: `use std::fs;` → `std::fs`, `import X from "react"` → `react`,
 /// `from collections import X` → `collections`
@@ -925,32 +970,12 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
 /// The `lang` parameter is needed to disambiguate `use` (Rust path vs Elixir module)
 /// and `import` (JS/TS `from` syntax vs Elixir/Python/Go bare module name).
 pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
+    if let Some(source) =
+        lang.and_then(|language| crate::lang::spec::spec(language).policy.import_source)
+    {
+        return source(text);
+    }
     let trimmed = text.trim().trim_end_matches(';');
-
-    // Bash: `source ./lib.sh`, `. ./lib.sh`, or tab-separated variants
-    if lang == Some(crate::types::Lang::Bash) {
-        let after = trimmed
-            .strip_prefix("source")
-            .or_else(|| trimmed.strip_prefix('.'))
-            .filter(|rest| rest.starts_with(char::is_whitespace))
-            .map_or(trimmed, str::trim_start);
-        // Skip variable-expanded paths (contain `$`)
-        if after.contains('$') {
-            return String::new();
-        }
-        return after.trim_matches(|c| c == '"' || c == '\'').to_string();
-    }
-
-    // Elixir: `use GenServer`, `import Kernel`, `alias Foo.Bar`, `require Logger`
-    // Must be checked before the Rust `use` and JS `import` branches.
-    if lang == Some(crate::types::Lang::Elixir) {
-        for prefix in &["use ", "import ", "alias ", "require "] {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                return rest.split(',').next().unwrap_or(rest).trim().to_string();
-            }
-        }
-        return trimmed.to_string();
-    }
 
     // Rust: `use foo::bar` → `foo::bar`
     if let Some(rest) = trimmed.strip_prefix("use ") {

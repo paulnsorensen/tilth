@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, OutlineMode};
 use crate::lang::detect_file_type;
 use crate::read::outline;
 use crate::search::base_walk_builder;
@@ -45,7 +45,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
         let file_type = detect_file_type(path);
         let symbols = match file_type {
             FileType::Code(_) => {
-                let outline_str = cache.get_or_compute_disk(path, true, || {
+                let outline_str = cache.get_or_compute_disk(path, OutlineMode::Capped, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -111,7 +111,7 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 }
 
 /// Compact human token count for directory rollups.
-/// Uses the same scale as `tilth_list` output (`12.3k`, `1.2M`).
+/// Uses compact k and M labels (`12.3k`, `1.2M`).
 ///
 /// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
 /// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
