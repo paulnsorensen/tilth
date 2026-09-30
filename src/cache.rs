@@ -40,6 +40,13 @@ pub struct ParsedFile {
     pub lang: Lang,
 }
 
+impl ParsedFile {
+    pub(crate) fn outline_entries(&self) -> Vec<crate::types::OutlineEntry> {
+        let lines: Vec<_> = self.content.lines().collect();
+        crate::lang::outline::walk_top_level(self.tree.root_node(), &lines, self.lang)
+    }
+}
+
 /// Cached parsed entry keyed by path.
 struct ParsedEntry {
     revision: FileRevision,
@@ -170,9 +177,7 @@ impl OutlineCache {
         // Stale or absent — parse and insert.
         let ts_lang = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&ts_lang).ok()?;
-        let tree = parser.parse(&content, None)?;
+        let tree = crate::lang::treesitter::parse_source(&content, &ts_lang)?;
         if FileRevision::of(path).as_ref() != Some(&revision) {
             return None;
         }
@@ -181,12 +186,55 @@ impl OutlineCache {
             tree,
             lang,
         });
+        self.publish_or_reuse_if_current(path, revision, file)
+    }
+
+    /// Reuse a disk snapshot only when its bytes match the caller's source.
+    /// Large files and retained source revisions parse without entering the cache.
+    pub(crate) fn parse_source(&self, path: &Path, content: &str) -> Option<Arc<ParsedFile>> {
+        if let Some(file) = self.get_or_parse(path) {
+            if file.content.as_str() == content {
+                return Some(file);
+            }
+        }
+        let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+            return None;
+        };
+        let language = crate::lang::outline::outline_language(lang)?;
+        let tree = crate::lang::treesitter::parse_source(content, &language)?;
+        Some(Arc::new(ParsedFile {
+            content: Arc::new(content.to_string()),
+            tree,
+            lang,
+        }))
+    }
+
+    /// Publish a completed parse only while it still describes the file on disk.
+    ///
+    /// This final revision check happens under the cache lock. A slow parse for
+    /// an old revision cannot replace a newer snapshot that another reader has
+    /// already published. A concurrent parse of the same revision reuses the
+    /// first published immutable snapshot.
+    fn publish_or_reuse_if_current(
+        &self,
+        path: &Path,
+        revision: FileRevision,
+        file: Arc<ParsedFile>,
+    ) -> Option<Arc<ParsedFile>> {
         let mut parsed = self
             .parsed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if FileRevision::of(path).as_ref() != Some(&revision) {
+            return None;
+        }
+        if let Some(entry) = parsed.get(path) {
+            if entry.revision == revision {
+                return Some(Arc::clone(&entry.file));
+            }
+        }
         parsed.put(
-            key,
+            path.to_path_buf(),
             ParsedEntry {
                 revision,
                 file: Arc::clone(&file),
@@ -386,6 +434,28 @@ mod tests {
     }
 
     #[test]
+    fn documents_growth_beyond_limit_then_shrink_refreshes_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resized.rs");
+        std::fs::write(&path, "fn before() {}").unwrap();
+        let cache = OutlineCache::new();
+        let retained = cache.get_or_parse(&path).unwrap();
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(500_001)
+            .unwrap();
+        assert!(cache.get_or_parse(&path).is_none());
+
+        std::fs::write(&path, "fn after() {}").unwrap();
+        let current = cache.get_or_parse(&path).unwrap();
+        assert!(!Arc::ptr_eq(&retained, &current));
+        assert_eq!(retained.outline_entries()[0].name, "before");
+        assert_eq!(current.outline_entries()[0].name, "after");
+        assert!(Arc::ptr_eq(&current, &cache.get_or_parse(&path).unwrap()));
+    }
+
+    #[test]
     fn outline_cache_bounds_entry_count() {
         let cache = OutlineCache::new();
         // Insert more than the cap; the cache must never exceed it.
@@ -398,5 +468,174 @@ mod tests {
             len <= MAX_OUTLINE_ENTRIES,
             "cache grew unbounded: {len} entries"
         );
+    }
+
+    #[test]
+    fn late_old_revision_cannot_replace_newer_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        std::fs::write(&path, "fn old() {}").unwrap();
+        let cache = OutlineCache::new();
+        let old_revision = FileRevision::of(&path).unwrap();
+        let old_snapshot = cache.get_or_parse(&path).unwrap();
+
+        std::fs::write(&path, "fn new() {}").unwrap();
+        let newer_snapshot = cache.get_or_parse(&path).unwrap();
+        assert!(
+            cache
+                .publish_or_reuse_if_current(&path, old_revision, old_snapshot)
+                .is_none(),
+            "a late parse for an old disk revision must not replace a newer snapshot"
+        );
+        let retained = cache.get_or_parse(&path).unwrap();
+        assert!(Arc::ptr_eq(&newer_snapshot, &retained));
+        assert_eq!(&**retained.content, "fn new() {}");
+    }
+
+    #[test]
+    fn concurrent_misses_reuse_one_published_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("source.rs"));
+        std::fs::write(&*path, "fn shared() {}").unwrap();
+        let cache = Arc::new(OutlineCache::new());
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let path = Arc::clone(&path);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                cache.get_or_parse(&path).unwrap()
+            }));
+        }
+        start.wait();
+        let first = workers.pop().unwrap().join().unwrap();
+        let second = workers.pop().unwrap().join().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&**first.content, "fn shared() {}");
+    }
+
+    #[test]
+    fn documents_replacement_during_real_parse_does_not_publish_stale_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.rs");
+        let source = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let (entered, resume) = witness.pause_next();
+        let cache = Arc::new(OutlineCache::new());
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || worker_cache.get_or_parse(&worker_path));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        crate::util::atomic_write_bytes(&path, b"fn after() {}\n").unwrap();
+        let current = cache.get_or_parse(&path).unwrap();
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap().is_none());
+        assert!(Arc::ptr_eq(&current, &cache.get_or_parse(&path).unwrap()));
+        assert_eq!(current.outline_entries()[0].name, "after");
+        assert_eq!(witness.count(), 1);
+    }
+
+    #[test]
+    fn documents_retained_source_and_tree_stay_coherent_after_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retained.rs");
+        std::fs::write(&path, "fn before() {}").unwrap();
+        let cache = OutlineCache::new();
+        let retained = cache.get_or_parse(&path).unwrap();
+        std::fs::write(&path, "fn after() {}").unwrap();
+        let current = cache.get_or_parse(&path).unwrap();
+        assert!(!Arc::ptr_eq(&retained, &current));
+        assert_eq!(retained.outline_entries()[0].name, "before");
+        assert_eq!(current.outline_entries()[0].name, "after");
+        assert_eq!(
+            retained
+                .tree
+                .root_node()
+                .utf8_text(retained.content.as_bytes())
+                .unwrap(),
+            "fn before() {}"
+        );
+        let supplied = cache.parse_source(&path, &retained.content).unwrap();
+        assert_eq!(supplied.outline_entries()[0].name, "before");
+        assert!(Arc::ptr_eq(&current, &cache.get_or_parse(&path).unwrap()));
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.get_or_parse(&path).is_none());
+        assert_eq!(retained.outline_entries()[0].name, "before");
+    }
+
+    #[test]
+    fn documents_parsed_capacity_is_bounded_and_missing_paths_do_not_evict() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let first_path = dir.path().join("first.rs");
+        std::fs::write(&first_path, "fn retained() {}").unwrap();
+        let retained = cache.get_or_parse(&first_path).unwrap();
+        for index in 0..MAX_PARSED_ENTRIES {
+            let path = dir.path().join(format!("file_{index}.rs"));
+            std::fs::write(&path, format!("fn entry_{index}() {{}}")).unwrap();
+            assert!(cache.get_or_parse(&path).is_some());
+        }
+        assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
+        assert!(!cache.parsed.lock().unwrap().contains(&first_path));
+        let neighbor = dir.path().join("file_499.rs");
+        let unchanged = cache.get_or_parse(&neighbor).unwrap();
+        assert!(cache.get_or_parse(&dir.path().join("missing.rs")).is_none());
+        assert!(Arc::ptr_eq(
+            &unchanged,
+            &cache.get_or_parse(&neighbor).unwrap()
+        ));
+        assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
+        assert_eq!(retained.outline_entries()[0].name, "retained");
+    }
+
+    #[test]
+    fn documents_capped_and_uncapped_renderings_share_one_parse() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outline_test.rs");
+        let mut source = format!("// {}\n", dir.path().display());
+        for index in 0..150 {
+            writeln!(source, "pub fn entry_{index}() {{}}").unwrap();
+        }
+        std::fs::write(&path, &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let cache = OutlineCache::new();
+        let file_type = crate::types::FileType::Code(Lang::Rust);
+        let render = |capped| {
+            cache.get_or_compute(&path, source.as_bytes(), capped, || {
+                crate::read::outline::generate_cached(
+                    &path,
+                    file_type,
+                    &source,
+                    source.as_bytes(),
+                    capped,
+                    &cache,
+                )
+            })
+        };
+        let capped = render(true);
+        let uncapped = render(false);
+        assert!(capped.contains("outline truncated"));
+        assert!(!capped.contains("entry_149"));
+        assert!(uncapped.contains("entry_149"));
+        assert!(!uncapped.contains("outline truncated"));
+        assert!(Arc::ptr_eq(&capped, &render(true)));
+        assert!(Arc::ptr_eq(&uncapped, &render(false)));
+        assert_eq!(witness.count(), 1);
+        for (capped_mode, actual) in [(true, capped), (false, uncapped)] {
+            let expected = crate::read::outline::generate(
+                &path,
+                file_type,
+                &source,
+                source.as_bytes(),
+                capped_mode,
+            );
+            assert_eq!(&*actual, expected);
+        }
     }
 }

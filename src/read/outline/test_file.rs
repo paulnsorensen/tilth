@@ -6,10 +6,16 @@ use crate::types::Lang;
 pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<(String, bool)> {
     let language = crate::lang::outline::outline_language(lang)?;
 
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language).ok()?;
-    let tree = parser.parse(content, None)?;
+    let tree = crate::lang::treesitter::parse_source(content, &language)?;
 
+    outline_from_tree(content, max_lines, &tree)
+}
+
+pub(crate) fn outline_from_tree(
+    content: &str,
+    max_lines: usize,
+    tree: &tree_sitter::Tree,
+) -> Option<(String, bool)> {
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
     let mut entries = Vec::new();

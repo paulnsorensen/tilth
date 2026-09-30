@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::search::{callees, callers, grok};
 use crate::types::is_test_file;
@@ -68,7 +69,7 @@ impl Target {
                 .is_ok_and(|filter| !filter.matched(path, false).is_ignore())
     }
 
-    fn validate(&self, cwd: &Path) -> Result<(), String> {
+    fn validate(&self, cwd: &Path, cache: &OutlineCache) -> Result<(), String> {
         if self.scope != cwd.to_string_lossy() {
             return Err("follow target scope does not match cwd".into());
         }
@@ -110,28 +111,34 @@ impl Target {
             let spec = format!("{}:{line}", full.display());
             let (target, _, _) = match (self.name.as_deref(), self.occurrence) {
                 (Some(name), Some(occurrence)) => {
-                    grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd)
+                    grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd, cache)
                 }
-                _ => grok::resolve_with_source(&spec, cwd),
+                _ => grok::resolve_with_source_cached(&spec, cwd, cache),
             }
             .map_err(|e| e.to_string())?;
             if target.start_line != line || Some(&target.name) != self.name.as_ref() {
                 return Err("follow target identity changed; search again".into());
             }
-            self.validate_occurrence(&full, cwd)?;
+            self.validate_occurrence(&full, cwd, cache)?;
         }
         Ok(())
     }
 
-    fn validate_occurrence(&self, full: &Path, cwd: &Path) -> Result<(), String> {
+    fn validate_occurrence(
+        &self,
+        full: &Path,
+        cwd: &Path,
+        cache: &OutlineCache,
+    ) -> Result<(), String> {
         let Some(occurrence) = self.occurrence else {
             return Ok(());
         };
         let Some(name) = self.name.as_deref() else {
             return Err("follow occurrence requires a symbol target".into());
         };
-        let result = crate::search::search_symbol_raw(name, cwd, self.glob.as_deref())
-            .map_err(|e| e.to_string())?;
+        let result =
+            crate::search::search_symbol_raw_cached(name, cwd, self.glob.as_deref(), cache)
+                .map_err(|e| e.to_string())?;
         let canonical = full.canonicalize().map_err(|e| e.to_string())?;
         let matches = result.matches.iter().filter(|candidate| {
             candidate.is_definition
@@ -155,7 +162,7 @@ pub(super) struct Follow {
 }
 
 impl Follow {
-    pub fn parse(value: &Value, cwd: &Path) -> Result<Self, String> {
+    pub fn parse(value: &Value, cwd: &Path, cache: &OutlineCache) -> Result<Self, String> {
         let kind = value
             .get("kind")
             .and_then(Value::as_str)
@@ -178,7 +185,7 @@ impl Follow {
         }
         let follow: Self = serde_json::from_value(value.clone())
             .map_err(|e| format!("invalid follow hint: {e}"))?;
-        follow.target.validate(cwd)?;
+        follow.target.validate(cwd, cache)?;
         if follow.kind != "fetch_dependencies" && follow.target.line.is_none() {
             return Err("this continuation requires a symbol target".into());
         }
@@ -190,12 +197,13 @@ impl Follow {
         cwd: &Path,
         bloom: &BloomFilterCache,
         client: &str,
+        cache: &OutlineCache,
     ) -> Result<Value, String> {
         let query = self.target.name.as_deref().unwrap_or(&self.target.path);
         let mut result = super::base_result(query, &self.kind, "ok");
         result["target"] = json!(self.target);
         if self.kind == "fetch_dependencies" {
-            let deps = dependencies(&self.target, cwd, client)?;
+            let deps = dependencies(&self.target, cwd, client, cache)?;
             let empty = deps["imports"].as_array().unwrap().is_empty()
                 && deps["dependents"].as_array().unwrap().is_empty();
             if deps["coverage"] != "complete" {
@@ -210,18 +218,28 @@ impl Follow {
         let spec = format!("{}:{}", full.display(), self.target.line.unwrap());
         let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
             (Some(name), Some(occurrence)) => {
-                grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd)
+                grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd, cache)
             }
-            _ => grok::resolve_with_source(&spec, cwd),
+            _ => grok::resolve_with_source_cached(&spec, cwd, cache),
         }
         .map_err(|e| e.to_string())?;
-        self.target.validate_occurrence(&full, cwd)?;
+        self.target.validate_occurrence(&full, cwd, cache)?;
+        let parsed = cache.parse_source(&full, &content);
         let mut partial = false;
         let mut items = Vec::new();
         let target_span_start = target.span_start_line;
         match self.kind.as_str() {
             "fetch_siblings" => {
-                let entries = crate::lang::outline::get_deep_outline_tree(&content, lang);
+                let entries = parsed.as_ref().map_or_else(
+                    || crate::lang::outline::get_deep_outline_tree(&content, lang),
+                    |parsed| {
+                        crate::lang::outline::deep_outline_tree_from_tree(
+                            &parsed.content,
+                            lang,
+                            &parsed.tree,
+                        )
+                    },
+                );
                 items = grok::collect_siblings(&entries, &target)
                     .into_iter()
                     .map(|s| {
@@ -233,12 +251,20 @@ impl Follow {
                     .collect();
             }
             "fetch_callees" => {
-                let names = callees::extract_callee_names(
-                    &content,
-                    lang,
-                    Some((target_span_start, target.end_line)),
+                let range = Some((target_span_start, target.end_line));
+                let names = parsed.as_ref().map_or_else(
+                    || callees::extract_callee_names(&content, lang, range),
+                    |parsed| {
+                        callees::extract_callee_names_from_tree(
+                            &parsed.content,
+                            lang,
+                            &parsed.tree,
+                            range,
+                        )
+                    },
                 );
-                let resolved = callees::resolve_callees(&names, &full, &content, bloom);
+                let resolved =
+                    callees::resolve_callees_cached(&names, &full, &content, bloom, cache);
                 // Unresolved names are not verified external calls.
                 partial = names.iter().any(|n| !resolved.iter().any(|c| &c.name == n));
                 let candidates: Vec<_> = resolved
@@ -265,12 +291,13 @@ impl Follow {
             }
             "fetch_callers" | "fetch_tests" => {
                 let names = std::iter::once(target.name.clone()).collect();
-                let (matches, unreadable) = callers::find_callers_batch(
+                let (matches, unreadable) = callers::find_callers_batch_cached(
                     &names,
                     cwd,
                     bloom,
                     self.target.glob.as_deref(),
                     callers::BATCH_EARLY_QUIT,
+                    cache,
                 )
                 .map_err(|e| e.to_string())?;
                 partial = unreadable > 0 || matches.len() >= callers::BATCH_EARLY_QUIT;
@@ -282,11 +309,12 @@ impl Follow {
                         continue;
                     }
                     // Bind same-name candidates to the resolved definition through the existing import resolver.
-                    let resolved = callees::resolve_callees(
+                    let resolved = callees::resolve_callees_cached(
                         std::slice::from_ref(&target.name),
                         &caller.path,
                         &caller.content,
                         bloom,
+                        cache,
                     );
                     if resolved.is_empty() {
                         partial = true;
@@ -332,8 +360,13 @@ impl Follow {
     }
 }
 
-pub(super) fn dependencies(target: &Target, cwd: &Path, client: &str) -> Result<Value, String> {
-    dependencies_within(target, cwd, client, DEPS_WARM_DEADLINE)
+pub(super) fn dependencies(
+    target: &Target,
+    cwd: &Path,
+    client: &str,
+    cache: &OutlineCache,
+) -> Result<Value, String> {
+    dependencies_within(target, cwd, client, DEPS_WARM_DEADLINE, cache)
 }
 
 /// `budget` is the wall clock granted to reconcile + impact once the index
@@ -344,6 +377,7 @@ fn dependencies_within(
     cwd: &Path,
     client: &str,
     budget: Duration,
+    cache: &OutlineCache,
 ) -> Result<Value, String> {
     let full = cwd
         .join(&target.path)
@@ -359,7 +393,8 @@ fn dependencies_within(
         crate::lang::detect_file_type(&full),
         crate::types::FileType::Code(crate::types::Lang::Python)
     ) {
-        let resolution = crate::read::imports::resolve_python_scoped(&full, &content, &py_roots);
+        let resolution =
+            crate::read::imports::resolve_python_scoped_cached(&full, &content, &py_roots, cache);
         own_uncertain = !resolution.uncertain.is_empty();
         resolution
             .paths()
@@ -380,8 +415,13 @@ fn dependencies_within(
     let (refresh, impact, state) = match crate::index::deps::open(cwd, client) {
         Ok(handle) => {
             let deadline = Instant::now() + budget;
-            let refresh = crate::index::deps::reconcile(&handle, handle.worktree_root(), deadline);
-            let impact = crate::index::deps::impact(&handle, &full, deadline);
+            let refresh = crate::index::deps::reconcile_cached(
+                &handle,
+                handle.worktree_root(),
+                deadline,
+                cache,
+            );
+            let impact = crate::index::deps::impact_cached(&handle, &full, deadline, cache);
             (refresh, Some(impact), "open")
         }
         Err(_) => (crate::index::deps::Coverage::default(), None, "unavailable"),
@@ -449,9 +489,10 @@ mod tests {
     }
 
     fn run(cwd: &Path, hint: &Value) -> Value {
-        Follow::parse(hint, cwd)
+        let cache = OutlineCache::new();
+        Follow::parse(hint, cwd, &cache)
             .unwrap()
-            .execute(cwd, &BloomFilterCache::new(), "scope-test")
+            .execute(cwd, &BloomFilterCache::new(), "scope-test", &cache)
             .unwrap()
     }
 
@@ -484,7 +525,7 @@ mod tests {
 
         let mut absolute = follow_hint(tmp.path(), "fetch_callers", &Value::Null);
         absolute["target"]["path"] = json!(outside.path().join("secret.ts").to_string_lossy());
-        let err = Follow::parse(&absolute, tmp.path()).unwrap_err();
+        let err = Follow::parse(&absolute, tmp.path(), &OutlineCache::new()).unwrap_err();
         assert!(err.contains("cwd-relative"), "{err}");
 
         #[cfg(unix)]
@@ -497,7 +538,7 @@ mod tests {
             let mut linked = follow_hint(tmp.path(), "fetch_callers", &Value::Null);
             linked["target"]["path"] = json!("linked.ts");
             linked["target"]["line"] = json!(1);
-            let err = Follow::parse(&linked, tmp.path()).unwrap_err();
+            let err = Follow::parse(&linked, tmp.path(), &OutlineCache::new()).unwrap_err();
             assert!(err.contains("outside cwd"), "{err}");
         }
     }
@@ -520,8 +561,14 @@ mod tests {
             scope: tmp.path().to_string_lossy().into(),
             glob: None,
         };
-        let result =
-            dependencies_within(&target, tmp.path(), "deadline-test", Duration::ZERO).unwrap();
+        let result = dependencies_within(
+            &target,
+            tmp.path(),
+            "deadline-test",
+            Duration::ZERO,
+            &OutlineCache::new(),
+        )
+        .unwrap();
         assert_eq!(result["coverage"], "partial");
         assert_eq!(result["timed_out"], true);
         assert_eq!(result["refresh"]["complete"], false);
@@ -565,6 +612,7 @@ mod tests {
             tmp.path(),
             "uncertain-consumer-test",
             Duration::from_secs(30),
+            &OutlineCache::new(),
         )
         .unwrap();
         // surface.py's owner is blocked, so it can be a hidden dependent.
@@ -597,9 +645,10 @@ mod tests {
                 "scope": tmp.path().to_string_lossy(), "glob": null
             }})
         };
-        Follow::parse(&hint(ranges[1]), tmp.path()).expect("current occurrence is valid");
+        Follow::parse(&hint(ranges[1]), tmp.path(), &OutlineCache::new())
+            .expect("current occurrence is valid");
         std::fs::write(tmp.path().join("dupes.rs"), "fn run() {}\n").unwrap();
-        let err = Follow::parse(&hint(ranges[1]), tmp.path()).unwrap_err();
+        let err = Follow::parse(&hint(ranges[1]), tmp.path(), &OutlineCache::new()).unwrap_err();
         assert!(err.contains("occurrence changed"), "{err}");
     }
 

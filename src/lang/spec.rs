@@ -117,6 +117,9 @@ pub(crate) fn adornment_kind(node: tree_sitter::Node, kinds: &[&str]) -> bool {
 /// for grammars without a named declaration child).
 pub(crate) type CanonicalAnchor = fn(tree_sitter::Node) -> tree_sitter::Node;
 
+pub(crate) type ReceiverExtractor =
+    for<'a> fn(&str, tree_sitter::Node<'a>, &tree_sitter::Language) -> Option<String>;
+
 /// All per-language data and behavior in one record. Read via `spec(lang)`.
 pub(crate) struct LangSpec {
     /// Human-readable language name (`lang_display_name`).
@@ -144,7 +147,7 @@ pub(crate) struct LangSpec {
     pub has_lifetimes: bool,
     /// Comment/log stripping family.
     pub strip_family: Option<StripFamily>,
-    pub extract_receiver: Option<fn(&str, &tree_sitter::Language) -> Option<String>>,
+    pub extract_receiver: Option<ReceiverExtractor>,
     /// Definition-name extraction + semantic weight (Elixir overrides the defaults).
     pub definitions: DefinitionOps,
     /// Transparent definition wrapper node kinds.

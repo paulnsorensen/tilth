@@ -39,6 +39,32 @@ Treat these findings as adapter requirements, not evidence that Tree-sitter cann
 [^12]: https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/bindings/rust/lib.rs; https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.23.2/queries/tags.scm
 [^13]: https://github.com/tree-sitter/tree-sitter-javascript/blob/v0.25.0/queries/tags.scm
 
+## Shared parsed documents in the fork
+
+Tilth's shared parsed-document cache supplies immutable source and Tree-sitter snapshots to production read, search, and grok consumers.
+The MCP service passes one existing `OutlineCache` through these paths; it does not add a second parser cache.[^17]
+
+Disk revisions guard cache reuse and publication.
+A late parse cannot replace an already published newer revision.
+Concurrent misses for one revision reuse the first published snapshot.
+Old readers retain their original source and tree through `Arc<ParsedFile>`.[^18]
+
+The parsed cache retains at most 500 entries, with a 500,000-byte source limit per entry.
+Large files use uncached parsing where existing consumers permit them.
+This fallback preserves search results without increasing retained cache limits.
+Full and range reads do not require a syntax parse.[^19]
+
+Tree-aware helpers preserve existing outline extraction instead of replacing it with ast-grep outlines.
+Compiled-query caches release their mutex before caller, callee, sibling, or receiver matching runs.[^20]
+Parse reuse is verified behavior, not a measured end-to-end latency claim.
+
+[^17]: src/mcp/mod.rs:357-383; src/read/outline/mod.rs:47-69; src/mcp/mod.rs::tests::documents_reuse_real_parses_across_production_requests
+[^18]: src/cache.rs:34-54,151-244; src/cache.rs::tests::late_old_revision_cannot_replace_newer_snapshot; src/cache.rs::tests::concurrent_misses_reuse_one_published_snapshot
+[^19]: src/cache.rs:15-20,151-209; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
+[^20]: src/lang/treesitter.rs:428-456; src/search/callee_query.rs:36-56; src/lang/go.rs::extract_go_receiver_name
+
+_Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
+
 ## Other candidate boundaries
 
 `tempfile` already exists as a development dependency.

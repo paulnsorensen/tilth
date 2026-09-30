@@ -50,7 +50,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                     // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();
                     let buf = content.as_bytes();
-                    outline::generate(path, file_type, &content, buf, true)
+                    outline::generate_cached(path, file_type, &content, buf, true, cache)
                 });
 
                 Some(extract_symbol_names(&outline_str))

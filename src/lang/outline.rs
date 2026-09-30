@@ -1004,9 +1004,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 
 fn parse_outline(content: &str, lang: Lang) -> Option<(tree_sitter::Tree, Vec<&str>)> {
     let ts_lang = outline_language(lang)?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&ts_lang).ok()?;
-    let tree = parser.parse(content, None)?;
+    let tree = super::treesitter::parse_source(content, &ts_lang)?;
     Some((tree, content.lines().collect()))
 }
 
@@ -1055,9 +1053,21 @@ pub(crate) fn get_deep_outline_entries(content: &str, lang: Lang) -> Vec<Outline
 /// Parse the full declaration tree for consumers that need deep parent/sibling context.
 /// The regular outline remains shallow for display stability.
 pub(crate) fn get_deep_outline_tree(content: &str, lang: Lang) -> Vec<OutlineEntry> {
-    let Some((tree, lines)) = parse_outline(content, lang) else {
+    let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
     };
+    let Some(tree) = super::treesitter::parse_source(content, &ts_lang) else {
+        return Vec::new();
+    };
+    deep_outline_tree_from_tree(content, lang, &tree)
+}
+
+pub(crate) fn deep_outline_tree_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+) -> Vec<OutlineEntry> {
+    let lines: Vec<_> = content.lines().collect();
     let mut located = Vec::new();
     collect_located_entries(tree.root_node(), &lines, lang, &mut located);
     let mut flat = deep_outline_entries(tree.root_node(), &lines, lang);
@@ -1203,9 +1213,23 @@ fn get_outline_entries_and_entry(
     line: u32,
     accepts: fn(&OutlineEntry, u32) -> bool,
 ) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
-    let Some((tree, lines)) = parse_outline(content, lang) else {
+    let Some(ts_lang) = outline_language(lang) else {
         return (Vec::new(), None);
     };
+    let Some(tree) = super::treesitter::parse_source(content, &ts_lang) else {
+        return (Vec::new(), None);
+    };
+    outline_entries_and_entry_from_tree(content, lang, &tree, line, accepts)
+}
+
+fn outline_entries_and_entry_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+    line: u32,
+    accepts: fn(&OutlineEntry, u32) -> bool,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    let lines: Vec<_> = content.lines().collect();
     let root = tree.root_node();
     let entry = deep_outline_entries(root, &lines, lang)
         .into_iter()
@@ -1221,6 +1245,15 @@ pub(crate) fn get_outline_entries_and_entry_at_line(
     get_outline_entries_and_entry(content, lang, line, owns_path_line)
 }
 
+pub(crate) fn outline_entries_and_entry_at_line_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+    line: u32,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    outline_entries_and_entry_from_tree(content, lang, tree, line, owns_path_line)
+}
+
 /// Parse once, return the shallow outline, and resolve the deepest converted
 /// declaration with the requested name and canonical start line. When provided,
 /// `semantic_end` distinguishes declarations that share both values. If no
@@ -1233,9 +1266,24 @@ pub(crate) fn get_outline_entries_and_entry_by_name_at_start_line(
     line: u32,
     semantic_end: Option<u32>,
 ) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
-    let Some((tree, lines)) = parse_outline(content, lang) else {
+    let Some(ts_lang) = outline_language(lang) else {
         return (Vec::new(), None);
     };
+    let Some(tree) = super::treesitter::parse_source(content, &ts_lang) else {
+        return (Vec::new(), None);
+    };
+    outline_entries_and_entry_by_name_from_tree(content, lang, &tree, name, line, semantic_end)
+}
+
+pub(crate) fn outline_entries_and_entry_by_name_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+    name: &str,
+    line: u32,
+    semantic_end: Option<u32>,
+) -> (Vec<OutlineEntry>, Option<OutlineEntry>) {
+    let lines: Vec<_> = content.lines().collect();
     let root = tree.root_node();
     let mut deep_entries = deep_outline_entries(root, &lines, lang);
     let matches_identity = |entry: &OutlineEntry| {

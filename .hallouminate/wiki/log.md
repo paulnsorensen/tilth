@@ -8,3 +8,7 @@
 
 2026-09-30 · bae2d01722b96182 · merged · adr/tilth-search-v2-roadmap-003.md · Record signed pre-epoch file revisions and verified cache regressions.
 
+
+
+2026-09-30 · c970238aa51b13dc · merged · upstream-library-reuse.md · Record shared immutable parsed documents, revision-checked publication, bounded retention, uncached large-file fallback, and lock-free matching. Frozen retrieval probes pass at ranks 1, 2, 1, 1.
+

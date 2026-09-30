@@ -161,13 +161,14 @@ fn resolved_shard_fields(
     content: &str,
     worktree: &Path,
     roots: &crate::read::imports::PyRoots,
+    cache: &crate::cache::OutlineCache,
 ) -> ShardFields {
     let to_rel = |p: PathBuf| {
         p.strip_prefix(worktree)
             .ok()
             .map(|r| r.to_string_lossy().to_string())
     };
-    let fields = crate::read::imports::resolve_scoped_shard_fields(abs, content, roots);
+    let fields = crate::read::imports::resolve_scoped_shard_fields(abs, content, roots, cache);
     ShardFields {
         deps: fields.paths.into_iter().filter_map(to_rel).collect(),
         reexport_hops: fields.hops.into_iter().filter_map(to_rel).collect(),
@@ -183,6 +184,7 @@ fn rescan_shard(
     worktree: &Path,
     roots: &crate::read::imports::PyRoots,
     rel: &str,
+    cache: &crate::cache::OutlineCache,
 ) -> Option<(String, storage::FileShard)> {
     let abs = worktree.join(rel);
     let signature = storage::signature_of(&abs)?;
@@ -193,7 +195,7 @@ fn rescan_shard(
         return Some((rel.to_string(), ShardFields::empty().into_shard(signature)));
     }
     let content = std::fs::read_to_string(&abs).ok()?;
-    let fields = resolved_shard_fields(&abs, &content, worktree, roots);
+    let fields = resolved_shard_fields(&abs, &content, worktree, roots, cache);
     if storage::signature_of(&abs).as_ref() != Some(&signature) {
         return None;
     }
@@ -257,6 +259,7 @@ fn drain_worklist(
     worklist: HashSet<String>,
     already: &HashSet<String>,
     deadline: Instant,
+    cache: &crate::cache::OutlineCache,
 ) -> (Vec<(String, storage::FileShard)>, Vec<String>) {
     let mut forced_upserts = Vec::new();
     let mut still_pending = Vec::new();
@@ -269,7 +272,7 @@ fn drain_worklist(
             still_pending.push(rel);
             break;
         }
-        if let Some(shard) = rescan_shard(worktree, roots, &rel) {
+        if let Some(shard) = rescan_shard(worktree, roots, &rel, cache) {
             forced_upserts.push(shard);
         }
     }
@@ -293,13 +296,14 @@ fn rescan_reexport_importers(
     pending: Vec<String>,
     walk_status: WalkStatus,
     deadline: Instant,
+    cache: &crate::cache::OutlineCache,
 ) -> (Vec<(String, storage::FileShard)>, Vec<String>, bool) {
     let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
     let mut worklist = reexport_worklist(db, upserts, deletes, previously_known, pending);
     match walk_status {
         WalkStatus::Complete => {
             let (forced_upserts, still_pending) =
-                drain_worklist(worktree, roots, worklist, &already, deadline);
+                drain_worklist(worktree, roots, worklist, &already, deadline, cache);
             let timed_out = !still_pending.is_empty();
             (forced_upserts, still_pending, timed_out)
         }
@@ -327,7 +331,23 @@ fn rescan_reexport_importers(
 /// deadline is checked across the initial walk, the invalidation worklist,
 /// the forced rebuild, and the write stage; `Coverage.complete` is false
 /// whenever any of those stages stops with work remaining.
+#[cfg(test)]
 pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant) -> Coverage {
+    reconcile_cached(
+        handle,
+        worktree,
+        deadline,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+/// Reconcile dependency shards with the request's shared document cache.
+pub(crate) fn reconcile_cached(
+    handle: &HandleState,
+    worktree: &Path,
+    deadline: Instant,
+    cache: &crate::cache::OutlineCache,
+) -> Coverage {
     let Ok((known_signatures, previously_known)) = storage::file_index_state(&handle.db) else {
         return Coverage::default();
     };
@@ -397,7 +417,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 failed = true;
                 continue;
             };
-            resolved_shard_fields(path, &content, worktree, &roots)
+            resolved_shard_fields(path, &content, worktree, &roots, cache)
         } else {
             ShardFields::empty()
         };
@@ -438,6 +458,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         pending,
         walk_status,
         deadline,
+        cache,
     );
     timed_out |= worklist_timed_out;
 
@@ -460,7 +481,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                     pending_to_write.push(importer);
                     break;
                 }
-                if let Some((rel, shard)) = rescan_shard(worktree, &roots, &importer) {
+                if let Some((rel, shard)) = rescan_shard(worktree, &roots, &importer, cache) {
                     if shard.deps.iter().any(|d| new_inits.contains(d.as_str())) {
                         forced_upserts.push((rel, shard));
                     }
@@ -513,7 +534,18 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
 /// current on-disk state before being reported — a stored edge that no
 /// longer holds (source deleted, import removed) is dropped rather than
 /// returned stale.
+#[cfg(test)]
 pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> VerifiedPartial {
+    impact_cached(handle, target, deadline, &crate::cache::OutlineCache::new())
+}
+
+/// Verify dependents with the request's shared document cache.
+pub(crate) fn impact_cached(
+    handle: &HandleState,
+    target: &Path,
+    deadline: Instant,
+    cache: &crate::cache::OutlineCache,
+) -> VerifiedPartial {
     let target_abs = if target.is_absolute() {
         target.to_path_buf()
     } else {
@@ -577,8 +609,12 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         let verified = if shard.signature == live_signature {
             true
         } else if let Ok(content) = std::fs::read_to_string(&candidate_abs) {
-            let fields =
-                crate::read::imports::resolve_scoped_shard_fields(&candidate_abs, &content, &roots);
+            let fields = crate::read::imports::resolve_scoped_shard_fields(
+                &candidate_abs,
+                &content,
+                &roots,
+                cache,
+            );
             let proven = fields
                 .paths
                 .iter()
@@ -1230,7 +1266,8 @@ mod tests {
         let middle = "packages/producer/src/producer/ingest/__init__.py";
         write_file(repo.path(), middle, "from .leaf2 import Thing\n");
         let roots = crate::read::imports::PyRoots::discover(repo.path());
-        let (rel, shard) = rescan_shard(repo.path(), &roots, middle).unwrap();
+        let cache = crate::cache::OutlineCache::new();
+        let (rel, shard) = rescan_shard(repo.path(), &roots, middle, &cache).unwrap();
         let upserts = vec![(rel, shard)];
         let (_, previously_known) = storage::file_index_state(&handle.db).unwrap();
         let (forced, pending, timed_out) = rescan_reexport_importers(
@@ -1243,6 +1280,7 @@ mod tests {
             Vec::new(),
             WalkStatus::TimedOut,
             far_deadline(),
+            &cache,
         );
 
         assert!(timed_out);
@@ -1326,7 +1364,8 @@ mod tests {
         );
         let roots = crate::read::imports::PyRoots::discover(repo.path());
         let init_rel = "packages/producer/src/producer/ingest/__init__.py".to_string();
-        let (rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel).unwrap();
+        let cache = crate::cache::OutlineCache::new();
+        let (rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel, &cache).unwrap();
         let upserts = vec![(rel, new_shard)];
         let previously_known: HashSet<String> = [init_rel.clone()].into_iter().collect();
 
@@ -1337,6 +1376,7 @@ mod tests {
             worklist,
             &HashSet::new(),
             Instant::now(),
+            &cache,
         );
 
         assert!(

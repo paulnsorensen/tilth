@@ -29,30 +29,31 @@ fn sibling_query_str(lang: Lang) -> Option<&'static str> {
 /// field accesses and method calls on `self`/`this`. Returns deduplicated,
 /// sorted member names.
 pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u32)) -> Vec<String> {
+    let Some(language) = outline_language(lang) else {
+        return Vec::new();
+    };
+    let Some(tree) = crate::lang::treesitter::parse_source(content, &language) else {
+        return Vec::new();
+    };
+    extract_sibling_references_from_tree(content, lang, &tree, def_range)
+}
+
+pub(crate) fn extract_sibling_references_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+    def_range: (u32, u32),
+) -> Vec<String> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
     };
-
     let Some(query_str) = sibling_query_str(lang) else {
         return Vec::new();
     };
-
-    // For Go, resolve the receiver name before entering the query cache lock to
-    // avoid re-entrancy on `QUERY_CACHE` (the receiver extractor also uses it).
-    // The extractor is supplied per-language via `spec(lang).extract_receiver`
-    // (only Go has one).
+    // Receiver extraction borrows the same source and tree.
     let go_receiver = crate::lang::spec::spec(lang)
         .extract_receiver
-        .and_then(|extract| extract(content, &ts_lang));
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
+        .and_then(|extract| extract(content, tree.root_node(), &ts_lang));
 
     let bytes = content.as_bytes();
     let (start, end) = def_range;

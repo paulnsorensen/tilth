@@ -216,7 +216,7 @@ pub fn read_file(
         let file_mb = byte_len as f64 / 1_000_000.0;
 
         let outline = cache.get_or_compute(path, buf, true, || {
-            outline::generate(path, file_type, &content, buf, true)
+            outline::generate_cached(path, file_type, &content, buf, true, cache)
         });
 
         let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
@@ -247,7 +247,7 @@ pub fn read_file(
     let capped = byte_len > FILE_SIZE_CAP;
 
     let outline = cache.get_or_compute(path, buf, capped, || {
-        outline::generate(path, file_type, &content, buf, capped)
+        outline::generate_cached(path, file_type, &content, buf, capped, cache)
     });
 
     // OGATE: if the outline is not meaningfully smaller than the full file,

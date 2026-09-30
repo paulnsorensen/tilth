@@ -170,7 +170,7 @@ fn run_search_v2(
                 ));
             }
             follows.push(Some(
-                Follow::parse(hint, cwd).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
+                Follow::parse(hint, cwd, cache).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
             ));
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
@@ -204,7 +204,7 @@ fn run_search_v2(
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             let result = follow
-                .execute(cwd, bloom, client)
+                .execute(cwd, bloom, client, cache)
                 .map_err(|e| SearchFailure::new(e, "follow_error"))?;
             (result, follow.kind.clone(), Vec::new(), None)
         } else {
@@ -220,7 +220,7 @@ fn run_search_v2(
         if result.get("target").is_some() && follow.is_none() {
             let target: Target = serde_json::from_value(result["target"].clone())
                 .map_err(|e| SearchFailure::new(e.to_string(), "dependency_error"))?;
-            result["dependency_impact"] = continuations::dependencies(&target, cwd, client)
+            result["dependency_impact"] = continuations::dependencies(&target, cwd, client, cache)
                 .map_err(|e| SearchFailure::new(e, "dependency_error"))?;
             if result["dependency_impact"]["coverage"] != "complete" {
                 mark_partial(&mut result);
@@ -393,8 +393,17 @@ fn route_query(
                 crate::types::FileType::Code(_)
             ) {
                 let target_spec = format!("{query}:1");
-                let (mut result, hints) =
-                    unique_hit(&target_spec, "path", &candidate, 1, None, None, cwd, glob)?;
+                let (mut result, hints) = unique_hit(
+                    &target_spec,
+                    "path",
+                    &candidate,
+                    1,
+                    None,
+                    None,
+                    cwd,
+                    glob,
+                    cache,
+                )?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
@@ -475,7 +484,7 @@ fn route_identifier(
     cwd: &Path,
     cache: &OutlineCache,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    let sym_result = crate::search::search_symbol_raw(query, cwd, glob)?;
+    let sym_result = crate::search::search_symbol_raw_cached(query, cwd, glob, cache)?;
     let discovery_partial = sym_result.files_unreadable > 0
         || sym_result.definitions
             > sym_result
@@ -528,6 +537,7 @@ fn route_identifier(
             target.def_byte_range,
             cwd,
             glob,
+            cache,
         )?;
         if discovery_partial {
             mark_partial(&mut result);
@@ -679,6 +689,7 @@ fn unique_hit(
     occurrence: Option<(usize, usize)>,
     cwd: &Path,
     glob: Option<&str>,
+    cache: &OutlineCache,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
     let (source_path, line, name, body, core_partial) = if resolved_as == "path" {
         let content = std::fs::read_to_string(target_path).map_err(|source| {
@@ -698,12 +709,14 @@ fn unique_hit(
                 semantic_end,
                 query,
                 occurrence,
+                cache,
             )?,
             None => crate::search::grok::resolve_candidate_with_source(
                 target_path,
                 target_line,
                 semantic_end,
                 query,
+                cache,
             )?,
         };
         let span_start = target.span_start_line;
@@ -786,8 +799,18 @@ mod tests {
         let path = tmp.path().join("a.rs");
         std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
 
-        let (result, hints) = unique_hit("root", "symbol", &path, 3, None, None, tmp.path(), None)
-            .expect("fresh symbol resolution must replace the stale candidate line");
+        let (result, hints) = unique_hit(
+            "root",
+            "symbol",
+            &path,
+            3,
+            None,
+            None,
+            tmp.path(),
+            None,
+            &OutlineCache::new(),
+        )
+        .expect("fresh symbol resolution must replace the stale candidate line");
 
         assert_eq!(result["core"], "fn root() {}");
         assert_eq!(result["target"]["line"], 1);
@@ -1774,10 +1797,23 @@ mod tests {
     /// is a session fact rather than a constant.
     #[test]
     fn telemetry_snapshots_pretrim_inputs_and_session_first_call() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success());
+        // Keep metadata independent of the checkout path, but force body trimming.
+        let source = format!(
+            "fn detect_file_type() {{\n{}\n}}\n",
+            "    let _value = 1;\n".repeat(300)
+        );
+        std::fs::write(root.path().join("fixture.rs"), source).unwrap();
         let (cache, session, bloom) = components();
         let (telemetry, sink) = telemetry();
         let args = json!({
-            "cwd": repo_root().to_str().unwrap(),
+            "cwd": root.path(),
             "queries": [{"query": "detect_file_type"}, {"query": "detect_file_type"}],
             "budget": 900,
         });

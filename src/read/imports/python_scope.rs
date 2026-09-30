@@ -17,9 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
+use crate::cache::{OutlineCache, ParsedFile};
 use crate::lang::detect_file_type;
-use crate::lang::outline::outline_language;
 use crate::types::{FileType, Lang};
+use std::sync::Arc;
 
 /// A resolved import edge with the evidence that produced it.
 pub(crate) struct ImportEdge {
@@ -186,20 +187,31 @@ pub(crate) fn resolve_python_edges(
     content: &str,
     roots: &PyRoots,
 ) -> PyResolution {
+    resolve_python_edges_cached(file_path, content, roots, &OutlineCache::new())
+}
+
+pub(crate) fn resolve_python_edges_cached(
+    file_path: &Path,
+    content: &str,
+    roots: &PyRoots,
+    cache: &OutlineCache,
+) -> PyResolution {
     let mut res = PyResolution::default();
     let Some(dir) = file_path.parent() else {
         return res;
     };
-    let Some(tree) = parse_python(content) else {
+    let Some(parsed) = cache.parse_source(file_path, content) else {
         return res;
     };
     let mut raw = Vec::new();
-    collect_python_imports(tree.root_node(), content.as_bytes(), &mut raw);
+    collect_python_imports(parsed.tree.root_node(), parsed.content.as_bytes(), &mut raw);
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    // One initializer cache per resolution pass: each `__init__.py` on a
-    // re-export chain is read and parsed once, not once per (name, hop).
-    let mut inits = InitCache::default();
+    // Per-pass ownership records borrow shared document snapshots.
+    let mut inits = InitCache {
+        files: HashMap::new(),
+        documents: cache,
+    };
     for imp in raw {
         if imp.module.is_empty() {
             continue;
@@ -289,13 +301,6 @@ pub(crate) fn target_ambiguity(target: &Path, roots: &PyRoots) -> Option<Ambiguo
     } else {
         None
     }
-}
-
-fn parse_python(content: &str) -> Option<tree_sitter::Tree> {
-    let language = outline_language(Lang::Python)?;
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language).ok()?;
-    parser.parse(content, None)
 }
 
 /// One import statement in raw form: the module source, the line it sits on,
@@ -445,46 +450,51 @@ enum OwnerResult {
 
 /// One parsed package initializer: its source, syntax tree, and imports.
 struct ParsedInit {
-    content: String,
-    tree: tree_sitter::Tree,
+    file: Arc<ParsedFile>,
     imports: Vec<RawImport>,
 }
 
 /// Parsed initializers for one resolution pass. `None` records a read or
 /// parse failure so the failure is also reported once, not retried per hop.
-#[derive(Default)]
-struct InitCache {
+struct InitCache<'a> {
     files: HashMap<PathBuf, Option<Rc<ParsedInit>>>,
+    documents: &'a OutlineCache,
 }
 
-impl InitCache {
+impl InitCache<'_> {
     fn get(&mut self, init: &Path) -> Option<Rc<ParsedInit>> {
         if let Some(cached) = self.files.get(init) {
             return cached.clone();
         }
-        let parsed = std::fs::read_to_string(init).ok().and_then(|content| {
-            let tree = parse_python(&content)?;
-            let mut imports = Vec::new();
-            collect_python_imports(tree.root_node(), content.as_bytes(), &mut imports);
-            Some(Rc::new(ParsedInit {
-                content,
-                tree,
-                imports,
-            }))
-        });
+        let parsed = self
+            .documents
+            .get_or_parse(init)
+            .or_else(|| {
+                let content = std::fs::read_to_string(init).ok()?;
+                self.documents.parse_source(init, &content)
+            })
+            .map(|file| {
+                let mut imports = Vec::new();
+                collect_python_imports(
+                    file.tree.root_node(),
+                    file.content.as_bytes(),
+                    &mut imports,
+                );
+                Rc::new(ParsedInit { file, imports })
+            });
         self.files.insert(init.to_path_buf(), parsed.clone());
         parsed
     }
 }
 
-fn initializer_defines_name(inits: &mut InitCache, init: &Path, name: &str) -> bool {
+fn initializer_defines_name(inits: &mut InitCache<'_>, init: &Path, name: &str) -> bool {
     let Some(parsed) = inits.get(init) else {
         return false;
     };
-    let root = parsed.tree.root_node();
+    let root = parsed.file.tree.root_node();
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
-        if python_node_defines_name(node, parsed.content.as_bytes(), name) {
+        if python_node_defines_name(node, parsed.file.content.as_bytes(), name) {
             return true;
         }
     }
@@ -541,7 +551,7 @@ fn resolve_reexport_owner(
     name: &str,
     roots: &PyRoots,
     visited: &mut HashSet<(PathBuf, String)>,
-    inits: &mut InitCache,
+    inits: &mut InitCache<'_>,
 ) -> OwnerResult {
     if !visited.insert((init.to_path_buf(), name.to_string())) {
         return OwnerResult::Blocked; // cycle: terminate without fabricating an owner
@@ -936,7 +946,11 @@ mod tests {
             .join("packages/producer/src/producer/ingest/__init__.py");
         let roots = PyRoots::discover(tmp.path());
         let mut visited = HashSet::new();
-        let mut inits = InitCache::default();
+        let cache = OutlineCache::new();
+        let mut inits = InitCache {
+            files: HashMap::new(),
+            documents: &cache,
+        };
         // The resolver terminates and reports no fabricated owner.
         assert!(matches!(
             resolve_reexport_owner(&init, "RankingEntry", &roots, &mut visited, &mut inits),
@@ -1214,7 +1228,11 @@ mod tests {
         let init = tmp
             .path()
             .join("packages/producer/src/producer/ingest/__init__.py");
-        let mut inits = InitCache::default();
+        let cache = OutlineCache::new();
+        let mut inits = InitCache {
+            files: HashMap::new(),
+            documents: &cache,
+        };
         let first = inits.get(&init).expect("readable initializer");
         // A later read of the same path returns the cached parse, even after
         // the file changes on disk within the pass.

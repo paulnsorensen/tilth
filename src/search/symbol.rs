@@ -61,6 +61,24 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
+    search_cached(
+        query,
+        scope,
+        context,
+        glob,
+        full,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+pub(crate) fn search_cached(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    cache: &crate::cache::OutlineCache,
+) -> Result<SearchResult, TilthError> {
     let (max_matches, def_threshold, usage_threshold) = if full {
         (
             FULL_MAX_MATCHES,
@@ -83,7 +101,7 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold),
+        || find_definitions(query, scope, glob, def_threshold, cache),
         || find_usages(query, &matcher, scope, glob, usage_threshold),
     );
 
@@ -160,6 +178,7 @@ fn find_definitions(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
+    cache: &crate::cache::OutlineCache,
 ) -> Result<(Vec<Match>, usize), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -227,7 +246,24 @@ fn find_definitions(
             let ts_language = lang.and_then(outline_language);
 
             let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, lang, &content, file_lines, mtime)
+                cache.parse_source(path, &content).map_or_else(
+                    || {
+                        find_defs_treesitter(
+                            path, query, ts_lang, lang, &content, file_lines, mtime,
+                        )
+                    },
+                    |parsed| {
+                        find_defs_from_tree(
+                            path,
+                            query,
+                            lang,
+                            &parsed.content,
+                            file_lines,
+                            mtime,
+                            &parsed.tree,
+                        )
+                    },
+                )
             } else {
                 Vec::new()
             };
@@ -288,8 +324,9 @@ pub(crate) fn all_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
 ) -> Result<Vec<Match>, TilthError> {
-    let (mut defs, _files_unreadable) = find_definitions(query, scope, glob, usize::MAX)?;
+    let (mut defs, _files_unreadable) = find_definitions(query, scope, glob, usize::MAX, cache)?;
     rank::sort(&mut defs, query, scope, None);
     defs.sort_by_key(stratum_for_display);
     Ok(defs)
@@ -306,15 +343,21 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::treesitter::parse_source(content, ts_lang) else {
         return Vec::new();
     };
+    find_defs_from_tree(path, query, lang, content, file_lines, mtime, &tree)
+}
 
+fn find_defs_from_tree(
+    path: &Path,
+    query: &str,
+    lang: Option<crate::types::Lang>,
+    content: &str,
+    file_lines: u32,
+    mtime: SystemTime,
+    tree: &tree_sitter::Tree,
+) -> Vec<Match> {
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
     let mut defs = Vec::new();

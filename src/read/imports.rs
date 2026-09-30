@@ -42,10 +42,12 @@ pub(crate) fn resolve_scoped_shard_fields(
     file_path: &Path,
     content: &str,
     roots: &PyRoots,
+    cache: &crate::cache::OutlineCache,
 ) -> ScopedShardFields {
     match detect_file_type(file_path) {
         FileType::Code(Lang::Python) => {
-            python_scope::resolve_python_edges(file_path, content, roots).into_shard_fields()
+            python_scope::resolve_python_edges_cached(file_path, content, roots, cache)
+                .into_shard_fields()
         }
         _ => ScopedShardFields {
             paths: resolve_related_files_with_content(file_path, content),
@@ -62,8 +64,22 @@ pub(crate) fn resolve_python_scoped(
     content: &str,
     roots: &PyRoots,
 ) -> PyResolution {
+    resolve_python_scoped_cached(
+        file_path,
+        content,
+        roots,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+pub(crate) fn resolve_python_scoped_cached(
+    file_path: &Path,
+    content: &str,
+    roots: &PyRoots,
+    cache: &crate::cache::OutlineCache,
+) -> PyResolution {
     if matches!(detect_file_type(file_path), FileType::Code(Lang::Python)) {
-        python_scope::resolve_python_edges(file_path, content, roots)
+        python_scope::resolve_python_edges_cached(file_path, content, roots, cache)
     } else {
         PyResolution::default()
     }

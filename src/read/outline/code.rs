@@ -9,15 +9,19 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> (String, bool) {
         return fallback_outline(content, max_lines);
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
-        return fallback_outline(content, max_lines);
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::treesitter::parse_source(content, &language) else {
         return fallback_outline(content, max_lines);
     };
 
+    outline_from_tree(content, lang, max_lines, &tree)
+}
+
+pub(crate) fn outline_from_tree(
+    content: &str,
+    lang: Lang,
+    max_lines: usize,
+    tree: &tree_sitter::Tree,
+) -> (String, bool) {
     let root = tree.root_node();
     let lines: Vec<&str> = content.lines().collect();
     let entries = walk_top_level(root, &lines, lang);

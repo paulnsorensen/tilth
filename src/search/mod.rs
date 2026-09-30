@@ -363,7 +363,7 @@ pub fn search_symbol(
     cache: &OutlineCache,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, false)?;
+    let result = symbol::search_cached(query, scope, None, glob, false, cache)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(
         &result,
@@ -391,7 +391,7 @@ pub fn search_symbol_expanded(
     edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, context, glob, full)?;
+    let result = symbol::search_cached(query, scope, context, glob, full, cache)?;
     format_search_result(
         &result,
         cache,
@@ -429,7 +429,7 @@ pub fn search_multi_symbol_expanded(
     let mut sections: Vec<alloc::BudgetedSection> = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let result = symbol::search(query, scope, context, glob, full)?;
+        let result = symbol::search_cached(query, scope, context, glob, full, cache)?;
         if result.matches.is_empty() {
             let (files_matched_glob, files_searched) = count_files_for_empty(scope, glob);
             let header = format::search_empty_header(
@@ -610,6 +610,15 @@ pub fn search_symbol_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     symbol::search(query, scope, None, glob, false)
+}
+
+pub(crate) fn search_symbol_raw_cached(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached(query, scope, None, glob, false, cache)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -1092,8 +1101,18 @@ fn format_single_match(
 
                     if m.is_definition && m.def_range.is_some() {
                         if let crate::types::FileType::Code(lang) = file_type {
-                            let callee_names =
-                                callees::extract_callee_names(&content, lang, m.def_range);
+                            let parsed = cache.parse_source(&m.path, &content);
+                            let callee_names = parsed.as_ref().map_or_else(
+                                || callees::extract_callee_names(&content, lang, m.def_range),
+                                |parsed| {
+                                    callees::extract_callee_names_from_tree(
+                                        &parsed.content,
+                                        lang,
+                                        &parsed.tree,
+                                        m.def_range,
+                                    )
+                                },
+                            );
                             if !callee_names.is_empty() {
                                 let mut nodes = callees::resolve_callees_transitive(
                                     &callee_names,
@@ -1102,6 +1121,7 @@ fn format_single_match(
                                     bloom,
                                     2,
                                     15,
+                                    cache,
                                 );
 
                                 if let Some(ref name) = m.def_name {
@@ -1145,12 +1165,26 @@ fn format_single_match(
                             }
 
                             if let Some(def_range) = m.def_range {
-                                let entries =
-                                    crate::lang::outline::get_outline_entries(&content, lang);
+                                let entries = parsed.as_ref().map_or_else(
+                                    || crate::lang::outline::get_outline_entries(&content, lang),
+                                    |parsed| parsed.outline_entries(),
+                                );
                                 if let Some(parent) = siblings::find_parent_entry(&entries, m.line)
                                 {
-                                    let refs = siblings::extract_sibling_references(
-                                        &content, lang, def_range,
+                                    let refs = parsed.as_ref().map_or_else(
+                                        || {
+                                            siblings::extract_sibling_references(
+                                                &content, lang, def_range,
+                                            )
+                                        },
+                                        |parsed| {
+                                            siblings::extract_sibling_references_from_tree(
+                                                &parsed.content,
+                                                lang,
+                                                &parsed.tree,
+                                                def_range,
+                                            )
+                                        },
                                     );
                                     if !refs.is_empty() {
                                         let filtered: Vec<String> =
@@ -1358,12 +1392,13 @@ fn basename_file_outline(
     let file_type = crate::lang::detect_file_type(&matched_path);
 
     let outline = cache.get_or_compute(&matched_path, content.as_bytes(), false, || {
-        crate::read::outline::generate(
+        crate::read::outline::generate_cached(
             &matched_path,
             file_type,
             &content,
             content.as_bytes(),
             false,
+            cache,
         )
     });
 
@@ -1748,7 +1783,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     Some(cache.get_or_compute_disk(path, false, || {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let buf = content.as_bytes();
-        read::outline::generate(path, file_type, &content, buf, false)
+        read::outline::generate_cached(path, file_type, &content, buf, false, cache)
     }))
 }
 

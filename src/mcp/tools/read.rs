@@ -174,7 +174,7 @@ fn tool_read_paths(
                 // file, non-code file) fall through to the existing inline
                 // error path so we don't misclassify them as "not found".
                 if let PathSuffix::Symbol(name) = suffix {
-                    if matches!(resolve_symbol(path, name), SymbolLookup::Missing) {
+                    if matches!(resolve_symbol(path, name, cache), SymbolLookup::Missing) {
                         return PerPath::NotFound(format!("{}#{}", path.display(), name));
                     }
                 }
@@ -462,7 +462,7 @@ pub(crate) fn read_single_with_suffix(
         }
         PathSuffix::Symbol(name) => {
             // Resolve symbol via outline → range once, reused for read + spec.
-            match resolve_symbol_range(path, name) {
+            match resolve_symbol_range(path, name, cache) {
                 Some((s, e)) => {
                     let range = format!("{s}-{e}");
                     let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
@@ -541,7 +541,7 @@ enum SymbolLookup {
     PreconditionFailed,
 }
 
-fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
+fn resolve_symbol(path: &Path, name: &str, cache: &OutlineCache) -> SymbolLookup {
     let Ok(content) = std::fs::read_to_string(path) else {
         return SymbolLookup::PreconditionFailed;
     };
@@ -549,7 +549,16 @@ fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
         return SymbolLookup::PreconditionFailed;
     };
     // Symbol selectors use the deep semantic index; display outlines remain shallow.
-    let entries = crate::lang::outline::get_deep_outline_entries(&content, lang);
+    let entries = cache.parse_source(path, &content).map_or_else(
+        || crate::lang::outline::get_deep_outline_entries(&content, lang),
+        |parsed| {
+            crate::lang::outline::deep_outline_entries(
+                parsed.tree.root_node(),
+                &parsed.content.lines().collect::<Vec<_>>(),
+                lang,
+            )
+        },
+    );
     match find_symbol_entry(&entries, name) {
         Some((s, e)) => SymbolLookup::Found(s, e),
         None => SymbolLookup::Missing,
@@ -558,8 +567,8 @@ fn resolve_symbol(path: &Path, name: &str) -> SymbolLookup {
 
 /// Back-compat shim for `read_single_with_suffix`, which collapses all
 /// non-Found outcomes into a single inline error message.
-fn resolve_symbol_range(path: &Path, name: &str) -> Option<(usize, usize)> {
-    match resolve_symbol(path, name) {
+fn resolve_symbol_range(path: &Path, name: &str, cache: &OutlineCache) -> Option<(usize, usize)> {
+    match resolve_symbol(path, name, cache) {
         SymbolLookup::Found(s, e) => Some((s, e)),
         SymbolLookup::Missing | SymbolLookup::PreconditionFailed => None,
     }
@@ -718,7 +727,10 @@ fn read_signature_file(
         let body = crate::read::read_file(path, None, false, cache, false)?;
         return Ok((body, line_count));
     };
-    let entries = crate::lang::outline::get_outline_entries(&content, lang);
+    let entries = cache.parse_source(path, &content).map_or_else(
+        || crate::lang::outline::get_outline_entries(&content, lang),
+        |parsed| parsed.outline_entries(),
+    );
     let lines: Vec<&str> = content.lines().collect();
     let mut body = String::new();
     render_signature_entries(&entries, &lines, &mut body);
@@ -839,7 +851,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_symbol_range(&path, "target"),
+            resolve_symbol_range(&path, "target", &OutlineCache::new()),
             Some((3, 5)),
             "symbol lookup must reach definitions below the shallow display outline"
         );

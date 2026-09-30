@@ -91,6 +91,24 @@ pub(crate) fn find_callers_batch(
     glob: Option<&str>,
     early_quit_threshold: usize,
 ) -> Result<(Vec<(String, CallerMatch)>, usize), TilthError> {
+    find_callers_batch_cached(
+        targets,
+        scope,
+        bloom,
+        glob,
+        early_quit_threshold,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+pub(crate) fn find_callers_batch_cached(
+    targets: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    early_quit_threshold: usize,
+    cache: &crate::cache::OutlineCache,
+) -> Result<(Vec<(String, CallerMatch)>, usize), TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
     let files_unreadable = AtomicUsize::new(0);
@@ -152,9 +170,17 @@ pub(crate) fn find_callers_batch(
                 return ignore::WalkState::Continue;
             }
 
-            let content = Arc::new(content);
-            let file_callers =
-                find_callers_treesitter_batch(path, targets, &ts_lang, &content, lang);
+            let Some(parsed) = cache.parse_source(path, &content) else {
+                return ignore::WalkState::Continue;
+            };
+            let file_callers = find_callers_treesitter_batch(
+                path,
+                targets,
+                &ts_lang,
+                &parsed.content,
+                lang,
+                &parsed.tree,
+            );
 
             if !file_callers.is_empty() {
                 found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
@@ -182,21 +208,14 @@ fn find_callers_treesitter_batch(
     ts_lang: &tree_sitter::Language,
     content: &Arc<String>,
     lang: crate::types::Lang,
+    tree: &tree_sitter::Tree,
 ) -> Vec<(String, CallerMatch)> {
     // Get the query string for this language
     let Some(query_str) = super::callee_query::callee_query_str(lang) else {
         return Vec::new();
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
     let content_str = content.as_str();
-    let Some(tree) = parser.parse(content_str, None) else {
-        return Vec::new();
-    };
 
     let content_bytes = content_str.as_bytes();
     let lines: Vec<&str> = content_str.lines().collect();
@@ -293,13 +312,15 @@ pub fn search_callers_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
+    let cache = crate::cache::OutlineCache::new();
     let (max_matches, batch_quit) = if full {
         (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
     } else {
         (MAX_MATCHES, BATCH_EARLY_QUIT)
     };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let (raw, files_unreadable) = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
+    let (raw, files_unreadable) =
+        find_callers_batch_cached(&single, scope, bloom, glob, batch_quit, &cache)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
@@ -346,6 +367,7 @@ pub fn search_callers_expanded(
         bloom,
         glob,
         batch_quit,
+        &cache,
     );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
@@ -444,11 +466,14 @@ fn write_second_hop_impact(
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
     batch_quit: usize,
+    cache: &crate::cache::OutlineCache,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
     }
-    let Ok((hop2, _)) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
+    let Ok((hop2, _)) =
+        find_callers_batch_cached(all_caller_names, scope, bloom, glob, batch_quit, cache)
+    else {
         return;
     };
 
@@ -597,6 +622,7 @@ mod tests {
             &ts_lang,
             &source,
             lang,
+            &crate::lang::treesitter::parse_source(&source, &ts_lang).unwrap(),
         );
 
         let mut actual = Vec::new();
