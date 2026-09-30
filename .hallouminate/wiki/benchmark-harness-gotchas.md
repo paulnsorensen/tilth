@@ -113,6 +113,10 @@ Do not copy an interactive access token and assume it survives an unattended sch
 Keep credentials out of reports and logs.
 Historical test results are evidence for their original tree, not substitutes for testing an extracted branch.
 
+When rebasing this wiki-only PR after #280, retain the benchmark tree from `main`.
+The split commit removes earlier benchmark files, not #280's replacement.
+Retarget report links to the rebased archive commit, which remains in the PR history.
+
 [^sept-harness]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-fixed-results.md; https://github.com/paulnsorensen/tilth/blob/919069a/benchmark/run.py
 [^sept-selection]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-curated-selection.md
 [^sept-large]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md
