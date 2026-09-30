@@ -143,49 +143,25 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         format!("[{}-{}]", entry.start_line, entry.end_line)
     };
 
-    let kind_label = match entry.kind {
-        OutlineKind::Function => {
-            if lang == Lang::Scala {
-                "def"
-            } else if lang == Lang::Kotlin {
-                "fun"
-            } else {
-                "fn"
-            }
-        }
-        OutlineKind::Class => "class",
-        OutlineKind::Struct => "struct",
-        OutlineKind::Interface => {
-            if lang == Lang::Scala {
-                "trait"
-            } else {
-                "interface"
-            }
-        }
-        OutlineKind::TypeAlias => "type",
-        OutlineKind::Enum => "enum",
-        OutlineKind::Constant => "const",
-        OutlineKind::ImmutableVariable => "val",
-        OutlineKind::Variable => {
-            if lang == Lang::Scala {
-                "var"
-            } else {
-                "let"
-            }
-        }
-        OutlineKind::Export => "export",
-        OutlineKind::Property => "prop",
-        OutlineKind::Module => {
-            if lang == Lang::Scala || lang == Lang::Kotlin {
-                "object"
-            } else {
-                "mod"
-            }
-        }
-        OutlineKind::Import => "import",
-        OutlineKind::TestSuite => "suite",
-        OutlineKind::TestCase => "test",
-    };
+    let kind_label = (crate::lang::spec::spec(lang).policy.outline_label)(entry.kind).unwrap_or(
+        match entry.kind {
+            OutlineKind::Function => "fn",
+            OutlineKind::Class => "class",
+            OutlineKind::Struct => "struct",
+            OutlineKind::Interface => "interface",
+            OutlineKind::TypeAlias => "type",
+            OutlineKind::Enum => "enum",
+            OutlineKind::Constant => "const",
+            OutlineKind::ImmutableVariable => "val",
+            OutlineKind::Variable => "let",
+            OutlineKind::Export => "export",
+            OutlineKind::Property => "prop",
+            OutlineKind::Module => "mod",
+            OutlineKind::Import => "import",
+            OutlineKind::TestSuite => "suite",
+            OutlineKind::TestCase => "test",
+        },
+    );
 
     let sig = match &entry.signature {
         Some(s) => format!("\n{prefix}           {s}"),

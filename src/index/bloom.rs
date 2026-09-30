@@ -128,9 +128,8 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
 /// This is intentionally approximate -- it does not understand all language
 /// syntaxes perfectly, but is fast and good enough for Bloom filter population.
 ///
-/// `lang` gates language-specific lexing: the Rust lifetime heuristic only
-/// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
-/// opens a single-quoted string, matching their actual syntax.
+/// `lang` selects language-owned lexer capabilities. Without the lifetime
+/// capability, a `'` opens a single-quoted string.
 fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
     IdentifierIter::new(content, lang)
 }
@@ -161,17 +160,22 @@ struct IdentifierIter<'a> {
     src: &'a str,
     pos: usize,
     state: ScanState,
-    lang: Option<Lang>,
+    triple_quoted_strings: bool,
+    hash_line_comments: bool,
+    has_lifetimes: bool,
 }
 
 impl<'a> IdentifierIter<'a> {
     fn new(content: &'a str, lang: Option<Lang>) -> Self {
+        let policy = lang.map(crate::lang::spec::spec);
         Self {
             bytes: content.as_bytes(),
             src: content,
             pos: 0,
             state: ScanState::Code,
-            lang,
+            triple_quoted_strings: policy.is_some_and(|spec| spec.policy.triple_quoted_strings),
+            hash_line_comments: policy.is_some_and(|spec| spec.policy.hash_line_comments),
+            has_lifetimes: lang.is_some_and(Lang::has_lifetimes),
         }
     }
 }
@@ -191,7 +195,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                 ScanState::Code => {
                     // Check for start of string literals
                     if b == b'"' {
-                        if self.lang == Some(Lang::Python)
+                        if self.triple_quoted_strings
                             && bytes.get(i..i + 3) == Some(b"\"\"\"".as_slice())
                         {
                             self.state = ScanState::StringTripleDouble;
@@ -203,7 +207,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                         continue;
                     }
                     if b == b'\'' {
-                        if self.lang == Some(Lang::Python)
+                        if self.triple_quoted_strings
                             && bytes.get(i..i + 3) == Some(b"'''".as_slice())
                         {
                             self.state = ScanState::StringTripleSingle;
@@ -221,7 +225,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                         // single-quoted string, so the heuristic is gated on
                         // `has_lifetimes` to avoid swallowing identifiers after a
                         // `'foo'` string there.
-                        let is_lifetime = self.lang.is_some_and(Lang::has_lifetimes)
+                        let is_lifetime = self.has_lifetimes
                             && i + 1 < len
                             && is_ident_start(bytes[i + 1])
                             && !(i + 2 < len && bytes[i + 2] == b'\'');
@@ -240,7 +244,7 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     }
 
                     // Check for comments
-                    if b == b'#' && self.lang == Some(Lang::Python) {
+                    if b == b'#' && self.hash_line_comments {
                         self.state = ScanState::LineComment;
                         self.pos += 1;
                         continue;

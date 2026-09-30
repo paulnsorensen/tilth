@@ -6,11 +6,9 @@ use std::time::SystemTime;
 
 use super::accept_walk_entry;
 use super::file_metadata;
-use crate::lang::elixir::is_elixir_definition;
-use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS};
 use crate::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
-    go_declaration_name_line,
 };
 
 use crate::error::TilthError;
@@ -374,28 +372,15 @@ fn walk_for_definitions(
 
     let kind = node.kind();
 
-    // Definition kinds and name/weight ops come from the per-language spec. For
-    // a known language these are `spec(lang).definition_kinds` / `.definitions`
-    // (the shared defaults for every language except Elixir, which carries its
-    // own); when `lang` is unknown we fall back to the shared defaults.
-    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
-        Some(l) => {
-            let s = spec(l);
-            (s.definition_kinds, &s.definitions)
-        }
-        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
-    };
+    let def_ops: &DefinitionOps =
+        lang.map_or(&DEFAULT_DEFS, |language| &spec(language).definitions);
 
-    if def_kinds.contains(&kind) {
-        let go_name_line = if lang == Some(crate::types::Lang::Go) {
-            go_declaration_name_line(node, lines, query)
-        } else {
-            None
-        };
+    if (def_ops.is_definition)(node, lines) {
+        let name_line = (def_ops.name_line)(node, lines, query);
         let defines_query =
-            (def_ops.extract_name)(node, lines).as_deref() == Some(query) || go_name_line.is_some();
+            (def_ops.extract_name)(node, lines).as_deref() == Some(query) || name_line.is_some();
         if defines_query {
-            let line_num = go_name_line.unwrap_or_else(|| node.start_position().row as u32 + 1);
+            let line_num = name_line.unwrap_or_else(|| node.start_position().row as u32 + 1);
             let line_text = lines
                 .get(line_num.saturating_sub(1) as usize)
                 .unwrap_or(&"")
@@ -479,37 +464,7 @@ fn walk_for_definitions(
                 });
             }
         }
-    } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
-        // Elixir: definitions are `call` nodes — check separately. Name and
-        // weight come from `spec(Elixir).definitions` via `def_ops`.
-        if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_byte_range: Some((node.start_byte(), node.end_byte())),
-                    def_name: Some(query.to_string()),
-                    def_weight: (def_ops.weight)(node, lines),
-                    impl_target: None,
-                });
-            }
-        }
     }
-
     // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

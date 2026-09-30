@@ -276,8 +276,8 @@ fn owner_of_match(m: &crate::types::Match, cache: &OutlineCache) -> Option<Strin
     let FileType::Code(lang) = detect_file_type(&m.path) else {
         return None;
     };
-    if lang == Lang::Go {
-        return go_receiver_type(&m.path, start, cache);
+    if let Some(query) = crate::lang::spec::spec(lang).policy.receiver_type_query {
+        return receiver_type(&m.path, start, cache, query);
     }
     let parsed = cache.get_or_parse(&m.path)?;
     let lines: Vec<&str> = parsed.content.lines().collect();
@@ -330,7 +330,8 @@ fn find_parent_name_inner(
             |(start, end)| child.start_byte() == start && child.end_byte() == end,
         );
         if matches_target && crate::lang::treesitter::DEFINITION_KINDS.contains(&child.kind()) {
-            return qualified_definition_owner(child, lines).or(here);
+            let definitions = &crate::lang::spec::spec(lang).definitions;
+            return (definitions.qualified_owner)(child, lines).or(here);
         }
         if let Some(found) = find_parent_name_inner(
             child,
@@ -341,32 +342,6 @@ fn find_parent_name_inner(
             here.clone(),
         ) {
             return Some(found);
-        }
-    }
-    None
-}
-
-fn qualified_definition_owner(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let mut pending = vec![node.child_by_field_name("declarator")?];
-    while let Some(current) = pending.pop() {
-        if current.kind() == "qualified_identifier" {
-            if let Some(name) = current.child_by_field_name("name") {
-                if name.kind() == "qualified_identifier" {
-                    pending.push(name);
-                    continue;
-                }
-            }
-            let scope = current.child_by_field_name("scope")?;
-            return Some(crate::lang::treesitter::node_text_simple(
-                scope,
-                lines,
-                crate::lang::treesitter::NodeTextMode::Full,
-            ));
-        }
-        for field in ["name", "declarator"].into_iter().rev() {
-            if let Some(child) = current.child_by_field_name(field) {
-                pending.push(child);
-            }
         }
     }
     None
@@ -387,16 +362,19 @@ fn owner_matches(container_name: &str, qualifier: &str) -> bool {
 /// Tree-sitter query for a Go `method_declaration`'s receiver type, scoped to
 /// the method whose node starts at `start_line`. Handles both value (`Foo`) and
 /// pointer (`*Foo`) receivers, returning the bare type name.
-fn go_receiver_type(path: &Path, start_line: u32, cache: &OutlineCache) -> Option<String> {
+fn receiver_type(
+    path: &Path,
+    start_line: u32,
+    cache: &OutlineCache,
+    receiver_query: &'static str,
+) -> Option<String> {
     use streaming_iterator::StreamingIterator;
-
-    const GO_RECV_TYPE_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration type: [(type_identifier) @ty (pointer_type (type_identifier) @ty)])) name: (field_identifier) @method)";
 
     let parsed = cache.get_or_parse(path)?;
     let ts_lang = crate::lang::outline::outline_language(parsed.lang)?;
     let bytes = parsed.content.as_bytes();
 
-    crate::lang::treesitter::with_query(&ts_lang, GO_RECV_TYPE_QUERY, |query| {
+    crate::lang::treesitter::with_query(&ts_lang, receiver_query, |query| {
         let ty_idx = query.capture_index_for_name("ty")?;
         let method_idx = query.capture_index_for_name("method")?;
         let mut cursor = tree_sitter::QueryCursor::new();
@@ -534,7 +512,7 @@ fn enrich_from_outline(
             }
         }
     };
-    if lang == Lang::Go
+    if crate::lang::spec::spec(lang).policy.restore_grouped_name
         && target.name != name
         && (target.kind == OutlineKind::Constant || target.kind == OutlineKind::Variable)
     {

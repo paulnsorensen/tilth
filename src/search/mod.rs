@@ -28,6 +28,7 @@ use ignore::WalkBuilder;
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
+use crate::lang::{is_basename_source, search_priority};
 use crate::read;
 use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, Match, SearchResult};
@@ -1194,18 +1195,6 @@ fn format_single_match(
 /// When an outline cache is available, wraps each match in the file's outline context.
 /// When `expand > 0`, the top N matches inline actual code (def body or ±10 lines).
 /// When there are >5 matches, groups them into facets for easier navigation.
-/// Prefer source languages over their compiled equivalents.
-/// Higher value = more likely to be the original source.
-fn source_priority(path: &Path) -> u8 {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "ts" | "tsx" => 10,
-        "rs" | "go" | "py" | "rb" | "java" | "kt" | "scala" | "swift" | "c" | "cpp" | "h"
-        | "cs" | "php" => 9,
-        "js" | "jsx" | "mjs" | "cjs" => 7,
-        _ => 3,
-    }
-}
-
 /// Find a basename-matching candidate among already-collected search matches.
 fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<&Path> = None;
@@ -1218,33 +1207,14 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
         if stem.to_ascii_lowercase() != query_lower {
             continue;
         }
-        let ext = m.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_code = matches!(
-            ext,
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "go"
-                | "py"
-                | "rb"
-                | "java"
-                | "c"
-                | "cpp"
-                | "h"
-                | "cs"
-                | "swift"
-                | "kt"
-                | "scala"
-                | "php"
-        );
+        let is_code = is_basename_source(&m.path);
         if !is_code {
             if candidate.is_none() {
                 candidate = Some(&m.path);
             }
             continue;
         }
-        let prio = source_priority(&m.path);
+        let prio = search_priority(&m.path);
         if prio > best_priority {
             best_priority = prio;
             candidate = Some(&m.path);
@@ -1317,7 +1287,7 @@ fn find_basename_fallback_capped(scope: &Path, query_lower: &str, cap: usize) ->
         if stem.to_ascii_lowercase() != *query_lower {
             continue;
         }
-        let prio = source_priority(path);
+        let prio = search_priority(path);
         if prio > best_priority {
             best_priority = prio;
             candidate = Some(path.to_path_buf());
@@ -1987,6 +1957,91 @@ mod tests {
             .filter_map(|p| p.extension())
             .map(|e| e.to_string_lossy().to_string())
             .collect()
+    }
+
+    fn path_match(path: &str) -> Match {
+        Match {
+            path: PathBuf::from(path),
+            line: 1,
+            text: String::new(),
+            is_definition: false,
+            exact: false,
+            file_lines: 1,
+            mtime: SystemTime::UNIX_EPOCH,
+            def_range: None,
+            def_byte_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        }
+    }
+
+    #[test]
+    fn source_priority_uses_exact_policy_extensions() {
+        for (extensions, expected) in [
+            (&["ts", "tsx"][..], 10),
+            (
+                &[
+                    "rs", "go", "py", "rb", "java", "kt", "scala", "swift", "c", "cpp", "h", "cs",
+                    "php",
+                ][..],
+                9,
+            ),
+            (&["js", "jsx", "mjs", "cjs"][..], 7),
+            (&["TS", "RS", "pyi", "kts", "hpp", "txt", ""][..], 3),
+        ] {
+            for extension in extensions {
+                let path = PathBuf::from(format!("file.{extension}"));
+                assert_eq!(search_priority(&path), expected, "extension {extension}");
+            }
+        }
+
+        for extension in [
+            "rs", "ts", "tsx", "js", "jsx", "go", "py", "rb", "java", "c", "cpp", "h", "cs",
+            "swift", "kt", "scala", "php",
+        ] {
+            assert!(
+                is_basename_source(Path::new(&format!("file.{extension}"))),
+                "extension {extension}"
+            );
+        }
+        for extension in ["mjs", "cjs", "pyi", "kts", "hpp", "TS", "txt"] {
+            assert!(
+                !is_basename_source(Path::new(&format!("file.{extension}"))),
+                "extension {extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn basename_candidate_preserves_priority_ties_and_fallbacks() {
+        let matches = [
+            path_match("first/widget.ts"),
+            path_match("second/widget.tsx"),
+            path_match("third/widget.rs"),
+        ];
+        assert_eq!(
+            find_basename_candidate(&matches, "widget"),
+            Some(PathBuf::from("first/widget.ts"))
+        );
+
+        let noneligible = [
+            path_match("first/widget.mjs"),
+            path_match("second/widget.txt"),
+        ];
+        assert_eq!(
+            find_basename_candidate(&noneligible, "widget"),
+            Some(PathBuf::from("first/widget.mjs"))
+        );
+
+        let eligible_wins = [
+            path_match("first/widget.pyi"),
+            path_match("second/widget.js"),
+        ];
+        assert_eq!(
+            find_basename_candidate(&eligible_wins, "widget"),
+            Some(PathBuf::from("second/widget.js"))
+        );
     }
 
     // ── filter_code_lines unit tests ──

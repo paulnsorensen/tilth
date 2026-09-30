@@ -1,6 +1,6 @@
 //! JavaScript language spec. Shares callee/sibling queries with TS/TSX.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 /// Callee query shared by JavaScript, TypeScript, and TSX.
 pub(crate) const CALLEE_QUERY: &str = concat!(
@@ -25,7 +25,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &["package.json"],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::JsTs),
     extract_receiver: None,
@@ -33,6 +32,15 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::javascript::DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::javascript::canonical_anchor,
     attach_leading_adornment: crate::lang::javascript::attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        import_external,
+        import_resolver: resolve_import,
+        search_priority: 7,
+        search_extensions: &["js", "jsx", "mjs", "cjs"],
+        basename_extensions: &["js", "jsx"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::embedded_semantic_start,
 };
 
@@ -57,4 +65,47 @@ pub(crate) fn attach_leading_adornment(
     _lines: &[&str],
 ) -> bool {
     crate::lang::spec::adornment_kind(adornment, &["decorator"])
+}
+
+pub(crate) fn import_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("import ") || trimmed.starts_with("import{")
+}
+
+pub(crate) fn import_external(source: &str) -> bool {
+    !(source.starts_with('.') || source.starts_with("@/") || source.starts_with("~/"))
+}
+
+pub(crate) fn resolve_import(dir: &std::path::Path, source: &str) -> Option<std::path::PathBuf> {
+    let base = dir.join(source);
+    if matches!(
+        base.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "jsx")
+    ) {
+        if base.is_file() {
+            return Some(base);
+        }
+        for extension in ["ts", "tsx"] {
+            let candidate = base.with_extension(extension);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for extension in [".ts", ".tsx", ".js", ".jsx"] {
+        let candidate = std::path::PathBuf::from(format!("{}{extension}", base.display()));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    if base.exists() && base.is_file() {
+        return Some(base);
+    }
+    for name in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
+        let candidate = base.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }

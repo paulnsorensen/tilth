@@ -28,3 +28,8 @@
 2026-09-29 · a795796f35aea5f2 · merged · local-gate-gotchas.md · Record LF/CRLF/CR lexer invariants and byte-identity ownership for same-line declarations. Exact and both natural retrieval probes rank first.
 2026-09-29 · e31a01c7fa98829a · merged · adr/tilth-search-v2-roadmap-001.md; adr/tilth-search-v2-roadmap-006.md; edit-anchor-design.md; usage-analytics-2026-07.md · Record public-only MCP diff retirement, retained internal edit behavior, and calibrated diff follow-up counts. Exact and natural retrieval probes pass.
 
+
+2026-09-30 · 9c12cd46ebe199e5 · new-page · language-policy-registry.md · Record LangSpec ownership and the separate source-ranking registry. Preserve detection aliases and legacy overview behavior. Exact and natural retrieval probes pass.
+
+2026-09-30 · 9c12cd46ebe199e5 · merged · local-gate-gotchas.md; index.md · Link the policy registry and update the moved JavaScript resolver citation.
+

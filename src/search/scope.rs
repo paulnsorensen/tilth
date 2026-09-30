@@ -7,10 +7,7 @@
 use std::path::Path;
 
 use crate::cache::OutlineCache;
-use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
-use crate::lang::treesitter::{
-    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
-};
+use crate::lang::treesitter::extract_definition_name;
 
 /// Type-like node kinds that can enclose a function definition.
 const TYPE_KINDS: &[&str] = &[
@@ -51,43 +48,37 @@ pub(super) fn walk_to_enclosing_definition<'a>(
     lines: &[&str],
     lang: crate::types::Lang,
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
+    let definitions = &crate::lang::spec::spec(lang).definitions;
     let mut current = Some(node);
-    while let Some(n) = current {
-        let def_name = if DEFINITION_KINDS.contains(&n.kind()) {
-            extract_definition_name(n, lines)
-        } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
-            extract_elixir_definition_name(n, lines)
-        } else {
-            None
-        };
+    while let Some(definition) = current {
+        let name = (definitions.is_definition)(definition, lines)
+            .then(|| (definitions.extract_name)(definition, lines))
+            .flatten();
 
-        if let Some(name) = def_name {
+        if let Some(name) = name {
             let range = (
-                n.start_position().row as u32 + 1,
-                n.end_position().row as u32 + 1,
+                definition.start_position().row as u32 + 1,
+                definition.end_position().row as u32 + 1,
             );
 
-            // Walk further up to find an enclosing type/module and qualify the name.
-            // `defmodule` is a `call` node, not in TYPE_KINDS, so Elixir needs a
-            // separate check to produce `Module.func`.
-            let mut parent = n.parent();
-            while let Some(p) = parent {
-                if TYPE_KINDS.contains(&p.kind()) {
-                    if let Some(type_name) = extract_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
+            let mut parent = definition.parent();
+            while let Some(container) = parent {
+                let container_name = if TYPE_KINDS.contains(&container.kind()) {
+                    extract_definition_name(container, lines)
+                } else if (definitions.is_container)(container, lines) {
+                    (definitions.extract_name)(container, lines)
+                } else {
+                    None
+                };
+                if let Some(container_name) = container_name {
+                    return Some((definition, format!("{container_name}.{name}"), range));
                 }
-                if lang == crate::types::Lang::Elixir && is_elixir_definition(p, lines) {
-                    if let Some(type_name) = extract_elixir_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
-                }
-                parent = p.parent();
+                parent = container.parent();
             }
 
-            return Some((n, name, range));
+            return Some((definition, name, range));
         }
-        current = n.parent();
+        current = definition.parent();
     }
     None
 }
@@ -154,27 +145,8 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         "object_declaration" => "object",
         "impl_item" => "impl",
         "export_statement" => "export",
-        "call" if lang == crate::types::Lang::Elixir => elixir_kind_label(node, lines),
-        _ => "definition",
-    }
-}
-
-/// Elixir definitions are all `call` nodes; the keyword (`def`, `defmodule`,
-/// …) lives in the call's `target` field. Map it to the same vocabulary
-/// `kind_label` produces for other languages.
-fn elixir_kind_label(node: tree_sitter::Node, lines: &[&str]) -> &'static str {
-    let Some(target) = node.child_by_field_name("target") else {
-        return "definition";
-    };
-    match node_text_simple(target, lines, NodeTextMode::Full).as_str() {
-        "defmodule" => "module",
-        "defprotocol" => "protocol",
-        "defimpl" => "impl",
-        "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate" => {
-            "function"
-        }
-        "defstruct" | "defexception" => "struct",
-        _ => "definition",
+        _ => (crate::lang::spec::spec(lang).definitions.kind_label)(node, lines)
+            .unwrap_or("definition"),
     }
 }
 
@@ -256,6 +228,20 @@ mod tests {
         let scope = enclosing_definition_at(&p, 3, &cache).unwrap();
         assert_eq!(scope.kind, "function");
         assert_eq!(scope.name, "Foo.bar");
+    }
+
+    #[test]
+    fn enclosing_at_nested_elixir_def_qualifies_with_outer_def() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "a.ex",
+            "defmodule Foo do\n  def outer do\n    def inner do\n      :ok\n    end\n  end\nend\n",
+        );
+        let cache = OutlineCache::new();
+        let scope = enclosing_definition_at(&p, 4, &cache).unwrap();
+        assert_eq!(scope.kind, "function");
+        assert_eq!(scope.name, "outer.inner");
     }
 
     #[test]
