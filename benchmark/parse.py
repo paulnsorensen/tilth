@@ -200,6 +200,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
     turn_items: dict[int, list] = {}  # turn_index -> items in that turn
     current_turn = -1
     turn_usages: list[dict] = []
+    active_turn = False
 
     # Collect events
     for event in events:
@@ -209,6 +210,9 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
             session_id = event.get("thread_id", "")
 
         elif event_type == "turn.started":
+            if active_turn:
+                raise ValueError("Codex stream starts a turn before the prior turn completes")
+            active_turn = True
             current_turn += 1
             turn_items[current_turn] = []
 
@@ -224,8 +228,17 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
                     result_text_parts.append(text)
 
         elif event_type == "turn.completed":
+            if not active_turn:
+                raise ValueError("Codex stream completes a turn that did not start")
+            active_turn = False
             usage = event.get("usage", {})
             turn_usages.append(usage)
+
+        elif event_type in {"turn.failed", "error"}:
+            raise ValueError(f"Codex stream failed: {event.get('error') or event.get('message') or event_type}")
+
+    if active_turn or not turn_usages:
+        raise ValueError("Codex stream ended without a completed turn")
 
     # Build turns
     turns: list[Turn] = []
@@ -264,9 +277,18 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
 
             elif item_type == "mcp_tool_call":
                 tool_name = item.get("tool", "unknown")
+                server = item.get("server", "unknown")
                 tool_calls.append(ToolCall(
-                    name=tool_name,
+                    name=f"mcp__{server}__{tool_name}",
                     input=item.get("arguments", {}),
+                    tool_use_id=item_id,
+                    turn_index=turn_idx,
+                ))
+
+            elif item_type == "file_change":
+                tool_calls.append(ToolCall(
+                    name="Edit",
+                    input={"changes": item.get("changes", [])},
                     tool_use_id=item_id,
                     turn_index=turn_idx,
                 ))

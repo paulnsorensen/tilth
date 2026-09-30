@@ -1,6 +1,6 @@
 //! Ruby language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = "(call method: (identifier) @callee)\n";
 
@@ -14,7 +14,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &[],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: None,
     extract_receiver: None,
@@ -22,5 +21,11 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::spec::default_canonical_anchor,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        search_priority: 9,
+        search_extensions: &["rb"],
+        basename_extensions: &["rb"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::default_semantic_start,
 };

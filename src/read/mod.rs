@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use memmap2::Mmap;
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, OutlineMode};
 use crate::error::TilthError;
 use crate::format;
 use crate::lang::detect_file_type;
@@ -215,7 +215,7 @@ pub fn read_file(
         #[allow(clippy::cast_precision_loss)]
         let file_mb = byte_len as f64 / 1_000_000.0;
 
-        let outline = cache.get_or_compute(path, buf, true, || {
+        let outline = cache.get_or_compute(path, buf, OutlineMode::Capped, || {
             outline::generate(path, file_type, &content, buf, true)
         });
 
@@ -245,8 +245,13 @@ pub fn read_file(
     let file_type = detect_file_type(path);
 
     let capped = byte_len > FILE_SIZE_CAP;
+    let mode = if capped {
+        OutlineMode::Capped
+    } else {
+        OutlineMode::Full
+    };
 
-    let outline = cache.get_or_compute(path, buf, capped, || {
+    let outline = cache.get_or_compute(path, buf, mode, || {
         outline::generate(path, file_type, &content, buf, capped)
     });
 

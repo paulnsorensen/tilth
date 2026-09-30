@@ -1,6 +1,6 @@
 //! C language spec. Shares its callee query with C++.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 /// Callee query shared by C and C++.
 pub(crate) const CALLEE_QUERY: &str = concat!(
@@ -18,7 +18,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::None,
     scoped_imports: false,
     manifests: &[],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::CppC),
     extract_receiver: None,
@@ -26,6 +25,15 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::c::canonical_anchor,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        import_external,
+        import_resolver: resolve_import,
+        search_priority: 9,
+        search_extensions: &["c", "h"],
+        basename_extensions: &["c", "h"],
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::embedded_semantic_start,
 };
 
@@ -35,4 +43,17 @@ pub(crate) fn canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
     } else {
         node
     }
+}
+
+pub(crate) fn import_line(line: &str) -> bool {
+    line.trim_start().starts_with("#include")
+}
+
+pub(crate) fn import_external(source: &str) -> bool {
+    !source.starts_with('"')
+}
+
+pub(crate) fn resolve_import(dir: &std::path::Path, source: &str) -> Option<std::path::PathBuf> {
+    let candidate = dir.join(source.trim_matches('"'));
+    candidate.exists().then_some(candidate)
 }

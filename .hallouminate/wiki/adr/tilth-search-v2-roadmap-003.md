@@ -53,8 +53,8 @@ Reconciliation and impact verification trust matching signatures.
 Equal-length edits that restore mtime can therefore retain stale dependency edges.[^freshness-before]
 
 The authorized fix uses a per-file revision with richer Unix change metadata.
-It preserves cheap warm scans and selective shard replacement.
-Platforms without that metadata use a content fingerprint.
+On Unix, it keeps warm scans cheap and preserves selective shard replacement.
+Other platforms read the file content to compute a fingerprint.
 Legacy signatures remain readable but cannot count as fresh revisions.[^freshness-fix]
 
 This approach does not establish a transactional repository snapshot.

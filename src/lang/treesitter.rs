@@ -11,10 +11,15 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
+    "method",           // Ruby
+    "singleton_method", // Ruby
     // Classes, structs & Kotlin objects
     "class_declaration",
     "class_definition",
+    "class",           // Ruby
+    "class_specifier", // C++
     "struct_item",
+    "struct_specifier", // C++
     "object_declaration",
     // Interfaces & types (TS)
     "interface_declaration",
@@ -56,10 +61,9 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         if let Some(child) = node.child_by_field_name(field) {
             let text = node_text_simple(child, lines, NodeTextMode::Full);
             if !text.is_empty() {
-                // For variable_declarator, get the identifier inside
                 if child.kind().contains("declarator") {
-                    if let Some(id) = child.child_by_field_name("name") {
-                        return Some(node_text_simple(id, lines, NodeTextMode::Full));
+                    if let Some(name) = declarator_name(child, lines) {
+                        return Some(name);
                     }
                 }
                 return Some(text);
@@ -102,6 +106,29 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
+    None
+}
+
+fn declarator_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        if matches!(
+            current.kind(),
+            "identifier" | "field_identifier" | "operator_name"
+        ) {
+            return Some(node_text_simple(current, lines, NodeTextMode::Full));
+        }
+        if current.kind() == "parenthesized_declarator" {
+            if let Some(child) = current.named_child(0) {
+                pending.push(child);
+            }
+        }
+        for field in ["name", "identifier", "declarator"].into_iter().rev() {
+            if let Some(child) = current.child_by_field_name(field) {
+                pending.push(child);
+            }
+        }
+    }
     None
 }
 
@@ -315,9 +342,14 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
+        | "singleton_method"
         | "class_declaration"
         | "class_definition"
+        | "class"
+        | "class_specifier"
         | "struct_item"
+        | "struct_specifier"
         | "interface_declaration"
         | "trait_declaration"
         | "trait_item"
@@ -420,6 +452,7 @@ mod tests {
         assert_eq!(definition_weight("interface_declaration"), 100);
         assert_eq!(definition_weight("enum_item"), 100);
         assert_eq!(definition_weight("decorated_definition"), 100);
+        assert_eq!(definition_weight("method"), 100);
         // 90 — impls / object-like declarations (Rust impl_item, Kotlin object_declaration).
         assert_eq!(definition_weight("impl_item"), 90);
         assert_eq!(definition_weight("object_declaration"), 90);
@@ -438,6 +471,23 @@ mod tests {
         assert_eq!(definition_weight("export_statement"), 30);
         // 50 — unrecognized kind falls to the default tier, not 0.
         assert_eq!(definition_weight("comment"), 50);
+    }
+
+    #[test]
+    fn deeply_nested_c_declarator_has_the_owned_name() {
+        let depth = 5_000;
+        let source = format!(
+            "int {}deep_marker{}(void) {{ return 0; }}\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tree = parse(&source, Lang::C);
+        let lines: Vec<&str> = source.lines().collect();
+        let node = find_by_kind(tree.root_node(), "function_definition");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("deep_marker".to_string())
+        );
     }
 
     /// Parse `src` with `lang`'s grammar and return the owned tree.
@@ -588,6 +638,27 @@ mod tests {
             extract_definition_name(node, &lines),
             Some("total".to_string())
         );
+    }
+
+    #[test]
+    fn extract_definition_name_unwraps_owned_c_declarators() {
+        for (language, source) in [
+            (Lang::C, "int language_marker(void) { return 1; }\n"),
+            (Lang::C, "int (*language_marker(void))(int) { return 0; }\n"),
+            (Lang::Cpp, "int Widget::language_marker() { return 1; }\n"),
+            (
+                Lang::Cpp,
+                "int (*language_marker(void))(int) { return 0; }\n",
+            ),
+        ] {
+            let tree = parse(source, language);
+            let lines: Vec<&str> = source.lines().collect();
+            let node = find_by_kind(tree.root_node(), "function_definition");
+            assert_eq!(
+                extract_definition_name(node, &lines),
+                Some("language_marker".to_string())
+            );
+        }
     }
 
     #[test]

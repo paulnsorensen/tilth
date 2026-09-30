@@ -2,7 +2,7 @@
 
 use streaming_iterator::StreamingIterator;
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call_expression function: (identifier) @callee)\n",
@@ -11,6 +11,8 @@ const CALLEE_QUERY: &str = concat!(
 
 const SIBLING_QUERY: &str =
     "(selector_expression operand: (identifier) @recv field: (field_identifier) @ref)\n";
+
+const RECEIVER_TYPE_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration type: [(type_identifier) @ty (pointer_type (type_identifier) @ty)])) name: (field_identifier) @method)";
 
 /// Root (first `/`-segment) of each Go stdlib package. A Go import is stdlib
 /// when its first path segment is one of these — covering both single-segment
@@ -72,14 +74,36 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     stdlib: StdlibRule::GoRoots(GO_STDLIB_ROOTS),
     scoped_imports: false,
     manifests: &["go.mod"],
-    definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::Go),
     extract_receiver: Some(extract_go_receiver_name),
-    definitions: DEFAULT_DEFS,
+    definitions: crate::lang::spec::DefinitionOps {
+        name_line: crate::lang::treesitter::go_declaration_name_line,
+        ..DEFAULT_DEFS
+    },
     canonical_anchor: crate::lang::spec::default_canonical_anchor,
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
+    policy: crate::lang::spec::LanguagePolicy {
+        import_line,
+        same_package: Some(crate::lang::spec::SamePackagePolicy {
+            extension: "go",
+            excluded_suffix: "_test.go",
+            max_files: 20,
+            max_file_size: 100_000,
+        }),
+        receiver_type_query: Some(RECEIVER_TYPE_QUERY),
+        restore_grouped_name: true,
+        search_priority: 9,
+        search_extensions: &["go"],
+        basename_extensions: &["go"],
+        test_filename: Some(crate::lang::spec::TestFilenamePolicy {
+            order: 1,
+            label: "_test.go",
+            matches: is_test_filename,
+        }),
+        ..crate::lang::spec::DEFAULT_POLICY
+    },
     semantic_start: crate::lang::spec::default_semantic_start,
 };
 
@@ -115,4 +139,12 @@ pub(crate) fn extract_go_receiver_name(
         None
     })
     .flatten()
+}
+
+fn import_line(line: &str) -> bool {
+    line.trim_start().starts_with("import ")
+}
+
+fn is_test_filename(path: &str) -> bool {
+    path.ends_with("_test.go")
 }
