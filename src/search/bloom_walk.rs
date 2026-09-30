@@ -1,10 +1,9 @@
 //! Shared file-prefilter helper for relational queries (callers, callees,
 //! deps). Reads a file, gates on size, and runs the per-file bloom prefilter
-//! against any of the supplied target symbols. Returns content + mtime when
+//! against any of the supplied target symbols. Returns the content when
 //! the file is worth deeper inspection (tree-sitter parse, outline scan).
 
 use std::path::Path;
-use std::time::SystemTime;
 
 use crate::index::bloom::BloomFilterCache;
 
@@ -45,15 +44,11 @@ where
     if meta.len() > max_size {
         return BloomRead::Skip;
     }
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let Ok(content) = std::fs::read_to_string(path) else {
         return BloomRead::Unreadable;
     };
 
-    if !targets
-        .into_iter()
-        .any(|t| bloom.contains(path, mtime, &content, t.as_ref()))
-    {
+    if !bloom.contains_any(path, &content, targets) {
         return BloomRead::Skip;
     }
 

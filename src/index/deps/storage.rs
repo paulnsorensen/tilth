@@ -31,13 +31,7 @@ const UNCERTAIN_SOURCES: TableDefinition<&str, &[u8]> = TableDefinition::new("un
 /// uncertainty, so `file_index_state` forces its rescan.
 pub(super) const FILE_SHARD_SCHEMA_VERSION: u8 = 2;
 
-/// Cheap change signature for a file: mtime + length. Cheaper than hashing
-/// content on every reconcile scan; a mismatch triggers a real re-derive.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub(super) struct FileSignature {
-    pub(super) mtime_nanos: i128,
-    pub(super) len: u64,
-}
+pub(super) use crate::util::FileRevision as FileSignature;
 
 /// A file's own resolved local dependencies (its "shard" of the index).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -61,13 +55,7 @@ pub(super) struct FileShard {
 
 /// Current on-disk signature for `path`, or `None` if it cannot be read.
 pub(super) fn signature_of(path: &Path) -> Option<FileSignature> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    let nanos = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i128;
-    Some(FileSignature {
-        mtime_nanos: nanos,
-        len: meta.len(),
-    })
+    FileSignature::of(path)
 }
 
 fn redb_err(e: impl std::fmt::Display) -> DepsError {

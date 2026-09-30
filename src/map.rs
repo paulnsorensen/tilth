@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, OutlineMode};
 use crate::lang::detect_file_type;
 use crate::read::outline;
 use crate::search::base_walk_builder;
@@ -45,11 +45,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
         let file_type = detect_file_type(path);
         let symbols = match file_type {
             FileType::Code(_) => {
-                let mtime = meta
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-                let outline_str = cache.get_or_compute(path, mtime, || {
+                let outline_str = cache.get_or_compute_disk(path, OutlineMode::Capped, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();

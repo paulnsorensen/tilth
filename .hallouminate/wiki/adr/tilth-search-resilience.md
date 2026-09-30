@@ -20,6 +20,27 @@ Evidence: [[../usage-analytics-2026-07]].
 - **Consequences:** kind:content path stays byte-identical (regression
   test); genuine regex behavior unchanged.
 
+
+
+#### Search v2 disclosure regression (verified 2026-09-29)
+
+Search v2 preserves literal fallback but loses the required disclosure.
+This contradicts ADR-001; it does not supersede the accepted decision.
+
+At revision `7005d6ab912843456dec498266fc3644fbcd4ea4`, `content::search` returns the regex parse reason with its literal result.
+Both raw adapters discard that reason (`src/search/mod.rs:615-631`).
+The MCP regex route still reports `resolved_as: regex` (`src/mcp/tools/search_v2.rs:408-415`).
+
+A live probe searches for `RegexMatcher::new(` with glob `src/search/content.rs`.
+It returns three literal matches, `status: ok`, `resolved_as: regex`, and empty diagnostics.
+The escaped regex `RegexMatcher::new\(` returns the same three locations.
+The source lines are 41, 45, and 52.
+
+Treat this as an unresolved implementation gap, not proof of regex behavior.
+The research session changes no search code and runs no regression suite.
+
+_Source: checkout source and live MCP query comparison · Updated: 2026-09-29_
+
 ### ADR-002: Multi-symbol cap goes soft [status: accepted]
 
 - **Context:** >5 symbols hard-errors in three arms (any/symbol/callers).
