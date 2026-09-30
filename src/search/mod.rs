@@ -25,7 +25,7 @@ use std::time::SystemTime;
 
 use ignore::WalkBuilder;
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, OutlineMode};
 use crate::error::TilthError;
 use crate::format;
 use crate::read;
@@ -966,22 +966,25 @@ fn format_single_match(
         }
     }
 
-    // Check session dedup for definitions with def_range. The mtime
+    // Check session dedup for definitions with def_range. The revision
     // check ensures a post-edit search re-inlines the body rather than
     // pointing at stale line numbers. Only stat() when the match is
     // actually dedup-eligible — non-definition / no-def_range / no-session
-    // matches never consult the session, so they skip the syscall.
+    // matches never consult the session, so they skip the syscall. Stat
+    // happens here, before `expand_match` reads the file below, so the
+    // recorded revision reflects the bytes that get expanded.
     let dedup_eligible = m.is_definition && m.def_range.is_some() && session.is_some();
-    let current_mtime = if dedup_eligible {
-        std::fs::metadata(&m.path)
-            .ok()
-            .and_then(|md| md.modified().ok())
+    let current_revision = if dedup_eligible {
+        crate::util::FileRevision::of(&m.path)
     } else {
         None
     };
     let deduped = dedup_eligible
-        && session
-            .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
+        && session.is_some_and(|s| {
+            current_revision
+                .as_ref()
+                .is_some_and(|revision| s.is_expanded(&m.path, m.line, revision))
+        });
     // expand_match always prints a range containing m.line (def_range starts
     // at m.line for definitions; the ±10 fallback for def_range: None / usages
     // trivially contains it), so the raw "-> [line] text" preview would
@@ -1019,8 +1022,8 @@ fn format_single_match(
             if !skip {
                 if let Some((code, content)) = expand_match(m, scope, edit_mode) {
                     if m.is_definition && m.def_range.is_some() {
-                        if let (Some(s), Some(t)) = (session, current_mtime) {
-                            s.record_expand(&m.path, m.line, t);
+                        if let (Some(s), Some(revision)) = (session, &current_revision) {
+                            s.record_expand(&m.path, m.line, revision.clone());
                         }
                     }
 
@@ -1357,15 +1360,16 @@ fn basename_file_outline(
     let content = std::fs::read_to_string(&matched_path).ok()?;
     let file_type = crate::lang::detect_file_type(&matched_path);
 
-    let outline = cache.get_or_compute(&matched_path, content.as_bytes(), false, || {
-        crate::read::outline::generate(
-            &matched_path,
-            file_type,
-            &content,
-            content.as_bytes(),
-            false,
-        )
-    });
+    let outline =
+        cache.get_or_compute(&matched_path, content.as_bytes(), OutlineMode::Full, || {
+            crate::read::outline::generate(
+                &matched_path,
+                file_type,
+                &content,
+                content.as_bytes(),
+                false,
+            )
+        });
 
     if outline.trim().is_empty() {
         return None;
@@ -1745,11 +1749,13 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     if meta.len() > 500_000 {
         return None;
     }
-    Some(cache.get_or_compute_disk(path, false, || {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let buf = content.as_bytes();
-        read::outline::generate(path, file_type, &content, buf, false)
-    }))
+    Some(
+        cache.get_or_compute_disk_with_metadata(path, OutlineMode::Full, &meta, || {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let buf = content.as_bytes();
+            read::outline::generate(path, file_type, &content, buf, false)
+        }),
+    )
 }
 
 /// Find the outline entry index that encloses the given line.

@@ -3,7 +3,6 @@ use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -338,29 +337,25 @@ impl Session {
         self.saved_tokens.store(0, Ordering::Relaxed);
     }
 
-    /// Return true only when the recorded revision and caller timestamp still match.
-    pub fn is_expanded(&self, path: &Path, line: u32, current_mtime: SystemTime) -> bool {
-        let Some(revision) = crate::util::FileRevision::of(path)
-            .filter(|revision| revision.matches_mtime(current_mtime))
-        else {
-            return false;
-        };
+    /// Return true only when the recorded revision equals the caller's revision.
+    pub fn is_expanded(
+        &self,
+        path: &Path,
+        line: u32,
+        revision: &crate::util::FileRevision,
+    ) -> bool {
         let key = format!("{}:{}", path.display(), line);
         self.expanded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
-            .is_some_and(|recorded| *recorded == revision)
+            .is_some_and(|recorded| recorded == revision)
     }
 
-    /// Refuse a caller timestamp that no longer matches the file.
-    /// A timestamp alone cannot bind preloaded bytes during concurrent restored-mtime edits.
-    pub fn record_expand(&self, path: &Path, line: u32, mtime: SystemTime) {
-        let Some(revision) =
-            crate::util::FileRevision::of(path).filter(|revision| revision.matches_mtime(mtime))
-        else {
-            return;
-        };
+    /// Record this expansion under the caller's revision. The caller builds
+    /// `revision` from the same read it is recording, so this never stats
+    /// the file itself.
+    pub fn record_expand(&self, path: &Path, line: u32, revision: crate::util::FileRevision) {
         let key = format!("{}:{}", path.display(), line);
         self.expanded
             .lock()
@@ -376,19 +371,19 @@ impl Session {
     /// no lock in between, so two concurrent calls for the same target both
     /// see "not expanded" and both inline the full body — the dedup pays for
     /// itself only when exactly one caller can win the claim.
-    pub fn claim_expand(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
-        let Some(revision) =
-            crate::util::FileRevision::of(path).filter(|revision| revision.matches_mtime(mtime))
-        else {
-            return false;
-        };
+    pub fn claim_expand(
+        &self,
+        path: &Path,
+        line: u32,
+        revision: &crate::util::FileRevision,
+    ) -> bool {
         let key = format!("{}:{}", path.display(), line);
         let mut expanded = self
             .expanded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match expanded.insert(key, revision.clone()) {
-            Some(previous) => previous == revision,
+            Some(previous) => previous == *revision,
             None => false,
         }
     }
@@ -410,45 +405,18 @@ mod tests {
         let path = dir.path().join("source.rs");
         std::fs::write(&path, "fn alpha() {}").unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let revision = crate::util::FileRevision::of(&path).unwrap();
         let session = Session::new();
-        session.record_expand(&path, 1, mtime);
-        assert!(session.is_expanded(&path, 1, mtime));
-        assert!(session.claim_expand(&path, 1, mtime));
-        std::fs::write(&path, "fn bravo() {}").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(mtime))
-            .unwrap();
-        assert!(!session.is_expanded(&path, 1, mtime));
-        assert!(!session.claim_expand(&path, 1, mtime));
-        assert!(session.claim_expand(&path, 1, mtime));
-        std::fs::remove_file(&path).unwrap();
-        assert!(!session.is_expanded(&path, 1, mtime));
-    }
-
-    #[test]
-    fn freshness_expansion_rejects_earlier_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("source.rs");
-        std::fs::write(&path, "fn alpha() {}").unwrap();
-        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let current = old + std::time::Duration::from_secs(1);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(current))
-            .unwrap();
-        let session = Session::new();
-        session.record_expand(&path, 1, old);
-        assert!(!session.is_expanded(&path, 1, current));
-        assert!(!session.claim_expand(&path, 1, old));
-        assert!(!session.claim_expand(&path, 1, old));
-        assert!(!session.claim_expand(&path, 1, current));
-        assert!(session.is_expanded(&path, 1, current));
-        assert!(!session.is_expanded(&path, 1, old));
+        session.record_expand(&path, 1, revision.clone());
+        assert!(session.is_expanded(&path, 1, &revision));
+        assert!(session.claim_expand(&path, 1, &revision));
+        crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+            std::fs::write(&path, "fn bravo() {}").unwrap();
+        });
+        let changed = crate::util::FileRevision::of(&path).unwrap();
+        assert!(!session.is_expanded(&path, 1, &changed));
+        assert!(!session.claim_expand(&path, 1, &changed));
+        assert!(session.claim_expand(&path, 1, &changed));
     }
 
     #[test]

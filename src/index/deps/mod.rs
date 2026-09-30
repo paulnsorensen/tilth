@@ -175,29 +175,37 @@ fn resolved_shard_fields(
     }
 }
 
-/// Rebuild `rel`'s shard from its current on-disk state. `None` when the
-/// file has disappeared or cannot be read. The one builder every
-/// forced-rescan site (redirect/edited/deleted-init worklist, new-init
+/// Result of one forced shard rebuild.
+enum Rescan {
+    Shard(String, storage::FileShard),
+    /// The file disappeared or cannot be read. Drop it from the worklist.
+    Gone,
+    /// The file changed during the rebuild. Retry it on the next pass.
+    Drifted,
+}
+
+/// Rebuild `rel`'s shard from its current on-disk state. The one builder
+/// every forced-rescan site (redirect/edited/deleted-init worklist, new-init
 /// discovery, pending catch-up) shares, replacing duplicated inline blocks.
-fn rescan_shard(
-    worktree: &Path,
-    roots: &crate::read::imports::PyRoots,
-    rel: &str,
-) -> Option<(String, storage::FileShard)> {
+fn rescan_shard(worktree: &Path, roots: &crate::read::imports::PyRoots, rel: &str) -> Rescan {
     let abs = worktree.join(rel);
-    let signature = storage::signature_of(&abs)?;
+    let Some(signature) = storage::signature_of(&abs) else {
+        return Rescan::Gone;
+    };
     if !matches!(
         crate::lang::detect_file_type(&abs),
         crate::types::FileType::Code(_)
     ) {
-        return Some((rel.to_string(), ShardFields::empty().into_shard(signature)));
+        return Rescan::Shard(rel.to_string(), ShardFields::empty().into_shard(signature));
     }
-    let content = std::fs::read_to_string(&abs).ok()?;
+    let Ok(content) = std::fs::read_to_string(&abs) else {
+        return Rescan::Gone;
+    };
     let fields = resolved_shard_fields(&abs, &content, worktree, roots);
-    if storage::signature_of(&abs).as_ref() != Some(&signature) {
-        return None;
+    if !signature.is_current(&abs) {
+        return Rescan::Drifted;
     }
-    Some((rel.to_string(), fields.into_shard(signature)))
+    Rescan::Shard(rel.to_string(), fields.into_shard(signature))
 }
 
 /// The bounded set of files needing a forced shard rebuild this pass:
@@ -246,35 +254,57 @@ fn reexport_worklist(
     worklist
 }
 
+/// Output of the forced-rescan stage.
+struct Drained {
+    upserts: Vec<(String, storage::FileShard)>,
+    /// Rels to persist as `pending_rescan` for the next pass.
+    pending: Vec<String>,
+    /// The deadline stopped the stage with work remaining.
+    timed_out: bool,
+    /// At least one rel changed during its rebuild and stays pending.
+    drifted: bool,
+}
+
 /// Drain `worklist` under `deadline`, rescanning each rel's shard. Returns
 /// the rebuilt shards plus whatever remained unprocessed when the deadline
 /// stopped further work — the caller persists that remainder as
 /// `pending_rescan` so the next pass resumes exactly where this one left
-/// off, instead of losing track of a still-stale consumer.
+/// off, instead of losing track of a still-stale consumer. A rel that
+/// changed during its rebuild also stays pending; a gone rel is dropped.
 fn drain_worklist(
     worktree: &Path,
     roots: &crate::read::imports::PyRoots,
     worklist: HashSet<String>,
     already: &HashSet<String>,
     deadline: Instant,
-) -> (Vec<(String, storage::FileShard)>, Vec<String>) {
-    let mut forced_upserts = Vec::new();
-    let mut still_pending = Vec::new();
+) -> Drained {
+    let mut drained = Drained {
+        upserts: Vec::new(),
+        pending: Vec::new(),
+        timed_out: false,
+        drifted: false,
+    };
     let mut iter = worklist.into_iter();
     for rel in iter.by_ref() {
         if already.contains(&rel) {
             continue;
         }
         if Instant::now() >= deadline {
-            still_pending.push(rel);
+            drained.timed_out = true;
+            drained.pending.push(rel);
             break;
         }
-        if let Some(shard) = rescan_shard(worktree, roots, &rel) {
-            forced_upserts.push(shard);
+        match rescan_shard(worktree, roots, &rel) {
+            Rescan::Shard(rel, shard) => drained.upserts.push((rel, shard)),
+            Rescan::Gone => {}
+            Rescan::Drifted => {
+                drained.drifted = true;
+                drained.pending.push(rel);
+            }
         }
     }
-    still_pending.extend(iter);
-    (forced_upserts, still_pending)
+    drained.pending.extend(iter);
+    drained
 }
 
 #[derive(Clone, Copy)]
@@ -293,19 +323,19 @@ fn rescan_reexport_importers(
     pending: Vec<String>,
     walk_status: WalkStatus,
     deadline: Instant,
-) -> (Vec<(String, storage::FileShard)>, Vec<String>, bool) {
+) -> Drained {
     let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
     let mut worklist = reexport_worklist(db, upserts, deletes, previously_known, pending);
     match walk_status {
-        WalkStatus::Complete => {
-            let (forced_upserts, still_pending) =
-                drain_worklist(worktree, roots, worklist, &already, deadline);
-            let timed_out = !still_pending.is_empty();
-            (forced_upserts, still_pending, timed_out)
-        }
+        WalkStatus::Complete => drain_worklist(worktree, roots, worklist, &already, deadline),
         WalkStatus::TimedOut => {
             worklist.retain(|rel| !already.contains(rel));
-            (Vec::new(), worklist.into_iter().collect(), true)
+            Drained {
+                upserts: Vec::new(),
+                pending: worklist.into_iter().collect(),
+                timed_out: true,
+                drifted: false,
+            }
         }
     }
 }
@@ -401,7 +431,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         } else {
             ShardFields::empty()
         };
-        if storage::signature_of(path).as_ref() != Some(&signature) {
+        if !signature.is_current(path) {
             failed = true;
             continue;
         }
@@ -428,7 +458,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
     } else {
         WalkStatus::Complete
     };
-    let (mut forced_upserts, mut pending_to_write, worklist_timed_out) = rescan_reexport_importers(
+    let drained = rescan_reexport_importers(
         &handle.db,
         worktree,
         &roots,
@@ -439,7 +469,10 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         walk_status,
         deadline,
     );
-    timed_out |= worklist_timed_out;
+    let mut forced_upserts = drained.upserts;
+    let mut pending_to_write = drained.pending;
+    timed_out |= drained.timed_out;
+    failed |= drained.drifted;
 
     if !timed_out {
         let new_inits: HashSet<&str> = upserts
@@ -460,9 +493,16 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                     pending_to_write.push(importer);
                     break;
                 }
-                if let Some((rel, shard)) = rescan_shard(worktree, &roots, &importer) {
-                    if shard.deps.iter().any(|d| new_inits.contains(d.as_str())) {
-                        forced_upserts.push((rel, shard));
+                match rescan_shard(worktree, &roots, &importer) {
+                    Rescan::Shard(rel, shard) => {
+                        if shard.deps.iter().any(|d| new_inits.contains(d.as_str())) {
+                            forced_upserts.push((rel, shard));
+                        }
+                    }
+                    Rescan::Gone => {}
+                    Rescan::Drifted => {
+                        failed = true;
+                        pending_to_write.push(importer);
                     }
                 }
             }
@@ -592,7 +632,7 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
             failed = true;
             false
         };
-        if storage::signature_of(&candidate_abs).as_ref() != Some(&live_signature) {
+        if !live_signature.is_current(&candidate_abs) {
             failed = true;
             continue;
         }
@@ -641,13 +681,9 @@ mod tests {
             reconcile(&handle, repo.path(), far_deadline()).files_changed,
             0
         );
-        std::fs::write(&source, "use self::bravo;\n").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&source)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(mtime))
-            .unwrap();
+        crate::util::rewrite_with_restored_mtime(&source, mtime, || {
+            std::fs::write(&source, "use self::bravo;\n").unwrap();
+        });
         assert!(impact(&handle, Path::new("alpha.rs"), far_deadline())
             .dependents
             .is_empty());
@@ -674,13 +710,9 @@ mod tests {
                 std::fs::remove_file(&source).unwrap();
             }
             let content = format!("use self::{};\n", target.trim_end_matches(".rs"));
-            crate::util::atomic_write_bytes(&source, content.as_bytes()).unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&source)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(mtime))
-                .unwrap();
+            crate::util::rewrite_with_restored_mtime(&source, mtime, || {
+                crate::util::atomic_write_bytes(&source, content.as_bytes()).unwrap();
+            });
             assert!(impact(&handle, Path::new(obsolete), far_deadline())
                 .dependents
                 .is_empty());
@@ -706,13 +738,36 @@ mod tests {
     }
 
     #[test]
+    fn freshness_pre_epoch_mtime_reconciles_once_and_reports_complete() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        let path = repo.path().join("source.rs");
+        std::fs::write(&path, "pub fn f() {}\n").unwrap();
+        let pre_epoch = std::time::SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(1, 500_000_000))
+            .expect("1968 timestamp is representable");
+        crate::util::set_mtime(&path, pre_epoch);
+
+        let handles = DepsIndexHandles::new();
+        let handle = handles.open(repo.path(), "client").unwrap();
+        let first = reconcile(&handle, repo.path(), far_deadline());
+        assert_eq!(first.files_changed, 1);
+        assert!(first.complete);
+
+        let second = reconcile(&handle, repo.path(), far_deadline());
+        assert_eq!(second.files_changed, 0);
+        assert!(second.complete);
+    }
+
+    #[test]
     fn freshness_legacy_signature_forces_refresh() {
         let repo = init_git_repo();
         let path = repo.path().join("source.rs");
         std::fs::write(&path, "fn alpha() {}").unwrap();
         let current = storage::signature_of(&path).unwrap();
+        let current_json = serde_json::to_value(&current).unwrap();
         let legacy: storage::FileSignature = serde_json::from_value(serde_json::json!({
-            "mtime_nanos": current.mtime_nanos, "len": current.len
+            "mtime_nanos": current_json["mtime_nanos"], "len": current_json["len"]
         }))
         .unwrap();
         assert_ne!(legacy, current);
@@ -1230,10 +1285,17 @@ mod tests {
         let middle = "packages/producer/src/producer/ingest/__init__.py";
         write_file(repo.path(), middle, "from .leaf2 import Thing\n");
         let roots = crate::read::imports::PyRoots::discover(repo.path());
-        let (rel, shard) = rescan_shard(repo.path(), &roots, middle).unwrap();
+        let Rescan::Shard(rel, shard) = rescan_shard(repo.path(), &roots, middle) else {
+            panic!("the edited initializer must rebuild");
+        };
         let upserts = vec![(rel, shard)];
         let (_, previously_known) = storage::file_index_state(&handle.db).unwrap();
-        let (forced, pending, timed_out) = rescan_reexport_importers(
+        let Drained {
+            upserts: forced,
+            pending,
+            timed_out,
+            ..
+        } = rescan_reexport_importers(
             &handle.db,
             repo.path(),
             &roots,
@@ -1326,12 +1388,18 @@ mod tests {
         );
         let roots = crate::read::imports::PyRoots::discover(repo.path());
         let init_rel = "packages/producer/src/producer/ingest/__init__.py".to_string();
-        let (rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel).unwrap();
+        let Rescan::Shard(rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel) else {
+            panic!("the initializer must rebuild");
+        };
         let upserts = vec![(rel, new_shard)];
         let previously_known: HashSet<String> = [init_rel.clone()].into_iter().collect();
 
         let worklist = reexport_worklist(&handle.db, &upserts, &[], &previously_known, Vec::new());
-        let (forced, pending) = drain_worklist(
+        let Drained {
+            upserts: forced,
+            pending,
+            ..
+        } = drain_worklist(
             repo.path(),
             &roots,
             worklist,
@@ -1442,5 +1510,33 @@ mod tests {
         let resolved = impact(&handle, rankings, far_deadline());
         assert!(resolved.coverage.complete);
         assert!(canonicalized(&resolved.dependents).contains(&direct));
+    }
+
+    #[test]
+    fn deleted_uncertain_source_leaves_the_rescan_worklist() {
+        let _cache = set_cache_dir();
+        let repo = init_git_repo();
+        reexport_fixture(repo.path());
+        write_file(
+            repo.path(),
+            "src/producer/ingest/rankings.py",
+            "class RankingEntry:\n    pass\n",
+        );
+        let handle = DepsIndexHandles::new()
+            .open(repo.path(), "deleted-uncertain")
+            .unwrap();
+        let refresh = reconcile(&handle, repo.path(), far_deadline());
+        assert_eq!(refresh.uncertain_sources, 1);
+
+        std::fs::remove_file(repo.path().join("consumer/src/consumer/direct.py")).unwrap();
+        let first = reconcile(&handle, repo.path(), far_deadline());
+        assert!(
+            first.complete,
+            "a deleted uncertain source must not stay pending"
+        );
+        assert!(!first.timed_out);
+        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        let second = reconcile(&handle, repo.path(), far_deadline());
+        assert!(second.complete);
     }
 }
