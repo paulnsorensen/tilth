@@ -12,7 +12,9 @@ use crate::lang::treesitter::{
     definition_weight as default_definition_weight,
     extract_definition_name as default_extract_definition_name, DEFINITION_KINDS,
 };
-use crate::types::Lang;
+use std::path::{Path, PathBuf};
+
+use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// A language-specific predicate for a leading declaration adornment.
 ///
@@ -119,6 +121,95 @@ pub(crate) type CanonicalAnchor = fn(tree_sitter::Node) -> tree_sitter::Node;
 
 pub(crate) type ReceiverExtractor =
     for<'a> fn(&str, tree_sitter::Node<'a>, &tree_sitter::Language) -> Option<String>;
+pub(crate) type ImportResolver = fn(&Path, &str) -> Option<PathBuf>;
+pub(crate) type SpecialOutline =
+    fn(tree_sitter::Node, &[&str], Lang, usize) -> Option<OutlineEntry>;
+#[derive(Clone, Copy)]
+pub(crate) struct SamePackagePolicy {
+    pub extension: &'static str,
+    pub excluded_suffix: &'static str,
+    pub max_files: usize,
+    pub max_file_size: u64,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct TestFilenamePolicy {
+    pub order: u8,
+    pub label: &'static str,
+    pub matches: fn(&str) -> bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct InlineTestPolicy {
+    pub order: u8,
+    pub label: &'static str,
+    pub extension: &'static str,
+    pub marker: &'static str,
+    pub max_files: usize,
+    pub extension_ignore_ascii_case: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct LanguagePolicy {
+    pub triple_quoted_strings: bool,
+    pub hash_line_comments: bool,
+    pub import_line: fn(&str) -> bool,
+    pub import_external: fn(&str) -> bool,
+    pub import_resolver: ImportResolver,
+    pub import_source: Option<fn(&str) -> String>,
+    pub special_outline: SpecialOutline,
+    pub outline_label: fn(OutlineKind) -> Option<&'static str>,
+    pub sibling_object: Option<&'static str>,
+    pub callee_allowed: fn(&str) -> bool,
+    pub same_package: Option<SamePackagePolicy>,
+    pub receiver_type_query: Option<&'static str>,
+    pub restore_grouped_name: bool,
+    pub search_priority: u8,
+    pub search_extensions: &'static [&'static str],
+    pub basename_extensions: &'static [&'static str],
+    pub test_filename: Option<TestFilenamePolicy>,
+    pub inline_test: Option<InlineTestPolicy>,
+}
+pub(crate) fn never_import(_line: &str) -> bool {
+    false
+}
+pub(crate) fn always_external(_source: &str) -> bool {
+    true
+}
+pub(crate) fn no_import_resolution(_dir: &Path, _source: &str) -> Option<PathBuf> {
+    None
+}
+pub(crate) fn no_special_outline(
+    _node: tree_sitter::Node,
+    _lines: &[&str],
+    _lang: Lang,
+    _depth: usize,
+) -> Option<OutlineEntry> {
+    None
+}
+pub(crate) fn default_outline_label(_kind: OutlineKind) -> Option<&'static str> {
+    None
+}
+pub(crate) fn allow_callee(_name: &str) -> bool {
+    true
+}
+pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
+    triple_quoted_strings: false,
+    hash_line_comments: false,
+    import_line: never_import,
+    import_external: always_external,
+    import_resolver: no_import_resolution,
+    import_source: None,
+    special_outline: no_special_outline,
+    outline_label: default_outline_label,
+    sibling_object: None,
+    callee_allowed: allow_callee,
+    same_package: None,
+    receiver_type_query: None,
+    restore_grouped_name: false,
+    search_priority: 3,
+    search_extensions: &[],
+    basename_extensions: &[],
+    test_filename: None,
+    inline_test: None,
+};
 
 /// All per-language data and behavior in one record. Read via `spec(lang)`.
 pub(crate) struct LangSpec {
@@ -141,8 +232,6 @@ pub(crate) struct LangSpec {
     pub scoped_imports: bool,
     /// Manifest filenames used for dependency discovery.
     pub manifests: &'static [&'static str],
-    /// Tree-sitter node kinds that represent definitions.
-    pub definition_kinds: &'static [&'static str],
     /// Whether this language's signatures use lifetime tick stripping.
     pub has_lifetimes: bool,
     /// Comment/log stripping family.
@@ -158,6 +247,8 @@ pub(crate) struct LangSpec {
     pub attach_leading_adornment: AttachLeadingAdornment,
     /// Language-owned semantic ownership start for embedded adornments.
     pub semantic_start: SemanticStart,
+    /// Language-owned policies used by generic readers and search engines.
+    pub policy: LanguagePolicy,
 }
 
 /// Shared default for declarations whose node starts at the canonical anchor.
@@ -229,15 +320,23 @@ pub(crate) enum StripFamily {
 /// Definition-name extraction + semantic weight for a language. The default
 /// (`DEFAULT_DEFS`) walks standard field names; Elixir overrides both because
 /// its definitions are `call` nodes.
+#[derive(Clone, Copy)]
 pub(crate) struct DefinitionOps {
+    /// Decide whether an AST node is a definition in this language.
+    pub is_definition: fn(tree_sitter::Node, &[&str]) -> bool,
     /// Extract the defined symbol name from a definition node.
     pub extract_name: fn(tree_sitter::Node, &[&str]) -> Option<String>,
+    /// Return a query's exact name line for grouped declarations.
+    pub name_line: fn(tree_sitter::Node, &[&str], &str) -> Option<u32>,
+    /// Extract an explicitly qualified owner from a definition.
+    pub qualified_owner: fn(tree_sitter::Node, &[&str]) -> Option<String>,
+    /// Identify definition nodes that also qualify nested names.
+    pub is_container: fn(tree_sitter::Node, &[&str]) -> bool,
+    /// Return a language-specific kind label.
+    pub kind_label: fn(tree_sitter::Node, &[&str]) -> Option<&'static str>,
     /// Semantic ranking weight for a definition node.
     pub weight: fn(tree_sitter::Node, &[&str]) -> u16,
 }
-
-/// Shared default definition kinds — used by every language except Elixir.
-pub(crate) const DEFAULT_DEF_KINDS: &[&str] = DEFINITION_KINDS;
 
 /// Default weight adapter: weight is keyed on the node kind, so the node's
 /// `lines` argument is unused. Kept in the `(node, lines)` shape so every
@@ -246,9 +345,34 @@ fn default_defs_weight(node: tree_sitter::Node, _lines: &[&str]) -> u16 {
     default_definition_weight(node.kind())
 }
 
-/// Shared default `DefinitionOps` — referenced by every non-Elixir spec.
+fn default_is_definition(node: tree_sitter::Node, _lines: &[&str]) -> bool {
+    DEFINITION_KINDS.contains(&node.kind())
+}
+
+fn no_name_line(_node: tree_sitter::Node, _lines: &[&str], _query: &str) -> Option<u32> {
+    None
+}
+
+fn no_qualified_owner(_node: tree_sitter::Node, _lines: &[&str]) -> Option<String> {
+    None
+}
+
+fn no_definition_container(_node: tree_sitter::Node, _lines: &[&str]) -> bool {
+    false
+}
+
+fn no_definition_kind_label(_node: tree_sitter::Node, _lines: &[&str]) -> Option<&'static str> {
+    None
+}
+
+/// Shared `DefinitionOps` base. Languages override only the operations they own.
 pub(crate) const DEFAULT_DEFS: DefinitionOps = DefinitionOps {
+    is_definition: default_is_definition,
     extract_name: default_extract_definition_name,
+    name_line: no_name_line,
+    qualified_owner: no_qualified_owner,
+    is_container: no_definition_container,
+    kind_label: no_definition_kind_label,
     weight: default_defs_weight,
 };
 
@@ -422,15 +546,16 @@ mod tests {
     }
 
     #[test]
-    fn elixir_is_the_only_definition_override() {
-        // The refactor's shared-default-plus-override design: every spec points at
-        // DEFAULT_DEF_KINDS except Elixir, whose definitions are `call` nodes.
+    fn elixir_is_the_only_definition_predicate_override() {
         for &lang in mod_all_langs_for_test() {
-            let uses_default = spec(lang).definition_kinds == DEFAULT_DEF_KINDS;
+            let uses_default = std::ptr::fn_addr_eq(
+                spec(lang).definitions.is_definition,
+                DEFAULT_DEFS.is_definition,
+            );
             assert_eq!(
                 uses_default,
                 !matches!(lang, Lang::Elixir),
-                "{lang:?} definition_kinds override mismatch — only Elixir diverges"
+                "{lang:?} definition predicate override mismatch — only Elixir diverges"
             );
         }
     }

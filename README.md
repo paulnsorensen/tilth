@@ -162,7 +162,7 @@ $ tilth diff HEAD~1
   [+]      fn refresh_token                    L120
 ```
 
-Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. Replaces `git diff` for AI agents.
+Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. This optional CLI view remains available. MCP clients use shell `git diff` and `git log`; the `tilth_diff` MCP tool is retired.
 
 ## Benchmarks
 
@@ -255,7 +255,14 @@ For headless runs, `--disallowedTools` (above) is the equivalent lever.
 
 ### Bash guard hook
 
-Banning built-in Grep/Glob moves exploration into Bash (`grep`/`rg` lead `tilth_search` by up to 4.6:1 in the same telemetry), where the MCP surface cannot see it. `scripts/tilth-bash-guard` is a Claude Code PreToolUse hook that denies common leading `grep`/`rg`/`find`/`cat`/`ls` commands targeting project files (wrapper forms like `bash -c` are not inspected) and routes the agent to `tilth_search`/`tilth_read`/`tilth_list`; pipe filters (`cargo test | grep foo`) and paths outside the project pass through. Verify the guard with `python3 scripts/tilth-bash-guard --self-test`, then install it in a tilth-enabled project's `.claude/settings.json`; review the script itself like any other executable dependency before installing it, especially when checking out untrusted branches:
+`scripts/tilth-bash-guard` routes project content reads from leading `grep`/`rg`/`cat` commands to `tilth_search`/`tilth_read`.
+Shell `ls` and `find` allow directory browsing.
+Project input reads, output redirects, and `find` execution or write actions remain guarded.
+Wrapper forms such as `bash -c` are not inspected.
+Pipe filters (`cargo test | grep foo`) and paths outside the project pass through.
+Run `python3 scripts/tilth-bash-guard --self-test` before installation.
+Install the hook in a tilth-enabled project's `.claude/settings.json`.
+Review the script before installation, especially on untrusted branches:
 
 ```json
 {

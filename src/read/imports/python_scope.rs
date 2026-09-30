@@ -291,7 +291,8 @@ pub(crate) fn resolve_python_edges_cached(
 /// honest signal both engines key their ambiguity behavior on. Callers pass
 /// the `roots` they already discovered for the scope.
 pub(crate) fn target_ambiguity(target: &Path, roots: &PyRoots) -> Option<AmbiguousTarget> {
-    if !matches!(detect_file_type(target), FileType::Code(Lang::Python)) {
+    if !matches!(detect_file_type(target), FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports)
+    {
         return None;
     }
     let module = roots.module_of(target)?;

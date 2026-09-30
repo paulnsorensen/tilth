@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::lang::detect_file_type;
+use crate::lang::{spec::spec, ALL_LANGS};
 use crate::read::imports::is_import_line;
 use crate::search::SKIP_DIRS;
 use crate::types::{FileType, Lang};
@@ -642,44 +643,52 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
         .code_files
         .iter()
         .any(|(path, _)| path.contains(".test.") || path.contains(".spec."));
-    let has_go_tests = walk
-        .code_files
+    let mut policy_styles: Vec<(u8, &'static str)> = ALL_LANGS
         .iter()
-        .any(|(path, _)| path.ends_with("_test.go"));
-    let has_py_tests = walk
-        .code_files
-        .iter()
-        .any(|(path, _)| path.starts_with("test_") || path.contains("/test_"));
+        .filter_map(|&lang| spec(lang).policy.test_filename)
+        .filter(|policy| {
+            walk.code_files
+                .iter()
+                .any(|(path, _)| (policy.matches)(path))
+        })
+        .map(|policy| (policy.order, policy.label))
+        .collect();
 
-    if has_test_files && !walk.has_dunder_tests {
-        styles.push("*.test/spec files".to_string());
-    }
-    if has_go_tests {
-        styles.push("_test.go".to_string());
-    }
-    if has_py_tests {
-        styles.push("test_*.py".to_string());
-    }
-
-    // Rust in-source test detection
-    if primary_lang == Some(Lang::Rust) {
-        let has_cfg_test = walk
+    if let Some(policy) = primary_lang.and_then(|lang| spec(lang).policy.inline_test) {
+        let has_inline_tests = walk
             .code_files
             .iter()
             .filter(|(path, _)| {
                 Path::new(path)
                     .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        if policy.extension_ignore_ascii_case {
+                            extension.eq_ignore_ascii_case(policy.extension)
+                        } else {
+                            extension == policy.extension
+                        }
+                    })
             })
-            .take(5)
+            .take(policy.max_files)
             .any(|(path, _)| {
-                let full = root.join(path);
-                fs::read_to_string(&full).is_ok_and(|content| content.contains("#[cfg(test)]"))
+                fs::read_to_string(root.join(path))
+                    .is_ok_and(|content| content.contains(policy.marker))
             });
-        if has_cfg_test {
-            styles.push("in-source #[cfg(test)]".to_string());
+        if has_inline_tests {
+            policy_styles.push((policy.order, policy.label));
         }
     }
+
+    if has_test_files && !walk.has_dunder_tests {
+        styles.push("*.test/spec files".to_string());
+    }
+    policy_styles.sort_by_key(|(order, _)| *order);
+    styles.extend(
+        policy_styles
+            .into_iter()
+            .map(|(_, label)| label.to_string()),
+    );
 
     if styles.is_empty() {
         None
@@ -816,10 +825,114 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
 mod tests {
     use super::*;
 
+    fn walk_with_files(paths: &[&str]) -> WalkResult {
+        WalkResult {
+            lang_counts: HashMap::new(),
+            module_lang_counts: HashMap::new(),
+            code_files: paths.iter().map(|path| ((*path).to_string(), 0)).collect(),
+            has_tests_dir: false,
+            has_test_dir: false,
+            has_dunder_tests: false,
+            has_spec_dir: false,
+        }
+    }
+
     #[test]
-    fn test_fingerprint_on_tilth() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let output = fingerprint(root);
+    fn test_style_preserves_label_order_and_legacy_filename_matching() {
+        let mut walk =
+            walk_with_files(&["src/widget.test.ts", "pkg/widget_test.go", "test_legacy.rs"]);
+        walk.has_tests_dir = true;
+        walk.has_test_dir = true;
+        walk.has_spec_dir = true;
+
+        assert_eq!(
+            test_style(Path::new("."), &walk, None).as_deref(),
+            Some("tests/, test/, spec/, *.test/spec files, _test.go, test_*.py")
+        );
+
+        walk.has_dunder_tests = true;
+        assert_eq!(
+            test_style(Path::new("."), &walk, None).as_deref(),
+            Some("tests/, test/, __tests__/, spec/, _test.go, test_*.py")
+        );
+    }
+
+    #[test]
+    fn test_style_detects_go_and_python_filenames_independently() {
+        let go_walk = walk_with_files(&["pkg/widget_test.go"]);
+        assert_eq!(
+            test_style(Path::new("."), &go_walk, None).as_deref(),
+            Some("_test.go")
+        );
+
+        let python_walk = walk_with_files(&["test_legacy.rs"]);
+        assert_eq!(
+            test_style(Path::new("."), &python_walk, None).as_deref(),
+            Some("test_*.py")
+        );
+    }
+
+    #[test]
+    fn test_style_limits_inline_scan_to_five_eligible_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = [
+            "README.md",
+            "one.rs",
+            "two.rs",
+            "three.rs",
+            "four.rs",
+            "five.rs",
+            "six.rs",
+        ];
+        for path in paths {
+            std::fs::write(tmp.path().join(path), "pub fn example() {}\n").unwrap();
+        }
+        std::fs::write(tmp.path().join("six.rs"), "#[cfg(test)]\nmod tests {}\n").unwrap();
+        let walk = walk_with_files(&paths);
+
+        assert_eq!(test_style(tmp.path(), &walk, Some(Lang::Rust)), None);
+
+        std::fs::write(tmp.path().join("six.rs"), "pub fn example() {}\n").unwrap();
+        std::fs::write(tmp.path().join("five.rs"), "#[cfg(test)]\nmod tests {}\n").unwrap();
+        assert_eq!(
+            test_style(tmp.path(), &walk, Some(Lang::Rust)).as_deref(),
+            Some("in-source #[cfg(test)]")
+        );
+    }
+
+    #[test]
+    fn test_style_uses_only_primary_language_inline_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.RS"), "#[cfg(test)]\nmod tests {}\n").unwrap();
+        let walk = walk_with_files(&["lib.RS"]);
+
+        assert_eq!(
+            test_style(tmp.path(), &walk, Some(Lang::Rust)).as_deref(),
+            Some("in-source #[cfg(test)]")
+        );
+        assert_eq!(test_style(tmp.path(), &walk, Some(Lang::Python)), None);
+
+        std::fs::write(tmp.path().join("lib.RS"), "pub fn example() {}\n").unwrap();
+        assert_eq!(test_style(tmp.path(), &walk, Some(Lang::Rust)), None);
+    }
+
+    #[test]
+    fn test_fingerprint_detects_rust_project() {
+        let tmp = tempfile::tempdir().expect("temporary project should be created");
+        std::fs::create_dir(tmp.path().join("src")).expect("source directory should be created");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "tilth"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("manifest should be written");
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn example() {}\n")
+            .expect("Rust source should be written");
+
+        let output = fingerprint(tmp.path());
 
         assert!(!output.is_empty(), "fingerprint should not be empty");
         assert!(
@@ -827,7 +940,10 @@ mod tests {
             "should detect Rust as primary language"
         );
         assert!(output.contains("Cargo.toml"), "should detect manifest");
-        assert!(output.contains("tilth"), "should find project name");
+        assert!(
+            output.contains("Cargo.toml (tilth"),
+            "should find project name in manifest summary"
+        );
 
         // Token budget: output should be compact
         let estimated_tokens = output.len() / 4;

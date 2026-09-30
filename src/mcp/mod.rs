@@ -13,12 +13,8 @@ use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 mod iso;
 mod path_suffix;
 mod tools;
-mod tree;
 
-use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search_v2,
-    tool_write,
-};
+use tools::{tool_definitions, tool_deps, tool_grok, tool_read, tool_search_v2, tool_write};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -338,9 +334,10 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
 /// names keep the plain `unknown tool: X` message.
 fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
     match tool {
-        "tilth_files" => "unknown tool 'tilth_files' — did you mean 'tilth_list' \
-            (directory listing) or 'tilth_read' (file contents)?"
-            .to_string(),
+        "tilth_files" | "tilth_list" => format!(
+            "retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
+        ),
+        "tilth_diff" => "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.".to_string(),
         "tilth_edit" if edit_mode => {
             "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
         }
@@ -357,12 +354,9 @@ fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
     // Budget validation only applies to tools that honour the budget param.
-    // tilth_list and tilth_write ignore budget; rejecting budget:0 for them
+    // tilth_write ignores budget; rejecting budget:0 for it
     // produces a confusing read-oriented error on non-read operations.
-    let budget_aware = matches!(
-        tool,
-        "tilth_read" | "tilth_deps" | "tilth_diff" | "tilth_grok"
-    );
+    let budget_aware = matches!(tool, "tilth_read" | "tilth_deps" | "tilth_grok");
     if budget_aware {
         if let Some(b) = args.get("budget") {
             if !matches!(b.as_u64(), Some(n) if n >= 1) {
@@ -376,10 +370,8 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     let result = match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => dispatch_search_v2(args, services),
-        "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session(), services.cache()),
-        "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(unknown_tool_error(tool, edit_mode)),
     };
@@ -570,6 +562,36 @@ mod tests {
     }
 
     #[test]
+    fn retired_directory_tools_return_guidance_without_dispatch() {
+        for edit_mode in [false, true] {
+            let services = Services::new(edit_mode);
+            for tool in ["tilth_list", "tilth_files"] {
+                for args in [
+                    serde_json::json!({}),
+                    serde_json::json!({"cwd": "/", "patterns": ["*"]}),
+                ] {
+                    let err = dispatch_tool(tool, &args, &services).unwrap_err();
+                    assert_eq!(err, format!("retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retired_diff_returns_guidance_before_argument_validation() {
+        for edit_mode in [false, true] {
+            let services = Services::new(edit_mode);
+            for args in [
+                serde_json::json!({}),
+                serde_json::json!({"cwd": "/", "source": "working"}),
+                serde_json::json!({"cwd": 42, "budget": 0, "source": []}),
+            ] {
+                let err = dispatch_tool("tilth_diff", &args, &services).unwrap_err();
+                assert_eq!(err, "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.");
+            }
+        }
+    }
+    #[test]
     fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
         let services = Services::new(true);
         let args = serde_json::json!({ "cwd": "/" });
@@ -577,8 +599,7 @@ mod tests {
         let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
         assert_eq!(
             files_err,
-            "unknown tool 'tilth_files' — did you mean 'tilth_list' \
-            (directory listing) or 'tilth_read' (file contents)?"
+            "retired tool 'tilth_files' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
         );
 
         let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
@@ -751,10 +772,8 @@ mod tests {
                 "tilth_search",
                 serde_json::json!({ "queries": [{ "query": "x" }] }),
             ),
-            ("tilth_list", serde_json::json!({ "patterns": ["*.rs"] })),
             ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
             ("tilth_grok", serde_json::json!({ "target": "x" })),
-            ("tilth_diff", serde_json::json!({})),
             (
                 "tilth_write",
                 serde_json::json!({ "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 1 }] }] }),
@@ -856,11 +875,11 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1458,
+            1355,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
-            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, and git diff.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log); use `tilth_read`, `tilth_search`, `tilth_list`, `tilth_diff`. Shell is for tests, builds, and non-file operations."
+            "tilth — code intelligence MCP server. Replaces grep and cat.\nDO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg); use `tilth_read` and `tilth_search`. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations."
         ));
         assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
@@ -896,11 +915,11 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1961,
+            1975,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
-            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for tests, builds, and non-file operations."
+            "tilth — code intelligence MCP server. Replaces grep, cat, and host edit tools.\nDO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations."
         ));
         assert!(EDIT_MODE_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
@@ -2354,14 +2373,7 @@ mod tests {
     /// every tool the mode offers, and the shell DO NOT lines.
     #[test]
     fn build_instructions_fit_2kb_and_carry_critical_spans() {
-        let shared_tools = [
-            "tilth_search",
-            "tilth_read",
-            "tilth_list",
-            "tilth_deps",
-            "tilth_grok",
-            "tilth_diff",
-        ];
+        let shared_tools = ["tilth_search", "tilth_read", "tilth_deps", "tilth_grok"];
         for edit in [false, true] {
             let s = build_instructions(edit);
             assert!(
@@ -2382,145 +2394,19 @@ mod tests {
                     "edit mode must advertise tilth_write"
                 );
             }
+            assert!(!s.contains("tilth_list"), "retired tool in instructions");
+            assert!(!s.contains("tilth_diff"), "retired tool in instructions");
+            assert!(s.contains("shell `git diff` or `git log`"));
+            assert!(s.contains("directory browsing (ls/find)"));
             assert!(
-                s.contains("DO NOT use shell for repo files or history"),
+                s.contains("DO NOT use shell for repo content reads"),
                 "missing shell DO NOT line (edit={edit})"
             );
             assert!(
-                s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
+                s.contains("cat/head/tail/sed/grep/rg)"),
                 "shell DO NOT line must enumerate the replaced commands (edit={edit})"
             );
         }
-    }
-
-    /// Tightened tree-shape assertion: the rendered tree carries the box-
-    /// drawing connectors and a per-directory token rollup, not just the
-    /// substring `src/`.
-    #[test]
-    fn tool_list_emits_tree_shape_with_connectors_and_rollups() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
-        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
-        let args = serde_json::json!({
-            "patterns": ["**/*.rs"],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_list(&args).expect("list ok");
-        assert!(
-            out.contains("├── ") || out.contains("└── "),
-            "expected box-drawing connector: {out}"
-        );
-        // Per-file token annotation
-        assert!(out.contains("a.rs"), "expected a.rs entry: {out}");
-        assert!(out.contains("tokens"), "expected token rollup: {out}");
-        // Files count on directory line
-        assert!(
-            out.lines()
-                .any(|l| l.contains("src/") && l.contains("files")),
-            "expected src/ line with files rollup: {out}"
-        );
-    }
-
-    /// `tilth_list` empty patterns rejected.
-    #[test]
-    fn tool_list_empty_patterns_rejected() {
-        let cwd = std::env::current_dir().unwrap();
-        let args = serde_json::json!({ "patterns": [], "scope": cwd.to_str().unwrap(), "cwd": cwd.to_str().unwrap() });
-        let err = tool_list(&args).expect_err("empty must error");
-        assert!(err.contains("at least one"), "unexpected: {err}");
-    }
-
-    /// `tilth_list` enforces the 20-pattern cap.
-    #[test]
-    fn tool_list_patterns_over_limit_rejected() {
-        let mut ps = Vec::with_capacity(21);
-        for _ in 0..21 {
-            ps.push(serde_json::json!("*.rs"));
-        }
-        let cwd = std::env::current_dir().unwrap();
-        let args = serde_json::json!({ "patterns": ps, "scope": cwd.to_str().unwrap(), "cwd": cwd.to_str().unwrap() });
-        let err = tool_list(&args).expect_err(">20 must error");
-        assert!(err.contains("limited to 20"), "unexpected: {err}");
-    }
-
-    /// `tilth_list` emits a tree with rolled-up token counts.
-    #[test]
-    fn tool_list_produces_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
-        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
-        let args = serde_json::json!({
-            "patterns": ["*.rs"],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_list(&args).expect("list ok");
-        assert!(out.contains("src/"), "expected src/ in tree: {out}");
-        assert!(out.contains("a.rs"), "expected a.rs: {out}");
-        assert!(out.contains("tokens"), "expected token rollup: {out}");
-    }
-
-    /// Correctness: `tool_list` must respect `SKIP_DIRS` so `target/`,
-    /// `node_modules/`, `.git/` don't blow the budget.
-    #[test]
-    fn tool_list_walker_respects_skip_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/keep.rs"), "fn k(){}").unwrap();
-        std::fs::create_dir(dir.path().join("target")).unwrap();
-        std::fs::write(dir.path().join("target/skip.rs"), "fn s(){}").unwrap();
-        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
-        std::fs::write(dir.path().join("node_modules/skip.js"), "x").unwrap();
-        let args = serde_json::json!({
-            "patterns": ["**/*"],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-        let out = tool_list(&args).expect("list ok");
-        assert!(
-            out.contains("keep.rs"),
-            "expected src/keep.rs in tree: {out}"
-        );
-        assert!(!out.contains("target/"), "target/ must be skipped: {out}");
-        assert!(
-            !out.contains("node_modules"),
-            "node_modules must be skipped: {out}"
-        );
-    }
-
-    #[test]
-    fn tool_list_ignores_ignore_files_except_tilthignore() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
-        std::fs::write(dir.path().join(".ignore"), "hidden.rs\n").unwrap();
-        std::fs::write(dir.path().join(".git/info/exclude"), "excluded.rs\n").unwrap();
-        std::fs::write(dir.path().join("hidden.rs"), "fn hidden() {}\n").unwrap();
-        std::fs::write(dir.path().join("excluded.rs"), "fn excluded() {}\n").unwrap();
-        std::fs::write(dir.path().join("denied.rs"), "fn denied() {}\n").unwrap();
-        std::fs::write(dir.path().join(".tilthignore"), "denied.rs\n").unwrap();
-        let args = serde_json::json!({
-            "patterns": ["*.rs"],
-            "scope": dir.path().to_str().unwrap(),
-            "cwd": dir.path().to_str().unwrap()
-        });
-
-        let out = tool_list(&args).expect("list ok");
-
-        assert!(
-            out.contains("hidden.rs"),
-            ".ignore must not hide files: {out}"
-        );
-        assert!(
-            out.contains("excluded.rs"),
-            ".git/info/exclude must not hide files: {out}"
-        );
-        assert!(
-            !out.contains("denied.rs"),
-            ".tilthignore must deny files: {out}"
-        );
     }
 
     /// Dispatch rejects a non-positive `budget` (0, negative, non-integer)
@@ -2557,7 +2443,7 @@ mod tests {
         );
     }
 
-    /// `tilth_write` and `tilth_list` don't consume budget; passing budget:0 must
+    /// `tilth_write` does not consume budget; passing budget:0 must
     /// not produce a budget error — the error should come from their own
     /// parameter validation, not the budget gate.
     #[test]
@@ -2579,25 +2465,6 @@ mod tests {
         assert!(
             !err.contains("positive integer"),
             "budget gate must not fire for tilth_write: {err}"
-        );
-
-        // tilth_list, budget:0 → own patterns error, not budget error.
-        let services = Services::new(false);
-        let tmp = tempfile::tempdir().unwrap();
-        let args = serde_json::json!({
-            "budget": 0,
-            "patterns": [],
-            "cwd": tmp.path().to_str().unwrap()
-        });
-        let err = dispatch_tool("tilth_list", &args, &services)
-            .expect_err("empty patterns must be rejected");
-        assert!(
-            err.contains("at least one glob"),
-            "error must come from the empty-patterns check: {err}"
-        );
-        assert!(
-            !err.contains("positive integer"),
-            "budget gate must not fire for tilth_list: {err}"
         );
     }
 

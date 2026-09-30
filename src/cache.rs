@@ -19,10 +19,35 @@ const MAX_OUTLINE_ENTRIES: usize = 2000;
 /// per-entry cost here.
 const MAX_PARSED_ENTRIES: usize = 500;
 
+/// Whether a cached outline was rendered in size-capped or full form.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutlineMode {
+    Capped,
+    Full,
+}
+
+/// Content-supplied and disk-backed outlines key the same path independently;
+/// without this, one path's warm content entry and warm disk entry would
+/// evict each other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RevisionKind {
+    Content,
+    Disk,
+}
+
 #[derive(PartialEq, Eq)]
 enum OutlineRevision {
     Content(u64),
     Disk(FileRevision),
+}
+
+impl OutlineRevision {
+    fn kind(&self) -> RevisionKind {
+        match self {
+            OutlineRevision::Content(_) => RevisionKind::Content,
+            OutlineRevision::Disk(_) => RevisionKind::Disk,
+        }
+    }
 }
 
 /// One revision per path and rendering mode; stale values replace old entries.
@@ -54,9 +79,9 @@ struct ParsedEntry {
 }
 
 /// Bounded outline and parsed-file caches. Each entry retains its source revision.
-/// Outline keys also distinguish capped and uncapped rendering.
+/// Outline keys also distinguish rendering mode and content vs. disk revisions.
 pub struct OutlineCache {
-    entries: Mutex<CLruCache<(PathBuf, bool), CacheEntry>>,
+    entries: Mutex<CLruCache<(PathBuf, OutlineMode, RevisionKind), CacheEntry>>,
     parsed: Mutex<CLruCache<PathBuf, ParsedEntry>>,
 }
 
@@ -85,39 +110,56 @@ impl OutlineCache {
         &self,
         path: &Path,
         content: &[u8],
-        capped: bool,
+        mode: OutlineMode,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
         self.compute_revision(
             path,
-            capped,
+            mode,
             OutlineRevision::Content(content_fingerprint(content)),
             compute,
         )
     }
 
-    /// Cache a disk-backed outline without reading source bytes on warm hits.
+    /// Cache a disk-backed outline. On Unix a warm hit costs one `stat`, no
+    /// source read; non-Unix warm hits still read the file to fingerprint it
+    /// because mtime and length alone are insufficient there.
     /// The closure must read the file after this method starts.
     pub fn get_or_compute_disk(
         &self,
         path: &Path,
-        capped: bool,
+        mode: OutlineMode,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
         let Some(revision) = FileRevision::of(path) else {
             return compute().into();
         };
-        self.compute_revision(path, capped, OutlineRevision::Disk(revision), compute)
+        self.compute_revision(path, mode, OutlineRevision::Disk(revision), compute)
+    }
+
+    /// Same as `get_or_compute_disk`, but reuses metadata the caller already
+    /// fetched instead of `stat`-ing the file again.
+    pub fn get_or_compute_disk_with_metadata(
+        &self,
+        path: &Path,
+        mode: OutlineMode,
+        meta: &std::fs::Metadata,
+        compute: impl FnOnce() -> String,
+    ) -> Arc<str> {
+        let Some(revision) = FileRevision::from_metadata(path, meta) else {
+            return compute().into();
+        };
+        self.compute_revision(path, mode, OutlineRevision::Disk(revision), compute)
     }
 
     fn compute_revision(
         &self,
         path: &Path,
-        capped: bool,
+        mode: OutlineMode,
         revision: OutlineRevision,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
-        let key = (path.to_path_buf(), capped);
+        let key = (path.to_path_buf(), mode, revision.kind());
         {
             let mut entries = self
                 .entries
@@ -131,7 +173,7 @@ impl OutlineCache {
         }
         let outline: Arc<str> = compute().into();
         if let OutlineRevision::Disk(before) = &revision {
-            if FileRevision::of(path).as_ref() != Some(before) {
+            if !before.is_current(path) {
                 return outline;
             }
         }
@@ -150,7 +192,8 @@ impl OutlineCache {
 
     /// Parse a code file with tree-sitter and cache the result. Returns
     /// `None` for non-code files, files larger than the 500 KB cap, or parse
-    /// failures.
+    /// failures. Returns the freshly parsed (uncached) file, not `None`, when
+    /// the file changes during parsing.
     #[must_use]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
@@ -162,7 +205,6 @@ impl OutlineCache {
         }
         let revision = FileRevision::from_metadata(path, &meta)?;
         let key = path.to_path_buf();
-        // Reuse the tree only while the disk revision matches.
         {
             let mut parsed = self
                 .parsed
@@ -174,19 +216,16 @@ impl OutlineCache {
                 }
             }
         }
-        // Stale or absent — parse and insert.
         let ts_lang = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
         let tree = crate::lang::treesitter::parse_source(&content, &ts_lang)?;
-        if FileRevision::of(path).as_ref() != Some(&revision) {
-            return None;
-        }
         let file = Arc::new(ParsedFile {
             content: Arc::new(content),
             tree,
             lang,
         });
-        self.publish_or_reuse_if_current(path, revision, file)
+        self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
+            .or(Some(file))
     }
 
     /// Reuse a disk snapshot only when its bytes match the caller's source.
@@ -225,7 +264,7 @@ impl OutlineCache {
             .parsed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if FileRevision::of(path).as_ref() != Some(&revision) {
+        if !revision.is_current(path) {
             return None;
         }
         if let Some(entry) = parsed.get(path) {
@@ -249,15 +288,6 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    fn restore_mtime(path: &Path, mtime: SystemTime) {
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(mtime))
-            .unwrap();
-    }
-
     #[test]
     fn freshness_parsed_preserved_mtime_and_warm_reuse() {
         let dir = tempfile::tempdir().unwrap();
@@ -270,8 +300,9 @@ mod tests {
         let first = cache.get_or_parse(&path).unwrap();
         let unchanged = cache.get_or_parse(&other).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get_or_parse(&path).unwrap()));
-        std::fs::write(&path, "fn bravo() {}").unwrap();
-        restore_mtime(&path, mtime);
+        crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+            std::fs::write(&path, "fn bravo() {}").unwrap();
+        });
         let changed = cache.get_or_parse(&path).unwrap();
         assert_eq!(&**changed.content, "fn bravo() {}");
         assert!(!Arc::ptr_eq(&first, &changed));
@@ -290,7 +321,7 @@ mod tests {
             .checked_sub(std::time::Duration::new(1, 500_000_000))
             .expect("1968 timestamp is representable");
         std::fs::write(&path, "fn alpha() {}").unwrap();
-        restore_mtime(&path, mtime);
+        crate::util::set_mtime(&path, mtime);
 
         let cache = OutlineCache::new();
         let first = cache
@@ -304,8 +335,9 @@ mod tests {
             "unchanged pre-epoch source must reuse"
         );
 
-        std::fs::write(&path, "fn bravo() {}").unwrap();
-        restore_mtime(&path, mtime);
+        crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+            std::fs::write(&path, "fn bravo() {}").unwrap();
+        });
         let changed = cache
             .get_or_parse(&path)
             .expect("changed pre-epoch source must parse");
@@ -323,11 +355,15 @@ mod tests {
         std::fs::write(&path, "fn alpha() {}").unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let cache = OutlineCache::new();
-        cache.get_or_compute_disk(&path, false, || std::fs::read_to_string(&path).unwrap());
-        std::fs::write(&path, "fn bravo() {}").unwrap();
-        restore_mtime(&path, mtime);
-        let changed =
-            cache.get_or_compute_disk(&path, false, || std::fs::read_to_string(&path).unwrap());
+        cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+            std::fs::read_to_string(&path).unwrap()
+        });
+        crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+            std::fs::write(&path, "fn bravo() {}").unwrap();
+        });
+        let changed = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+            std::fs::read_to_string(&path).unwrap()
+        });
         assert_eq!(&*changed, "fn bravo() {}");
     }
 
@@ -337,15 +373,23 @@ mod tests {
         let path = dir.path().join("source.rs");
         std::fs::write(&path, "fn alpha() {}").unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = crate::util::FileRevision::of(&path).unwrap();
         let cache = OutlineCache::new();
-        cache.get_or_compute_disk(&path, false, || {
+        cache.get_or_compute_disk(&path, OutlineMode::Full, || {
             let old = std::fs::read_to_string(&path).unwrap();
-            std::fs::write(&path, "fn bravo() {}").unwrap();
-            restore_mtime(&path, mtime);
+            crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+                std::fs::write(&path, "fn bravo() {}").unwrap();
+            });
             old
         });
-        let current =
-            cache.get_or_compute_disk(&path, false, || std::fs::read_to_string(&path).unwrap());
+        assert_ne!(crate::util::FileRevision::of(&path).unwrap(), before);
+        assert!(
+            cache.entries.lock().unwrap().is_empty(),
+            "must not publish an outline computed from bytes that no longer match disk"
+        );
+        let current = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+            std::fs::read_to_string(&path).unwrap()
+        });
         assert_eq!(&*current, "fn bravo() {}");
     }
 
@@ -353,11 +397,12 @@ mod tests {
     fn evicts_stale_content_on_reinsert() {
         let cache = OutlineCache::new();
         let path = Path::new("fake/path.rs");
-        cache.get_or_compute(path, b"old", false, || "outline v0".to_string());
+        cache.get_or_compute(path, b"old", OutlineMode::Full, || "outline v0".to_string());
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
-        cache.get_or_compute(path, b"new", false, || "outline v1".to_string());
+        cache.get_or_compute(path, b"new", OutlineMode::Full, || "outline v1".to_string());
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
-        let hit = cache.get_or_compute(path, b"new", false, || panic!("must hit cache"));
+        let hit =
+            cache.get_or_compute(path, b"new", OutlineMode::Full, || panic!("must hit cache"));
         assert_eq!(&*hit, "outline v1");
     }
 
@@ -374,13 +419,19 @@ mod tests {
             .enumerate()
         {
             cache.get_or_parse(&path).unwrap();
-            cache.get_or_compute_disk(&path, false, || std::fs::read_to_string(&path).unwrap());
+            cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+                std::fs::read_to_string(&path).unwrap()
+            });
             match step {
-                0 => crate::util::atomic_write_bytes(&path, expected.as_bytes()).unwrap(),
+                0 => crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+                    crate::util::atomic_write_bytes(&path, expected.as_bytes()).unwrap();
+                }),
                 1 => {
                     std::fs::remove_file(&path).unwrap();
                     assert!(cache.get_or_parse(&path).is_none());
-                    std::fs::write(&path, expected).unwrap();
+                    crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+                        std::fs::write(&path, expected).unwrap();
+                    });
                 }
                 _ => {
                     std::fs::rename(&path, &moved).unwrap();
@@ -389,15 +440,18 @@ mod tests {
                         &**cache.get_or_parse(&moved).unwrap().content,
                         "fn gamma() {}"
                     );
-                    std::fs::write(&path, expected).unwrap();
+                    crate::util::rewrite_with_restored_mtime(&path, mtime, || {
+                        std::fs::write(&path, expected).unwrap();
+                    });
                 }
             }
-            restore_mtime(&path, mtime);
             assert_eq!(&**cache.get_or_parse(&path).unwrap().content, expected);
-            let outline =
-                cache.get_or_compute_disk(&path, false, || std::fs::read_to_string(&path).unwrap());
+            let outline = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+                std::fs::read_to_string(&path).unwrap()
+            });
             assert_eq!(&*outline, expected);
-            let warm = cache.get_or_compute_disk(&path, false, || panic!("warm disk hit"));
+            let warm =
+                cache.get_or_compute_disk(&path, OutlineMode::Full, || panic!("warm disk hit"));
             assert!(Arc::ptr_eq(&outline, &warm));
         }
     }
@@ -406,14 +460,20 @@ mod tests {
     fn freshness_preloaded_outlines_track_bytes_and_rendering_mode() {
         let cache = OutlineCache::new();
         let path = Path::new("source.rs");
-        let first = cache.get_or_compute(path, b"old", false, || "old outline".into());
-        let warm = cache.get_or_compute(path, b"old", false, || panic!("warm content hit"));
+        let first = cache.get_or_compute(path, b"old", OutlineMode::Full, || "old outline".into());
+        let warm = cache.get_or_compute(path, b"old", OutlineMode::Full, || {
+            panic!("warm content hit")
+        });
         assert!(Arc::ptr_eq(&first, &warm));
-        let capped = cache.get_or_compute(path, b"old", true, || "capped outline".into());
+        let capped = cache.get_or_compute(path, b"old", OutlineMode::Capped, || {
+            "capped outline".into()
+        });
         assert_eq!(&*capped, "capped outline");
-        let changed = cache.get_or_compute(path, b"new", false, || "new outline".into());
+        let changed =
+            cache.get_or_compute(path, b"new", OutlineMode::Full, || "new outline".into());
         assert_eq!(&*changed, "new outline");
-        let unchanged = cache.get_or_compute(path, b"old", true, || panic!("capped hit"));
+        let unchanged =
+            cache.get_or_compute(path, b"old", OutlineMode::Capped, || panic!("capped hit"));
         assert!(Arc::ptr_eq(&capped, &unchanged));
     }
 
@@ -461,7 +521,9 @@ mod tests {
         // Insert more than the cap; the cache must never exceed it.
         for i in 0..MAX_OUTLINE_ENTRIES + 50 {
             let path = PathBuf::from(format!("fake/path{i}.rs"));
-            cache.get_or_compute(&path, b"source", false, || format!("outline {i}"));
+            cache.get_or_compute(&path, b"source", OutlineMode::Full, || {
+                format!("outline {i}")
+            });
         }
         let len = cache.entries.lock().unwrap().len();
         assert!(
@@ -534,7 +596,18 @@ mod tests {
         crate::util::atomic_write_bytes(&path, b"fn after() {}\n").unwrap();
         let current = cache.get_or_parse(&path).unwrap();
         resume.send(()).unwrap();
-        assert!(worker.join().unwrap().is_none());
+        let retained = worker.join().unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&retained, &current));
+        assert_eq!(retained.content.as_str(), source);
+        assert_eq!(retained.outline_entries()[0].name, "before");
+        assert_eq!(
+            retained
+                .tree
+                .root_node()
+                .utf8_text(retained.content.as_bytes())
+                .unwrap(),
+            source
+        );
         assert!(Arc::ptr_eq(&current, &cache.get_or_parse(&path).unwrap()));
         assert_eq!(current.outline_entries()[0].name, "after");
         assert_eq!(witness.count(), 1);
@@ -607,7 +680,12 @@ mod tests {
         let cache = OutlineCache::new();
         let file_type = crate::types::FileType::Code(Lang::Rust);
         let render = |capped| {
-            cache.get_or_compute(&path, source.as_bytes(), capped, || {
+            let mode = if capped {
+                OutlineMode::Capped
+            } else {
+                OutlineMode::Full
+            };
+            cache.get_or_compute(&path, source.as_bytes(), mode, || {
                 crate::read::outline::generate_cached(
                     &path,
                     file_type,

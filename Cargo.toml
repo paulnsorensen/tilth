@@ -128,7 +128,14 @@ libc = "0.2"
 
 
 [dev-dependencies]
+cucumber = "0.23.0"
+futures = { version = "0.3", default-features = false, features = ["executor"] }
 jsonschema = { version = "0.18", default-features = false }
+
+[[test]]
+name = "bdd"
+path = "tests/bdd/main.rs"
+harness = false
 
 [profile.release]
 opt-level = 3

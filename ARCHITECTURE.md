@@ -333,7 +333,9 @@ opinionated defaults:
   per-repo deny knob. Gitignore syntax, including `!path` re-include;
   per-directory; layered via `ignore`'s `add_custom_ignore_filename`,
   which the crate builds independently of the disabled git layers.
-  Applied to every walker — search, `tilth_list`, and `map`. An
+  Applied to every remaining walker — search and `map`. (Retired
+  `tilth_list` used this walker too; directory browsing now goes
+  through shell `ls`/`find`, which does not honor `.tilthignore`.) An
   explicit `tilth_read` of a path also respects it (`read::tilthignore_denies`),
   so a repo can hard-deny a deliberate
   read of its secret files; the read returns `IgnoreDenied`.
@@ -483,7 +485,8 @@ machinery:
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius for diff
-  workflows; called by `tilth_diff --blast`.
+  workflows; called by the CLI `tilth diff --blast` (the MCP
+  `tilth_diff` tool is retired in favor of shell `git diff`).
 
 ### Glob (`glob.rs`)
 
@@ -653,8 +656,9 @@ single tool each.
 
 ### Diff (`src/diff/`)
 
-`tilth_diff` (and the `tilth diff` CLI subcommand) ends up in
-`diff::diff`. The pipeline:
+The CLI `tilth diff` subcommand ends up in `diff::diff` (the MCP
+`tilth_diff` tool is retired — use shell `git diff` for changes and
+`git log` for history). The pipeline:
 
 1. **Resolve source** (`resolve_source`) — `DiffSource` is a
    six-armed enum: `GitUncommitted` (default), `GitStaged`, `GitRef`

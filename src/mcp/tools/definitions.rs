@@ -114,37 +114,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_list",
-            "annotations": { "readOnlyHint": true },
-            "description": "List a directory tree with token-size rollups; omit patterns for a project overview. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["cwd"],
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Optional batch (max 20); omit patterns for a project overview."
-                    },
-                    "depth": {
-                        "type": "number",
-                        "description": "Maximum directory depth; 1 is top-level."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Tree root directory; defaults to the checkout."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max response tokens."
-                    },
-                    "cwd": cwd_prop.clone()
-                }
-            }
-        }),
-        serde_json::json!({
             "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
             "description": "Check a file's imports and dependent callers before changing/removing an export or relied-on behavior. DO NOT use for ordinary reads or internal edits. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/repo\").",
@@ -194,55 +163,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "description": "Max response tokens."
                     },
                     "cwd": cwd_prop.clone()
-                }
-            }
-        }),
-        serde_json::json!({
-            "name": "tilth_diff",
-            "annotations": { "readOnlyHint": true },
-            "description": "Structural function-level diff. DO NOT use shell git diff/log. Git sources use the server project; only patch/a/b paths anchor under cwd. Examples: tilth_diff(cwd: \"/abs/repo\"); tilth_diff(source: \"HEAD~1\", cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["cwd"],
-                "properties": {
-                    "cwd": cwd_prop.clone(),
-                    "source": {
-                        "type": "string",
-                        "description": "uncommitted (default), staged, or git ref; ignored with a/b, patch, or log."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "File, file:function, or, in overview only, checkout-relative directory; log accepts files only."
-                    },
-                    "a": {
-                        "type": "string",
-                        "description": "First file; requires b."
-                    },
-                    "b": {
-                        "type": "string",
-                        "description": "Second file; requires a."
-                    },
-                    "patch": {
-                        "type": "string",
-                        "description": "Patch-file path instead of git diff."
-                    },
-                    "log": {
-                        "type": "string",
-                        "description": "Git range for per-commit summaries, e.g. `HEAD~5..HEAD`."
-                    },
-                    "search": {
-                        "type": "string",
-                        "description": "Case-insensitive symbol/file substring filter."
-                    },
-                    "blast": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Warn on callers of changed signatures."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max response tokens."
-                    }
                 }
             }
         }),
@@ -486,13 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn tilth_diff_schema_has_no_expand_property() {
-        let tools = tool_definitions(false);
-        let diff = tools
-            .iter()
-            .find(|t| t["name"] == "tilth_diff")
-            .expect("diff tool");
-        assert!(diff["inputSchema"]["properties"]["expand"].is_null());
+    fn tilth_diff_is_not_registered_in_either_mode() {
+        for edit_mode in [false, true] {
+            assert!(!tool_definitions(edit_mode)
+                .iter()
+                .any(|tool| tool["name"] == "tilth_diff"));
+        }
     }
 
     /// Each search entry contains one query, follow hint, or structural pattern.
@@ -584,21 +503,18 @@ mod tests {
         }
     }
 
-    /// `tilth_files` was consolidated into `tilth_list`; it must no longer be
-    /// advertised so clients can't discover a removed tool.
+    /// Retired directory tools must not appear in either mode.
     #[test]
-    fn tilth_files_is_not_advertised() {
+    fn retired_directory_tools_are_not_advertised() {
         for edit_mode in [false, true] {
             let defs = tool_definitions(edit_mode);
             let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
-            assert!(
-                !names.contains(&"tilth_files"),
-                "tilth_files must not be advertised (folded into tilth_list)"
-            );
-            assert!(
-                names.contains(&"tilth_list"),
-                "tilth_list must remain advertised"
-            );
+            for retired in ["tilth_files", "tilth_list"] {
+                assert!(
+                    !names.contains(&retired),
+                    "{retired} must not be advertised"
+                );
+            }
         }
     }
 
@@ -621,12 +537,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. All seven tools in edit mode
-    /// (`tilth_diff` included) take paths and require cwd.
+    /// `root` property must be gone from every tool. All five tools in edit mode
+    /// take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 7, "edit mode advertises 7 path-taking tools");
+        assert_eq!(tools.len(), 5, "edit mode advertises 5 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];
@@ -661,57 +577,6 @@ mod tests {
             description.contains("always set this explicitly"),
             "cwd description must tell the model to set cwd: {description}"
         );
-    }
-
-    /// `tilth_list` treats an omitted `patterns` key as a project overview,
-    /// while present arrays retain glob-tree behavior and validation.
-    #[test]
-    fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
-        let tools = tool_definitions(false);
-        let list = tools
-            .iter()
-            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_list"))
-            .expect("tilth_list tool definition present");
-        let schema = &list["inputSchema"];
-
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .expect("required array present")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert_eq!(
-            required,
-            vec!["cwd"],
-            "tilth_list must require only cwd — patterns is optional"
-        );
-        assert!(
-            schema["properties"]["patterns"]["description"]
-                .as_str()
-                .expect("patterns description present")
-                .contains("omit patterns for a project overview"),
-            "patterns description must advertise the overview omission"
-        );
-
-        let compiled = jsonschema::JSONSchema::compile(schema)
-            .expect("tilth_list inputSchema must be a valid JSON Schema");
-        assert!(
-            compiled.is_valid(&serde_json::json!({"cwd": "/abs"})),
-            "a bare cwd-only call must validate: patterns is optional"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"]})),
-            "cwd stays required"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": "*.rs", "cwd": "/abs"})),
-            "non-array patterns must fail schema validation client-side"
-        );
-        assert!(
-            !compiled.is_valid(&serde_json::json!({"patterns": [], "cwd": "/abs"})),
-            "empty patterns must fail schema validation (minItems: 1)"
-        );
-        assert!(compiled.is_valid(&serde_json::json!({"patterns": ["*.rs"], "cwd": "/abs"})));
     }
 
     /// Claude Code truncates each tool `description` at 2,048 bytes. Every

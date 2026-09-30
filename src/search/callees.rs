@@ -100,42 +100,9 @@ pub(crate) fn extract_callee_names_from_tree(
     let mut names = names;
     names.sort();
     names.dedup();
-
-    // Elixir: the callee query `(call target: (identifier) @callee)` also captures
-    // definition keywords (def, defmodule, etc.) and import keywords (use, import,
-    // alias, require) since those are all `call` nodes. Filter them out.
-    if lang == Lang::Elixir {
-        names.retain(|n| !is_elixir_keyword(n));
-    }
+    names.retain(|name| (crate::lang::spec::spec(lang).policy.callee_allowed)(name));
 
     names
-}
-
-/// Keywords that should not appear as callee names in Elixir.
-/// These are definition and import forms that are syntactically `call` nodes.
-/// Superset of `ELIXIR_DEFINITION_TARGETS` (treesitter.rs) plus import keywords
-/// (`use`, `import`, `alias`, `require`) and `defoverridable`.
-fn is_elixir_keyword(name: &str) -> bool {
-    matches!(
-        name,
-        "def"
-            | "defp"
-            | "defmodule"
-            | "defmacro"
-            | "defmacrop"
-            | "defguard"
-            | "defguardp"
-            | "defdelegate"
-            | "defstruct"
-            | "defexception"
-            | "defprotocol"
-            | "defimpl"
-            | "defoverridable"
-            | "use"
-            | "import"
-            | "alias"
-            | "require"
-    )
 }
 
 /// Match callee names against outline entries, moving resolved names out of `remaining`.
@@ -270,9 +237,16 @@ pub(crate) fn resolve_callees_cached(
         return resolved;
     }
 
-    // 3. For Go: scan same-directory files (same package, no explicit imports)
-    if lang == Lang::Go {
-        resolve_same_package(&mut remaining, &mut resolved, source_path, cache);
+    // 3. Scan same-package files when the language defines a directory namespace.
+    if let Some(policy) = crate::lang::spec::spec(lang).policy.same_package {
+        resolve_same_package(
+            &mut remaining,
+            &mut resolved,
+            source_path,
+            lang,
+            policy,
+            cache,
+        );
     }
 
     resolved
@@ -287,11 +261,10 @@ fn resolve_same_package(
     remaining: &mut std::collections::HashSet<&str>,
     resolved: &mut Vec<ResolvedCallee>,
     source_path: &Path,
+    lang: Lang,
+    policy: crate::lang::spec::SamePackagePolicy,
     cache: &crate::cache::OutlineCache,
 ) {
-    const MAX_FILES: usize = 20;
-    const MAX_FILE_SIZE: u64 = 100_000; // 100KB
-
     let Some(dir) = source_path.parent() else {
         return;
     };
@@ -300,38 +273,40 @@ fn resolve_same_package(
         return;
     };
 
-    // Collect eligible .go files, sorted for deterministic order
-    let mut go_files: Vec<PathBuf> = entries
+    // Collect eligible package files, sorted for deterministic order.
+    let suffix = format!(".{}", policy.extension);
+    let mut package_files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .filter(|e| {
             let path = e.path();
             let name = e.file_name();
             let name_str = name.to_string_lossy();
             path != source_path
-                && name_str.ends_with(".go")
-                && !name_str.ends_with("_test.go")
-                && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_SIZE)
+                && name_str.ends_with(&suffix)
+                && !name_str.ends_with(policy.excluded_suffix)
+                && e.metadata()
+                    .is_ok_and(|metadata| metadata.len() <= policy.max_file_size)
         })
         .map(|e| e.path())
         .collect();
 
-    go_files.sort();
-    go_files.truncate(MAX_FILES);
+    package_files.sort();
+    package_files.truncate(policy.max_files);
 
-    for go_path in go_files {
+    for package_path in package_files {
         if remaining.is_empty() {
             break;
         }
 
-        let Ok(content) = std::fs::read_to_string(&go_path) else {
+        let Ok(content) = std::fs::read_to_string(&package_path) else {
             continue;
         };
 
-        let outline = cache.parse_source(&go_path, &content).map_or_else(
-            || get_outline_entries(&content, Lang::Go),
+        let outline = cache.parse_source(&package_path, &content).map_or_else(
+            || get_outline_entries(&content, lang),
             |parsed| parsed.outline_entries(),
         );
-        resolve_from_entries(&outline, &go_path, remaining, resolved);
+        resolve_from_entries(&outline, &package_path, remaining, resolved);
     }
 }
 
@@ -565,6 +540,101 @@ end
         assert!(
             names.contains(&"map".to_string()),
             "expected map from Enum.map pipe, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn go_same_package_uses_sorted_twenty_file_prefix_and_exclusions() {
+        const EXPECTED_MAX_FILES: usize = 20;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("main.go");
+        let source_content = "package sample\n\nfunc caller() {}\n";
+        std::fs::write(&source_path, source_content).unwrap();
+
+        for index in (0..=EXPECTED_MAX_FILES).rev() {
+            let function = format!("Func{index:02}");
+            let content = format!("package sample\n\nfunc {function}() {{}}\n");
+            std::fs::write(tmp.path().join(format!("file_{index:02}.go")), content).unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("excluded_test.go"),
+            "package sample\n\nfunc ExcludedTest() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("00_wrong.txt"),
+            "package sample\n\nfunc WrongExtension() {}\n",
+        )
+        .unwrap();
+
+        let mut names: Vec<String> = (0..=EXPECTED_MAX_FILES)
+            .map(|index| format!("Func{index:02}"))
+            .collect();
+        names.extend(["ExcludedTest".to_string(), "WrongExtension".to_string()]);
+
+        let resolved = resolve_callees(
+            &names,
+            &source_path,
+            source_content,
+            &crate::index::bloom::BloomFilterCache::new(),
+        );
+        let actual: Vec<(String, PathBuf)> = resolved
+            .into_iter()
+            .map(|callee| (callee.name, callee.file))
+            .collect();
+        let expected: Vec<(String, PathBuf)> = (0..EXPECTED_MAX_FILES)
+            .map(|index| {
+                (
+                    format!("Func{index:02}"),
+                    tmp.path().join(format!("file_{index:02}.go")),
+                )
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn go_same_package_accepts_100000_bytes_and_rejects_100001() {
+        const EXPECTED_MAX_FILE_SIZE: usize = 100_000;
+
+        fn sized_go_file(function: &str, size: usize) -> String {
+            let mut content = format!("package sample\n\nfunc {function}() {{}}\n");
+            assert!(content.len() <= size);
+            content.push_str(&" ".repeat(size - content.len()));
+            content
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("main.go");
+        let source_content = "package sample\n\nfunc caller() {}\n";
+        std::fs::write(&source_path, source_content).unwrap();
+        std::fs::write(
+            tmp.path().join("at_limit.go"),
+            sized_go_file("AtLimit", EXPECTED_MAX_FILE_SIZE),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("over_limit.go"),
+            sized_go_file("OverLimit", EXPECTED_MAX_FILE_SIZE + 1),
+        )
+        .unwrap();
+
+        let resolved = resolve_callees(
+            &["AtLimit".to_string(), "OverLimit".to_string()],
+            &source_path,
+            source_content,
+            &crate::index::bloom::BloomFilterCache::new(),
+        );
+        let actual: Vec<(String, PathBuf)> = resolved
+            .into_iter()
+            .map(|callee| (callee.name, callee.file))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![("AtLimit".to_string(), tmp.path().join("at_limit.go"))]
         );
     }
 }

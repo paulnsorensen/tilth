@@ -31,13 +31,6 @@ pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<Trun
     truncate(output, budget, budget)
 }
 
-/// Per-section token cap when `n` batch items share `budget`: `budget / n`
-/// (min 1) so every item is represented instead of early items starving
-/// later ones.
-pub(crate) fn item_budget(budget: u64, n: usize) -> u64 {
-    (budget / (n.max(1) as u64)).max(1)
-}
-
 /// Truncate one batch section to its per-item `cap` while citing the total
 /// `budget` (not the per-item share) as the lever in any truncation marker —
 /// raising `budget` is what gives the section more room.
@@ -240,14 +233,6 @@ mod tests {
         let from_wrapper = apply(&input, 60);
         let (from_info, _) = apply_with_info(&input, 60);
         assert_eq!(from_wrapper, from_info);
-    }
-
-    #[test]
-    fn item_budget_splits_evenly_with_floor() {
-        assert_eq!(item_budget(300, 3), 100);
-        assert_eq!(item_budget(10, 4), 2); // 10 / 4 = 2
-        assert_eq!(item_budget(3, 10), 1); // floor of 1 — never starves to 0
-        assert_eq!(item_budget(1000, 0), 1000); // n.max(1) guards div-by-zero
     }
 
     #[test]
