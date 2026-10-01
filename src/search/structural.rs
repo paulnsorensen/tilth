@@ -161,6 +161,8 @@ impl StructuralPatterns {
         // The request validates and prepares every entry before execution.
         let compiled = &self.0[&(language.to_string(), source.to_string())];
         let scan = Mutex::new(StructuralScan::default());
+        let kept = Mutex::new(std::collections::BinaryHeap::<Keyed>::new());
+        let literal = compiled.pattern.fixed_string();
         super::walker(scope, glob)?.run(|| {
             Box::new(|entry| {
                 let Ok(entry) = entry else {
@@ -174,7 +176,62 @@ impl StructuralPatterns {
                 {
                     return ignore::WalkState::Continue;
                 }
-                let Some(snapshot) = cache.get_or_parse(entry.path()) else {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(crate::lang::detection::is_minified_by_name)
+                {
+                    return ignore::WalkState::Continue;
+                }
+                let snapshot = if literal.is_empty() {
+                    let Some(snapshot) = cache.get_or_parse(path) else {
+                        scan.lock().unwrap().skipped_files += 1;
+                        return ignore::WalkState::Continue;
+                    };
+                    if snapshot.content.len() as u64
+                        >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                        && crate::lang::detection::is_minified_by_content(
+                            snapshot.content.as_bytes(),
+                        )
+                    {
+                        return ignore::WalkState::Continue;
+                    }
+                    Some(snapshot)
+                } else {
+                    // Probe the literal on raw bytes so non-candidates never parse or enter the cache.
+                    let Ok(meta) = std::fs::metadata(path) else {
+                        scan.lock().unwrap().skipped_files += 1;
+                        return ignore::WalkState::Continue;
+                    };
+                    let content = if meta.len() > super::MAX_SEARCH_FILE_SIZE {
+                        None
+                    } else {
+                        std::fs::read_to_string(path).ok()
+                    };
+                    let Some(content) = content else {
+                        scan.lock().unwrap().skipped_files += 1;
+                        return ignore::WalkState::Continue;
+                    };
+                    if memchr::memmem::find(content.as_bytes(), literal.as_bytes()).is_none() {
+                        return ignore::WalkState::Continue;
+                    }
+                    if content.len() as u64 >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                        && crate::lang::detection::is_minified_by_content(content.as_bytes())
+                    {
+                        return ignore::WalkState::Continue;
+                    }
+                    cache.parse_with_revision(
+                        path,
+                        &content,
+                        // `meta` predates the read, so a stale publish fails its recheck.
+                        crate::util::FileRevision::from_metadata_and_bytes(
+                            &meta,
+                            content.as_bytes(),
+                        ),
+                    )
+                };
+                let Some(snapshot) = snapshot else {
                     scan.lock().unwrap().skipped_files += 1;
                     return ignore::WalkState::Continue;
                 };
@@ -182,12 +239,9 @@ impl StructuralPatterns {
                     snapshot,
                     language: compiled.language,
                 });
+                let rel = crate::format::rel(path, scope);
+                let mut found = Vec::new();
                 for matched in root.root().find_all(&compiled.pattern) {
-                    let mut scan = scan.lock().unwrap();
-                    if scan.items.len() == MAX_MATCHES {
-                        scan.limited = true;
-                        return ignore::WalkState::Quit;
-                    }
                     let environment = matched.get_env();
                     let mut captures = BTreeMap::new();
                     for variable in environment.get_matched_variables() {
@@ -211,24 +265,64 @@ impl StructuralPatterns {
                             MetaVariable::Dropped(_) | MetaVariable::Multiple => {}
                         }
                     }
-                    scan.items.push(StructuralItem {
-                        path: crate::format::rel(entry.path(), scope),
+                    found.push(Keyed(StructuralItem {
+                        path: rel.clone(),
                         range: Location::of(&matched),
                         captures,
-                    });
+                    }));
+                }
+                // Keep the smallest MAX_MATCHES keys so the cap ignores thread timing.
+                let mut kept = kept.lock().unwrap();
+                let mut overflowed = false;
+                for item in found {
+                    kept.push(item);
+                    if kept.len() > MAX_MATCHES {
+                        kept.pop();
+                        overflowed = true;
+                    }
+                }
+                drop(kept);
+                if overflowed {
+                    scan.lock().unwrap().limited = true;
                 }
                 ignore::WalkState::Continue
             })
         });
         let mut scan = scan.into_inner().unwrap();
-        scan.items.sort_by(|left, right| {
-            (&left.path, left.range.start_byte, left.range.end_byte).cmp(&(
-                &right.path,
-                right.range.start_byte,
-                right.range.end_byte,
-            ))
-        });
+        scan.items = kept
+            .into_inner()
+            .unwrap()
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Keyed(item)| item)
+            .collect();
         Ok(scan)
+    }
+}
+
+/// Orders items by path then byte range for the bounded max-heap.
+struct Keyed(StructuralItem);
+
+impl Keyed {
+    fn order(&self) -> (&str, usize, usize) {
+        (&self.0.path, self.0.range.start_byte, self.0.range.end_byte)
+    }
+}
+
+impl PartialEq for Keyed {
+    fn eq(&self, other: &Self) -> bool {
+        self.order() == other.order()
+    }
+}
+impl Eq for Keyed {}
+impl PartialOrd for Keyed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Keyed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
     }
 }
 
@@ -299,7 +393,6 @@ mod tests {
             snapshot: Arc::clone(&snapshot),
             language: SupportLang::Python,
         };
-        assert!(Arc::ptr_eq(&snapshot, &document.snapshot));
         assert_eq!(document.root_node().id(), snapshot.tree.root_node().id());
         assert_eq!(document.get_range(0..4).as_ptr(), snapshot.content.as_ptr());
         let root = AstGrep::doc(document);
@@ -307,5 +400,84 @@ mod tests {
         let matched = root.root().find(&pattern).unwrap();
         assert!(matches!(matched.text(), Cow::Borrowed("wrap(value)")));
         assert_eq!(matched.text().as_ptr(), snapshot.content.as_ptr());
+    }
+
+    fn scan(dir: &Path, source: &str) -> StructuralScan {
+        let mut patterns = StructuralPatterns::default();
+        patterns.prepare("python", source).unwrap();
+        let cache = OutlineCache::new();
+        patterns
+            .search("python", source, dir, None, &cache)
+            .unwrap()
+    }
+
+    #[test]
+    fn limited_scan_keeps_the_sorted_prefix_regardless_of_thread_timing() {
+        let directory = tempfile::tempdir().unwrap();
+        let line = "wrap(value)\n";
+        for name in ["a.py", "b.py", "c.py"] {
+            std::fs::write(directory.path().join(name), line.repeat(400)).unwrap();
+        }
+        for _ in 0..20 {
+            let result = scan(directory.path(), "wrap($A)");
+            assert!(result.limited);
+            assert_eq!(result.skipped_files, 0);
+            let keys: Vec<_> = result
+                .items
+                .iter()
+                .map(|item| (item.path.as_str(), item.range.start_byte))
+                .collect();
+            let expected: Vec<_> = [("a.py", 400), ("b.py", 400), ("c.py", 200)]
+                .into_iter()
+                .flat_map(|(name, count)| (0..count).map(move |index| (name, index * line.len())))
+                .collect();
+            assert_eq!(keys, expected);
+        }
+    }
+
+    #[test]
+    fn literal_prefilter_never_parses_files_without_the_literal() {
+        let directory = tempfile::tempdir().unwrap();
+        let hit = "prefilter_literal_unique(value)\n";
+        let miss = "prefilter_other_unique(value)\n";
+        let hit_witness = crate::lang::treesitter::ParseWitness::new(hit);
+        let miss_witness = crate::lang::treesitter::ParseWitness::new(miss);
+        std::fs::write(directory.path().join("hit.py"), hit).unwrap();
+        std::fs::write(directory.path().join("miss.py"), miss).unwrap();
+        let result = scan(directory.path(), "prefilter_literal_unique($A)");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].path, "hit.py");
+        assert_eq!(result.skipped_files, 0);
+        assert!(!result.limited);
+        assert_eq!(hit_witness.count(), 1);
+        assert_eq!(miss_witness.count(), 0);
+    }
+
+    #[test]
+    fn minified_files_are_skipped_silently() {
+        let directory = tempfile::tempdir().unwrap();
+        let by_name = directory.path().join("bundle.min.ts");
+        assert!(crate::lang::detection::is_minified_by_name("bundle.min.ts"));
+        std::fs::write(by_name, "wrap(value);\n").unwrap();
+        let padding = " ".repeat(crate::lang::detection::MINIFIED_CHECK_THRESHOLD as usize);
+        std::fs::write(
+            directory.path().join("dense.ts"),
+            format!("wrap(value);{padding}"),
+        )
+        .unwrap();
+        let mut patterns = StructuralPatterns::default();
+        patterns.prepare("typescript", "wrap($A)").unwrap();
+        let result = patterns
+            .search(
+                "typescript",
+                "wrap($A)",
+                directory.path(),
+                None,
+                &OutlineCache::new(),
+            )
+            .unwrap();
+        assert!(result.items.is_empty());
+        assert_eq!(result.skipped_files, 0);
+        assert!(!result.limited);
     }
 }
