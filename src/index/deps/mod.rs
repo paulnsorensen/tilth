@@ -726,9 +726,10 @@ mod tests {
         crate::util::rewrite_with_restored_mtime(&source, mtime, || {
             std::fs::write(&source, "use self::bravo;\n").unwrap();
         });
-        assert!(impact(&handle, Path::new("alpha.rs"), far_deadline())
-            .dependents
-            .is_empty());
+        assert_eq!(
+            impact(&handle, Path::new("alpha.rs"), far_deadline()).dependents,
+            [] as [std::path::PathBuf; 0]
+        );
         assert_eq!(
             reconcile(&handle, repo.path(), far_deadline()).files_changed,
             1
@@ -755,9 +756,10 @@ mod tests {
             crate::util::rewrite_with_restored_mtime(&source, mtime, || {
                 crate::util::atomic_write_bytes(&source, content.as_bytes()).unwrap();
             });
-            assert!(impact(&handle, Path::new(obsolete), far_deadline())
-                .dependents
-                .is_empty());
+            assert_eq!(
+                impact(&handle, Path::new(obsolete), far_deadline()).dependents,
+                [] as [std::path::PathBuf; 0]
+            );
             assert_eq!(
                 reconcile(&handle, repo.path(), far_deadline()).files_changed,
                 1
@@ -953,7 +955,7 @@ mod tests {
 
         std::fs::remove_file(repo.path().join("dep.rs")).unwrap();
         let after = impact(&handle, Path::new("target.rs"), far_deadline());
-        assert!(after.dependents.is_empty());
+        assert_eq!(after.dependents, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -996,9 +998,10 @@ mod tests {
         std::fs::remove_file(repo.path().join("dep.rs")).unwrap();
         let coverage = reconcile(&handle, repo.path(), far_deadline());
         assert_eq!(coverage.files_changed, 1);
-        assert!(impact(&handle, Path::new("target.rs"), far_deadline())
-            .dependents
-            .is_empty());
+        assert_eq!(
+            impact(&handle, Path::new("target.rs"), far_deadline()).dependents,
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]
@@ -1376,7 +1379,10 @@ mod tests {
         assert!(
             canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
         );
-        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_eq!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1479,7 +1485,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_ne!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
 
         // The triggering init's signature is already committed, so it no longer
         // "looks changed" — only the persisted pending entry can resume the work.
@@ -1582,7 +1591,10 @@ mod tests {
             "a deleted uncertain source must not stay pending"
         );
         assert!(!first.timed_out);
-        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_eq!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
         let second = reconcile(&handle, repo.path(), far_deadline());
         assert!(second.complete);
     }

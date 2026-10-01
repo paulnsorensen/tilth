@@ -1147,7 +1147,10 @@ mod tests {
                 .all(|d| !d.path.starts_with(scope.join("linked"))),
             "a consumer behind a symlink that leaves the scope must be skipped"
         );
-        assert!(result.reverse_coverage.uncertain.is_empty());
+        assert_eq!(
+            result.reverse_coverage.uncertain,
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]

@@ -504,13 +504,19 @@ mod tests {
         let unscoped_callees = run(cwd, &follow_hint(cwd, "fetch_callees", &Value::Null));
         assert_eq!(unscoped_callees["items"][0]["name"], "leaf");
         let scoped_callees = run(cwd, &follow_hint(cwd, "fetch_callees", &json!("root.ts")));
-        assert!(scoped_callees["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            scoped_callees["items"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(scoped_callees["completeness"], "partial");
 
         let unscoped_callers = run(cwd, &follow_hint(cwd, "fetch_callers", &Value::Null));
         assert_eq!(unscoped_callers["items"][0]["name"], "outside_caller");
         let scoped_callers = run(cwd, &follow_hint(cwd, "fetch_callers", &json!("root.ts")));
-        assert!(scoped_callers["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            scoped_callers["items"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]
