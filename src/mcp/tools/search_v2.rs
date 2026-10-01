@@ -965,7 +965,10 @@ mod tests {
         assert_eq!(result["results"][0]["status"], "partial");
         assert_eq!(result["results"][0]["completeness"], "partial");
         assert_eq!(result["results"][0]["items"].as_array().unwrap().len(), 30);
-        assert!(result["hints"].as_array().unwrap().is_empty());
+        assert_eq!(
+            result["hints"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         let mut response = json!({"results": [
             {"query": "one", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "\\\"".repeat(100_000)},
             {"query": "two", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "second"}
@@ -1153,7 +1156,10 @@ mod tests {
             call(&json!({"cwd": tmp.path(), "queries": [{"query": "a.rs", "glob": "*.ts"}]}))
                 .unwrap();
         assert_eq!(excluded["results"][0]["status"], "no_match");
-        assert!(excluded["hints"].as_array().unwrap().is_empty());
+        assert_eq!(
+            excluded["hints"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         let initial = call(&json!({"cwd": tmp.path(), "queries": [{"query": "a.rs"}]})).unwrap();
         assert_eq!(initial["hints"].as_array().unwrap().len(), 1);
         let followed =
@@ -1497,7 +1503,7 @@ mod tests {
             .iter()
             .map(|h| h["kind"].as_str().expect("kind is a string"))
             .collect();
-        assert!(hint_kinds.is_empty());
+        assert_eq!(hint_kinds, [] as [&str; 0]);
     }
 
     #[test]
@@ -1681,7 +1687,10 @@ mod tests {
                 !identities.iter().any(|s| s == "wrong_caller"),
                 "{followed}"
             );
-            assert!(followed["hints"].as_array().unwrap().is_empty());
+            assert_eq!(
+                followed["hints"].as_array().unwrap().as_slice(),
+                [] as [serde_json::Value; 0]
+            );
         }
         assert_eq!(hints[0]["target"]["line"], 2);
         assert_eq!(hints[0]["target"]["path"], "fixture.ts");
@@ -1783,7 +1792,10 @@ mod tests {
         let miss = single_query(&absent_query()).expect("miss query");
         assert_eq!(miss["results"][0]["status"], "no_match");
         let ambiguous = single_query("run").expect("ambiguous query");
-        assert!(ambiguous["hints"].as_array().expect("hints").is_empty());
+        assert_eq!(
+            ambiguous["hints"].as_array().expect("hints").as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]
