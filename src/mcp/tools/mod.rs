@@ -97,7 +97,7 @@ pub(super) fn resolve_scope(args: &Value, cwd: &std::path::Path) -> Result<PathB
              omit \"scope\" to use \"cwd\"; refusing to search a broader directory."
         )
     };
-    std::fs::read_dir(&resolved).map_err(&access_error)?;
+    std::fs::read_dir(&resolved).map_err(access_error)?;
     std::fs::metadata(resolved.join(".")).map_err(access_error)?;
     Ok(resolved)
 }
