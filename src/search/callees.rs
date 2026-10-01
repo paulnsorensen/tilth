@@ -208,13 +208,15 @@ pub(crate) fn resolve_callees_cached(
 
         // Read + bloom prefilter via shared helper. Skip the file when no
         // remaining symbol is bloom-positive.
-        let super::bloom_walk::BloomRead::Hit(import_content) =
-            super::bloom_walk::read_with_bloom_check(
-                &import_path,
-                remaining.iter().copied(),
-                bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
-            )
+        let super::bloom_walk::BloomRead::Hit {
+            content: import_content,
+            ..
+        } = super::bloom_walk::read_with_bloom_check(
+            &import_path,
+            remaining.iter().copied(),
+            bloom,
+            super::bloom_walk::MAX_FILE_SIZE,
+        )
         else {
             continue;
         };

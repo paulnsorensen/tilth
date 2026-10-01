@@ -243,7 +243,7 @@ pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 /// building — those differ per caller.
 pub(crate) fn accept_walk_entry(
     entry: Result<ignore::DirEntry, ignore::Error>,
-) -> Option<(std::path::PathBuf, u64)> {
+) -> Option<(std::path::PathBuf, u64, Option<std::fs::Metadata>)> {
     let entry = entry.ok()?;
 
     if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -260,17 +260,16 @@ pub(crate) fn accept_walk_entry(
         return None;
     }
 
-    let file_size = match std::fs::metadata(path) {
-        Ok(meta) => {
-            if meta.len() > MAX_SEARCH_FILE_SIZE {
-                return None;
-            }
-            meta.len()
-        }
-        Err(_) => 0,
-    };
+    let meta = std::fs::metadata(path).ok();
+    if meta
+        .as_ref()
+        .is_some_and(|m| m.len() > MAX_SEARCH_FILE_SIZE)
+    {
+        return None;
+    }
+    let file_size = meta.as_ref().map_or(0, std::fs::Metadata::len);
 
-    Some((entry.into_path(), file_size))
+    Some((entry.into_path(), file_size, meta))
 }
 
 /// Stat-only file filter used before searching: drop files whose names mark

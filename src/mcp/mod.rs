@@ -1010,7 +1010,12 @@ mod tests {
             "outline read reparses the shared snapshot"
         );
         let response: Value = serde_json::from_str(&result).unwrap();
-        for hint in response["hints"].as_array().unwrap() {
+        let hints = response["hints"].as_array().unwrap();
+        assert!(
+            hints.iter().any(|h| h["kind"] != "fetch_dependencies"),
+            "search must emit a followable hint: {hints:?}"
+        );
+        for hint in hints {
             if hint["kind"] == "fetch_dependencies" {
                 continue;
             }
