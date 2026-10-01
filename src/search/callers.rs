@@ -35,7 +35,7 @@ pub struct CallerMatch {
     pub caller_range: Option<(u32, u32)>,
     /// File content, already read during `find_callers_batch` — avoids re-reading during expand.
     /// Shared across all call sites in the same file via reference counting.
-    pub content: Arc<String>,
+    pub content: Arc<crate::cache::ParsedFile>,
 }
 
 /// Scan `scope` for the literal `target` byte sequence. Used by the
@@ -177,9 +177,9 @@ pub(crate) fn find_callers_batch_cached(
                 path,
                 targets,
                 &ts_lang,
-                &parsed.content,
+                &parsed,
                 lang,
-                &parsed.tree,
+                parsed.tree(),
             );
 
             if !file_callers.is_empty() {
@@ -206,7 +206,7 @@ fn find_callers_treesitter_batch(
     path: &Path,
     targets: &HashSet<String>,
     ts_lang: &tree_sitter::Language,
-    content: &Arc<String>,
+    snapshot: &Arc<crate::cache::ParsedFile>,
     lang: crate::types::Lang,
     tree: &tree_sitter::Tree,
 ) -> Vec<(String, CallerMatch)> {
@@ -215,10 +215,9 @@ fn find_callers_treesitter_batch(
         return Vec::new();
     };
 
-    let content_str = content.as_str();
-
-    let content_bytes = content_str.as_bytes();
-    let lines: Vec<&str> = content_str.lines().collect();
+    let content = snapshot.content();
+    let content_bytes = content.as_bytes();
+    let lines: Vec<&str> = content.lines().collect();
 
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
@@ -275,7 +274,7 @@ fn find_callers_treesitter_batch(
                         calling_function,
                         call_text,
                         caller_range,
-                        content: Arc::clone(content),
+                        content: Arc::clone(snapshot),
                     },
                 ));
             }
@@ -427,7 +426,7 @@ fn write_caller_bucket(
         if i < expand {
             if let Some((start, end)) = caller.caller_range {
                 // Use cached content — no re-read needed
-                let lines: Vec<&str> = caller.content.lines().collect();
+                let lines: Vec<&str> = caller.content.content().lines().collect();
                 let start_idx = (start as usize).saturating_sub(1);
                 let end_idx = (end as usize).min(lines.len());
 
@@ -608,10 +607,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caller_matches_reuse_original_file_content_arc() {
-        let source = Arc::new(
-            "fn callee() {}\n\nfn caller() {\n    callee();\n    callee();\n}\n".to_string(),
-        );
+    fn caller_matches_reuse_original_parsed_document() {
+        let source = "fn callee() {}\n\nfn caller() {\n    callee();\n    callee();\n}\n";
+        let cache = crate::cache::OutlineCache::new();
+        let snapshot = cache.parse_source(Path::new("sample.rs"), source).unwrap();
         let targets = HashSet::from(["callee".to_string()]);
         let lang = crate::types::Lang::Rust;
         let ts_lang = outline_language(lang).expect("rust grammar should be available");
@@ -620,9 +619,9 @@ mod tests {
             Path::new("sample.rs"),
             &targets,
             &ts_lang,
-            &source,
+            &snapshot,
             lang,
-            &crate::lang::treesitter::parse_source(&source, &ts_lang).unwrap(),
+            snapshot.tree(),
         );
 
         let mut actual = Vec::new();
@@ -636,8 +635,8 @@ mod tests {
         );
         for (_, caller) in &matches {
             assert!(
-                Arc::ptr_eq(&caller.content, &source),
-                "caller content should reuse the Arc created for the file"
+                Arc::ptr_eq(&caller.content, &snapshot),
+                "caller content must retain the parsed document"
             );
         }
     }

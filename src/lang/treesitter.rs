@@ -3,6 +3,39 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use ast_grep_core::matcher::PatternBuilder;
+use ast_grep_core::source::Edit;
+use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
+use ast_grep_core::{AstGrep, Language, Pattern, PatternError};
+
+/// The grammar identity for an ast-grep-owned parsed document.
+#[derive(Clone)]
+pub(crate) struct DocumentLanguage(tree_sitter::Language);
+
+impl Language for DocumentLanguage {
+    fn kind_to_id(&self, kind: &str) -> u16 {
+        self.0.id_for_node_kind(kind, true)
+    }
+
+    fn field_to_id(&self, field: &str) -> Option<u16> {
+        self.0
+            .field_id_for_name(field)
+            .map(std::num::NonZeroU16::get)
+    }
+
+    fn build_pattern(&self, builder: &PatternBuilder) -> Result<Pattern, PatternError> {
+        builder.build(|source| StrDoc::try_new(source, self.clone()))
+    }
+}
+
+impl LanguageExt for DocumentLanguage {
+    fn get_ts_language(&self) -> tree_sitter::Language {
+        self.0.clone()
+    }
+}
+
+pub(crate) type ParsedDocument = AstGrep<StrDoc<DocumentLanguage>>;
+
 /// Parse source without retaining a parser or a global lock.
 pub(crate) fn parse_source(
     content: &str,
@@ -11,17 +44,33 @@ pub(crate) fn parse_source(
     parse_with_tree(content, language, None)
 }
 
-/// Clone and edit a retained tree. Existing readers keep their original tree.
-pub(crate) fn reparse_source(
+/// Create the ast-grep document that owns one immutable parsed snapshot.
+pub(crate) fn parse_document(
+    content: &str,
+    language: &tree_sitter::Language,
+) -> Option<ParsedDocument> {
+    record_parse(content, false);
+    let document = StrDoc::try_new(content, DocumentLanguage(language.clone())).ok();
+    pause_parse(content);
+    let document = document?;
+    #[cfg(test)]
+    record_candidate_root(content);
+    Some(AstGrep::doc(document))
+}
+
+/// Clone one immutable snapshot and delegate its edit and reparse to ast-grep.
+pub(crate) fn document_after_edit(
     before: &str,
     after: &str,
-    tree: &tree_sitter::Tree,
-    language: &tree_sitter::Language,
-) -> Option<tree_sitter::Tree> {
+    document: &ParsedDocument,
+) -> Option<ParsedDocument> {
+    if document.root().get_doc().src != before {
+        return None;
+    }
     let mut start = before
         .bytes()
         .zip(after.bytes())
-        .take_while(|(a, b)| a == b)
+        .take_while(|(left, right)| left == right)
         .count();
     while !before.is_char_boundary(start) || !after.is_char_boundary(start) {
         start -= 1;
@@ -30,7 +79,7 @@ pub(crate) fn reparse_source(
         .bytes()
         .rev()
         .zip(after[start..].bytes().rev())
-        .take_while(|(a, b)| a == b)
+        .take_while(|(left, right)| left == right)
         .count();
     while !before.is_char_boundary(before.len() - suffix)
         || !after.is_char_boundary(after.len() - suffix)
@@ -39,45 +88,32 @@ pub(crate) fn reparse_source(
     }
     let old_end = before.len() - suffix;
     let new_end = after.len() - suffix;
-    let mut edited = tree.clone();
-    edited.edit(&tree_sitter::InputEdit {
-        start_byte: start,
-        old_end_byte: old_end,
-        new_end_byte: new_end,
-        start_position: byte_position(before, start),
-        old_end_position: byte_position(before, old_end),
-        new_end_position: byte_position(after, new_end),
+    let mut edited = document.clone();
+    record_parse(after, true);
+    let result = edited.edit(Edit {
+        position: start,
+        deleted_length: old_end - start,
+        inserted_text: after.as_bytes()[start..new_end].to_vec(),
     });
-    parse_with_tree(after, language, Some(&edited))
+    pause_parse(after);
+    result.ok()?;
+    Some(edited)
 }
 
-fn byte_position(source: &str, offset: usize) -> tree_sitter::Point {
-    let prefix = &source.as_bytes()[..offset];
-    tree_sitter::Point {
-        row: memchr::memchr_iter(b'\n', prefix).count(),
-        column: memchr::memrchr(b'\n', prefix).map_or(offset, |newline| offset - newline - 1),
-    }
-}
-
-fn parse_with_tree(
-    content: &str,
-    language: &tree_sitter::Language,
-    old_tree: Option<&tree_sitter::Tree>,
-) -> Option<tree_sitter::Tree> {
+fn record_parse(content: &str, incremental: bool) {
     #[cfg(test)]
-    {
-        let mut counts = PARSE_COUNTS.lock().unwrap();
-        if let Some(count) = counts.get_mut(content) {
-            if old_tree.is_some() {
-                count.1 += 1;
-            } else {
-                count.0 += 1;
-            }
+    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
+        if incremental {
+            counts.incremental += 1;
+        } else {
+            counts.full += 1;
         }
     }
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language).ok()?;
-    let tree = parser.parse(content, old_tree);
+    #[cfg(not(test))]
+    let _ = (content, incremental);
+}
+
+fn pause_parse(content: &str) {
     #[cfg(test)]
     {
         let pause = PARSE_PAUSES.lock().unwrap().remove(content);
@@ -88,11 +124,33 @@ fn parse_with_tree(
                 .unwrap();
         }
     }
+    #[cfg(not(test))]
+    let _ = content;
+}
+
+fn parse_with_tree(
+    content: &str,
+    language: &tree_sitter::Language,
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Option<tree_sitter::Tree> {
+    record_parse(content, old_tree.is_some());
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(content, old_tree);
+    pause_parse(content);
     tree
 }
 
 #[cfg(test)]
-static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, (usize, usize)>>> =
+#[derive(Default)]
+struct ParseCounts {
+    full: usize,
+    incremental: usize,
+    candidate_roots: usize,
+}
+
+#[cfg(test)]
+static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, ParseCounts>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
@@ -100,6 +158,13 @@ type ParsePause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 #[cfg(test)]
 static PARSE_PAUSES: LazyLock<Mutex<HashMap<String, ParsePause>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn record_candidate_root(content: &str) {
+    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
+        counts.candidate_roots += 1;
+    }
+}
 
 /// Counts real parses of unique fixture bytes, including parallel walker threads.
 #[cfg(test)]
@@ -111,17 +176,21 @@ impl ParseWitness {
         assert!(PARSE_COUNTS
             .lock()
             .unwrap()
-            .insert(content.to_string(), (0, 0))
+            .insert(content.to_string(), ParseCounts::default())
             .is_none());
         Self(content.to_string())
     }
 
     pub(crate) fn count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0].0
+        PARSE_COUNTS.lock().unwrap()[&self.0].full
     }
 
     pub(crate) fn incremental_count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0].1
+        PARSE_COUNTS.lock().unwrap()[&self.0].incremental
+    }
+
+    pub(crate) fn candidate_root_count(&self) -> usize {
+        PARSE_COUNTS.lock().unwrap()[&self.0].candidate_roots
     }
 
     pub(crate) fn pause_next(
@@ -555,6 +624,21 @@ pub(crate) fn with_query<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_reparse_delegates_to_ast_grep_document() {
+        let implementation = include_str!("treesitter.rs");
+        let local_input_edit = ["tree_sitter::Input", "Edit"].concat();
+        let delegated_edit = [".edit(", "Edit {"].concat();
+        assert!(
+            !implementation.contains(&local_input_edit),
+            "local InputEdit plumbing bypasses ast-grep document edits"
+        );
+        assert!(
+            implementation.contains(&delegated_edit),
+            "incremental reparsing must call the ast-grep document edit API"
+        );
+    }
 
     #[test]
     fn node_text_mode_controls_multiline_truncation() {

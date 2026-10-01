@@ -41,13 +41,15 @@ Treat these findings as adapter requirements, not evidence that Tree-sitter cann
 
 ## Shared parsed documents in the fork
 
-Tilth's shared parsed-document cache supplies immutable source and Tree-sitter snapshots to production read, search, and grok consumers.
+Tilth's parsed-document cache owns cached source and syntax trees through one ast-grep `StrDoc` per revision.
+Production read, search, grok, caller, and structural paths borrow that document through `ParsedFile`.
 The MCP service passes one existing `OutlineCache` through these paths; it does not add a second parser cache.[^17]
 
 Disk revisions guard cache reuse and publication.
 A late parse cannot replace an already published newer revision.
 Concurrent misses for one revision reuse the first published snapshot.
-Old readers retain their original source and tree through `Arc<ParsedFile>`.[^18]
+Old readers retain their original ast-grep source and tree through `Arc<ParsedFile>`.
+Warm reads and structural matches reuse the same source pointer, tree identity, and candidate root.[^18]
 
 The parsed cache retains at most 500 entries, with a 500,000-byte source limit per entry.
 Large files use uncached parsing where existing consumers permit them.
@@ -55,11 +57,14 @@ This fallback preserves search results without increasing retained cache limits.
 Full and range reads do not require a syntax parse.[^19]
 
 Tree-aware helpers preserve existing outline extraction instead of replacing it with ast-grep outlines.
+Warm writes clone the retained document into a private replacement, then use the public `AstGrep::edit` operation for incremental reparsing.
+The cold constructor copies its source. Warm reads and structural matches borrow the retained string.
+Tests compare source pointers, lengths, capacities, and retained-reader bytes; they do not measure total or transient allocator calls.[^18]
 Compiled-query caches release their mutex before caller, callee, sibling, or receiver matching runs.[^20]
 Parse reuse is verified behavior, not a measured end-to-end latency claim.
 
-[^17]: src/mcp/mod.rs:357-383; src/read/outline/mod.rs:47-69; src/mcp/mod.rs::tests::documents_reuse_real_parses_across_production_requests
-[^18]: src/cache.rs:34-54,151-244; src/cache.rs::tests::late_old_revision_cannot_replace_newer_snapshot; src/cache.rs::tests::concurrent_misses_reuse_one_published_snapshot
+[^17]: src/cache.rs:60-101,219-326; src/read/outline/mod.rs:48-69; src/mcp/mod.rs::tests::documents_reuse_real_parses_across_production_requests
+[^18]: src/search/structural.rs::tests::owned_document_borrows_cached_bytes_and_tree; src/mcp/tools/search_v2.rs::tests::structural_requests_retain_one_real_candidate_root; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
 [^19]: src/cache.rs:15-20,151-209; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
 [^20]: src/lang/treesitter.rs:428-456; src/search/callee_query.rs:36-56; src/lang/go.rs::extract_go_receiver_name
 
@@ -68,13 +73,13 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 The shared-document cache guarantees snapshot reuse, not one parse execution during concurrent misses.
 Parsing occurs outside the cache mutex before guarded publication.
 A concurrent-cache migration must preserve revision checks even if it coordinates missing-key loads.
-The structural-search adapter already borrows the retained source and tree; it does not require a second candidate-file AST.
+Structural search uses the retained ast-grep root directly; it does not construct a second candidate-file AST.
 
 Compiled queries and edit history have different validity rules from current parsed documents.
 A file edit does not change a compiled language query.
 Edit history retains older text and observed-line permissions, so a current-document cache cannot replace it by itself.
 
-_Source: Integration worktree at base 0dd6bf00088892b50578829efbb14dad403a312a; src/cache.rs:199-249; src/search/structural.rs:20-63; src/edit/snapshots.rs:126-170 · Updated: 2026-10-01_
+_Source: Owned-document layer at base 5ed3790df83d64ae6c71a41f9f615131fe015da2; src/cache.rs; src/lang/treesitter.rs; src/search/structural.rs · Updated: 2026-10-01_
 
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
 

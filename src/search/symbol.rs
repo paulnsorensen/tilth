@@ -255,10 +255,10 @@ fn find_definitions(
                             path,
                             query,
                             lang,
-                            &parsed.content,
+                            parsed.content(),
                             file_lines,
                             mtime,
-                            &parsed.tree,
+                            parsed.tree(),
                         )
                     },
                 )

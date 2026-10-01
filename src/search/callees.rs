@@ -386,7 +386,7 @@ fn resolve_second_hop(
     let def_range = Some((parent.span_start_line, parent.end_line));
     let nested_names = cache.parse_source(&parent.file, &content).map_or_else(
         || extract_callee_names(&content, lang, def_range),
-        |parsed| extract_callee_names_from_tree(&parsed.content, lang, &parsed.tree, def_range),
+        |parsed| extract_callee_names_from_tree(parsed.content(), lang, parsed.tree(), def_range),
     );
 
     if nested_names.is_empty() {

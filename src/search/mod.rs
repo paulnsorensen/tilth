@@ -1114,9 +1114,9 @@ fn format_single_match(
                                 || callees::extract_callee_names(&content, lang, m.def_range),
                                 |parsed| {
                                     callees::extract_callee_names_from_tree(
-                                        &parsed.content,
+                                        parsed.content(),
                                         lang,
-                                        &parsed.tree,
+                                        parsed.tree(),
                                         m.def_range,
                                     )
                                 },
@@ -1187,9 +1187,9 @@ fn format_single_match(
                                         },
                                         |parsed| {
                                             siblings::extract_sibling_references_from_tree(
-                                                &parsed.content,
+                                                parsed.content(),
                                                 lang,
-                                                &parsed.tree,
+                                                parsed.tree(),
                                                 def_range,
                                             )
                                         },

@@ -57,19 +57,48 @@ struct CacheEntry {
     outline: Arc<str>,
 }
 
-/// File contents and its tree-sitter parse, cached together so AST consumers
-/// don't re-parse on every call. `content` is `Arc<String>` so callers can
-/// hold the bytes for `Node::utf8_text` without copying.
+/// One ast-grep-owned source and tree snapshot shared by all AST consumers.
 pub struct ParsedFile {
-    pub content: Arc<String>,
-    pub tree: tree_sitter::Tree,
+    document: crate::lang::treesitter::ParsedDocument,
     pub lang: Lang,
 }
 
+impl std::fmt::Debug for ParsedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ParsedFile")
+            .field("content_len", &self.content().len())
+            .field("lang", &self.lang)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for ParsedFile {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.content()
+    }
+}
+
 impl ParsedFile {
+    #[must_use]
+    pub fn content(&self) -> &String {
+        &self.document.root().get_doc().src
+    }
+
+    #[must_use]
+    pub fn tree(&self) -> &tree_sitter::Tree {
+        &self.document.root().get_doc().tree
+    }
+
+    pub(crate) fn ast(&self) -> &crate::lang::treesitter::ParsedDocument {
+        &self.document
+    }
+
     pub(crate) fn outline_entries(&self) -> Vec<crate::types::OutlineEntry> {
-        let lines: Vec<_> = self.content.lines().collect();
-        crate::lang::outline::walk_top_level(self.tree.root_node(), &lines, self.lang)
+        let lines: Vec<_> = self.content().lines().collect();
+        crate::lang::outline::walk_top_level(self.tree().root_node(), &lines, self.lang)
     }
 }
 
@@ -217,14 +246,10 @@ impl OutlineCache {
                 }
             }
         }
-        let ts_lang = crate::lang::outline::outline_language(lang)?;
+        let language = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
-        let tree = crate::lang::treesitter::parse_source(&content, &ts_lang)?;
-        let file = Arc::new(ParsedFile {
-            content: Arc::new(content),
-            tree,
-            lang,
-        });
+        let document = crate::lang::treesitter::parse_document(&content, &language)?;
+        let file = Arc::new(ParsedFile { document, lang });
         self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
             .or(Some(file))
     }
@@ -233,7 +258,7 @@ impl OutlineCache {
     /// Large files and retained source revisions parse without entering the cache.
     pub(crate) fn parse_source(&self, path: &Path, content: &str) -> Option<Arc<ParsedFile>> {
         if let Some(file) = self.get_or_parse(path) {
-            if file.content.as_str() == content {
+            if file.content() == content {
                 return Some(file);
             }
         }
@@ -241,12 +266,8 @@ impl OutlineCache {
             return None;
         };
         let language = crate::lang::outline::outline_language(lang)?;
-        let tree = crate::lang::treesitter::parse_source(content, &language)?;
-        Some(Arc::new(ParsedFile {
-            content: Arc::new(content.to_string()),
-            tree,
-            lang,
-        }))
+        let document = crate::lang::treesitter::parse_document(content, &language)?;
+        Some(Arc::new(ParsedFile { document, lang }))
     }
 
     /// Remove only this path's rendered outlines and parsed snapshot.
@@ -277,7 +298,7 @@ impl OutlineCache {
             .get(path)
             .map(|entry| Arc::clone(&entry.file));
         self.invalidate(path);
-        let Some(previous) = previous.filter(|file| file.content.as_str() == before) else {
+        let Some(previous) = previous.filter(|file| file.content() == before) else {
             return;
         };
         if after.len() > 500_000 {
@@ -293,17 +314,13 @@ impl OutlineCache {
         {
             return;
         }
-        let Some(language) = crate::lang::outline::outline_language(previous.lang) else {
-            return;
-        };
-        let Some(tree) =
-            crate::lang::treesitter::reparse_source(before, after, &previous.tree, &language)
+        let Some(document) =
+            crate::lang::treesitter::document_after_edit(before, after, previous.ast())
         else {
             return;
         };
         let file = Arc::new(ParsedFile {
-            content: Arc::new(after.to_string()),
-            tree,
+            document,
             lang: previous.lang,
         });
         let _ = self.publish_or_reuse_if_current(path, revision, file);
@@ -421,7 +438,7 @@ mod tests {
         assert!(cache.get_or_parse(&path).is_none());
         assert_eq!(witness.count(), 0);
         assert_eq!(witness.incremental_count(), 0);
-        assert_eq!(old.content.as_str(), source);
+        assert_eq!(old.content().as_str(), source);
     }
 
     #[test]
@@ -440,7 +457,7 @@ mod tests {
             std::fs::write(&path, "fn bravo() {}").unwrap();
         });
         let changed = cache.get_or_parse(&path).unwrap();
-        assert_eq!(&**changed.content, "fn bravo() {}");
+        assert_eq!(changed.content().as_str(), "fn bravo() {}");
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(Arc::ptr_eq(
             &unchanged,
@@ -477,7 +494,7 @@ mod tests {
         let changed = cache
             .get_or_parse(&path)
             .expect("changed pre-epoch source must parse");
-        assert_eq!(&**changed.content, "fn bravo() {}");
+        assert_eq!(changed.content().as_str(), "fn bravo() {}");
         assert!(
             !Arc::ptr_eq(&first, &changed),
             "changed pre-epoch source must not reuse stale content"
@@ -573,7 +590,7 @@ mod tests {
                     std::fs::rename(&path, &moved).unwrap();
                     assert!(cache.get_or_parse(&path).is_none());
                     assert_eq!(
-                        &**cache.get_or_parse(&moved).unwrap().content,
+                        cache.get_or_parse(&moved).unwrap().content().as_str(),
                         "fn gamma() {}"
                     );
                     crate::util::rewrite_with_restored_mtime(&path, mtime, || {
@@ -581,7 +598,10 @@ mod tests {
                     });
                 }
             }
-            assert_eq!(&**cache.get_or_parse(&path).unwrap().content, expected);
+            assert_eq!(
+                cache.get_or_parse(&path).unwrap().content().as_str(),
+                expected
+            );
             let outline = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
                 std::fs::read_to_string(&path).unwrap()
             });
@@ -687,7 +707,7 @@ mod tests {
         );
         let retained = cache.get_or_parse(&path).unwrap();
         assert!(Arc::ptr_eq(&newer_snapshot, &retained));
-        assert_eq!(&**retained.content, "fn new() {}");
+        assert_eq!(retained.content().as_str(), "fn new() {}");
     }
 
     #[test]
@@ -711,7 +731,7 @@ mod tests {
         let first = workers.pop().unwrap().join().unwrap();
         let second = workers.pop().unwrap().join().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(&**first.content, "fn shared() {}");
+        assert_eq!(first.content().as_str(), "fn shared() {}");
     }
 
     #[test]
@@ -734,13 +754,13 @@ mod tests {
         resume.send(()).unwrap();
         let retained = worker.join().unwrap().unwrap();
         assert!(!Arc::ptr_eq(&retained, &current));
-        assert_eq!(retained.content.as_str(), source);
+        assert_eq!(retained.content().as_str(), source);
         assert_eq!(retained.outline_entries()[0].name, "before");
         assert_eq!(
             retained
-                .tree
+                .tree()
                 .root_node()
-                .utf8_text(retained.content.as_bytes())
+                .utf8_text(retained.content().as_bytes())
                 .unwrap(),
             source
         );
@@ -763,13 +783,13 @@ mod tests {
         assert_eq!(current.outline_entries()[0].name, "after");
         assert_eq!(
             retained
-                .tree
+                .tree()
                 .root_node()
-                .utf8_text(retained.content.as_bytes())
+                .utf8_text(retained.content().as_bytes())
                 .unwrap(),
             "fn before() {}"
         );
-        let supplied = cache.parse_source(&path, &retained.content).unwrap();
+        let supplied = cache.parse_source(&path, retained.content()).unwrap();
         assert_eq!(supplied.outline_entries()[0].name, "before");
         assert!(Arc::ptr_eq(&current, &cache.get_or_parse(&path).unwrap()));
         std::fs::remove_file(&path).unwrap();

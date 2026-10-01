@@ -1061,6 +1061,66 @@ mod tests {
     }
 
     #[test]
+    fn structural_requests_retain_one_real_candidate_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = String::from("owned_document_unique(value)\n");
+        let input_allocation = (source.as_ptr(), source.len(), source.capacity());
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let path = tmp.path().join("owned.py");
+        std::fs::write(&path, &source).unwrap();
+        let (cache, session, bloom) = components();
+        let (telemetry, _telemetry_dir) = telemetry();
+        let args = json!({"cwd": tmp.path(), "queries": [{
+            "pattern": "owned_document_unique($A)", "language": "python"
+        }]});
+
+        let response =
+            tool_search_v2(&args, &cache, &session, &bloom, &telemetry, "test", "test").unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["results"][0]["items"].as_array().unwrap().len(), 1);
+        let retained = cache.get_or_parse(&path).unwrap();
+        let retained_allocation = (
+            retained.content().as_ptr(),
+            retained.content().len(),
+            retained.content().capacity(),
+        );
+        let tree_identity = retained.tree().root_node().id();
+        assert_ne!(
+            retained_allocation.0, input_allocation.0,
+            "cold parsing must retain source bytes owned by the parsed document"
+        );
+        assert_eq!(retained_allocation.1, input_allocation.1);
+        assert!(retained_allocation.2 >= retained_allocation.1);
+
+        let response =
+            tool_search_v2(&args, &cache, &session, &bloom, &telemetry, "test", "test").unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["results"][0]["items"].as_array().unwrap().len(), 1);
+        let warm = cache.get_or_parse(&path).unwrap();
+
+        assert_eq!(witness.count(), 1, "the candidate source parses once");
+        assert_eq!(
+            witness.candidate_root_count(),
+            1,
+            "one resident revision must retain one real ast-grep candidate root"
+        );
+        assert!(std::sync::Arc::ptr_eq(&retained, &warm));
+        assert_eq!(
+            (
+                warm.content().as_ptr(),
+                warm.content().len(),
+                warm.content().capacity(),
+            ),
+            retained_allocation,
+            "warm cache and structural requests must retain the source allocation"
+        );
+        assert_eq!(warm.tree().root_node().id(), tree_identity);
+        let document = warm.ast().root().get_doc();
+        assert_eq!(document.src.as_ptr(), retained_allocation.0);
+        assert_eq!(document.tree.root_node().id(), tree_identity);
+    }
+
+    #[test]
     fn secret_files_never_emit_source_in_core() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(

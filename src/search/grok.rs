@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, ParsedFile};
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
@@ -15,6 +15,23 @@ use crate::lang::outline::{find_entry_by_start_line, get_outline_entries};
 use crate::search::callees::{extract_callee_names, ResolvedCallee};
 use crate::search::callers::{CallerMatch, BATCH_EARLY_QUIT};
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
+
+#[derive(Debug, Clone)]
+pub(crate) enum SourceSnapshot {
+    Parsed(std::sync::Arc<ParsedFile>),
+    Raw(std::sync::Arc<String>),
+}
+
+impl std::ops::Deref for SourceSnapshot {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Parsed(parsed) => parsed.content(),
+            Self::Raw(content) => content.as_str(),
+        }
+    }
+}
 
 /// What grok resolved the user's target string to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +88,7 @@ fn parse_target_spec(s: &str) -> TargetSpec {
 pub(crate) fn resolve_with_source(
     spec: &str,
     scope: &Path,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     resolve_with_source_cached(spec, scope, &OutlineCache::new())
 }
 
@@ -79,7 +96,7 @@ pub(crate) fn resolve_with_source_cached(
     spec: &str,
     scope: &Path,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     match parse_target_spec(spec) {
         TargetSpec::Symbol(name) => resolve_by_name(&name, scope, cache),
         TargetSpec::PathLine { path, line } => {
@@ -101,7 +118,7 @@ pub(crate) fn resolve_with_source_occurrence(
     occurrence: (usize, usize),
     scope: &Path,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     let TargetSpec::PathLine { path, line } = parse_target_spec(spec) else {
         return Err(TilthError::InvalidQuery {
             query: spec.to_string(),
@@ -146,7 +163,7 @@ fn resolve_by_name(
     name: &str,
     scope: &Path,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     // The literal spec (`Alpha::dispatch`) never equals a bare definition name,
     // so this attempt only fires for genuinely bare targets. No qualifier to honor.
     if let Some(resolved) = resolve_def_by_query(name, None, scope, cache)? {
@@ -208,7 +225,7 @@ fn resolve_def_by_query(
     qualifier: Option<&str>,
     scope: &Path,
     cache: &OutlineCache,
-) -> Result<Option<(ResolvedTarget, std::sync::Arc<String>, Lang)>, TilthError> {
+) -> Result<Option<(ResolvedTarget, SourceSnapshot, Lang)>, TilthError> {
     let Some(qualifier) = qualifier else {
         let result = super::search_symbol_raw_cached(query, scope, None, cache)?;
         let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
@@ -296,9 +313,9 @@ fn owner_of_match(m: &crate::types::Match, cache: &OutlineCache) -> Option<Strin
         return receiver_type(&m.path, start, cache, query);
     }
     let parsed = cache.get_or_parse(&m.path)?;
-    let lines: Vec<&str> = parsed.content.lines().collect();
+    let lines: Vec<&str> = parsed.content().lines().collect();
     find_parent_name(
-        parsed.tree.root_node(),
+        parsed.tree().root_node(),
         &lines,
         lang,
         start,
@@ -388,13 +405,13 @@ fn receiver_type(
 
     let parsed = cache.get_or_parse(path)?;
     let ts_lang = crate::lang::outline::outline_language(parsed.lang)?;
-    let bytes = parsed.content.as_bytes();
+    let bytes = parsed.content().as_bytes();
 
     crate::lang::treesitter::with_query(&ts_lang, receiver_query, |query| {
         let ty_idx = query.capture_index_for_name("ty")?;
         let method_idx = query.capture_index_for_name("method")?;
         let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, parsed.tree.root_node(), bytes);
+        let mut matches = cursor.matches(query, parsed.tree().root_node(), bytes);
         while let Some(m) = matches.next() {
             let starts_here = m.captures().iter().any(|c| {
                 c.index == method_idx && c.node.start_position().row as u32 + 1 == start_line
@@ -436,15 +453,15 @@ fn resolve_by_path_line(
     path: &Path,
     line: u32,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     let (content, lang) = read_code_file(path, cache)?;
     let (entries, deep_entry) = cache.parse_source(path, &content).map_or_else(
         || crate::lang::outline::get_outline_entries_and_entry_at_line(&content, lang, line),
         |parsed| {
             crate::lang::outline::outline_entries_and_entry_at_line_from_tree(
-                &parsed.content,
+                parsed.content(),
                 lang,
-                &parsed.tree,
+                parsed.tree(),
                 line,
             )
         },
@@ -466,12 +483,10 @@ fn resolve_by_path_line(
 
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
-fn read_code_file(
-    path: &Path,
-    cache: &OutlineCache,
-) -> Result<(std::sync::Arc<String>, Lang), TilthError> {
+fn read_code_file(path: &Path, cache: &OutlineCache) -> Result<(SourceSnapshot, Lang), TilthError> {
     if let Some(parsed) = cache.get_or_parse(path) {
-        return Ok((std::sync::Arc::clone(&parsed.content), parsed.lang));
+        let lang = parsed.lang;
+        return Ok((SourceSnapshot::Parsed(parsed), lang));
     }
     let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
@@ -483,7 +498,16 @@ fn read_code_file(
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
-    Ok((std::sync::Arc::new(content), lang))
+    if crate::lang::outline::outline_language(lang).is_none() {
+        return Ok((SourceSnapshot::Raw(std::sync::Arc::new(content)), lang));
+    }
+    let parsed = cache
+        .parse_source(path, &content)
+        .ok_or_else(|| TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: "source could not be parsed".to_string(),
+        })?;
+    Ok((SourceSnapshot::Parsed(parsed), lang))
 }
 
 /// Read the file at `path`, find the outline entry that starts at `start_line`,
@@ -497,7 +521,7 @@ fn enrich_from_outline(
     other_def_count: usize,
     resolve_moved_name: bool,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     let (content, lang) = read_code_file(&path, cache)?;
     let (entries, exact_entry) = cache.parse_source(&path, &content).map_or_else(
         || {
@@ -511,9 +535,9 @@ fn enrich_from_outline(
         },
         |parsed| {
             crate::lang::outline::outline_entries_and_entry_by_name_from_tree(
-                &parsed.content,
+                parsed.content(),
                 lang,
-                &parsed.tree,
+                parsed.tree(),
                 &name,
                 start_line,
                 semantic_end,
@@ -573,7 +597,7 @@ pub(crate) fn resolve_candidate_with_source(
     semantic_end: Option<u32>,
     name: &str,
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     enrich_from_outline(
         path.to_path_buf(),
         start_line,
@@ -592,7 +616,7 @@ pub(crate) fn resolve_candidate_with_source_occurrence(
     name: &str,
     occurrence: (usize, usize),
     cache: &OutlineCache,
-) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
     let scope = path.parent().unwrap_or_else(|| Path::new("."));
     let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
@@ -845,9 +869,9 @@ pub(crate) fn grok_cached(
         || extract_callee_names(&content, lang, Some((target_span_start, target.end_line))),
         |parsed| {
             super::callees::extract_callee_names_from_tree(
-                &parsed.content,
+                parsed.content(),
                 lang,
-                &parsed.tree,
+                parsed.tree(),
                 Some((target_span_start, target.end_line)),
             )
         },
