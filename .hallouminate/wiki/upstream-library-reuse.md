@@ -63,7 +63,37 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 [^19]: src/cache.rs:15-20,151-209; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
 [^20]: src/lang/treesitter.rs:428-456; src/search/callee_query.rs:36-56; src/lang/go.rs::extract_go_receiver_name
 
+### Reuse does not guarantee one parse
+
+The shared-document cache guarantees snapshot reuse, not one parse execution during concurrent misses.
+Parsing occurs outside the cache mutex before guarded publication.
+A concurrent-cache migration must preserve revision checks even if it coordinates missing-key loads.
+The structural-search adapter already borrows the retained source and tree; it does not require a second candidate-file AST.
+
+Compiled queries and edit history have different validity rules from current parsed documents.
+A file edit does not change a compiled language query.
+Edit history retains older text and observed-line permissions, so a current-document cache cannot replace it by itself.
+
+_Source: Integration worktree at base 0dd6bf00088892b50578829efbb14dad403a312a; src/cache.rs:199-249; src/search/structural.rs:20-63; src/edit/snapshots.rs:126-170 · Updated: 2026-10-01_
+
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
+
+
+
+### Verified incremental writes
+
+Verified warm writes reuse parsed snapshots through a cloned tree and incremental parsing.
+The cache checks exact old bytes, bounded on-disk new bytes, and disk revisions before publication.
+Old readers retain their original source and tree. Parsing holds no global cache mutex.[^21]
+
+Cold writes do not populate the parsed-document cache. External changes use full parsing.
+Create, delete, and move operations invalidate affected paths, not unrelated snapshots.
+A failed move still invalidates source bytes already committed before the rename failure.[^22]
+
+[^21]: src/cache.rs:270-343; src/lang/treesitter.rs:14-91; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
+[^22]: src/mcp/tools/write.rs::tests::incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees; src/mcp/tools/write.rs::tests::incremental_write_failed_move_invalidates_already_committed_source
+
+_Source: Verified incremental-write implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_
 
 ## Other candidate boundaries
 

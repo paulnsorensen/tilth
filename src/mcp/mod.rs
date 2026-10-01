@@ -372,7 +372,9 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_search" => dispatch_search_v2(args, services),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session(), services.cache()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+        "tilth_write" if edit_mode => {
+            tool_write(args, services.session(), services.bloom(), services.cache())
+        }
         _ => Err(unknown_tool_error(tool, edit_mode)),
     };
     // Observe every dispatch — an errored call still advances/resets the
@@ -976,6 +978,226 @@ mod tests {
              Trim a description — the cap does not yield.",
             surface.saturating_sub(CAP)
         );
+    }
+
+    #[test]
+    fn incremental_write_reuses_tree_through_production_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incremental.rs");
+        let before = format!("// {}\nfn main() {{ Some(café); }}\n", dir.path().display());
+        let after = before.replace("café", "thé");
+        std::fs::write(&path, &before).unwrap();
+        let services = Services::new(true);
+        let old = services.cache().get_or_parse(&path).unwrap();
+        let old_shape = old.tree.root_node().to_sexp();
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let read =
+            serde_json::json!({"cwd": dir.path(), "paths": ["incremental.rs"], "mode": "full"});
+        dispatch_tool("tilth_read", &read, &services).unwrap();
+        let tag = format!("{:04X}", crate::edit::tag::compute_file_hash(&before));
+        let write = serde_json::json!({"cwd": dir.path(), "edits": [{
+            "path": "incremental.rs", "tag": tag,
+            "ops": [{"op": "replace_text", "old": "café", "new": "thé"}]
+        }]});
+        let result = dispatch_tool("tilth_write", &write, &services).unwrap();
+        assert!(result.contains("applied"), "{result}");
+        let read = dispatch_tool("tilth_read", &read, &services).unwrap();
+        assert!(read.contains("Some(thé)"), "{read}");
+        let search = serde_json::json!({"cwd": dir.path(), "queries": [{
+            "pattern": "Some($A)", "language": "rust"
+        }]});
+        let result = dispatch_tool("tilth_search", &search, &services).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["results"][0]["items"].as_array().unwrap().len(), 1);
+        let capture = &result["results"][0]["items"][0]["captures"]["A"][0];
+        let start = capture["start_byte"].as_u64().unwrap() as usize;
+        let end = capture["end_byte"].as_u64().unwrap() as usize;
+        assert_eq!(&after[start..end], "thé");
+        assert_eq!(
+            witness.count(),
+            0,
+            "a verified warm write must not fully reparse"
+        );
+        assert_eq!(witness.incremental_count(), 1);
+        let current = services.cache().get_or_parse(&path).unwrap();
+        assert_eq!(current.content.as_str(), after);
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert_eq!(old.content.as_str(), before);
+        assert_eq!(old.tree.root_node().to_sexp(), old_shape);
+    }
+
+    fn incremental_request(services: &Services, path: &std::path::Path, ops: &Value) -> Value {
+        let read = serde_json::json!({
+            "cwd": path.parent().unwrap(), "paths": [path], "mode": "full"
+        });
+        dispatch_tool("tilth_read", &read, services).unwrap();
+        let source = std::fs::read_to_string(path).unwrap();
+        let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(&source));
+        serde_json::json!({
+            "cwd": path.parent().unwrap(), "edits": [{"path": path, "tag": tag, "ops": ops}]
+        })
+    }
+
+    fn assert_same_nodes(actual: tree_sitter::Node<'_>, expected: tree_sitter::Node<'_>) {
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.range(), expected.range());
+        assert_eq!(actual.is_named(), expected.is_named());
+        assert_eq!(actual.is_error(), expected.is_error());
+        assert_eq!(actual.is_missing(), expected.is_missing());
+        assert_eq!(actual.child_count(), expected.child_count());
+        let mut actual_cursor = actual.walk();
+        let mut expected_cursor = expected.walk();
+        for (actual, expected) in actual
+            .children(&mut actual_cursor)
+            .zip(expected.children(&mut expected_cursor))
+        {
+            assert_same_nodes(actual, expected);
+        }
+    }
+
+    #[test]
+    fn incremental_write_coordinates_match_fresh_parses_and_captures() {
+        for (language, name, comment, body, whole) in [
+            (
+                "rust",
+                "source.rs",
+                "//",
+                "fn main() { Some(\"café\"); }",
+                "fn other() { Some(\"whole\"); }",
+            ),
+            (
+                "typescript",
+                "source.ts",
+                "//",
+                "wrap(\"café\");",
+                "wrap(\"whole\");",
+            ),
+            (
+                "python",
+                "source.py",
+                "#",
+                "wrap(\"café\")",
+                "wrap(\"whole\")",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let header = format!("{comment} {}\n", dir.path().display());
+            let mut before = format!("{header}{body}\n");
+            std::fs::write(&path, &before).unwrap();
+            let services = Services::new(true);
+            let pattern = if language == "rust" {
+                "Some($A)"
+            } else {
+                "wrap($A)"
+            };
+            let search = serde_json::json!({
+                "cwd": dir.path(), "queries": [{"pattern": pattern, "language": language}]
+            });
+            let variants = [
+                serde_json::json!({"op": "replace_text", "old": "é", "new": "ê"}),
+                serde_json::json!({"op": "replace_text", "old": "ê", "new": "©"}),
+                serde_json::json!({"op": "insert_before", "line": 2, "content": format!("{comment} 火\n{comment} é")}),
+                serde_json::json!({"op": "delete", "start": 2, "end": 3}),
+                serde_json::json!({"op": "replace_text", "old": "\"caf©\"", "new": "\n    \"火\"\n"}),
+                serde_json::json!({"op": "replace_text", "old": "\n    \"火\"\n", "new": "\"tea\""}),
+                serde_json::json!({"op": "replace", "start": 1, "end": 2, "content": format!("{header}{whole}")}),
+                serde_json::json!({"op": "replace", "start": 1, "end": 2, "content": ""}),
+            ];
+            for (index, op) in variants.into_iter().enumerate() {
+                let old = services.cache().get_or_parse(&path).unwrap();
+                let fresh_old = OutlineCache::new().get_or_parse(&path).unwrap();
+                let request = incremental_request(&services, &path, &serde_json::json!([op]));
+                let expected_source = match index {
+                    0 => before.replace('é', "ê"),
+                    1 => before.replace('ê', "©"),
+                    2 => before.replacen('\n', &format!("\n{comment} 火\n{comment} é\n"), 1),
+                    3 => format!("{header}{}\n", body.replace('é', "©")),
+                    4 => before.replace("\"caf©\"", "\n    \"火\"\n"),
+                    5 => before.replace("\n    \"火\"\n", "\"tea\""),
+                    6 => format!("{header}{whole}\n"),
+                    _ => String::new(),
+                };
+                let witness = (index != 7)
+                    .then(|| crate::lang::treesitter::ParseWitness::new(&expected_source));
+                let result = dispatch_tool("tilth_write", &request, &services).unwrap();
+                assert!(result.contains("applied"), "{result}");
+                let after = std::fs::read_to_string(&path).unwrap();
+                assert_ne!(after, before, "{language} edit {index}");
+                let current = services.cache().get_or_parse(&path).unwrap();
+                assert_eq!(current.content.as_str(), after);
+                assert_eq!(after, expected_source);
+                if let Some(witness) = witness {
+                    assert_eq!(witness.count(), 0, "{language} edit {index}");
+                    assert_eq!(witness.incremental_count(), 1, "{language} edit {index}");
+                }
+                let fresh = OutlineCache::new().get_or_parse(&path).unwrap();
+                assert_same_nodes(current.tree.root_node(), fresh.tree.root_node());
+                assert_same_nodes(old.tree.root_node(), fresh_old.tree.root_node());
+                assert_eq!(old.content.as_str(), before);
+                let actual: Value = serde_json::from_str(
+                    &dispatch_tool("tilth_search", &search, &services).unwrap(),
+                )
+                .unwrap();
+                let expected: Value = serde_json::from_str(
+                    &dispatch_tool("tilth_search", &search, &Services::new(true)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual["results"][0]["items"],
+                    expected["results"][0]["items"]
+                );
+                assert_eq!(
+                    actual["results"][0]["items"].as_array().unwrap().len(),
+                    usize::from(index != 7),
+                    "{language} edit {index}",
+                );
+                before = after;
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_write_external_replacement_during_parse_cannot_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.rs");
+        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        let after = before.replace("before", "written");
+        let external = before.replace("before", "external");
+        std::fs::write(&path, &before).unwrap();
+        let services = Services::new(true);
+        let old = services.cache().get_or_parse(&path).unwrap();
+        let request = incremental_request(
+            &services,
+            &path,
+            &serde_json::json!([{
+                "op": "replace_text", "old": "before", "new": "written"
+            }]),
+        );
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
+        let (entered, resume) = witness.pause_next();
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| dispatch_tool("tilth_write", &request, &services));
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            crate::util::atomic_write_bytes(&path, external.as_bytes()).unwrap();
+            let replacement = services.cache().get_or_parse(&path).unwrap();
+            assert_eq!(replacement.content.as_str(), external);
+            resume.send(()).unwrap();
+            let result = writing.join().unwrap().unwrap();
+            assert!(result.contains("applied"), "{result}");
+            assert!(Arc::ptr_eq(
+                &replacement,
+                &services.cache().get_or_parse(&path).unwrap()
+            ));
+        });
+        assert_eq!(old.content.as_str(), before);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 1);
+        assert_eq!(external_witness.count(), 1);
+        assert_eq!(external_witness.incremental_count(), 0);
     }
 
     #[test]
@@ -2314,6 +2536,7 @@ mod tests {
             &serde_json::json!({"edits": edits, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
+            &cache,
         )
         .expect("write ok");
         assert!(out.contains("applied"), "expected applied: {out}");
@@ -2323,8 +2546,13 @@ mod tests {
     #[test]
     fn tool_write_missing_edits_blob_is_top_level_error() {
         let (session, bloom) = edit_services();
-        let err = tool_write(&serde_json::json!({}), &session, &bloom)
-            .expect_err("missing edits → error");
+        let err = tool_write(
+            &serde_json::json!({}),
+            &session,
+            &bloom,
+            &OutlineCache::new(),
+        )
+        .expect_err("missing edits → error");
         assert!(err.contains("edits"), "error must name the param: {err}");
     }
 

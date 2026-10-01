@@ -1188,6 +1188,7 @@ mod tests {
                 }),
                 &session,
                 &bloom,
+                &cache,
             )
         };
         assert!(write(2).unwrap_err().contains("never displayed"));
@@ -1533,6 +1534,7 @@ mod tests {
             &serde_json::json!({"edits": edits, "cwd": cwd}),
             &session,
             &bloom,
+            &cache,
         )
         .expect_err("sole rejected section → isError");
         assert!(
@@ -1584,6 +1586,7 @@ mod tests {
             &serde_json::json!({"edits": reject, "cwd": cwd}),
             &session,
             &bloom,
+            &cache,
         )
         .expect_err("sole rejected section → isError");
         assert!(
@@ -1602,6 +1605,7 @@ mod tests {
             &serde_json::json!({"edits": ok, "cwd": cwd}),
             &session,
             &bloom,
+            &cache,
         )
         .expect("write call");
         assert!(
@@ -1664,6 +1668,7 @@ mod tests {
             &serde_json::json!({"edits": edits, "cwd": cwd}),
             &session,
             &bloom,
+            &cache,
         )
         .expect_err("sole rejected section → isError");
         assert!(
