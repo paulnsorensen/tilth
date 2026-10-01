@@ -198,7 +198,7 @@ fn find_definitions(
                 return ignore::WalkState::Quit;
             }
 
-            let Some((path, file_size)) = accept_walk_entry(entry) else {
+            let Some((path, file_size, meta)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
             let path = path.as_path();
@@ -244,24 +244,30 @@ fn find_definitions(
             let ts_language = lang.and_then(outline_language);
 
             let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                cache.parse_source(path, &content).map_or_else(
-                    || {
-                        find_defs_treesitter(
-                            path, query, ts_lang, lang, &content, file_lines, mtime,
-                        )
-                    },
-                    |parsed| {
-                        find_defs_from_tree(
-                            path,
-                            query,
-                            lang,
-                            &parsed.content,
-                            file_lines,
-                            mtime,
-                            &parsed.tree,
-                        )
-                    },
-                )
+                // `meta` predates the read, so a stale publish fails its recheck.
+                let revision = meta.as_ref().and_then(|m| {
+                    crate::util::FileRevision::from_metadata_and_bytes(m, content.as_bytes())
+                });
+                cache
+                    .parse_with_revision(path, &content, revision)
+                    .map_or_else(
+                        || {
+                            find_defs_treesitter(
+                                path, query, ts_lang, lang, &content, file_lines, mtime,
+                            )
+                        },
+                        |parsed| {
+                            find_defs_from_tree(
+                                path,
+                                query,
+                                lang,
+                                &parsed.content,
+                                file_lines,
+                                mtime,
+                                &parsed.tree,
+                            )
+                        },
+                    )
             } else {
                 Vec::new()
             };
@@ -586,7 +592,7 @@ fn find_usages(
                 return ignore::WalkState::Quit;
             }
 
-            let Some((path, file_size)) = accept_walk_entry(entry) else {
+            let Some((path, file_size, _)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
             let path = path.as_path();
