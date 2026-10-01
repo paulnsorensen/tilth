@@ -955,8 +955,14 @@ mod tests {
     #[test]
     fn suggest_headings_empty_query_returns_empty() {
         let input = b"# A\n## B\n";
-        assert!(suggest_headings(input, "", 5).is_empty());
-        assert!(suggest_headings(input, "###", 5).is_empty());
+        assert_eq!(
+            suggest_headings(input, "", 5),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            suggest_headings(input, "###", 5),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// `CommonMark` allows `~~~` as a fence delimiter. Headings inside

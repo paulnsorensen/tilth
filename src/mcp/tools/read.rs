@@ -1361,7 +1361,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert!(!out.is_empty());
+            assert_ne!(out, "");
             let header_line = out.lines().next().unwrap();
             let header: Value = serde_json::from_str(header_line)
                 .unwrap_or_else(|e| panic!("header line must be JSON: {header_line}: {e}"));
