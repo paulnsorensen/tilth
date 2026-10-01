@@ -877,7 +877,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1355,
+            1452,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -917,7 +917,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1975,
+            2016,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -2684,6 +2684,10 @@ mod tests {
             for tool in shared_tools {
                 assert!(s.contains(tool), "missing tool {tool} (edit={edit})");
             }
+            assert!(
+                s.contains("{pattern: \"Some($A)\", language, glob?}"),
+                "structural search entry shape must stay advertised (edit={edit})"
+            );
             if edit {
                 assert!(
                     s.contains("tilth_write"),

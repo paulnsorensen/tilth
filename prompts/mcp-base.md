@@ -10,7 +10,7 @@ BATCH related work; array parameters never accept singular values:
 
 ROUTE:
 
-- Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint}]`; routing is automatic. Do not add query `kind`, `expand`, or `context`.
+- Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint} | {pattern: "Some($A)", language, glob?}]`; `pattern` matches code shape in rust/typescript/python; routing is automatic. Do not add query `kind`, `expand`, or `context`.
 - Read known files/symbols/ranges → `tilth_read`; omit `mode`. DO NOT pass `mode: full` when a `path#symbol` or `path#n-m` section answers.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
