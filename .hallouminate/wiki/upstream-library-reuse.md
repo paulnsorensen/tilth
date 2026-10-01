@@ -70,6 +70,8 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 [^19]: src/cache.rs:15-20,151-209; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
 [^20]: src/lang/treesitter.rs::with_query and shared_query_* tests; src/search/callers.rs::find_callers_treesitter_batch; src/search/callees.rs::extract_callee_names_from_tree; src/search/siblings.rs::extract_sibling_references_from_tree; src/lang/go.rs::extract_go_receiver_name
 
+_Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
+
 ### Reuse does not guarantee one parse
 
 The shared-document cache guarantees snapshot reuse, not one parse execution during concurrent misses.
@@ -83,10 +85,6 @@ Edit history retains older text and observed-line permissions, so a current-docu
 
 _Source: Owned-document layer at base 5ed3790df83d64ae6c71a41f9f615131fe015da2; src/cache.rs; src/lang/treesitter.rs; src/search/structural.rs · Updated: 2026-10-01_
 
-_Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
-
-
-
 ### Verified incremental writes
 
 Verified warm writes reuse parsed snapshots through a cloned tree and incremental parsing.
@@ -97,7 +95,7 @@ Cold writes do not populate the parsed-document cache. External changes use full
 Create, delete, and move operations invalidate affected paths, not unrelated snapshots.
 A failed move still invalidates source bytes already committed before the rename failure.[^22]
 
-[^21]: src/cache.rs:270-343; src/lang/treesitter.rs:14-91; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
+[^21]: src/cache.rs:298-404; src/lang/treesitter.rs:14-92; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
 [^22]: src/mcp/tools/write.rs::tests::incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees; src/mcp/tools/write.rs::tests::incremental_write_failed_move_invalidates_already_committed_source
 
 _Source: Verified incremental-write implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_
