@@ -471,14 +471,14 @@ machinery:
   framework registration).
 - **Callees** (`callees.rs`) — resolve outgoing calls inside a
   definition body. Drives the `── calls ──` footer under each
-  expanded match. Cached `Query` compilation lives in
-  `callee_query.rs`.
+  expanded match. `callee_query.rs` selects per-language query text;
+  it does not own the compiled-query cache.
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
-  definition). Compiles tree-sitter `Query` objects lazily and caches
-  them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
-  uses the query string's pointer address (`&'static str`) so distinct
-  queries against the same language stay separated.
+  definition).
+- **Shared query cache** (`lang::treesitter::with_query`) — callers,
+  callees, siblings, and receiver extraction share it. Cache keys use actual
+  `tree_sitter::Language` values and query content.
 - **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
   Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
   `format_deps` does the human output. The external-dep stdlib
