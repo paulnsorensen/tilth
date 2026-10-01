@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -307,6 +308,66 @@ impl OutlineCache {
         }))
     }
 
+    /// Remove only this path's rendered outlines and parsed snapshot.
+    pub(crate) fn invalidate(&self, path: &Path) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for mode in [OutlineMode::Capped, OutlineMode::Full] {
+            for kind in [RevisionKind::Content, RevisionKind::Disk] {
+                entries.pop(&(path.to_path_buf(), mode, kind));
+            }
+        }
+        drop(entries);
+        self.parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop(path);
+    }
+
+    /// Publish incremental bytes only after a successful write and disk verification.
+    /// Cold paths stay cold. A mismatch discards this path, never unrelated entries.
+    pub(crate) fn update_after_write(&self, path: &Path, before: &str, after: &str) {
+        let previous = self
+            .parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .map(|entry| Arc::clone(&entry.file));
+        self.invalidate(path);
+        let Some(previous) = previous.filter(|file| file.content.as_str() == before) else {
+            return;
+        };
+        if after.len() > 500_000 {
+            return;
+        }
+        let Some(revision) = FileRevision::of(path) else {
+            return;
+        };
+        if !std::fs::File::open(path)
+            .and_then(|file| written_bytes_match(file, after.as_bytes()))
+            .unwrap_or(false)
+            || !revision.is_current(path)
+        {
+            return;
+        }
+        let Some(language) = crate::lang::outline::outline_language(previous.lang) else {
+            return;
+        };
+        let Some(tree) =
+            crate::lang::treesitter::reparse_source(before, after, &previous.tree, &language)
+        else {
+            return;
+        };
+        let file = Arc::new(ParsedFile {
+            content: Arc::new(after.to_string()),
+            tree,
+            lang: previous.lang,
+        });
+        let _ = self.publish_or_reuse_if_current(path, revision, file);
+    }
+
     /// Publish a completed parse only while it still describes the file on disk.
     ///
     /// This final revision check happens under the cache lock. A slow parse for
@@ -342,10 +403,85 @@ impl OutlineCache {
     }
 }
 
+fn written_bytes_match(reader: impl Read, expected: &[u8]) -> std::io::Result<bool> {
+    let mut actual = Vec::new();
+    reader
+        .take(expected.len() as u64 + 1)
+        .read_to_end(&mut actual)?;
+    Ok(actual == expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn incremental_verification_reads_only_expected_bytes_plus_one() {
+        let expected = b"fn exact() {}";
+        let mut bytes = expected.to_vec();
+        bytes.extend_from_slice(b"external replacement suffix");
+        let mut source = std::io::Cursor::new(bytes);
+        assert!(!written_bytes_match(&mut source, expected).unwrap());
+        assert_eq!(source.position(), expected.len() as u64 + 1);
+
+        for (source, matches) in [
+            (expected.as_slice(), true),
+            (b"fn other() {}".as_slice(), false),
+            (&expected[..expected.len() - 1], false),
+        ] {
+            assert_eq!(written_bytes_match(source, expected).unwrap(), matches);
+        }
+        let mut source = std::io::Cursor::new(b"external");
+        assert!(!written_bytes_match(&mut source, b"").unwrap());
+        assert_eq!(source.position(), 1);
+        assert!(written_bytes_match(b"".as_slice(), b"").unwrap());
+    }
+
+    #[test]
+    fn incremental_invalidation_removes_all_path_variants_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.rs");
+        let other = dir.path().join("other.rs");
+        let cache = OutlineCache::new();
+        for file in [&path, &other] {
+            std::fs::write(file, "fn retained() {}").unwrap();
+            cache.get_or_parse(file).unwrap();
+            for mode in [OutlineMode::Capped, OutlineMode::Full] {
+                cache.get_or_compute(file, b"fn retained() {}", mode, || "content".into());
+                cache.get_or_compute_disk(file, mode, || "disk".into());
+            }
+        }
+        assert_eq!(cache.entries.lock().unwrap().len(), 8);
+        assert_eq!(cache.parsed.lock().unwrap().len(), 2);
+        let retained = cache.get_or_parse(&other).unwrap();
+        cache.invalidate(&path);
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().all(|((key, _, _), _)| key == &other));
+        drop(entries);
+        assert_eq!(cache.parsed.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(&retained, &cache.get_or_parse(&other).unwrap()));
+    }
+
+    #[test]
+    fn incremental_growth_past_byte_cap_discards_snapshot_without_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        let source = format!("// {}\nfn old() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        let cache = OutlineCache::new();
+        let old = cache.get_or_parse(&path).unwrap();
+        let after = format!("{source}//{}", "x".repeat(500_000));
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        crate::util::atomic_write_bytes(&path, after.as_bytes()).unwrap();
+        cache.update_after_write(&path, &source, &after);
+        assert_eq!(cache.parsed.lock().unwrap().len(), 0);
+        assert!(cache.get_or_parse(&path).is_none());
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 0);
+        assert_eq!(old.content.as_str(), source);
+    }
 
     #[test]
     fn freshness_parsed_preserved_mtime_and_warm_reuse() {

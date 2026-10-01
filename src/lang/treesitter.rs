@@ -8,16 +8,76 @@ pub(crate) fn parse_source(
     content: &str,
     language: &tree_sitter::Language,
 ) -> Option<tree_sitter::Tree> {
+    parse_with_tree(content, language, None)
+}
+
+/// Clone and edit a retained tree. Existing readers keep their original tree.
+pub(crate) fn reparse_source(
+    before: &str,
+    after: &str,
+    tree: &tree_sitter::Tree,
+    language: &tree_sitter::Language,
+) -> Option<tree_sitter::Tree> {
+    let mut start = before
+        .bytes()
+        .zip(after.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !before.is_char_boundary(start) || !after.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut suffix = before[start..]
+        .bytes()
+        .rev()
+        .zip(after[start..].bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !before.is_char_boundary(before.len() - suffix)
+        || !after.is_char_boundary(after.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let old_end = before.len() - suffix;
+    let new_end = after.len() - suffix;
+    let mut edited = tree.clone();
+    edited.edit(&tree_sitter::InputEdit {
+        start_byte: start,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: byte_position(before, start),
+        old_end_position: byte_position(before, old_end),
+        new_end_position: byte_position(after, new_end),
+    });
+    parse_with_tree(after, language, Some(&edited))
+}
+
+fn byte_position(source: &str, offset: usize) -> tree_sitter::Point {
+    let prefix = &source.as_bytes()[..offset];
+    tree_sitter::Point {
+        row: memchr::memchr_iter(b'\n', prefix).count(),
+        column: memchr::memrchr(b'\n', prefix).map_or(offset, |newline| offset - newline - 1),
+    }
+}
+
+fn parse_with_tree(
+    content: &str,
+    language: &tree_sitter::Language,
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Option<tree_sitter::Tree> {
     #[cfg(test)]
     {
         let mut counts = PARSE_COUNTS.lock().unwrap();
         if let Some(count) = counts.get_mut(content) {
-            *count += 1;
+            if old_tree.is_some() {
+                count.1 += 1;
+            } else {
+                count.0 += 1;
+            }
         }
     }
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(language).ok()?;
-    let tree = parser.parse(content, None);
+    let tree = parser.parse(content, old_tree);
     #[cfg(test)]
     {
         let pause = PARSE_PAUSES.lock().unwrap().remove(content);
@@ -32,7 +92,7 @@ pub(crate) fn parse_source(
 }
 
 #[cfg(test)]
-static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, usize>>> =
+static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, (usize, usize)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
@@ -51,13 +111,17 @@ impl ParseWitness {
         assert!(PARSE_COUNTS
             .lock()
             .unwrap()
-            .insert(content.to_string(), 0)
+            .insert(content.to_string(), (0, 0))
             .is_none());
         Self(content.to_string())
     }
 
     pub(crate) fn count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0]
+        PARSE_COUNTS.lock().unwrap()[&self.0].0
+    }
+
+    pub(crate) fn incremental_count(&self) -> usize {
+        PARSE_COUNTS.lock().unwrap()[&self.0].1
     }
 
     pub(crate) fn pause_next(

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::cache::OutlineCache;
 use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
@@ -60,6 +61,7 @@ pub(crate) fn tool_write(
     args: &Value,
     session: &Session,
     _bloom: &Arc<BloomFilterCache>,
+    cache: &OutlineCache,
 ) -> Result<String, String> {
     let (sections, cwd, show_diff) = parse_write_args(args)?;
 
@@ -72,6 +74,7 @@ pub(crate) fn tool_write(
     let ctx = SectionCtx {
         cwd,
         session,
+        cache,
         show_diff,
         section_budget,
     };
@@ -103,6 +106,7 @@ pub(crate) fn tool_write(
 struct SectionCtx<'a> {
     cwd: &'a Path,
     session: &'a Session,
+    cache: &'a OutlineCache,
     show_diff: bool,
     section_budget: u64,
 }
@@ -192,6 +196,9 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             source: e,
         }
     })?;
+    #[cfg(test)]
+    tests::after_commit(path);
+    ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
     let first_changed = first_changed_line(&live, &new_text);
@@ -419,6 +426,7 @@ fn commit_file_op(
                     }
                 }
             })?;
+            ctx.cache.invalidate(path);
             session.record_read(path);
             let new_tag = session.record_snapshot(path, content, std::iter::empty());
             let mut block = format!("## {}\ncreated{suffix}", path.display());
@@ -439,6 +447,8 @@ fn commit_file_op(
                 path: path.to_path_buf(),
                 source: e,
             })?;
+            ctx.cache.invalidate(path);
+            ctx.cache.invalidate(&canonical);
             session.invalidate_snapshot(&canonical);
             Ok(format!("## {}\nremoved{suffix}", path.display()))
         }
@@ -465,6 +475,8 @@ fn commit_file_op(
                         source: e,
                     }
                 })?;
+                ctx.cache.invalidate(path);
+                ctx.cache.invalidate(&canonical_src);
             }
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
@@ -476,6 +488,9 @@ fn commit_file_op(
                 path: dest.clone(),
                 source: e,
             })?;
+            ctx.cache.invalidate(path);
+            ctx.cache.invalidate(&canonical_src);
+            ctx.cache.invalidate(&dest);
             session.relocate_snapshot(&canonical_src, &dest);
             Ok(format!(
                 "## {}\nmoved{suffix} → {}",
@@ -645,6 +660,263 @@ mod tests {
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
     use serde_json::json;
+
+    type CommitHook = Box<dyn FnOnce() + Send>;
+    static COMMIT_HOOKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CommitHook>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    pub(super) fn after_commit(path: &Path) {
+        let hook = COMMIT_HOOKS.lock().unwrap().remove(path);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[test]
+    fn incremental_write_replacement_before_verification_stays_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.rs");
+        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        let after = before.replace("before", "tilth_");
+        let external = before.replace("before", "other_");
+        std::fs::write(&path, &before).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let old = cache.get_or_parse(&path).unwrap();
+        let tag = read_for_tag(&session, &path);
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
+        let target = path.clone();
+        let replacement = external.clone();
+        COMMIT_HOOKS.lock().unwrap().insert(
+            path.clone(),
+            Box::new(move || {
+                let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+                crate::util::atomic_write_bytes(&target, replacement.as_bytes()).unwrap();
+                crate::util::set_mtime(&target, mtime);
+            }),
+        );
+        let result = super::tool_write(
+            &json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+                "op": "replace_text", "old": "before", "new": "tilth_"
+            }]))}),
+            &session,
+            &bloom,
+            &cache,
+        )
+        .unwrap();
+        assert!(result.contains("applied"), "{result}");
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 0);
+        let current = cache.get_or_parse(&path).unwrap();
+        assert_eq!(current.content.as_str(), external);
+        assert_eq!(external_witness.count(), 1);
+        assert_eq!(external_witness.incremental_count(), 0);
+        assert_eq!(old.content.as_str(), before);
+    }
+
+    #[test]
+    fn incremental_write_mixed_batch_preserves_rejected_and_unrelated_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let mut retained = Vec::new();
+        for name in ["accepted", "rejected", "unrelated"] {
+            let path = dir.path().join(format!("{name}.rs"));
+            let source = format!("// {}\nfn {name}() {{}}\n", dir.path().display());
+            std::fs::write(&path, source).unwrap();
+            let old = cache.get_or_parse(&path).unwrap();
+            let tag = read_for_tag(&session, &path);
+            retained.push((path, old, tag));
+        }
+        let (accepted, old, tag) = &retained[0];
+        let after = old.content.replace("accepted", "updated");
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let (rejected, _, rejected_tag) = &retained[1];
+        let request = json!({"cwd": dir.path(), "edits": [
+            {"path": rejected, "tag": rejected_tag, "ops": [{
+                "op": "replace_text", "old": "not_present", "new": "wrong"
+            }]},
+            {"path": accepted, "tag": tag, "ops": [{
+                "op": "replace_text", "old": "accepted", "new": "updated"
+            }]}
+        ]});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(
+            result.contains("error:") && result.contains("applied"),
+            "{result}"
+        );
+        assert_eq!(
+            cache.get_or_parse(accepted).unwrap().content.as_str(),
+            after
+        );
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 1);
+        for (path, snapshot, _) in &retained[1..] {
+            assert!(Arc::ptr_eq(snapshot, &cache.get_or_parse(path).unwrap()));
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                snapshot.content.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_write_failed_move_invalidates_already_committed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        let after = before.replace("before", "changed");
+        std::fs::write(&path, &before).unwrap();
+        std::fs::write(dir.path().join("blocked"), "not a directory").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let old = cache.get_or_parse(&path).unwrap();
+        let tag = read_for_tag(&session, &path);
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let result = super::tool_write(
+            &json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([
+                {"op": "replace_text", "old": "before", "new": "changed"},
+                {"op": "move_file", "dest": "blocked/dest.rs"}
+            ]))}),
+            &session,
+            &bloom,
+            &cache,
+        )
+        .unwrap_err();
+        assert!(result.contains("blocked"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 0);
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), after);
+        assert_eq!(witness.count(), 1);
+        assert_eq!(old.content.as_str(), before);
+    }
+
+    #[test]
+    fn incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let before = format!("// {}\nfn initial() {{}}\n", dir.path().display());
+        let cold = before.replace("initial", "cold");
+        std::fs::write(&path, &before).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let tag = read_for_tag(&session, &path);
+        let cold_witness = crate::lang::treesitter::ParseWitness::new(&cold);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "initial", "new": "cold"
+        }]))});
+        assert!(super::tool_write(&request, &session, &bloom, &cache)
+            .unwrap()
+            .contains("applied"));
+        assert_eq!(cold_witness.count(), 0);
+        assert_eq!(cold_witness.incremental_count(), 0);
+        let retained = cache.get_or_parse(&path).unwrap();
+        assert_eq!(retained.content.as_str(), cold);
+        assert_eq!(cold_witness.count(), 1);
+
+        let tag = read_for_tag(&session, &path);
+        let noop = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "cold", "new": "cold"
+        }]))});
+        assert!(super::tool_write(&noop, &session, &bloom, &cache)
+            .unwrap()
+            .contains("no change"));
+        assert!(Arc::ptr_eq(&retained, &cache.get_or_parse(&path).unwrap()));
+        assert_eq!(cold_witness.count(), 1);
+        assert_eq!(cold_witness.incremental_count(), 0);
+
+        let external = before.replace("initial", "outside");
+        crate::util::atomic_write_bytes(&path, external.as_bytes()).unwrap();
+        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
+        let tag = read_for_tag(&session, &path);
+        let written = external.replace("outside", "after_external");
+        let witness = crate::lang::treesitter::ParseWitness::new(&written);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "outside", "new": "after_external"
+        }]))});
+        assert!(super::tool_write(&request, &session, &bloom, &cache)
+            .unwrap()
+            .contains("applied"));
+        assert_eq!(external_witness.count(), 0);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(
+            witness.incremental_count(),
+            0,
+            "cached bytes differ from verified live bytes"
+        );
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), written);
+        assert_eq!(witness.count(), 1);
+
+        let newer = written.replace("after_external", "newer_external");
+        let witness = crate::lang::treesitter::ParseWitness::new(&newer);
+        crate::util::atomic_write_bytes(&path, newer.as_bytes()).unwrap();
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), newer);
+        assert_eq!(witness.count(), 1);
+        assert_eq!(witness.incremental_count(), 0);
+    }
+
+    #[test]
+    fn incremental_write_rename_and_delete_keep_unrelated_cache_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let dest = dir.path().join("destination.rs");
+        let other = dir.path().join("other.rs");
+        let source = format!("// {}\nfn source() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(&dest, "fn previous_destination() {}").unwrap();
+        std::fs::write(&other, "fn unrelated() {}").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let old_source = cache.get_or_parse(&path).unwrap();
+        let old_dest = cache.get_or_parse(&dest).unwrap();
+        let unrelated = cache.get_or_parse(&other).unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        let tag = read_for_tag(&session, &path);
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "move_file", "dest": dest
+        }]))});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("moved"), "{result}");
+        assert!(!path.exists());
+        assert!(cache.get_or_parse(&path).is_none());
+        assert_eq!(witness.count(), 0, "rename must not parse a new path");
+        assert_eq!(witness.incremental_count(), 0);
+        let moved = cache.get_or_parse(&dest).unwrap();
+        assert_eq!(moved.content.as_str(), source);
+        assert!(!Arc::ptr_eq(&old_dest, &moved));
+        assert_eq!(witness.count(), 1);
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &cache.get_or_parse(&other).unwrap()
+        ));
+
+        let tag = read_for_tag(&session, &dest);
+        let request = json!({"cwd": dir.path(), "edits": edits(&dest, Some(&tag), json!([{
+            "op": "delete_file"
+        }]))});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("removed"), "{result}");
+        assert!(!dest.exists());
+        assert!(cache.get_or_parse(&dest).is_none());
+        assert_eq!(old_source.content.as_str(), source);
+        assert_eq!(moved.content.as_str(), source);
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &cache.get_or_parse(&other).unwrap()
+        ));
+    }
+
+    fn tool_write(
+        args: &Value,
+        session: &Session,
+        bloom: &Arc<BloomFilterCache>,
+    ) -> Result<String, String> {
+        super::tool_write(args, session, bloom, &OutlineCache::new())
+    }
 
     fn services() -> (Session, Arc<BloomFilterCache>) {
         (Session::new(), Arc::new(BloomFilterCache::new()))
