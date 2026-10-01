@@ -112,7 +112,7 @@ fn collect_candidates_capped(
         let candidates = &candidates;
         let code_files_attempted = &code_files_attempted;
         Box::new(move |entry| {
-            let Some((path, file_size)) = crate::search::accept_walk_entry(entry) else {
+            let Some((path, file_size, _)) = crate::search::accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
             let path = path.as_path();
