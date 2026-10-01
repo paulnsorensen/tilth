@@ -1008,10 +1008,11 @@ mod tests {
         }]});
         let result = dispatch_tool("tilth_search", &search, &services).unwrap();
         let result: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["results"][0]["items"].as_array().unwrap().len(), 1);
-        let capture = &result["results"][0]["items"][0]["captures"]["A"][0];
-        let start = capture["start_byte"].as_u64().unwrap() as usize;
-        let end = capture["end_byte"].as_u64().unwrap() as usize;
+        assert_eq!(result["results"][0]["total_matches"], 1);
+        // Compact match: [start_line, end_line, start_byte, end_byte, captures].
+        let capture = &result["results"][0]["items"][0]["matches"][0][4]["A"][0];
+        let start = capture[2].as_u64().unwrap() as usize;
+        let end = capture[3].as_u64().unwrap() as usize;
         assert_eq!(&after[start..end], "thé");
         assert_eq!(
             witness.count(),
