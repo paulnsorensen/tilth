@@ -61,7 +61,7 @@ pub(crate) fn extract_callee_names_from_tree(
     };
     let content_bytes = content.as_bytes();
 
-    let Some(names) = super::callee_query::with_callee_query(&ts_lang, query_str, |query| {
+    let Some(names) = crate::lang::treesitter::with_query(&ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
             return Vec::new();
         };

@@ -580,41 +580,41 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
     }
 }
 
-/// Global cache of compiled tree-sitter queries, shared by symbol/caller
-/// search (`search::siblings`) and per-language extractors (e.g. Go's
-/// receiver-name lookup). Keyed by `(node_kind_count, field_count,
-/// query_str_ptr)` so that distinct query strings for the same language are
-/// stored under separate keys. We avoid `Language::name()` because ABI < 15
-/// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
-#[allow(clippy::type_complexity)]
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), Arc<tree_sitter::Query>>>> =
+/// Global cache of compiled tree-sitter queries. The key uses tree-sitter's
+/// grammar identity and query content, including grammars without a name.
+type QueryKey = (tree_sitter::Language, &'static str);
+static QUERY_CACHE: LazyLock<Mutex<HashMap<QueryKey, Arc<tree_sitter::Query>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static QUERY_COMPILE_ATTEMPTS: LazyLock<Mutex<HashMap<QueryKey, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
 /// reference to the cached `Query`. Returns `None` if compilation fails.
-///
-/// `query_str` must be `'static` so its pointer address is stable across
-/// calls and can serve as part of the cache key.
 pub(crate) fn with_query<R>(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
     f: impl FnOnce(&tree_sitter::Query) -> R,
 ) -> Option<R> {
     use std::collections::hash_map::Entry;
-    // Pointer address distinguishes different queries for the same language.
-    let key = (
-        ts_lang.node_kind_count(),
-        ts_lang.field_count(),
-        query_str.as_ptr() as usize,
-    );
+
+    let key = (ts_lang.clone(), query_str);
     let mut cache = QUERY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let query = match cache.entry(key) {
-        Entry::Occupied(e) => Arc::clone(e.get()),
-        Entry::Vacant(e) => {
+        Entry::Occupied(entry) => Arc::clone(entry.get()),
+        Entry::Vacant(entry) => {
+            #[cfg(test)]
+            {
+                let mut attempts = QUERY_COMPILE_ATTEMPTS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *attempts.entry((ts_lang.clone(), query_str)).or_default() += 1;
+            }
             let query = Arc::new(tree_sitter::Query::new(ts_lang, query_str).ok()?);
-            Arc::clone(e.insert(query))
+            Arc::clone(entry.insert(query))
         }
     };
     drop(cache);
@@ -624,6 +624,159 @@ pub(crate) fn with_query<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn captures(
+        query: &tree_sitter::Query,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        capture_name: &str,
+    ) -> Vec<String> {
+        use streaming_iterator::StreamingIterator;
+
+        let capture = query
+            .capture_index_for_name(capture_name)
+            .expect("query has the requested capture");
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+        let mut names = Vec::new();
+        while let Some(query_match) = matches.next() {
+            names.extend(
+                query_match
+                    .captures()
+                    .iter()
+                    .filter(|candidate| candidate.index == capture)
+                    .map(|candidate| {
+                        candidate
+                            .node
+                            .utf8_text(source.as_bytes())
+                            .expect("capture is valid UTF-8")
+                            .to_owned()
+                    }),
+            );
+        }
+        names
+    }
+
+    fn query_compile_attempts(language: &tree_sitter::Language, query: &'static str) -> usize {
+        QUERY_COMPILE_ATTEMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(language.clone(), query))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn shared_query_cache_distinguishes_query_content() {
+        const FUNCTION_QUERY: &str = "(function_item name: (identifier) @target)";
+        const CALL_QUERY: &str = "(call_expression function: (identifier) @target)";
+        const SOURCE: &str = "fn alpha() { beta(); }";
+
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let tree = parse_source(SOURCE, &language).expect("source parses");
+
+        for _ in 0..2 {
+            let functions = with_query(&language, FUNCTION_QUERY, |query| {
+                captures(query, &tree, SOURCE, "target")
+            })
+            .expect("function query compiles");
+            let calls = with_query(&language, CALL_QUERY, |query| {
+                captures(query, &tree, SOURCE, "target")
+            })
+            .expect("call query compiles");
+            assert_eq!(functions, ["alpha"]);
+            assert_eq!(calls, ["beta"]);
+        }
+
+        assert_eq!(query_compile_attempts(&language, FUNCTION_QUERY), 1);
+        assert_eq!(query_compile_attempts(&language, CALL_QUERY), 1);
+    }
+
+    #[test]
+    fn shared_query_cache_uses_unnamed_grammar_identity() {
+        const QUERY: &str = "(identifier) @grammar_identity_target";
+        const RUST_SOURCE: &str = "fn rust_marker() {}";
+        const KOTLIN_SOURCE: &str = "fun kotlinMarker() {}";
+
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let kotlin: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        assert_eq!(kotlin.name(), None);
+
+        let rust_tree = parse_source(RUST_SOURCE, &rust).expect("rust source parses");
+        let kotlin_tree = parse_source(KOTLIN_SOURCE, &kotlin).expect("kotlin source parses");
+        let rust_names = with_query(&rust, QUERY, |query| {
+            captures(query, &rust_tree, RUST_SOURCE, "grammar_identity_target")
+        })
+        .expect("rust query compiles");
+        let kotlin_names = with_query(&kotlin, QUERY, |query| {
+            captures(
+                query,
+                &kotlin_tree,
+                KOTLIN_SOURCE,
+                "grammar_identity_target",
+            )
+        })
+        .expect("kotlin query compiles");
+
+        assert_eq!(rust_names, ["rust_marker"]);
+        assert_eq!(kotlin_names, ["kotlinMarker"]);
+        assert_eq!(query_compile_attempts(&rust, QUERY), 1);
+        assert_eq!(query_compile_attempts(&kotlin, QUERY), 1);
+    }
+
+    #[test]
+    fn shared_query_compile_failure_is_retried() {
+        const INVALID_QUERY: &str = "(shared_query_missing_node) @invalid";
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+
+        assert!(with_query(&language, INVALID_QUERY, |_| ()).is_none());
+        assert!(with_query(&language, INVALID_QUERY, |_| ()).is_none());
+        assert_eq!(query_compile_attempts(&language, INVALID_QUERY), 2);
+    }
+
+    #[test]
+    fn shared_query_survives_edits_and_allows_reentrant_callbacks() {
+        const OUTER_QUERY: &str = "(function_item name: (identifier) @edit_target)";
+        const INNER_QUERY: &str = "(call_expression function: (identifier) @nested_target)";
+        const BEFORE: &str = "fn before() { first(); }";
+        const AFTER: &str = "fn after() { second(); }";
+
+        let dir = tempfile::tempdir().expect("temporary directory is created");
+        let path = dir.path().join("query-cache.rs");
+        std::fs::write(&path, BEFORE).expect("initial source is written");
+        let cache = crate::cache::OutlineCache::new();
+        let before = cache.get_or_parse(&path).expect("initial source parses");
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+
+        let (before_functions, before_calls) = with_query(&language, OUTER_QUERY, |query| {
+            let functions = captures(query, before.tree(), before.content(), "edit_target");
+            let calls = with_query(&language, INNER_QUERY, |nested| {
+                captures(nested, before.tree(), before.content(), "nested_target")
+            })
+            .expect("reentrant query compiles");
+            (functions, calls)
+        })
+        .expect("outer query compiles");
+        assert_eq!(before_functions, ["before"]);
+        assert_eq!(before_calls, ["first"]);
+
+        crate::util::atomic_write_bytes(&path, AFTER.as_bytes()).expect("edit is written");
+        cache.update_after_write(&path, BEFORE, AFTER);
+        let after = cache.get_or_parse(&path).expect("edited source parses");
+        let after_functions = with_query(&language, OUTER_QUERY, |query| {
+            captures(query, after.tree(), after.content(), "edit_target")
+        })
+        .expect("outer query stays cached");
+        let after_calls = with_query(&language, INNER_QUERY, |query| {
+            captures(query, after.tree(), after.content(), "nested_target")
+        })
+        .expect("inner query stays cached");
+
+        assert_eq!(after_functions, ["after"]);
+        assert_eq!(after_calls, ["second"]);
+        assert_eq!(query_compile_attempts(&language, OUTER_QUERY), 1);
+        assert_eq!(query_compile_attempts(&language, INNER_QUERY), 1);
+    }
 
     #[test]
     fn incremental_reparse_delegates_to_ast_grep_document() {
