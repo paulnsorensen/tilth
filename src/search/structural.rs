@@ -141,10 +141,10 @@ impl StructuralPatterns {
                         scan.lock().unwrap().skipped_files += 1;
                         return ignore::WalkState::Continue;
                     };
-                    if snapshot.content.len() as u64
+                    if snapshot.content().len() as u64
                         >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                         && crate::lang::detection::is_minified_by_content(
-                            snapshot.content.as_bytes(),
+                            snapshot.content().as_bytes(),
                         )
                     {
                         return ignore::WalkState::Continue;
