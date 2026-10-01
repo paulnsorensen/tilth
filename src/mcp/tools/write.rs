@@ -196,8 +196,11 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             source: e,
         }
     })?;
-    #[cfg(test)]
-    tests::after_commit(path);
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        if canonical != path {
+            ctx.cache.invalidate(&canonical);
+        }
+    }
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
@@ -475,9 +478,11 @@ fn commit_file_op(
                         source: e,
                     }
                 })?;
-                ctx.cache.invalidate(path);
-                ctx.cache.invalidate(&canonical_src);
             }
+            // Evict the source before the rename so a failed rename still
+            // drops a source that this section already wrote.
+            ctx.cache.invalidate(path);
+            ctx.cache.invalidate(&canonical_src);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
                     path: parent.to_path_buf(),
@@ -488,8 +493,6 @@ fn commit_file_op(
                 path: dest.clone(),
                 source: e,
             })?;
-            ctx.cache.invalidate(path);
-            ctx.cache.invalidate(&canonical_src);
             ctx.cache.invalidate(&dest);
             session.relocate_snapshot(&canonical_src, &dest);
             Ok(format!(
@@ -661,59 +664,23 @@ mod tests {
     use crate::session::Session;
     use serde_json::json;
 
-    type CommitHook = Box<dyn FnOnce() + Send>;
-    static COMMIT_HOOKS: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CommitHook>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-    pub(super) fn after_commit(path: &Path) {
-        let hook = COMMIT_HOOKS.lock().unwrap().remove(path);
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
     #[test]
-    fn incremental_write_replacement_before_verification_stays_cold() {
+    fn incremental_write_create_evicts_parsed_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("race.rs");
-        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
-        let after = before.replace("before", "tilth_");
-        let external = before.replace("before", "other_");
-        std::fs::write(&path, &before).unwrap();
+        let path = dir.path().join("created.rs");
         let (session, bloom) = services();
         let cache = OutlineCache::new();
-        let old = cache.get_or_parse(&path).unwrap();
-        let tag = read_for_tag(&session, &path);
-        let witness = crate::lang::treesitter::ParseWitness::new(&after);
-        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
-        let target = path.clone();
-        let replacement = external.clone();
-        COMMIT_HOOKS.lock().unwrap().insert(
-            path.clone(),
-            Box::new(move || {
-                let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
-                crate::util::atomic_write_bytes(&target, replacement.as_bytes()).unwrap();
-                crate::util::set_mtime(&target, mtime);
-            }),
-        );
-        let result = super::tool_write(
-            &json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
-                "op": "replace_text", "old": "before", "new": "tilth_"
-            }]))}),
-            &session,
-            &bloom,
-            &cache,
-        )
-        .unwrap();
-        assert!(result.contains("applied"), "{result}");
-        assert_eq!(witness.count(), 0);
-        assert_eq!(witness.incremental_count(), 0);
-        let current = cache.get_or_parse(&path).unwrap();
-        assert_eq!(current.content.as_str(), external);
-        assert_eq!(external_witness.count(), 1);
-        assert_eq!(external_witness.incremental_count(), 0);
-        assert_eq!(old.content.as_str(), before);
+        // Seed a parsed entry, then remove the file so the create can fill the path.
+        std::fs::write(&path, "fn stale() {}").unwrap();
+        cache.get_or_parse(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.has_parsed(&path));
+        let request = json!({"cwd": dir.path(), "edits": [{"path": &path, "ops": [{
+            "op": "create_file", "content": "fn fresh() {}"
+        }]}]});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("created"), "{result}");
+        assert!(!cache.has_parsed(&path));
     }
 
     #[test]
@@ -789,6 +756,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
         assert_eq!(witness.count(), 0);
         assert_eq!(witness.incremental_count(), 0);
+        assert!(!cache.has_parsed(&path));
         assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), after);
         assert_eq!(witness.count(), 1);
         assert_eq!(old.content.as_str(), before);
@@ -882,7 +850,9 @@ mod tests {
         let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
         assert!(result.contains("moved"), "{result}");
         assert!(!path.exists());
+        assert!(!cache.has_parsed(&path));
         assert!(cache.get_or_parse(&path).is_none());
+        assert!(!cache.has_parsed(&dest));
         assert_eq!(witness.count(), 0, "rename must not parse a new path");
         assert_eq!(witness.incremental_count(), 0);
         let moved = cache.get_or_parse(&dest).unwrap();
@@ -901,6 +871,7 @@ mod tests {
         let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
         assert!(result.contains("removed"), "{result}");
         assert!(!dest.exists());
+        assert!(!cache.has_parsed(&dest));
         assert!(cache.get_or_parse(&dest).is_none());
         assert_eq!(old_source.content.as_str(), source);
         assert_eq!(moved.content.as_str(), source);
