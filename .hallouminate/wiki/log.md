@@ -64,5 +64,5 @@
 
 
 
-2026-10-01 · incremental-0dd6bf0-verified · merged · upstream-library-reuse.md · Document verified warm incremental snapshots, bounded disk checks, cold-write behavior, and path invalidation. Exact-title and two natural retrieval probes pass.
+2026-10-01 · 7c99b485d4cad9af · merged · upstream-library-reuse.md · Document verified warm incremental snapshots, bounded disk checks, cold-write behavior, and path invalidation. Exact-title and two natural retrieval probes pass.
 
