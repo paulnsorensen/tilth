@@ -588,13 +588,13 @@ mod tests {
     #[test]
     fn test_identifier_extraction_empty() {
         let idents: Vec<&str> = extract_identifiers("", Some(Lang::Rust)).collect();
-        assert!(idents.is_empty());
+        assert_eq!(idents, [] as [&str; 0]);
     }
 
     #[test]
     fn test_identifier_extraction_no_identifiers() {
         let idents: Vec<&str> = extract_identifiers("123 + 456 = 789", Some(Lang::Rust)).collect();
-        assert!(idents.is_empty());
+        assert_eq!(idents, [] as [&str; 0]);
     }
 
     #[test]

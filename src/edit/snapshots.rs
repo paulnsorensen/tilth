@@ -503,7 +503,7 @@ mod tests {
             recorded_at: 0,
             seen_lines: HashSet::new(),
         };
-        assert!(snap.seen_ranges().is_empty());
+        assert_eq!(snap.seen_ranges(), [] as [(u32, u32); 0]);
     }
 
     #[test]
