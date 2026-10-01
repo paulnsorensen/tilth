@@ -134,6 +134,17 @@ It passes 20 consecutive runs without changing runtime language selection.[^20]
 [^19]: [Failed PR #280 CI run](https://github.com/paulnsorensen/tilth/actions/runs/36541092921/job/109316414746); `src/overview.rs:35-46,259-354,819-838` at `50300a271a897e88426f5841b948d78639a90e52`. Local reproduction on 2026-09-29 uses five isolated executions of `cargo test -q --lib overview::tests::test_fingerprint_on_tilth -- --exact --nocapture`.
 [^20]: [PR #280 fingerprint fixture correction](https://github.com/paulnsorensen/tilth/pull/280); `src/overview.rs::tests::test_fingerprint_detects_rust_project`. Local verification on 2026-09-29: 20/20 focused executions and all three overview tests pass.
 
+## macOS temporary-path cache keys
+
+On macOS, `tempfile` paths start with `/var`, but `/var` is a symlink to `/private/var`.
+The search walker and the test fixture can then key one file under two paths.
+Cache lookups miss, and parse-count assertions in `documents_*` MCP tests fail.
+At PR #287 head `53a76df`, `documents_reuse_real_parses_across_production_requests` and `documents_python_dependencies_reuse_trees_and_refresh_reexports` fail this way without any code change.[^21]
+Run the local gate with `TMPDIR=/private/var/tmp just check` on macOS.
+Linux CI does not have this symlink and is unaffected.
+
+[^21]: PR #287 affinage cure on 2026-10-01. Both tests fail at pristine `53a76df` with the default `TMPDIR`. With `TMPDIR=/private/var/tmp`, `just check` exits 0 (1,216 Rust library tests).
+
 ## Historical baseline
 
 The August 2026 review of PR #144 reports a macOS batch-budget test failure.
@@ -150,4 +161,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, and PR #283 language BDD scope and upstream regressions · Updated: 2026-09-30 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, and PR #287 macOS gate run · Updated: 2026-10-01 · Supersedes: August 2026 local-gate baseline guidance._

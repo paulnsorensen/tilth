@@ -14,11 +14,13 @@ use crate::util::{content_fingerprint, FileRevision};
 const MAX_OUTLINE_ENTRIES: usize = 2000;
 
 /// Count cap for the parsed-file cache. Each entry pins up to 500 KB of
-/// source plus a tree-sitter `Tree`; capping at 500 entries bounds retained
-/// memory to roughly 250 MB in the worst case, comparable in spirit to
-/// snapshots' 64 MiB ceiling (`src/edit/snapshots.rs`) scaled for the larger
-/// per-entry cost here.
+/// source plus a tree-sitter `Tree`. The cap bounds retained source to
+/// roughly 250 MB in the worst case. Trees add more on top of that. The
+/// snapshots ceiling in `src/edit/snapshots.rs` is 64 MiB.
 const MAX_PARSED_ENTRIES: usize = 500;
+
+/// Largest file the parsed-file cache accepts.
+const MAX_PARSED_FILE_BYTES: u64 = 500_000;
 
 /// Whether a cached outline was rendered in size-capped or full form.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,21 +232,12 @@ impl OutlineCache {
             return None;
         };
         let meta = std::fs::metadata(path).ok()?;
-        if meta.len() > 500_000 {
+        if meta.len() > MAX_PARSED_FILE_BYTES {
             return None;
         }
         let revision = FileRevision::from_metadata(path, &meta)?;
-        let key = path.to_path_buf();
-        {
-            let mut parsed = self
-                .parsed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(e) = parsed.get(&key) {
-                if e.revision == revision {
-                    return Some(Arc::clone(&e.file));
-                }
-            }
+        if let Some(file) = self.lookup_parsed(path, &revision, None) {
+            return Some(file);
         }
         let language = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
@@ -252,6 +245,28 @@ impl OutlineCache {
         let file = Arc::new(ParsedFile { document, lang });
         self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
             .or(Some(file))
+    }
+
+    /// Return the cached snapshot for `path` when its revision matches and,
+    /// if given, its bytes equal `content`. This never reads or parses.
+    fn lookup_parsed(
+        &self,
+        path: &Path,
+        revision: &FileRevision,
+        content: Option<&str>,
+    ) -> Option<Arc<ParsedFile>> {
+        let mut parsed = self
+            .parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = parsed.get(path)?;
+        if entry.revision != *revision {
+            return None;
+        }
+        if content.is_some_and(|c| entry.file.content.as_str() != c) {
+            return None;
+        }
+        Some(Arc::clone(&entry.file))
     }
 
     /// Reuse a disk snapshot only when its bytes match the caller's source.
@@ -262,6 +277,37 @@ impl OutlineCache {
                 return Some(file);
             }
         }
+        Self::parse_supplied(path, content)
+    }
+
+    /// Parse bytes that a bulk walk already read. The caller must take
+    /// `revision` BEFORE it reads the bytes. A hit needs an equal revision
+    /// and equal bytes. A miss parses the supplied bytes once and never
+    /// re-reads the file. The parse is published only if the file still has
+    /// `revision` under the cache lock. A change between the stat and the
+    /// read, or after the read, fails that check, so no stale bytes enter
+    /// the cache. Without a revision, or over the size limit, nothing is published.
+    pub(crate) fn parse_with_revision(
+        &self,
+        path: &Path,
+        content: &str,
+        revision: Option<FileRevision>,
+    ) -> Option<Arc<ParsedFile>> {
+        let Some(revision) = revision else {
+            return Self::parse_supplied(path, content);
+        };
+        if content.len() as u64 > MAX_PARSED_FILE_BYTES {
+            return Self::parse_supplied(path, content);
+        }
+        if let Some(file) = self.lookup_parsed(path, &revision, Some(content)) {
+            return Some(file);
+        }
+        let file = Self::parse_supplied(path, content)?;
+        self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
+            .or(Some(file))
+    }
+
+    fn parse_supplied(path: &Path, content: &str) -> Option<Arc<ParsedFile>> {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
@@ -697,7 +743,7 @@ mod tests {
         let old_revision = FileRevision::of(&path).unwrap();
         let old_snapshot = cache.get_or_parse(&path).unwrap();
 
-        std::fs::write(&path, "fn new() {}").unwrap();
+        crate::util::atomic_write_bytes(&path, b"fn new() {}").unwrap();
         let newer_snapshot = cache.get_or_parse(&path).unwrap();
         assert!(
             cache
@@ -811,7 +857,9 @@ mod tests {
         }
         assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
         assert!(!cache.parsed.lock().unwrap().contains(&first_path));
-        let neighbor = dir.path().join("file_499.rs");
+        let neighbor = dir
+            .path()
+            .join(format!("file_{}.rs", MAX_PARSED_ENTRIES - 1));
         let unchanged = cache.get_or_parse(&neighbor).unwrap();
         assert!(cache.get_or_parse(&dir.path().join("missing.rs")).is_none());
         assert!(Arc::ptr_eq(
@@ -820,6 +868,41 @@ mod tests {
         ));
         assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
         assert_eq!(retained.outline_entries()[0].name, "retained");
+    }
+
+    #[test]
+    fn parse_with_revision_publishes_once_and_get_or_parse_reuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walked.rs");
+        let source = format!("// {}\nfn walked() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let cache = OutlineCache::new();
+        let revision = FileRevision::of(&path);
+
+        let cold = cache.parse_with_revision(&path, &source, revision).unwrap();
+        assert_eq!(witness.count(), 1);
+        let warm = cache.get_or_parse(&path).unwrap();
+        assert!(Arc::ptr_eq(&cold, &warm));
+        assert_eq!(witness.count(), 1, "get_or_parse reuses the walker parse");
+    }
+
+    #[test]
+    fn parse_with_revision_refuses_to_publish_bytes_older_than_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("walked.rs");
+        std::fs::write(&path, "fn old() {}").unwrap();
+        let cache = OutlineCache::new();
+        let old_revision = FileRevision::of(&path);
+        crate::util::atomic_write_bytes(&path, b"fn new() {}").unwrap();
+
+        let stale = cache
+            .parse_with_revision(&path, "fn old() {}", old_revision)
+            .unwrap();
+        assert_eq!(stale.content.as_str(), "fn old() {}");
+        let current = cache.get_or_parse(&path).unwrap();
+        assert_eq!(current.content.as_str(), "fn new() {}");
+        assert!(!Arc::ptr_eq(&stale, &current));
     }
 
     #[test]

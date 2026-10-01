@@ -147,13 +147,13 @@ pub(crate) fn find_callers_batch_cached(
             };
 
             // Read + size-gate + bloom prefilter in one shared step.
-            let content = match super::bloom_walk::read_with_bloom_check(
+            let (content, meta) = match super::bloom_walk::read_with_bloom_check(
                 path,
                 targets,
                 bloom,
                 super::bloom_walk::MAX_FILE_SIZE,
             ) {
-                super::bloom_walk::BloomRead::Hit(content) => content,
+                super::bloom_walk::BloomRead::Hit { content, meta } => (content, meta),
                 super::bloom_walk::BloomRead::Skip => return ignore::WalkState::Continue,
                 super::bloom_walk::BloomRead::Unreadable => {
                     files_unreadable.fetch_add(1, Ordering::Relaxed);
@@ -170,7 +170,12 @@ pub(crate) fn find_callers_batch_cached(
                 return ignore::WalkState::Continue;
             }
 
-            let Some(parsed) = cache.parse_source(path, &content) else {
+            let Some(parsed) = cache.parse_with_revision(
+                path,
+                &content,
+                // `meta` predates the read, so a stale publish fails its recheck.
+                crate::util::FileRevision::from_metadata_and_bytes(&meta, content.as_bytes()),
+            ) else {
                 return ignore::WalkState::Continue;
             };
             let file_callers = find_callers_treesitter_batch(

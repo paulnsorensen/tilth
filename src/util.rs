@@ -40,6 +40,31 @@ impl FileRevision {
     }
 
     pub(crate) fn from_metadata(_path: &Path, meta: &std::fs::Metadata) -> Option<Self> {
+        Self::from_parts(meta, || {
+            #[cfg(not(unix))]
+            {
+                file_fingerprint(_path).ok()
+            }
+            #[cfg(unix)]
+            {
+                None
+            }
+        })
+    }
+
+    /// Build a revision from `meta` and bytes the caller already read. Take
+    /// `meta` BEFORE reading `bytes`. A change between the stat and the read
+    /// leaves a stale mtime or length. On non-Unix, the hash covers the
+    /// supplied bytes, and `is_current` still rejects the stale mtime. A
+    /// change after the read fails `is_current`.
+    pub(crate) fn from_metadata_and_bytes(meta: &std::fs::Metadata, bytes: &[u8]) -> Option<Self> {
+        Self::from_parts(meta, || Some(content_fingerprint(bytes)))
+    }
+
+    fn from_parts(
+        meta: &std::fs::Metadata,
+        _content_hash: impl FnOnce() -> Option<u64>,
+    ) -> Option<Self> {
         let mtime_nanos = system_time_nanos(meta.modified().ok()?);
         #[cfg(unix)]
         let (dev, ino, ctime_nanos, content_hash) = {
@@ -49,8 +74,7 @@ impl FileRevision {
             (Some(meta.dev()), Some(meta.ino()), Some(ctime_nanos), None)
         };
         #[cfg(not(unix))]
-        let (dev, ino, ctime_nanos, content_hash) =
-            (None, None, None, Some(file_fingerprint(_path).ok()?));
+        let (dev, ino, ctime_nanos, content_hash) = (None, None, None, Some(_content_hash()?));
         Some(Self {
             mtime_nanos,
             len: meta.len(),
@@ -204,6 +228,26 @@ mod tests {
             .checked_sub(Duration::new(1, 500_000_000))
             .expect("1968 timestamp is representable");
         assert_eq!(system_time_nanos(before_epoch), -1_500_000_000);
+    }
+
+    #[test]
+    fn from_metadata_and_bytes_matches_from_metadata_for_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        std::fs::write(&path, b"fn a() {}").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            FileRevision::from_metadata_and_bytes(&meta, &bytes),
+            FileRevision::from_metadata(&path, &meta)
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            FileRevision::from_metadata_and_bytes(&meta, b"other")
+                .unwrap()
+                .content_hash,
+            Some(content_fingerprint(b"other"))
+        );
     }
 
     #[test]

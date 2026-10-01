@@ -73,7 +73,7 @@ pub fn search(
                 return ignore::WalkState::Quit;
             }
 
-            let Some((path, file_size)) = accept_walk_entry(entry) else {
+            let Some((path, file_size, _)) = accept_walk_entry(entry) else {
                 return ignore::WalkState::Continue;
             };
             let path = path.as_path();
