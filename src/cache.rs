@@ -263,7 +263,7 @@ impl OutlineCache {
         if entry.revision != *revision {
             return None;
         }
-        if content.is_some_and(|c| entry.file.content.as_str() != c) {
+        if content.is_some_and(|c| entry.file.content().as_str() != c) {
             return None;
         }
         Some(Arc::clone(&entry.file))
@@ -899,9 +899,9 @@ mod tests {
         let stale = cache
             .parse_with_revision(&path, "fn old() {}", old_revision)
             .unwrap();
-        assert_eq!(stale.content.as_str(), "fn old() {}");
+        assert_eq!(stale.content().as_str(), "fn old() {}");
         let current = cache.get_or_parse(&path).unwrap();
-        assert_eq!(current.content.as_str(), "fn new() {}");
+        assert_eq!(current.content().as_str(), "fn new() {}");
         assert!(!Arc::ptr_eq(&stale, &current));
     }
 
