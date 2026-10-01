@@ -12,9 +12,8 @@ use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{find_entry_by_start_line, get_outline_entries};
-use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
-use crate::search::search_symbol_raw;
+use crate::search::callees::{extract_callee_names, ResolvedCallee};
+use crate::search::callers::{CallerMatch, BATCH_EARLY_QUIT};
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
@@ -68,19 +67,28 @@ fn parse_target_spec(s: &str) -> TargetSpec {
 
 /// Resolve a target spec and return the loaded source plus its detected
 /// language. Single file read; single outline parse downstream.
+#[cfg(test)]
 pub(crate) fn resolve_with_source(
     spec: &str,
     scope: &Path,
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+    resolve_with_source_cached(spec, scope, &OutlineCache::new())
+}
+
+pub(crate) fn resolve_with_source_cached(
+    spec: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
     match parse_target_spec(spec) {
-        TargetSpec::Symbol(name) => resolve_by_name(&name, scope),
+        TargetSpec::Symbol(name) => resolve_by_name(&name, scope, cache),
         TargetSpec::PathLine { path, line } => {
             let path = if path.is_absolute() {
                 path
             } else {
                 scope.join(path)
             };
-            resolve_by_path_line(&path, line)
+            resolve_by_path_line(&path, line, cache)
         }
     }
 }
@@ -92,7 +100,8 @@ pub(crate) fn resolve_with_source_occurrence(
     name: &str,
     occurrence: (usize, usize),
     scope: &Path,
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
     let TargetSpec::PathLine { path, line } = parse_target_spec(spec) else {
         return Err(TilthError::InvalidQuery {
             query: spec.to_string(),
@@ -104,7 +113,7 @@ pub(crate) fn resolve_with_source_occurrence(
     } else {
         scope.join(path)
     };
-    let result = search_symbol_raw(name, scope, None)?;
+    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.clone(),
         source,
@@ -129,13 +138,18 @@ pub(crate) fn resolve_with_source_occurrence(
         name.to_string(),
         0,
         false,
+        cache,
     )
 }
 
-fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+fn resolve_by_name(
+    name: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
     // The literal spec (`Alpha::dispatch`) never equals a bare definition name,
     // so this attempt only fires for genuinely bare targets. No qualifier to honor.
-    if let Some(resolved) = resolve_def_by_query(name, None, scope)? {
+    if let Some(resolved) = resolve_def_by_query(name, None, scope, cache)? {
         return Ok(resolved);
     }
     // Qualified target (`Type::method`, `Type.method`, or `a::b::method`): retry
@@ -143,7 +157,7 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
     // retry selects the same-named definition owned by that qualifier.
     let (qualifier, bare) = split_qualified(name);
     if bare != name && !bare.is_empty() {
-        if let Some(resolved) = resolve_def_by_query(bare, qualifier, scope)? {
+        if let Some(resolved) = resolve_def_by_query(bare, qualifier, scope, cache)? {
             return Ok(resolved);
         }
     }
@@ -193,9 +207,10 @@ fn resolve_def_by_query(
     query: &str,
     qualifier: Option<&str>,
     scope: &Path,
-) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
+    cache: &OutlineCache,
+) -> Result<Option<(ResolvedTarget, std::sync::Arc<String>, Lang)>, TilthError> {
     let Some(qualifier) = qualifier else {
-        let result = search_symbol_raw(query, scope, None)?;
+        let result = super::search_symbol_raw_cached(query, scope, None, cache)?;
         let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
         if definitions.is_empty() {
             return Ok(None);
@@ -212,20 +227,20 @@ fn resolve_def_by_query(
             query.to_string(),
             other_def_count,
             false,
+            cache,
         )
         .map(Some);
     };
 
-    let definitions = crate::search::symbol::all_definitions(query, scope, None)?;
+    let definitions = crate::search::symbol::all_definitions(query, scope, None, cache)?;
     if definitions.is_empty() {
         return Ok(None);
     }
 
     // Qualified resolution: partition candidates by whether their owner matches.
-    let cache = OutlineCache::new();
     let owner_matched: Vec<_> = definitions
         .iter()
-        .filter(|m| owner_of_match(m, &cache).is_some_and(|owner| owner_matches(&owner, qualifier)))
+        .filter(|m| owner_of_match(m, cache).is_some_and(|owner| owner_matches(&owner, qualifier)))
         .collect();
 
     match owner_matched.first() {
@@ -241,6 +256,7 @@ fn resolve_def_by_query(
                 query.to_string(),
                 other_def_count,
                 false,
+                cache,
             )
             .map(Some)
         }
@@ -249,7 +265,7 @@ fn resolve_def_by_query(
             // caller did not ask for. 404 with a suggestion naming the real owners.
             Err(TilthError::NotFound {
                 path: PathBuf::from(query),
-                suggestion: Some(owner_suggestion(query, qualifier, &definitions, &cache)),
+                suggestion: Some(owner_suggestion(query, qualifier, &definitions, cache)),
             })
         }
     }
@@ -419,10 +435,20 @@ fn owner_suggestion(
 fn resolve_by_path_line(
     path: &Path,
     line: u32,
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let (content, lang) = read_code_file(path)?;
-    let (entries, deep_entry) =
-        crate::lang::outline::get_outline_entries_and_entry_at_line(&content, lang, line);
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+    let (content, lang) = read_code_file(path, cache)?;
+    let (entries, deep_entry) = cache.parse_source(path, &content).map_or_else(
+        || crate::lang::outline::get_outline_entries_and_entry_at_line(&content, lang, line),
+        |parsed| {
+            crate::lang::outline::outline_entries_and_entry_at_line_from_tree(
+                &parsed.content,
+                lang,
+                &parsed.tree,
+                line,
+            )
+        },
+    );
     let target = match deep_entry
         .as_ref()
         .or_else(|| find_entry_at_line(&entries, line))
@@ -440,7 +466,13 @@ fn resolve_by_path_line(
 
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
-fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
+fn read_code_file(
+    path: &Path,
+    cache: &OutlineCache,
+) -> Result<(std::sync::Arc<String>, Lang), TilthError> {
+    if let Some(parsed) = cache.get_or_parse(path) {
+        return Ok((std::sync::Arc::clone(&parsed.content), parsed.lang));
+    }
     let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
@@ -451,7 +483,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
-    Ok((content, lang))
+    Ok((std::sync::Arc::new(content), lang))
 }
 
 /// Read the file at `path`, find the outline entry that starts at `start_line`,
@@ -464,16 +496,30 @@ fn enrich_from_outline(
     name: String,
     other_def_count: usize,
     resolve_moved_name: bool,
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let (content, lang) = read_code_file(&path)?;
-    let (entries, exact_entry) =
-        crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
-            &content,
-            lang,
-            &name,
-            start_line,
-            semantic_end,
-        );
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
+    let (content, lang) = read_code_file(&path, cache)?;
+    let (entries, exact_entry) = cache.parse_source(&path, &content).map_or_else(
+        || {
+            crate::lang::outline::get_outline_entries_and_entry_by_name_at_start_line(
+                &content,
+                lang,
+                &name,
+                start_line,
+                semantic_end,
+            )
+        },
+        |parsed| {
+            crate::lang::outline::outline_entries_and_entry_by_name_from_tree(
+                &parsed.content,
+                lang,
+                &parsed.tree,
+                &name,
+                start_line,
+                semantic_end,
+            )
+        },
+    );
     let mut target = if let Some(entry) = exact_entry
         .as_ref()
         .filter(|entry| entry.name == name)
@@ -526,7 +572,8 @@ pub(crate) fn resolve_candidate_with_source(
     start_line: u32,
     semantic_end: Option<u32>,
     name: &str,
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
     enrich_from_outline(
         path.to_path_buf(),
         start_line,
@@ -534,6 +581,7 @@ pub(crate) fn resolve_candidate_with_source(
         name.to_string(),
         0,
         true,
+        cache,
     )
 }
 
@@ -543,9 +591,10 @@ pub(crate) fn resolve_candidate_with_source_occurrence(
     semantic_end: Option<u32>,
     name: &str,
     occurrence: (usize, usize),
-) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    cache: &OutlineCache,
+) -> Result<(ResolvedTarget, std::sync::Arc<String>, Lang), TilthError> {
     let scope = path.parent().unwrap_or_else(|| Path::new("."));
-    let result = search_symbol_raw(name, scope, None)?;
+    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
@@ -570,6 +619,7 @@ pub(crate) fn resolve_candidate_with_source_occurrence(
         name.to_string(),
         0,
         false,
+        cache,
     )
 }
 
@@ -762,17 +812,48 @@ pub fn grok(
     session: &crate::session::Session,
     caps: GrokCaps,
 ) -> Result<GrokResult, TilthError> {
-    let (target, content, lang) = resolve_with_source(target_spec, scope)?;
-    // Captured immediately after the read above, so the revision reflects
-    // the bytes in `content` as closely as a follow-up stat can.
+    grok_cached(
+        target_spec,
+        scope,
+        bloom,
+        session,
+        caps,
+        &OutlineCache::new(),
+    )
+}
+
+pub(crate) fn grok_cached(
+    target_spec: &str,
+    scope: &Path,
+    bloom: &BloomFilterCache,
+    session: &crate::session::Session,
+    caps: GrokCaps,
+    cache: &OutlineCache,
+) -> Result<GrokResult, TilthError> {
+    let (target, content, lang) = resolve_with_source_cached(target_spec, scope, cache)?;
+    // Capture the revision immediately after resolving the source.
     let target_revision = crate::util::FileRevision::of(&target.path);
-    let entries = get_outline_entries(&content, lang);
+    let parsed = cache.parse_source(&target.path, &content);
+    let entries = parsed.as_ref().map_or_else(
+        || get_outline_entries(&content, lang),
+        |parsed| parsed.outline_entries(),
+    );
     let target_span_start = target.span_start_line;
 
     // --- Callees -----------------------------------------------------------
-    let callee_names =
-        extract_callee_names(&content, lang, Some((target_span_start, target.end_line)));
-    let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
+    let callee_names = parsed.as_ref().map_or_else(
+        || extract_callee_names(&content, lang, Some((target_span_start, target.end_line))),
+        |parsed| {
+            super::callees::extract_callee_names_from_tree(
+                &parsed.content,
+                lang,
+                &parsed.tree,
+                Some((target_span_start, target.end_line)),
+            )
+        },
+    );
+    let resolved =
+        super::callees::resolve_callees_cached(&callee_names, &target.path, &content, bloom, cache);
 
     let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
     let externals: Vec<String> = callee_names
@@ -816,7 +897,14 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let (raw_callers, _) = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let (raw_callers, _) = super::callers::find_callers_batch_cached(
+        &symbols,
+        scope,
+        bloom,
+        None,
+        BATCH_EARLY_QUIT,
+        cache,
+    )?;
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()
@@ -1517,7 +1605,7 @@ mod tests {
         let body = "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n";
         let path = write_fixture(tmp.path(), "src/a.rs", body);
 
-        let (target, content, lang) = resolve_by_path_line(&path, 2).unwrap();
+        let (target, content, lang) = resolve_by_path_line(&path, 2, &OutlineCache::new()).unwrap();
         assert_eq!(target.name, "alpha");
         assert_eq!(target.kind, OutlineKind::Function);
         assert_eq!(target.start_line, 1);
@@ -1534,7 +1622,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_fixture(tmp.path(), "src/a.rs", "mod outer { fn inner() {} }\n");
 
-        let (target, _, _) = resolve_by_path_line(&path, 1).unwrap();
+        let (target, _, _) = resolve_by_path_line(&path, 1, &OutlineCache::new()).unwrap();
         assert_eq!(target.name, "inner");
         assert_eq!(target.kind, OutlineKind::Function);
     }
@@ -1546,7 +1634,8 @@ mod tests {
         let path = write_fixture(tmp.path(), "src/deep.rs", body);
 
         for line in [3, 4, 5] {
-            let (target, _, lang) = resolve_by_path_line(&path, line).unwrap();
+            let (target, _, lang) =
+                resolve_by_path_line(&path, line, &OutlineCache::new()).unwrap();
             assert_eq!(target.name, "method");
             assert_eq!(target.start_line, 4);
             assert_eq!(target.span_start_line, 3);
@@ -1561,7 +1650,8 @@ mod tests {
         let path = write_fixture(tmp.path(), "producer.py", body);
 
         for line in [2, 3, 4, 5] {
-            let (target, _, lang) = resolve_by_path_line(&path, line).unwrap();
+            let (target, _, lang) =
+                resolve_by_path_line(&path, line, &OutlineCache::new()).unwrap();
             assert_eq!(target.name, "blocked");
             assert_eq!(target.kind, OutlineKind::Function);
             assert_eq!(target.start_line, 4);
@@ -1575,7 +1665,7 @@ mod tests {
         let body = "def load():\n    import os\n    return os.getcwd()\n";
         let path = write_fixture(tmp.path(), "loader.py", body);
 
-        let (target, _, _) = resolve_by_path_line(&path, 2).unwrap();
+        let (target, _, _) = resolve_by_path_line(&path, 2, &OutlineCache::new()).unwrap();
         assert_eq!(target.name, "load");
         assert_eq!(target.kind, OutlineKind::Function);
     }
@@ -1585,7 +1675,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let body = "fn alpha() {}\n";
         let path = write_fixture(tmp.path(), "src/a.rs", body);
-        let err = resolve_by_path_line(&path, 99).unwrap_err();
+        let err = resolve_by_path_line(&path, 99, &OutlineCache::new()).unwrap_err();
         assert!(matches!(err, TilthError::NotFound { .. }));
     }
 
@@ -1593,7 +1683,7 @@ mod tests {
     fn resolve_by_path_line_rejects_non_code_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_fixture(tmp.path(), "notes.txt", "hello\n");
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        let err = resolve_by_path_line(&path, 1, &OutlineCache::new()).unwrap_err();
         assert!(matches!(err, TilthError::InvalidQuery { .. }));
     }
 
@@ -1601,7 +1691,7 @@ mod tests {
     fn resolve_by_path_line_missing_file_is_io_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nope.rs");
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        let err = resolve_by_path_line(&path, 1, &OutlineCache::new()).unwrap_err();
         assert!(matches!(err, TilthError::IoError { .. }));
     }
 
@@ -1635,9 +1725,26 @@ mod tests {
         let body = "function run() { function run() {}\n  return 1;\n}\n";
         let path = write_fixture(tmp.path(), "nested.js", body);
 
-        let (inner, _, _) =
-            enrich_from_outline(path.clone(), 1, Some(1), "run".into(), 1, false).unwrap();
-        let (outer, _, _) = enrich_from_outline(path, 1, Some(3), "run".into(), 1, false).unwrap();
+        let (inner, _, _) = enrich_from_outline(
+            path.clone(),
+            1,
+            Some(1),
+            "run".into(),
+            1,
+            false,
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        let (outer, _, _) = enrich_from_outline(
+            path,
+            1,
+            Some(3),
+            "run".into(),
+            1,
+            false,
+            &OutlineCache::new(),
+        )
+        .unwrap();
 
         assert_eq!((inner.span_start_line, inner.end_line), (1, 1));
         assert_eq!((outer.span_start_line, outer.end_line), (1, 3));
@@ -1660,7 +1767,7 @@ mod tests {
         ];
         for (file, source, name) in cases {
             let path = write_fixture(tmp.path(), file, source);
-            let (by_line, _, _) = resolve_by_path_line(&path, 2).unwrap();
+            let (by_line, _, _) = resolve_by_path_line(&path, 2, &OutlineCache::new()).unwrap();
             assert_eq!(by_line.name, name);
             assert_eq!(by_line.start_line, 4);
             assert_eq!(by_line.span_start_line, 2);
@@ -1680,7 +1787,7 @@ mod tests {
             "export default\nfunction run() { return 1; }\n",
         );
         for line in [1, 2] {
-            let (target, _, _) = resolve_by_path_line(&path, line).unwrap();
+            let (target, _, _) = resolve_by_path_line(&path, line, &OutlineCache::new()).unwrap();
             assert_eq!(target.name, "run");
             assert_eq!(target.start_line, 2);
             assert_eq!(target.span_start_line, 1);

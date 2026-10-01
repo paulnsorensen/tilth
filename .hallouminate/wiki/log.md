@@ -58,3 +58,7 @@
 
 2026-09-29 · 30c6e8e245716112 · merged · local-gate-gotchas.md · Record the PR #280 fingerprint language-count tie and deterministic Rust fixture. All three frozen retrieval probes return this page first.
 
+
+
+2026-09-30 · c970238aa51b13dc · merged · upstream-library-reuse.md · Record shared immutable parsed documents, revision-checked publication, bounded retention, uncached large-file fallback, and lock-free matching. Frozen retrieval probes pass at ranks 1, 2, 1, 1.
+

@@ -371,7 +371,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => dispatch_search_v2(args, services),
         "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), services.cache()),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(unknown_tool_error(tool, edit_mode)),
     };
@@ -976,6 +976,306 @@ mod tests {
              Trim a description — the cap does not yield.",
             surface.saturating_sub(CAP)
         );
+    }
+
+    #[test]
+    fn documents_reuse_real_parses_across_production_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("// {}\nfn document_leaf() {{}}\nfn document_target() {{ document_leaf(); }}\nfn document_caller() {{ document_target(); }}\n", dir.path().display());
+        std::fs::write(dir.path().join("document.rs"), &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let services = Services::new(false);
+        let grok = serde_json::json!({"cwd": dir.path(), "target": "document.rs:3"});
+        let first = dispatch_tool("tilth_grok", &grok, &services).unwrap();
+        assert!(first.contains("document_leaf") && first.contains("document_caller"));
+        let cold = witness.count();
+        assert_eq!(cold, 1, "each cacheable revision needs one full parse");
+        dispatch_tool("tilth_grok", &grok, &services).unwrap();
+        assert_eq!(
+            witness.count(),
+            cold,
+            "unchanged grok request reparses source"
+        );
+        let search =
+            serde_json::json!({"cwd": dir.path(), "queries": [{"query": "document_target"}]});
+        let result = dispatch_tool("tilth_search", &search, &services).unwrap();
+        assert!(result.contains("document_target"));
+        assert_eq!(witness.count(), cold, "search reparses the grok snapshot");
+        let read =
+            serde_json::json!({"cwd": dir.path(), "paths": ["document.rs"], "mode": "signature"});
+        dispatch_tool("tilth_read", &read, &services).unwrap();
+        assert_eq!(
+            witness.count(),
+            cold,
+            "outline read reparses the shared snapshot"
+        );
+        let response: Value = serde_json::from_str(&result).unwrap();
+        let hints = response["hints"].as_array().unwrap();
+        assert!(
+            hints.iter().any(|h| h["kind"] != "fetch_dependencies"),
+            "search must emit a followable hint: {hints:?}"
+        );
+        for hint in hints {
+            if hint["kind"] == "fetch_dependencies" {
+                continue;
+            }
+            let follow = serde_json::json!({"cwd": dir.path(), "queries": [{"follow": hint}]});
+            for _ in 0..2 {
+                let response = dispatch_tool("tilth_search", &follow, &services).unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                assert_ne!(response["results"][0]["status"], "error");
+                assert_eq!(
+                    witness.count(),
+                    cold,
+                    "follow reparses the shared snapshot: {hint}"
+                );
+            }
+        }
+        let read_symbol =
+            serde_json::json!({"cwd": dir.path(), "paths": ["document.rs#document_target"]});
+        dispatch_tool("tilth_read", &read_symbol, &services).unwrap();
+        assert_eq!(
+            witness.count(),
+            cold,
+            "symbol read reparses the shared snapshot"
+        );
+        let by_name = serde_json::json!({"cwd": dir.path(), "target": "document_target"});
+        dispatch_tool("tilth_grok", &by_name, &services).unwrap();
+        assert_eq!(
+            witness.count(),
+            cold,
+            "name resolution reparses the shared snapshot"
+        );
+    }
+
+    #[test]
+    fn documents_python_dependencies_reuse_trees_and_refresh_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(dir.path().join("src/pkg/sub")).unwrap();
+        let fixtures = [
+            (
+                "src/consumer.py",
+                "from pkg import exported\ndef py_target():\n    return exported()\n",
+            ),
+            ("src/pkg/__init__.py", "from .sub import exported\n"),
+            (
+                "src/pkg/sub/__init__.py",
+                "from .old import old_name as exported\n",
+            ),
+            ("src/pkg/sub/old.py", "def old_name():\n    return 1\n"),
+            ("src/pkg/sub/new.py", "def new_name():\n    return 2\n"),
+        ];
+        let sources: Vec<_> = fixtures
+            .iter()
+            .map(|(path, body)| {
+                let source = format!("# {} {path}\n{body}", dir.path().display());
+                std::fs::write(dir.path().join(path), &source).unwrap();
+                source
+            })
+            .collect();
+        let witnesses: Vec<_> = sources
+            .iter()
+            .map(|s| crate::lang::treesitter::ParseWitness::new(s))
+            .collect();
+        let services = Services::new(false);
+        let search = |name: &str| -> Value {
+            let args = serde_json::json!({"cwd": dir.path(), "queries": [{"query": name}]});
+            serde_json::from_str(&dispatch_tool("tilth_search", &args, &services).unwrap()).unwrap()
+        };
+        let first = search("py_target");
+        assert_eq!(
+            first["results"][0]["dependency_impact"]["imports"],
+            serde_json::json!(["src/pkg/__init__.py", "src/pkg/sub/old.py"])
+        );
+        assert_eq!(
+            first["results"][0]["dependency_impact"]["coverage"],
+            "complete"
+        );
+        let cold: Vec<_> = witnesses
+            .iter()
+            .map(crate::lang::treesitter::ParseWitness::count)
+            .collect();
+        assert!(cold.iter().all(|count| *count > 0));
+        let hint = first["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hint| hint["kind"] == "fetch_dependencies")
+            .unwrap();
+        for _ in 0..2 {
+            let repeated = search("py_target");
+            assert_eq!(
+                repeated["results"][0]["dependency_impact"]["imports"],
+                first["results"][0]["dependency_impact"]["imports"]
+            );
+            let follow = serde_json::json!({"cwd": dir.path(), "queries": [{"follow": hint}]});
+            let result: Value =
+                serde_json::from_str(&dispatch_tool("tilth_search", &follow, &services).unwrap())
+                    .unwrap();
+            assert_eq!(
+                result["results"][0]["dependency_impact"]["imports"],
+                first["results"][0]["dependency_impact"]["imports"]
+            );
+            let warm: Vec<_> = witnesses
+                .iter()
+                .map(crate::lang::treesitter::ParseWitness::count)
+                .collect();
+            assert_eq!(
+                warm, cold,
+                "warm Python search/follow reparses target or initializer"
+            );
+        }
+        assert_eq!(cold, vec![1; fixtures.len()]);
+        assert!(
+            search("old_name")["results"][0]["dependency_impact"]["dependents"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("src/consumer.py"))
+        );
+        let updated = format!(
+            "# {} replacement\nfrom .new import new_name as exported\n",
+            dir.path().display()
+        );
+        let changed = crate::lang::treesitter::ParseWitness::new(&updated);
+        crate::util::atomic_write_bytes(
+            &dir.path().join("src/pkg/sub/__init__.py"),
+            updated.as_bytes(),
+        )
+        .unwrap();
+        let refreshed = search("py_target");
+        assert_eq!(
+            refreshed["results"][0]["dependency_impact"]["imports"],
+            serde_json::json!(["src/pkg/__init__.py", "src/pkg/sub/new.py"])
+        );
+        assert_eq!(
+            refreshed["results"][0]["dependency_impact"]["coverage"],
+            "complete"
+        );
+        assert!(
+            !search("old_name")["results"][0]["dependency_impact"]["dependents"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("src/consumer.py"))
+        );
+        assert!(
+            search("new_name")["results"][0]["dependency_impact"]["dependents"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("src/consumer.py"))
+        );
+        assert_eq!(changed.count(), 1);
+        assert_eq!(
+            witnesses
+                .iter()
+                .map(crate::lang::treesitter::ParseWitness::count)
+                .collect::<Vec<_>>(),
+            cold
+        );
+    }
+
+    #[test]
+    fn documents_expanded_search_reuses_sibling_and_callee_trees() {
+        for (file, body) in [
+            ("member.rs", "struct Worker { value: i32 }\nimpl Worker {\n fn helper(&self) {}\n fn run(&self) { self.helper(); let _ = self.value; }\n}\n"),
+            ("member.go", "package fixture\ntype Worker struct { value int }\nfunc (w *Worker) helper() {}\nfunc (w *Worker) run() { w.helper(); _ = w.value }\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = format!("// {}\n{body}", dir.path().display());
+            std::fs::write(dir.path().join(file), &source).unwrap();
+            let witness = crate::lang::treesitter::ParseWitness::new(&source);
+            let services = Services::new(false);
+            let read = serde_json::json!({"cwd": dir.path(), "paths": [file], "mode": "signature"});
+            dispatch_tool("tilth_read", &read, &services).unwrap();
+            assert_eq!(witness.count(), 1);
+            for _ in 0..2 {
+                let result = crate::search::search_symbol_expanded(
+                    "run", dir.path(), services.cache(), &crate::session::Session::new(),
+                    services.bloom(), 1, None, None, false, false, None,
+                ).unwrap();
+                assert!(result.contains("-- calls --"), "{file}: {result}");
+                if file == "member.rs" {
+                    assert!(result.contains("-- siblings --"), "{file}: {result}");
+                } else {
+                    // Go methods remain top-level entries. Check receiver extraction directly.
+                    let parsed = services.cache().get_or_parse(&dir.path().join(file)).unwrap();
+                    let names = crate::search::siblings::extract_sibling_references_from_tree(
+                        &parsed.content, parsed.lang, &parsed.tree, (5, 5),
+                    );
+                    assert_eq!(names, ["helper", "value"]);
+                }
+                assert!(result.contains("helper") && result.contains("value"));
+                assert_eq!(witness.count(), 1, "expanded {file} reparses its snapshot");
+            }
+        }
+    }
+
+    #[test]
+    fn documents_direct_reads_do_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("// {}\nfn byte_only() {{}}\n", dir.path().display());
+        std::fs::write(dir.path().join("direct.rs"), &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let services = Services::new(false);
+        for args in [
+            serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs"], "mode": "full"}),
+            serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs#2-2"]}),
+            serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs"]}),
+        ] {
+            let response = dispatch_tool("tilth_read", &args, &services).unwrap();
+            assert!(response.contains("fn byte_only() {}"));
+        }
+        assert_eq!(witness.count(), 0);
+    }
+
+    #[test]
+    fn documents_large_sources_keep_existing_search_and_grok_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!("fn large_leaf() {{}}\nfn large_target() {{ large_leaf(); }}\nfn large_caller() {{ large_target(); }}\n{}", "// a long source comment with enough bytes to exceed the parsed cache size boundary\n".repeat(6500));
+        let path = dir.path().join("large.rs");
+        assert!(source.len() > 500_000 && source.len() < 1_000_000);
+        std::fs::write(&path, &source).unwrap();
+        let services = Services::new(false);
+        assert!(services.cache().get_or_parse(&path).is_none());
+        let result = crate::search::grok::grok_cached(
+            "large.rs:2",
+            dir.path(),
+            services.bloom(),
+            services.session(),
+            crate::search::grok::GrokCaps::default(),
+            services.cache(),
+        )
+        .unwrap();
+        assert_eq!(result.target.name, "large_target");
+        assert_eq!(
+            result
+                .callees_internal
+                .iter()
+                .map(|callee| callee.name.as_str())
+                .collect::<Vec<_>>(),
+            ["large_leaf"]
+        );
+        assert!(
+            result.callers.is_empty(),
+            "the caller walk keeps its existing 500 KB limit"
+        );
+        let search = serde_json::json!({"cwd": dir.path(), "queries": [{"query": "large_target"}]});
+        let response = dispatch_tool("tilth_search", &search, &services).unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            response["results"][0]["target"].is_null(),
+            "symbol discovery keeps its existing 500 KB limit"
+        );
+        let read =
+            serde_json::json!({"cwd": dir.path(), "paths": ["large.rs"], "mode": "signature"});
+        let response = dispatch_tool("tilth_read", &read, &services).unwrap();
+        assert!(response.contains("large_target"));
+        assert!(services.cache().get_or_parse(&path).is_none());
     }
 
     /// AGENTS.md is the human-facing copy of the two embedded prompt files,

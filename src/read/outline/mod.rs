@@ -44,6 +44,31 @@ pub fn generate(
     with_omission_note(outline, truncated)
 }
 
+/// Render the same source/tree snapshot across disk-backed consumers.
+pub(crate) fn generate_cached(
+    path: &Path,
+    file_type: FileType,
+    content: &str,
+    buf: &[u8],
+    capped: bool,
+    cache: &crate::cache::OutlineCache,
+) -> String {
+    let Some(parsed) = cache.parse_source(path, content) else {
+        return generate(path, file_type, content, buf, capped);
+    };
+    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    if crate::types::is_test_file(path) {
+        if let Some((outline, truncated)) =
+            test_file::outline_from_tree(&parsed.content, max_lines, &parsed.tree)
+        {
+            return with_omission_note(outline, truncated);
+        }
+    }
+    let (outline, truncated) =
+        code::outline_from_tree(&parsed.content, parsed.lang, max_lines, &parsed.tree);
+    with_omission_note(outline, truncated)
+}
+
 /// Append a note when the outline actually hit `max_lines` and more symbols
 /// exist below. Without this note, agents read the outline as exhaustive
 /// and miss symbols below the cap.

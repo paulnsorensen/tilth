@@ -38,23 +38,27 @@ pub fn extract_callee_names(
     lang: Lang,
     def_range: Option<(u32, u32)>,
 ) -> Vec<String> {
+    let Some(language) = outline_language(lang) else {
+        return Vec::new();
+    };
+    let Some(tree) = crate::lang::treesitter::parse_source(content, &language) else {
+        return Vec::new();
+    };
+    extract_callee_names_from_tree(content, lang, &tree, def_range)
+}
+
+pub(crate) fn extract_callee_names_from_tree(
+    content: &str,
+    lang: Lang,
+    tree: &tree_sitter::Tree,
+    def_range: Option<(u32, u32)>,
+) -> Vec<String> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
     };
-
     let Some(query_str) = super::callee_query::callee_query_str(lang) else {
         return Vec::new();
     };
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
-
     let content_bytes = content.as_bytes();
 
     let Some(names) = super::callee_query::with_callee_query(&ts_lang, query_str, |query| {
@@ -153,6 +157,22 @@ pub fn resolve_callees(
     source_content: &str,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Vec<ResolvedCallee> {
+    resolve_callees_cached(
+        callee_names,
+        source_path,
+        source_content,
+        bloom,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+pub(crate) fn resolve_callees_cached(
+    callee_names: &[String],
+    source_path: &Path,
+    source_content: &str,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    cache: &crate::cache::OutlineCache,
+) -> Vec<ResolvedCallee> {
     if callee_names.is_empty() {
         return Vec::new();
     }
@@ -167,7 +187,10 @@ pub fn resolve_callees(
     let mut resolved = Vec::new();
 
     // 1. Check source file's own outline entries
-    let entries = get_outline_entries(source_content, lang);
+    let entries = cache.parse_source(source_path, source_content).map_or_else(
+        || get_outline_entries(source_content, lang),
+        |parsed| parsed.outline_entries(),
+    );
     resolve_from_entries(&entries, source_path, &mut remaining, &mut resolved);
 
     if remaining.is_empty() {
@@ -185,13 +208,15 @@ pub fn resolve_callees(
 
         // Read + bloom prefilter via shared helper. Skip the file when no
         // remaining symbol is bloom-positive.
-        let super::bloom_walk::BloomRead::Hit(import_content) =
-            super::bloom_walk::read_with_bloom_check(
-                &import_path,
-                remaining.iter().copied(),
-                bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
-            )
+        let super::bloom_walk::BloomRead::Hit {
+            content: import_content,
+            ..
+        } = super::bloom_walk::read_with_bloom_check(
+            &import_path,
+            remaining.iter().copied(),
+            bloom,
+            super::bloom_walk::MAX_FILE_SIZE,
+        )
         else {
             continue;
         };
@@ -201,7 +226,12 @@ pub fn resolve_callees(
             continue;
         };
 
-        let import_entries = get_outline_entries(&import_content, import_lang);
+        let import_entries = cache
+            .parse_source(&import_path, &import_content)
+            .map_or_else(
+                || get_outline_entries(&import_content, import_lang),
+                |parsed| parsed.outline_entries(),
+            );
         resolve_from_entries(&import_entries, &import_path, &mut remaining, &mut resolved);
     }
 
@@ -211,7 +241,14 @@ pub fn resolve_callees(
 
     // 3. Scan same-package files when the language defines a directory namespace.
     if let Some(policy) = crate::lang::spec::spec(lang).policy.same_package {
-        resolve_same_package(&mut remaining, &mut resolved, source_path, lang, policy);
+        resolve_same_package(
+            &mut remaining,
+            &mut resolved,
+            source_path,
+            lang,
+            policy,
+            cache,
+        );
     }
 
     resolved
@@ -228,6 +265,7 @@ fn resolve_same_package(
     source_path: &Path,
     lang: Lang,
     policy: crate::lang::spec::SamePackagePolicy,
+    cache: &crate::cache::OutlineCache,
 ) {
     let Some(dir) = source_path.parent() else {
         return;
@@ -266,7 +304,10 @@ fn resolve_same_package(
             continue;
         };
 
-        let outline = get_outline_entries(&content, lang);
+        let outline = cache.parse_source(&package_path, &content).map_or_else(
+            || get_outline_entries(&content, lang),
+            |parsed| parsed.outline_entries(),
+        );
         resolve_from_entries(&outline, &package_path, remaining, resolved);
     }
 }
@@ -279,16 +320,18 @@ fn resolve_same_package(
 ///
 /// `budget` caps the total number of 2nd-hop (child) callees across all parents.
 /// Cycle detection prevents infinite loops via `(file, start_line)` tracking.
-pub fn resolve_callees_transitive(
+pub(crate) fn resolve_callees_transitive(
     initial_names: &[String],
     source_path: &Path,
     source_content: &str,
     bloom: &crate::index::bloom::BloomFilterCache,
     depth_limit: u32,
     budget: usize,
+    cache: &crate::cache::OutlineCache,
 ) -> Vec<ResolvedCalleeNode> {
     // 1st hop: resolve direct callees (existing logic)
-    let first_hop = resolve_callees(initial_names, source_path, source_content, bloom);
+    let first_hop =
+        resolve_callees_cached(initial_names, source_path, source_content, bloom, cache);
 
     if depth_limit < 2 || first_hop.is_empty() {
         return first_hop
@@ -313,7 +356,7 @@ pub fn resolve_callees_transitive(
 
     for parent in first_hop {
         let children = if budget_remaining > 0 {
-            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining)
+            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining, cache)
         } else {
             Vec::new()
         };
@@ -332,6 +375,7 @@ fn resolve_second_hop(
     bloom: &crate::index::bloom::BloomFilterCache,
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
+    cache: &crate::cache::OutlineCache,
 ) -> Vec<ResolvedCallee> {
     let file_type = crate::lang::detect_file_type(&parent.file);
     let crate::types::FileType::Code(lang) = file_type else {
@@ -342,13 +386,16 @@ fn resolve_second_hop(
     };
 
     let def_range = Some((parent.span_start_line, parent.end_line));
-    let nested_names = extract_callee_names(&content, lang, def_range);
+    let nested_names = cache.parse_source(&parent.file, &content).map_or_else(
+        || extract_callee_names(&content, lang, def_range),
+        |parsed| extract_callee_names_from_tree(&parsed.content, lang, &parsed.tree, def_range),
+    );
 
     if nested_names.is_empty() {
         return Vec::new();
     }
 
-    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, bloom);
+    let mut resolved = resolve_callees_cached(&nested_names, &parent.file, &content, bloom, cache);
 
     // Filter: skip self-recursive calls and already-visited callees
     resolved.retain(|c| {

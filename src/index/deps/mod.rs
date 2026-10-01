@@ -161,13 +161,14 @@ fn resolved_shard_fields(
     content: &str,
     worktree: &Path,
     roots: &crate::read::imports::PyRoots,
+    cache: &crate::cache::OutlineCache,
 ) -> ShardFields {
     let to_rel = |p: PathBuf| {
         p.strip_prefix(worktree)
             .ok()
             .map(|r| r.to_string_lossy().to_string())
     };
-    let fields = crate::read::imports::resolve_scoped_shard_fields(abs, content, roots);
+    let fields = crate::read::imports::resolve_scoped_shard_fields(abs, content, roots, cache);
     ShardFields {
         deps: fields.paths.into_iter().filter_map(to_rel).collect(),
         reexport_hops: fields.hops.into_iter().filter_map(to_rel).collect(),
@@ -187,7 +188,12 @@ enum Rescan {
 /// Rebuild `rel`'s shard from its current on-disk state. The one builder
 /// every forced-rescan site (redirect/edited/deleted-init worklist, new-init
 /// discovery, pending catch-up) shares, replacing duplicated inline blocks.
-fn rescan_shard(worktree: &Path, roots: &crate::read::imports::PyRoots, rel: &str) -> Rescan {
+fn rescan_shard(
+    worktree: &Path,
+    roots: &crate::read::imports::PyRoots,
+    rel: &str,
+    cache: &crate::cache::OutlineCache,
+) -> Rescan {
     let abs = worktree.join(rel);
     let Some(signature) = storage::signature_of(&abs) else {
         return Rescan::Gone;
@@ -201,7 +207,7 @@ fn rescan_shard(worktree: &Path, roots: &crate::read::imports::PyRoots, rel: &st
     let Ok(content) = std::fs::read_to_string(&abs) else {
         return Rescan::Gone;
     };
-    let fields = resolved_shard_fields(&abs, &content, worktree, roots);
+    let fields = resolved_shard_fields(&abs, &content, worktree, roots, cache);
     if !signature.is_current(&abs) {
         return Rescan::Drifted;
     }
@@ -277,6 +283,7 @@ fn drain_worklist(
     worklist: HashSet<String>,
     already: &HashSet<String>,
     deadline: Instant,
+    cache: &crate::cache::OutlineCache,
 ) -> Drained {
     let mut drained = Drained {
         upserts: Vec::new(),
@@ -294,7 +301,7 @@ fn drain_worklist(
             drained.pending.push(rel);
             break;
         }
-        match rescan_shard(worktree, roots, &rel) {
+        match rescan_shard(worktree, roots, &rel, cache) {
             Rescan::Shard(rel, shard) => drained.upserts.push((rel, shard)),
             Rescan::Gone => {}
             Rescan::Drifted => {
@@ -323,11 +330,14 @@ fn rescan_reexport_importers(
     pending: Vec<String>,
     walk_status: WalkStatus,
     deadline: Instant,
+    cache: &crate::cache::OutlineCache,
 ) -> Drained {
     let already: HashSet<String> = upserts.iter().map(|(rel, _)| rel.clone()).collect();
     let mut worklist = reexport_worklist(db, upserts, deletes, previously_known, pending);
     match walk_status {
-        WalkStatus::Complete => drain_worklist(worktree, roots, worklist, &already, deadline),
+        WalkStatus::Complete => {
+            drain_worklist(worktree, roots, worklist, &already, deadline, cache)
+        }
         WalkStatus::TimedOut => {
             worklist.retain(|rel| !already.contains(rel));
             Drained {
@@ -357,7 +367,23 @@ fn rescan_reexport_importers(
 /// deadline is checked across the initial walk, the invalidation worklist,
 /// the forced rebuild, and the write stage; `Coverage.complete` is false
 /// whenever any of those stages stops with work remaining.
+#[cfg(test)]
 pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant) -> Coverage {
+    reconcile_cached(
+        handle,
+        worktree,
+        deadline,
+        &crate::cache::OutlineCache::new(),
+    )
+}
+
+/// Reconcile dependency shards with the request's shared document cache.
+pub(crate) fn reconcile_cached(
+    handle: &HandleState,
+    worktree: &Path,
+    deadline: Instant,
+    cache: &crate::cache::OutlineCache,
+) -> Coverage {
     let Ok((known_signatures, previously_known)) = storage::file_index_state(&handle.db) else {
         return Coverage::default();
     };
@@ -427,7 +453,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                 failed = true;
                 continue;
             };
-            resolved_shard_fields(path, &content, worktree, &roots)
+            resolved_shard_fields(path, &content, worktree, &roots, cache)
         } else {
             ShardFields::empty()
         };
@@ -468,6 +494,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
         pending,
         walk_status,
         deadline,
+        cache,
     );
     let mut forced_upserts = drained.upserts;
     let mut pending_to_write = drained.pending;
@@ -493,7 +520,7 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
                     pending_to_write.push(importer);
                     break;
                 }
-                match rescan_shard(worktree, &roots, &importer) {
+                match rescan_shard(worktree, &roots, &importer, cache) {
                     Rescan::Shard(rel, shard) => {
                         if shard.deps.iter().any(|d| new_inits.contains(d.as_str())) {
                             forced_upserts.push((rel, shard));
@@ -553,7 +580,18 @@ pub(crate) fn reconcile(handle: &HandleState, worktree: &Path, deadline: Instant
 /// current on-disk state before being reported — a stored edge that no
 /// longer holds (source deleted, import removed) is dropped rather than
 /// returned stale.
+#[cfg(test)]
 pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> VerifiedPartial {
+    impact_cached(handle, target, deadline, &crate::cache::OutlineCache::new())
+}
+
+/// Verify dependents with the request's shared document cache.
+pub(crate) fn impact_cached(
+    handle: &HandleState,
+    target: &Path,
+    deadline: Instant,
+    cache: &crate::cache::OutlineCache,
+) -> VerifiedPartial {
     let target_abs = if target.is_absolute() {
         target.to_path_buf()
     } else {
@@ -617,8 +655,12 @@ pub(crate) fn impact(handle: &HandleState, target: &Path, deadline: Instant) -> 
         let verified = if shard.signature == live_signature {
             true
         } else if let Ok(content) = std::fs::read_to_string(&candidate_abs) {
-            let fields =
-                crate::read::imports::resolve_scoped_shard_fields(&candidate_abs, &content, &roots);
+            let fields = crate::read::imports::resolve_scoped_shard_fields(
+                &candidate_abs,
+                &content,
+                &roots,
+                cache,
+            );
             let proven = fields
                 .paths
                 .iter()
@@ -684,9 +726,10 @@ mod tests {
         crate::util::rewrite_with_restored_mtime(&source, mtime, || {
             std::fs::write(&source, "use self::bravo;\n").unwrap();
         });
-        assert!(impact(&handle, Path::new("alpha.rs"), far_deadline())
-            .dependents
-            .is_empty());
+        assert_eq!(
+            impact(&handle, Path::new("alpha.rs"), far_deadline()).dependents,
+            [] as [std::path::PathBuf; 0]
+        );
         assert_eq!(
             reconcile(&handle, repo.path(), far_deadline()).files_changed,
             1
@@ -713,9 +756,10 @@ mod tests {
             crate::util::rewrite_with_restored_mtime(&source, mtime, || {
                 crate::util::atomic_write_bytes(&source, content.as_bytes()).unwrap();
             });
-            assert!(impact(&handle, Path::new(obsolete), far_deadline())
-                .dependents
-                .is_empty());
+            assert_eq!(
+                impact(&handle, Path::new(obsolete), far_deadline()).dependents,
+                [] as [std::path::PathBuf; 0]
+            );
             assert_eq!(
                 reconcile(&handle, repo.path(), far_deadline()).files_changed,
                 1
@@ -911,7 +955,7 @@ mod tests {
 
         std::fs::remove_file(repo.path().join("dep.rs")).unwrap();
         let after = impact(&handle, Path::new("target.rs"), far_deadline());
-        assert!(after.dependents.is_empty());
+        assert_eq!(after.dependents, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -954,9 +998,10 @@ mod tests {
         std::fs::remove_file(repo.path().join("dep.rs")).unwrap();
         let coverage = reconcile(&handle, repo.path(), far_deadline());
         assert_eq!(coverage.files_changed, 1);
-        assert!(impact(&handle, Path::new("target.rs"), far_deadline())
-            .dependents
-            .is_empty());
+        assert_eq!(
+            impact(&handle, Path::new("target.rs"), far_deadline()).dependents,
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]
@@ -1285,7 +1330,8 @@ mod tests {
         let middle = "packages/producer/src/producer/ingest/__init__.py";
         write_file(repo.path(), middle, "from .leaf2 import Thing\n");
         let roots = crate::read::imports::PyRoots::discover(repo.path());
-        let Rescan::Shard(rel, shard) = rescan_shard(repo.path(), &roots, middle) else {
+        let cache = crate::cache::OutlineCache::new();
+        let Rescan::Shard(rel, shard) = rescan_shard(repo.path(), &roots, middle, &cache) else {
             panic!("the edited initializer must rebuild");
         };
         let upserts = vec![(rel, shard)];
@@ -1305,6 +1351,7 @@ mod tests {
             Vec::new(),
             WalkStatus::TimedOut,
             far_deadline(),
+            &cache,
         );
 
         assert!(timed_out);
@@ -1332,7 +1379,10 @@ mod tests {
         assert!(
             canonicalized(&impact(&handle, leaf2, far_deadline()).dependents).contains(&surface)
         );
-        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_eq!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1388,7 +1438,9 @@ mod tests {
         );
         let roots = crate::read::imports::PyRoots::discover(repo.path());
         let init_rel = "packages/producer/src/producer/ingest/__init__.py".to_string();
-        let Rescan::Shard(rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel) else {
+        let cache = crate::cache::OutlineCache::new();
+        let Rescan::Shard(rel, new_shard) = rescan_shard(repo.path(), &roots, &init_rel, &cache)
+        else {
             panic!("the initializer must rebuild");
         };
         let upserts = vec![(rel, new_shard)];
@@ -1405,6 +1457,7 @@ mod tests {
             worklist,
             &HashSet::new(),
             Instant::now(),
+            &cache,
         );
 
         assert!(
@@ -1432,7 +1485,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_ne!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
 
         // The triggering init's signature is already committed, so it no longer
         // "looks changed" — only the persisted pending entry can resume the work.
@@ -1535,7 +1591,10 @@ mod tests {
             "a deleted uncertain source must not stay pending"
         );
         assert!(!first.timed_out);
-        assert!(storage::read_pending_rescan(&handle.db).unwrap().is_empty());
+        assert_eq!(
+            storage::read_pending_rescan(&handle.db).unwrap(),
+            [] as [std::string::String; 0]
+        );
         let second = reconcile(&handle, repo.path(), far_deadline());
         assert!(second.complete);
     }

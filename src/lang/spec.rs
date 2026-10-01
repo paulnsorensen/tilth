@@ -119,10 +119,11 @@ pub(crate) fn adornment_kind(node: tree_sitter::Node, kinds: &[&str]) -> bool {
 /// for grammars without a named declaration child).
 pub(crate) type CanonicalAnchor = fn(tree_sitter::Node) -> tree_sitter::Node;
 
+pub(crate) type ReceiverExtractor =
+    for<'a> fn(&str, tree_sitter::Node<'a>, &tree_sitter::Language) -> Option<String>;
 pub(crate) type ImportResolver = fn(&Path, &str) -> Option<PathBuf>;
 pub(crate) type SpecialOutline =
     fn(tree_sitter::Node, &[&str], Lang, usize) -> Option<OutlineEntry>;
-
 #[derive(Clone, Copy)]
 pub(crate) struct SamePackagePolicy {
     pub extension: &'static str,
@@ -130,14 +131,12 @@ pub(crate) struct SamePackagePolicy {
     pub max_files: usize,
     pub max_file_size: u64,
 }
-
 #[derive(Clone, Copy)]
 pub(crate) struct TestFilenamePolicy {
     pub order: u8,
     pub label: &'static str,
     pub matches: fn(&str) -> bool,
 }
-
 #[derive(Clone, Copy)]
 pub(crate) struct InlineTestPolicy {
     pub order: u8,
@@ -147,7 +146,6 @@ pub(crate) struct InlineTestPolicy {
     pub max_files: usize,
     pub extension_ignore_ascii_case: bool,
 }
-
 #[derive(Clone, Copy)]
 pub(crate) struct LanguagePolicy {
     pub triple_quoted_strings: bool,
@@ -169,19 +167,15 @@ pub(crate) struct LanguagePolicy {
     pub test_filename: Option<TestFilenamePolicy>,
     pub inline_test: Option<InlineTestPolicy>,
 }
-
 pub(crate) fn never_import(_line: &str) -> bool {
     false
 }
-
 pub(crate) fn always_external(_source: &str) -> bool {
     true
 }
-
 pub(crate) fn no_import_resolution(_dir: &Path, _source: &str) -> Option<PathBuf> {
     None
 }
-
 pub(crate) fn no_special_outline(
     _node: tree_sitter::Node,
     _lines: &[&str],
@@ -190,15 +184,12 @@ pub(crate) fn no_special_outline(
 ) -> Option<OutlineEntry> {
     None
 }
-
 pub(crate) fn default_outline_label(_kind: OutlineKind) -> Option<&'static str> {
     None
 }
-
 pub(crate) fn allow_callee(_name: &str) -> bool {
     true
 }
-
 pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
     triple_quoted_strings: false,
     hash_line_comments: false,
@@ -245,7 +236,7 @@ pub(crate) struct LangSpec {
     pub has_lifetimes: bool,
     /// Comment/log stripping family.
     pub strip_family: Option<StripFamily>,
-    pub extract_receiver: Option<fn(&str, &tree_sitter::Language) -> Option<String>>,
+    pub extract_receiver: Option<ReceiverExtractor>,
     /// Definition-name extraction + semantic weight (Elixir overrides the defaults).
     pub definitions: DefinitionOps,
     /// Transparent definition wrapper node kinds.

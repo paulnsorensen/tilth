@@ -1,7 +1,86 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// Parse source without retaining a parser or a global lock.
+pub(crate) fn parse_source(
+    content: &str,
+    language: &tree_sitter::Language,
+) -> Option<tree_sitter::Tree> {
+    #[cfg(test)]
+    {
+        let mut counts = PARSE_COUNTS.lock().unwrap();
+        if let Some(count) = counts.get_mut(content) {
+            *count += 1;
+        }
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(content, None);
+    #[cfg(test)]
+    {
+        let pause = PARSE_PAUSES.lock().unwrap().remove(content);
+        if let Some((entered, resume)) = pause {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    tree
+}
+
+#[cfg(test)]
+static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+type ParsePause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+#[cfg(test)]
+static PARSE_PAUSES: LazyLock<Mutex<HashMap<String, ParsePause>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Counts real parses of unique fixture bytes, including parallel walker threads.
+#[cfg(test)]
+pub(crate) struct ParseWitness(String);
+
+#[cfg(test)]
+impl ParseWitness {
+    pub(crate) fn new(content: &str) -> Self {
+        assert!(PARSE_COUNTS
+            .lock()
+            .unwrap()
+            .insert(content.to_string(), 0)
+            .is_none());
+        Self(content.to_string())
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        PARSE_COUNTS.lock().unwrap()[&self.0]
+    }
+
+    pub(crate) fn pause_next(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        assert!(PARSE_PAUSES
+            .lock()
+            .unwrap()
+            .insert(self.0.clone(), (entered, release))
+            .is_none());
+        (observed, resume)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParseWitness {
+    fn drop(&mut self) {
+        PARSE_COUNTS.lock().unwrap().remove(&self.0);
+        PARSE_PAUSES.lock().unwrap().remove(&self.0);
+    }
+}
 
 /// Definition node kinds across tree-sitter grammars.
 pub(crate) const DEFINITION_KINDS: &[&str] = &[
@@ -375,7 +454,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
 /// stored under separate keys. We avoid `Language::name()` because ABI < 15
 /// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
 #[allow(clippy::type_complexity)]
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
+static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), Arc<tree_sitter::Query>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
@@ -399,13 +478,14 @@ pub(crate) fn with_query<R>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let query = match cache.entry(key) {
-        Entry::Occupied(e) => e.into_mut(),
+        Entry::Occupied(e) => Arc::clone(e.get()),
         Entry::Vacant(e) => {
-            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-            e.insert(q)
+            let query = Arc::new(tree_sitter::Query::new(ts_lang, query_str).ok()?);
+            Arc::clone(e.insert(query))
         }
     };
-    Some(f(query))
+    drop(cache);
+    Some(f(&query))
 }
 
 #[cfg(test)]

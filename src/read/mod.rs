@@ -216,7 +216,7 @@ pub fn read_file(
         let file_mb = byte_len as f64 / 1_000_000.0;
 
         let outline = cache.get_or_compute(path, buf, OutlineMode::Capped, || {
-            outline::generate(path, file_type, &content, buf, true)
+            outline::generate_cached(path, file_type, &content, buf, true, cache)
         });
 
         let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
@@ -252,7 +252,7 @@ pub fn read_file(
     };
 
     let outline = cache.get_or_compute(path, buf, mode, || {
-        outline::generate(path, file_type, &content, buf, capped)
+        outline::generate_cached(path, file_type, &content, buf, capped, cache)
     });
 
     // OGATE: if the outline is not meaningfully smaller than the full file,
@@ -955,8 +955,14 @@ mod tests {
     #[test]
     fn suggest_headings_empty_query_returns_empty() {
         let input = b"# A\n## B\n";
-        assert!(suggest_headings(input, "", 5).is_empty());
-        assert!(suggest_headings(input, "###", 5).is_empty());
+        assert_eq!(
+            suggest_headings(input, "", 5),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            suggest_headings(input, "###", 5),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// `CommonMark` allows `~~~` as a fence delimiter. Headings inside

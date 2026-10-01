@@ -5,7 +5,7 @@
 //! and the compiled-query cache.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::types::Lang;
 
@@ -15,6 +15,7 @@ pub(super) fn callee_query_str(lang: Lang) -> Option<&'static str> {
     crate::lang::spec::spec(lang).callee_query
 }
 
+type CachedQueries = HashMap<(usize, usize), Arc<tree_sitter::Query>>;
 /// Global cache of compiled tree-sitter queries for callee extraction.
 ///
 /// Keyed by `(symbol_count, field_count)` — a pair that uniquely identifies
@@ -24,8 +25,7 @@ pub(super) fn callee_query_str(lang: Lang) -> Option<&'static str> {
 ///
 /// `Query` is `Send + Sync` in tree-sitter 0.25, so a global `Mutex`-guarded
 /// map is safe and avoids recompiling the same query on every call.
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize), tree_sitter::Query>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static QUERY_CACHE: LazyLock<Mutex<CachedQueries>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Stable cache key for a tree-sitter language. Uses `(symbol_count,
 /// field_count)` which is unique for every grammar shipped with tilth.
@@ -41,15 +41,19 @@ pub(super) fn with_callee_query<R>(
     f: impl FnOnce(&tree_sitter::Query) -> R,
 ) -> Option<R> {
     let key = lang_cache_key(ts_lang);
-    let mut cache = QUERY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
-        let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-        e.insert(query);
-    }
-    // Safety: we just inserted if absent, so the key is always present here.
-    Some(f(cache.get(&key).expect("just inserted")))
+    let query = {
+        let mut cache = QUERY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(query) = cache.get(&key) {
+            Arc::clone(query)
+        } else {
+            let query = Arc::new(tree_sitter::Query::new(ts_lang, query_str).ok()?);
+            cache.insert(key, Arc::clone(&query));
+            query
+        }
+    };
+    Some(f(&query))
 }
 
 #[cfg(test)]

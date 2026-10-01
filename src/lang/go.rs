@@ -111,14 +111,11 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 /// in the file. Go receiver is the first parameter in `func (r *Type) Name()`.
 pub(crate) fn extract_go_receiver_name(
     content: &str,
+    root: tree_sitter::Node,
     ts_lang: &tree_sitter::Language,
 ) -> Option<String> {
     // `'static` so its pointer address is a stable cache key.
     const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
-
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(ts_lang).ok()?;
-    let tree = parser.parse(content, None)?;
 
     let bytes = content.as_bytes();
 
@@ -126,7 +123,7 @@ pub(crate) fn extract_go_receiver_name(
     crate::lang::treesitter::with_query(ts_lang, GO_RECV_QUERY, |query| {
         let recv_idx = query.capture_index_for_name("recv")?;
         let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), bytes);
+        let mut matches = cursor.matches(query, root, bytes);
 
         if let Some(m) = matches.next() {
             for cap in m.captures() {
