@@ -296,7 +296,8 @@ impl OutlineCache {
     }
 
     /// Remove only this path's rendered outlines and parsed snapshot.
-    pub(crate) fn invalidate(&self, path: &Path) {
+    /// Return the removed parsed snapshot, if any.
+    pub(crate) fn invalidate(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         let mut entries = self
             .entries
             .lock()
@@ -310,23 +311,27 @@ impl OutlineCache {
         self.parsed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop(path);
+            .pop(path)
+            .map(|entry| entry.file)
+    }
+
+    /// Report whether a parsed snapshot exists for this path.
+    #[cfg(test)]
+    pub(crate) fn has_parsed(&self, path: &Path) -> bool {
+        self.parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(path)
     }
 
     /// Publish incremental bytes only after a successful write and disk verification.
     /// Cold paths stay cold. A mismatch discards this path, never unrelated entries.
     pub(crate) fn update_after_write(&self, path: &Path, before: &str, after: &str) {
-        let previous = self
-            .parsed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(path)
-            .map(|entry| Arc::clone(&entry.file));
-        self.invalidate(path);
+        let previous = self.invalidate(path);
         let Some(previous) = previous.filter(|file| file.content.as_str() == before) else {
             return;
         };
-        if after.len() > 500_000 {
+        if after.len() as u64 > MAX_PARSED_FILE_BYTES {
             return;
         }
         let Some(revision) = FileRevision::of(path) else {
@@ -459,7 +464,9 @@ mod tests {
         std::fs::write(&path, &source).unwrap();
         let cache = OutlineCache::new();
         let old = cache.get_or_parse(&path).unwrap();
-        let after = format!("{source}//{}", "x".repeat(500_000));
+        let padding = MAX_PARSED_FILE_BYTES as usize - source.len() - 2 + 1;
+        let after = format!("{source}//{}", "x".repeat(padding));
+        assert_eq!(after.len() as u64, MAX_PARSED_FILE_BYTES + 1);
         let witness = crate::lang::treesitter::ParseWitness::new(&after);
         crate::util::atomic_write_bytes(&path, after.as_bytes()).unwrap();
         cache.update_after_write(&path, &source, &after);
@@ -468,6 +475,52 @@ mod tests {
         assert_eq!(witness.count(), 0);
         assert_eq!(witness.incremental_count(), 0);
         assert_eq!(old.content.as_str(), source);
+    }
+
+    #[test]
+    fn incremental_growth_to_exact_byte_cap_reparses_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.rs");
+        let source = format!("// {}\nfn old() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        let cache = OutlineCache::new();
+        cache.get_or_parse(&path).unwrap();
+        let padding = MAX_PARSED_FILE_BYTES as usize - source.len() - 2;
+        let after = format!("{source}//{}", "x".repeat(padding));
+        assert_eq!(after.len() as u64, MAX_PARSED_FILE_BYTES);
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        crate::util::atomic_write_bytes(&path, after.as_bytes()).unwrap();
+        cache.update_after_write(&path, &source, &after);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 1);
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), after);
+    }
+
+    #[test]
+    fn incremental_write_replacement_before_verification_stays_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.rs");
+        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        let after = before.replace("before", "tilth_");
+        let external = before.replace("before", "other_");
+        std::fs::write(&path, &before).unwrap();
+        let cache = OutlineCache::new();
+        let old = cache.get_or_parse(&path).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
+        crate::util::atomic_write_bytes(&path, after.as_bytes()).unwrap();
+        // An external writer replaces the file with equal-length bytes and
+        // restores the mtime. Only the byte read-back can detect this.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        crate::util::atomic_write_bytes(&path, external.as_bytes()).unwrap();
+        crate::util::set_mtime(&path, mtime);
+        cache.update_after_write(&path, &before, &after);
+        assert!(!cache.has_parsed(&path));
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 0);
+        assert_eq!(external_witness.count(), 0);
+        assert_eq!(external_witness.incremental_count(), 0);
+        assert_eq!(old.content.as_str(), before);
     }
 
     #[test]
