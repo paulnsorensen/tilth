@@ -48,6 +48,8 @@ pub(crate) struct StructuralScan {
     pub(crate) items: Vec<StructuralItem>,
     pub(crate) skipped_files: usize,
     pub(crate) limited: bool,
+    /// Matches per file, counted before the retention cap.
+    pub(crate) file_counts: BTreeMap<String, usize>,
 }
 
 /// Bound match retention independently of the response token budget.
@@ -219,6 +221,9 @@ impl StructuralPatterns {
                         range: Location::of(&matched),
                         captures,
                     }));
+                }
+                if !found.is_empty() {
+                    scan.lock().unwrap().file_counts.insert(rel, found.len());
                 }
                 // Keep the smallest MAX_MATCHES keys so the cap ignores thread timing.
                 let mut kept = kept.lock().unwrap();

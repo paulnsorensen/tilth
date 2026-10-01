@@ -237,7 +237,9 @@ fn run_search_v2(
     let mut hints = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
+    let mut file_counts = Vec::with_capacity(entries.len());
     for (entry, follow) in entries.iter().zip(&follows) {
+        let mut counts = None;
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             let result = follow
@@ -266,7 +268,18 @@ fn run_search_v2(
                 },
             );
             result["language"] = json!(language);
-            result["items"] = json!(scan.items);
+            result["view"] = json!("matches");
+            let total: usize = scan.file_counts.values().sum();
+            result["total_matches"] = json!(total);
+            result["files_matched"] = json!(scan.file_counts.len());
+            result["items"] = group_matches(&json!(scan.items));
+            if scan.limited {
+                result["note"] = json!(format!(
+                    "Showing the first {} of {total} matches. Narrow with glob.",
+                    scan.items.len()
+                ));
+            }
+            counts = Some(scan.file_counts);
             if scan.skipped_files > 0 {
                 result["skipped_files"] = json!(scan.skipped_files);
             }
@@ -296,6 +309,7 @@ fn run_search_v2(
                 mark_partial(&mut result);
             }
         }
+        file_counts.push(counts);
         routes_tried.push(route);
         hints.append(&mut entry_hints);
         results.push(result);
@@ -336,7 +350,7 @@ fn run_search_v2(
         routes_tried[0].clone()
     };
     let mut response = json!({"results": results, "hints": hints, "diagnostics": if normalizations.is_empty() { json!({}) } else { json!({"normalizations": normalizations}) }});
-    let output = reduce_response(&mut response, budget)
+    let output = reduce_response(&mut response, budget, &file_counts)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
     let budget_limited = response["results"]
         .as_array()
@@ -380,7 +394,11 @@ const REMOVABLE: [(Option<&str>, &str); 6] = [
 /// exact deltas so the whole response is serialized only once at the end.
 /// Entries and hints are never removed, so a budget too small for the required
 /// metadata is an error rather than a lossy answer.
-fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> {
+fn reduce_response(
+    response: &mut Value,
+    budget: u64,
+    file_counts: &[Option<FileCounts>],
+) -> Result<String, String> {
     let output = serde_json::to_string(response).map_err(|e| e.to_string())?;
     let mut len = output.len();
     if crate::types::estimate_tokens(len as u64) <= budget {
@@ -413,6 +431,18 @@ fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> 
         if crate::types::estimate_tokens(len as u64) <= budget {
             break;
         }
+        if let (None, "items", Some(Some(counts))) = (owner, field, file_counts.get(index)) {
+            if !counts.is_empty() {
+                let result = &mut response["results"][index];
+                let rest = len - result.to_string().len();
+                let narrowed = narrow_structural(result, counts, &|bytes| {
+                    crate::types::estimate_tokens((rest + bytes) as u64) <= budget
+                });
+                len = rest + narrowed.to_string().len();
+                *result = narrowed;
+                continue;
+            }
+        }
         let result = &mut response["results"][index];
         let removed = match owner {
             None => result.as_object_mut().and_then(|o| o.remove(field)),
@@ -438,6 +468,184 @@ fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> 
         ));
     }
     serde_json::to_string(response).map_err(|e| e.to_string())
+}
+
+/// A longer file list is not actionable for an agent, so it skips to directory counts.
+const MAX_LISTED_FILES: usize = 100;
+
+/// Matches per file for one structural result, counted before the retention cap.
+type FileCounts = std::collections::BTreeMap<String, usize>;
+
+fn span(location: &Value) -> Value {
+    json!([
+        location["start_line"],
+        location["end_line"],
+        location["start_byte"],
+        location["end_byte"]
+    ])
+}
+
+/// Group sorted matches by path: `[{path, matches: [[sl, el, sb, eb, captures?]]}]`.
+fn group_matches(items: &Value) -> Value {
+    let mut groups: Vec<(&str, Vec<Value>)> = Vec::new();
+    for item in items.as_array().into_iter().flatten() {
+        let path = item["path"].as_str().unwrap_or_default();
+        let mut entry = span(&item["range"]).as_array().cloned().unwrap_or_default();
+        let captures: serde_json::Map<String, Value> = item["captures"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, locations)| {
+                let spans = locations.as_array().into_iter().flatten().map(span);
+                (name.clone(), Value::Array(spans.collect()))
+            })
+            .collect();
+        if !captures.is_empty() {
+            entry.push(Value::Object(captures));
+        }
+        match groups.last_mut() {
+            Some((last, matches)) if *last == path => matches.push(Value::Array(entry)),
+            _ => groups.push((path, vec![Value::Array(entry)])),
+        }
+    }
+    Value::Array(
+        groups
+            .into_iter()
+            .map(|(path, matches)| json!({"path": path, "matches": matches}))
+            .collect(),
+    )
+}
+
+/// Smallest directory depth (at least 1) that yields two groups, else the
+/// deepest. Root-level files group as `.`. Values are `(matches, files)`.
+fn directory_groups(counts: &FileCounts) -> std::collections::BTreeMap<String, (usize, usize)> {
+    let max_depth = counts
+        .keys()
+        .map(|path| path.matches('/').count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let group = |depth: usize| {
+        let mut groups = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for (path, count) in counts {
+            let key = path.rsplit_once('/').map_or_else(
+                || ".".to_string(),
+                |(parent, _)| parent.split('/').take(depth).collect::<Vec<_>>().join("/"),
+            );
+            let entry = groups.entry(key).or_default();
+            entry.0 += count;
+            entry.1 += 1;
+        }
+        groups
+    };
+    let mut groups = group(1);
+    for depth in 2..=max_depth {
+        if groups.len() >= 2 {
+            break;
+        }
+        groups = group(depth);
+    }
+    groups
+}
+
+/// Replace a structural result's `items` that no longer fit the budget with the
+/// richest view that does: a prefix of the single matched file, per-file
+/// counts, per-directory counts, or nothing. `fits` takes the candidate
+/// result's serialized length.
+fn narrow_structural(result: &Value, counts: &FileCounts, fits: &dyn Fn(usize) -> bool) -> Value {
+    let total: usize = counts.values().sum();
+    let file_total = counts.len();
+    let mut base = result.clone();
+    if let Some(object) = base.as_object_mut() {
+        object.remove("items");
+    }
+    mark_partial(&mut base);
+    base["budget_limited"] = json!(true);
+    let fitting = |candidate: &Value| fits(candidate.to_string().len());
+
+    if file_total == 1 {
+        let path = counts.keys().next().unwrap();
+        let all = result["items"][0]["matches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let prefix = |keep: usize| {
+            let mut candidate = base.clone();
+            candidate["items"] = json!([{"path": path, "matches": all[..keep]}]);
+            candidate["shown"] = json!(keep);
+            candidate["note"] = json!(format!(
+                "Showing the first {keep} of {total} matches in {path}. Raise budget to see more."
+            ));
+            candidate
+        };
+        let (mut low, mut high) = (0, all.len());
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            if fitting(&prefix(middle)) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if low > 0 {
+            return prefix(low);
+        }
+    }
+
+    if file_total <= MAX_LISTED_FILES {
+        let mut files = base.clone();
+        files["view"] = json!("files");
+        files["files"] = Value::Array(
+            counts
+                .iter()
+                .map(|(path, count)| json!([path, count]))
+                .collect(),
+        );
+        let mut note = format!(
+            "Too many matches ({total} in {file_total} files) for the budget. Rerun this entry with glob set to a listed path."
+        );
+        if counts.keys().any(|path| !path.contains('/')) {
+            note.push_str(" Prefix a top-level file with / to match only that file.");
+        }
+        files["note"] = json!(note);
+        if fitting(&files) {
+            return files;
+        }
+    }
+
+    let groups = directory_groups(counts);
+    let mut top: Vec<(&String, &usize)> = counts.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let example = groups
+        .keys()
+        .find(|dir| *dir != ".")
+        .map_or("*", String::as_str);
+    let mut directories = base.clone();
+    directories["view"] = json!("directories");
+    directories["directories"] = Value::Array(
+        groups
+            .iter()
+            .map(|(dir, (count, file_count))| json!([dir, count, file_count]))
+            .collect(),
+    );
+    directories["top_files"] = Value::Array(
+        top.into_iter()
+            .take(10)
+            .map(|(path, count)| json!([path, count]))
+            .collect(),
+    );
+    directories["note"] = json!(format!(
+        "Too many matches ({total} in {file_total} files across {} directories) for the budget. Rerun this entry with glob set to a directory, e.g. \"{example}/**\".",
+        groups.len()
+    ));
+    if fitting(&directories) {
+        return directories;
+    }
+    base["view"] = json!("none");
+    base["note"] = json!(format!(
+        "Too many matches ({total} in {file_total} files) for the budget. Raise budget or narrow with glob."
+    ));
+    base
 }
 
 /// Route one query through the deterministic precedence: path -> regex ->
@@ -970,7 +1178,7 @@ mod tests {
             {"query": "two", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "second"}
         ], "hints": [], "diagnostics": {}});
         for budget in [crate::budget::DEFAULT_BUDGET, 150] {
-            let output = reduce_response(&mut response.clone(), budget).unwrap();
+            let output = reduce_response(&mut response.clone(), budget, &[]).unwrap();
             assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
             let parsed: Value = serde_json::from_str(&output).unwrap();
             assert_eq!(parsed["results"].as_array().unwrap().len(), 2);
@@ -984,7 +1192,7 @@ mod tests {
         response["results"][0]["dependency_impact"] = json!({
             "coverage": "complete", "imports": ["x".repeat(10000)], "dependents": [], "total_imports": 1
         });
-        assert!(reduce_response(&mut response, 200).is_ok());
+        assert!(reduce_response(&mut response, 200, &[]).is_ok());
         assert_eq!(
             response["results"][0]["dependency_impact"]["coverage"],
             "partial"
@@ -996,7 +1204,7 @@ mod tests {
         let mut response = json!({"results": [{"query": "root", "resolved_as": "ambiguous",
             "status": "ambiguous", "completeness": "complete",
             "candidates": [{"path": "x".repeat(5000)}]}], "hints": [], "diagnostics": {}});
-        let output = reduce_response(&mut response, 100).unwrap();
+        let output = reduce_response(&mut response, 100, &[]).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["results"][0]["status"], "ambiguous");
         assert_eq!(parsed["results"][0]["completeness"], "partial");

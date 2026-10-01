@@ -110,19 +110,36 @@ Each entry contains exactly one of `query`, `follow`, or `pattern`.
 Pattern entries require `language` and accept only an optional `glob`.
 Invalid patterns and unsupported languages fail without a text-search fallback.
 
-Each structural result contains `items` with a relative `path`, a match `range`, and named `captures`.
-Ranges use zero-based, half-open byte offsets and one-based endpoint line numbers.
+Each structural result carries `view`, `total_matches` (all matches in scope, including any beyond the retention cap), and `files_matched`.
+Ordering is always deterministic: by path, then by start byte, then by end byte.
+
+The default `view` is `"matches"`.
+Its `items` are file groups sorted by path: `{"path": "src/a.rs", "matches": [[start_line, end_line, start_byte, end_byte], ...]}`.
+A match with captures has a fifth element, an object that maps each capture name to a list of the same four-number ranges.
+Byte offsets are zero-based and half-open. Line numbers are one-based.
 The end line identifies the exclusive end position, including the next line when the range ends after a newline.
-Captures map names to lists of ranges.
 Multi-captures retain matched punctuation, such as commas, in source order.
 Results contain owned ranges, not source text or borrowed syntax nodes.
+
+When the response exceeds the budget, a structural result steps down the first of these tiers that fits.
+Every step sets `completeness: "partial"` and `budget_limited: true`, and adds a `note`.
+
+1. One matched file: `items` keeps the longest prefix of that file's matches that fits, and `shown` gives its length. `view` stays `"matches"`.
+2. `view: "files"`: `files` is `[[path, count], ...]` sorted by path. It covers every matching file, and counts include matches beyond the retention cap. This tier applies only to 100 or fewer matching files; a longer list is not actionable, so it skips to tier 3. When a listed path has no `/`, the note adds "Prefix a top-level file with / to match only that file."
+3. `view: "directories"`: `directories` is `[[dir, count, files], ...]` sorted by directory. Directories group at the smallest depth of at least 1 that yields two or more groups, and root-level files group as `"."`. `top_files` lists up to 10 `[path, count]` pairs, largest count first, then by path.
+4. `view: "none"`: the listing is removed. Only the totals, `budget_limited`, and a `note` that says to raise the budget or narrow with `glob` are left.
+
+To narrow a trimmed result, rerun the entry with `glob` set to a listed path or to `"<dir>/**"`.
+A path that contains a `/` matches exactly that file.
+A root-level file name has no `/`, so a bare name also matches same-named files in subdirectories; prefix it with `/` (for example `"/main.rs"`) to match only the root file.
+Paths that contain glob metacharacters (`*`, `?`, `[`, `]`, `{`, `}`, `\`) are treated as patterns, not literal paths, so they cannot be used as an exact glob.
 
 Structural search uses the same scope, ignore, secret-file, and response-budget policies as other search entries.
 Matching reuses cached source and trees.
 Each distinct language/pattern pair compiles once per request.
-The scan retains at most 1,000 matches and marks limited or skipped-file scans as partial.
+The scan retains at most 1,000 matches, sets `match_limited` with a `note` when more exist, and marks limited or skipped-file scans as partial.
 Files above the existing 500,000-byte parse limit are skipped.
-Response-budget reduction can remove items and sets `budget_limited`.
+Skipped files are counted in `skipped_files`.
 
 ### Blast-radius deps
 
