@@ -164,11 +164,7 @@ fn run_search_v2(
             != 1
         {
             return Err(SearchFailure::new(
-                if object.contains_key("pattern") {
-                    "each entry requires exactly one of query, follow, or pattern"
-                } else {
-                    "each entry requires exactly one of query or follow"
-                },
+                "each entry requires exactly one of query, follow, or pattern",
                 "bad_query_entry",
             ));
         }

@@ -81,26 +81,27 @@ class StructuralSearch(unittest.TestCase):
 
     def test_invalid_requests_fail_without_fallback(self):
         invalid = [
-            {"pattern": "wrap($A)", "language": "go"},
-            {"pattern": "wrap($A)"},
-            {"pattern": "wrap($A)", "language": "tsx"},
-            {"pattern": "wrap($A)", "language": "python", "query": "wrap"},
-            {"pattern": "wrap($A)", "language": "python", "follow": {}},
-            {"pattern": "wrap($A)", "language": "python", "unknown": True},
-            {"pattern": "", "language": "python"},
-            {"pattern": "$$$ARGS", "language": "python"},
-            {"pattern": "foo(); bar();", "language": "typescript"},
-            {"pattern": "wrap(!!!)", "language": "python"},
-            {"pattern": "fn broken( {", "language": "rust"},
-            {"pattern": "wrap(!!!)", "language": "typescript"},
-            {"pattern": 7, "language": "python"},
-            {"pattern": "wrap($A)", "language": "python", "glob": 7},
+            ({"pattern": "wrap($A)", "language": "go"}, "unsupported structural language"),
+            ({"pattern": "wrap($A)"}, "language must be"),
+            ({"pattern": "wrap($A)", "language": "tsx"}, "unsupported structural language"),
+            ({"pattern": "wrap($A)", "language": "python", "query": "wrap"}, "exactly one of query, follow, or pattern"),
+            ({"pattern": "wrap($A)", "language": "python", "follow": {}}, "exactly one of query, follow, or pattern"),
+            ({"pattern": "wrap($A)", "language": "python", "unknown": True}, "accept only pattern, language, and glob"),
+            ({"pattern": "", "language": "python"}, "invalid structural pattern"),
+            ({"pattern": "$$$ARGS", "language": "python"}, "invalid structural pattern"),
+            ({"pattern": "foo(); bar();", "language": "typescript"}, "Multiple AST nodes"),
+            ({"pattern": "wrap(!!!)", "language": "python"}, "invalid structural pattern"),
+            ({"pattern": "fn broken( {", "language": "rust"}, "invalid structural pattern"),
+            ({"pattern": "wrap(!!!)", "language": "typescript"}, "invalid structural pattern"),
+            ({"pattern": 7, "language": "python"}, "pattern must be a string"),
+            ({"pattern": "wrap($A)", "language": "python", "glob": 7}, "glob must be a string"),
+            ({"pattern": "wrap($A)", "language": "python", "glob": "["}, "invalid glob"),
         ]
-        for entry in invalid:
+        for entry, fragment in invalid:
             with self.subTest(entry=entry):
                 response = self.call([entry])
                 self.assertTrue(harness.tool_is_error(response), response)
-                self.assertTrue(harness.tool_result_text(response))
+                self.assertIn(fragment, harness.tool_result_text(response))
 
     def test_shared_walker_filters_and_typescript_not_tsx(self):
         for path in ("keep/source.ts", "other.ts", "ignored.ts", "node_modules/vendor.ts", "source.tsx"):
@@ -172,6 +173,16 @@ class StructuralSearch(unittest.TestCase):
         result = self.result([{"pattern": "wrap($A)", "language": "python"}])["results"][0]
         self.assertEqual(result["completeness"], "partial")
         self.assertEqual(result["skipped_files"], 1)
+
+    def test_file_at_size_limit_is_scanned(self):
+        head = "wrap(value)\n#\n#\n"
+        content = head + "#" * (500000 - len(head) - 1) + "\n"
+        self.assertEqual(len(content.encode()), 500000)
+        self.write("limit.py", content)
+        result = self.result([{"pattern": "wrap($A)", "language": "python"}])["results"][0]
+        self.assertEqual(result["completeness"], "complete")
+        self.assertEqual(len(result["items"]), 1)
+        self.assertNotIn("skipped_files", result)
 
     def test_mixed_batch_preserves_entry_order(self):
         self.write("source.py", "wrap(value)\n")

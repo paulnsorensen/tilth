@@ -71,9 +71,9 @@ class ContinuationBoundary(unittest.TestCase):
             ),
             (
                 {"query": "root", "follow": {"kind": "fetch_callers", "target": {"path": "fixture.ts", "line": 1, "name": "root", "scope": scope}}},
-                "exactly one of query or follow",
+                "exactly one of query, follow, or pattern",
             ),
-            ({}, "exactly one of query or follow"),
+            ({}, "exactly one of query, follow, or pattern"),
         ]
         for entry, expected in cases:
             with self.subTest(entry=entry):
