@@ -65,6 +65,34 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-09-30 · Supersedes: no historical upstream assessment_
 
+### Reuse does not guarantee one parse
+
+The shared-document cache guarantees snapshot reuse, not one parse execution during concurrent misses.
+Parsing occurs outside the cache mutex before guarded publication.
+A concurrent-cache migration must preserve revision checks even if it coordinates missing-key loads.
+The structural-search adapter already borrows the retained source and tree; it does not require a second candidate-file AST.
+
+Compiled queries and edit history have different validity rules from current parsed documents.
+A file edit does not change a compiled language query.
+Edit history retains older text and observed-line permissions, so a current-document cache cannot replace it by itself.
+
+_Source: src/cache.rs:201-224,403-428; src/search/structural.rs:21-64; src/edit/snapshots.rs:30-37,126-173 · Updated: 2026-10-01_
+
+### Verified incremental writes
+
+Verified warm writes reuse parsed snapshots through a cloned tree and incremental parsing.
+The cache checks exact old bytes, bounded on-disk new bytes, and disk revisions before publication.
+Old readers retain their original source and tree. Parsing holds no global cache mutex.[^21]
+
+Cold writes do not populate the parsed-document cache. External changes use full parsing.
+Create, delete, and move operations invalidate affected paths, not unrelated snapshots.
+A failed move still invalidates source bytes already committed before the rename failure.[^22]
+
+[^21]: src/cache.rs:311-437; src/lang/treesitter.rs:14-88; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
+[^22]: src/mcp/tools/write.rs::tests::incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees; src/mcp/tools/write.rs::tests::incremental_write_failed_move_invalidates_already_committed_source
+
+_Source: Verified incremental-write implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_
+
 ## Other candidate boundaries
 
 `tempfile` already exists as a development dependency.

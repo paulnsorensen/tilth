@@ -12,11 +12,12 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::cache::OutlineCache;
 use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
@@ -56,10 +57,15 @@ fn parse_write_args(args: &Value) -> Result<(Vec<Section>, &Path, bool), String>
     Ok((sections, cwd, show_diff))
 }
 
+fn canonical_or_raw(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub(crate) fn tool_write(
     args: &Value,
     session: &Session,
     _bloom: &Arc<BloomFilterCache>,
+    cache: &OutlineCache,
 ) -> Result<String, String> {
     let (sections, cwd, show_diff) = parse_write_args(args)?;
 
@@ -72,6 +78,7 @@ pub(crate) fn tool_write(
     let ctx = SectionCtx {
         cwd,
         session,
+        cache,
         show_diff,
         section_budget,
     };
@@ -103,6 +110,7 @@ pub(crate) fn tool_write(
 struct SectionCtx<'a> {
     cwd: &'a Path,
     session: &'a Session,
+    cache: &'a OutlineCache,
     show_diff: bool,
     section_budget: u64,
 }
@@ -192,6 +200,9 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             source: e,
         }
     })?;
+    // `update_after_write` consumes the raw spelling; evict only its alias.
+    ctx.cache.invalidate_alias(path, &canonical_or_raw(path));
+    ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
     let first_changed = first_changed_line(&live, &new_text);
@@ -419,6 +430,8 @@ fn commit_file_op(
                     }
                 }
             })?;
+            ctx.cache
+                .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
             let new_tag = session.record_snapshot(path, content, std::iter::empty());
             let mut block = format!("## {}\ncreated{suffix}", path.display());
@@ -439,6 +452,7 @@ fn commit_file_op(
                 path: path.to_path_buf(),
                 source: e,
             })?;
+            ctx.cache.invalidate_spellings(path, &canonical);
             session.invalidate_snapshot(&canonical);
             Ok(format!("## {}\nremoved{suffix}", path.display()))
         }
@@ -466,6 +480,9 @@ fn commit_file_op(
                     }
                 })?;
             }
+            // Evict the source before the rename so a failed rename still
+            // drops a source that this section already wrote.
+            ctx.cache.invalidate_spellings(path, &canonical_src);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
                     path: parent.to_path_buf(),
@@ -476,6 +493,8 @@ fn commit_file_op(
                 path: dest.clone(),
                 source: e,
             })?;
+            ctx.cache
+                .invalidate_spellings(&dest, &canonical_or_raw(&dest));
             session.relocate_snapshot(&canonical_src, &dest);
             Ok(format!(
                 "## {}\nmoved{suffix} → {}",
@@ -646,6 +665,231 @@ mod tests {
     use crate::session::Session;
     use serde_json::json;
 
+    #[test]
+    fn incremental_write_create_evicts_parsed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.rs");
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        // Seed a parsed entry, then remove the file so the create can fill the path.
+        std::fs::write(&path, "fn stale() {}").unwrap();
+        cache.get_or_parse(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.has_parsed(&path));
+        let request = json!({"cwd": dir.path(), "edits": [{"path": &path, "ops": [{
+            "op": "create_file", "content": "fn fresh() {}"
+        }]}]});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("created"), "{result}");
+        assert!(!cache.has_parsed(&path));
+    }
+
+    #[test]
+    fn incremental_write_mixed_batch_preserves_rejected_and_unrelated_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let mut retained = Vec::new();
+        for name in ["accepted", "rejected", "unrelated"] {
+            let path = dir.path().join(format!("{name}.rs"));
+            let source = format!("// {}\nfn {name}() {{}}\n", dir.path().display());
+            std::fs::write(&path, source).unwrap();
+            let old = cache.get_or_parse(&path).unwrap();
+            let tag = read_for_tag(&session, &path);
+            retained.push((path, old, tag));
+        }
+        let (accepted, old, tag) = &retained[0];
+        let after = old.content.replace("accepted", "updated");
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let (rejected, _, rejected_tag) = &retained[1];
+        let request = json!({"cwd": dir.path(), "edits": [
+            {"path": rejected, "tag": rejected_tag, "ops": [{
+                "op": "replace_text", "old": "not_present", "new": "wrong"
+            }]},
+            {"path": accepted, "tag": tag, "ops": [{
+                "op": "replace_text", "old": "accepted", "new": "updated"
+            }]}
+        ]});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(
+            result.contains("error:") && result.contains("applied"),
+            "{result}"
+        );
+        assert_eq!(
+            cache.get_or_parse(accepted).unwrap().content.as_str(),
+            after
+        );
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 1);
+        for (path, snapshot, _) in &retained[1..] {
+            assert!(Arc::ptr_eq(snapshot, &cache.get_or_parse(path).unwrap()));
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                snapshot.content.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_write_failed_move_invalidates_already_committed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let before = format!("// {}\nfn before() {{}}\n", dir.path().display());
+        let after = before.replace("before", "changed");
+        std::fs::write(&path, &before).unwrap();
+        std::fs::write(dir.path().join("blocked"), "not a directory").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let old = cache.get_or_parse(&path).unwrap();
+        let tag = read_for_tag(&session, &path);
+        let witness = crate::lang::treesitter::ParseWitness::new(&after);
+        let result = super::tool_write(
+            &json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([
+                {"op": "replace_text", "old": "before", "new": "changed"},
+                {"op": "move_file", "dest": "blocked/dest.rs"}
+            ]))}),
+            &session,
+            &bloom,
+            &cache,
+        )
+        .unwrap_err();
+        assert!(result.contains("blocked"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(witness.incremental_count(), 0);
+        assert!(!cache.has_parsed(&path));
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), after);
+        assert_eq!(witness.count(), 1);
+        assert_eq!(old.content.as_str(), before);
+    }
+
+    #[test]
+    fn incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let before = format!("// {}\nfn initial() {{}}\n", dir.path().display());
+        let cold = before.replace("initial", "cold");
+        std::fs::write(&path, &before).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let tag = read_for_tag(&session, &path);
+        let cold_witness = crate::lang::treesitter::ParseWitness::new(&cold);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "initial", "new": "cold"
+        }]))});
+        assert!(super::tool_write(&request, &session, &bloom, &cache)
+            .unwrap()
+            .contains("applied"));
+        assert_eq!(cold_witness.count(), 0);
+        assert_eq!(cold_witness.incremental_count(), 0);
+        let retained = cache.get_or_parse(&path).unwrap();
+        assert_eq!(retained.content.as_str(), cold);
+        assert_eq!(cold_witness.count(), 1);
+
+        let tag = read_for_tag(&session, &path);
+        let noop = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "cold", "new": "cold"
+        }]))});
+        assert!(super::tool_write(&noop, &session, &bloom, &cache)
+            .unwrap()
+            .contains("no change"));
+        assert!(Arc::ptr_eq(&retained, &cache.get_or_parse(&path).unwrap()));
+        assert_eq!(cold_witness.count(), 1);
+        assert_eq!(cold_witness.incremental_count(), 0);
+
+        let external = before.replace("initial", "outside");
+        crate::util::atomic_write_bytes(&path, external.as_bytes()).unwrap();
+        let external_witness = crate::lang::treesitter::ParseWitness::new(&external);
+        let tag = read_for_tag(&session, &path);
+        let written = external.replace("outside", "after_external");
+        let witness = crate::lang::treesitter::ParseWitness::new(&written);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "replace_text", "old": "outside", "new": "after_external"
+        }]))});
+        assert!(super::tool_write(&request, &session, &bloom, &cache)
+            .unwrap()
+            .contains("applied"));
+        assert_eq!(external_witness.count(), 0);
+        assert_eq!(witness.count(), 0);
+        assert_eq!(
+            witness.incremental_count(),
+            0,
+            "cached bytes differ from verified live bytes"
+        );
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), written);
+        assert_eq!(witness.count(), 1);
+
+        let newer = written.replace("after_external", "newer_external");
+        let witness = crate::lang::treesitter::ParseWitness::new(&newer);
+        crate::util::atomic_write_bytes(&path, newer.as_bytes()).unwrap();
+        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), newer);
+        assert_eq!(witness.count(), 1);
+        assert_eq!(witness.incremental_count(), 0);
+    }
+
+    #[test]
+    fn incremental_write_rename_and_delete_keep_unrelated_cache_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let dest = dir.path().join("destination.rs");
+        let other = dir.path().join("other.rs");
+        let source = format!("// {}\nfn source() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(&dest, "fn previous_destination() {}").unwrap();
+        std::fs::write(&other, "fn unrelated() {}").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let old_source = cache.get_or_parse(&path).unwrap();
+        let old_dest = cache.get_or_parse(&dest).unwrap();
+        let unrelated = cache.get_or_parse(&other).unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        let tag = read_for_tag(&session, &path);
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let request = json!({"cwd": dir.path(), "edits": edits(&path, Some(&tag), json!([{
+            "op": "move_file", "dest": dest
+        }]))});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("moved"), "{result}");
+        assert!(!path.exists());
+        assert!(!cache.has_parsed(&path));
+        assert!(cache.get_or_parse(&path).is_none());
+        assert!(!cache.has_parsed(&dest));
+        assert_eq!(witness.count(), 0, "rename must not parse a new path");
+        assert_eq!(witness.incremental_count(), 0);
+        let moved = cache.get_or_parse(&dest).unwrap();
+        assert_eq!(moved.content.as_str(), source);
+        assert!(!Arc::ptr_eq(&old_dest, &moved));
+        assert_eq!(witness.count(), 1);
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &cache.get_or_parse(&other).unwrap()
+        ));
+
+        let tag = read_for_tag(&session, &dest);
+        let request = json!({"cwd": dir.path(), "edits": edits(&dest, Some(&tag), json!([{
+            "op": "delete_file"
+        }]))});
+        let result = super::tool_write(&request, &session, &bloom, &cache).unwrap();
+        assert!(result.contains("removed"), "{result}");
+        assert!(!dest.exists());
+        assert!(!cache.has_parsed(&dest));
+        assert!(cache.get_or_parse(&dest).is_none());
+        assert_eq!(old_source.content.as_str(), source);
+        assert_eq!(moved.content.as_str(), source);
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &cache.get_or_parse(&other).unwrap()
+        ));
+    }
+
+    fn tool_write_cold_cache(
+        args: &Value,
+        session: &Session,
+        bloom: &Arc<BloomFilterCache>,
+    ) -> Result<String, String> {
+        super::tool_write(args, session, bloom, &OutlineCache::new())
+    }
+
     fn services() -> (Session, Arc<BloomFilterCache>) {
         (Session::new(), Arc::new(BloomFilterCache::new()))
     }
@@ -693,7 +937,7 @@ mod tests {
 
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -719,7 +963,7 @@ mod tests {
         // content ends in "\n" — must not splice an extra blank line, matching
         // the old grammar's finalize_payload trailing-blank strip.
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "fn A() {}\n" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -745,7 +989,7 @@ mod tests {
         std::fs::write(&p, "NEW1\nNEW2\nalpha\nbeta\nTARGET\ndelta\n").unwrap();
 
         let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "RECOVERED" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -773,7 +1017,7 @@ mod tests {
 
         std::fs::write(&p, "totally\ndifferent\ncontent\nhere\n").unwrap();
         let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "NEW" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -805,7 +1049,7 @@ mod tests {
         // External process rewrites ONLY line 3, leaving a/b/d untouched.
         std::fs::write(&p, "a\nb\nEXTERNAL\nd\n").unwrap();
         let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "NEW" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -851,7 +1095,7 @@ mod tests {
             let tag = read_for_tag(&session, &p);
             std::fs::write(&p, external).unwrap();
 
-            let out = tool_write(
+            let out = tool_write_cold_cache(
                 &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
                 &session,
                 &bloom,
@@ -901,7 +1145,7 @@ mod tests {
         // Edit anchored on line 5 (inside `other`, never displayed) — on the
         // drift path this must still be rejected by the seen-lines gate.
         let ops = json!([{ "op": "replace", "start": 5, "end": 5, "content": "    let y = 9;" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -932,7 +1176,7 @@ mod tests {
         // External drift.
         std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
         let ops = json!([{ "op": "delete_file" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -958,7 +1202,7 @@ mod tests {
 
         std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
         let ops = json!([{ "op": "move_file", "dest": "moved.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -989,7 +1233,7 @@ mod tests {
 
         std::fs::write(&p, "x\ny\nz\n").unwrap();
         let ops = json!([{ "op": "delete_file" }, { "op": "move_file", "dest": "other.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1020,7 +1264,7 @@ mod tests {
             crate::edit::tag::compute_file_hash("alpha\nbeta\n") ^ 0x1
         );
         let ops = json!([{ "op": "delete_file" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1055,7 +1299,7 @@ mod tests {
             crate::edit::tag::compute_file_hash("one\ntwo\n") ^ 0x1
         );
         let ops = json!([{ "op": "move_file", "dest": "stolen.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1104,7 +1348,7 @@ mod tests {
 
         std::fs::write(&p, &colliding).unwrap();
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "overwrite" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1131,7 +1375,7 @@ mod tests {
         let live_tag = crate::edit::tag::compute_file_hash("x\ny\n");
         let bogus = format!("{:04X}", live_tag ^ 0x1);
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&bogus), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1151,7 +1395,7 @@ mod tests {
         let (session, bloom) = services();
         let evil = Path::new("../evil.rs");
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "x" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(evil, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1178,7 +1422,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &target);
         let ops = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&target, Some(&tag), ops), "cwd": checkout.path().to_str().unwrap()}),
             &session,
             &bloom,
@@ -1204,7 +1448,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "move_file", "dest": "../escaped.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1236,7 +1480,7 @@ mod tests {
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
         let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1250,7 +1494,7 @@ mod tests {
         // The relocated snapshot must carry src's seen-lines {1,2}: an edit on
         // the never-displayed line 4 of dest is rejected by the seen-lines gate.
         let ops2 = json!([{ "op": "replace", "start": 4, "end": 4, "content": "D" }]);
-        let rej = tool_write(
+        let rej = tool_write_cold_cache(
             &json!({"edits": edits(&dest, Some(&tag), ops2), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1296,7 +1540,7 @@ mod tests {
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
         let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": link.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1317,7 +1561,7 @@ mod tests {
         // `real/src.rs` canonical key `record()` used, and the gate is
         // silently skipped.
         let ops2 = json!([{ "op": "replace", "start": 4, "end": 4, "content": "D" }]);
-        let rej = tool_write(
+        let rej = tool_write_cold_cache(
             &json!({"edits": edits(&dest_link, Some(&tag), ops2), "cwd": link.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1345,7 +1589,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &src);
         let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&src, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1372,7 +1616,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "delete_file" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1386,7 +1630,7 @@ mod tests {
         // is a Fabricated rejection ("not from this session").
         std::fs::write(&p, "fresh content here\n").unwrap();
         let stale = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
-        let out2 = tool_write(
+        let out2 = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), stale), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1422,7 +1666,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "delete_file" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": link.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1444,7 +1688,7 @@ mod tests {
         // wrongly recovered instead.
         std::fs::write(real.join("gone.rs"), "fresh content here\n").unwrap();
         let stale = json!([{ "op": "replace", "start": 1, "end": 1, "content": "X" }]);
-        let out2 = tool_write(
+        let out2 = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), stale), "cwd": link.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1468,7 +1712,7 @@ mod tests {
         let (session, bloom) = services();
         let p = root.join("new.rs");
         let ops = json!([{ "op": "prepend", "content": "fn seeded() {}" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1537,7 +1781,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1561,7 +1805,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace_text", "old": "missing", "new": "renamed" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1589,7 +1833,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1619,7 +1863,7 @@ mod tests {
         // drifted live text so recovery cannot land the edit either way.
         std::fs::write(&p, "alpha\nCHANGED\ngamma\n").unwrap();
         let ops = json!([{ "op": "replace_text", "old": "missing-text", "new": "replacement" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1653,7 +1897,7 @@ mod tests {
         let (session, bloom) = services();
         let ops = json!([{ "op": "create_file", "content": content }]);
 
-        tool_write(
+        tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1672,7 +1916,7 @@ mod tests {
         let (session, bloom) = services();
         let ops = json!([{ "op": "create_file", "content": content }]);
 
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1701,7 +1945,7 @@ mod tests {
         let (session, bloom) = services();
         let ops = json!([{ "op": "create_file", "content": "replacement\n" }]);
 
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1730,7 +1974,7 @@ mod tests {
         let (session, bloom) = services();
         let ops = json!([{ "op": "create_file", "content": "replacement\n" }]);
 
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&link, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1761,7 +2005,7 @@ mod tests {
         let (session, bloom) = services();
         let ops = json!([{ "op": "create_file", "content": "new\n" }]);
 
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(&p, Some("ABCD"), ops),
                 "cwd": root.to_str().unwrap()
@@ -1785,7 +2029,8 @@ mod tests {
     #[test]
     fn missing_edits_blob_rejected() {
         let (session, bloom) = services();
-        let err = tool_write(&json!({}), &session, &bloom).expect_err("no edits → top-level error");
+        let err = tool_write_cold_cache(&json!({}), &session, &bloom)
+            .expect_err("no edits → top-level error");
         assert!(
             err.contains("edits"),
             "error must name the required param: {err}"
@@ -1797,8 +2042,9 @@ mod tests {
     #[test]
     fn legacy_blob_string_yields_teaching_error() {
         let (session, bloom) = services();
-        let err = tool_write(&json!({"edits": "[a.rs#0000]\nDEL 1\n"}), &session, &bloom)
-            .expect_err("legacy blob string must be a teaching error");
+        let err =
+            tool_write_cold_cache(&json!({"edits": "[a.rs#0000]\nDEL 1\n"}), &session, &bloom)
+                .expect_err("legacy blob string must be a teaching error");
         assert!(
             err.contains("JSON array"),
             "must teach the new shape: {err}"
@@ -1815,7 +2061,7 @@ mod tests {
     fn double_encoded_string_yields_teaching_error() {
         let (session, bloom) = services();
         let encoded = "[{\"path\":\"a.rs\",\"tag\":\"0000\",\"ops\":[]}]";
-        let err = tool_write(&json!({"edits": encoded}), &session, &bloom)
+        let err = tool_write_cold_cache(&json!({"edits": encoded}), &session, &bloom)
             .expect_err("double-encoded array must be a teaching error");
         assert!(
             err.contains("double-encoded"),
@@ -1838,7 +2084,7 @@ mod tests {
         let (session, bloom) = services();
         // `replace` missing its `content` field.
         let ops = json!([{ "op": "replace", "start": 1, "end": 2 }]);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1868,7 +2114,7 @@ mod tests {
                 })
             })
             .collect();
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({"edits": Value::Array(sections), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1902,7 +2148,7 @@ mod tests {
                 "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn TWO() {}" }]
             }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1941,7 +2187,7 @@ mod tests {
                 "ops": [{ "op": "replace", "start": 2, "end": 2, "content": "fn B() {}" }]
             }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -1987,7 +2233,7 @@ mod tests {
         // An edit anchored on line 5 (inside `other`, never displayed) is rejected.
         let reject_ops =
             json!([{ "op": "replace", "start": 5, "end": 5, "content": "    let y = 9;" }]);
-        let reject = tool_write(
+        let reject = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), reject_ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2006,7 +2252,7 @@ mod tests {
         // An edit anchored on line 2 (inside the displayed span) applies.
         let ok_ops =
             json!([{ "op": "replace", "start": 2, "end": 2, "content": "    let x = 42;" }]);
-        let ok = tool_write(
+        let ok = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ok_ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2051,7 +2297,7 @@ mod tests {
 
         let tag = format!("{:04X}", compute_file_hash(content));
         let ops = json!([{ "op": "replace", "start": 3, "end": 3, "content": "fn C() {}" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2076,7 +2322,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace", "start": 2, "end": 2, "content": "fn B() {}" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2102,7 +2348,7 @@ mod tests {
         let (session, bloom) = services();
         // start = u32::MAX + 1 — out of range for the wire field.
         let ops = json!([{ "op": "replace", "start": 4_294_967_296i64, "end": 1, "content": "x" }]);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2127,7 +2373,7 @@ mod tests {
         std::fs::write(&p, "stable\n").unwrap();
         let (session, bloom) = services();
         let ops = json!([{ "op": "frobnicate", "start": 1, "end": 1 }]);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some("0000"), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2168,7 +2414,7 @@ mod tests {
                 "ops": [{ "op": "replace", "start": 1, "end": 1 }]
             }
         ]);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2195,7 +2441,7 @@ mod tests {
             { "op": "create_file", "content": "fn created() {}\n" },
             { "op": "append", "content": "fn extra() {}" }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2224,7 +2470,7 @@ mod tests {
             { "op": "create_file", "content": "first\n" },
             { "op": "create_file", "content": "second\n" }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2257,7 +2503,7 @@ mod tests {
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
         let ops = json!([{ "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2294,7 +2540,7 @@ mod tests {
         // `old` uses spaces where the file uses a tab, so only the
         // whitespace-normalized fallback can resolve the swap.
         let ops = json!([{ "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2327,7 +2573,7 @@ mod tests {
             { "op": "move_file", "dest": "mv_ws_dest.rs" },
             { "op": "replace_text", "old": "    let y = 2;", "new": "let y = 42;" }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2372,7 +2618,7 @@ mod tests {
                 "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "Y" }]
             }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2415,7 +2661,7 @@ mod tests {
                 "ops": [{ "op": "replace", "start": 1, "end": 1, "content": "fn B() {}" }]
             }
         ]);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": edits_val, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2449,7 +2695,7 @@ mod tests {
         std::fs::write(&p, &original).unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2499,7 +2745,7 @@ mod tests {
         std::fs::write(&p, &original).unwrap();
         let (session, bloom) = services();
         let tag = read_for_tag(&session, &p);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2566,7 +2812,7 @@ mod tests {
             .map(|tag| format!("{tag:04X}"))
             .unwrap();
 
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2620,7 +2866,7 @@ mod tests {
         std::fs::write(&p, &original).unwrap();
         let (session, bloom) = services();
         let initial_tag = read_for_tag(&session, &p);
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2634,7 +2880,7 @@ mod tests {
         )
         .expect("first write");
         let fresh_tag = tag_from_output(&p, &out);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2673,7 +2919,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (session, bloom) = services();
-        let created = tool_write(
+        let created = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2687,7 +2933,7 @@ mod tests {
         )
         .expect("create");
         let tag = tag_from_output(&p, &created);
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2718,7 +2964,7 @@ mod tests {
             .record_snapshot(&p, &original, [1])
             .map(|tag| format!("{tag:04X}"))
             .unwrap();
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2776,7 +3022,7 @@ mod tests {
             }));
             paths.push(p);
         }
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({"edits": sections, "diff": true, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
@@ -2831,7 +3077,7 @@ mod tests {
             .record_snapshot(&good, original, [1])
             .map(|tag| format!("{tag:04X}"))
             .unwrap();
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": [
                     {"path": good.to_str().unwrap(), "tag": tag, "ops": [{"op": "replace", "start": 1, "end": 1, "content": "ONE"}]},
@@ -2876,7 +3122,7 @@ mod tests {
             .map(|tag| format!("{tag:04X}"))
             .unwrap();
         std::fs::write(&p, format!("external\n{original}")).unwrap();
-        let out = tool_write(
+        let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
@@ -2900,7 +3146,7 @@ mod tests {
             out.contains("updated"),
             "recovered output lost status/content: {out}"
         );
-        let err = tool_write(
+        let err = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
