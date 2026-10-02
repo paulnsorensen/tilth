@@ -329,7 +329,6 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
     out
 }
 
-const RETIRED_GROK: &str = "retired tool 'tilth_grok' — use 'tilth_search' for the definition, then follow its fetch_callers, fetch_callees, fetch_siblings, or fetch_tests hints.";
 /// Build the error for an unrecognized tool name, adding a "did you mean"
 /// hint for names agents commonly confuse for a real verb. Genuinely unknown
 /// names keep the plain `unknown tool: X` message.
@@ -338,8 +337,6 @@ fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
         "tilth_files" | "tilth_list" => format!(
             "retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
         ),
-        "tilth_diff" => "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.".to_string(),
-        "tilth_grok" => RETIRED_GROK.to_string(),
         "tilth_edit" if edit_mode => {
             "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
         }
@@ -580,35 +577,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retired_diff_returns_guidance_before_argument_validation() {
-        for edit_mode in [false, true] {
-            let services = Services::new(edit_mode);
-            for args in [
-                serde_json::json!({}),
-                serde_json::json!({"cwd": "/", "source": "working"}),
-                serde_json::json!({"cwd": 42, "budget": 0, "source": []}),
-            ] {
-                let err = dispatch_tool("tilth_diff", &args, &services).unwrap_err();
-                assert_eq!(err, "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.");
-            }
-        }
-    }
-
-    #[test]
-    fn retired_grok_returns_guidance_before_argument_validation() {
-        for edit_mode in [false, true] {
-            let services = Services::new(edit_mode);
-            for args in [
-                serde_json::json!({}),
-                serde_json::json!({"cwd": "/", "target": "main"}),
-                serde_json::json!({"cwd": 42, "budget": 0}),
-            ] {
-                let err = dispatch_tool("tilth_grok", &args, &services).unwrap_err();
-                assert_eq!(err, RETIRED_GROK);
-            }
-        }
-    }
     #[test]
     fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
         let services = Services::new(true);
