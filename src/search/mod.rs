@@ -123,18 +123,12 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// `add_custom_ignore_filename`. Gitignore syntax (supports `!` re-include).
 /// The `ignore` crate builds the custom-ignore matcher independently of the
 /// git layers (which stay disabled), so this is the one ignore mechanism tilth
-/// honors — a repo can hard-deny secret or noisy files from search/list/map
+/// honors — a repo can hard-deny secret or noisy files from search
 /// even though `.gitignore` is intentionally not consulted.
 pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// Shared walker policy: searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files
-/// are found. Used by both the parallel search walker (`walker()`) and the
-/// sequential map walker (`crate::map::generate`), which each apply their own
-/// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
-pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    walk_builder(scope, None)
-}
-
+/// are found. Callers apply their own final `.threads()` and `.build_parallel()`.
 fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder

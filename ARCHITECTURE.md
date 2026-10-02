@@ -9,8 +9,8 @@ faster than they can be re-checked.
 Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
-file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. There's also a Cargo workspace, an
+file reader, and supporting subsystems for edit and blast-radius
+analysis. There's also a Cargo workspace, an
 `install.rs` that writes MCP-host configs, a benchmark harness, and an
 npm wrapper that fetches a prebuilt binary on `npm install`.
 
@@ -37,9 +37,6 @@ src/
 │                    queries, hot dirs, expanded-set dedup
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
-├── overview.rs      Project fingerprint; CLI-only via `tilth overview`,
-│                    not injected at MCP `initialize`
-├── map.rs           tilth --map: structural tree of the codebase
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
 │
@@ -98,15 +95,6 @@ src/
 │   ├── mod.rs
 │   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
 │                        (BloomFilterCache wraps the per-file filters)
-│
-└── diff/            Structural diff
-    ├── mod.rs           DiffSource resolution; diff() pipeline orchestrator
-    ├── parse.rs         Parse unified diff text → FileDiff structs
-    ├── overlay.rs       FileDiff + on-disk source → structural FileOverlay
-    │                    (changed symbols with confidence scores);
-    │                    cross-file move detection
-    ├── matching.rs      Symbol identity matching across before/after
-    └── format.rs        FileOverlay → human-readable output
 ```
 
 ## Two entry surfaces
@@ -119,19 +107,16 @@ shell with its own concurrency model.
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
 plus flags. The mode is determined by mutually-exclusive flags
-(`--callers`, `--deps`, `--map`, `--mcp`, `--edit`, `--full`,
-`--expand`, `--section`). Three subcommands sit alongside the
-free-form path:
-
-- `tilth install <host>` — delegates to `install::run`.
-- `tilth diff [<source>]` — bypasses `lib.rs` entirely and goes
-  through `diff::resolve_source` + `diff::diff`.
-- `tilth overview` — prints the project fingerprint that the MCP
-  `initialize` response would inject.
+(`--callers`, `--deps`, `--mcp`, `--edit`, `--full`,
+`--expand`, `--section`). One subcommand sits alongside the
+free-form path: `tilth install <host>` delegates to `install::run`.
+The structural diff (`tilth diff`), project fingerprint
+(`tilth overview`), and codebase map (`tilth --map`) are removed;
+use shell `git diff`, `git log`, `ls`, and `find` instead.
 
 The default (no-subcommand) mode dispatches into `lib::run` (or
-`run_full`, `run_expanded`, `run_callers`, `run_deps`,
-`map::generate`) based on the active flags. The output is printed
+`run_full`, `run_expanded`, `run_callers`, `run_deps`) based on the
+active flags. The output is printed
 verbatim to stdout. JSON output (`--json`) emits a serde-serialized
 `SearchResult`; otherwise the human-readable formatter wins.
 
@@ -170,11 +155,9 @@ methods worth describing in detail:
   and goes through `handle_tool_call`.
 
 Tool dispatch is routed by name through `dispatch_tool` to
-`tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
-`tool_edit` (the last only in edit mode).
-`tilth_map` is no longer reachable through MCP — its schema is omitted
-from `tools/list` and the dispatch stub has been removed. The CLI
-still has `tilth --map`; the MCP boundary was retired after benchmark
+`tool_read` / `tool_search_v2` / `tool_deps` / `tool_write`
+(the last only in edit mode).
+`tilth_map` is no longer reachable through MCP or the CLI; benchmark
 data showed structural maps hurt agent task success rates.
 
 Concurrency: each `tools/call` spawns a worker thread, communicates via
@@ -484,9 +467,6 @@ machinery:
   `format_deps` does the human output. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
-- **Blast** (`blast.rs`) — symbol-level blast radius for diff
-  workflows; called by the CLI `tilth diff --blast` (the MCP
-  `tilth_diff` tool is retired in favor of shell `git diff`).
 
 ### Glob (`glob.rs`)
 
@@ -647,52 +627,10 @@ This is actively used in the relational-query paths (it's why
 `tilth_search kind:callers` doesn't take O(N files) tree-sitter parses
 on every query).
 
-## Diff and edit subsystems
+## Edit subsystem
 
-These two are separate from the search/read pipeline but share the same
-walker and tree-sitter infrastructure. Both are large enough to be
-peers of the search subsystem but stay quiet because they sit behind a
-single tool each.
-
-### Diff (`src/diff/`)
-
-The CLI `tilth diff` subcommand ends up in `diff::diff` (the MCP
-`tilth_diff` tool is retired — use shell `git diff` for changes and
-`git log` for history). The pipeline:
-
-1. **Resolve source** (`resolve_source`) — `DiffSource` is a
-   six-armed enum: `GitUncommitted` (default), `GitStaged`, `GitRef`
-   (any rev or rev range), `Files(a, b)` (file-to-file), `Patch(path)`
-   (read a `.patch` file), `Log(range)` (per-commit summaries).
-2. **`run_git_diff`** shells out to `git diff` with the right args
-   (or reads the patch file).
-3. **`parse::parse_unified_diff`** turns the raw text into
-   `Vec<FileDiff>` — header, hunks, lines.
-4. **`overlay::compute_overlay`** combines each `FileDiff` with the
-   on-disk source to produce a `FileOverlay` — a structural view of
-   changed *symbols* with confidence scores
-   (`MatchConfidence::High/Medium/Low/None`).
-5. **`overlay::cross_file_matching`** detects symbols moved between
-   files.
-6. **`overlay::signature_warnings`** flags signature changes that
-   might break callers.
-7. **Search filter** (`filter_by_search`) — narrows to symbols/files
-   matching a substring, if `--search` was passed.
-8. **Blast radius** (`compute_blast`) — for each signature-changed
-   symbol, list of impacted files, gated on `--blast`.
-9. **Format** — dispatched by scope shape: `format::format_overview`
-   (no scope), `format::format_file_detail` (single file scope), or
-   `format::format_function_detail` (`file:fn` scope). Marker line
-   prefixes are `[+]`/`[-]`/`[~]`/`[~:sig]`; the overview header is
-   budgeted via `budget::apply`.
-10. **Conflict detection** — only on `DiffSource::GitUncommitted`,
-    `overlay::detect_conflicts` scans each affected file for git
-    merge-conflict markers and `format::format_conflicts` appends the
-    findings to the output.
-
-`diff_log(range, scope, budget)` is a separate pipeline for `--log
-HEAD~5..HEAD` summaries — runs `git log --pretty + git show` per commit
-and emits a structural change list per commit.
+Edit is separate from the search/read pipeline but shares the same
+walker and tree-sitter infrastructure. It sits behind a single tool.
 
 ### Edit (`src/edit.rs`)
 
@@ -790,20 +728,9 @@ A handful of small files cut across every subsystem.
 
 ## Auxiliary modules
 
-Three modules sit outside the search/read flow but are still
+One module sits outside the search/read flow but is still
 user-facing.
 
-- **`overview.rs`** — `fingerprint(root)` walks files (depth 2),
-  detects primary language, parses the project manifest (`Cargo.toml`,
-  `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
-  (`branch`, `uncommitted`, `recent commits`), and emits a few
-  hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
-  budget; warn-on-overrun via stderr. CLI-only via `tilth overview`;
-  the MCP `initialize` response no longer injects it.
-- **`map.rs`** — `tilth --map` generates a structural codebase tree:
-  per-directory token estimates, top-level symbols per file, depth
-  control. CLI-only — the MCP boundary doesn't expose it (no schema
-  in `tools/list`, no dispatch arm).
 - **`install.rs`** — `tilth install <host>` writes tilth's MCP server
   entry into a host's config file. Supports 22 hosts: claude-code,
   cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex,

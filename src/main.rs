@@ -66,16 +66,12 @@ struct Cli {
     glob: Option<String>,
 
     /// Find all callers of a symbol.
-    #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["deps", "edit"])]
     callers: bool,
 
     /// Analyze blast-radius dependencies of a file.
-    #[arg(long, conflicts_with_all = ["callers", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["callers", "edit"])]
     deps: bool,
-
-    /// Generate a structural codebase map.
-    #[arg(long, conflicts_with_all = ["callers", "deps", "expand", "section", "full"])]
-    map: bool,
 
     /// Print shell completions for the given shell.
     #[arg(long, value_name = "SHELL")]
@@ -94,46 +90,6 @@ enum Command {
         #[arg(long)]
         edit: bool,
     },
-    /// Show structural diff with function-level change summaries.
-    Diff {
-        /// Diff source: uncommitted (default), staged, or a git ref (e.g. HEAD~1, main..feat).
-        #[arg(default_value = "uncommitted")]
-        source: String,
-
-        /// Restrict diff to a specific file or directory.
-        #[arg(long)]
-        scope: Option<String>,
-
-        /// First file for file-to-file diff (requires --b).
-        #[arg(long)]
-        a: Option<PathBuf>,
-
-        /// Second file for file-to-file diff (requires --a).
-        #[arg(long)]
-        b: Option<PathBuf>,
-
-        /// Path to a .patch file to parse.
-        #[arg(long)]
-        patch: Option<PathBuf>,
-
-        /// Git log range for per-commit summaries (e.g. HEAD~5..HEAD).
-        #[arg(long)]
-        log: Option<String>,
-
-        /// Filter output to symbols or files matching this substring.
-        #[arg(long)]
-        search: Option<String>,
-
-        /// Show blast-radius warnings for signature-changed symbols.
-        #[arg(long)]
-        blast: bool,
-
-        /// Max tokens in response.
-        #[arg(long, default_value_t = 10000)]
-        budget: u64,
-    },
-    /// Show the project fingerprint (what MCP init would inject).
-    Overview,
 }
 
 fn main() {
@@ -153,58 +109,6 @@ fn main() {
                 if let Err(e) = tilth::install::run(host, edit) {
                     eprintln!("install error: {e}");
                     process::exit(1);
-                }
-            }
-            Command::Overview => {
-                let cwd = current_dir_or_log();
-                let output = tilth::overview::fingerprint(&cwd);
-                if output.is_empty() {
-                    eprintln!("No project fingerprint could be generated.");
-                    process::exit(1);
-                }
-                println!("{output}");
-            }
-            Command::Diff {
-                source,
-                scope,
-                a,
-                b,
-                patch,
-                log,
-                search,
-                blast,
-                budget,
-            } => {
-                let a_str = a.as_ref().map(|p| p.to_string_lossy().into_owned());
-                let b_str = b.as_ref().map(|p| p.to_string_lossy().into_owned());
-                let patch_str = patch.as_ref().map(|p| p.to_string_lossy().into_owned());
-                let diff_source = match tilth::diff::resolve_source(
-                    Some(&source),
-                    a_str.as_deref(),
-                    b_str.as_deref(),
-                    patch_str.as_deref(),
-                    log.as_deref(),
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("diff error: {e}");
-                        process::exit(1);
-                    }
-                };
-                let budget_opt = if budget == 0 { None } else { Some(budget) };
-                match tilth::diff::diff(
-                    &diff_source,
-                    scope.as_deref(),
-                    search.as_deref(),
-                    blast,
-                    budget_opt,
-                    &current_dir_or_log(),
-                ) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
-                    Err(e) => {
-                        eprintln!("diff error: {e}");
-                        process::exit(1);
-                    }
                 }
             }
         }
@@ -231,15 +135,6 @@ fn main() {
     }
 
     let is_tty = io::stdout().is_terminal();
-
-    // Map mode
-    if cli.map {
-        let cache = tilth::cache::OutlineCache::new();
-        let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
-        let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
-        emit_output(&output, is_tty);
-        return;
-    }
 
     // CLI mode: single query
     let Some(query) = cli.query else {

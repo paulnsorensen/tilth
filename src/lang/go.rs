@@ -95,11 +95,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         search_priority: 9,
         search_extensions: &["go"],
         basename_extensions: &["go"],
-        test_filename: Some(crate::lang::spec::TestFilenamePolicy {
-            order: 1,
-            label: "_test.go",
-            matches: is_test_filename,
-        }),
         ..crate::lang::spec::DEFAULT_POLICY
     },
     semantic_start: crate::lang::spec::default_semantic_start,
@@ -137,8 +132,4 @@ pub(crate) fn extract_go_receiver_name(
 
 fn import_line(line: &str) -> bool {
     line.trim_start().starts_with("import ")
-}
-
-fn is_test_filename(path: &str) -> bool {
-    path.ends_with("_test.go")
 }

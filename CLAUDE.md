@@ -6,7 +6,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ```
 src/
-  main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
+  main.rs              CLI entry (clap). Dispatches to install, MCP, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_INSTRUCTIONS via include_str! from prompts/.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
@@ -15,12 +15,6 @@ src/
     outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
     treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
-  diff/
-    mod.rs             Structural diff types, source resolution, orchestrator pipeline (diff()).
-    parse.rs           Unified diff parser: git diff output → Vec<FileDiff>.
-    matching.rs        Three-phase symbol matching: identity → structural hash → fuzzy similarity.
-    overlay.rs         Per-file structural overlay: outline old/new, match symbols, attribute hunks.
-    format.rs          Progressive-disclosure formatters: overview, file detail, function detail, log, conflicts.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
     outline/
@@ -60,7 +54,6 @@ src/
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
-  map.rs               Codebase map generation (CLI only, disabled as MCP tool).
   types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.

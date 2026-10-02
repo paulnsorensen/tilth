@@ -132,21 +132,6 @@ pub(crate) struct SamePackagePolicy {
     pub max_file_size: u64,
 }
 #[derive(Clone, Copy)]
-pub(crate) struct TestFilenamePolicy {
-    pub order: u8,
-    pub label: &'static str,
-    pub matches: fn(&str) -> bool,
-}
-#[derive(Clone, Copy)]
-pub(crate) struct InlineTestPolicy {
-    pub order: u8,
-    pub label: &'static str,
-    pub extension: &'static str,
-    pub marker: &'static str,
-    pub max_files: usize,
-    pub extension_ignore_ascii_case: bool,
-}
-#[derive(Clone, Copy)]
 pub(crate) struct LanguagePolicy {
     /// ast-grep language for structural search, reached via
     /// `spec(lang).policy.structural`; `None` disables it.
@@ -166,8 +151,6 @@ pub(crate) struct LanguagePolicy {
     pub search_priority: u8,
     pub search_extensions: &'static [&'static str],
     pub basename_extensions: &'static [&'static str],
-    pub test_filename: Option<TestFilenamePolicy>,
-    pub inline_test: Option<InlineTestPolicy>,
     /// Container node kinds whose children the outline walk treats as siblings.
     pub outline_flatten: &'static [&'static str],
     /// Text that precedes a structural pattern so it parses with the document
@@ -215,8 +198,6 @@ pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
     search_priority: 3,
     search_extensions: &[],
     basename_extensions: &[],
-    test_filename: None,
-    inline_test: None,
     outline_flatten: &[],
     pattern_preamble: "",
 };

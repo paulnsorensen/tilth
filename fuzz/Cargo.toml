@@ -26,10 +26,3 @@ path = "fuzz_targets/strip.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "diff_parse"
-path = "fuzz_targets/diff_parse.rs"
-test = false
-doc = false
-bench = false
