@@ -21,6 +21,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::tsx::canonical_anchor,
     attach_leading_adornment: crate::lang::tsx::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Tsx),
         import_line: crate::lang::javascript::import_line,
         import_external: crate::lang::javascript::import_external,
         import_resolver: crate::lang::javascript::resolve_import,

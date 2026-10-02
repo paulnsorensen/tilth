@@ -105,7 +105,12 @@ Use an explicit pattern entry to match syntax, rather than literal text or regul
 }
 ```
 
-Supported languages are Rust, TypeScript (`.ts`, not `.tsx`), and Python.
+Supported languages are Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, Swift, Kotlin, C#, Elixir, and Bash.
+The `language` value is the lowercase name, for example `c++` or `c#`.
+`typescript` matches `.ts` files only; use `tsx` for `.tsx` files.
+In every language, `$` followed by an uppercase letter or `_` starts a metavariable.
+So in PHP and Bash, `$this` and `$name` stay literal variables, but `$HOME` is a metavariable.
+In C, a bare call such as `wrap($A)` parses as a declaration; write `wrap($A);` to match the call statement.
 Each entry contains exactly one of `query`, `follow`, or `pattern`.
 Pattern entries require `language` and accept only an optional `glob`.
 Invalid patterns and unsupported languages fail without a text-search fallback.
@@ -370,7 +375,8 @@ Search, content search, and glob use early termination — time is roughly const
 
 Rust. ~20,000 lines. No runtime dependencies.
 
-- **tree-sitter** — AST parsing for 14 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift). Used for definition detection, callee extraction, callers query, and structural outlines.
+- **tree-sitter** — AST parsing for 17 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, Swift, Kotlin, C#, Elixir, Bash). Used for definition detection, callee extraction, callers query, and structural outlines.
+- **ast-grep** (`ast-grep-core`, `ast-grep-language`) — structural pattern search over the cached tree-sitter trees, with metavariables (`$A`, `$$$ARGS`) for every language above. PHP patterns parse with the same full grammar as PHP documents, so templates with inline HTML match too.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
 - **ignore** crate — parallel directory walking, searches all files including gitignored
 - **memmap2** — memory-mapped file reads (no buffers)

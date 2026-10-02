@@ -338,8 +338,11 @@ fun main() {
         // Imports
         assert!(
             outline.contains("imports:"),
-            "should have collapsed imports"
+            "should have collapsed imports: {outline}"
         );
+        for import in ["kotlin.collections.List", "kotlin.io.println"] {
+            assert!(outline.contains(import), "should list {import}: {outline}");
+        }
         // Interface (shown as class since Kotlin grammar uses class_declaration)
         assert!(outline.contains("class Drawable"), "should have Drawable");
         // Data class

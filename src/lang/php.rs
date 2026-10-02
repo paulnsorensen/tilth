@@ -29,6 +29,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::php::canonical_anchor,
     attach_leading_adornment: crate::lang::php::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Php),
+        pattern_preamble: "<?php ",
         search_priority: 9,
         search_extensions: &["php"],
         basename_extensions: &["php"],

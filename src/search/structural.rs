@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::meta_var::MetaVariable;
 use ast_grep_core::tree_sitter::StrDoc;
-use ast_grep_core::{Doc, Language, Node, Pattern, PatternError};
+use ast_grep_core::{Language, Node, Pattern, PatternError};
 use ast_grep_language::SupportLang;
 use serde::Serialize;
 
@@ -129,7 +129,8 @@ impl StructuralPatterns {
         };
         #[cfg(test)]
         COMPILATIONS.set(COMPILATIONS.get() + 1);
-        let pattern = Pattern::try_new(source, PatternLanguage(language))
+        let pattern = PatternLanguage::new(file_language, language)
+            .compile(source)
             .map_err(|error| format!("invalid structural pattern: {error}"))?;
         self.0.insert(
             key,
@@ -382,53 +383,112 @@ impl Ord for Keyed {
     }
 }
 
-/// Validate the selected subtree before ast-grep removes missing nodes.
+/// Parses patterns with the grammar the candidate documents use, so node kind
+/// ids agree. ast-grep's own language may use a different grammar (PHP).
 #[derive(Clone)]
-struct PatternLanguage(SupportLang);
+struct PatternLanguage {
+    support: SupportLang,
+    grammar: tree_sitter::Language,
+    preamble: &'static str,
+}
+
+impl PatternLanguage {
+    fn new(lang: Lang, support: SupportLang) -> Self {
+        let spec = crate::lang::spec::spec(lang);
+        let grammar = spec.grammar.expect("structural languages have a grammar");
+        Self {
+            support,
+            grammar: tree_sitter::Language::new(grammar),
+            preamble: spec.policy.pattern_preamble,
+        }
+    }
+
+    fn compile(&self, source: &str) -> Result<Pattern, String> {
+        if self.preamble.is_empty() {
+            return Pattern::try_new(source, self.clone()).map_err(|error| error.to_string());
+        }
+        // ast-grep selects a pattern node from the document root, which holds the
+        // preamble. Select the node by kind instead.
+        let processed = self.pre_process_pattern(source);
+        let document = StrDoc::try_new(&processed, self.clone())?;
+        let kind = self.select(&document.tree)?.kind().to_string();
+        Pattern::contextual(source, &kind, self.clone()).map_err(|error| error.to_string())
+    }
+
+    /// Select the pattern node, mirroring `single_matcher` in pinned ast-grep-core
+    /// 0.45.3. Rust expression patterns can have a missing outer semicolon.
+    fn select<'t>(&self, tree: &'t tree_sitter::Tree) -> Result<tree_sitter::Node<'t>, String> {
+        let mut selected = tree.root_node();
+        if !self.preamble.is_empty() {
+            let mut cursor = selected.walk();
+            let body: Vec<_> = selected
+                .children(&mut cursor)
+                .filter(|child| child.start_byte() >= self.preamble.len())
+                .collect();
+            let single = body.len() == 1
+                || (body.len() == 2 && (body[1].is_missing() || body[1].kind().is_empty()));
+            if !single {
+                return Err("structural pattern must be a single node".into());
+            }
+            selected = body[0];
+        }
+        while selected.child_count() == 1
+            || (selected.child_count() == 2
+                && selected
+                    .child(1)
+                    .is_some_and(|child| child.is_missing() || child.kind().is_empty()))
+        {
+            selected = selected.child(0).unwrap();
+        }
+        if selected.has_error() || selected.is_missing() {
+            return Err("syntax error or missing syntax in structural pattern".into());
+        }
+        Ok(selected)
+    }
+}
+
+impl ast_grep_core::tree_sitter::LanguageExt for PatternLanguage {
+    fn get_ts_language(&self) -> tree_sitter::Language {
+        self.grammar.clone()
+    }
+}
 
 impl Language for PatternLanguage {
     fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
-        self.0.pre_process_pattern(query)
+        let processed = self.support.pre_process_pattern(query);
+        if self.preamble.is_empty() {
+            return processed;
+        }
+        Cow::Owned(format!("{}{processed}", self.preamble))
     }
 
     fn meta_var_char(&self) -> char {
-        self.0.meta_var_char()
+        self.support.meta_var_char()
     }
 
     fn expando_char(&self) -> char {
-        self.0.expando_char()
+        self.support.expando_char()
     }
 
     fn extract_meta_var(&self, source: &str) -> Option<MetaVariable> {
-        self.0.extract_meta_var(source)
+        self.support.extract_meta_var(source)
     }
 
     fn kind_to_id(&self, kind: &str) -> u16 {
-        self.0.kind_to_id(kind)
+        self.grammar.id_for_node_kind(kind, true)
     }
 
     fn field_to_id(&self, field: &str) -> Option<u16> {
-        self.0.field_to_id(field)
+        self.grammar
+            .field_id_for_name(field)
+            .map(std::num::NonZeroU16::get)
     }
 
     fn build_pattern(&self, builder: &PatternBuilder) -> Result<Pattern, PatternError> {
         builder.build(|source| {
             // Only patterns parse here. Candidate documents retain cached trees.
-            let document = StrDoc::try_new(source, self.0)?;
-            let mut selected = document.root_node();
-            // Mirror single_matcher in pinned ast-grep-core 0.45.3.
-            // Rust expression patterns can have a missing outer semicolon.
-            while selected.child_count() == 1
-                || (selected.child_count() == 2
-                    && selected
-                        .child(1)
-                        .is_some_and(|child| child.is_missing() || child.kind().is_empty()))
-            {
-                selected = selected.child(0).unwrap();
-            }
-            if selected.has_error() || selected.is_missing() {
-                return Err("syntax error or missing syntax in structural pattern".into());
-            }
+            let document = StrDoc::try_new(source, self.clone())?;
+            self.select(&document.tree)?;
             Ok(document)
         })
     }
@@ -445,7 +505,9 @@ mod tests {
         std::fs::write(&path, "wrap(value)\n").unwrap();
         let cache = OutlineCache::new();
         let snapshot = cache.get_or_parse(&path).unwrap();
-        let pattern = Pattern::try_new("wrap($A)", PatternLanguage(SupportLang::Python)).unwrap();
+        let pattern = PatternLanguage::new(Lang::Python, SupportLang::Python)
+            .compile("wrap($A)")
+            .unwrap();
         let matched = snapshot.ast().root().find(&pattern).unwrap();
         assert!(matches!(matched.text(), Cow::Borrowed("wrap(value)")));
         assert_eq!(matched.text().as_ptr(), snapshot.content().as_ptr());
@@ -514,20 +576,40 @@ mod tests {
 
     #[test]
     fn structural_languages_come_from_the_lang_spec() {
-        assert_eq!(
-            crate::lang::spec::structural_language_names(),
-            ["rust", "typescript", "python"]
-        );
-        assert_eq!(
-            crate::lang::spec::structural_language_list(),
-            "rust, typescript, or python"
-        );
-        assert!(crate::lang::spec::structural_language("tsx").is_none());
+        const NAMES: [&str; 17] = [
+            "rust",
+            "typescript",
+            "tsx",
+            "javascript",
+            "python",
+            "go",
+            "java",
+            "scala",
+            "c",
+            "c++",
+            "ruby",
+            "php",
+            "swift",
+            "kotlin",
+            "c#",
+            "elixir",
+            "bash",
+        ];
+        assert_eq!(crate::lang::spec::structural_language_names(), NAMES);
+        let list = format!("{}, or bash", NAMES[..16].join(", "));
+        assert_eq!(crate::lang::spec::structural_language_list(), list);
+        // Grammar-less languages have no structural entry.
+        for name in ["docker", "make", "markdown"] {
+            assert!(
+                crate::lang::spec::structural_language(name).is_none(),
+                "{name}"
+            );
+        }
         let mut patterns = StructuralPatterns::default();
-        let error = patterns.prepare("go", "wrap($A)").unwrap_err();
+        let error = patterns.prepare("make", "wrap($A)").unwrap_err();
         assert_eq!(
             error,
-            "unsupported structural language; use rust, typescript, or python"
+            format!("unsupported structural language; use {list}")
         );
     }
 
@@ -536,10 +618,49 @@ mod tests {
         use ast_grep_core::tree_sitter::LanguageExt;
         for name in crate::lang::spec::structural_language_names() {
             let (lang, support) = crate::lang::spec::structural_language(&name).unwrap();
-            let document =
-                tree_sitter::Language::new(crate::lang::spec::spec(lang).grammar.unwrap());
-            assert_eq!(support.get_ts_language(), document, "{name}");
+            let spec = crate::lang::spec::spec(lang);
+            let document = tree_sitter::Language::new(spec.grammar.unwrap());
+            // The grammar the pattern parses with is the document grammar.
+            assert_eq!(
+                PatternLanguage::new(lang, support).grammar,
+                document,
+                "{name}"
+            );
+            // Only a preamble language lets ast-grep's own grammar differ.
+            if spec.policy.pattern_preamble.is_empty() {
+                assert_eq!(support.get_ts_language(), document, "{name}");
+            }
         }
+    }
+
+    #[test]
+    fn php_patterns_match_code_after_inline_html() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            "<div class=\"x\">{ it's }</div>\n<?php\n$out = wrap($this->value);\n?>\n<p>done</p>\n";
+        std::fs::write(directory.path().join("page.phtml"), source).unwrap();
+        let mut patterns = StructuralPatterns::default();
+        patterns.prepare("php", "wrap($this->$P)").unwrap();
+        let result = patterns
+            .search(
+                "php",
+                "wrap($this->$P)",
+                directory.path(),
+                None,
+                &OutlineCache::new(),
+            )
+            .unwrap();
+        assert_eq!(result.retained, 1);
+        assert_eq!(result.groups[0].path, "page.phtml");
+        let start = source.find("wrap(").unwrap();
+        let end = source.find(");").unwrap() + 1;
+        assert_eq!(
+            serde_json::to_value(&result.groups).unwrap(),
+            serde_json::json!([{"path": "page.phtml", "matches": [
+                [3, 3, start, end, {"P": [[3, 3, end - 6, end - 1]]}]
+            ]}])
+        );
+        assert!(patterns.prepare("php", "a(); b();").is_err());
     }
 
     #[test]

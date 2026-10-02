@@ -28,6 +28,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::swift::canonical_anchor,
     attach_leading_adornment: crate::lang::swift::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Swift),
         search_priority: 9,
         search_extensions: &["swift"],
         basename_extensions: &["swift"],

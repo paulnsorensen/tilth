@@ -64,7 +64,9 @@ pub(super) fn walk_to_enclosing_definition<'a>(
             let mut parent = definition.parent();
             while let Some(container) = parent {
                 let container_name = if TYPE_KINDS.contains(&container.kind()) {
+                    // Grammars without a `name` field (Kotlin) name types through the spec.
                     extract_definition_name(container, lines)
+                        .or_else(|| (definitions.extract_name)(container, lines))
                 } else if (definitions.is_container)(container, lines) {
                     (definitions.extract_name)(container, lines)
                 } else {
@@ -331,6 +333,20 @@ mod tests {
             assert_eq!(scope.kind, *kind, "kind mismatch for {filename}");
             assert_eq!(scope.name, *name, "name mismatch for {filename}");
         }
+    }
+
+    #[test]
+    fn enclosing_at_kotlin_method_qualifies_with_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "a.kt",
+            "class Service {\n    fun handle() {\n        val x = 1\n    }\n}\n",
+        );
+        let cache = OutlineCache::new();
+        let scope = enclosing_definition_at(&p, 3, &cache).unwrap();
+        assert_eq!(scope.kind, "function");
+        assert_eq!(scope.name, "Service.handle");
     }
 
     #[test]

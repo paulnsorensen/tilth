@@ -687,10 +687,10 @@ mod tests {
     fn shared_query_cache_uses_unnamed_grammar_identity() {
         const QUERY: &str = "(identifier) @grammar_identity_target";
         const RUST_SOURCE: &str = "fn rust_marker() {}";
-        const KOTLIN_SOURCE: &str = "fun kotlinMarker() {}";
+        const KOTLIN_SOURCE: &str = "package kotlinMarker";
 
         let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        let kotlin: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let kotlin: tree_sitter::Language = tree_sitter_kotlin_sg::LANGUAGE.into();
         assert_eq!(kotlin.name(), None);
 
         let rust_tree = parse_source(RUST_SOURCE, &rust).expect("rust source parses");

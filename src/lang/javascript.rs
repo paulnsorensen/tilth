@@ -33,6 +33,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::javascript::canonical_anchor,
     attach_leading_adornment: crate::lang::javascript::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::JavaScript),
         import_line,
         import_external,
         import_resolver: resolve_import,
