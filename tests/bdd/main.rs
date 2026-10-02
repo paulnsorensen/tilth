@@ -20,6 +20,7 @@ struct TilthWorld {
     before_write: Vec<u8>,
     fixture: Option<Fixture>,
     fixture_path: String,
+    cli_output: String,
 }
 
 impl TilthWorld {
@@ -286,30 +287,62 @@ fn read_range_exact(world: &mut TilthWorld, first: u64, last: u64, step: &cucumb
 
 #[then("the search callers are exactly")]
 fn search_callers(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
+    let actual = follow_items(world, "fetch_callers");
+    assert_eq!(actual, docstring(step), "{world:?}");
+}
+
+#[then("the search callees are exactly")]
+fn search_callees(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
+    let actual = follow_items(world, "fetch_callees");
+    assert_eq!(actual, docstring(step), "{world:?}");
+}
+
+/// Follow the search hint of `kind`; return sorted `path:line name` rows.
+fn follow_items(world: &mut TilthWorld, kind: &str) -> String {
     let hint = world.search_payload()["hints"]
         .as_array()
         .expect("search hints")
         .iter()
-        .find(|hint| hint["kind"] == "fetch_callers")
-        .expect("fetch_callers hint")
+        .find(|hint| hint["kind"] == kind)
+        .unwrap_or_else(|| panic!("{kind} hint"))
         .clone();
     world.call("tilth_search", json!({"queries": [{"follow": hint}]}));
     let payload = world.search_payload();
     let mut actual = payload["results"][0]["items"]
         .as_array()
-        .expect("caller items")
+        .expect("follow items")
         .iter()
         .map(|item| {
             format!(
                 "{}:{} {}",
-                item["path"].as_str().expect("caller path"),
+                item["path"].as_str().expect("item path"),
                 item["line"],
-                item["name"].as_str().expect("caller name")
+                item["name"].as_str().expect("item name")
             )
         })
         .collect::<Vec<_>>();
     actual.sort();
-    assert_eq!(actual.join("\n"), docstring(step), "{world:?}");
+    actual.join("\n")
+}
+
+#[when(expr = "I run the expanded CLI search for {string}")]
+fn cli_expanded_search(world: &mut TilthWorld, query: String) {
+    world.cli_output = world.session().cli(&[&query, "--expand"]);
+}
+
+/// Compare `name path:range` rows of one `-- section --` block.
+#[then(expr = "the CLI {word} section is exactly")]
+fn cli_section(world: &mut TilthWorld, section: String, step: &cucumber::gherkin::Step) {
+    let header = format!("-- {section} --");
+    let rows = world
+        .cli_output
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .map(|row| row.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.join("\n"), docstring(step), "{}", world.cli_output);
 }
 #[then(expr = "the dependency report has exactly 1 local dependency {string}")]
 fn exact_local_dependency(world: &mut TilthWorld, path: String) {

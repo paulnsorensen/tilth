@@ -429,6 +429,108 @@ fn resolve_second_hop(
 mod tests {
     use super::*;
 
+    /// Every callee pattern of every language, as raw names before resolution.
+    #[test]
+    fn callee_names_cover_every_query_pattern() {
+        let cases: &[(Lang, &str, &[&str])] = &[
+            (
+                Lang::Rust,
+                "fn f() { plain(); s.method(); Kind::scoped(); shout!(); }\n",
+                &["method", "plain", "scoped", "shout"],
+            ),
+            (
+                Lang::Python,
+                "plain()\ns.method()\n",
+                &["method", "plain"],
+            ),
+            (
+                Lang::Go,
+                "package p\nfunc f() { plain(); s.method() }\n",
+                &["method", "plain"],
+            ),
+            (
+                Lang::C,
+                "void f(void) { plain(); s.field(); p->arrow(); }\n",
+                &["arrow", "field", "plain"],
+            ),
+            (
+                Lang::Cpp,
+                "void f() { plain(); s.field(); this->arrow(); }\n",
+                &["arrow", "field", "plain"],
+            ),
+            (
+                Lang::CSharp,
+                "class K { void F() { Plain(); s.Member(); } }\n",
+                &["Member", "Plain"],
+            ),
+            (
+                Lang::Java,
+                "class K { void f() { plain(); s.member(); } }\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::JavaScript,
+                "plain();\ns.member();\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::TypeScript,
+                "plain();\ns.member();\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::Tsx,
+                "const v = <div>{plain() + s.member()}</div>;\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::Kotlin,
+                "fun f() { plain(); s.member() }\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::Php,
+                "<?php\nplain();\n\\ns\\qualified();\nnamespace\\relative();\n$o->member();\n$o?->nullsafe();\nK::scoped();\n",
+                &[
+                    "\\ns\\qualified",
+                    "member",
+                    "namespace\\relative",
+                    "nullsafe",
+                    "plain",
+                    "scoped",
+                ],
+            ),
+            (
+                Lang::Ruby,
+                "plain()\ns.member\nbare\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::Scala,
+                "object O { plain(); s.member(); a infix b }\n",
+                &["infix", "member", "plain"],
+            ),
+            (
+                Lang::Swift,
+                "plain()\ns.member()\n",
+                &["member", "plain"],
+            ),
+            (
+                Lang::Elixir,
+                "plain()\nMod.remote()\n",
+                &["plain", "remote"],
+            ),
+            (Lang::Bash, "first arg\nsecond\n", &["first", "second"]),
+        ];
+        for (lang, source, expected) in cases {
+            assert_eq!(
+                extract_callee_names(source, *lang, None),
+                *expected,
+                "{lang:?}"
+            );
+        }
+    }
+
     #[test]
     fn extract_kotlin_callee_names() {
         let kotlin = r#"fun example() {

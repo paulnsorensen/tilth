@@ -343,4 +343,42 @@ mod tests {
             vec!["keep", "value"]
         );
     }
+
+    /// Every sibling pattern keeps receiver members and drops other objects.
+    #[test]
+    fn sibling_references_cover_every_query_pattern() {
+        let cases: &[(Lang, &str)] = &[
+            (
+                Lang::Rust,
+                "impl K {\n    fn run(&self, o: K) {\n        self.value;\n        self.keep();\n        o.drop();\n    }\n}\n",
+            ),
+            (
+                Lang::Java,
+                "class K {\n    void run(K o) {\n        this.value = 1;\n        this.keep();\n        o.drop();\n    }\n}\n",
+            ),
+            (
+                Lang::JavaScript,
+                "class K {\n  run(o) {\n    this.value;\n    this.keep();\n    o.drop();\n  }\n}\n",
+            ),
+            (
+                Lang::TypeScript,
+                "class K {\n  run(o: K) {\n    this.value;\n    this.keep();\n    o.drop();\n  }\n}\n",
+            ),
+            (
+                Lang::Tsx,
+                "class K {\n  run(o: K) {\n    this.value;\n    this.keep();\n    o.drop();\n  }\n}\n",
+            ),
+            (
+                Lang::Swift,
+                "class K {\n    func run(o: K) {\n        self.value\n        self.keep()\n        o.drop()\n    }\n}\n",
+            ),
+        ];
+        for (lang, source) in cases {
+            assert_eq!(
+                extract_sibling_references(source, *lang, (2, 6)),
+                vec!["keep", "value"],
+                "{lang:?}"
+            );
+        }
+    }
 }

@@ -56,6 +56,8 @@ Runner API: [Cucumber Rust](https://docs.rs/cucumber/latest/cucumber/).
 
 `upstream.feature` covers reported Python caller loss, Ruby declarations, C++ containers and operators, and JavaScript-to-TypeScript import resolution. Caller checks follow the search `fetch_callers` hint and compare exact locations on cold and warm requests. The Python caller fixtures import the target relatively because `fetch_callers` binds callers through the import resolver. Dependency checks compare resolved paths and existing reverse call-site dependents. These regressions use the existing grammars and filename registry.
 
+`calls.feature` pins the call and member queries of the 17 grammar-backed languages. Callers and callees follow the search hints. Siblings come from `tilth <symbol> --expand`, because MCP search does not report them. Fixtures avoid the known Swift parse of `a.b() + c()` and its `let x = f()` enclosing-name quirk. Raw query captures that resolution hides, such as Rust macros and PHP qualified names, stay in unit goldens in `src/search/callees.rs` and `src/search/siblings.rs`.
+
 A leading vertical bar in an expected docstring preserves source indentation. The step implementation removes only that marker before exact comparison.
 
 ## Unit migration parity
