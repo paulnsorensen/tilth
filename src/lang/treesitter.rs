@@ -920,7 +920,7 @@ mod tests {
     fn extract_definition_name_go_type_declaration_struct() {
         // Go type_declaration carries no name field itself — the name lives on
         // the inner type_spec. Without the descent every Go type definition is
-        // dropped as nameless (the gin HandlersChain grok failure).
+        // dropped as nameless (the gin HandlersChain resolution failure).
         let src = "type Engine struct {\n\tpool int\n}\n";
         let tree = parse(src, Lang::Go);
         let lines: Vec<&str> = src.lines().collect();

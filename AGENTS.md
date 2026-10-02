@@ -17,7 +17,6 @@ ROUTE:
 - Find/explore → `tilth_search`: `queries: [{query, glob?} | {follow: hint} | {pattern: "Some($A)", language, glob?}]`; `pattern` matches code shape for any `language` the schema lists; routing is automatic. Do not add query `kind`, `expand`, or `context`.
 - Read known files/symbols/ranges → `tilth_read`; omit `mode`. DO NOT pass `mode: full` when a `path#symbol` or `path#n-m` section answers.
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
-- Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
 - Changes/history → shell `git diff` or `git log`.
 - Browse directories → shell `ls` or `find`.
 DO NOT re-read expanded search content.
@@ -39,5 +38,5 @@ READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numb
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
-ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint} | {pattern: "Some($A)", language, glob?}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read` (omit `mode`); importers/imports → `tilth_deps`; understand one symbol → `tilth_grok`; changes/history → shell `git diff` or `git log`; browse directories → shell `ls` or `find`.
+ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint} | {pattern: "Some($A)", language, glob?}]`; routing is automatic; do not select kind, expand, or context); read → `tilth_read` (omit `mode`); importers/imports → `tilth_deps`; changes/history → shell `git diff` or `git log`; browse directories → shell `ls` or `find`.
 DO NOT re-read expanded search content.

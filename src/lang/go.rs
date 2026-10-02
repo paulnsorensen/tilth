@@ -12,8 +12,6 @@ const CALLEE_QUERY: &str = concat!(
 const SIBLING_QUERY: &str =
     "(selector_expression operand: (identifier) @recv field: (field_identifier) @ref)\n";
 
-const RECEIVER_TYPE_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration type: [(type_identifier) @ty (pointer_type (type_identifier) @ty)])) name: (field_identifier) @method)";
-
 /// Root (first `/`-segment) of each Go stdlib package. A Go import is stdlib
 /// when its first path segment is one of these — covering both single-segment
 /// (`fmt`) and multi-segment (`net/http`, `encoding/json`) forms. Matching the
@@ -93,7 +91,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
             max_files: 20,
             max_file_size: 100_000,
         }),
-        receiver_type_query: Some(RECEIVER_TYPE_QUERY),
         restore_grouped_name: true,
         search_priority: 9,
         search_extensions: &["go"],

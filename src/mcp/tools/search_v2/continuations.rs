@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
-use crate::search::{callees, callers, grok};
+use crate::search::{callees, callers, target};
 use crate::types::is_test_file;
 
 const SECTION_CAP: usize = 30;
@@ -108,12 +108,11 @@ impl Target {
             return Err("follow target is outside its glob".into());
         }
         if let Some(line) = self.line {
-            let spec = format!("{}:{line}", full.display());
             let (target, _, _) = match (self.name.as_deref(), self.occurrence) {
-                (Some(name), Some(occurrence)) => {
-                    grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd, cache)
-                }
-                _ => grok::resolve_with_source_cached(&spec, cwd, cache),
+                (Some(name), Some(occurrence)) => target::resolve_by_path_line_occurrence(
+                    &full, line, name, occurrence, cwd, cache,
+                ),
+                _ => target::resolve_by_path_line(&full, line, cache),
             }
             .map_err(|e| e.to_string())?;
             if target.start_line != line || Some(&target.name) != self.name.as_ref() {
@@ -215,12 +214,12 @@ impl Follow {
             return Ok(result);
         }
         let full = cwd.join(&self.target.path);
-        let spec = format!("{}:{}", full.display(), self.target.line.unwrap());
+        let line = self.target.line.unwrap();
         let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
             (Some(name), Some(occurrence)) => {
-                grok::resolve_with_source_occurrence(&spec, name, occurrence, cwd, cache)
+                target::resolve_by_path_line_occurrence(&full, line, name, occurrence, cwd, cache)
             }
-            _ => grok::resolve_with_source_cached(&spec, cwd, cache),
+            _ => target::resolve_by_path_line(&full, line, cache),
         }
         .map_err(|e| e.to_string())?;
         self.target.validate_occurrence(&full, cwd, cache)?;
@@ -240,7 +239,7 @@ impl Follow {
                         )
                     },
                 );
-                items = grok::collect_siblings(&entries, &target)
+                items = target::collect_siblings(&entries, &target)
                     .into_iter()
                     .map(|s| {
                         let signature =

@@ -639,8 +639,7 @@ fn push_locked(paths: &Mutex<Vec<PathBuf>>, path: PathBuf) {
 }
 
 /// Returns true if the name is a noise/placeholder that should be excluded
-/// from the reverse-dependency search. Also used by `fuzzy_symbol` to filter
-/// the grok suggestion candidate pool — one home for the invariant.
+/// from the reverse-dependency search.
 pub(crate) fn is_placeholder_name(name: &str) -> bool {
     if name == "<anonymous>" {
         return true;

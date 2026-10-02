@@ -367,31 +367,6 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, revision);
     }
-
-    /// Check-and-record in one lock acquisition: returns what
-    /// [`Self::is_expanded`] would have returned, and records this expansion
-    /// if it did not.
-    ///
-    /// Callers that check first and record after the body is assembled hold
-    /// no lock in between, so two concurrent calls for the same target both
-    /// see "not expanded" and both inline the full body — the dedup pays for
-    /// itself only when exactly one caller can win the claim.
-    pub fn claim_expand(
-        &self,
-        path: &Path,
-        line: u32,
-        revision: &crate::util::FileRevision,
-    ) -> bool {
-        let key = format!("{}:{}", path.display(), line);
-        let mut expanded = self
-            .expanded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match expanded.insert(key, revision.clone()) {
-            Some(previous) => previous == *revision,
-            None => false,
-        }
-    }
 }
 
 impl Default for Session {
@@ -414,14 +389,11 @@ mod tests {
         let session = Session::new();
         session.record_expand(&path, 1, revision.clone());
         assert!(session.is_expanded(&path, 1, &revision));
-        assert!(session.claim_expand(&path, 1, &revision));
         crate::util::rewrite_with_restored_mtime(&path, mtime, || {
             std::fs::write(&path, "fn bravo() {}").unwrap();
         });
         let changed = crate::util::FileRevision::of(&path).unwrap();
         assert!(!session.is_expanded(&path, 1, &changed));
-        assert!(!session.claim_expand(&path, 1, &changed));
-        assert!(session.claim_expand(&path, 1, &changed));
     }
 
     #[test]
@@ -589,7 +561,7 @@ mod tests {
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_grok", &serde_json::json!({ "target": "X" }), true),
+            session.batch_nudge("tilth_deps", &serde_json::json!({ "path": "x.rs" }), true),
             None
         );
         assert_eq!(

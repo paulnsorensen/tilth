@@ -16,10 +16,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     has_lifetimes: false,
     strip_family: Some(StripFamily::CppC),
     extract_receiver: None,
-    definitions: crate::lang::spec::DefinitionOps {
-        qualified_owner,
-        ..DEFAULT_DEFS
-    },
+    definitions: DEFAULT_DEFS,
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     canonical_anchor: crate::lang::cpp::canonical_anchor,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
@@ -42,30 +39,4 @@ pub(crate) fn canonical_anchor(node: tree_sitter::Node) -> tree_sitter::Node {
     } else {
         node
     }
-}
-
-fn qualified_owner(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let mut pending = vec![node.child_by_field_name("declarator")?];
-    while let Some(current) = pending.pop() {
-        if current.kind() == "qualified_identifier" {
-            if let Some(name) = current.child_by_field_name("name") {
-                if name.kind() == "qualified_identifier" {
-                    pending.push(name);
-                    continue;
-                }
-            }
-            let scope = current.child_by_field_name("scope")?;
-            return Some(crate::lang::treesitter::node_text_simple(
-                scope,
-                lines,
-                crate::lang::treesitter::NodeTextMode::Full,
-            ));
-        }
-        for field in ["name", "declarator"].into_iter().rev() {
-            if let Some(child) = current.child_by_field_name(field) {
-                pending.push(child);
-            }
-        }
-    }
-    None
 }

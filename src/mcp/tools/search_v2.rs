@@ -1,6 +1,6 @@
 //! The canonical `tilth_search` engine: deterministic query routing (path ->
 //! regex -> signature-prefix normalization -> filename-shaped miss ->
-//! symbol/ambiguous -> literal -> miss) with bounded grok/deps enrichment on
+//! symbol/ambiguous -> literal -> miss) with bounded definition/deps enrichment on
 //! unique hits, plus a `follow` branch that executes the continuation hints a
 //! prior result handed back (see
 //! `.hallouminate/wiki/adr/tilth-search-v2-roadmap-006.md`).
@@ -1087,7 +1087,7 @@ fn unique_hit(
         (target_path.to_path_buf(), None, None, body, core_partial)
     } else {
         let (target, content, _) = match occurrence {
-            Some(occurrence) => crate::search::grok::resolve_candidate_with_source_occurrence(
+            Some(occurrence) => crate::search::target::resolve_candidate_with_source_occurrence(
                 target_path,
                 target_line,
                 semantic_end,
@@ -1095,7 +1095,7 @@ fn unique_hit(
                 occurrence,
                 cache,
             )?,
-            None => crate::search::grok::resolve_candidate_with_source(
+            None => crate::search::target::resolve_candidate_with_source(
                 target_path,
                 target_line,
                 semantic_end,

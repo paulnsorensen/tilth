@@ -12,6 +12,7 @@ Feature: Upstream language regressions stay fixed
       """
     And the file "upstream/caller.py" contains exactly
       ```
+      from .target import after_the_apostrophe
       FIXTURE = """
       {"prompt": "count ripgrep's lines"}
       """
@@ -21,6 +22,7 @@ Feature: Upstream language regressions stay fixed
       ```
     And the file "upstream/single.py" contains exactly
       """
+      from .target import after_the_apostrophe
       FIXTURE = '''
       owner's fixture
       '''
@@ -30,28 +32,29 @@ Feature: Upstream language regressions stay fixed
       """
     And the file "upstream/hash.py" contains exactly
       """
+      from .target import after_the_apostrophe
       # caller's note
       def hash_caller():
           after_the_apostrophe()
       """
-    When I grok "after_the_apostrophe"
-    Then grok resolves "after_the_apostrophe" in "upstream/target.py" at line 1 without ambiguity
+    When I search for "after_the_apostrophe"
+    Then the search resolves "after_the_apostrophe" in "upstream/target.py" at line 1
       """
       def after_the_apostrophe():
           pass
       """
-    And grok reports callers exactly
+    And the search callers are exactly
       """
-      upstream/caller.py:6 caller
-      upstream/hash.py:3 hash_caller
-      upstream/single.py:6 single_caller
+      upstream/caller.py:7 caller
+      upstream/hash.py:4 hash_caller
+      upstream/single.py:7 single_caller
       """
-    When I grok "after_the_apostrophe"
-    Then grok reports callers exactly
+    When I search for "after_the_apostrophe"
+    Then the search callers are exactly
       """
-      upstream/caller.py:6 caller
-      upstream/hash.py:3 hash_caller
-      upstream/single.py:6 single_caller
+      upstream/caller.py:7 caller
+      upstream/hash.py:4 hash_caller
+      upstream/single.py:7 single_caller
       """
 
   @issue226
@@ -70,8 +73,8 @@ Feature: Upstream language regressions stay fixed
         end
       end
       """
-    When I grok "Greeter"
-    Then grok resolves "Greeter" in "upstream/greeter.rb" at line 1 without ambiguity
+    When I search for "Greeter"
+    Then the search resolves "Greeter" in "upstream/greeter.rb" at line 1
       """
       class Greeter
         def hello
@@ -79,33 +82,20 @@ Feature: Upstream language regressions stay fixed
         end
       end
       """
-    When I grok "Greeter::hello"
-    Then grok resolves "hello" in "upstream/greeter.rb" at line 2 without ambiguity
+    When I search for "hello"
+    Then the search resolves "hello" in "upstream/greeter.rb" at line 2
       """
       |  def hello
       |    1
       |  end
       """
-    When I grok "Factory::build"
-    Then grok resolves "build" in "upstream/greeter.rb" at line 8 without ambiguity
+    When I search for "build"
+    Then the search resolves "build" in "upstream/greeter.rb" at line 8
       """
       |  def self.build
       |    Greeter.new
       |  end
       """
-
-  Scenario: Same-line Ruby classes retain method ownership
-    Given the file "upstream/same-line.rb" contains exactly
-      """
-      class SameLineRuby; def call; 7; end; end
-      """
-    When I grok "SameLineRuby::call"
-    Then grok resolves "call" in "upstream/same-line.rb" at line 1 without ambiguity
-      """
-      class SameLineRuby; def call; 7; end; end
-      """
-    When I grok "OtherRuby::call"
-    Then grok fails because "call" is not owned by "OtherRuby"
 
   @issue227
   Scenario: C++ containers operators and qualified definitions keep canonical names
@@ -143,8 +133,8 @@ Feature: Upstream language regressions stay fixed
 
       int ns::Nested::far() { return 6; }
       """
-    When I grok "Widget"
-    Then grok resolves "Widget" in "upstream/widget.cpp" at line 1 without ambiguity
+    When I search for "Widget"
+    Then the search resolves "Widget" in "upstream/widget.cpp" at line 1
       """
       class Widget {
       public:
@@ -153,63 +143,25 @@ Feature: Upstream language regressions stay fixed
           Widget operator+(const Widget& other) const { return other; }
       };
       """
-    When I grok "Record"
-    Then grok resolves "Record" in "upstream/widget.cpp" at line 8 without ambiguity
+    When I search for "Record"
+    Then the search resolves "Record" in "upstream/widget.cpp" at line 8
       """
       struct Record {
           int value;
       };
       """
-    When I grok "Widget::inline_method"
-    Then grok resolves "inline_method" in "upstream/widget.cpp" at line 3 without ambiguity
+    When I search for "inline_method"
+    Then the search resolves "inline_method" in "upstream/widget.cpp" at line 3
       """
       |    int inline_method() { return 2; }
       """
-    When I grok "operator+"
-    Then grok resolves "operator+" in "upstream/widget.cpp" at line 5 without ambiguity
-      """
-      |    Widget operator+(const Widget& other) const { return other; }
-      """
-    When I grok "Widget::operator+"
-    Then grok resolves "operator+" in "upstream/widget.cpp" at line 5 without ambiguity
-      """
-      |    Widget operator+(const Widget& other) const { return other; }
-      """
-    When I grok "Widget::outside_method"
-    Then grok resolves "outside_method" in "upstream/widget.cpp" at line 12 without ambiguity
-      """
-      int Widget::outside_method() { return 3; }
-      """
-    When I grok "Other::outside_method"
-    Then grok resolves "outside_method" in "upstream/widget.cpp" at line 19 without ambiguity
-      """
-      int Other::outside_method() { return 4; }
-      """
-    When I grok "Nested::outside"
-    Then grok resolves "outside" in "upstream/widget.cpp" at line 28 without ambiguity
-      """
-      |int Nested::outside() { return 5; }
-      """
-    When I grok "Nested::far"
-    Then grok resolves "far" in "upstream/widget.cpp" at line 31 without ambiguity
+    When I search for "outside_method"
+    Then the search is ambiguous between "upstream/widget.cpp" lines 12 and 19
+    When I search for "far"
+    Then the search resolves "far" in "upstream/widget.cpp" at line 31
       """
       int ns::Nested::far() { return 6; }
       """
-    When I grok "Record::outside_method"
-    Then grok fails because "outside_method" is not owned by "Record"
-
-  Scenario: Same-line C++ classes retain method ownership
-    Given the file "upstream/same-line.cpp" contains exactly
-      """
-      class SameLineCpp { public: int call() { return 7; } };
-      """
-    When I grok "SameLineCpp::call"
-    Then grok resolves "call" in "upstream/same-line.cpp" at line 1 without ambiguity
-      """
-      class SameLineCpp { public: int call() { return 7; } };
-      """
-    When I grok "OtherCpp::call"
-    Then grok fails because "call" is not owned by "OtherCpp"
 
   @issue225
   Scenario: TypeScript resolves missing JavaScript specifiers to source files

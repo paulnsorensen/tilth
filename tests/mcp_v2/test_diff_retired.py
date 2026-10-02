@@ -1,4 +1,4 @@
-"""The retired MCP diff tool directs callers to Git in both modes."""
+"""Retired MCP tools stay out of the registry and redirect callers in both modes."""
 import unittest
 
 import harness
@@ -36,3 +36,21 @@ class DiffRetired(unittest.TestCase):
                     self.assertIn("retired tool", text)
                     self.assertIn("git diff", text)
                     self.assertIn("git log", text)
+
+
+class GrokRetired(unittest.TestCase):
+    def test_absent_from_registry_and_calls_point_to_search(self):
+        for flags in [[], ["--edit"]]:
+            with self.subTest(flags=flags):
+                result = harness.run_mcp(flags, [
+                    harness.initialize_request(),
+                    harness.tools_list_request(),
+                    harness.tools_call_request(3, "tilth_grok", {"target": "main"}),
+                ])
+                self.assertEqual(result.returncode, 0)
+                self.assertNotIn("tilth_grok", result.tool_names())
+                response = result.response_by_id(3)
+                self.assertTrue(harness.tool_is_error(response))
+                text = harness.tool_result_text(response)
+                self.assertIn("retired tool", text)
+                self.assertIn("tilth_search", text)

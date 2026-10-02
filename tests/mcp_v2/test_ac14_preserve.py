@@ -14,15 +14,14 @@ def setUpModule():
 
 
 class AC14Preserve(unittest.TestCase):
-    def test_grok_and_deps_unchanged(self):
+    def test_deps_unchanged(self):
         requests = [
             harness.initialize_request(1),
             harness.tools_call_request(2, "tilth_deps", {"path": "src/types.rs", "cwd": CWD}),
-            harness.tools_call_request(3, "tilth_grok", {"target": "detect_file_type", "cwd": CWD}),
         ]
         res = harness.run_mcp([], requests)
         self.assertEqual(res.returncode, 0, msg=harness.WITNESS[_AC])
-        for request_id in [2, 3]:
+        for request_id in [2]:
             response = res.response_by_id(request_id)
             self.assertIsNotNone(response, msg=harness.WITNESS[_AC])
             self.assertFalse(harness.tool_is_error(response), msg=harness.WITNESS[_AC])

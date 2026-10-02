@@ -23,7 +23,7 @@ class GinRouteCatchAllLogicTask(Task):
     never mentions ``tree.go``, ``getValue``, or the ``n.path`` slice. Grepping
     the failing value finds the route registration and the handler, not the
     tree math. Localising the cause requires walking the call chain from the
-    router into the tree (tilth ``kind:callers`` / ``tilth_grok``), which is the
+    router into the tree (tilth ``fetch_callers`` follow hints), which is the
     navigation case a text search cannot express.
 
     Each gate test also asserts the sibling ``:name``/``:last_name`` params, so a

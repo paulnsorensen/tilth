@@ -42,7 +42,7 @@ Treat these findings as adapter requirements, not evidence that Tree-sitter cann
 ## Shared parsed documents in the fork
 
 Tilth's parsed-document cache owns cached source and syntax trees through one ast-grep `StrDoc` per revision.
-Production read, search, grok, caller, and structural paths borrow that document through `ParsedFile`.
+Production read, search, caller, and structural paths borrow that document through `ParsedFile`.
 The MCP service passes one existing `OutlineCache` through these paths; it does not add a second parser cache.[^17]
 
 Disk revisions guard cache reuse and publication.
@@ -67,7 +67,7 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 
 [^17]: src/cache.rs::ParsedFile; src/cache.rs::OutlineCache::parse_with_revision; src/read/outline/mod.rs::generate_cached; src/mcp/mod.rs::tests::documents_reuse_real_parses_across_production_requests
 [^18]: src/search/structural.rs::tests::owned_document_borrows_cached_bytes_and_tree; src/mcp/tools/search_v2.rs::tests::structural_requests_retain_one_real_candidate_root; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
-[^19]: src/cache.rs::MAX_PARSED_ENTRIES; src/cache.rs::OutlineCache::get_or_parse; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
+[^19]: src/cache.rs::MAX_PARSED_ENTRIES; src/cache.rs::OutlineCache::get_or_parse; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_target_results
 [^20]: src/lang/treesitter.rs::with_query and shared_query_* tests; src/search/callers.rs::find_callers_treesitter_batch; src/search/callees.rs::extract_callee_names_from_tree; src/search/siblings.rs::extract_sibling_references_from_tree; src/lang/go.rs::extract_go_receiver_name
 
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_

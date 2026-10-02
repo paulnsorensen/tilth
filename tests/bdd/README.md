@@ -54,25 +54,25 @@ Runner API: [Cucumber Rust](https://docs.rs/cucumber/latest/cucumber/).
 
 `history.feature` records each regression family with commit or pull-request tags. Expected paths, canonical lines, names, ambiguity, and bodies are fixture literals. Tests do not read the production registry or parser tables to build an oracle.
 
-`upstream.feature` covers reported Python caller loss, Ruby declarations, C++ ownership and operators, and JavaScript-to-TypeScript import resolution. Caller checks compare exact locations on cold and warm requests. Dependency checks compare resolved paths and existing reverse call-site dependents. These regressions use the existing grammars and filename registry.
+`upstream.feature` covers reported Python caller loss, Ruby declarations, C++ containers and operators, and JavaScript-to-TypeScript import resolution. Caller checks follow the search `fetch_callers` hint and compare exact locations on cold and warm requests. The Python caller fixtures import the target relatively because `fetch_callers` binds callers through the import resolver. Dependency checks compare resolved paths and existing reverse call-site dependents. These regressions use the existing grammars and filename registry.
 
 A leading vertical bar in an expected docstring preserves source indentation. The step implementation removes only that marker before exact comparison.
 
 ## Unit migration parity
 
-Eleven candidate unit tests are fully migrated. `deeply_nested_definitions_detected` is split because raw definition counts have no public MCP equivalent.
+Four candidate unit tests remain fully migrated; two keep partial coverage. `deeply_nested_definitions_detected` is split because raw definition counts have no public MCP equivalent. The qualified-owner rows record tests that left with `tilth_grok`, which owned `Type::method` resolution.
 
 | Candidate unit function | Original assertions | Migration disposition |
 | --- | --- | --- |
-| `resolve_qualified_target_strips_type_prefix` | Both separator forms resolve name `dispatch`; each has zero other definitions. | “Rust qualified targets accept both separator forms” checks both public grok headers, bodies, and absence of ambiguity. |
-| `qualified_nested_wrapped_classes_keep_the_real_owner` | Python and TypeScript qualified targets retain the inner class name. | “Nested wrapped classes keep their real owners” checks exact public grok names, paths, canonical lines, and bodies. The TypeScript wrapper duplicate remains visible because the removed unit did not assert its ambiguity count. |
-| `resolve_qualified_target_ambiguous_segment_resolves_named_owner` | Alpha and Beta resolve name `dispatch`, select their owner files, and report zero other definitions. | “Qualified Rust owner removes same-name ambiguity” checks both candidates, then exact Alpha and Beta grok targets without ambiguity. |
-| `resolve_qualified_target_typescript_class_method` | Name is `dispatch`; path is `beta.ts`. | “Qualified TypeScript owner selects the requested method” checks name, path, line, body, and ambiguity. |
-| `resolve_qualified_target_python_class_method` | Name is `dispatch`; path is `alpha.py`. | “Qualified Python owner selects the requested method” checks name, path, line, body, and ambiguity. |
-| `resolve_qualified_target_go_receiver_type` | Name is `Bar`; receiver owner selects `foo.go`. | “Qualified Go owner selects the requested receiver” checks name, path, line, body, and ambiguity. |
-| `resolve_go_grouped_and_multi_name_declarations_use_query_name` | Returned names equal `StatusInactive` and `CounterB`. | “Grouped and multi-name Go declarations retain the query name” checks both public grok headers and bodies. |
+| `resolve_qualified_target_strips_type_prefix` | Both separator forms resolve name `dispatch`; each has zero other definitions. | Removed with `tilth_grok`. |
+| `qualified_nested_wrapped_classes_keep_the_real_owner` | Python and TypeScript qualified targets retain the inner class name. | “Nested wrapped classes keep their decorated spans” checks the inner class name, path, canonical line, and decorated body through search. The owner check left with `tilth_grok`. |
+| `resolve_qualified_target_ambiguous_segment_resolves_named_owner` | Alpha and Beta resolve name `dispatch`, select their owner files, and report zero other definitions. | “Same-name Rust methods stay ambiguous to search” checks both candidates. Owner selection left with `tilth_grok`. |
+| `resolve_qualified_target_typescript_class_method` | Name is `dispatch`; path is `beta.ts`. | Removed with `tilth_grok`. |
+| `resolve_qualified_target_python_class_method` | Name is `dispatch`; path is `alpha.py`. | Removed with `tilth_grok`. |
+| `resolve_qualified_target_go_receiver_type` | Name is `Bar`; receiver owner selects `foo.go`. | Removed with `tilth_grok`. |
+| `resolve_go_grouped_and_multi_name_declarations_use_query_name` | Returned names equal `StatusInactive` and `CounterB`. | “Grouped and multi-name Go declarations retain the query name” checks both search targets and bodies. |
 | `deeply_nested_definitions_detected` | TypeScript and Rust each return exactly one raw definition, set `is_definition`, and use lines 2 and 3. | The two “Deep …” scenarios check public classification, path, line, and body. A focused unit test retains exact raw-count, line, and definition invariants because MCP deduplicates overlapping definitions. |
-| `elixir_definitions_detected` | The dotted module is a definition; public function, private function, and macro block forms are non-empty definitions. | The Elixir scenario checks the dotted module through grok, block-form `hello` and `my_macro`, and keyword-form `private_helper` through exact structural search. |
+| `elixir_definitions_detected` | The dotted module is a definition; public function, private function, and macro block forms are non-empty definitions. | The Elixir scenario checks block-form `hello` and `my_macro`, and keyword-form `private_helper`, through exact structural search. The dotted-module check left with `tilth_grok`: search routes a dotted query to literal search. |
 | `elixir_guard_clause_definitions` | Guarded public block form, guarded private keyword form, and `defguard` are non-empty definitions. | The Elixir scenario checks block-form `safe_div`, keyword-form private `checked`, and `is_positive` as exact structural results. |
 | `elixir_delegate_and_nested_modules` | Delegate and nested module are non-empty definitions. | The Elixir scenario checks `count` and `Inner` as exact structural results. |
 | `symbol_read_resolves_doubly_nested_definition` | Private range resolution returns lines 3–5. | “Deep Rust definitions are searchable and readable by symbol” compares exactly the three numbered source lines. |

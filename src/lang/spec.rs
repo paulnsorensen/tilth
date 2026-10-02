@@ -162,7 +162,6 @@ pub(crate) struct LanguagePolicy {
     pub sibling_object: Option<&'static str>,
     pub callee_allowed: fn(&str) -> bool,
     pub same_package: Option<SamePackagePolicy>,
-    pub receiver_type_query: Option<&'static str>,
     pub restore_grouped_name: bool,
     pub search_priority: u8,
     pub search_extensions: &'static [&'static str],
@@ -212,7 +211,6 @@ pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
     sibling_object: None,
     callee_allowed: allow_callee,
     same_package: None,
-    receiver_type_query: None,
     restore_grouped_name: false,
     search_priority: 3,
     search_extensions: &[],
@@ -340,8 +338,6 @@ pub(crate) struct DefinitionOps {
     pub extract_name: fn(tree_sitter::Node, &[&str]) -> Option<String>,
     /// Return a query's exact name line for grouped declarations.
     pub name_line: fn(tree_sitter::Node, &[&str], &str) -> Option<u32>,
-    /// Extract an explicitly qualified owner from a definition.
-    pub qualified_owner: fn(tree_sitter::Node, &[&str]) -> Option<String>,
     /// Identify definition nodes that also qualify nested names.
     pub is_container: fn(tree_sitter::Node, &[&str]) -> bool,
     /// Return a language-specific kind label.
@@ -365,10 +361,6 @@ fn no_name_line(_node: tree_sitter::Node, _lines: &[&str], _query: &str) -> Opti
     None
 }
 
-fn no_qualified_owner(_node: tree_sitter::Node, _lines: &[&str]) -> Option<String> {
-    None
-}
-
 fn no_definition_container(_node: tree_sitter::Node, _lines: &[&str]) -> bool {
     false
 }
@@ -382,7 +374,6 @@ pub(crate) const DEFAULT_DEFS: DefinitionOps = DefinitionOps {
     is_definition: default_is_definition,
     extract_name: default_extract_definition_name,
     name_line: no_name_line,
-    qualified_owner: no_qualified_owner,
     is_container: no_definition_container,
     kind_label: no_definition_kind_label,
     weight: default_defs_weight,
