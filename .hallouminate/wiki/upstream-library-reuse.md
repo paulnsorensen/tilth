@@ -79,7 +79,9 @@ One initializer reads and parses the file. Waiters share its immutable result wi
 Loading and ready entries share the existing 500-entry bound; no separate loader registry exists.[^23]
 
 Reservation compares the observed entry identity after checking disk freshness outside the mutex.
-A competing replacement makes a reader retry. Failed initialization releases waiters and permits a later retry.
+A competing replacement makes a reader retry, up to three attempts; after that the reader parses once without caching. Failed initialization releases waiters and permits a later retry.
+Only the caller that runs the initializer rechecks freshness; a warm hit costs one stat.
+Publication reserves a slot that already holds its parse, so no reader can claim it empty. Publication never waits for another caller's in-flight load; it keeps its own parse.
 Failure cleanup removes only its own entry, never a newer replacement.[^24]
 
 Invalidation, revision changes, and eviction can start another resident load.
@@ -87,7 +89,7 @@ The guarantee therefore does not mean one parse forever for a revision.
 Structural search uses the retained ast-grep root directly; it does not construct a second candidate-file AST.
 
 [^23]: src/cache.rs::OutlineCache::get_or_parse; src/cache.rs::tests::concurrent_misses_perform_one_real_read_and_parse; src/cache.rs::tests::loading_and_ready_entries_share_the_hard_capacity; src/cache.rs::tests::paused_real_read_does_not_block_an_independent_key
-[^24]: src/cache.rs::OutlineCache::load_for_revision; src/cache.rs::OutlineCache::discard_if_entry; src/cache.rs::tests::stale_reader_reservation_cannot_replace_a_newer_entry; src/cache.rs::tests::stale_writer_publication_cannot_replace_a_newer_entry; src/cache.rs::tests::failed_initializer_cannot_remove_its_replacement_and_releases_waiters
+[^24]: src/cache.rs::OutlineCache::load_for_revision; src/cache.rs::OutlineCache::publish_or_reuse_if_current; src/cache.rs::OutlineCache::discard_if_entry; src/cache.rs::tests::stale_reader_reservation_cannot_replace_a_newer_entry; src/cache.rs::tests::stale_writer_publication_cannot_replace_a_newer_entry; src/cache.rs::tests::failed_initializer_cannot_remove_its_replacement_and_releases_waiters; src/cache.rs::tests::publication_does_not_wait_for_an_in_flight_load; src/cache.rs::tests::repeated_reservation_refusals_parse_once_without_caching; src/cache.rs::tests::documents_revision_change_during_real_parse_replaces_loading_entry
 
 _Source: Local coordinated-load implementation and regression tests · Updated: 2026-10-01 · Supersedes: uncoordinated concurrent misses in the preceding document layer_
 
