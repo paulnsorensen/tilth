@@ -54,8 +54,8 @@ const SUPPORTED_HOSTS: &[&str] = &[
 ];
 
 /// The tilth server entry as JSON. Format depends on the host's [`ConfigFormat`] variant.
-fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
-    let (command, args) = tilth_command_and_args(edit);
+fn tilth_server_entry(format: &ConfigFormat) -> Value {
+    let (command, args) = tilth_command_and_args();
     match format {
         ConfigFormat::Json { .. } => json!({
             "command": command,
@@ -84,7 +84,9 @@ fn stale_hook_warning(script_exists: bool) -> Option<&'static str> {
 }
 
 /// Write MCP config for the given host, preserving existing config.
-pub fn run(host: &str, edit: bool) -> Result<(), String> {
+/// The MCP server always serves the edit surface, so the entry carries no
+/// mode flag.
+pub fn run(host: &str) -> Result<(), String> {
     let host_info = resolve_host(host)?;
 
     if let Some(parent) = host_info.path.parent() {
@@ -94,9 +96,9 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 
     match host_info.format {
         ConfigFormat::Json { .. } | ConfigFormat::JsonLocal { .. } => {
-            write_json_config(&host_info, edit)?;
+            write_json_config(&host_info)?;
         }
-        ConfigFormat::Toml => write_toml_config(&host_info, edit)?,
+        ConfigFormat::Toml => write_toml_config(&host_info)?,
     }
 
     if host == "claude-code" {
@@ -107,11 +109,7 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
         }
     }
 
-    if edit {
-        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
-    } else {
-        eprintln!("✓ tilth added to {}", host_info.path.display());
-    }
+    eprintln!("✓ tilth added to {}", host_info.path.display());
 
     if let Some(note) = host_info.note {
         eprintln!("  {note}");
@@ -127,7 +125,7 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
+fn write_json_config(host_info: &HostInfo) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
         ConfigFormat::Toml => unreachable!("write_json_config called for TOML host"),
@@ -145,7 +143,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     upsert_json_server(
         &mut config,
         servers_key,
-        tilth_server_entry(edit, &host_info.format),
+        tilth_server_entry(&host_info.format),
     )?;
 
     let out =
@@ -191,15 +189,15 @@ fn insert_tilth_table(root: &mut toml_edit::Table, table: toml_edit::Table) -> R
 /// Inserts/replaces the `[mcp_servers.tilth]` table in a parsed TOML document,
 /// preserving every other table, key, and comment via `toml_edit`'s
 /// format-preserving edit model.
-fn upsert_toml_tilth_table(doc: &mut toml_edit::DocumentMut, edit: bool) -> Result<(), String> {
-    let (command, args) = tilth_command_and_args(edit);
+fn upsert_toml_tilth_table(doc: &mut toml_edit::DocumentMut) -> Result<(), String> {
+    let (command, args) = tilth_command_and_args();
     let table = build_tilth_toml_table(&command, &args);
     insert_tilth_table(doc.as_table_mut(), table)
 }
 
 /// Writes a `[mcp_servers.tilth]` section into a TOML config file, preserving
 /// the rest of the document (formatting, comments, other tables) untouched.
-fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
+fn write_toml_config(host_info: &HostInfo) -> Result<(), String> {
     let existing = if host_info.path.exists() {
         fs::read_to_string(&host_info.path)
             .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?
@@ -211,19 +209,15 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("invalid TOML in {}: {e}", host_info.path.display()))?;
 
-    upsert_toml_tilth_table(&mut doc, edit)
-        .map_err(|e| format!("{}: {e}", host_info.path.display()))?;
+    upsert_toml_tilth_table(&mut doc).map_err(|e| format!("{}: {e}", host_info.path.display()))?;
 
     atomic_write(&host_info.path, &doc.to_string())?;
     Ok(())
 }
 
 /// Returns (command, args) for the tilth MCP server entry.
-fn tilth_command_and_args(edit: bool) -> (String, Vec<String>) {
-    let mut mcp_args: Vec<String> = vec!["--mcp".into()];
-    if edit {
-        mcp_args.push("--edit".into());
-    }
+fn tilth_command_and_args() -> (String, Vec<String>) {
+    let mcp_args: Vec<String> = vec!["--mcp".into()];
 
     let via_npm = std::env::current_exe()
         .ok()
@@ -552,7 +546,7 @@ mod tests {
     #[test]
     fn toml_section_appended_when_absent() {
         let mut doc: toml_edit::DocumentMut = "[other]\nk = 1\n".parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, false).unwrap();
+        upsert_toml_tilth_table(&mut doc).unwrap();
         let out = doc.to_string();
         assert!(out.contains("[other]"));
         assert!(out.contains("[mcp_servers.tilth]"));
@@ -563,7 +557,7 @@ mod tests {
     fn toml_preserves_comments_and_unrelated_section() {
         let existing = "# legacy note about [mcp_servers.tilth] kept for humans\n[other]\nk = 1\n";
         let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, false).unwrap();
+        upsert_toml_tilth_table(&mut doc).unwrap();
         let out = doc.to_string();
         assert!(
             out.contains("# legacy note about [mcp_servers.tilth] kept for humans"),
@@ -582,7 +576,7 @@ mod tests {
     fn toml_section_replaces_existing_tilth_table() {
         let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n[other]\nk = 1\n";
         let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, true).unwrap();
+        upsert_toml_tilth_table(&mut doc).unwrap();
         let out = doc.to_string();
         assert!(!out.contains("\"old\""), "old command not removed: {out:?}");
         assert!(out.contains("[other]"));
@@ -634,7 +628,7 @@ mod tests {
             format: ConfigFormat::Toml,
             note: None,
         };
-        let err = write_toml_config(&host_info, false).unwrap_err();
+        let err = write_toml_config(&host_info).unwrap_err();
         assert!(
             err.contains(&path.display().to_string()),
             "error must include config path, got: {err:?}"
@@ -1082,29 +1076,25 @@ mod tests {
 
     #[test]
     fn opencode_entry_uses_local_shape() {
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
+        let entry = tilth_server_entry(&ConfigFormat::JsonLocal { servers_key: "mcp" });
         assert_eq!(entry["type"], json!("local"));
         assert!(entry["command"].is_array());
         assert!(entry.get("args").is_none());
     }
 
     #[test]
-    fn opencode_entry_with_edit() {
-        let entry = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" });
-        assert_eq!(entry["type"], json!("local"));
+    fn entry_omits_the_retired_edit_flag() {
+        let entry = tilth_server_entry(&ConfigFormat::JsonLocal { servers_key: "mcp" });
         let cmd = entry["command"].as_array().unwrap();
-        assert!(cmd.iter().any(|v| v == "--edit"));
         assert!(cmd.iter().any(|v| v == "--mcp"));
+        assert!(!cmd.iter().any(|v| v == "--edit"));
     }
 
     #[test]
     fn standard_entry_format() {
-        let entry = tilth_server_entry(
-            false,
-            &ConfigFormat::Json {
-                servers_key: "mcpServers",
-            },
-        );
+        let entry = tilth_server_entry(&ConfigFormat::Json {
+            servers_key: "mcpServers",
+        });
         assert!(entry.get("type").is_none());
         assert!(entry["command"].is_string());
         assert!(entry["args"].is_array());
@@ -1113,7 +1103,7 @@ mod tests {
     #[test]
     fn opencode_upserts_under_mcp_key() {
         let mut config = json!({});
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
+        let entry = tilth_server_entry(&ConfigFormat::JsonLocal { servers_key: "mcp" });
         upsert_json_server(&mut config, "mcp", entry).unwrap();
 
         assert!(config.get("mcp").is_some());

@@ -216,7 +216,6 @@ fn run_inner(
                 None,
                 glob,
                 cli_full,
-                false,
                 budget_tokens,
             )?;
             // fit_to_budget (inside search_multi_symbol_expanded) already applied
@@ -294,7 +293,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
@@ -306,7 +304,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
@@ -323,7 +320,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Content(text) => search::search_content_expanded(
@@ -335,7 +331,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
@@ -347,7 +342,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)

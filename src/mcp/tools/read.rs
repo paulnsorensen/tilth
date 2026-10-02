@@ -33,7 +33,6 @@ pub(in crate::mcp) fn tool_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
-    edit_mode: bool,
 ) -> Result<String, String> {
     // A bare-string `paths` coerces to a single-element array — the caller
     // asked for one file, not the wrong shape — and the response teaches
@@ -62,7 +61,7 @@ pub(in crate::mcp) fn tool_read(
         args
     };
 
-    let result = tool_read_paths(dispatch_args, cache, session, edit_mode, note_tokens);
+    let result = tool_read_paths(dispatch_args, cache, session, note_tokens);
     if coerced_str.is_some() {
         result.map(|mut body| {
             body.push_str(&batching_note());
@@ -77,7 +76,6 @@ fn tool_read_paths(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
-    edit_mode: bool,
     note_tokens: u64,
 ) -> Result<String, String> {
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
@@ -208,29 +206,15 @@ fn tool_read_paths(
                         && matches!(suffix, PathSuffix::None)
                         && should_auto_signature(path));
                 let (body, spec) = if force_full && matches!(suffix, PathSuffix::None) {
-                    let b = crate::read::read_file(path, None, true, cache, edit_mode)
+                    let b = crate::read::read_file(path, None, true, cache, true)
                         .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e));
                     (b, crate::read::SeenSpec::Whole)
                 } else {
-                    read_single_with_suffix(
-                        path,
-                        suffix,
-                        signature,
-                        force_stripped,
-                        edit_mode,
-                        cache,
-                    )
+                    read_single_with_suffix(path, suffix, signature, force_stripped, cache)
                 };
                 // Record the whole-file-tag snapshot so a follow-up tilth_write
                 // can verify the tag, using the seen-lines the view displayed.
-                if edit_mode
-                    && should_record_edit_snapshot(
-                        path,
-                        suffix,
-                        signature,
-                        force_stripped,
-                        force_full,
-                    )
+                if should_record_edit_snapshot(path, suffix, signature, force_stripped, force_full)
                 {
                     crate::read::record_edit_snapshot(session, path, &spec);
                 }
@@ -402,11 +386,8 @@ fn tool_read_paths(
     // mode flags are dropped here in favor of the explicit slice the LLM asked for.
     if !matches!(suffix, PathSuffix::None) {
         session.record_read(&path);
-        let (body, spec) =
-            read_single_with_suffix(&path, &suffix, force_signature, false, edit_mode, cache);
-        if edit_mode
-            && should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full)
-        {
+        let (body, spec) = read_single_with_suffix(&path, &suffix, force_signature, false, cache);
+        if should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full) {
             crate::read::record_edit_snapshot(session, &path, &spec);
         }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
@@ -461,14 +442,13 @@ fn tool_read_paths(
 
     // Cold-path fuzzy resolution: scope the gitignore-aware tree walk to the
     // per-call `cwd`, not the server's own process directory.
-    let mut output =
-        crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, cwd)
-            .map_err(|e| e.to_string())?;
+    let mut output = crate::read::read_file_resolving(&path, None, force_full, cache, true, cwd)
+        .map_err(|e| e.to_string())?;
     // An outlined view emits no `[path#TAG]` and no numbered lines, so it
     // displayed nothing to anchor an edit against — recording whole-file
     // seenLines here would poison the snapshot for a later range read of the
     // same content and defeat the unseen-anchor gate. Record nothing.
-    if edit_mode && should_record_edit_snapshot(&path, &suffix, false, false, force_full) {
+    if should_record_edit_snapshot(&path, &suffix, false, false, force_full) {
         crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
     }
 
@@ -531,7 +511,6 @@ pub(crate) fn read_single_with_suffix(
     suffix: &PathSuffix,
     signature: bool,
     stripped: bool,
-    edit_mode: bool,
     cache: &OutlineCache,
 ) -> (String, crate::read::SeenSpec) {
     use crate::read::SeenSpec;
@@ -540,8 +519,8 @@ pub(crate) fn read_single_with_suffix(
     match suffix {
         PathSuffix::LineRange(s, e) => {
             let range = format!("{s}-{e}");
-            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
-                .unwrap_or_else(render_err);
+            let body =
+                crate::read::read_ranges(path, &[range.as_str()], true).unwrap_or_else(render_err);
             (body, SeenSpec::Ranges(vec![(cast(*s), cast(*e))]))
         }
         PathSuffix::FromLine(n) => {
@@ -549,8 +528,8 @@ pub(crate) fn read_single_with_suffix(
             let total = count_lines(path).map_or(*n, |t| t as usize);
             let end = total.max(*n);
             let range = format!("{n}-{end}");
-            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
-                .unwrap_or_else(render_err);
+            let body =
+                crate::read::read_ranges(path, &[range.as_str()], true).unwrap_or_else(render_err);
             (body, SeenSpec::Ranges(vec![(cast(*n), cast(end))]))
         }
         PathSuffix::Heading(h) => {
@@ -559,12 +538,12 @@ pub(crate) fn read_single_with_suffix(
             // read the raw anchor to surface the error and fall back to Whole.
             if let Some((s, e)) = crate::read::resolve_heading_span(path, h) {
                 let range = format!("{s}-{e}");
-                let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                let body = crate::read::read_ranges(path, &[range.as_str()], true)
                     .unwrap_or_else(render_err);
                 (body, SeenSpec::Ranges(vec![(s, e)]))
             } else {
-                let body = crate::read::read_ranges(path, &[h.as_str()], edit_mode)
-                    .unwrap_or_else(render_err);
+                let body =
+                    crate::read::read_ranges(path, &[h.as_str()], true).unwrap_or_else(render_err);
                 (body, SeenSpec::Whole)
             }
         }
@@ -573,7 +552,7 @@ pub(crate) fn read_single_with_suffix(
             match resolve_symbol_range(path, name, cache) {
                 Some((s, e)) => {
                     let range = format!("{s}-{e}");
-                    let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                    let body = crate::read::read_ranges(path, &[range.as_str()], true)
                         .unwrap_or_else(render_err);
                     (body, SeenSpec::Ranges(vec![(cast(s), cast(e))]))
                 }
@@ -604,15 +583,15 @@ pub(crate) fn read_single_with_suffix(
                     read_stripped_file(path, cache).map_or_else(render_err, |(body, _, _)| body);
                 return (body, SeenSpec::Whole);
             }
-            let body = crate::read::read_file(path, None, false, cache, edit_mode)
-                .unwrap_or_else(render_err);
+            let body =
+                crate::read::read_file(path, None, false, cache, true).unwrap_or_else(render_err);
             (body, SeenSpec::Whole)
         }
     }
 }
 
 /// Whether an edit-mode read of `path` with `suffix` should record a
-/// whole-file-tag snapshot (callers gate on `edit_mode` first). Returns `false`
+/// whole-file-tag snapshot Returns `false`
 /// for signature and stripped views (non-editable, no tag emitted), and an
 /// outlined whole-file
 /// view (no numbered lines shown — recording whole-file seen-lines would poison
@@ -1053,7 +1032,7 @@ mod tests {
             "budget": 10_000,
             "cwd": dir.path().to_str().unwrap()
         });
-        let full = tool_read(&args, &cache, &session, false).unwrap();
+        let full = tool_read(&args, &cache, &session).unwrap();
         let budget = crate::types::estimate_tokens(full.len() as u64);
         let budgeted = tool_read(
             &serde_json::json!({
@@ -1064,7 +1043,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(
@@ -1085,7 +1063,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(
@@ -1118,7 +1095,6 @@ mod tests {
                 }),
                 &cache,
                 &session,
-                false,
             )
             .unwrap();
             assert!(
@@ -1168,9 +1144,9 @@ mod tests {
             "budget": 10_000,
             "cwd": dir.path().to_str().unwrap()
         });
-        let full = tool_read(&args, &cache, &sizing_session, true).unwrap();
+        let full = tool_read(&args, &cache, &sizing_session).unwrap();
         args["budget"] = Value::from(crate::types::estimate_tokens(full.len() as u64));
-        let out = tool_read(&args, &cache, &session, true).unwrap();
+        let out = tool_read(&args, &cache, &session).unwrap();
         assert!(out.contains("20:let value_20 = 20;"), "{out}");
         assert!(out.contains("80:let value_80 = 80;"), "{out}");
         assert!(out.contains("── not found ──"), "{out}");
@@ -1214,7 +1190,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(out.contains("fn small() {}"), "{out}");
@@ -1253,7 +1228,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(out.contains("── not found ──"), "{out}");
@@ -1298,7 +1272,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(
@@ -1333,7 +1306,6 @@ mod tests {
             }),
             &cache,
             &session,
-            false,
         )
         .unwrap();
         assert!(
@@ -1358,7 +1330,6 @@ mod tests {
                 }),
                 &cache,
                 &session,
-                false,
             )
             .unwrap();
             assert_ne!(out, "");
@@ -1392,7 +1363,7 @@ mod tests {
             "mode": "full",
             "cwd": root.to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session).unwrap();
         assert!(
             result.contains("fn hello()"),
             "expected file content via cwd-anchored path, got: {result}"
@@ -1413,7 +1384,7 @@ mod tests {
             "mode": "full",
             "cwd": unrelated.path().to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session).unwrap();
         assert!(
             result.contains("fn abs()"),
             "absolute path must resolve independently of cwd, got: {result}"
@@ -1435,7 +1406,7 @@ mod tests {
             "mode": "full",
             "cwd": checkout.path().to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session).unwrap();
         assert!(
             result.contains("fn check()"),
             "absolute path outside cwd must read (trust-absolute), got: {result}"
@@ -1448,7 +1419,7 @@ mod tests {
         // cannot see the caller's shell cwd, so it must be told the checkout dir.
         let (session, cache) = services();
         let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
-        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        let err = tool_read(&args, &cache, &session).unwrap_err();
         assert!(
             err.contains("cwd") && err.contains("absolute checkout directory"),
             "missing cwd must refuse with the teaching error: {err}"
@@ -1465,7 +1436,7 @@ mod tests {
             "mode": "full",
             "cwd": tmp.path().to_str().unwrap()
         });
-        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        let err = tool_read(&args, &cache, &session).unwrap_err();
         assert!(
             err.contains("escapes") && err.contains(".."),
             "relative `..` path must be refused: {err}"
@@ -1512,7 +1483,6 @@ mod tests {
             &serde_json::json!({"paths": [p.to_str().unwrap()], "cwd": cwd}),
             &cache,
             &session,
-            true,
         )
         .expect("edit-mode auto read");
 
@@ -1522,7 +1492,6 @@ mod tests {
             &serde_json::json!({"paths": [range], "cwd": cwd}),
             &cache,
             &session,
-            true,
         )
         .expect("edit-mode range read");
 
@@ -1569,7 +1538,6 @@ mod tests {
             &serde_json::json!({"paths": [format!("{}#{}", p.display(), "# Section A")], "cwd": cwd}),
             &cache,
             &session,
-            true,
         )
         .expect("heading read");
         assert!(
@@ -1648,7 +1616,6 @@ mod tests {
             &serde_json::json!({"paths": [big.to_str().unwrap(), small.to_str().unwrap()], "cwd": cwd}),
             &cache,
             &session,
-            true,
         )
         .expect("edit-mode multi read");
 
@@ -1657,7 +1624,6 @@ mod tests {
             &serde_json::json!({"paths": [range], "cwd": cwd}),
             &cache,
             &session,
-            true,
         )
         .expect("edit-mode range read");
 
@@ -1706,7 +1672,7 @@ mod tests {
         let session = Session::new();
         let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
-        tool_read(&args, &cache, &session, false).expect("large file read");
+        tool_read(&args, &cache, &session).expect("large file read");
 
         let (baseline, saved) = session.savings();
         assert!(
@@ -1730,7 +1696,7 @@ mod tests {
         let session = Session::new();
         let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
-        tool_read(&args, &cache, &session, false).expect("small file read");
+        tool_read(&args, &cache, &session).expect("small file read");
 
         let (baseline, saved) = session.savings();
         assert!(baseline > 0, "baseline must be > 0 for a non-empty file");
@@ -1757,7 +1723,7 @@ mod tests {
         let session = Session::new();
         let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())], "cwd": dir.path().to_str().unwrap() });
 
-        tool_read(&args, &cache, &session, false).expect("section read");
+        tool_read(&args, &cache, &session).expect("section read");
 
         let (baseline, saved) = session.savings();
         assert_eq!(
@@ -1775,8 +1741,8 @@ mod tests {
     fn tool_read_paths_wrong_type_reports_type_error() {
         let (session, cache) = services();
         let args = serde_json::json!({ "paths": 42, "cwd": "/" });
-        let err = tool_read(&args, &cache, &session, false)
-            .expect_err("wrong-type paths must be rejected");
+        let err =
+            tool_read(&args, &cache, &session).expect_err("wrong-type paths must be rejected");
         assert!(
             err.contains("paths must be an array of file paths"),
             "error must name the type mismatch: {err}"
@@ -1821,7 +1787,7 @@ mod tests {
             "budget": budget,
             "cwd": dir.path().to_str().unwrap()
         });
-        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        let out = tool_read(&args, &cache, &session).expect("coerced read must succeed");
         let out_tokens = crate::types::estimate_tokens(out.len() as u64);
 
         assert!(
@@ -1842,8 +1808,8 @@ mod tests {
             "budget": budget - note_tokens,
             "cwd": dir.path().to_str().unwrap()
         });
-        let array_out = tool_read(&array_args, &cache_arr, &session_arr, false)
-            .expect("array read must succeed");
+        let array_out =
+            tool_read(&array_args, &cache_arr, &session_arr).expect("array read must succeed");
 
         assert_eq!(
             out,
@@ -1884,7 +1850,7 @@ mod tests {
             "cwd": dir.path().to_str().unwrap()
         });
 
-        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        let out = tool_read(&args, &cache, &session).expect("coerced read must succeed");
         let (baseline, saved) = session.savings();
 
         let baseline_tokens = crate::types::estimate_tokens(file_size);
@@ -1923,7 +1889,7 @@ mod tests {
             "cwd": dir.path().to_str().unwrap()
         });
 
-        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        let out = tool_read(&args, &cache, &session).expect("coerced read must succeed");
         assert!(out.contains("[outline]"), "expected outline path: {out}");
         let (baseline, saved) = session.savings();
 

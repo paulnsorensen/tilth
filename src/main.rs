@@ -48,9 +48,10 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
-    /// Enable edit mode: whole-file-tag output + `tilth_write` tool.
-    #[arg(long)]
-    edit: bool,
+    /// Accepted for backwards compatibility and ignored: the MCP server always
+    /// serves the edit surface.
+    #[arg(long = "edit", hide = true)]
+    _edit: bool,
 
     /// Inline source for top N search matches (default 2 when flag bare).
     ///
@@ -66,11 +67,11 @@ struct Cli {
     glob: Option<String>,
 
     /// Find all callers of a symbol.
-    #[arg(long, conflicts_with_all = ["deps", "edit"])]
+    #[arg(long, conflicts_with = "deps")]
     callers: bool,
 
     /// Analyze blast-radius dependencies of a file.
-    #[arg(long, conflicts_with_all = ["callers", "edit"])]
+    #[arg(long, conflicts_with = "callers")]
     deps: bool,
 
     /// Print shell completions for the given shell.
@@ -86,9 +87,10 @@ enum Command {
         /// MCP host to configure.
         host: String,
 
-        /// Enable edit mode (whole-file-tag output + `tilth_write` tool).
-        #[arg(long)]
-        edit: bool,
+        /// Accepted for backwards compatibility and ignored: the MCP server
+        /// always serves the edit surface.
+        #[arg(long = "edit", hide = true)]
+        _edit: bool,
     },
 }
 
@@ -105,8 +107,8 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Command::Install { ref host, edit } => {
-                if let Err(e) = tilth::install::run(host, edit) {
+            Command::Install { ref host, .. } => {
+                if let Err(e) = tilth::install::run(host) {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
@@ -127,7 +129,7 @@ fn main() {
                     .unwrap_or_else(|_| cli.scope.clone()),
             )
         };
-        if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
+        if let Err(e) = tilth::mcp::run(mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
             process::exit(1);
         }

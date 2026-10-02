@@ -107,7 +107,7 @@ shell with its own concurrency model.
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
 plus flags. The mode is determined by mutually-exclusive flags
-(`--callers`, `--deps`, `--mcp`, `--edit`, `--full`,
+(`--callers`, `--deps`, `--mcp`, `--full`,
 `--expand`, `--section`). One subcommand sits alongside the
 free-form path: `tilth install <host>` delegates to `install::run`.
 The structural diff (`tilth diff`), project fingerprint
@@ -127,7 +127,7 @@ completions (`--completions <shell>`) using `clap_complete`.
 
 ### MCP server (`src/mcp.rs`)
 
-Invoked as `tilth --mcp` (or `tilth --mcp --edit` for edit mode). The
+Invoked as `tilth --mcp`; `--edit` is still accepted and ignored. The
 binary becomes a JSON-RPC server speaking newline-delimited messages
 over stdio. The body is a hand-rolled loop, not a framework.
 
@@ -145,18 +145,14 @@ anything else returns a JSON-RPC `method not found` error. The two
 methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
-  and an `instructions` string: the standalone base file
-  (`SERVER_INSTRUCTIONS`, `include_str!("../../prompts/mcp-base.md")`)
-  or the standalone edit-mode file (`EDIT_MODE_INSTRUCTIONS`,
-  `prompts/mcp-edit.md`) — never both, never concatenated with an
-  overview. `build_instructions(edit_mode)` selects the one complete
-  file for the mode and returns it trimmed.
+  and an `instructions` string: `SERVER_INSTRUCTIONS`
+  (`include_str!("../../prompts/mcp.md")`), never concatenated with an
+  overview. `build_instructions()` returns it trimmed.
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
 
 Tool dispatch is routed by name through `dispatch_tool` to
-`tool_read` / `tool_search_v2` / `tool_deps` / `tool_write`
-(the last only in edit mode).
+`tool_read` / `tool_search_v2` / `tool_deps` / `tool_write`.
 `tilth_map` is no longer reachable through MCP or the CLI; benchmark
 data showed structural maps hurt agent task success rates.
 
@@ -169,8 +165,8 @@ Rust since cancelling a thread mid-tree-sitter-parse is unsound. A
 process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
-Edit mode (`--edit`) selects the standalone `EDIT_MODE_INSTRUCTIONS`
-file describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
+The server has one mode: `tilth_write` is always registered, and
+`tilth_read` always prints whole-file-tag output.
 
 ## Query pipeline
 
@@ -682,20 +678,17 @@ necessary: aborting a thread mid-tree-sitter-parse is unsafe, so
 "forget about it" is the only correct option short of a full async
 rewrite.
 
-**Tool definitions.** `tool_definitions(edit_mode)` returns the schemas
+**Tool definitions.** `tool_definitions()` returns the schemas
 emitted at `tools/list`. These are the canonical source for argument
 shapes; the in-process `dispatch_tool` and the per-tool functions
 (`tool_search`, `tool_read`, etc.) parse them by `serde_json::Value`
 lookups rather than typed structs.
 
-**Instructions injection.** `build_instructions(edit_mode)` selects and
-returns exactly one standalone file per mode as the `instructions`
+**Instructions injection.** `build_instructions()` returns
+`SERVER_INSTRUCTIONS` (`prompts/mcp.md`) as the `instructions`
 string every host gets at `initialize` — never concatenated, and
-never prefixed with a project overview. Base mode serves
-`SERVER_INSTRUCTIONS` (`prompts/mcp-base.md`); edit mode serves
-`EDIT_MODE_INSTRUCTIONS` (`prompts/mcp-edit.md`) with the `tilth_write`
-instructions. Both files fit Claude Code's 2KB `instructions`-field
-truncation. The text names exact bad commands (`Bash(grep/cat/find)`)
+never prefixed with a project overview. The file fits Claude Code's
+2KB `instructions`-field truncation. The text names exact bad commands (`Bash(grep/cat/find)`)
 and provides `<bad>→<good>` rewrites because agents kept reaching for
 those despite earlier "DO NOT use Grep/Read/Glob" rules.
 
@@ -753,7 +746,7 @@ Concrete "if you wanted to change X, edit Y":
   `classify::classify` (place by precedence) → match arms in
   `lib::run_query_basic` and `lib::run_query_expanded` → handler in
   `search/`.
-- **Add a new MCP tool.** Schema in `mcp::tool_definitions(edit_mode)`
+- **Add a new MCP tool.** Schema in `mcp::tool_definitions()`
   → dispatch arm in `mcp::dispatch_tool` → `tool_*` function near the
   others. If the tool needs cross-call state, add it to the
   `Session`/`OutlineCache` argument list and propagate.

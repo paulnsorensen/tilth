@@ -917,7 +917,6 @@ mod tests {
             &json!({"paths": [path.to_str().unwrap()], "mode": "full", "cwd": path.parent().unwrap().to_str().unwrap()}),
             &cache,
             session,
-            true,
         )
         .expect("edit-mode read");
         let marker = format!("{}#", path.display());
@@ -1136,7 +1135,6 @@ mod tests {
             &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("symbol read");
         let tag = format!("{:04X}", compute_file_hash(content));
@@ -1478,7 +1476,6 @@ mod tests {
             &json!({"paths": [format!("{}#1-2", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
@@ -1538,7 +1535,6 @@ mod tests {
             &json!({"paths": [format!("{}#1-2", p.display())], "cwd": link.to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
@@ -2224,7 +2220,6 @@ mod tests {
             &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("symbol read");
         assert!(
@@ -2287,14 +2282,12 @@ mod tests {
             &json!({"paths": [p.to_str().unwrap()], "mode": "signature", "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("signature read");
         crate::mcp::tools::tool_read(
             &json!({"paths": [format!("{}#1-1", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
 

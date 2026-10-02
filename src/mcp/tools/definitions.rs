@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
     let read_desc = include_str!("../../../prompts/tools/read.md");
     let cwd_prop = cwd_property();
     let mut tools = vec![
@@ -141,59 +141,57 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
     ];
 
-    if edit_mode {
-        tools.push(serde_json::json!({
-            "name": "tilth_write",
-            "annotations": { "readOnlyHint": false },
-            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["edits", "cwd"],
-                "properties": {
-                    "edits": {
-                        "type": "array",
-                        "description": "Up to 20 `{path, tag?, ops}` sections; copy read tags.",
-                        "items": {
-                            "type": "object",
-                            "required": ["path", "ops"],
-                            "properties": {
-                                "path": { "type": "string", "description": "Absolute or cwd-relative path." },
-                                "tag": { "type": "string", "description": "4-hex whole-file read tag." },
-                                "ops": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["op"],
-                                        "oneOf": [
-                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" } } },
-                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "start", "end", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "start", "end"], "additionalProperties": false, "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 } } },
-                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
-                                            { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
-                                            { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
-                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
-                                        ]
-                                    }
+    tools.push(serde_json::json!({
+        "name": "tilth_write",
+        "annotations": { "readOnlyHint": false },
+        "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
+        "inputSchema": {
+            "type": "object",
+            "required": ["edits", "cwd"],
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "description": "Up to 20 `{path, tag?, ops}` sections; copy read tags.",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "ops"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute or cwd-relative path." },
+                            "tag": { "type": "string", "description": "4-hex whole-file read tag." },
+                            "ops": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["op"],
+                                    "oneOf": [
+                                        { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" } } },
+                                        { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } },
+                                        { "required": ["op", "start", "end", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                        { "required": ["op", "start", "end"], "additionalProperties": false, "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                        { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                        { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                        { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "prepend" }, "content": { "type": "string" } } },
+                                        { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "append" }, "content": { "type": "string" } } },
+                                        { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                        { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
+                                        { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
+                                        { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
+                                        { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
+                                    ]
                                 }
                             }
                         }
-                    },
-                    "diff": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Include compact diffs per section."
-                    },
-                    "cwd": cwd_prop.clone()
-                }
+                    }
+                },
+                "diff": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include compact diffs per section."
+                },
+                "cwd": cwd_prop.clone()
             }
-        }));
-    }
+        }
+    }));
     tools
 }
 
@@ -209,7 +207,7 @@ mod tests {
 
     #[test]
     fn tilth_write_surface_teaches_replace_text_first() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -242,7 +240,7 @@ mod tests {
 
     #[test]
     fn tilth_write_schema_requires_edits_array_of_sections() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -308,7 +306,7 @@ mod tests {
     /// required field is rejected at the schema layer before any file work.
     #[test]
     fn tilth_write_schema_validates_ops_and_rejects_bad_op() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -379,18 +377,16 @@ mod tests {
     }
 
     #[test]
-    fn retired_diff_and_grok_are_not_registered_in_either_mode() {
-        for edit_mode in [false, true] {
-            assert!(!tool_definitions(edit_mode)
-                .iter()
-                .any(|tool| tool["name"] == "tilth_diff" || tool["name"] == "tilth_grok"));
-        }
+    fn retired_diff_and_grok_are_not_registered() {
+        assert!(!tool_definitions()
+            .iter()
+            .any(|tool| tool["name"] == "tilth_diff" || tool["name"] == "tilth_grok"));
     }
 
     /// Each search entry contains one query, follow hint, or structural pattern.
     #[test]
     fn tilth_search_schema_matches_v2_contract_and_requires_queries_and_cwd() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions();
         let search = tools
             .iter()
             .find(|t| t["name"] == "tilth_search")
@@ -456,8 +452,7 @@ mod tests {
     #[test]
     fn tool_schemas_are_openai_strict_compatible() {
         const FORBIDDEN_TOP_LEVEL: [&str; 5] = ["oneOf", "anyOf", "allOf", "enum", "not"];
-        // edit_mode=true advertises the widest tool set (includes tilth_write).
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions() {
             let name = tool["name"].as_str().expect("tool name present");
             let schema = &tool["inputSchema"];
             assert_eq!(
@@ -476,18 +471,16 @@ mod tests {
         }
     }
 
-    /// Retired directory tools must not appear in either mode.
+    /// Retired directory tools must not be advertised.
     #[test]
     fn retired_directory_tools_are_not_advertised() {
-        for edit_mode in [false, true] {
-            let defs = tool_definitions(edit_mode);
-            let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
-            for retired in ["tilth_files", "tilth_list"] {
-                assert!(
-                    !names.contains(&retired),
-                    "{retired} must not be advertised"
-                );
-            }
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
+        for retired in ["tilth_files", "tilth_list"] {
+            assert!(
+                !names.contains(&retired),
+                "{retired} must not be advertised"
+            );
         }
     }
 
@@ -497,7 +490,7 @@ mod tests {
     #[test]
     fn tool_names_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions() {
             let name = tool["name"]
                 .as_str()
                 .expect("tool name present")
@@ -514,7 +507,7 @@ mod tests {
     /// take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         assert_eq!(tools.len(), 4, "edit mode advertises 4 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
@@ -553,26 +546,24 @@ mod tests {
     }
 
     /// Claude Code truncates each tool `description` at 2,048 bytes. Every
-    /// advertised description, in both modes, must fit under that cap or the
+    /// advertised description must fit under that cap or the
     /// model loses the tail of its routing guidance silently.
     #[test]
     fn tool_descriptions_fit_2kb() {
-        for edit_mode in [false, true] {
-            for tool in tool_definitions(edit_mode) {
-                let name = tool["name"].as_str().expect("tool name present");
-                let desc = tool["description"].as_str().expect("description present");
-                assert!(
-                    desc.len() <= 2048,
-                    "{name}: description is {} bytes, over the 2048-byte MCP truncation cap",
-                    desc.len()
-                );
-            }
+        for tool in tool_definitions() {
+            let name = tool["name"].as_str().expect("tool name present");
+            let desc = tool["description"].as_str().expect("description present");
+            assert!(
+                desc.len() <= 2048,
+                "{name}: description is {} bytes, over the 2048-byte MCP truncation cap",
+                desc.len()
+            );
         }
     }
 
     #[test]
     fn tilth_write_schema_includes_replace_text_branch() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -591,7 +582,7 @@ mod tests {
     }
     #[test]
     fn tilth_write_schema_replace_text_old_requires_min_length() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
@@ -611,7 +602,7 @@ mod tests {
     }
     #[test]
     fn tilth_write_schema_includes_create_file_branch() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions();
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))

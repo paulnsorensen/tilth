@@ -232,11 +232,7 @@ tilth install crush            # ~/.config/crush/crush.json
 tilth install pi               # ~/.pi/agent/mcp.json
 ```
 
-Add `--edit` to enable tag-anchored file editing (see [Edit mode](#edit-mode)):
-
-```bash
-tilth install claude-code --edit
-```
+Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). The old `--edit` flag is still accepted and does nothing.
 
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
@@ -301,7 +297,7 @@ Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-li
 
 ## Edit mode
 
-Install with `--edit` to add `tilth_write` and switch `tilth_read` to whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
+The MCP server always registers `tilth_write`, and `tilth_read` prints whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
 
 ```
 [src/auth.ts#1A2B]
