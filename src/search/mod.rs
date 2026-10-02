@@ -15,7 +15,7 @@ pub mod symbol;
 pub mod truncate;
 #[cfg(test)]
 pub(crate) use structural::compilation_count;
-pub(crate) use structural::StructuralPatterns;
+pub(crate) use structural::{StructuralPatterns, StructuralScan};
 
 mod bloom_walk;
 mod callee_query;
@@ -211,13 +211,8 @@ fn exact_glob_target(scope: &Path, glob: Option<&str>) -> Option<PathBuf> {
     if pattern.starts_with('!') || pattern.starts_with('#') {
         return None;
     }
-    if pattern
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'\\'))
-    {
-        return None;
-    }
-
+    // Metacharacters need no refusal: a pattern is only an exact target when
+    // it names an existing file literally, e.g. `app/[id]/route.ts`.
     let relative = Path::new(pattern);
     if !relative.is_relative() {
         return None;
@@ -238,20 +233,25 @@ fn exact_glob_target(scope: &Path, glob: Option<&str>) -> Option<PathBuf> {
 /// `count_files_for_empty` stay aligned.
 pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
-/// Shared file-walk entry filter for the content and symbol search walkers:
-/// unwraps the walker result, keeps only files, skips filenames that look
+/// Why a walk entry is not searched. Callers that report partial scans
+/// count `TooLarge`; the rest are silent skips.
+pub(crate) enum WalkSkip {
+    NotFile,
+    Minified,
+    TooLarge,
+}
+
+/// Shared file-walk entry policy: keeps only files, skips filenames that look
 /// minified (`.min.js`, `app-min.css`), and skips files over
-/// `MAX_SEARCH_FILE_SIZE`. Returns the path and its stat'd size on
-/// acceptance. Each caller still does its own read (byte vs string), its own
+/// `MAX_SEARCH_FILE_SIZE`. Returns the stat result (`None` when the stat
+/// failed) on acceptance. Each caller still does its own read, its own
 /// minified-by-content check (needs the read buffer), and its own match
 /// building — those differ per caller.
-pub(crate) fn accept_walk_entry(
-    entry: Result<ignore::DirEntry, ignore::Error>,
-) -> Option<(std::path::PathBuf, u64, Option<std::fs::Metadata>)> {
-    let entry = entry.ok()?;
-
+pub(crate) fn classify_walk_entry(
+    entry: &ignore::DirEntry,
+) -> Result<Option<std::fs::Metadata>, WalkSkip> {
     if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-        return None;
+        return Err(WalkSkip::NotFile);
     }
 
     let path = entry.path();
@@ -261,7 +261,7 @@ pub(crate) fn accept_walk_entry(
         .and_then(|n| n.to_str())
         .is_some_and(crate::lang::detection::is_minified_by_name)
     {
-        return None;
+        return Err(WalkSkip::Minified);
     }
 
     let meta = std::fs::metadata(path).ok();
@@ -269,10 +269,19 @@ pub(crate) fn accept_walk_entry(
         .as_ref()
         .is_some_and(|m| m.len() > MAX_SEARCH_FILE_SIZE)
     {
-        return None;
+        return Err(WalkSkip::TooLarge);
     }
-    let file_size = meta.as_ref().map_or(0, std::fs::Metadata::len);
+    Ok(meta)
+}
 
+/// `classify_walk_entry` for the content and symbol search walkers: unwraps
+/// the walker result and returns the path and its stat'd size on acceptance.
+pub(crate) fn accept_walk_entry(
+    entry: Result<ignore::DirEntry, ignore::Error>,
+) -> Option<(std::path::PathBuf, u64, Option<std::fs::Metadata>)> {
+    let entry = entry.ok()?;
+    let meta = classify_walk_entry(&entry).ok()?;
+    let file_size = meta.as_ref().map_or(0, std::fs::Metadata::len);
     Some((entry.into_path(), file_size, meta))
 }
 
@@ -2442,6 +2451,16 @@ mod tests {
             "slashless basename globs must not be treated as exact files"
         );
         assert_eq!(exact_glob_target(&scope, Some("")), None);
+
+        let bracketed = scope.join("app").join("[id]");
+        std::fs::create_dir_all(&bracketed).unwrap();
+        let route = bracketed.join("route.ts");
+        std::fs::write(&route, "export {};\n").unwrap();
+        assert_eq!(
+            exact_glob_target(&scope, Some("app/[id]/route.ts")),
+            Some(route),
+            "a real file whose name has glob metacharacters is an exact target"
+        );
     }
 
     #[test]

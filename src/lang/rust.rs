@@ -35,6 +35,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         import_line,
         import_external,
         import_resolver: resolve_import,
+        structural: Some(ast_grep_language::SupportLang::Rust),
         search_priority: 9,
         search_extensions: &["rs"],
         basename_extensions: &["rs"],

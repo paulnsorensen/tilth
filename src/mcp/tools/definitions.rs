@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: 'Some($A)', language, glob?}. Languages: rust, typescript (.ts only), python. No kind/expand/context.",
+            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Languages: rust, typescript (.ts only), python. No kind/expand/context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -20,8 +20,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                 {
                                     "required": ["query"],
                                     "properties": {
-                                        "query": { "type": "string" },
-                                        "glob": { "type": "string" }
+                                        "query": { "type": "string", "description": "Symbol, text, or regex." },
+                                        "glob": { "type": "string", "description": "Glob filter for this query." }
                                     },
                                     "additionalProperties": false
                                 },
@@ -29,7 +29,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                     "required": ["pattern", "language"],
                                     "properties": {
                                         "pattern": { "type": "string", "minLength": 1 },
-                                        "language": { "enum": ["rust", "typescript", "python"] },
+                                        "language": { "enum": crate::lang::spec::structural_language_names() },
                                         "glob": { "type": "string" }
                                     },
                                     "additionalProperties": false
@@ -39,6 +39,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                     "properties": {
                                         "follow": {
                                             "type": "object",
+                                            "description": "One unchanged server-emitted continuation hint.",
                                             "required": ["kind", "target"],
                                             "additionalProperties": false,
                                             "if": {"properties": {"kind": {"not": {"const": "fetch_dependencies"}}}},
@@ -69,7 +70,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             ]
                         },
                         "minItems": 1,
-                        "maxItems": 10
+                        "maxItems": 10,
+                        "description": "Required batch of 1-10 query, follow, or pattern entries."
                     },
                     "budget": {
                         "type": "integer", "minimum": 1,

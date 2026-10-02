@@ -192,7 +192,7 @@ class StructuralSearch(unittest.TestCase):
         self.assertTrue(result["budget_limited"])
         self.assertEqual(result["view"], "matches")
         shown = result["shown"]
-        self.assertTrue(0 < shown < 100, shown)
+        self.assertEqual(shown, 12)
         self.assertEqual(result["total_matches"], 100)
         self.assertEqual(
             result["note"],
@@ -341,9 +341,11 @@ class StructuralSearch(unittest.TestCase):
 
     def test_unparsed_file_marks_scan_partial(self):
         self.write("large.py", "# large\n" * 70000 + "wrap(value)\n")
-        result = self.result([{"pattern": "wrap($A)", "language": "python"}])["results"][0]
-        self.assertEqual(result["completeness"], "partial")
-        self.assertEqual(result["skipped_files"], 1)
+        for pattern in ("wrap($A)", "$F($A)"):  # literal and no-literal branches
+            with self.subTest(pattern=pattern):
+                result = self.result([{"pattern": pattern, "language": "python"}])["results"][0]
+                self.assertEqual(result["completeness"], "partial")
+                self.assertEqual(result["skipped_files"], 1)
 
     def test_file_at_size_limit_is_scanned(self):
         head = "wrap(value)\n#\n#\n"
@@ -365,6 +367,97 @@ class StructuralSearch(unittest.TestCase):
         self.assertEqual(paths("sub/deep/e.py"), ["sub/deep/e.py"])
         self.assertEqual(paths("/d.py"), ["d.py"])
         self.assertEqual(paths("d.py"), ["d.py", "sub/d.py"])
+
+    @staticmethod
+    def suggested_glob(note):
+        import re
+        found = re.search(r'e\.g\. "(.*?)"\.', note)
+        assert found, note
+        return found.group(1)
+
+    def test_larger_budget_shows_a_longer_prefix(self):
+        self.write("source.py", "wrap(value)\n" * 100)
+        entry = {"pattern": "wrap($A)", "language": "python"}
+        small = self.result([entry], budget=200)["results"][0]["shown"]
+        large = self.result([entry], budget=400)["results"][0]["shown"]
+        self.assertGreater(large, small)
+
+    def test_directory_rows_match_their_suggested_globs(self):
+        self.many([f"src/a{index:02}.py" for index in range(30)], 1)
+        self.many([f"src/x/b{index:02}.py" for index in range(80)], 1)
+        entry = {"pattern": "wrap($A)", "language": "python"}
+        result = self.result([entry], budget=400)["results"][0]
+        self.assertEqual(result["view"], "directories")
+        self.assertEqual(result["directories"], [["src/*", 30, 30], ["src/x", 80, 80]])
+        glob = self.suggested_glob(result["note"])
+        self.assertEqual(glob, "src/*")
+        narrowed = self.result([{**entry, "glob": glob}], budget=None)["results"][0]
+        self.assertEqual(narrowed["total_matches"], 30)
+        subtree = self.result([{**entry, "glob": "src/x/**"}], budget=None)["results"][0]
+        self.assertEqual(subtree["total_matches"], 80)
+
+    def test_bracket_directories_round_trip_through_suggested_globs(self):
+        self.many([f"app/[id]/f{index:02}.py" for index in range(60)], 1)
+        self.many([f"app/[slug]/g{index:02}.py" for index in range(60)], 1)
+        entry = {"pattern": "wrap($A)", "language": "python"}
+        result = self.result([entry], budget=400)["results"][0]
+        self.assertEqual(result["view"], "directories")
+        glob = self.suggested_glob(result["note"])
+        self.assertEqual(glob, r"app/\[id\]/**")
+        self.assertIn("Escape", result["note"])
+        narrowed = self.result([{**entry, "glob": glob}], budget=None)["results"][0]
+        self.assertEqual(narrowed["total_matches"], 60)
+        self.assertEqual({g["path"].split("/")[1] for g in narrowed["items"]}, {"[id]"})
+
+    def test_bracket_listed_paths_rerun_as_literal_files(self):
+        self.many(["app/[id]/a.py", "app/[id]/b.py"], 300)
+        entry = {"pattern": "wrap($A)", "language": "python"}
+        result = self.result([entry], budget=1000)["results"][0]
+        self.assertEqual(result["view"], "files")
+        for path, count in result["files"]:
+            narrowed = self.result([{**entry, "glob": path}], budget=None)["results"][0]
+            self.assertEqual([g["path"] for g in narrowed["items"]], [path])
+            self.assertEqual(narrowed["total_matches"], count)
+
+    def test_root_only_matches_suggest_a_glob_that_matches(self):
+        self.many([f"f{index:03}.py" for index in range(101)], 1)
+        entry = {"pattern": "wrap($A)", "language": "python"}
+        result = self.result([entry], budget=400)["results"][0]
+        self.assertEqual(result["view"], "directories")
+        self.assertEqual(result["directories"], [[".", 101, 101]])
+        glob = self.suggested_glob(result["note"])
+        self.assertEqual(glob, "/f000.py")
+        narrowed = self.result([{**entry, "glob": glob}], budget=None)["results"][0]
+        self.assertNotEqual(narrowed["status"], "no_match")
+        self.assertEqual([g["path"] for g in narrowed["items"]], ["f000.py"])
+
+    def test_single_directory_note_is_singular(self):
+        self.many([f"only/f{index:03}.py" for index in range(101)], 1)
+        result = self.result([{"pattern": "wrap($A)", "language": "python"}], budget=400)["results"][0]
+        self.assertEqual(result["view"], "directories")
+        self.assertIn("across 1 directory)", result["note"])
+
+    def test_tight_batch_budget_keeps_a_structural_tier(self):
+        self.many([f"d/f{index:02}.py" for index in range(30)], 20)
+        entries = [
+            {"query": "wrap(value)"},
+            {"pattern": "wrap($A)", "language": "python"},
+        ]
+        results = self.result(entries, budget=700)["results"]
+        self.assertEqual(len(results), 2)
+        self.assertIn(results[1]["view"], ("files", "directories"))
+
+    def test_two_structural_entries_renarrow_against_the_final_length(self):
+        self.many([f"a/f{index:02}.py" for index in range(40)], 20)
+        self.many([f"b/f{index:02}.py" for index in range(30)], 20, name="other")
+        entries = [
+            {"pattern": "wrap($A)", "language": "python"},
+            {"pattern": "other($A)", "language": "python"},
+        ]
+        results = self.result(entries, budget=400)["results"]
+        self.assertEqual(len(results), 2)
+        self.assertIn(results[0]["view"], ("files", "directories"))
+        self.assertIn("items", results[0])
 
     def test_mixed_batch_preserves_entry_order(self):
         self.write("source.py", "wrap(value)\n")

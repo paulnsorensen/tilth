@@ -60,6 +60,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         import_external,
         import_resolver: resolve_import,
         sibling_object: Some("self"),
+        structural: Some(ast_grep_language::SupportLang::Python),
         search_priority: 9,
         search_extensions: &["py"],
         basename_extensions: &["py"],
