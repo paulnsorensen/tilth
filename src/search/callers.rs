@@ -220,21 +220,11 @@ fn find_callers_treesitter_batch(
     let content = snapshot.content();
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
-    let callees = crate::lang::treesitter::query_captures(
-        ts_lang,
-        query_str,
-        tree.root_node(),
-        content_bytes,
-        ["callee"],
-    );
 
-    let mut callers = Vec::new();
-    for callee in callees.into_iter().filter_map(|[callee]| callee) {
-        let Ok(text) = callee.utf8_text(content_bytes) else {
-            continue;
-        };
+    let caller_at = |callee: tree_sitter::Node| -> Option<(String, CallerMatch)> {
+        let text = callee.utf8_text(content_bytes).ok()?;
         if !targets.contains(text) {
-            continue;
+            return None;
         }
         let matched_target = text.to_string();
         let line = callee.start_position().row as u32 + 1;
@@ -249,7 +239,7 @@ fn find_callers_treesitter_batch(
         };
 
         let (calling_function, caller_range) = find_enclosing_function(callee, &lines, lang);
-        callers.push((
+        Some((
             matched_target,
             CallerMatch {
                 path: path.to_path_buf(),
@@ -259,8 +249,22 @@ fn find_callers_treesitter_batch(
                 caller_range,
                 snapshot: Arc::clone(snapshot),
             },
-        ));
-    }
+        ))
+    };
+
+    let mut callers = Vec::new();
+    // Stream the matches: most call sites are not targets, so do not collect them.
+    crate::lang::treesitter::visit_query_captures(
+        ts_lang,
+        query_str,
+        tree.root_node(),
+        content_bytes,
+        ["callee"],
+        |[callee]| {
+            callers.extend(callee.and_then(caller_at));
+            std::ops::ControlFlow::Continue(())
+        },
+    );
     callers
 }
 

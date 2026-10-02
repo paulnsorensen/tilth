@@ -1,6 +1,7 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ast_grep_core::matcher::PatternBuilder;
@@ -584,7 +585,7 @@ static QUERY_COMPILE_ATTEMPTS: LazyLock<Mutex<HashMap<QueryKey, usize>>> =
 
 /// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
 /// reference to the cached `Query`. Returns `None` if compilation fails.
-pub(crate) fn with_query<R>(
+fn with_query<R>(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
     f: impl FnOnce(&tree_sitter::Query) -> R,
@@ -613,8 +614,38 @@ pub(crate) fn with_query<R>(
     Some(f(&query))
 }
 
-/// Run the cached query over `root`. Each match yields the first node of each
-/// capture in `names`, in order. A query that does not compile yields no matches.
+/// Run the cached query over `root` and give each match to `visit`, in order.
+/// Each match holds the first node of each capture in `names`.
+/// `visit` returns `ControlFlow::Break` to stop the walk.
+/// A query that does not compile gives no matches.
+pub(crate) fn visit_query_captures<'tree, const N: usize>(
+    ts_lang: &tree_sitter::Language,
+    query_str: &'static str,
+    root: tree_sitter::Node<'tree>,
+    source: &[u8],
+    names: [&str; N],
+    mut visit: impl FnMut([Option<tree_sitter::Node<'tree>>; N]) -> ControlFlow<()>,
+) {
+    use streaming_iterator::StreamingIterator;
+
+    with_query(ts_lang, query_str, |query| {
+        let indices = names.map(|name| query.capture_index_for_name(name));
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(query, root, source);
+        while let Some(found_match) = matches.next() {
+            let nodes = indices.map(|index| {
+                let index = index?;
+                let capture = found_match.captures().iter().find(|c| c.index == index)?;
+                Some(capture.node)
+            });
+            if visit(nodes).is_break() {
+                break;
+            }
+        }
+    });
+}
+
+/// Collect every match of [`visit_query_captures`].
 pub(crate) fn query_captures<'tree, const N: usize>(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
@@ -622,23 +653,12 @@ pub(crate) fn query_captures<'tree, const N: usize>(
     source: &[u8],
     names: [&str; N],
 ) -> Vec<[Option<tree_sitter::Node<'tree>>; N]> {
-    use streaming_iterator::StreamingIterator;
-
-    with_query(ts_lang, query_str, |query| {
-        let indices = names.map(|name| query.capture_index_for_name(name));
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, root, source);
-        let mut found = Vec::new();
-        while let Some(found_match) = matches.next() {
-            found.push(indices.map(|index| {
-                let index = index?;
-                let capture = found_match.captures().iter().find(|c| c.index == index)?;
-                Some(capture.node)
-            }));
-        }
-        found
-    })
-    .unwrap_or_default()
+    let mut found = Vec::new();
+    visit_query_captures(ts_lang, query_str, root, source, names, |nodes| {
+        found.push(nodes);
+        ControlFlow::Continue(())
+    });
+    found
 }
 
 #[cfg(test)]
@@ -752,6 +772,43 @@ mod tests {
         assert!(with_query(&language, INVALID_QUERY, |_| ()).is_none());
         assert!(with_query(&language, INVALID_QUERY, |_| ()).is_none());
         assert_eq!(query_compile_attempts(&language, INVALID_QUERY), 2);
+    }
+
+    #[test]
+    fn visit_query_captures_stops_on_break() {
+        const QUERY: &str = "(call_expression function: (identifier) @callee)";
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let source = "fn f() { first(); second(); third(); }";
+        let tree = parse_source(source, &language).expect("source parses");
+        let name = |node: Option<tree_sitter::Node>| {
+            node.and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        };
+
+        let mut visited = Vec::new();
+        visit_query_captures(
+            &language,
+            QUERY,
+            tree.root_node(),
+            source.as_bytes(),
+            ["callee"],
+            |[callee]| {
+                visited.extend(name(callee));
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(visited, ["first"]);
+
+        let all: Vec<_> = query_captures(
+            &language,
+            QUERY,
+            tree.root_node(),
+            source.as_bytes(),
+            ["callee"],
+        )
+        .into_iter()
+        .filter_map(|[callee]| name(callee))
+        .collect();
+        assert_eq!(all, ["first", "second", "third"]);
     }
 
     #[test]

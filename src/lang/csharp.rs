@@ -8,10 +8,9 @@ const CALLEE_QUERY: &str = concat!(
 );
 
 // tree-sitter-c-sharp 0.23 parses `this` as an anonymous token.
-const SIBLING_QUERY: &str = concat!(
-    "(member_access_expression expression: \"this\" name: (identifier) @ref)\n",
-    "(invocation_expression function: (member_access_expression expression: \"this\" name: (identifier) @ref))\n",
-);
+// A call such as `this.Keep()` contains this `member_access_expression`, so one pattern covers both.
+const SIBLING_QUERY: &str =
+    "(member_access_expression expression: \"this\" name: (identifier) @ref)\n";
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "C#",

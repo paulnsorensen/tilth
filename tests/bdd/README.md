@@ -1,6 +1,7 @@
 # Cucumber prototype
 
 This suite tests the compiled `tilth` binary through its MCP stdio interface.
+The sibling checks in `calls.feature` also run its CLI.
 It adds coverage beside the existing Rust and Python suites.
 
 ## Run

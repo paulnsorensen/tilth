@@ -231,6 +231,7 @@ Feature: Call and member queries stay stable in every language
       calls/sample.cpp:1 helper
       """
 
+  @f65e7bd @pr301
   Scenario: C# calls and members
     Given the file "calls/Sample.cs" contains exactly
       """
@@ -520,6 +521,7 @@ Feature: Call and member queries stay stable in every language
       """
 
   Scenario: PHP calls and members
+    Known gap: callers bind only the bare name, so the qualified calls on lines 22 and 23 are not callers of `helper`.
     Given the file "calls/sample.php" contains exactly
       """
       <?php

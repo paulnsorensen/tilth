@@ -293,6 +293,21 @@ mod tests {
         );
     }
 
+    /// The Go receiver comes from the first method in the file, and the query stops there.
+    #[test]
+    fn go_receiver_is_the_first_method_receiver() {
+        let content = "package sample\n\nfunc (a *A) x() {}\n\nfunc (b *B) y() {}\n";
+        let language = outline_language(Lang::Go).expect("Go has a grammar");
+        let tree =
+            crate::lang::treesitter::parse_source(content, &language).expect("source parses");
+
+        assert_eq!(
+            crate::lang::go::extract_go_receiver_name(content, tree.root_node(), &language)
+                .as_deref(),
+            Some("a")
+        );
+    }
+
     /// Every sibling pattern keeps receiver members and drops other objects.
     #[test]
     fn sibling_references_cover_every_query_pattern() {

@@ -108,11 +108,19 @@ pub(crate) fn extract_go_receiver_name(
     const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
 
     let bytes = content.as_bytes();
-    let [recv] =
-        crate::lang::treesitter::query_captures(ts_lang, GO_RECV_QUERY, root, bytes, ["recv"])
-            .into_iter()
-            .next()?;
-    recv?.utf8_text(bytes).ok().map(String::from)
+    let mut receiver = None;
+    crate::lang::treesitter::visit_query_captures(
+        ts_lang,
+        GO_RECV_QUERY,
+        root,
+        bytes,
+        ["recv"],
+        |[recv]| {
+            receiver = recv.and_then(|node| node.utf8_text(bytes).ok().map(String::from));
+            std::ops::ControlFlow::Break(())
+        },
+    );
+    receiver
 }
 
 fn import_line(line: &str) -> bool {
