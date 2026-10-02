@@ -140,10 +140,12 @@ On macOS, `tempfile` paths start with `/var`, but `/var` is a symlink to `/priva
 The search walker and the test fixture can then key one file under two paths.
 Cache lookups miss, and parse-count assertions in `documents_*` MCP tests fail.
 At PR #287 head `53a76df`, `documents_reuse_real_parses_across_production_requests` and `documents_python_dependencies_reuse_trees_and_refresh_reexports` fail this way without any code change.[^21]
+At main `998f311`, `tool_read_from_line_suffix` and `batch_read_shrink_floor_keeps_not_found_footer` also fail with the default `TMPDIR` and pass with the override.[^22]
 Run the local gate with `TMPDIR=/private/var/tmp just check` on macOS.
 Linux CI does not have this symlink and is unaffected.
 
 [^21]: PR #287 affinage cure on 2026-10-01. Both tests fail at pristine `53a76df` with the default `TMPDIR`. With `TMPDIR=/private/var/tmp`, `just check` exits 0 (1,216 Rust library tests).
+[^22]: PR #293 affinage rebase on 2026-10-01. The same four tests fail at pristine `998f311` and on the rebased PR with the default `TMPDIR`. With `TMPDIR=/private/var/tmp`, `just check` exits 0 (1,258 Rust library tests).
 
 ## Historical baseline
 
@@ -161,4 +163,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, and PR #287 macOS gate run · Updated: 2026-10-01 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, PR #287 and PR #293 macOS gate runs · Updated: 2026-10-01 · Supersedes: August 2026 local-gate baseline guidance._
