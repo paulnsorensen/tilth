@@ -114,7 +114,6 @@ pub(crate) fn extract_go_receiver_name(
     root: tree_sitter::Node,
     ts_lang: &tree_sitter::Language,
 ) -> Option<String> {
-    // `'static` so its pointer address is a stable cache key.
     const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
 
     let bytes = content.as_bytes();

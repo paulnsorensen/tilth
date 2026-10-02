@@ -60,13 +60,15 @@ Tree-aware helpers preserve existing outline extraction instead of replacing it 
 Warm writes clone the retained document into a private replacement, then use the public `AstGrep::edit` operation for incremental reparsing.
 Cold parses move the owned read `String` into the document. Only `&str` input copies. Warm reads and structural matches borrow the retained string.
 Tests compare source pointers, lengths, capacities, and retained-reader bytes; they do not measure total or transient allocator calls.[^18]
-Compiled-query caches release their mutex before caller, callee, sibling, or receiver matching runs.[^20]
+One compiled-query cache serves caller, callee, sibling, and receiver matching.
+Keys use actual Tree-sitter grammar identity and query content, including unnamed grammars.
+File edits retain compiled queries. Failed compilation remains retryable, and callbacks run after the cache mutex is released.[^20]
 Parse reuse is verified behavior, not a measured end-to-end latency claim.
 
 [^17]: src/cache.rs::ParsedFile; src/cache.rs::OutlineCache::parse_with_revision; src/read/outline/mod.rs::generate_cached; src/mcp/mod.rs::tests::documents_reuse_real_parses_across_production_requests
 [^18]: src/search/structural.rs::tests::owned_document_borrows_cached_bytes_and_tree; src/mcp/tools/search_v2.rs::tests::structural_requests_retain_one_real_candidate_root; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
 [^19]: src/cache.rs::MAX_PARSED_ENTRIES; src/cache.rs::OutlineCache::get_or_parse; src/mcp/mod.rs::tests::documents_direct_reads_do_not_parse; src/mcp/mod.rs::tests::documents_large_sources_keep_existing_search_and_grok_results
-[^20]: src/lang/treesitter.rs::with_query; src/search/callee_query.rs::with_callee_query; src/lang/go.rs::extract_go_receiver_name
+[^20]: src/lang/treesitter.rs::with_query and shared_query_* tests; src/search/callers.rs::find_callers_treesitter_batch; src/search/callees.rs::extract_callee_names_from_tree; src/search/siblings.rs::extract_sibling_references_from_tree; src/lang/go.rs::extract_go_receiver_name
 
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_
 

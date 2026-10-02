@@ -224,7 +224,7 @@ fn find_callers_treesitter_batch(
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
 
-    let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
+    let Some(callers) = crate::lang::treesitter::with_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
             return Vec::new();
         };
