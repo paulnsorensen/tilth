@@ -353,6 +353,10 @@ mod tests {
                 "impl K {\n    fn run(&self, o: K) {\n        self.value;\n        self.keep();\n        o.drop();\n    }\n}\n",
             ),
             (
+                Lang::CSharp,
+                "class K {\n    void Run(K o) {\n        this.value = 1;\n        this.keep();\n        o.drop();\n    }\n}\n",
+            ),
+            (
                 Lang::Java,
                 "class K {\n    void run(K o) {\n        this.value = 1;\n        this.keep();\n        o.drop();\n    }\n}\n",
             ),

@@ -280,6 +280,11 @@ Feature: Call and member queries stay stable in every language
       calls/Sample.cs:10 Ping
       calls/Sample.cs:5 Helper
       """
+    When I run the expanded CLI search for "Run"
+    Then the CLI siblings section is exactly
+      """
+      Ping calls/Sample.cs:10-13
+      """
 
   Scenario: Java calls and members
     Given the file "calls/Sample.java" contains exactly
