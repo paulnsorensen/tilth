@@ -156,6 +156,13 @@ Key metric: **cost per correct answer** = total_spend / correct_count. This is t
 
 Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`.
 
+## MCP tool surface
+
+Do not register an MCP tool, alias, or dispatch arm only to redirect callers.
+Agents do not remember removed or renamed tools, so a retirement shim or "did you mean" hint adds code without value.
+When you remove or rename a tool, delete it fully. An unregistered name gets the plain `unknown tool: <name>` error.
+Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed tool does not return by accident.
+
 ## MCP instructions
 
 Server instructions sent via MCP protocol live in `prompts/`:
