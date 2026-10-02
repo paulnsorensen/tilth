@@ -76,7 +76,7 @@ Compiled queries and edit history have different validity rules from current par
 A file edit does not change a compiled language query.
 Edit history retains older text and observed-line permissions, so a current-document cache cannot replace it by itself.
 
-_Source: Integration worktree at base 0dd6bf00088892b50578829efbb14dad403a312a; src/cache.rs:199-249; src/search/structural.rs:20-63; src/edit/snapshots.rs:126-170 · Updated: 2026-10-01_
+_Source: src/cache.rs:201-224,403-428; src/search/structural.rs:21-64; src/edit/snapshots.rs:30-37,126-173 · Updated: 2026-10-01_
 
 ### Verified incremental writes
 
@@ -88,7 +88,7 @@ Cold writes do not populate the parsed-document cache. External changes use full
 Create, delete, and move operations invalidate affected paths, not unrelated snapshots.
 A failed move still invalidates source bytes already committed before the rename failure.[^22]
 
-[^21]: src/cache.rs:298-404; src/lang/treesitter.rs:14-92; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
+[^21]: src/cache.rs:311-437; src/lang/treesitter.rs:14-88; src/mcp/mod.rs::tests::incremental_write_reuses_tree_through_production_requests
 [^22]: src/mcp/tools/write.rs::tests::incremental_write_cold_noop_and_external_changes_do_not_reuse_stale_trees; src/mcp/tools/write.rs::tests::incremental_write_failed_move_invalidates_already_committed_source
 
 _Source: Verified incremental-write implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_

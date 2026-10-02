@@ -18,37 +18,33 @@ pub(crate) fn reparse_source(
     tree: &tree_sitter::Tree,
     language: &tree_sitter::Language,
 ) -> Option<tree_sitter::Tree> {
-    let mut start = before
-        .bytes()
-        .zip(after.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    while !before.is_char_boundary(start) || !after.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut suffix = before[start..]
-        .bytes()
-        .rev()
-        .zip(after[start..].bytes().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    while !before.is_char_boundary(before.len() - suffix)
-        || !after.is_char_boundary(after.len() - suffix)
-    {
-        suffix -= 1;
-    }
-    let old_end = before.len() - suffix;
-    let new_end = after.len() - suffix;
+    let edit = input_edit(before, after);
     let mut edited = tree.clone();
-    edited.edit(&tree_sitter::InputEdit {
+    edited.edit(&edit);
+    parse_with_tree(after, language, Some(&edited))
+}
+
+/// Narrow the edit to the bytes between the shared prefix and suffix. Byte
+/// scans may split a UTF-8 character; tree-sitter edits are byte-based.
+fn input_edit(before: &str, after: &str) -> tree_sitter::InputEdit {
+    let (old, new) = (before.as_bytes(), after.as_bytes());
+    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[start..]
+        .iter()
+        .rev()
+        .zip(new[start..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    tree_sitter::InputEdit {
         start_byte: start,
         old_end_byte: old_end,
         new_end_byte: new_end,
         start_position: byte_position(before, start),
         old_end_position: byte_position(before, old_end),
         new_end_position: byte_position(after, new_end),
-    });
-    parse_with_tree(after, language, Some(&edited))
+    }
 }
 
 fn byte_position(source: &str, offset: usize) -> tree_sitter::Point {
@@ -69,9 +65,9 @@ fn parse_with_tree(
         let mut counts = PARSE_COUNTS.lock().unwrap();
         if let Some(count) = counts.get_mut(content) {
             if old_tree.is_some() {
-                count.1 += 1;
+                count.incremental += 1;
             } else {
-                count.0 += 1;
+                count.full += 1;
             }
         }
     }
@@ -92,7 +88,14 @@ fn parse_with_tree(
 }
 
 #[cfg(test)]
-static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, (usize, usize)>>> =
+#[derive(Default)]
+struct ParseCounts {
+    full: usize,
+    incremental: usize,
+}
+
+#[cfg(test)]
+static PARSE_COUNTS: LazyLock<Mutex<HashMap<String, ParseCounts>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
@@ -111,17 +114,17 @@ impl ParseWitness {
         assert!(PARSE_COUNTS
             .lock()
             .unwrap()
-            .insert(content.to_string(), (0, 0))
+            .insert(content.to_string(), ParseCounts::default())
             .is_none());
         Self(content.to_string())
     }
 
     pub(crate) fn count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0].0
+        PARSE_COUNTS.lock().unwrap()[&self.0].full
     }
 
     pub(crate) fn incremental_count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0].1
+        PARSE_COUNTS.lock().unwrap()[&self.0].incremental
     }
 
     pub(crate) fn pause_next(
@@ -815,5 +818,85 @@ mod tests {
         let lines: Vec<&str> = src.lines().collect();
         let node = find_by_kind(tree.root_node(), "impl_item");
         assert_eq!(extract_definition_name(node, &lines), None);
+    }
+
+    fn rust_language() -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+
+    fn assert_same_tree(actual: tree_sitter::Node<'_>, expected: tree_sitter::Node<'_>) {
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.range(), expected.range());
+        assert_eq!(actual.has_error(), expected.has_error());
+        assert_eq!(actual.child_count(), expected.child_count());
+        let (mut a, mut e) = (actual.walk(), expected.walk());
+        for (a, e) in actual.children(&mut a).zip(expected.children(&mut e)) {
+            assert_same_tree(a, e);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_reuses_unchanged_sibling_nodes() {
+        let before = "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }\n";
+        let after = "fn a() { 1 }\nfn b() { 22 + 2 }\nfn c() { 3 }\n";
+        let language = rust_language();
+        let old = parse_source(before, &language).unwrap();
+        let new = reparse_source(before, after, &old, &language).unwrap();
+        let (old_root, new_root) = (old.root_node(), new.root_node());
+        assert_eq!(
+            old_root.named_child(0).unwrap().id(),
+            new_root.named_child(0).unwrap().id()
+        );
+        assert_eq!(
+            old_root.named_child(2).unwrap().id(),
+            new_root.named_child(2).unwrap().id()
+        );
+        assert_ne!(
+            old_root.named_child(1).unwrap().id(),
+            new_root.named_child(1).unwrap().id()
+        );
+    }
+
+    #[test]
+    fn input_edit_is_narrow_and_byte_exact() {
+        let edit = input_edit("ab\ncd\nef", "ab\ncXYd\nef");
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (4, 4, 6)
+        );
+        assert_eq!(
+            edit.start_position,
+            tree_sitter::Point { row: 1, column: 1 }
+        );
+        assert_eq!(
+            edit.new_end_position,
+            tree_sitter::Point { row: 1, column: 3 }
+        );
+
+        let edit = input_edit("let s = \"cafe\";", "let s = \"caf\u{e9}\";");
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (12, 13, 14)
+        );
+    }
+
+    #[test]
+    fn incremental_reparse_matches_fresh_when_multibyte_chars_share_continuation_byte() {
+        let language = rust_language();
+        for (before, after) in [
+            (
+                "fn main() { Some(\"\u{e9}\"); }",
+                "fn main() { Some(\"\u{a9}\"); }",
+            ),
+            (
+                "fn main() { Some(\"\u{a9}\"); }",
+                "fn main() { Some(\"\u{e9}\"); }",
+            ),
+        ] {
+            let old = parse_source(before, &language).unwrap();
+            let incremental = reparse_source(before, after, &old, &language).unwrap();
+            let fresh = parse_source(after, &language).unwrap();
+            assert_same_tree(incremental.root_node(), fresh.root_node());
+        }
     }
 }

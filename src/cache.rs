@@ -328,6 +328,20 @@ impl OutlineCache {
             .map(|entry| entry.file)
     }
 
+    /// Remove `path` and its canonical spelling. `canonical` comes from the
+    /// caller because it must be captured before a remove or move.
+    pub(crate) fn invalidate_spellings(&self, path: &Path, canonical: &Path) {
+        self.invalidate_alias(path, canonical);
+        self.invalidate(path);
+    }
+
+    /// Remove only the canonical spelling when it differs from `path`.
+    pub(crate) fn invalidate_alias(&self, path: &Path, canonical: &Path) {
+        if canonical != path {
+            self.invalidate(canonical);
+        }
+    }
+
     /// Report whether a parsed snapshot exists for this path.
     #[cfg(test)]
     pub(crate) fn has_parsed(&self, path: &Path) -> bool {
@@ -340,21 +354,28 @@ impl OutlineCache {
     /// Publish incremental bytes only after a successful write and disk verification.
     /// Cold paths stay cold. A mismatch discards this path, never unrelated entries.
     pub(crate) fn update_after_write(&self, path: &Path, before: &str, after: &str) {
-        let previous = self.invalidate(path);
-        let Some(previous) = previous.filter(|file| file.content.as_str() == before) else {
+        let Some(previous) = self
+            .invalidate(path)
+            .filter(|file| file.content.as_str() == before)
+        else {
             return;
         };
         if after.len() as u64 > MAX_PARSED_FILE_BYTES {
             return;
         }
-        let Some(revision) = FileRevision::of(path) else {
+        let Ok(meta) = std::fs::metadata(path) else {
             return;
         };
         if !std::fs::File::open(path)
             .and_then(|file| written_bytes_match(file, after.as_bytes()))
             .unwrap_or(false)
-            || !revision.is_current(path)
         {
+            return;
+        }
+        let Some(revision) = FileRevision::from_metadata_and_bytes(&meta, after.as_bytes()) else {
+            return;
+        };
+        if !revision.is_current(path) {
             return;
         }
         let Some(language) = crate::lang::outline::outline_language(previous.lang) else {
@@ -409,7 +430,7 @@ impl OutlineCache {
 }
 
 fn written_bytes_match(reader: impl Read, expected: &[u8]) -> std::io::Result<bool> {
-    let mut actual = Vec::new();
+    let mut actual = Vec::with_capacity(expected.len() + 1);
     reader
         .take(expected.len() as u64 + 1)
         .read_to_end(&mut actual)?;
