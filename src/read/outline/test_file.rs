@@ -1,10 +1,5 @@
-use crate::lang::treesitter::ParsedDocument;
+use crate::lang::treesitter::{DocumentNode, ParsedDocument};
 use crate::types::Lang;
-
-type DocNode<'r> = ast_grep_core::Node<
-    'r,
-    ast_grep_core::tree_sitter::StrDoc<crate::lang::treesitter::DocumentLanguage>,
->;
 
 /// Extract test structure (describe/it/test) from a parsed file.
 /// Returns a structured test outline with suite nesting, or None if
@@ -50,7 +45,7 @@ struct TestCall {
 }
 
 /// Match `describe("…", …)`, `it("…", …)`, and their aliases.
-fn test_call(node: &DocNode<'_>) -> Option<TestCall> {
+fn test_call(node: &DocumentNode<'_>) -> Option<TestCall> {
     if !matches!(&*node.kind(), "call_expression" | "expression_statement") {
         return None;
     }
@@ -84,7 +79,7 @@ fn test_call(node: &DocNode<'_>) -> Option<TestCall> {
     })
 }
 
-fn first_line(node: &DocNode<'_>) -> String {
+fn first_line(node: &DocumentNode<'_>) -> String {
     node.text().lines().next().unwrap_or_default().to_string()
 }
 
@@ -124,6 +119,27 @@ mod tests {
         assert_eq!(text, "[1] test: it(\"a\")");
         assert!(truncated);
         let (_, truncated) = outline(source, Lang::JavaScript, 2).unwrap();
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn suite_inside_test_call_stays_at_depth_zero() {
+        let source = concat!(
+            "it('x', () => {\n",
+            "  describe('y', () => {\n",
+            "    it('z', () => {});\n",
+            "  });\n",
+            "});\n",
+        );
+        let (text, truncated) = outline(source, Lang::TypeScript, usize::MAX).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "[1] test: it(\"x\")\n",
+                "[2] suite: describe(\"y\")\n",
+                "  [3] test: it(\"z\")",
+            )
+        );
         assert!(!truncated);
     }
 

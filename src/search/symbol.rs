@@ -352,14 +352,17 @@ fn find_defs_in_document(
     let def_ops: &DefinitionOps =
         lang.map_or(&DEFAULT_DEFS, |language| &spec(language).definitions);
     let start_line = |node: tree_sitter::Node| node.start_position().row as u32 + 1;
-    let definition = |node: tree_sitter::Node, line: u32, name: String, weight, target| Match {
-        path: path.to_path_buf(),
-        line,
-        text: lines
+    let line_text = |line: u32| {
+        lines
             .get(line.saturating_sub(1) as usize)
             .unwrap_or(&"")
             .trim_end()
-            .to_string(),
+            .to_string()
+    };
+    let definition = |node: tree_sitter::Node, line: u32, name: String, weight, target| Match {
+        path: path.to_path_buf(),
+        line,
+        text: line_text(line),
         is_definition: true,
         exact: true,
         file_lines,
@@ -409,11 +412,7 @@ fn find_defs_in_document(
             );
             if let Some(entry) = entry {
                 definition.line = entry.start_line;
-                definition.text = lines
-                    .get(entry.start_line.saturating_sub(1) as usize)
-                    .unwrap_or(&"")
-                    .trim_end()
-                    .to_string();
+                definition.text = line_text(entry.start_line);
                 definition.def_range = Some((entry.span_start_line, entry.end_line));
             }
         }
@@ -967,6 +966,29 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
     }
 
     #[test]
+    fn rust_trait_impl_is_named_and_weighted() {
+        let code = "trait T {}\nstruct S;\nimpl T for S {}\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("lib.rs"),
+            "T",
+            &ts_lang,
+            Some(crate::types::Lang::Rust),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+
+        let implementations: Vec<_> = defs.iter().filter(|d| d.impl_target.is_some()).collect();
+        assert_eq!(implementations.len(), 1);
+        let implementation = implementations[0];
+        assert_eq!(implementation.def_name.as_deref(), Some("impl T for S"));
+        assert_eq!(implementation.impl_target.as_deref(), Some("T"));
+        assert_eq!(implementation.def_weight, 80);
+        assert_eq!(implementation.line, 3);
+    }
+
+    #[test]
     fn annotated_interface_implementation_reconciles_canonical_line() {
         let code = "@Deprecated\nclass Runner implements Task {}\n";
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Java).unwrap();
@@ -982,6 +1004,11 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
 
         let implementation = defs.first().expect("interface implementation should match");
         assert_eq!(implementation.line, 2);
+        assert_eq!(
+            implementation.def_name.as_deref(),
+            Some("Runner implements Task")
+        );
+        assert_eq!(implementation.impl_target.as_deref(), Some("Task"));
         assert_eq!(
             implementation.text.trim(),
             "class Runner implements Task {}"

@@ -146,6 +146,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn integration_note_on_capped_test_file() {
+        let path = std::path::Path::new("foo.test.ts");
+        assert!(crate::types::is_test_file(path));
+        let file_type = crate::types::FileType::Code(crate::types::Lang::TypeScript);
+        let build = |count: usize| {
+            let mut src = String::new();
+            for i in 0..count {
+                writeln!(src, "it('case {i}', () => {{}});").unwrap();
+            }
+            super::generate(path, file_type, &src, src.as_bytes(), true)
+        };
+        let over = build(super::OUTLINE_CAP + 1);
+        assert!(
+            over.contains("outline truncated"),
+            "expected truncation note for 101 test calls, got:\n{over}"
+        );
+        let at_cap = build(super::OUTLINE_CAP);
+        assert!(
+            !at_cap.contains("outline truncated"),
+            "spurious truncation note at exactly OUTLINE_CAP test calls:\n{at_cap}"
+        );
+    }
+
     /// Integration test: a small file (5 functions) must NOT produce
     /// the truncation note even when `capped=true` is passed, because
     /// the actual entry count is well below the cap.

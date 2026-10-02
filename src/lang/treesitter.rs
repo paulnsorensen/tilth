@@ -35,6 +35,7 @@ impl LanguageExt for DocumentLanguage {
 }
 
 pub(crate) type ParsedDocument = AstGrep<StrDoc<DocumentLanguage>>;
+pub(crate) type DocumentNode<'r> = ast_grep_core::Node<'r, StrDoc<DocumentLanguage>>;
 
 /// Parse source without retaining a parser or a global lock.
 pub(crate) fn parse_source(
