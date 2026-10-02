@@ -1462,14 +1462,14 @@ mod tests {
             "error must name all valid modes: {err}"
         );
         assert!(
-            err.contains("edit mode"),
-            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+            err.contains("already tagged and editable"),
+            "error must explain every read is already tagged: {err}"
         );
     }
 
-    /// `mode: "edit"` was never a valid mode value — tagged/editable reads
-    /// happen automatically when the server runs in edit mode, so the error
-    /// must redirect the caller rather than just name it "unknown".
+    /// `mode: "edit"` was never a valid mode value — every read is already
+    /// tagged and editable, so the error must redirect the caller rather than
+    /// just name it "unknown".
     #[test]
     fn tool_read_mode_edit_teaches_server_mode() {
         let args = serde_json::json!({
@@ -2188,8 +2188,8 @@ mod tests {
         let err = tool_read(&tc(&args), &cache, &session).expect_err("unknown mode rejected");
         assert!(err.contains("stripped"), "error must list new mode: {err}");
         assert!(
-            err.contains("edit mode"),
-            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+            err.contains("already tagged and editable"),
+            "error must explain every read is already tagged: {err}"
         );
     }
 

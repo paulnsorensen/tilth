@@ -19,7 +19,7 @@ tilth runs:
 - **Unit and integration tests** on every push (`cargo test`).
 - **CodeQL** static analysis on Rust, Python, and JavaScript on every push.
 - **OpenSSF Scorecard** weekly, results uploaded to the Code scanning view.
-- **cargo-fuzz** nightly across three input surfaces — `outline` (tree-sitter outline rendering across 18 languages), `strip` (comment / debug-log stripping), and `diff_parse` (unified diff parser). See `.github/workflows/fuzz.yml`. Crash artifacts land in the workflow run on failure; corpus is cached across runs.
+- **cargo-fuzz** nightly across two input surfaces — `outline` (tree-sitter outline rendering across 18 languages) and `strip` (comment / debug-log stripping). See `.github/workflows/fuzz.yml`. Crash artifacts land in the workflow run on failure; corpus is cached across runs.
 
 Reproducing a fuzz finding locally:
 

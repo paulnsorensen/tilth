@@ -360,7 +360,7 @@ Rust. ~20,000 lines. No runtime dependencies.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
 - **ignore** crate — parallel directory walking, searches all files including gitignored
 - **memmap2** — memory-mapped file reads (no buffers)
-- **DashMap** — concurrent outline cache, invalidated by mtime
+- **clru** — bounded LRU outline cache, invalidated by file revision
 
 Search runs definitions and usages in parallel via `rayon::join`. Callee resolution runs at expand time — extract callee names via tree-sitter queries, resolve against the source file's outline and imported files. Callers query uses the same tree-sitter patterns in reverse, walking the codebase with `memchr` SIMD pre-filtering for fast elimination.
 

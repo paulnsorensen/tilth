@@ -120,8 +120,8 @@ fn tool_read_paths(
     if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
         return Err(format!(
             "unknown read mode: {mode_str}. Valid modes: auto, full, signature, stripped. \
-            \"edit\" is not a mode — mode only controls the view; tagged, editable reads happen \
-            automatically when the server runs in edit mode."
+            \"edit\" is not a mode — mode only controls the view; every tilth_read is already \
+            tagged and editable."
         ));
     }
     let force_full = mode_str == "full";
@@ -158,7 +158,7 @@ fn tool_read_paths(
 
         // Per-path outcome. Workers are pure (read file, parse outline, format)
         // except for `session.record_read` (atomic + Mutex internally) and
-        // `cache` access (DashMap). Partitioned after the join to preserve
+        // `cache` access (Mutex-guarded LRU). Partitioned after the join to preserve
         // input order — `par_iter().collect()` is index-stable.
         enum PerPath {
             Content(String, String),
@@ -591,7 +591,7 @@ pub(crate) fn read_single_with_suffix(
 }
 
 /// Whether an edit-mode read of `path` with `suffix` should record a
-/// whole-file-tag snapshot Returns `false`
+/// whole-file-tag snapshot. Returns `false`
 /// for signature and stripped views (non-editable, no tag emitted), and an
 /// outlined whole-file
 /// view (no numbered lines shown — recording whole-file seen-lines would poison

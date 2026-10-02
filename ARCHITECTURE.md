@@ -575,11 +575,12 @@ deliberately scoped — only `OutlineCache`, `Session`, and
 
 ### `OutlineCache` (`cache.rs`)
 
-Two `DashMap` tables, both keyed by `(PathBuf, SystemTime)`:
+Two bounded `clru` LRU tables, each behind a `Mutex`:
 
-- `entries`: rendered outline strings (`Arc<str>`).
+- `entries`: rendered outline strings (`Arc<str>`), keyed by
+  `(PathBuf, OutlineMode, RevisionKind)`.
 - `parsed`: parsed tree-sitter trees (`Arc<ParsedFile>`,
-  carrying `Arc<String>` content, `tree_sitter::Tree`, and `Lang`).
+  carrying `Arc<String>` content, `tree_sitter::Tree`, and `Lang`), keyed by `PathBuf`.
 
 Entries are computed lazily via `get_or_compute` and `get_or_parse`.
 Both use the entry-API to avoid TOCTOU races. There is no eviction —

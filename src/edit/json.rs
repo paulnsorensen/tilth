@@ -243,8 +243,8 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
             let stripped = t.strip_prefix('#').unwrap_or(t.as_str());
             Some(parse_tag(stripped).ok_or_else(|| {
                 format!(
-                    "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from an \
-                     edit-mode read — run an edit-mode tilth_read of the path to mint a fresh tag",
+                    "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from a \
+                     tilth_read — run tilth_read on the path to mint a fresh tag",
                     raw.path
                 )
             })?)

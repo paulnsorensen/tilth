@@ -247,24 +247,11 @@ impl OutlineCache {
         )
     }
 
-    /// Cache a disk-backed outline. On Unix a warm hit costs one `stat`, no
-    /// source read; non-Unix warm hits still read the file to fingerprint it
-    /// because mtime and length alone are insufficient there.
+    /// Cache a disk-backed outline, reusing metadata the caller already
+    /// fetched instead of `stat`-ing the file again. On Unix a warm hit costs
+    /// no source read; non-Unix warm hits still read the file to fingerprint
+    /// it because mtime and length alone are insufficient there.
     /// The closure must read the file after this method starts.
-    pub fn get_or_compute_disk(
-        &self,
-        path: &Path,
-        mode: OutlineMode,
-        compute: impl FnOnce() -> String,
-    ) -> Arc<str> {
-        let Some(revision) = FileRevision::of(path) else {
-            return compute().into();
-        };
-        self.compute_revision(path, mode, OutlineRevision::Disk(revision), compute)
-    }
-
-    /// Same as `get_or_compute_disk`, but reuses metadata the caller already
-    /// fetched instead of `stat`-ing the file again.
     pub fn get_or_compute_disk_with_metadata(
         &self,
         path: &Path,
@@ -625,6 +612,16 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
+    fn disk(
+        cache: &OutlineCache,
+        path: &Path,
+        mode: OutlineMode,
+        compute: impl FnOnce() -> String,
+    ) -> Arc<str> {
+        let meta = std::fs::metadata(path).unwrap();
+        cache.get_or_compute_disk_with_metadata(path, mode, &meta, compute)
+    }
+
     #[test]
     fn incremental_verification_reads_only_expected_bytes_plus_one() {
         let expected = b"fn exact() {}";
@@ -658,7 +655,7 @@ mod tests {
             cache.get_or_parse(file).unwrap();
             for mode in [OutlineMode::Capped, OutlineMode::Full] {
                 cache.get_or_compute(file, b"fn retained() {}", mode, || "content".into());
-                cache.get_or_compute_disk(file, mode, || "disk".into());
+                disk(&cache, file, mode, || "disk".into());
             }
         }
         assert_eq!(cache.entries.lock().unwrap().len(), 8);
@@ -807,13 +804,13 @@ mod tests {
         std::fs::write(&path, "fn alpha() {}").unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let cache = OutlineCache::new();
-        cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+        disk(&cache, &path, OutlineMode::Full, || {
             std::fs::read_to_string(&path).unwrap()
         });
         crate::util::rewrite_with_restored_mtime(&path, mtime, || {
             std::fs::write(&path, "fn bravo() {}").unwrap();
         });
-        let changed = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+        let changed = disk(&cache, &path, OutlineMode::Full, || {
             std::fs::read_to_string(&path).unwrap()
         });
         assert_eq!(&*changed, "fn bravo() {}");
@@ -827,7 +824,7 @@ mod tests {
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let before = crate::util::FileRevision::of(&path).unwrap();
         let cache = OutlineCache::new();
-        cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+        disk(&cache, &path, OutlineMode::Full, || {
             let old = std::fs::read_to_string(&path).unwrap();
             crate::util::rewrite_with_restored_mtime(&path, mtime, || {
                 std::fs::write(&path, "fn bravo() {}").unwrap();
@@ -839,7 +836,7 @@ mod tests {
             cache.entries.lock().unwrap().is_empty(),
             "must not publish an outline computed from bytes that no longer match disk"
         );
-        let current = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+        let current = disk(&cache, &path, OutlineMode::Full, || {
             std::fs::read_to_string(&path).unwrap()
         });
         assert_eq!(&*current, "fn bravo() {}");
@@ -871,7 +868,7 @@ mod tests {
             .enumerate()
         {
             cache.get_or_parse(&path).unwrap();
-            cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+            disk(&cache, &path, OutlineMode::Full, || {
                 std::fs::read_to_string(&path).unwrap()
             });
             match step {
@@ -901,12 +898,11 @@ mod tests {
                 cache.get_or_parse(&path).unwrap().content().as_str(),
                 expected
             );
-            let outline = cache.get_or_compute_disk(&path, OutlineMode::Full, || {
+            let outline = disk(&cache, &path, OutlineMode::Full, || {
                 std::fs::read_to_string(&path).unwrap()
             });
             assert_eq!(&*outline, expected);
-            let warm =
-                cache.get_or_compute_disk(&path, OutlineMode::Full, || panic!("warm disk hit"));
+            let warm = disk(&cache, &path, OutlineMode::Full, || panic!("warm disk hit"));
             assert!(Arc::ptr_eq(&outline, &warm));
         }
     }

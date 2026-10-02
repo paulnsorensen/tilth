@@ -298,7 +298,7 @@ fn resolve_edit(
                 // A section read carries the whole-file tag, so the cheap route
                 // has to be part of the rejection.
                 return Err(TilthError::EditRejected(
-                    "replace_text requires a tag from an edit-mode read; a section read \
+                    "replace_text requires a tag from a tilth_read; a section read \
                      (path#12-40) carries the whole-file tag without reading the file in \
                      full, but `old` must occur in the lines it displayed. Files over the \
                      tag cap mint no tag — use line ops there."
@@ -1748,7 +1748,7 @@ mod tests {
             // when a section read would have supplied the same whole-file tag.
             TilthError::EditRejected(message) => {
                 assert!(
-                    message.starts_with("replace_text requires a tag from an edit-mode read"),
+                    message.starts_with("replace_text requires a tag from a tilth_read"),
                     "unexpected rejection: {message}"
                 );
                 assert!(

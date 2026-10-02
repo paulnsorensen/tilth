@@ -396,6 +396,18 @@ mod tests {
         assert_eq!(compute_expand(None, false), 0);
     }
 
+    /// `install <host> --edit` is a retired no-op flag; old scripts that
+    /// still pass it must keep parsing.
+    #[test]
+    fn install_accepts_retired_edit_flag() {
+        let cli = Cli::try_parse_from(["tilth", "install", "claude-code", "--edit"])
+            .expect("install --edit must still parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Install { ref host, .. }) if host == "claude-code"
+        ));
+    }
+
     /// Pin the regression that 16212fc was authored to prevent: a piped
     /// invocation (where `main` sets `full = !is_tty = true` for `FilePath`
     /// queries) must still receive `expand=0` here. `compute_expand` only
