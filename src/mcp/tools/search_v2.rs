@@ -612,9 +612,9 @@ fn narrow_structural(result: &Value, counts: &FileCounts, fits: &dyn Fn(usize) -
     base["budget_limited"] = json!(true);
     let fitting = |candidate: &Value| fits(candidate.to_string().len());
     prefix_tier(result, &base, counts, fits)
-        .or_else(|| files_tier(&base, counts).filter(&fitting))
-        .or_else(|| directories_tier(&base, counts).filter(&fitting))
-        .or_else(|| none_tier(&base, counts).filter(&fitting))
+        .or_else(|| files_tier(&base, counts).filter(fitting))
+        .or_else(|| directories_tier(&base, counts).filter(fitting))
+        .or_else(|| none_tier(&base, counts).filter(fitting))
         .unwrap_or(base)
 }
 
@@ -1175,7 +1175,7 @@ mod tests {
         reduce_response(results, &hints, &response["diagnostics"], budget)
     }
 
-    fn structural_record(items: Value) -> Value {
+    fn structural_record(items: &Value) -> Value {
         json!({"query": "wrap($A)", "resolved_as": "structural", "status": "ok",
             "completeness": "complete", "view": "matches", "items": items})
     }
@@ -1185,7 +1185,7 @@ mod tests {
         let counts: FileCounts = (0..60)
             .map(|i| (format!("dir{}/f{i}.py", i % 3), 2))
             .collect();
-        let result = structural_record(json!([]));
+        let result = structural_record(&json!([]));
         let mut plain = result.clone();
         plain.as_object_mut().unwrap().remove("items");
         mark_partial(&mut plain);
@@ -1213,7 +1213,7 @@ mod tests {
             .map(|i| json!([i, i, i * 7, i * 7 + 5, {"A": [[i, i, 1, 2]]}]))
             .collect();
         let counts: FileCounts = [("a.py".to_string(), 120)].into();
-        let result = structural_record(json!([{"path": "a.py", "matches": matches}]));
+        let result = structural_record(&json!([{"path": "a.py", "matches": matches}]));
         let shown = |limit: usize| {
             let narrowed = narrow_structural(&result, &counts, &|bytes| bytes <= limit);
             assert!(narrowed.to_string().len() <= limit || narrowed.get("shown").is_none());
@@ -1243,7 +1243,7 @@ mod tests {
             "completeness": "complete", "preview": "x".repeat(3000)});
         let results = vec![
             (plain, None),
-            (structural_record(json!(groups)), Some(counts)),
+            (structural_record(&json!(groups)), Some(counts)),
         ];
         let (output, limited) = reduce_response(results, &[], &json!({}), 300).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
