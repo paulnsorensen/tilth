@@ -7,9 +7,10 @@ const CALLEE_QUERY: &str = concat!(
     "(invocation_expression function: (member_access_expression name: (identifier) @callee))\n",
 );
 
+// tree-sitter-c-sharp 0.23 parses `this` as an anonymous token.
 const SIBLING_QUERY: &str = concat!(
-    "(member_access_expression expression: (this_expression) name: (identifier) @ref)\n",
-    "(invocation_expression function: (member_access_expression expression: (this_expression) name: (identifier) @ref))\n",
+    "(member_access_expression expression: \"this\" name: (identifier) @ref)\n",
+    "(invocation_expression function: (member_access_expression expression: \"this\" name: (identifier) @ref))\n",
 );
 
 pub(crate) const SPEC: LangSpec = LangSpec {

@@ -10,26 +10,21 @@ pub(super) fn callee_query_str(lang: Lang) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    /// A query that fails to compile returns no matches with no error.
     #[test]
-    fn kotlin_callee_query_compiles() {
-        let lang: tree_sitter::Language = tree_sitter_kotlin_sg::LANGUAGE.into();
-        let query_str = callee_query_str(Lang::Kotlin).unwrap();
-        tree_sitter::Query::new(&lang, query_str).expect("kotlin callee query should compile");
-    }
-
-    #[test]
-    fn elixir_callee_query_compiles() {
-        let lang: tree_sitter::Language = tree_sitter_elixir::LANGUAGE.into();
-        let query_str = callee_query_str(Lang::Elixir).unwrap();
-        tree_sitter::Query::new(&lang, query_str).expect("elixir callee query should compile");
-    }
-
-    #[test]
-    fn bash_callee_query_compiles() {
-        let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
-        let query_str = callee_query_str(Lang::Bash).unwrap();
-        tree_sitter::Query::new(&lang, query_str).expect("bash callee query should compile");
+    fn every_call_and_member_query_compiles() {
+        for lang in crate::lang::ALL_LANGS {
+            let spec = crate::lang::spec::spec(*lang);
+            let Some(grammar) = crate::lang::outline::outline_language(*lang) else {
+                continue;
+            };
+            for query in [spec.callee_query, spec.sibling_query]
+                .into_iter()
+                .flatten()
+            {
+                tree_sitter::Query::new(&grammar, query)
+                    .unwrap_or_else(|error| panic!("{lang:?}: {error}"));
+            }
+        }
     }
 }

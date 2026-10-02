@@ -100,6 +100,22 @@ impl Session {
         self.request("tools/call", &json!({"name": name, "arguments": arguments}))
     }
 
+    /// Run the CLI once in the workspace with the session cache.
+    pub fn cli(&self, args: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(args)
+            .current_dir(self.workspace())
+            .env("XDG_CACHE_HOME", self.root.path().join("cache"))
+            .output()
+            .expect("run tilth CLI");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 CLI output")
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Value {
         self.next_id += 1;
         self.last_request = json!({

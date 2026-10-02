@@ -1,7 +1,5 @@
 //! Go language spec. Diverges on: stdlib rule and method-receiver extraction.
 
-use streaming_iterator::StreamingIterator;
-
 use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
@@ -110,24 +108,11 @@ pub(crate) fn extract_go_receiver_name(
     const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
 
     let bytes = content.as_bytes();
-
-    // `with_query` returns `Option<Option<String>>`; flatten to `Option<String>`.
-    crate::lang::treesitter::with_query(ts_lang, GO_RECV_QUERY, |query| {
-        let recv_idx = query.capture_index_for_name("recv")?;
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, root, bytes);
-
-        if let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index == recv_idx {
-                    return cap.node.utf8_text(bytes).ok().map(String::from);
-                }
-            }
-        }
-
-        None
-    })
-    .flatten()
+    let [recv] =
+        crate::lang::treesitter::query_captures(ts_lang, GO_RECV_QUERY, root, bytes, ["recv"])
+            .into_iter()
+            .next()?;
+    recv?.utf8_text(bytes).ok().map(String::from)
 }
 
 fn import_line(line: &str) -> bool {

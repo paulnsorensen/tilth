@@ -613,6 +613,34 @@ pub(crate) fn with_query<R>(
     Some(f(&query))
 }
 
+/// Run the cached query over `root`. Each match yields the first node of each
+/// capture in `names`, in order. A query that does not compile yields no matches.
+pub(crate) fn query_captures<'tree, const N: usize>(
+    ts_lang: &tree_sitter::Language,
+    query_str: &'static str,
+    root: tree_sitter::Node<'tree>,
+    source: &[u8],
+    names: [&str; N],
+) -> Vec<[Option<tree_sitter::Node<'tree>>; N]> {
+    use streaming_iterator::StreamingIterator;
+
+    with_query(ts_lang, query_str, |query| {
+        let indices = names.map(|name| query.capture_index_for_name(name));
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(query, root, source);
+        let mut found = Vec::new();
+        while let Some(found_match) = matches.next() {
+            found.push(indices.map(|index| {
+                let index = index?;
+                let capture = found_match.captures().iter().find(|c| c.index == index)?;
+                Some(capture.node)
+            }));
+        }
+        found
+    })
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
