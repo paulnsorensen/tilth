@@ -18,6 +18,6 @@ class RetiredTools(unittest.TestCase):
                 ])
                 self.assertEqual(result.returncode, 0)
                 names = result.tool_names()
-                self.assertNotIn("tilth_diff", names)
-                self.assertNotIn("tilth_grok", names)
+                for retired in ["tilth_diff", "tilth_grok", "tilth_files", "tilth_list"]:
+                    self.assertNotIn(retired, names)
                 self.assertIn("tilth_read", names)

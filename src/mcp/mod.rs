@@ -334,9 +334,6 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
 /// names keep the plain `unknown tool: X` message.
 fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
     match tool {
-        "tilth_files" | "tilth_list" => format!(
-            "retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
-        ),
         "tilth_edit" if edit_mode => {
             "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
         }
@@ -562,31 +559,9 @@ mod tests {
     }
 
     #[test]
-    fn retired_directory_tools_return_guidance_without_dispatch() {
-        for edit_mode in [false, true] {
-            let services = Services::new(edit_mode);
-            for tool in ["tilth_list", "tilth_files"] {
-                for args in [
-                    serde_json::json!({}),
-                    serde_json::json!({"cwd": "/", "patterns": ["*"]}),
-                ] {
-                    let err = dispatch_tool(tool, &args, &services).unwrap_err();
-                    assert_eq!(err, format!("retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."));
-                }
-            }
-        }
-    }
-
-    #[test]
     fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
         let services = Services::new(true);
         let args = serde_json::json!({ "cwd": "/" });
-
-        let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
-        assert_eq!(
-            files_err,
-            "retired tool 'tilth_files' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
-        );
 
         let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
         assert_eq!(
