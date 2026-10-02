@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use streaming_iterator::StreamingIterator;
-
 use crate::lang::outline::{get_outline_entries, outline_language};
 use crate::types::{Lang, OutlineEntry};
 
@@ -61,43 +59,21 @@ pub(crate) fn extract_callee_names_from_tree(
     };
     let content_bytes = content.as_bytes();
 
-    let Some(names) = crate::lang::treesitter::with_query(&ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
-        };
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut names: Vec<String> = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // 1-indexed line number of the capture
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Filter by def_range if provided
-                if let Some((start, end)) = def_range {
-                    if line < start || line > end {
-                        continue;
-                    }
-                }
-
-                if let Ok(text) = cap.node.utf8_text(content_bytes) {
-                    names.push(text.to_string());
-                }
-            }
-        }
-
-        names
-    }) else {
-        return Vec::new();
-    };
-
-    let mut names = names;
+    let mut names: Vec<String> = crate::lang::treesitter::query_captures(
+        &ts_lang,
+        query_str,
+        tree.root_node(),
+        content_bytes,
+        ["callee"],
+    )
+    .into_iter()
+    .filter_map(|[callee]| callee)
+    .filter(|callee| {
+        let line = callee.start_position().row as u32 + 1;
+        def_range.is_none_or(|(start, end)| (start..=end).contains(&line))
+    })
+    .filter_map(|callee| callee.utf8_text(content_bytes).ok().map(str::to_owned))
+    .collect();
     names.sort();
     names.dedup();
     names.retain(|name| (crate::lang::spec::spec(lang).policy.callee_allowed)(name));

@@ -1,7 +1,5 @@
-use streaming_iterator::StreamingIterator;
-
 use crate::lang::outline::outline_language;
-use crate::lang::treesitter::with_query;
+use crate::lang::treesitter::query_captures;
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// A sibling field or method resolved from the same parent struct/class/impl.
@@ -59,75 +57,26 @@ pub(crate) fn extract_sibling_references_from_tree(
 
     let bytes = content.as_bytes();
     let (start, end) = def_range;
+    let text = |node: Option<tree_sitter::Node>| node.and_then(|n| n.utf8_text(bytes).ok());
 
-    let Some(names) = with_query(&ts_lang, query_str, |query| {
-        let Some(ref_idx) = query.capture_index_for_name("ref") else {
-            return Vec::new();
-        };
-
-        // For Python, we also need @obj to filter `self.x` vs `other.x`.
-        // For Scala, we also need @obj to filter `this.x` vs `other.x`.
-        let obj_idx = query.capture_index_for_name("obj");
-        // For Go, we need @recv to filter receiver-only accesses.
-        let recv_idx = query.capture_index_for_name("recv");
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), bytes);
-        let mut names: Vec<String> = Vec::new();
-
-        while let Some(m) = matches.next() {
-            if let (Some(expected), Some(object_index)) = (expected_object, obj_idx) {
-                let object_matches = m.captures().iter().any(|capture| {
-                    capture.index == object_index
-                        && capture
-                            .node
-                            .utf8_text(bytes)
-                            .is_ok_and(|text| text == expected)
-                });
-                if !object_matches {
-                    continue;
-                }
-            }
-
-            if language.extract_receiver.is_some() {
-                let (Some(receiver_index), Some(receiver_name)) = (recv_idx, receiver.as_deref())
-                else {
-                    continue;
-                };
-                let receiver_matches = m.captures().iter().any(|capture| {
-                    capture.index == receiver_index
-                        && capture
-                            .node
-                            .utf8_text(bytes)
-                            .is_ok_and(|text| text == receiver_name)
-                });
-                if !receiver_matches {
-                    continue;
-                }
-            }
-
-            for cap in m.captures() {
-                if cap.index != ref_idx {
-                    continue;
-                }
-
-                let line = cap.node.start_position().row as u32 + 1;
-                if line < start || line > end {
-                    continue;
-                }
-
-                if let Ok(text) = cap.node.utf8_text(bytes) {
-                    names.push(text.to_string());
-                }
-            }
-        }
-
-        names
-    }) else {
-        return Vec::new();
-    };
-
-    let mut names = names;
+    // `obj` keeps Python `self.x` and Scala `this.x`; `recv` keeps Go receiver members.
+    let mut names: Vec<String> = query_captures(
+        &ts_lang,
+        query_str,
+        tree.root_node(),
+        bytes,
+        ["ref", "obj", "recv"],
+    )
+    .into_iter()
+    .filter(|[_, object, _]| expected_object.is_none_or(|expected| text(*object) == Some(expected)))
+    .filter(|[_, _, recv]| {
+        language.extract_receiver.is_none()
+            || receiver.is_some() && text(*recv) == receiver.as_deref()
+    })
+    .filter_map(|[reference, _, _]| reference)
+    .filter(|reference| (start..=end).contains(&(reference.start_position().row as u32 + 1)))
+    .filter_map(|reference| text(Some(reference)).map(str::to_owned))
+    .collect();
     names.sort();
     names.dedup();
     names

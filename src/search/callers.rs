@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use streaming_iterator::StreamingIterator;
-
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
@@ -215,7 +213,6 @@ fn find_callers_treesitter_batch(
     lang: crate::types::Lang,
     tree: &tree_sitter::Tree,
 ) -> Vec<(String, CallerMatch)> {
-    // Get the query string for this language
     let Some(query_str) = super::callee_query::callee_query_str(lang) else {
         return Vec::new();
     };
@@ -223,73 +220,47 @@ fn find_callers_treesitter_batch(
     let content = snapshot.content();
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
+    let callees = crate::lang::treesitter::query_captures(
+        ts_lang,
+        query_str,
+        tree.root_node(),
+        content_bytes,
+        ["callee"],
+    );
 
-    let Some(callers) = crate::lang::treesitter::with_query(ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
+    let mut callers = Vec::new();
+    for callee in callees.into_iter().filter_map(|[callee]| callee) {
+        let Ok(text) = callee.utf8_text(content_bytes) else {
+            continue;
+        };
+        if !targets.contains(text) {
+            continue;
+        }
+        let matched_target = text.to_string();
+        let line = callee.start_position().row as u32 + 1;
+
+        // Show the call line only when the whole call expression fits on it.
+        let call_node = callee.parent().unwrap_or(callee);
+        let row = call_node.start_position().row;
+        let call_text = if row == call_node.end_position().row && row < lines.len() {
+            lines[row].trim().to_string()
+        } else {
+            matched_target.clone()
         };
 
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut callers = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // Check if the captured text matches any of our target symbols
-                let Ok(text) = cap.node.utf8_text(content_bytes) else {
-                    continue;
-                };
-
-                if !targets.contains(text) {
-                    continue;
-                }
-
-                let matched_target = text.to_string();
-
-                // Found a call site! Now walk up to find the calling function
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Get the call text (the whole call expression, not just the callee)
-                let call_node = cap.node.parent().unwrap_or(cap.node);
-                let same_line = call_node.start_position().row == call_node.end_position().row;
-                let call_text: String = if same_line {
-                    let row = call_node.start_position().row;
-                    if row < lines.len() {
-                        lines[row].trim().to_string()
-                    } else {
-                        matched_target.clone()
-                    }
-                } else {
-                    matched_target.clone()
-                };
-
-                // Walk up the tree to find the enclosing function
-                let (calling_function, caller_range) =
-                    find_enclosing_function(cap.node, &lines, lang);
-
-                callers.push((
-                    matched_target,
-                    CallerMatch {
-                        path: path.to_path_buf(),
-                        line,
-                        calling_function,
-                        call_text,
-                        caller_range,
-                        snapshot: Arc::clone(snapshot),
-                    },
-                ));
-            }
-        }
-
-        callers
-    }) else {
-        return Vec::new();
-    };
-
+        let (calling_function, caller_range) = find_enclosing_function(callee, &lines, lang);
+        callers.push((
+            matched_target,
+            CallerMatch {
+                path: path.to_path_buf(),
+                line,
+                calling_function,
+                call_text,
+                caller_range,
+                snapshot: Arc::clone(snapshot),
+            },
+        ));
+    }
     callers
 }
 
