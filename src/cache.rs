@@ -96,10 +96,13 @@ impl ParsedFile {
     }
 }
 
-/// One bounded resident entry. The cell is empty while one caller loads it.
+/// A shared load slot. It is empty while one caller loads it.
+type LoadSlot = Arc<OnceLock<Option<Arc<ParsedFile>>>>;
+
+/// One bounded resident entry: a revision and its load slot.
 struct ParsedEntry {
     revision: FileRevision,
-    file: Arc<OnceLock<Option<Arc<ParsedFile>>>>,
+    file: LoadSlot,
 }
 
 #[cfg(test)]
@@ -312,14 +315,18 @@ impl OutlineCache {
                 continue;
             };
             record_load_decision(path);
+            let mut loaded = false;
             let file = load
                 .get_or_init(|| {
+                    loaded = true;
                     let content = read_source(path).ok()?;
                     let document = crate::lang::treesitter::parse_document(content, &language)?;
                     Some(Arc::new(ParsedFile { document, lang }))
                 })
                 .clone();
-            if file.is_none() || !revision.is_current(path) {
+            // Only the caller that ran the load rechecks freshness; a warm hit
+            // trusts the revision it just observed, as a plain lookup does.
+            if file.is_none() || (loaded && !revision.is_current(path)) {
                 self.discard_if_entry(path, &revision, &load);
             }
             return file;
@@ -365,9 +372,10 @@ impl OutlineCache {
     /// `revision` BEFORE it reads the bytes. A hit needs an equal revision
     /// and equal bytes. A miss parses the supplied bytes once and never
     /// re-reads the file. The parse is published only if the file still has
-    /// `revision` under the cache lock. A change between the stat and the
-    /// read, or after the read, fails that check, so no stale bytes enter
-    /// the cache. Without a revision, or over the size limit, nothing is published.
+    /// `revision` after the read and the resident entry did not change while
+    /// that check ran. A change between the stat and the read, or after the
+    /// read, fails that check, so no stale bytes enter the cache. Without a
+    /// revision, or over the size limit, nothing is published.
     pub(crate) fn parse_with_revision<C: AsRef<str> + Into<String>>(
         &self,
         path: &Path,
@@ -504,11 +512,7 @@ impl OutlineCache {
         load.get_or_init(|| Some(file)).clone()
     }
 
-    fn load_for_revision(
-        &self,
-        path: &Path,
-        revision: &FileRevision,
-    ) -> Option<Arc<OnceLock<Option<Arc<ParsedFile>>>>> {
+    fn load_for_revision(&self, path: &Path, revision: &FileRevision) -> Option<LoadSlot> {
         let observed = {
             let mut parsed = self
                 .parsed
@@ -553,12 +557,7 @@ impl OutlineCache {
         Some(load)
     }
 
-    fn discard_if_entry(
-        &self,
-        path: &Path,
-        revision: &FileRevision,
-        load: &Arc<OnceLock<Option<Arc<ParsedFile>>>>,
-    ) {
+    fn discard_if_entry(&self, path: &Path, revision: &FileRevision, load: &LoadSlot) {
         let mut parsed = self
             .parsed
             .lock()
