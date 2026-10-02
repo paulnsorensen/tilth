@@ -40,7 +40,7 @@ src/
     structural.rs      ast-grep structural pattern search over cached trees; language mapping via `spec(lang).policy.structural`.
   index/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
-  cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.
+  cache.rs             OutlineCache — bounded LRU (clru) of path → (revision, outline, parsed document). Shared across tools.
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
   edit/
     mod.rs             Path-key normalization; re-exports the whole-file-tag edit modules below.
