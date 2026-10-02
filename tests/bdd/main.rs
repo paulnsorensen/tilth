@@ -184,6 +184,33 @@ fn ambiguous_search(world: &mut TilthWorld, first: String, second: String) {
     assert_eq!(paths, [first.as_str(), second.as_str()], "{world:?}");
 }
 
+#[then(expr = "the search is ambiguous between {string} lines {int} and {int}")]
+fn ambiguous_same_file(world: &mut TilthWorld, path: String, first: u64, second: u64) {
+    let payload = world.search_payload();
+    let result = &payload["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{world:?}");
+    let mut candidates = result["candidates"]
+        .as_array()
+        .expect("ambiguous candidates")
+        .iter()
+        .map(|candidate| {
+            (
+                candidate["path"]
+                    .as_str()
+                    .expect("candidate path")
+                    .to_owned(),
+                candidate["line"].as_u64().expect("candidate line"),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    assert_eq!(
+        candidates,
+        [(path.clone(), first), (path, second)],
+        "{world:?}"
+    );
+}
+
 #[then(expr = "the content search finds {int} match in {string} at line {int}")]
 fn content_match(
     world: &mut TilthWorld,
@@ -257,90 +284,33 @@ fn read_range_exact(world: &mut TilthWorld, first: u64, last: u64, step: &cucumb
     );
 }
 
-#[when(expr = "I grok {string}")]
-fn grok(world: &mut TilthWorld, target: String) {
-    world.call("tilth_grok", json!({"target": target, "full": true}));
-}
-
-#[then(expr = "grok resolves {string} in {string} at line {int} without ambiguity")]
-fn grok_target(
-    world: &mut TilthWorld,
-    name: String,
-    path: String,
-    line: u64,
-    step: &cucumber::gherkin::Step,
-) {
-    let text = world.successful_text();
-    let expected_header = format!("# grok: {name} [{path}:{line}]");
-    assert_eq!(
-        text.lines().next(),
-        Some(expected_header.as_str()),
-        "{world:?}"
-    );
-    assert!(!text.contains("> ambiguous:"), "{world:?}");
-    assert_eq!(grok_body(text), docstring(step), "{world:?}");
-}
-
-#[then(expr = "grok resolves {string} in {string} at line {int}")]
-fn grok_target_with_reported_ambiguity(
-    world: &mut TilthWorld,
-    name: String,
-    path: String,
-    line: u64,
-    step: &cucumber::gherkin::Step,
-) {
-    let text = world.successful_text();
-    let expected_header = format!("# grok: {name} [{path}:{line}]");
-    assert_eq!(
-        text.lines().next(),
-        Some(expected_header.as_str()),
-        "{world:?}"
-    );
-    assert_eq!(grok_body(text), docstring(step), "{world:?}");
-}
-
-#[then(expr = "grok reports {int} other definition")]
-fn grok_ambiguity(world: &mut TilthWorld, count: u64) {
-    let suffix = if count == 1 { "" } else { "s" };
-    assert!(
-        world
-            .successful_text()
-            .contains(&format!("> ambiguous: {count} other definition{suffix} ")),
-        "{world:?}"
-    );
-}
-
-#[then("grok reports callers exactly")]
-fn exact_callers(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
-    let text = world.successful_text();
-    let callers = text.split_once("## callers (").expect("callers section").1;
-    let callers = callers.split_once(")\n").expect("caller count").1;
-    let mut path = "";
-    let mut actual = Vec::new();
-    for row in callers.lines().take_while(|line| !line.starts_with("## ")) {
-        if let Some(file) = row.strip_prefix("  ").filter(|line| !line.starts_with(' ')) {
-            path = file;
-        } else if let Some(call) = row.strip_prefix("    [") {
-            let (line, owner) = call.split_once("]   in ").expect("caller row");
-            let owner = owner.strip_suffix("()").expect("caller owner");
-            actual.push(format!("{path}:{line} {owner}"));
-        }
-    }
+#[then("the search callers are exactly")]
+fn search_callers(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
+    let hint = world.search_payload()["hints"]
+        .as_array()
+        .expect("search hints")
+        .iter()
+        .find(|hint| hint["kind"] == "fetch_callers")
+        .expect("fetch_callers hint")
+        .clone();
+    world.call("tilth_search", json!({"queries": [{"follow": hint}]}));
+    let payload = world.search_payload();
+    let mut actual = payload["results"][0]["items"]
+        .as_array()
+        .expect("caller items")
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{} {}",
+                item["path"].as_str().expect("caller path"),
+                item["line"],
+                item["name"].as_str().expect("caller name")
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
     assert_eq!(actual.join("\n"), docstring(step), "{world:?}");
 }
-
-#[then(expr = "grok fails because {string} is not owned by {string}")]
-fn wrong_owner(world: &mut TilthWorld, name: String, owner: String) {
-    assert_eq!(world.response["isError"], true, "{world:?}");
-    let text = world.response["content"][0]["text"]
-        .as_str()
-        .expect("error text");
-    assert!(
-        text.contains(&format!("no '{name}' owned by '{owner}'")),
-        "{world:?}"
-    );
-}
-
 #[then(expr = "the dependency report has exactly 1 local dependency {string}")]
 fn exact_local_dependency(world: &mut TilthWorld, path: String) {
     let text = world.successful_text();
@@ -555,12 +525,6 @@ fn numbered_source(text: &str) -> String {
         .map(|(_, source)| source)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn grok_body(text: &str) -> &str {
-    text.split_once("\n## body\n").map_or("", |(_, body)| {
-        body.split("\n## ").next().unwrap_or(body).trim_end()
-    })
 }
 
 fn docstring(step: &cucumber::gherkin::Step) -> String {

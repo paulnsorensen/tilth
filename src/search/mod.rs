@@ -4,14 +4,13 @@ pub mod callers;
 pub mod content;
 pub mod deps;
 pub mod facets;
-mod fuzzy_symbol;
 pub mod glob;
-pub mod grok;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
 mod structural;
 pub mod symbol;
+pub mod target;
 pub mod truncate;
 #[cfg(test)]
 pub(crate) use structural::compilation_count;

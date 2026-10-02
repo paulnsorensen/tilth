@@ -14,7 +14,7 @@ mod iso;
 mod path_suffix;
 mod tools;
 
-use tools::{tool_definitions, tool_deps, tool_grok, tool_read, tool_search_v2, tool_write};
+use tools::{tool_definitions, tool_deps, tool_read, tool_search_v2, tool_write};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -329,26 +329,6 @@ fn append_nudge(body: String, tip: Option<String>) -> String {
     out
 }
 
-/// Build the error for an unrecognized tool name, adding a "did you mean"
-/// hint for names agents commonly confuse for a real verb. Genuinely unknown
-/// names keep the plain `unknown tool: X` message.
-fn unknown_tool_error(tool: &str, edit_mode: bool) -> String {
-    match tool {
-        "tilth_files" | "tilth_list" => format!(
-            "retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
-        ),
-        "tilth_diff" => "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.".to_string(),
-        "tilth_edit" if edit_mode => {
-            "unknown tool 'tilth_edit' — did you mean 'tilth_write'?".to_string()
-        }
-        "tilth_edit" => {
-            "unknown tool 'tilth_edit' — edit tools are disabled (server not in edit mode)"
-                .to_string()
-        }
-        _ => format!("unknown tool: {tool}"),
-    }
-}
-
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
@@ -356,7 +336,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // Budget validation only applies to tools that honour the budget param.
     // tilth_write ignores budget; rejecting budget:0 for it
     // produces a confusing read-oriented error on non-read operations.
-    let budget_aware = matches!(tool, "tilth_read" | "tilth_deps" | "tilth_grok");
+    let budget_aware = matches!(tool, "tilth_read" | "tilth_deps");
     if budget_aware {
         if let Some(b) = args.get("budget") {
             if !matches!(b.as_u64(), Some(n) if n >= 1) {
@@ -371,11 +351,10 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => dispatch_search_v2(args, services),
         "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), services.cache()),
         "tilth_write" if edit_mode => {
             tool_write(args, services.session(), services.bloom(), services.cache())
         }
-        _ => Err(unknown_tool_error(tool, edit_mode)),
+        _ => Err(format!("unknown tool: {tool}")),
     };
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
@@ -564,66 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn retired_directory_tools_return_guidance_without_dispatch() {
+    fn unregistered_tool_names_get_the_plain_unknown_tool_error() {
         for edit_mode in [false, true] {
             let services = Services::new(edit_mode);
-            for tool in ["tilth_list", "tilth_files"] {
-                for args in [
-                    serde_json::json!({}),
-                    serde_json::json!({"cwd": "/", "patterns": ["*"]}),
-                ] {
-                    let err = dispatch_tool(tool, &args, &services).unwrap_err();
-                    assert_eq!(err, format!("retired tool '{tool}' — use shell ls/find for directory browsing or 'tilth_read' for file contents."));
-                }
+            let args = serde_json::json!({ "cwd": "/" });
+            for tool in ["tilth_edit", "tilth_grok", "tilth_bogus"] {
+                let err = dispatch_tool(tool, &args, &services).unwrap_err();
+                assert_eq!(err, format!("unknown tool: {tool}"));
             }
         }
-    }
-
-    #[test]
-    fn retired_diff_returns_guidance_before_argument_validation() {
-        for edit_mode in [false, true] {
-            let services = Services::new(edit_mode);
-            for args in [
-                serde_json::json!({}),
-                serde_json::json!({"cwd": "/", "source": "working"}),
-                serde_json::json!({"cwd": 42, "budget": 0, "source": []}),
-            ] {
-                let err = dispatch_tool("tilth_diff", &args, &services).unwrap_err();
-                assert_eq!(err, "retired tool 'tilth_diff' — use shell git diff for changes and git log for history.");
-            }
-        }
-    }
-    #[test]
-    fn dispatch_tool_suggests_correct_verb_for_confusable_names() {
-        let services = Services::new(true);
-        let args = serde_json::json!({ "cwd": "/" });
-
-        let files_err = dispatch_tool("tilth_files", &args, &services).unwrap_err();
-        assert_eq!(
-            files_err,
-            "retired tool 'tilth_files' — use shell ls/find for directory browsing or 'tilth_read' for file contents."
-        );
-
-        let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
-        assert_eq!(
-            edit_err,
-            "unknown tool 'tilth_edit' — did you mean 'tilth_write'?"
-        );
-
-        let other_err = dispatch_tool("tilth_bogus", &args, &services).unwrap_err();
-        assert_eq!(other_err, "unknown tool: tilth_bogus");
-    }
-
-    #[test]
-    fn dispatch_tool_reports_edit_tools_disabled_in_read_only_mode() {
-        let services = Services::new(false);
-        let args = serde_json::json!({ "cwd": "/" });
-
-        let edit_err = dispatch_tool("tilth_edit", &args, &services).unwrap_err();
-        assert_eq!(
-            edit_err,
-            "unknown tool 'tilth_edit' — edit tools are disabled (server not in edit mode)"
-        );
+        let read_only = Services::new(false);
+        let err = dispatch_tool(
+            "tilth_write",
+            &serde_json::json!({ "cwd": "/" }),
+            &read_only,
+        )
+        .unwrap_err();
+        assert_eq!(err, "unknown tool: tilth_write");
     }
 
     #[test]
@@ -700,11 +636,11 @@ mod tests {
             if path == "b.rs" {
                 // Errored non-batchable call between the two reads.
                 dispatch_tool(
-                    "tilth_grok",
-                    &serde_json::json!({ "target": "x" }),
+                    "tilth_deps",
+                    &serde_json::json!({ "path": "x.rs" }),
                     &services,
                 )
-                .expect_err("grok without cwd must error");
+                .expect_err("deps without cwd must error");
             }
             let body = dispatch_tool(
                 "tilth_read",
@@ -775,7 +711,6 @@ mod tests {
                 serde_json::json!({ "queries": [{ "query": "x" }] }),
             ),
             ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
-            ("tilth_grok", serde_json::json!({ "target": "x" })),
             (
                 "tilth_write",
                 serde_json::json!({ "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 1 }] }] }),
@@ -877,7 +812,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1462,
+            1340,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -891,10 +826,6 @@ mod tests {
         assert!(
             SERVER_INSTRUCTIONS.contains("DO NOT omit `cwd`"),
             "require-cwd path discipline must remain in SERVER_INSTRUCTIONS"
-        );
-        assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_diff\", cwd:"),
-            "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
             SERVER_INSTRUCTIONS
@@ -917,7 +848,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            2016,
+            1976,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -1240,22 +1171,18 @@ mod tests {
         std::fs::write(dir.path().join("document.rs"), &source).unwrap();
         let witness = crate::lang::treesitter::ParseWitness::new(&source);
         let services = Services::new(false);
-        let grok = serde_json::json!({"cwd": dir.path(), "target": "document.rs:3"});
-        let first = dispatch_tool("tilth_grok", &grok, &services).unwrap();
-        assert!(first.contains("document_leaf") && first.contains("document_caller"));
-        let cold = witness.count();
-        assert_eq!(cold, 1, "each cacheable revision needs one full parse");
-        dispatch_tool("tilth_grok", &grok, &services).unwrap();
-        assert_eq!(
-            witness.count(),
-            cold,
-            "unchanged grok request reparses source"
-        );
         let search =
             serde_json::json!({"cwd": dir.path(), "queries": [{"query": "document_target"}]});
         let result = dispatch_tool("tilth_search", &search, &services).unwrap();
         assert!(result.contains("document_target"));
-        assert_eq!(witness.count(), cold, "search reparses the grok snapshot");
+        let cold = witness.count();
+        assert_eq!(cold, 1, "each cacheable revision needs one full parse");
+        dispatch_tool("tilth_search", &search, &services).unwrap();
+        assert_eq!(
+            witness.count(),
+            cold,
+            "unchanged search request reparses source"
+        );
         let read =
             serde_json::json!({"cwd": dir.path(), "paths": ["document.rs"], "mode": "signature"});
         dispatch_tool("tilth_read", &read, &services).unwrap();
@@ -1293,13 +1220,6 @@ mod tests {
             witness.count(),
             cold,
             "symbol read reparses the shared snapshot"
-        );
-        let by_name = serde_json::json!({"cwd": dir.path(), "target": "document_target"});
-        dispatch_tool("tilth_grok", &by_name, &services).unwrap();
-        assert_eq!(
-            witness.count(),
-            cold,
-            "name resolution reparses the shared snapshot"
         );
     }
 
@@ -1470,35 +1390,6 @@ mod tests {
         }
     }
 
-    fn assert_grammarless_grok_fallback(file: &str, source: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(file);
-        std::fs::write(&path, source).unwrap();
-        let request = serde_json::json!({
-            "cwd": dir.path(),
-            "target": format!("{}:1", path.display()),
-        });
-        let error = dispatch_tool("tilth_grok", &request, &Services::new(false)).unwrap_err();
-        assert!(
-            error.contains("no definition encloses line 1"),
-            "{file} must reach the existing grammarless fallback: {error}"
-        );
-        assert!(
-            !error.contains("source could not be parsed"),
-            "{file}: {error}"
-        );
-    }
-
-    #[test]
-    fn grok_path_line_preserves_dockerfile_fallback() {
-        assert_grammarless_grok_fallback("Dockerfile", "FROM scratch\n");
-    }
-
-    #[test]
-    fn grok_path_line_preserves_makefile_fallback() {
-        assert_grammarless_grok_fallback("Makefile", "all:\n\t@true\n");
-    }
-
     #[test]
     fn documents_direct_reads_do_not_parse() {
         let dir = tempfile::tempdir().unwrap();
@@ -1518,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_large_sources_keep_existing_search_and_grok_results() {
+    fn documents_large_sources_keep_existing_search_and_target_results() {
         let dir = tempfile::tempdir().unwrap();
         let source = format!("fn large_leaf() {{}}\nfn large_target() {{ large_leaf(); }}\nfn large_caller() {{ large_target(); }}\n{}", "// a long source comment with enough bytes to exceed the parsed cache size boundary\n".repeat(6500));
         let path = dir.path().join("large.rs");
@@ -1526,28 +1417,9 @@ mod tests {
         std::fs::write(&path, &source).unwrap();
         let services = Services::new(false);
         assert!(services.cache().get_or_parse(&path).is_none());
-        let result = crate::search::grok::grok_cached(
-            "large.rs:2",
-            dir.path(),
-            services.bloom(),
-            services.session(),
-            crate::search::grok::GrokCaps::default(),
-            services.cache(),
-        )
-        .unwrap();
-        assert_eq!(result.target.name, "large_target");
-        assert_eq!(
-            result
-                .callees_internal
-                .iter()
-                .map(|callee| callee.name.as_str())
-                .collect::<Vec<_>>(),
-            ["large_leaf"]
-        );
-        assert!(
-            result.callers.is_empty(),
-            "the caller walk keeps its existing 500 KB limit"
-        );
+        let (target, _, _) =
+            crate::search::target::resolve_by_path_line(&path, 2, services.cache()).unwrap();
+        assert_eq!(target.name, "large_target");
         let search = serde_json::json!({"cwd": dir.path(), "queries": [{"query": "large_target"}]});
         let response = dispatch_tool("tilth_search", &search, &services).unwrap();
         let response: Value = serde_json::from_str(&response).unwrap();
@@ -2668,7 +2540,7 @@ mod tests {
     /// every tool the mode offers, and the shell DO NOT lines.
     #[test]
     fn build_instructions_fit_2kb_and_carry_critical_spans() {
-        let shared_tools = ["tilth_search", "tilth_read", "tilth_deps", "tilth_grok"];
+        let shared_tools = ["tilth_search", "tilth_read", "tilth_deps"];
         for edit in [false, true] {
             let s = build_instructions(edit);
             assert!(
@@ -2695,6 +2567,7 @@ mod tests {
             }
             assert!(!s.contains("tilth_list"), "retired tool in instructions");
             assert!(!s.contains("tilth_diff"), "retired tool in instructions");
+            assert!(!s.contains("tilth_grok"), "retired tool in instructions");
             assert!(s.contains("shell `git diff` or `git log`"));
             assert!(s.contains("directory browsing (ls/find)"));
             assert!(

@@ -36,6 +36,7 @@ src/
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter).
     callees.rs         Callee extraction and resolution for expanded definitions.
     siblings.rs        Sibling symbol surfacing in search results.
+    target.rs          Definition-target resolution (path:line, occurrence, candidate) and sibling collection for search continuations.
     deps.rs            File-level dependency analysis (imports + dependents with symbols).
     rank.rs            Result ranking (definition weight, basename boost, context proximity).
     facets.rs          Faceted result grouping (definitions, usages, implementations).
@@ -99,6 +100,7 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 
 - The whole-file-tag edit model — JSON `edits` array of `{path, tag?, ops}` sections lowered onto the tag/seen-lines-gate/3-way-merge-recovery machinery (per #116) — the fork's `tilth_write` surface, not upstream's.
 - cwd anchoring and the trust-absolute posture: every path-taking MCP tool takes a required `cwd` (renamed from upstream's optional `root`); relative paths anchor under `cwd` with `..` refused, absolute paths are trusted as-is. The MCP roots one-shot handshake is removed. The `root`→`cwd` rename and the trust-absolute posture are permanent fork patches — expect them to conflict on every upstream sync and always resolve to the fork side.
+- `tilth_grok` is retired. The fork has no `tilth_grok` MCP tool, no `tilth grok` CLI command, and no `src/search/grok.rs`, `src/mcp/tools/grok.rs`, or `src/search/fuzzy_symbol.rs`. Search continuations use the trimmed resolver in `src/search/target.rs`. On a sync, drop upstream grok changes; move any resolver fix that search needs into `target.rs`.
 
 **Never-merge upstream commits:** `399721c9` and `10bec56a` must never land on this fork. Skip them when syncing.
 
@@ -153,6 +155,13 @@ Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each
 Key metric: **cost per correct answer** = total_spend / correct_count. This is the expected cost under retry (geometric model: `avg_cost / accuracy`).
 
 Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`.
+
+## MCP tool surface
+
+Do not register an MCP tool, alias, or dispatch arm only to redirect callers.
+Agents do not remember removed or renamed tools, so a retirement shim or "did you mean" hint adds code without value.
+When you remove or rename a tool, delete it fully. An unregistered name gets the plain `unknown tool: <name>` error.
+Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed tool does not return by accident.
 
 ## MCP instructions
 

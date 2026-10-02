@@ -1,9 +1,8 @@
-"""Tasks designed to exercise the tilth_grok tool.
+""""Understand this symbol" tasks.
 
-Prompts are deliberately phrased as "understand this symbol" questions so the
-agent can either (a) discover and use tilth_grok in one call, or (b) fall back
-to the search → expand → search-callers chain. Cost-per-correct should drop
-under (a) without sacrificing accuracy.
+These tasks first measured the retired tilth_grok tool. Agents now answer them
+through the search → expand → follow-callers chain. The task names keep the
+historical `grok_` prefix so result files stay comparable.
 
 These tasks are NEW (no overlap with existing benchmarks) so before/after
 comparisons aren't contaminated by tilth_search familiarity.

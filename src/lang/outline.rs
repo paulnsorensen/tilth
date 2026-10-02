@@ -6,13 +6,6 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
     crate::lang::spec::spec(lang).grammar.map(Into::into)
 }
 
-pub(crate) fn canonical_start_line(node: tree_sitter::Node, lang: Lang) -> u32 {
-    (crate::lang::spec::spec(lang).canonical_anchor)(node)
-        .start_position()
-        .row as u32
-        + 1
-}
-
 /// Parse markdown content into a tree-sitter block tree.
 ///
 /// Returns `None` if the parser fails to set the language (should not happen
@@ -430,32 +423,6 @@ fn is_transparent_declaration_wrapper(node: tree_sitter::Node, lang: Lang) -> bo
     crate::lang::spec::spec(lang)
         .definition_wrappers
         .contains(&node.kind())
-}
-
-/// Canonical outline name for a single container node, with no child recursion.
-/// Used by grok's AST owner finder so the owner string stays in lockstep with how
-/// the outline tree names impls/modules/classes (e.g. `"impl Foo"`). `None` for
-/// non-container or unnamed nodes. Passing `depth = 1` skips child collection.
-pub(crate) fn container_entry_name(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    lang: Lang,
-) -> Option<String> {
-    if is_transparent_declaration_wrapper(node, lang) {
-        return None;
-    }
-    node_to_entry(node, lines, lang, 1)
-        .filter(|entry| {
-            matches!(
-                entry.kind,
-                OutlineKind::Class
-                    | OutlineKind::Struct
-                    | OutlineKind::Interface
-                    | OutlineKind::Module
-                    | OutlineKind::Enum
-            )
-        })
-        .map(|entry| entry.name)
 }
 
 /// Collect child entries from a class/struct/impl body.

@@ -139,35 +139,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_grok",
-            "annotations": { "readOnlyHint": true },
-            "description": "Get one symbol's definition, body, signature, docs, callees, callers, siblings, and tests. DO NOT use for concept search or file reads. Example: tilth_grok(target: \"parse_unified_diff\", cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["target", "cwd"],
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Symbol, `file:line`, or `Type::method`."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Subdirectory to disambiguate; defaults to the checkout."
-                    },
-                    "full": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Widen caller/callee/sibling/test caps from 5/5/8/8 to 50/30/30/30."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max response tokens."
-                    },
-                    "cwd": cwd_prop.clone()
-                }
-            }
-        }),
     ];
 
     if edit_mode {
@@ -408,11 +379,11 @@ mod tests {
     }
 
     #[test]
-    fn tilth_diff_is_not_registered_in_either_mode() {
+    fn retired_diff_and_grok_are_not_registered_in_either_mode() {
         for edit_mode in [false, true] {
             assert!(!tool_definitions(edit_mode)
                 .iter()
-                .any(|tool| tool["name"] == "tilth_diff"));
+                .any(|tool| tool["name"] == "tilth_diff" || tool["name"] == "tilth_grok"));
         }
     }
 
@@ -539,12 +510,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. All five tools in edit mode
+    /// `root` property must be gone from every tool. All four tools in edit mode
     /// take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 5, "edit mode advertises 5 path-taking tools");
+        assert_eq!(tools.len(), 4, "edit mode advertises 4 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];

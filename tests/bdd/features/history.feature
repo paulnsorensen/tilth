@@ -134,35 +134,8 @@ Feature: Language matching regression history
       |  }
       """
 
-  @issue59
-  Scenario: Rust qualified targets accept both separator forms
-    Given the file "history/executor.rs" contains exactly
-      """
-      pub struct Executor;
-
-      impl Executor {
-          pub fn dispatch(&self) -> u32 {
-              1
-          }
-      }
-      """
-    When I grok "Executor::dispatch"
-    Then grok resolves "dispatch" in "history/executor.rs" at line 4 without ambiguity
-      """
-      |    pub fn dispatch(&self) -> u32 {
-      |        1
-      |    }
-      """
-    When I grok "Executor.dispatch"
-    Then grok resolves "dispatch" in "history/executor.rs" at line 4 without ambiguity
-      """
-      |    pub fn dispatch(&self) -> u32 {
-      |        1
-      |    }
-      """
-
   @2f7c448 @pr61
-  Scenario: Qualified Rust owner removes same-name ambiguity
+  Scenario: Same-name Rust methods stay ambiguous to search
     Given the file "history/alpha.rs" contains exactly
       """
       pub struct Alpha;
@@ -179,98 +152,8 @@ Feature: Language matching regression history
       """
     When I search for "dispatch"
     Then the search is ambiguous between "history/alpha.rs" and "history/beta.rs"
-    When I grok "dispatch"
-    Then grok reports 1 other definition
-    When I grok "Alpha::dispatch"
-    Then grok resolves "dispatch" in "history/alpha.rs" at line 3 without ambiguity
-      """
-      |    pub fn dispatch(&self) {}
-      """
-    When I grok "Beta::dispatch"
-    Then grok resolves "dispatch" in "history/beta.rs" at line 3 without ambiguity
-      """
-      |    pub fn dispatch(&self) {}
-      """
-
-  @2f7c448 @pr61
-  Scenario: Qualified TypeScript owner selects the requested method
-    Given the file "history/alpha.ts" contains exactly
-      """
-      export class Alpha {
-        dispatch(): number {
-          return 1;
-        }
-      }
-      """
-    And the file "history/beta.ts" contains exactly
-      """
-      export class Beta {
-        dispatch(): number {
-          return 2;
-        }
-      }
-      """
-    When I grok "Beta.dispatch"
-    Then grok resolves "dispatch" in "history/beta.ts" at line 2 without ambiguity
-      """
-      |  dispatch(): number {
-      |    return 2;
-      |  }
-      """
-
-  @2f7c448 @pr61
-  Scenario: Qualified Python owner selects the requested method
-    Given the file "history/alpha.py" contains exactly
-      """
-      class Alpha:
-          def dispatch(self):
-              return 1
-      """
-    And the file "history/beta.py" contains exactly
-      """
-      class Beta:
-          def dispatch(self):
-              return 2
-      """
-    When I grok "Alpha.dispatch"
-    Then grok resolves "dispatch" in "history/alpha.py" at line 2 without ambiguity
-      """
-      |    def dispatch(self):
-      |        return 1
-      """
-
-  @2f7c448 @pr61
-  Scenario: Qualified Go owner selects the requested receiver
-    Given the file "history/foo.go" contains exactly
-      """
-      package sample
-
-      type Foo struct{}
-
-      func (f *Foo) Bar() int {
-          return 1
-      }
-      """
-    And the file "history/baz.go" contains exactly
-      """
-      package sample
-
-      type Baz struct{}
-
-      func (b Baz) Bar() int {
-          return 2
-      }
-      """
-    When I grok "Foo.Bar"
-    Then grok resolves "Bar" in "history/foo.go" at line 5 without ambiguity
-      """
-      func (f *Foo) Bar() int {
-          return 1
-      }
-      """
-
   @790bdbe @pr270
-  Scenario: Nested wrapped classes keep their real owners
+  Scenario: Nested wrapped classes keep their decorated spans
     Given the file "history/nested.py" contains exactly
       """
       class Outer:
@@ -278,8 +161,8 @@ Feature: Language matching regression history
           class Inner:
               pass
       """
-    When I grok "Outer::Inner"
-    Then grok resolves "Inner" in "history/nested.py" at line 3 without ambiguity
+    When I search for "Inner"
+    Then the search resolves "Inner" in "history/nested.py" at line 3
       """
       |    @logged
       |    class Inner:
@@ -291,8 +174,8 @@ Feature: Language matching regression history
           export class Core {}
       }
       """
-    When I grok "Shell::Core"
-    Then grok resolves "Core" in "history/nested.ts" at line 2
+    When I search for "Core"
+    Then the search resolves "Core" in "history/nested.ts" at line 2
       """
       |    export class Core {}
       """
@@ -309,16 +192,16 @@ Feature: Language matching regression history
       )
       var CounterA, CounterB int
       """
-    When I grok "StatusInactive"
-    Then grok resolves "StatusInactive" in "history/consts.go" at line 3 without ambiguity
+    When I search for "StatusInactive"
+    Then the search resolves "StatusInactive" in "history/consts.go" at line 3
       """
       const (
           StatusActive = 1
           StatusInactive = 2
       )
       """
-    When I grok "CounterB"
-    Then grok resolves "CounterB" in "history/consts.go" at line 7 without ambiguity
+    When I search for "CounterB"
+    Then the search resolves "CounterB" in "history/consts.go" at line 7
       """
       var CounterA, CounterB int
       """
@@ -422,29 +305,6 @@ Feature: Language matching regression history
   @abb9711 @7e120a5
   Scenario: Elixir declaration forms remain structural symbols
     Given the file "history/forms.ex" contains exactly
-      """
-      defmodule MyApp.Greeter do
-        def hello(name) do
-          name
-        end
-        defp private_helper(x), do: x + 1
-        defmacro my_macro(expr) do
-          expr
-        end
-        def safe_div(a, b) when b != 0 do
-          a / b
-        end
-        defp checked(x) when is_integer(x), do: x
-        defguard is_positive(x) when x > 0
-        defdelegate count(list), to: Enum
-
-        defmodule Inner do
-          def nested_func, do: :ok
-        end
-      end
-      """
-    When I grok "MyApp.Greeter"
-    Then grok resolves "MyApp.Greeter" in "history/forms.ex" at line 1 without ambiguity
       """
       defmodule MyApp.Greeter do
         def hello(name) do
