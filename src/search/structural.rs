@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::meta_var::MetaVariable;
 use ast_grep_core::tree_sitter::StrDoc;
-use ast_grep_core::{Language, Node, Pattern, PatternError};
+use ast_grep_core::{Language, Pattern, PatternError};
 use ast_grep_language::SupportLang;
 use serde::Serialize;
 
 use crate::cache::{OutlineCache, ParsedFile};
 use crate::error::TilthError;
-use crate::lang::treesitter::DocumentLanguage;
+use crate::lang::treesitter::DocumentNode;
 use crate::types::{FileType, Lang};
 use crate::util::FileRevision;
 
@@ -28,7 +28,7 @@ struct Location {
 }
 
 impl Location {
-    fn of(node: &Node<'_, StrDoc<DocumentLanguage>>) -> Self {
+    fn of(node: &DocumentNode<'_>) -> Self {
         Self {
             start_byte: node.range().start,
             end_byte: node.range().end,

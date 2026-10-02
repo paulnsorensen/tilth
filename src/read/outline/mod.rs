@@ -59,7 +59,7 @@ pub(crate) fn generate_cached(
     let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
     if crate::types::is_test_file(path) {
         if let Some((outline, truncated)) =
-            test_file::outline_from_tree(parsed.content(), max_lines, parsed.tree())
+            test_file::outline_from_document(max_lines, parsed.ast())
         {
             return with_omission_note(outline, truncated);
         }
@@ -143,6 +143,30 @@ mod tests {
         assert!(
             result.contains("outline truncated"),
             "expected truncation note for 150 funcs over OUTLINE_CAP=100, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn integration_note_on_capped_test_file() {
+        let path = std::path::Path::new("foo.test.ts");
+        assert!(crate::types::is_test_file(path));
+        let file_type = crate::types::FileType::Code(crate::types::Lang::TypeScript);
+        let build = |count: usize| {
+            let mut src = String::new();
+            for i in 0..count {
+                writeln!(src, "it('case {i}', () => {{}});").unwrap();
+            }
+            super::generate(path, file_type, &src, src.as_bytes(), true)
+        };
+        let over = build(super::OUTLINE_CAP + 1);
+        assert!(
+            over.contains("outline truncated"),
+            "expected truncation note for 101 test calls, got:\n{over}"
+        );
+        let at_cap = build(super::OUTLINE_CAP);
+        assert!(
+            !at_cap.contains("outline truncated"),
+            "spurious truncation note at exactly OUTLINE_CAP test calls:\n{at_cap}"
         );
     }
 

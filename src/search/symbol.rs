@@ -257,14 +257,13 @@ fn find_definitions(
                             )
                         },
                         |parsed| {
-                            find_defs_from_tree(
+                            find_defs_in_document(
                                 path,
                                 query,
                                 lang,
-                                parsed.content(),
                                 file_lines,
                                 mtime,
-                                parsed.tree(),
+                                parsed.ast(),
                             )
                         },
                     )
@@ -332,52 +331,89 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let Some(tree) = crate::lang::treesitter::parse_source(content, ts_lang) else {
+    let Some(document) = crate::lang::treesitter::parse_document(content, ts_lang) else {
         return Vec::new();
     };
-    find_defs_from_tree(path, query, lang, content, file_lines, mtime, &tree)
+    find_defs_in_document(path, query, lang, file_lines, mtime, &document)
 }
 
-fn find_defs_from_tree(
+/// Find definitions of `query` in one parsed document, in source order.
+/// ast-grep's `dfs()` is iterative, so nesting depth needs no recursion guard.
+fn find_defs_in_document(
     path: &Path,
     query: &str,
     lang: Option<crate::types::Lang>,
-    content: &str,
     file_lines: u32,
     mtime: SystemTime,
-    tree: &tree_sitter::Tree,
+    document: &crate::lang::treesitter::ParsedDocument,
 ) -> Vec<Match> {
-    let lines: Vec<&str> = content.lines().collect();
-    let root = tree.root_node();
+    let root = document.root();
+    let lines: Vec<&str> = root.get_doc().src.lines().collect();
+    let def_ops: &DefinitionOps =
+        lang.map_or(&DEFAULT_DEFS, |language| &spec(language).definitions);
+    let start_line = |node: tree_sitter::Node| node.start_position().row as u32 + 1;
+    let line_text = |line: u32| {
+        lines
+            .get(line.saturating_sub(1) as usize)
+            .unwrap_or(&"")
+            .trim_end()
+            .to_string()
+    };
+    let definition = |node: tree_sitter::Node, line: u32, name: String, weight, target| Match {
+        path: path.to_path_buf(),
+        line,
+        text: line_text(line),
+        is_definition: true,
+        exact: true,
+        file_lines,
+        mtime,
+        def_range: Some((start_line(node), node.end_position().row as u32 + 1)),
+        def_byte_range: Some((node.start_byte(), node.end_byte())),
+        def_name: Some(name),
+        def_weight: weight,
+        impl_target: target,
+    };
+
     let mut defs = Vec::new();
+    for node in root.dfs().map(|node| node.get_inner_node()) {
+        if !(def_ops.is_definition)(node, &lines) {
+            continue;
+        }
+        let name_line = (def_ops.name_line)(node, &lines, query);
+        if name_line.is_some() || (def_ops.extract_name)(node, &lines).as_deref() == Some(query) {
+            let line = name_line.unwrap_or_else(|| start_line(node));
+            let weight = (def_ops.weight)(node, &lines);
+            defs.push(definition(node, line, query.to_string(), weight, None));
+        }
+        if let Some(name) = implementation_name(node, &lines, query) {
+            defs.push(definition(
+                node,
+                start_line(node),
+                name,
+                80,
+                Some(query.to_string()),
+            ));
+        }
+    }
 
-    walk_for_definitions(
-        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
-    );
-
-    if !defs.is_empty() {
-        if let Some(lang) = lang {
-            let deep_entries = crate::lang::outline::deep_outline_entries(root, &lines, lang);
-            for definition in &mut defs {
-                let Some(raw_range) = definition.def_range else {
-                    continue;
-                };
-                let entry = crate::lang::outline::find_entry_for_definition(
-                    &deep_entries,
-                    definition.def_name.as_deref(),
-                    definition.line,
-                    raw_range,
-                    definition.impl_target.as_deref(),
-                );
-                if let Some(entry) = entry {
-                    definition.line = entry.start_line;
-                    definition.text = lines
-                        .get(entry.start_line.saturating_sub(1) as usize)
-                        .unwrap_or(&"")
-                        .trim_end()
-                        .to_string();
-                    definition.def_range = Some((entry.span_start_line, entry.end_line));
-                }
+    if let (false, Some(lang)) = (defs.is_empty(), lang) {
+        let deep_entries =
+            crate::lang::outline::deep_outline_entries(root.get_inner_node(), &lines, lang);
+        for definition in &mut defs {
+            let Some(raw_range) = definition.def_range else {
+                continue;
+            };
+            let entry = crate::lang::outline::find_entry_for_definition(
+                &deep_entries,
+                definition.def_name.as_deref(),
+                definition.line,
+                raw_range,
+                definition.impl_target.as_deref(),
+            );
+            if let Some(entry) = entry {
+                definition.line = entry.start_line;
+                definition.text = line_text(entry.start_line);
+                definition.def_range = Some((entry.span_start_line, entry.end_line));
             }
         }
     }
@@ -385,134 +421,24 @@ fn find_defs_from_tree(
     defs
 }
 
-/// Recursively walk AST nodes looking for definitions of the queried symbol.
-fn walk_for_definitions(
-    node: tree_sitter::Node,
-    query: &str,
-    path: &Path,
-    lines: &[&str],
-    file_lines: u32,
-    mtime: SystemTime,
-    defs: &mut Vec<Match>,
-    lang: Option<crate::types::Lang>,
-    depth: usize,
-) {
-    // Pathological-recursion guard only — definitions can nest arbitrarily
-    // deep (export-wrapped classes, nested modules, namespace-nested classes),
-    // so this must not re-hide real definitions. A low cap previously did.
-    if depth > 64 {
-        return;
-    }
-
-    let kind = node.kind();
-
-    let def_ops: &DefinitionOps =
-        lang.map_or(&DEFAULT_DEFS, |language| &spec(language).definitions);
-
-    if (def_ops.is_definition)(node, lines) {
-        let name_line = (def_ops.name_line)(node, lines, query);
-        let defines_query =
-            (def_ops.extract_name)(node, lines).as_deref() == Some(query) || name_line.is_some();
-        if defines_query {
-            let line_num = name_line.unwrap_or_else(|| node.start_position().row as u32 + 1);
-            let line_text = lines
-                .get(line_num.saturating_sub(1) as usize)
-                .unwrap_or(&"")
-                .trim_end();
-            defs.push(Match {
-                path: path.to_path_buf(),
-                line: line_num,
-                text: line_text.to_string(),
-                is_definition: true,
-                exact: true,
-                file_lines,
-                mtime,
-                def_range: Some((
-                    node.start_position().row as u32 + 1,
-                    node.end_position().row as u32 + 1,
-                )),
-                def_byte_range: Some((node.start_byte(), node.end_byte())),
-                def_name: Some(query.to_string()),
-                def_weight: (def_ops.weight)(node, lines),
-                impl_target: None,
-            });
-        }
-
-        // Impl/interface detection: surface `impl Trait for Type` and
-        // `class X implements Interface` blocks when searching for the trait/interface.
-        if kind == "impl_item" {
-            if let Some(trait_name) = extract_impl_trait(node, lines) {
-                if trait_name == query {
-                    let impl_type =
-                        extract_impl_type(node, lines).unwrap_or_else(|| "<unknown>".to_string());
-                    let line_num = node.start_position().row as u32 + 1;
-                    let line_text = lines
-                        .get(node.start_position().row)
-                        .unwrap_or(&"")
-                        .trim_end();
-                    defs.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num,
-                        text: line_text.to_string(),
-                        is_definition: true,
-                        exact: true,
-                        file_lines,
-                        mtime,
-                        def_range: Some((
-                            node.start_position().row as u32 + 1,
-                            node.end_position().row as u32 + 1,
-                        )),
-                        def_byte_range: Some((node.start_byte(), node.end_byte())),
-                        def_name: Some(format!("impl {query} for {impl_type}")),
-                        def_weight: 80,
-                        impl_target: Some(query.to_string()),
-                    });
-                }
-            }
-        } else if kind == "class_declaration" || kind == "class_definition" {
-            let interfaces = extract_implemented_interfaces(node, lines);
-            if interfaces.iter().any(|i| i == query) {
+/// Name an `impl Trait for Type` or `class X implements Interface` block when
+/// `query` is the trait or interface it implements.
+fn implementation_name(node: tree_sitter::Node, lines: &[&str], query: &str) -> Option<String> {
+    match node.kind() {
+        "impl_item" => (extract_impl_trait(node, lines)? == query).then(|| {
+            let impl_type =
+                extract_impl_type(node, lines).unwrap_or_else(|| "<unknown>".to_string());
+            format!("impl {query} for {impl_type}")
+        }),
+        "class_declaration" | "class_definition" => extract_implemented_interfaces(node, lines)
+            .iter()
+            .any(|interface| interface == query)
+            .then(|| {
                 let class_name = extract_definition_name(node, lines)
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_byte_range: Some((node.start_byte(), node.end_byte())),
-                    def_name: Some(format!("{class_name} implements {query}")),
-                    def_weight: 80,
-                    impl_target: Some(query.to_string()),
-                });
-            }
-        }
-    }
-    // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_definitions(
-            child,
-            query,
-            path,
-            lines,
-            file_lines,
-            mtime,
-            defs,
-            lang,
-            depth + 1,
-        );
+                format!("{class_name} implements {query}")
+            }),
+        _ => None,
     }
 }
 
@@ -1040,6 +966,29 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
     }
 
     #[test]
+    fn rust_trait_impl_is_named_and_weighted() {
+        let code = "trait T {}\nstruct S;\nimpl T for S {}\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("lib.rs"),
+            "T",
+            &ts_lang,
+            Some(crate::types::Lang::Rust),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        );
+
+        let implementations: Vec<_> = defs.iter().filter(|d| d.impl_target.is_some()).collect();
+        assert_eq!(implementations.len(), 1);
+        let implementation = implementations[0];
+        assert_eq!(implementation.def_name.as_deref(), Some("impl T for S"));
+        assert_eq!(implementation.impl_target.as_deref(), Some("T"));
+        assert_eq!(implementation.def_weight, 80);
+        assert_eq!(implementation.line, 3);
+    }
+
+    #[test]
     fn annotated_interface_implementation_reconciles_canonical_line() {
         let code = "@Deprecated\nclass Runner implements Task {}\n";
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Java).unwrap();
@@ -1055,6 +1004,11 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
 
         let implementation = defs.first().expect("interface implementation should match");
         assert_eq!(implementation.line, 2);
+        assert_eq!(
+            implementation.def_name.as_deref(),
+            Some("Runner implements Task")
+        );
+        assert_eq!(implementation.impl_target.as_deref(), Some("Task"));
         assert_eq!(
             implementation.text.trim(),
             "class Runner implements Task {}"
@@ -1254,33 +1208,18 @@ pub mod a {
     }
 
     #[test]
-    fn pathological_nesting_guard_bounds_recursion() {
-        // The `depth > 64` guard caps recursion against pathological input. Each
-        // Rust module level adds two AST levels (mod_item → declaration_list), so
-        // a fn under N modules sits at AST depth 2N+1. 33 modules → depth 67,
-        // past the guard, so the walk stops before reaching it: no def found.
-        // This pins the guard so a future lift (or a re-lowered cap) regresses
-        // loudly in a known direction.
+    fn pathological_nesting_finds_definitions_without_a_depth_cap() {
+        // Each Rust module level adds two AST levels (mod_item → declaration_list),
+        // so a fn under N modules sits at AST depth 2N+1. The iterative ast-grep
+        // walk has no recursion guard, so depth 401 still finds the definition.
         let rust_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
 
-        let mk = |levels: usize| {
-            use std::fmt::Write;
-            let mut s = String::new();
-            for i in 0..levels {
-                s.push_str(&"    ".repeat(i));
-                let _ = writeln!(s, "pub mod m{i} {{");
-            }
-            s.push_str(&"    ".repeat(levels));
-            s.push_str("pub fn target() {}\n");
-            for i in (0..levels).rev() {
-                s.push_str(&"    ".repeat(i));
-                s.push_str("}\n");
-            }
-            s
-        };
+        let deep = format!(
+            "{}pub fn target() {{}}\n{}",
+            "pub mod m {\n".repeat(200),
+            "}\n".repeat(200)
+        );
 
-        // 33 modules → fn at AST depth 67 > 64: guard stops the walk first.
-        let deep = mk(33);
         let defs = find_defs_treesitter(
             std::path::Path::new("deep.rs"),
             "target",
@@ -1290,26 +1229,13 @@ pub mod a {
             deep.lines().count() as u32,
             SystemTime::now(),
         );
-        assert!(
-            defs.is_empty(),
-            "fn nested past the depth-64 guard must not be returned, got {defs:?}"
-        );
-
-        // 30 modules → fn at AST depth 61 ≤ 64: still found. Confirms the guard
-        // bounds only pathological depths, not realistic ones.
-        let ok = mk(30);
-        let defs = find_defs_treesitter(
-            std::path::Path::new("ok.rs"),
-            "target",
-            &rust_lang,
-            Some(crate::types::Lang::Rust),
-            &ok,
-            ok.lines().count() as u32,
-            SystemTime::now(),
-        );
-        assert!(
-            defs.iter().any(|d| d.is_definition),
-            "fn within the depth-64 guard must still be detected, got {defs:?}"
+        assert_eq!(
+            defs.iter()
+                .filter(|d| d.is_definition)
+                .map(|d| d.line)
+                .collect::<Vec<_>>(),
+            vec![201],
+            "fn nested 200 modules deep must be found once at its line, got {defs:?}"
         );
     }
 

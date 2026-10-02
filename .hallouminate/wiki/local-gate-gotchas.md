@@ -144,8 +144,19 @@ At main `998f311`, `tool_read_from_line_suffix` and `batch_read_shrink_floor_kee
 Run the local gate with `TMPDIR=/private/var/tmp just check` on macOS.
 Linux CI does not have this symlink and is unaffected.
 
+The default macOS `TMPDIR` can also break substring assertions.
+`tool_read_from_line_suffix` asserts `!out.contains("l1")`, and the output header contains the temporary file path.
+A user temporary directory such as `/var/folders/3g/jl1b…` contains `l1`, so the test fails even though line 1 is absent.
+This test passes with `TMPDIR=/tmp/tt`, but `documents_python_dependencies_reuse_trees_and_refresh_reexports` still fails there, because `/tmp` is also a symlink.
+Use a canonical path such as `/private/tmp/<dir>` or `/private/var/tmp` for both causes.[^23]
+
+Do not share one `CARGO_TARGET_DIR` between two worktrees of this crate.
+Cargo can treat the second tree as fresh when the other tree built later, so new tests do not compile or run.
+Compare the test count with the expected count, or `touch` the changed sources before the gate.[^23]
+
 [^21]: PR #287 affinage cure on 2026-10-01. Both tests fail at pristine `53a76df` with the default `TMPDIR`. With `TMPDIR=/private/var/tmp`, `just check` exits 0 (1,216 Rust library tests).
 [^22]: PR #293 affinage rebase on 2026-10-01. The same four tests fail at pristine `998f311` and on the rebased PR with the default `TMPDIR`. With `TMPDIR=/private/var/tmp`, `just check` exits 0 (1,258 Rust library tests).
+[^23]: PR #300 affinage cure on 2026-10-02 at base `e3344dd`. The failure message shows only `3:l3` and `4:l4` under a `/var/folders/3g/jl1b…/f.txt` header. With `TMPDIR=/private/tmp/tt`, `just check` exits 0 (1,061 Rust library tests). A shared target directory first reported 1,058 tests and omitted the three new ones.
 
 ## Historical baseline
 
@@ -163,4 +174,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, PR #287 and PR #293 macOS gate runs · Updated: 2026-10-01 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, PR #287, PR #293, and PR #300 macOS gate runs · Updated: 2026-10-02 · Supersedes: August 2026 local-gate baseline guidance._

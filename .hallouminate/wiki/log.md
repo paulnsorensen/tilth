@@ -67,3 +67,5 @@
 2026-10-01 · f77a006673c36f96 · merged · upstream-library-reuse.md · Record that shared parsed documents guarantee snapshot reuse, not one parse execution, and that compiled queries and edit history keep separate validity rules.
 
 2026-10-01 · 92ae5213050bd1fd · merged · upstream-library-reuse.md · Record the merge onto main and the zero-copy move of the owned read String into cold parsed documents.
+
+2026-10-02 · 5cd6b764a7b36652 · merged · local-gate-gotchas.md · Record that the default macOS TMPDIR breaks `!contains("l1")` assertions, that `/tmp` overrides still hit the symlink, and that a shared CARGO_TARGET_DIR across worktrees can skip new tests.
