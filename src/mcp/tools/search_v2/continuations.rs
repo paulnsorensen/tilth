@@ -234,9 +234,9 @@ impl Follow {
                     || crate::lang::outline::get_deep_outline_tree(&content, lang),
                     |parsed| {
                         crate::lang::outline::deep_outline_tree_from_tree(
-                            &parsed.content,
+                            parsed.content(),
                             lang,
-                            &parsed.tree,
+                            parsed.tree(),
                         )
                     },
                 );
@@ -256,9 +256,9 @@ impl Follow {
                     || callees::extract_callee_names(&content, lang, range),
                     |parsed| {
                         callees::extract_callee_names_from_tree(
-                            &parsed.content,
+                            parsed.content(),
                             lang,
-                            &parsed.tree,
+                            parsed.tree(),
                             range,
                         )
                     },
@@ -312,7 +312,7 @@ impl Follow {
                     let resolved = callees::resolve_callees_cached(
                         std::slice::from_ref(&target.name),
                         &caller.path,
-                        &caller.content,
+                        caller.snapshot.content(),
                         bloom,
                         cache,
                     );

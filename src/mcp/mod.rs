@@ -989,7 +989,13 @@ mod tests {
         std::fs::write(&path, &before).unwrap();
         let services = Services::new(true);
         let old = services.cache().get_or_parse(&path).unwrap();
-        let old_shape = old.tree.root_node().to_sexp();
+        let old_allocation = (
+            old.content().as_ptr(),
+            old.content().len(),
+            old.content().capacity(),
+        );
+        let replacement_input_allocation = (after.as_ptr(), after.len(), after.capacity());
+        let old_shape = old.tree().root_node().to_sexp();
         let witness = crate::lang::treesitter::ParseWitness::new(&after);
         let read =
             serde_json::json!({"cwd": dir.path(), "paths": ["incremental.rs"], "mode": "full"});
@@ -1021,10 +1027,36 @@ mod tests {
         );
         assert_eq!(witness.incremental_count(), 1);
         let current = services.cache().get_or_parse(&path).unwrap();
-        assert_eq!(current.content.as_str(), after);
+        assert_eq!(current.content().as_str(), after);
         assert!(!Arc::ptr_eq(&old, &current));
-        assert_eq!(old.content.as_str(), before);
-        assert_eq!(old.tree.root_node().to_sexp(), old_shape);
+        let current_allocation = (
+            current.content().as_ptr(),
+            current.content().len(),
+            current.content().capacity(),
+        );
+        assert_eq!(current_allocation.1, replacement_input_allocation.1);
+        assert!(current_allocation.2 >= current_allocation.1);
+        assert_eq!(old.content().as_str(), before);
+        assert_eq!(
+            (
+                old.content().as_ptr(),
+                old.content().len(),
+                old.content().capacity(),
+            ),
+            old_allocation,
+            "publishing a replacement must retain the old reader allocation"
+        );
+        assert_eq!(old.tree().root_node().to_sexp(), old_shape);
+        let warm = services.cache().get_or_parse(&path).unwrap();
+        assert!(Arc::ptr_eq(&current, &warm));
+        assert_eq!(
+            (
+                warm.content().as_ptr(),
+                warm.content().len(),
+                warm.content().capacity(),
+            ),
+            current_allocation
+        );
     }
 
     fn incremental_request(services: &Services, path: &std::path::Path, ops: &Value) -> Value {
@@ -1126,16 +1158,16 @@ mod tests {
                 let after = std::fs::read_to_string(&path).unwrap();
                 assert_ne!(after, before, "{language} edit {index}");
                 let current = services.cache().get_or_parse(&path).unwrap();
-                assert_eq!(current.content.as_str(), after);
+                assert_eq!(current.content().as_str(), after);
                 assert_eq!(after, expected_source);
                 if let Some(witness) = witness {
                     assert_eq!(witness.count(), 0, "{language} edit {index}");
                     assert_eq!(witness.incremental_count(), 1, "{language} edit {index}");
                 }
                 let fresh = OutlineCache::new().get_or_parse(&path).unwrap();
-                assert_same_nodes(current.tree.root_node(), fresh.tree.root_node());
-                assert_same_nodes(old.tree.root_node(), fresh_old.tree.root_node());
-                assert_eq!(old.content.as_str(), before);
+                assert_same_nodes(current.tree().root_node(), fresh.tree().root_node());
+                assert_same_nodes(old.tree().root_node(), fresh_old.tree().root_node());
+                assert_eq!(old.content().as_str(), before);
                 let actual: Value = serde_json::from_str(
                     &dispatch_tool("tilth_search", &search, &services).unwrap(),
                 )
@@ -1185,7 +1217,7 @@ mod tests {
                 .unwrap();
             crate::util::atomic_write_bytes(&path, external.as_bytes()).unwrap();
             let replacement = services.cache().get_or_parse(&path).unwrap();
-            assert_eq!(replacement.content.as_str(), external);
+            assert_eq!(replacement.content().as_str(), external);
             resume.send(()).unwrap();
             let result = writing.join().unwrap().unwrap();
             assert!(result.contains("applied"), "{result}");
@@ -1194,7 +1226,7 @@ mod tests {
                 &services.cache().get_or_parse(&path).unwrap()
             ));
         });
-        assert_eq!(old.content.as_str(), before);
+        assert_eq!(old.content().as_str(), before);
         assert_eq!(witness.count(), 0);
         assert_eq!(witness.incremental_count(), 1);
         assert_eq!(external_witness.count(), 1);
@@ -1428,7 +1460,7 @@ mod tests {
                     // Go methods remain top-level entries. Check receiver extraction directly.
                     let parsed = services.cache().get_or_parse(&dir.path().join(file)).unwrap();
                     let names = crate::search::siblings::extract_sibling_references_from_tree(
-                        &parsed.content, parsed.lang, &parsed.tree, (5, 5),
+                        parsed.content(), parsed.lang, parsed.tree(), (5, 5),
                     );
                     assert_eq!(names, ["helper", "value"]);
                 }
@@ -1436,6 +1468,35 @@ mod tests {
                 assert_eq!(witness.count(), 1, "expanded {file} reparses its snapshot");
             }
         }
+    }
+
+    fn assert_grammarless_grok_fallback(file: &str, source: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        std::fs::write(&path, source).unwrap();
+        let request = serde_json::json!({
+            "cwd": dir.path(),
+            "target": format!("{}:1", path.display()),
+        });
+        let error = dispatch_tool("tilth_grok", &request, &Services::new(false)).unwrap_err();
+        assert!(
+            error.contains("no definition encloses line 1"),
+            "{file} must reach the existing grammarless fallback: {error}"
+        );
+        assert!(
+            !error.contains("source could not be parsed"),
+            "{file}: {error}"
+        );
+    }
+
+    #[test]
+    fn grok_path_line_preserves_dockerfile_fallback() {
+        assert_grammarless_grok_fallback("Dockerfile", "FROM scratch\n");
+    }
+
+    #[test]
+    fn grok_path_line_preserves_makefile_fallback() {
+        assert_grammarless_grok_fallback("Makefile", "all:\n\t@true\n");
     }
 
     #[test]

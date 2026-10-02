@@ -3,77 +3,121 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use ast_grep_core::matcher::PatternBuilder;
+use ast_grep_core::source::Edit;
+use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
+use ast_grep_core::{AstGrep, Language, Pattern, PatternError};
+
+/// The grammar identity for an ast-grep-owned parsed document.
+#[derive(Clone)]
+pub(crate) struct DocumentLanguage(tree_sitter::Language);
+
+impl Language for DocumentLanguage {
+    fn kind_to_id(&self, kind: &str) -> u16 {
+        self.0.id_for_node_kind(kind, true)
+    }
+
+    fn field_to_id(&self, field: &str) -> Option<u16> {
+        self.0
+            .field_id_for_name(field)
+            .map(std::num::NonZeroU16::get)
+    }
+
+    fn build_pattern(&self, builder: &PatternBuilder) -> Result<Pattern, PatternError> {
+        builder.build(|source| StrDoc::try_new(source, self.clone()))
+    }
+}
+
+impl LanguageExt for DocumentLanguage {
+    fn get_ts_language(&self) -> tree_sitter::Language {
+        self.0.clone()
+    }
+}
+
+pub(crate) type ParsedDocument = AstGrep<StrDoc<DocumentLanguage>>;
+
 /// Parse source without retaining a parser or a global lock.
 pub(crate) fn parse_source(
     content: &str,
     language: &tree_sitter::Language,
 ) -> Option<tree_sitter::Tree> {
-    parse_with_tree(content, language, None)
-}
-
-/// Clone and edit a retained tree. Existing readers keep their original tree.
-pub(crate) fn reparse_source(
-    before: &str,
-    after: &str,
-    tree: &tree_sitter::Tree,
-    language: &tree_sitter::Language,
-) -> Option<tree_sitter::Tree> {
-    let edit = input_edit(before, after);
-    let mut edited = tree.clone();
-    edited.edit(&edit);
-    parse_with_tree(after, language, Some(&edited))
-}
-
-/// Narrow the edit to the bytes between the shared prefix and suffix. Byte
-/// scans may split a UTF-8 character; tree-sitter edits are byte-based.
-fn input_edit(before: &str, after: &str) -> tree_sitter::InputEdit {
-    let (old, new) = (before.as_bytes(), after.as_bytes());
-    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let suffix = old[start..]
-        .iter()
-        .rev()
-        .zip(new[start..].iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let old_end = old.len() - suffix;
-    let new_end = new.len() - suffix;
-    tree_sitter::InputEdit {
-        start_byte: start,
-        old_end_byte: old_end,
-        new_end_byte: new_end,
-        start_position: byte_position(before, start),
-        old_end_position: byte_position(before, old_end),
-        new_end_position: byte_position(after, new_end),
-    }
-}
-
-fn byte_position(source: &str, offset: usize) -> tree_sitter::Point {
-    let prefix = &source.as_bytes()[..offset];
-    tree_sitter::Point {
-        row: memchr::memchr_iter(b'\n', prefix).count(),
-        column: memchr::memrchr(b'\n', prefix).map_or(offset, |newline| offset - newline - 1),
-    }
-}
-
-fn parse_with_tree(
-    content: &str,
-    language: &tree_sitter::Language,
-    old_tree: Option<&tree_sitter::Tree>,
-) -> Option<tree_sitter::Tree> {
-    #[cfg(test)]
-    {
-        let mut counts = PARSE_COUNTS.lock().unwrap();
-        if let Some(count) = counts.get_mut(content) {
-            if old_tree.is_some() {
-                count.incremental += 1;
-            } else {
-                count.full += 1;
-            }
-        }
-    }
+    record_parse(content, false);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(language).ok()?;
-    let tree = parser.parse(content, old_tree);
+    let tree = parser.parse(content, None);
+    pause_parse(content);
+    tree
+}
+
+/// Create the ast-grep document that owns one immutable parsed snapshot.
+/// An owned `String` moves into the document without a copy.
+pub(crate) fn parse_document(
+    content: impl Into<String>,
+    language: &tree_sitter::Language,
+) -> Option<ParsedDocument> {
+    let src = content.into();
+    let tree = parse_source(&src, language)?;
+    Some(AstGrep::doc(StrDoc {
+        src,
+        lang: DocumentLanguage(language.clone()),
+        tree,
+    }))
+}
+
+/// Clone one immutable snapshot and delegate its edit and reparse to ast-grep.
+pub(crate) fn document_after_edit(
+    before: &str,
+    after: &str,
+    document: &ParsedDocument,
+) -> Option<ParsedDocument> {
+    debug_assert_eq!(document.root().get_doc().src, before);
+    let mut start = before
+        .bytes()
+        .zip(after.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(start) || !after.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut suffix = before[start..]
+        .bytes()
+        .rev()
+        .zip(after[start..].bytes().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !before.is_char_boundary(before.len() - suffix)
+        || !after.is_char_boundary(after.len() - suffix)
+    {
+        suffix -= 1;
+    }
+    let old_end = before.len() - suffix;
+    let new_end = after.len() - suffix;
+    let mut edited = document.clone();
+    record_parse(after, true);
+    let result = edited.edit(Edit {
+        position: start,
+        deleted_length: old_end - start,
+        inserted_text: after.as_bytes()[start..new_end].to_vec(),
+    });
+    pause_parse(after);
+    result.ok()?;
+    Some(edited)
+}
+
+fn record_parse(content: &str, incremental: bool) {
+    #[cfg(test)]
+    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
+        if incremental {
+            counts.incremental += 1;
+        } else {
+            counts.full += 1;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (content, incremental);
+}
+
+fn pause_parse(content: &str) {
     #[cfg(test)]
     {
         let pause = PARSE_PAUSES.lock().unwrap().remove(content);
@@ -84,7 +128,8 @@ fn parse_with_tree(
                 .unwrap();
         }
     }
-    tree
+    #[cfg(not(test))]
+    let _ = content;
 }
 
 #[cfg(test)]
@@ -92,6 +137,14 @@ fn parse_with_tree(
 struct ParseCounts {
     full: usize,
     incremental: usize,
+    scanned: Vec<usize>,
+}
+
+#[cfg(test)]
+pub(crate) fn record_scanned_document(content: &str, ptr: usize) {
+    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
+        counts.scanned.push(ptr);
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +178,10 @@ impl ParseWitness {
 
     pub(crate) fn incremental_count(&self) -> usize {
         PARSE_COUNTS.lock().unwrap()[&self.0].incremental
+    }
+
+    pub(crate) fn scanned_pointers(&self) -> Vec<usize> {
+        PARSE_COUNTS.lock().unwrap()[&self.0].scanned.clone()
     }
 
     pub(crate) fn pause_next(
@@ -560,6 +617,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_document_moves_owned_string_without_copy() {
+        let language = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let source = String::from("fn moved() {}\n");
+        let before = source.as_ptr();
+        let document = parse_document(source, &language).unwrap();
+        assert_eq!(document.root().get_doc().src.as_ptr(), before);
+    }
+
+    #[test]
+    fn incremental_reparse_delegates_to_ast_grep_document() {
+        let implementation = include_str!("treesitter.rs");
+        let local_input_edit = ["tree_sitter::Input", "Edit"].concat();
+        let delegated_edit = [".edit(", "Edit {"].concat();
+        assert!(
+            !implementation.contains(&local_input_edit),
+            "local InputEdit plumbing bypasses ast-grep document edits"
+        );
+        assert!(
+            implementation.contains(&delegated_edit),
+            "incremental reparsing must call the ast-grep document edit API"
+        );
+    }
+
+    #[test]
     fn node_text_mode_controls_multiline_truncation() {
         let first_line =
             "pub fn very_long_function_name_with_enough_characters_to_force_truncation_for_outline_test() {";
@@ -835,14 +916,21 @@ mod tests {
         }
     }
 
+    fn document(source: &str) -> ParsedDocument {
+        parse_document(source, &rust_language()).unwrap()
+    }
+
+    fn tree(document: &ParsedDocument) -> &tree_sitter::Tree {
+        &document.root().get_doc().tree
+    }
+
     #[test]
     fn incremental_reparse_reuses_unchanged_sibling_nodes() {
         let before = "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }\n";
         let after = "fn a() { 1 }\nfn b() { 22 + 2 }\nfn c() { 3 }\n";
-        let language = rust_language();
-        let old = parse_source(before, &language).unwrap();
-        let new = reparse_source(before, after, &old, &language).unwrap();
-        let (old_root, new_root) = (old.root_node(), new.root_node());
+        let old = document(before);
+        let new = document_after_edit(before, after, &old).unwrap();
+        let (old_root, new_root) = (tree(&old).root_node(), tree(&new).root_node());
         assert_eq!(
             old_root.named_child(0).unwrap().id(),
             new_root.named_child(0).unwrap().id()
@@ -858,31 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn input_edit_is_narrow_and_byte_exact() {
-        let edit = input_edit("ab\ncd\nef", "ab\ncXYd\nef");
-        assert_eq!(
-            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
-            (4, 4, 6)
-        );
-        assert_eq!(
-            edit.start_position,
-            tree_sitter::Point { row: 1, column: 1 }
-        );
-        assert_eq!(
-            edit.new_end_position,
-            tree_sitter::Point { row: 1, column: 3 }
-        );
-
-        let edit = input_edit("let s = \"cafe\";", "let s = \"caf\u{e9}\";");
-        assert_eq!(
-            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
-            (12, 13, 14)
-        );
-    }
-
-    #[test]
     fn incremental_reparse_matches_fresh_when_multibyte_chars_share_continuation_byte() {
-        let language = rust_language();
         for (before, after) in [
             (
                 "fn main() { Some(\"\u{e9}\"); }",
@@ -892,11 +956,12 @@ mod tests {
                 "fn main() { Some(\"\u{a9}\"); }",
                 "fn main() { Some(\"\u{e9}\"); }",
             ),
+            ("let s = \"cafe\";", "let s = \"caf\u{e9}\";"),
         ] {
-            let old = parse_source(before, &language).unwrap();
-            let incremental = reparse_source(before, after, &old, &language).unwrap();
-            let fresh = parse_source(after, &language).unwrap();
-            assert_same_tree(incremental.root_node(), fresh.root_node());
+            let incremental = document_after_edit(before, after, &document(before)).unwrap();
+            assert_eq!(incremental.root().get_doc().src, after);
+            let fresh = document(after);
+            assert_same_tree(tree(&incremental).root_node(), tree(&fresh).root_node());
         }
     }
 }

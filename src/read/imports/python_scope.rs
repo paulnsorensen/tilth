@@ -204,7 +204,11 @@ pub(crate) fn resolve_python_edges_cached(
         return res;
     };
     let mut raw = Vec::new();
-    collect_python_imports(parsed.tree.root_node(), parsed.content.as_bytes(), &mut raw);
+    collect_python_imports(
+        parsed.tree().root_node(),
+        parsed.content().as_bytes(),
+        &mut raw,
+    );
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
     // Per-pass ownership records borrow shared document snapshots.
@@ -477,8 +481,8 @@ impl InitCache<'_> {
             .map(|file| {
                 let mut imports = Vec::new();
                 collect_python_imports(
-                    file.tree.root_node(),
-                    file.content.as_bytes(),
+                    file.tree().root_node(),
+                    file.content().as_bytes(),
                     &mut imports,
                 );
                 Rc::new(ParsedInit { file, imports })
@@ -492,10 +496,10 @@ fn initializer_defines_name(inits: &mut InitCache<'_>, init: &Path, name: &str) 
     let Some(parsed) = inits.get(init) else {
         return false;
     };
-    let root = parsed.file.tree.root_node();
+    let root = parsed.file.tree().root_node();
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
-        if python_node_defines_name(node, parsed.file.content.as_bytes(), name) {
+        if python_node_defines_name(node, parsed.file.content().as_bytes(), name) {
             return true;
         }
     }

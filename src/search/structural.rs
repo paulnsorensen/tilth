@@ -1,67 +1,21 @@
 //! Read-only structural matching over retained source/tree snapshots.
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::meta_var::MetaVariable;
-use ast_grep_core::source::{Content, Edit};
 use ast_grep_core::tree_sitter::StrDoc;
-use ast_grep_core::{AstGrep, Doc, Language, Node, Pattern, PatternError};
+use ast_grep_core::{Doc, Language, Node, Pattern, PatternError};
 use ast_grep_language::SupportLang;
 use serde::Serialize;
 
 use crate::cache::{OutlineCache, ParsedFile};
 use crate::error::TilthError;
+use crate::lang::treesitter::DocumentLanguage;
 use crate::types::{FileType, Lang};
 use crate::util::FileRevision;
-
-/// The adapter retains the exact cached source allocation and tree.
-#[derive(Clone)]
-struct SnapshotDoc {
-    snapshot: Arc<ParsedFile>,
-    language: SupportLang,
-}
-
-impl Content for SnapshotDoc {
-    type Underlying = u8;
-    fn get_range(&self, range: Range<usize>) -> &[u8] {
-        self.snapshot.content.get_range(range)
-    }
-    fn decode_str(source: &str) -> Cow<'_, [u8]> {
-        String::decode_str(source)
-    }
-    fn encode_bytes(bytes: &[u8]) -> Cow<'_, str> {
-        String::encode_bytes(bytes)
-    }
-    fn get_char_column(&self, column: usize, offset: usize) -> usize {
-        self.snapshot.content.get_char_column(column, offset)
-    }
-}
-
-impl Doc for SnapshotDoc {
-    type Source = Self;
-    type Lang = SupportLang;
-    type Node<'r> = tree_sitter::Node<'r>;
-
-    fn get_lang(&self) -> &Self::Lang {
-        &self.language
-    }
-    fn get_source(&self) -> &Self::Source {
-        self
-    }
-    fn root_node(&self) -> Self::Node<'_> {
-        self.snapshot.tree.root_node()
-    }
-    fn get_node_text<'a>(&'a self, node: &Self::Node<'a>) -> Cow<'a, str> {
-        Cow::Borrowed(&self.snapshot.content[node.byte_range()])
-    }
-    fn do_edit(&mut self, _edit: &Edit<Self::Source>) -> Result<(), String> {
-        Err("structural search snapshots are read-only".into())
-    }
-}
 
 /// Byte offsets are zero-based and half-open. Lines are one-based and identify
 /// both endpoints. Wire form: `[start_line, end_line, start_byte, end_byte]`.
@@ -74,7 +28,7 @@ struct Location {
 }
 
 impl Location {
-    fn of(node: &Node<'_, SnapshotDoc>) -> Self {
+    fn of(node: &Node<'_, StrDoc<DocumentLanguage>>) -> Self {
         Self {
             start_byte: node.range().start,
             end_byte: node.range().end,
@@ -142,7 +96,6 @@ pub(crate) struct StructuralScan {
 const MAX_MATCHES: usize = 1000;
 
 struct CompiledPattern {
-    language: SupportLang,
     file_language: Lang,
     pattern: Pattern,
 }
@@ -181,7 +134,6 @@ impl StructuralPatterns {
         self.0.insert(
             key,
             CompiledPattern {
-                language,
                 file_language,
                 pattern,
             },
@@ -242,11 +194,8 @@ impl StructuralPatterns {
                         None
                     }
                 };
-                let root = AstGrep::doc(SnapshotDoc {
-                    snapshot,
-                    language: compiled.language,
-                });
-                let found = collect_matches(&root, &compiled.pattern, &rel, bound.as_ref());
+                let found =
+                    collect_matches(snapshot.ast(), &compiled.pattern, &rel, bound.as_ref());
                 if found.total > 0 {
                     scan.lock().unwrap().file_counts.insert(rel, found.total);
                 }
@@ -307,7 +256,7 @@ fn load_candidate(
     if let Some(snapshot) = FileRevision::from_metadata(path, meta)
         .and_then(|revision| cache.cached_parse(path, &revision))
     {
-        return if skippable(snapshot.content.as_bytes()) {
+        return if skippable(snapshot.content().as_bytes()) {
             Loaded::Skip
         } else {
             Loaded::Snapshot(snapshot)
@@ -337,7 +286,7 @@ struct Collected {
 /// Match `pattern` in one document. Once `bound` (the full heap's largest key)
 /// is known, keys at or above it are counted without building an item.
 fn collect_matches(
-    root: &AstGrep<SnapshotDoc>,
+    root: &crate::lang::treesitter::ParsedDocument,
     pattern: &Pattern,
     rel: &str,
     bound: Option<&(String, usize, usize)>,
@@ -347,6 +296,11 @@ fn collect_matches(
         overflowed: false,
         items: Vec::new(),
     };
+    #[cfg(test)]
+    {
+        let src = &root.root().get_doc().src;
+        crate::lang::treesitter::record_scanned_document(src, src.as_ptr() as usize);
+    }
     for matched in root.root().find_all(pattern) {
         found.total += 1;
         let range = Location::of(&matched);
@@ -485,23 +439,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_adapter_borrows_cached_bytes_and_tree() {
+    fn owned_document_borrows_cached_bytes_and_tree() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.py");
         std::fs::write(&path, "wrap(value)\n").unwrap();
         let cache = OutlineCache::new();
         let snapshot = cache.get_or_parse(&path).unwrap();
-        let document = SnapshotDoc {
-            snapshot: Arc::clone(&snapshot),
-            language: SupportLang::Python,
-        };
-        assert_eq!(document.root_node().id(), snapshot.tree.root_node().id());
-        assert_eq!(document.get_range(0..4).as_ptr(), snapshot.content.as_ptr());
-        let root = AstGrep::doc(document);
         let pattern = Pattern::try_new("wrap($A)", PatternLanguage(SupportLang::Python)).unwrap();
-        let matched = root.root().find(&pattern).unwrap();
+        let matched = snapshot.ast().root().find(&pattern).unwrap();
         assert!(matches!(matched.text(), Cow::Borrowed("wrap(value)")));
-        assert_eq!(matched.text().as_ptr(), snapshot.content.as_ptr());
+        assert_eq!(matched.text().as_ptr(), snapshot.content().as_ptr());
     }
 
     fn scan(dir: &Path, source: &str) -> StructuralScan {

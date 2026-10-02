@@ -661,8 +661,8 @@ fn resolve_symbol(path: &Path, name: &str, cache: &OutlineCache) -> SymbolLookup
         || crate::lang::outline::get_deep_outline_entries(&content, lang),
         |parsed| {
             crate::lang::outline::deep_outline_entries(
-                parsed.tree.root_node(),
-                &parsed.content.lines().collect::<Vec<_>>(),
+                parsed.tree().root_node(),
+                &parsed.content().lines().collect::<Vec<_>>(),
                 lang,
             )
         },

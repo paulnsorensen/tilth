@@ -99,7 +99,7 @@ pub fn enclosing_definition_at(
         return None;
     }
     let parsed = cache.get_or_parse(path)?;
-    let lines: Vec<&str> = parsed.content.lines().collect();
+    let lines: Vec<&str> = parsed.content().lines().collect();
     let row = (line - 1) as usize;
     if row >= lines.len() {
         return None;
@@ -107,7 +107,7 @@ pub fn enclosing_definition_at(
 
     let point = tree_sitter::Point { row, column: 0 };
     let target = parsed
-        .tree
+        .tree()
         .root_node()
         .descendant_for_point_range(point, point)?;
 

@@ -699,7 +699,7 @@ mod tests {
             retained.push((path, old, tag));
         }
         let (accepted, old, tag) = &retained[0];
-        let after = old.content.replace("accepted", "updated");
+        let after = old.content().replace("accepted", "updated");
         let witness = crate::lang::treesitter::ParseWitness::new(&after);
         let (rejected, _, rejected_tag) = &retained[1];
         let request = json!({"cwd": dir.path(), "edits": [
@@ -716,7 +716,7 @@ mod tests {
             "{result}"
         );
         assert_eq!(
-            cache.get_or_parse(accepted).unwrap().content.as_str(),
+            cache.get_or_parse(accepted).unwrap().content().as_str(),
             after
         );
         assert_eq!(witness.count(), 0);
@@ -725,7 +725,7 @@ mod tests {
             assert!(Arc::ptr_eq(snapshot, &cache.get_or_parse(path).unwrap()));
             assert_eq!(
                 std::fs::read_to_string(path).unwrap(),
-                snapshot.content.as_str()
+                snapshot.content().as_str()
             );
         }
     }
@@ -758,9 +758,9 @@ mod tests {
         assert_eq!(witness.count(), 0);
         assert_eq!(witness.incremental_count(), 0);
         assert!(!cache.has_parsed(&path));
-        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), after);
+        assert_eq!(cache.get_or_parse(&path).unwrap().content().as_str(), after);
         assert_eq!(witness.count(), 1);
-        assert_eq!(old.content.as_str(), before);
+        assert_eq!(old.content().as_str(), before);
     }
 
     #[test]
@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(cold_witness.count(), 0);
         assert_eq!(cold_witness.incremental_count(), 0);
         let retained = cache.get_or_parse(&path).unwrap();
-        assert_eq!(retained.content.as_str(), cold);
+        assert_eq!(retained.content().as_str(), cold);
         assert_eq!(cold_witness.count(), 1);
 
         let tag = read_for_tag(&session, &path);
@@ -816,13 +816,16 @@ mod tests {
             0,
             "cached bytes differ from verified live bytes"
         );
-        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), written);
+        assert_eq!(
+            cache.get_or_parse(&path).unwrap().content().as_str(),
+            written
+        );
         assert_eq!(witness.count(), 1);
 
         let newer = written.replace("after_external", "newer_external");
         let witness = crate::lang::treesitter::ParseWitness::new(&newer);
         crate::util::atomic_write_bytes(&path, newer.as_bytes()).unwrap();
-        assert_eq!(cache.get_or_parse(&path).unwrap().content.as_str(), newer);
+        assert_eq!(cache.get_or_parse(&path).unwrap().content().as_str(), newer);
         assert_eq!(witness.count(), 1);
         assert_eq!(witness.incremental_count(), 0);
     }
@@ -857,7 +860,7 @@ mod tests {
         assert_eq!(witness.count(), 0, "rename must not parse a new path");
         assert_eq!(witness.incremental_count(), 0);
         let moved = cache.get_or_parse(&dest).unwrap();
-        assert_eq!(moved.content.as_str(), source);
+        assert_eq!(moved.content().as_str(), source);
         assert!(!Arc::ptr_eq(&old_dest, &moved));
         assert_eq!(witness.count(), 1);
         assert!(Arc::ptr_eq(
@@ -874,8 +877,8 @@ mod tests {
         assert!(!dest.exists());
         assert!(!cache.has_parsed(&dest));
         assert!(cache.get_or_parse(&dest).is_none());
-        assert_eq!(old_source.content.as_str(), source);
-        assert_eq!(moved.content.as_str(), source);
+        assert_eq!(old_source.content().as_str(), source);
+        assert_eq!(moved.content().as_str(), source);
         assert!(Arc::ptr_eq(
             &unrelated,
             &cache.get_or_parse(&other).unwrap()
