@@ -148,6 +148,9 @@ pub(crate) struct InlineTestPolicy {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct LanguagePolicy {
+    /// ast-grep language for structural search, reached via
+    /// `spec(lang).policy.structural`; `None` disables it.
+    pub structural: Option<ast_grep_language::SupportLang>,
     pub triple_quoted_strings: bool,
     pub hash_line_comments: bool,
     pub import_line: fn(&str) -> bool,
@@ -191,6 +194,7 @@ pub(crate) fn allow_callee(_name: &str) -> bool {
     true
 }
 pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
+    structural: None,
     triple_quoted_strings: false,
     hash_line_comments: false,
     import_line: never_import,
@@ -375,6 +379,38 @@ pub(crate) const DEFAULT_DEFS: DefinitionOps = DefinitionOps {
     kind_label: no_definition_kind_label,
     weight: default_defs_weight,
 };
+
+/// Resolve a structural-search language name to its file language and ast-grep language.
+pub(crate) fn structural_language(name: &str) -> Option<(Lang, ast_grep_language::SupportLang)> {
+    super::ALL_LANGS.iter().find_map(|&lang| {
+        let spec = spec(lang);
+        let support = spec.policy.structural?;
+        (spec.display.to_ascii_lowercase() == name).then_some((lang, support))
+    })
+}
+
+/// Structural-search language names, in registry order.
+pub(crate) fn structural_language_names() -> Vec<String> {
+    super::ALL_LANGS
+        .iter()
+        .filter_map(|&lang| {
+            let spec = spec(lang);
+            spec.policy
+                .structural
+                .map(|_| spec.display.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Human list of structural languages: `a, b, or c`.
+pub(crate) fn structural_language_list() -> String {
+    let mut names = structural_language_names();
+    match names.pop() {
+        Some(last) if !names.is_empty() => format!("{}, or {last}", names.join(", ")),
+        Some(last) => last,
+        None => String::new(),
+    }
+}
 
 /// The single surviving full-`Lang` dispatch. Every other former `match lang`
 /// reads a field on the returned spec.

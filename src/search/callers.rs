@@ -33,9 +33,9 @@ pub struct CallerMatch {
     pub call_text: String,
     /// Line range of the calling function (for expand).
     pub caller_range: Option<(u32, u32)>,
-    /// File content, already read during `find_callers_batch` — avoids re-reading during expand.
+    /// Parsed snapshot, already read during `find_callers_batch` — avoids re-reading during expand.
     /// Shared across all call sites in the same file via reference counting.
-    pub content: Arc<crate::cache::ParsedFile>,
+    pub snapshot: Arc<crate::cache::ParsedFile>,
 }
 
 /// Scan `scope` for the literal `target` byte sequence. Used by the
@@ -279,7 +279,7 @@ fn find_callers_treesitter_batch(
                         calling_function,
                         call_text,
                         caller_range,
-                        content: Arc::clone(snapshot),
+                        snapshot: Arc::clone(snapshot),
                     },
                 ));
             }
@@ -431,7 +431,7 @@ fn write_caller_bucket(
         if i < expand {
             if let Some((start, end)) = caller.caller_range {
                 // Use cached content — no re-read needed
-                let lines: Vec<&str> = caller.content.content().lines().collect();
+                let lines: Vec<&str> = caller.snapshot.content().lines().collect();
                 let start_idx = (start as usize).saturating_sub(1);
                 let end_idx = (end as usize).min(lines.len());
 
@@ -640,7 +640,7 @@ mod tests {
         );
         for (_, caller) in &matches {
             assert!(
-                Arc::ptr_eq(&caller.content, &snapshot),
+                Arc::ptr_eq(&caller.snapshot, &snapshot),
                 "caller content must retain the parsed document"
             );
         }
