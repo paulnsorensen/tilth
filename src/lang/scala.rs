@@ -8,10 +8,8 @@ const CALLEE_QUERY: &str = concat!(
     "(infix_expression operator: (identifier) @callee)\n",
 );
 
-const SIBLING_QUERY: &str = concat!(
-    "(field_expression (identifier) @obj (identifier) @ref)\n",
-    "(call_expression function: (field_expression (identifier) @obj (identifier) @ref))\n",
-);
+// A call such as `this.keep()` contains this `field_expression`, so one pattern covers both.
+const SIBLING_QUERY: &str = "(field_expression (identifier) @obj (identifier) @ref)\n";
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Scala",

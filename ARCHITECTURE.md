@@ -51,8 +51,8 @@ src/
 │   │                    usages_cross
 │   ├── truncate.rs      Display cap policy (per-facet limits)
 │   ├── strip.rs         Cognitive-load stripping in expanded source
-│   ├── siblings.rs      Tree-sitter sibling extraction (with cached
-│   │                    Query objects)
+│   ├── siblings.rs      Tree-sitter sibling extraction (through the
+│   │                    shared `lang::treesitter` query cache)
 │   ├── callers.rs       Find call sites of a symbol (`tilth_search
 │   │                    kind:callers`); enclosing-scope annotation
 │   ├── callees.rs       Resolve function calls inside a definition
@@ -61,8 +61,8 @@ src/
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
 │   │                    bloom filter) factored out of callers/callees
-│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
-│   │                    extraction across languages
+│   ├── callee_query.rs  Per-language callee query selection; the
+│   │                    compiled queries live in `lang::treesitter`
 │   └── scope.rs         `enclosing_definition_at` — walks up the AST
 │                        from a match to find the enclosing function /
 │                        type, used by both `callers` annotation and
@@ -85,7 +85,9 @@ src/
 ├── lang/            Language detection + tree-sitter wrapper
 │   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
 │   ├── detection.rs     Binary / generated / minified detection
-│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
+│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name,
+│   │                    cached query runners (`visit_query_captures`,
+│   │                    `query_captures`)
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
 │                        node_to_entry walker (the bulk of this file);
 │                        parse_markdown / heading_level / heading_text
@@ -455,9 +457,11 @@ machinery:
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
   definition).
-- **Shared query cache** (`lang::treesitter::with_query`) — callers,
-  callees, siblings, and receiver extraction share it. Cache keys use actual
-  `tree_sitter::Language` values and query content.
+- **Shared query cache** (`lang::treesitter`) — callers, callees,
+  siblings, and receiver extraction share it. `visit_query_captures` streams
+  the capture nodes of each match and can stop early; `query_captures`
+  collects them. Cache keys use actual `tree_sitter::Language` values and
+  query content.
 - **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
   Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
   `format_deps` does the human output. The external-dep stdlib

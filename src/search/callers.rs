@@ -220,47 +220,53 @@ fn find_callers_treesitter_batch(
     let content = snapshot.content();
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
-    let callees = crate::lang::treesitter::query_captures(
+
+    let mut callers = Vec::new();
+    // Stream the matches: most call sites are not targets, so do not collect them.
+    crate::lang::treesitter::visit_query_captures(
         ts_lang,
         query_str,
         tree.root_node(),
         content_bytes,
         ["callee"],
+        |[callee]| {
+            let next = std::ops::ControlFlow::Continue(());
+            let Some(callee) = callee else {
+                return next;
+            };
+            let Ok(text) = callee.utf8_text(content_bytes) else {
+                return next;
+            };
+            if !targets.contains(text) {
+                return next;
+            }
+            let matched_target = text.to_string();
+            let line = callee.start_position().row as u32 + 1;
+
+            // Show the call line only when the whole call expression fits on it.
+            let call_node = callee.parent().unwrap_or(callee);
+            let row = call_node.start_position().row;
+            let call_text = if row == call_node.end_position().row && row < lines.len() {
+                lines[row].trim().to_string()
+            } else {
+                matched_target.clone()
+            };
+
+            let (calling_function, caller_range) = find_enclosing_function(callee, &lines, lang);
+            callers.push((
+                matched_target,
+                CallerMatch {
+                    path: path.to_path_buf(),
+                    line,
+                    calling_function,
+                    call_text,
+                    caller_range,
+                    snapshot: Arc::clone(snapshot),
+                },
+            ));
+            next
+        },
     );
-
-    let mut callers = Vec::new();
-    for callee in callees.into_iter().filter_map(|[callee]| callee) {
-        let Ok(text) = callee.utf8_text(content_bytes) else {
-            continue;
-        };
-        if !targets.contains(text) {
-            continue;
-        }
-        let matched_target = text.to_string();
-        let line = callee.start_position().row as u32 + 1;
-
-        // Show the call line only when the whole call expression fits on it.
-        let call_node = callee.parent().unwrap_or(callee);
-        let row = call_node.start_position().row;
-        let call_text = if row == call_node.end_position().row && row < lines.len() {
-            lines[row].trim().to_string()
-        } else {
-            matched_target.clone()
-        };
-
-        let (calling_function, caller_range) = find_enclosing_function(callee, &lines, lang);
-        callers.push((
-            matched_target,
-            CallerMatch {
-                path: path.to_path_buf(),
-                line,
-                calling_function,
-                call_text,
-                caller_range,
-                snapshot: Arc::clone(snapshot),
-            },
-        ));
-    }
     callers
 }
 

@@ -9,10 +9,8 @@ const CALLEE_QUERY: &str = concat!(
     "(macro_invocation macro: (identifier) @callee)\n",
 );
 
-const SIBLING_QUERY: &str = concat!(
-    "(field_expression value: (self) field: (field_identifier) @ref)\n",
-    "(call_expression function: (field_expression value: (self) field: (field_identifier) @ref))\n",
-);
+// A method call such as `self.keep()` contains this `field_expression`, so one pattern covers both.
+const SIBLING_QUERY: &str = "(field_expression value: (self) field: (field_identifier) @ref)\n";
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Rust",

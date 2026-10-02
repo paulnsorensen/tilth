@@ -406,67 +406,68 @@ mod tests {
     use super::*;
 
     /// Every callee pattern of every language, as raw names before resolution.
+    /// Each fixture also reads a member without a call; that name must not appear.
     #[test]
     fn callee_names_cover_every_query_pattern() {
         let cases: &[(Lang, &str, &[&str])] = &[
             (
                 Lang::Rust,
-                "fn f() { plain(); s.method(); Kind::scoped(); shout!(); }\n",
+                "fn f() { plain(); s.method(); Kind::scoped(); shout!(); s.field; }\n",
                 &["method", "plain", "scoped", "shout"],
             ),
             (
                 Lang::Python,
-                "plain()\ns.method()\n",
+                "plain()\ns.method()\ns.field\n",
                 &["method", "plain"],
             ),
             (
                 Lang::Go,
-                "package p\nfunc f() { plain(); s.method() }\n",
+                "package p\nfunc f() { plain(); s.method(); _ = s.field }\n",
                 &["method", "plain"],
             ),
             (
                 Lang::C,
-                "void f(void) { plain(); s.field(); p->arrow(); }\n",
+                "void f(void) { plain(); s.field(); p->arrow(); s.member; p->pointee; }\n",
                 &["arrow", "field", "plain"],
             ),
             (
                 Lang::Cpp,
-                "void f() { plain(); s.field(); this->arrow(); }\n",
+                "void f() { plain(); s.field(); this->arrow(); s.member; this->pointee; }\n",
                 &["arrow", "field", "plain"],
             ),
             (
                 Lang::CSharp,
-                "class K { void F() { Plain(); s.Member(); } }\n",
+                "class K { void F() { Plain(); s.Member(); var v = s.Field; } }\n",
                 &["Member", "Plain"],
             ),
             (
                 Lang::Java,
-                "class K { void f() { plain(); s.member(); } }\n",
+                "class K { void f() { plain(); s.member(); int v = s.field; } }\n",
                 &["member", "plain"],
             ),
             (
                 Lang::JavaScript,
-                "plain();\ns.member();\n",
+                "plain();\ns.member();\ns.field;\n",
                 &["member", "plain"],
             ),
             (
                 Lang::TypeScript,
-                "plain();\ns.member();\n",
+                "plain();\ns.member();\ns.field;\n",
                 &["member", "plain"],
             ),
             (
                 Lang::Tsx,
-                "const v = <div>{plain() + s.member()}</div>;\n",
+                "const v = <div>{plain() + s.member() + s.field}</div>;\n",
                 &["member", "plain"],
             ),
             (
                 Lang::Kotlin,
-                "fun f() { plain(); s.member() }\n",
+                "fun f() { plain(); s.member(); val v = s.field }\n",
                 &["member", "plain"],
             ),
             (
                 Lang::Php,
-                "<?php\nplain();\n\\ns\\qualified();\nnamespace\\relative();\n$o->member();\n$o?->nullsafe();\nK::scoped();\n",
+                "<?php\nplain();\n\\ns\\qualified();\nnamespace\\relative();\n$o->member();\n$o?->nullsafe();\nK::scoped();\n$o->field;\n",
                 &[
                     "\\ns\\qualified",
                     "member",
@@ -483,20 +484,20 @@ mod tests {
             ),
             (
                 Lang::Scala,
-                "object O { plain(); s.member(); a infix b }\n",
+                "object O { plain(); s.member(); a infix b; val v = s.field }\n",
                 &["infix", "member", "plain"],
             ),
             (
                 Lang::Swift,
-                "plain()\ns.member()\n",
-                &["member", "plain"],
+                "plain()\ns.member()\nprint(s.field)\n",
+                &["member", "plain", "print"],
             ),
             (
                 Lang::Elixir,
                 "plain()\nMod.remote()\n",
                 &["plain", "remote"],
             ),
-            (Lang::Bash, "first arg\nsecond\n", &["first", "second"]),
+            (Lang::Bash, "first arg\nsecond\nfield=1\n", &["first", "second"]),
         ];
         for (lang, source, expected) in cases {
             assert_eq!(

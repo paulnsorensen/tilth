@@ -13,7 +13,7 @@ src/
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
     outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
-    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
+    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight(). Cached query runners: visit_query_captures(), query_captures().
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
