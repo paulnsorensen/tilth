@@ -49,40 +49,35 @@ pub(super) fn walk_to_enclosing_definition<'a>(
     lang: crate::types::Lang,
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let definitions = &crate::lang::spec::spec(lang).definitions;
-    let mut current = Some(node);
-    while let Some(definition) = current {
-        let name = (definitions.is_definition)(definition, lines)
-            .then(|| (definitions.extract_name)(definition, lines))
-            .flatten();
+    let (definition, name) = std::iter::successors(Some(node), tree_sitter::Node::parent)
+        .find_map(|candidate| {
+            let name = (definitions.is_definition)(candidate, lines)
+                .then(|| (definitions.extract_name)(candidate, lines))??;
+            Some((candidate, name))
+        })?;
+    let range = (
+        definition.start_position().row as u32 + 1,
+        definition.end_position().row as u32 + 1,
+    );
 
-        if let Some(name) = name {
-            let range = (
-                definition.start_position().row as u32 + 1,
-                definition.end_position().row as u32 + 1,
-            );
-
-            let mut parent = definition.parent();
-            while let Some(container) = parent {
-                let container_name = if TYPE_KINDS.contains(&container.kind()) {
-                    // Grammars without a `name` field (Kotlin) name types through the spec.
-                    extract_definition_name(container, lines)
-                        .or_else(|| (definitions.extract_name)(container, lines))
-                } else if (definitions.is_container)(container, lines) {
-                    (definitions.extract_name)(container, lines)
-                } else {
-                    None
-                };
-                if let Some(container_name) = container_name {
-                    return Some((definition, format!("{container_name}.{name}"), range));
-                }
-                parent = container.parent();
+    let container = std::iter::successors(definition.parent(), tree_sitter::Node::parent).find_map(
+        |container| {
+            if TYPE_KINDS.contains(&container.kind()) {
+                // Grammars without a `name` field (Kotlin) name types through the spec.
+                extract_definition_name(container, lines)
+                    .or_else(|| (definitions.extract_name)(container, lines))
+            } else if (definitions.is_container)(container, lines) {
+                (definitions.extract_name)(container, lines)
+            } else {
+                None
             }
-
-            return Some((definition, name, range));
-        }
-        current = definition.parent();
-    }
-    None
+        },
+    );
+    let name = match container {
+        Some(container) => format!("{container}.{name}"),
+        None => name,
+    };
+    Some((definition, name, range))
 }
 
 /// Find the nearest enclosing definition for `(path, line)` by re-parsing

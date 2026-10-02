@@ -1,135 +1,134 @@
+use crate::lang::treesitter::ParsedDocument;
 use crate::types::Lang;
 
-/// Extract test structure (describe/it/test) via tree-sitter queries.
+type DocNode<'r> = ast_grep_core::Node<
+    'r,
+    ast_grep_core::tree_sitter::StrDoc<crate::lang::treesitter::DocumentLanguage>,
+>;
+
+/// Extract test structure (describe/it/test) from a parsed file.
 /// Returns a structured test outline with suite nesting, or None if
 /// no test structure was found.
 pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<(String, bool)> {
     let language = crate::lang::outline::outline_language(lang)?;
-
-    let tree = crate::lang::treesitter::parse_source(content, &language)?;
-
-    outline_from_tree(content, max_lines, &tree)
+    let document = crate::lang::treesitter::parse_document(content, &language)?;
+    outline_from_document(max_lines, &document)
 }
 
-pub(crate) fn outline_from_tree(
-    content: &str,
+/// Each test call becomes one line, indented by the number of enclosing suites.
+pub(crate) fn outline_from_document(
     max_lines: usize,
-    tree: &tree_sitter::Tree,
+    document: &ParsedDocument,
 ) -> Option<(String, bool)> {
-    let lines: Vec<&str> = content.lines().collect();
-    let root = tree.root_node();
-    let mut entries = Vec::new();
-    let mut truncated = false;
+    let root = document.root();
+    let mut calls = root.dfs().filter_map(|node| {
+        let call = test_call(&node)?;
+        let depth = node
+            .ancestors()
+            .filter(|ancestor| test_call(ancestor).is_some_and(|c| c.is_suite))
+            .count();
+        let line = node.start_pos().line() + 1;
+        let label = if call.is_suite { "suite" } else { "test" };
+        Some(format!(
+            "{}[{line}] {label}: {}",
+            "  ".repeat(depth),
+            call.name
+        ))
+    });
 
-    extract_test_calls(root, &lines, 0, max_lines, &mut entries, &mut truncated);
-
+    let entries: Vec<String> = calls.by_ref().take(max_lines).collect();
     if entries.is_empty() {
         return None;
     }
-
+    let truncated = calls.next().is_some();
     Some((entries.join("\n"), truncated))
 }
 
-/// Recursively find describe/it/test call expressions.
-fn extract_test_calls(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    depth: usize,
-    max_lines: usize,
-    entries: &mut Vec<String>,
-    truncated: &mut bool,
-) {
-    if entries.len() >= max_lines {
-        return;
-    }
-
-    let kind = node.kind();
-
-    // Look for call expressions: describe(...), it(...), test(...)
-    if kind == "call_expression" || kind == "expression_statement" {
-        if let Some(name) = extract_test_name(node, lines) {
-            if entries.len() >= max_lines {
-                *truncated = true;
-                return;
-            }
-            let line = node.start_position().row as u32 + 1;
-            let indent = "  ".repeat(depth);
-            let label = if name.starts_with("describe") || name.starts_with("context") {
-                "suite"
-            } else {
-                "test"
-            };
-            entries.push(format!("{indent}[{line}] {label}: {name}"));
-
-            // Recurse into the callback body for nested describes
-            if label == "suite" {
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    extract_test_calls(child, lines, depth + 1, max_lines, entries, truncated);
-                }
-                return;
-            }
-        }
-    }
-
-    // Recurse
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_test_calls(child, lines, depth, max_lines, entries, truncated);
-    }
+struct TestCall {
+    name: String,
+    is_suite: bool,
 }
 
-/// Extract the function name and first string argument from a call expression.
-fn extract_test_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let mut cursor = node.walk();
-
-    // Find the function name
-    let func = node.children(&mut cursor).find(|c| {
-        let k = c.kind();
-        k == "identifier" || k == "member_expression" || k == "call_expression"
+/// Match `describe("…", …)`, `it("…", …)`, and their aliases.
+fn test_call(node: &DocNode<'_>) -> Option<TestCall> {
+    if !matches!(&*node.kind(), "call_expression" | "expression_statement") {
+        return None;
+    }
+    let func = node.children().find(|child| {
+        matches!(
+            &*child.kind(),
+            "identifier" | "member_expression" | "call_expression"
+        )
     })?;
-
-    let func_text = get_node_text(func, lines);
+    let func = first_line(&func);
     if !matches!(
-        func_text.as_str(),
+        func.as_str(),
         "describe" | "it" | "test" | "context" | "specify"
     ) {
         return None;
     }
 
-    // Find the first string argument
-    let mut cursor2 = node.walk();
-    let args = node
-        .children(&mut cursor2)
-        .find(|c| c.kind() == "arguments")?;
-
-    let mut cursor3 = args.walk();
-    let first_arg = args.children(&mut cursor3).find(|c| {
-        let k = c.kind();
-        k == "string" || k == "template_string" || k == "string_literal"
+    let args = node.children().find(|child| child.kind() == "arguments")?;
+    let title = args.children().find(|child| {
+        matches!(
+            &*child.kind(),
+            "string" | "template_string" | "string_literal"
+        )
     })?;
+    let title = first_line(&title);
+    let title = title.trim_matches('"').trim_matches('\'').trim_matches('`');
 
-    let arg_text = get_node_text(first_arg, lines);
-    // Strip quotes
-    let cleaned = arg_text
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim_matches('`');
-
-    Some(format!("{func_text}(\"{cleaned}\")"))
+    Some(TestCall {
+        is_suite: matches!(func.as_str(), "describe" | "context"),
+        name: format!("{func}(\"{title}\")"),
+    })
 }
 
-fn get_node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
+fn first_line(node: &DocNode<'_>) -> String {
+    node.text().lines().next().unwrap_or_default().to_string()
+}
 
-    if row < lines.len() && row == end_row {
-        let col_end = node.end_position().column.min(lines[row].len());
-        lines[row][col_start..col_end].to_string()
-    } else if row < lines.len() {
-        lines[row][col_start..].to_string()
-    } else {
-        String::new()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nests_tests_under_suites_in_source_order() {
+        let source = concat!(
+            "describe('auth', () => {\n",
+            "  it('logs in', () => {});\n",
+            "  context('expired', () => {\n",
+            "    test(`refreshes`, () => {});\n",
+            "  });\n",
+            "});\n",
+            "it('top level', () => {});\n",
+        );
+        let (text, truncated) = outline(source, Lang::TypeScript, usize::MAX).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "[1] suite: describe(\"auth\")\n",
+                "  [2] test: it(\"logs in\")\n",
+                "  [3] suite: context(\"expired\")\n",
+                "    [4] test: test(\"refreshes\")\n",
+                "[7] test: it(\"top level\")",
+            )
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn reports_truncation_only_when_calls_remain() {
+        let source = "it('a', () => {});\nit('b', () => {});\n";
+        let (text, truncated) = outline(source, Lang::JavaScript, 1).unwrap();
+        assert_eq!(text, "[1] test: it(\"a\")");
+        assert!(truncated);
+        let (_, truncated) = outline(source, Lang::JavaScript, 2).unwrap();
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn ignores_files_without_test_calls() {
+        assert!(outline("const x = run('a');\n", Lang::JavaScript, usize::MAX).is_none());
     }
 }

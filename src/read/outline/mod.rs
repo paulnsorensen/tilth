@@ -59,7 +59,7 @@ pub(crate) fn generate_cached(
     let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
     if crate::types::is_test_file(path) {
         if let Some((outline, truncated)) =
-            test_file::outline_from_tree(parsed.content(), max_lines, parsed.tree())
+            test_file::outline_from_document(max_lines, parsed.ast())
         {
             return with_omission_note(outline, truncated);
         }
