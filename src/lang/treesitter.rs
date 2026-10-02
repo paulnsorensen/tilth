@@ -775,6 +775,43 @@ mod tests {
     }
 
     #[test]
+    fn visit_query_captures_stops_on_break() {
+        const QUERY: &str = "(call_expression function: (identifier) @callee)";
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let source = "fn f() { first(); second(); third(); }";
+        let tree = parse_source(source, &language).expect("source parses");
+        let name = |node: Option<tree_sitter::Node>| {
+            node.and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        };
+
+        let mut visited = Vec::new();
+        visit_query_captures(
+            &language,
+            QUERY,
+            tree.root_node(),
+            source.as_bytes(),
+            ["callee"],
+            |[callee]| {
+                visited.extend(name(callee));
+                ControlFlow::Break(())
+            },
+        );
+        assert_eq!(visited, ["first"]);
+
+        let all: Vec<_> = query_captures(
+            &language,
+            QUERY,
+            tree.root_node(),
+            source.as_bytes(),
+            ["callee"],
+        )
+        .into_iter()
+        .filter_map(|[callee]| name(callee))
+        .collect();
+        assert_eq!(all, ["first", "second", "third"]);
+    }
+
+    #[test]
     fn shared_query_survives_edits_and_allows_reentrant_callbacks() {
         const OUTER_QUERY: &str = "(function_item name: (identifier) @edit_target)";
         const INNER_QUERY: &str = "(call_expression function: (identifier) @nested_target)";

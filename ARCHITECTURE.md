@@ -292,7 +292,8 @@ checked when the shape suggests a file").
 The search subsystem is the largest area of code. The walker preamble
 (size gating + mtime + bloom filter) is factored into `bloom_walk.rs`
 so all relational paths share it; AST-scope walking is in `scope.rs`;
-cached tree-sitter `Query` objects live in `callee_query.rs`.
+cached tree-sitter `Query` objects live in `lang::treesitter`, and
+`callee_query.rs` selects the per-language query text.
 
 ### Walker and ignore policy (`mod.rs`)
 

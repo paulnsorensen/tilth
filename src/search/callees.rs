@@ -406,7 +406,9 @@ mod tests {
     use super::*;
 
     /// Every callee pattern of every language, as raw names before resolution.
-    /// Each fixture also reads a member without a call; that name must not appear.
+    /// Most fixtures also read a member without a call; that name must not appear.
+    /// Elixir parses `s.field` as a call, so its row expects `field`.
+    /// Bash has no members, so its row checks that an assignment is not a call.
     #[test]
     fn callee_names_cover_every_query_pattern() {
         let cases: &[(Lang, &str, &[&str])] = &[
@@ -494,8 +496,8 @@ mod tests {
             ),
             (
                 Lang::Elixir,
-                "plain()\nMod.remote()\n",
-                &["plain", "remote"],
+                "plain()\nMod.remote()\ns.field\n",
+                &["field", "plain", "remote"],
             ),
             (Lang::Bash, "first arg\nsecond\nfield=1\n", &["first", "second"]),
         ];

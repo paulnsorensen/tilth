@@ -14,7 +14,7 @@ mod tests {
 
     /// A query that does not compile returns no matches with no error.
     /// A pattern without a capture that search reads drops its matches with no error.
-    /// `query_captures` keeps the first node of each capture, so no capture can repeat.
+    /// `query_captures` keeps only the first node of each capture, so the test refuses a repeated capture.
     #[test]
     fn every_call_and_member_query_compiles() {
         for lang in crate::lang::ALL_LANGS {
