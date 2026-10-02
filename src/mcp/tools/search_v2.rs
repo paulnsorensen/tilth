@@ -152,13 +152,19 @@ fn run_search_v2(
         ));
     }
     let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
+    let mut structural = crate::search::StructuralPatterns::default();
     for entry in entries {
         let object = entry
             .as_object()
             .ok_or_else(|| SearchFailure::new("each entry must be an object", "bad_query_entry"))?;
-        if object.contains_key("query") == object.contains_key("follow") {
+        if ["query", "follow", "pattern"]
+            .iter()
+            .filter(|key| object.contains_key(**key))
+            .count()
+            != 1
+        {
             return Err(SearchFailure::new(
-                "each entry requires exactly one of query or follow",
+                "each entry requires exactly one of query, follow, or pattern",
                 "bad_query_entry",
             ));
         }
@@ -172,6 +178,9 @@ fn run_search_v2(
             follows.push(Some(
                 Follow::parse(hint, cwd, cache).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
             ));
+        } else if object.contains_key("pattern") {
+            parse_structural_entry(object, cwd, &mut structural)?;
+            follows.push(None);
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
                 return Err(SearchFailure::new(
@@ -185,28 +194,37 @@ fn run_search_v2(
                     "bad_query_entry",
                 ));
             }
-            if entry.get("glob").is_some_and(|g| !g.is_string()) {
-                return Err(SearchFailure::new(
-                    "glob must be a string",
-                    "bad_query_entry",
-                ));
-            }
-            crate::search::walker(cwd, entry.get("glob").and_then(Value::as_str))
-                .map_err(|e| SearchFailure::new(e.to_string(), "bad_query_entry"))?;
+            validate_entry_glob(object, cwd, "bad_query_entry")?;
             follows.push(None);
         }
     }
-    let mut results = Vec::with_capacity(entries.len());
+    let mut results: Vec<(Value, Option<FileCounts>)> = Vec::with_capacity(entries.len());
     let mut hints = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
     for (entry, follow) in entries.iter().zip(&follows) {
+        let mut counts = None;
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             let result = follow
                 .execute(cwd, bloom, client, cache)
                 .map_err(|e| SearchFailure::new(e, "follow_error"))?;
             (result, follow.kind.clone(), Vec::new(), None)
+        } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
+            let language = entry["language"].as_str().unwrap();
+            session.record_structural_search();
+            let scan = structural
+                .search(
+                    language,
+                    pattern,
+                    cwd,
+                    entry.get("glob").and_then(Value::as_str),
+                    cache,
+                )
+                .map_err(|error| SearchFailure::new(error.to_string(), "structural_error"))?;
+            let (result, file_counts) = structural_result(scan, pattern, language);
+            counts = Some(file_counts);
+            (result, "structural".into(), Vec::new(), None)
         } else {
             route_query(
                 entry["query"].as_str().unwrap(),
@@ -228,14 +246,14 @@ fn run_search_v2(
         }
         routes_tried.push(route);
         hints.append(&mut entry_hints);
-        results.push(result);
+        results.push((result, counts));
         if let Some(diagnostic) = diagnostic {
             normalizations.push(diagnostic);
         }
     }
     let dependency_states: Vec<(bool, bool, bool)> = results
         .iter()
-        .filter_map(|r| r.get("dependency_impact"))
+        .filter_map(|(r, _)| r.get("dependency_impact"))
         .map(|d| {
             (
                 d["coverage"] == "complete",
@@ -244,7 +262,7 @@ fn run_search_v2(
             )
         })
         .collect();
-    let partial = results.iter().any(|r| r["completeness"] == "partial");
+    let partial = results.iter().any(|(r, _)| r["completeness"] == "partial");
     let timeout = dependency_states.iter().any(|&(_, timed_out, _)| timed_out);
     let dependency_coverage = if dependency_states.is_empty() {
         1.0
@@ -265,12 +283,13 @@ fn run_search_v2(
     } else {
         routes_tried[0].clone()
     };
-    let mut response = json!({"results": results, "hints": hints, "diagnostics": if normalizations.is_empty() { json!({}) } else { json!({"normalizations": normalizations}) }});
-    let output = reduce_response(&mut response, budget)
+    let diagnostics = if normalizations.is_empty() {
+        json!({})
+    } else {
+        json!({"normalizations": normalizations})
+    };
+    let (output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
-    let budget_limited = response["results"]
-        .as_array()
-        .is_some_and(|results| results.iter().any(|r| r["budget_limited"] == true));
     Ok(SearchRun {
         response: output,
         route,
@@ -281,6 +300,93 @@ fn run_search_v2(
         shard_state: shard_state.into(),
         budget_limited,
     })
+}
+
+/// Check that an entry's optional `glob` is a string and builds a walker.
+fn validate_entry_glob(
+    object: &serde_json::Map<String, Value>,
+    cwd: &Path,
+    class: &'static str,
+) -> Result<(), SearchFailure> {
+    let glob = match object.get("glob") {
+        None => None,
+        Some(Value::String(glob)) => Some(glob.as_str()),
+        Some(_) => return Err(SearchFailure::new("glob must be a string", class)),
+    };
+    crate::search::walker(cwd, glob)
+        .map(|_| ())
+        .map_err(|error| SearchFailure::new(error.to_string(), class))
+}
+
+/// Validate one structural entry and compile its pattern into `structural`.
+fn parse_structural_entry(
+    object: &serde_json::Map<String, Value>,
+    cwd: &Path,
+    structural: &mut crate::search::StructuralPatterns,
+) -> Result<(), SearchFailure> {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "pattern" | "language" | "glob"))
+    {
+        return Err(SearchFailure::new(
+            "structural entries accept only pattern, language, and glob",
+            "bad_structural",
+        ));
+    }
+    let pattern = object
+        .get("pattern")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SearchFailure::new("pattern must be a string", "bad_structural"))?;
+    let language = object
+        .get("language")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SearchFailure::new(
+                format!(
+                    "language must be {}",
+                    crate::lang::spec::structural_language_list()
+                ),
+                "bad_structural",
+            )
+        })?;
+    validate_entry_glob(object, cwd, "bad_structural")?;
+    structural
+        .prepare(language, pattern)
+        .map_err(|error| SearchFailure::new(error, "bad_structural"))
+}
+
+/// Build the result record for one structural scan, returning it with the
+/// per-file match counts the budget trim needs.
+fn structural_result(
+    scan: crate::search::StructuralScan,
+    pattern: &str,
+    language: &str,
+) -> (Value, FileCounts) {
+    let mut result = base_result(
+        pattern,
+        "structural",
+        if scan.retained == 0 { "no_match" } else { "ok" },
+    );
+    result["language"] = json!(language);
+    result["view"] = json!("matches");
+    let total: usize = scan.file_counts.values().sum();
+    result["total_matches"] = json!(total);
+    result["files_matched"] = json!(scan.file_counts.len());
+    result["items"] = json!(scan.groups);
+    if scan.limited {
+        result["note"] = json!(format!(
+            "Showing the first {} of {total} matches. Narrow with glob.",
+            scan.retained
+        ));
+        result["match_limited"] = json!(true);
+    }
+    if scan.skipped_files > 0 {
+        result["skipped_files"] = json!(scan.skipped_files);
+    }
+    if scan.limited || scan.skipped_files > 0 {
+        mark_partial(&mut result);
+    }
+    (result, scan.file_counts)
 }
 
 /// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
@@ -304,17 +410,28 @@ const REMOVABLE: [(Option<&str>, &str); 6] = [
     (Some("dependency_impact"), "dependents"),
 ];
 
-/// Serialize `response`, dropping optional payloads largest-first until the
-/// token estimate fits `budget`. Candidates are sized once up front — dropping
-/// one never changes another's serialized size — and length is then tracked by
-/// exact deltas so the whole response is serialized only once at the end.
-/// Entries and hints are never removed, so a budget too small for the required
-/// metadata is an error rather than a lossy answer.
-fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> {
-    let output = serde_json::to_string(response).map_err(|e| e.to_string())?;
+/// Serialize the response, dropping optional payloads until the token estimate
+/// fits `budget`. Each result carries the per-file match counts that let a
+/// structural result narrow instead of vanish. Plain payloads go first,
+/// largest-first and sized once up front (dropping one never changes another's
+/// size). Structural `items` are narrowed last by `narrow_structural` against
+/// the length the other drops left, and re-serialized per narrowed result.
+/// Length is tracked by exact deltas, so the whole response is serialized once
+/// more at the end. Entries and hints are never removed, so a budget too small
+/// for the required metadata is an error rather than a lossy answer. Returns
+/// the output and whether any result was budget-limited.
+fn reduce_response(
+    results: Vec<(Value, Option<FileCounts>)>,
+    hints: &[Value],
+    diagnostics: &Value,
+    budget: u64,
+) -> Result<(String, bool), String> {
+    let (results, counts): (Vec<Value>, Vec<Option<FileCounts>>) = results.into_iter().unzip();
+    let mut response = json!({"results": results, "hints": hints, "diagnostics": diagnostics});
+    let output = serde_json::to_string(&response).map_err(|e| e.to_string())?;
     let mut len = output.len();
     if crate::types::estimate_tokens(len as u64) <= budget {
-        return Ok(output);
+        return Ok((output, false));
     }
     let Some(results) = response["results"].as_array() else {
         return Err("search response must carry a results array".into());
@@ -338,8 +455,16 @@ fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> 
     }
     // Stable sort: equally sized payloads keep result order, then `REMOVABLE` order.
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.3));
+    let (structural, plain): (Vec<_>, Vec<_>) =
+        candidates
+            .into_iter()
+            .partition(|&(index, owner, field, _)| {
+                owner.is_none()
+                    && field == "items"
+                    && counts[index].as_ref().is_some_and(|c| !c.is_empty())
+            });
 
-    for (index, owner, field, size) in candidates {
+    for (index, owner, field, size) in plain {
         if crate::types::estimate_tokens(len as u64) <= budget {
             break;
         }
@@ -362,12 +487,271 @@ fn reduce_response(response: &mut Value, budget: u64) -> Result<String, String> 
         result["budget_limited"] = json!(true);
         len = len + result.to_string().len() - before;
     }
+    let mut narrowed_originals: Vec<(usize, Value)> = Vec::new();
+    for (index, ..) in structural {
+        if crate::types::estimate_tokens(len as u64) <= budget {
+            break;
+        }
+        let Some(counts) = counts[index].as_ref() else {
+            continue;
+        };
+        let result = &mut response["results"][index];
+        let rest = len - result.to_string().len();
+        let narrowed = narrow_structural(result, counts, &|bytes| {
+            crate::types::estimate_tokens((rest + bytes) as u64) <= budget
+        });
+        len = rest + narrowed.to_string().len();
+        narrowed_originals.push((index, std::mem::replace(result, narrowed)));
+    }
+    // Early narrows were sized against the later results' full `items`; once
+    // those shrink, re-narrow each against the final length and keep any
+    // richer view that now fits.
+    for (index, original) in &narrowed_originals {
+        let Some(counts) = counts[*index].as_ref() else {
+            continue;
+        };
+        let result = &mut response["results"][*index];
+        let current = result.to_string().len();
+        let rest = len - current;
+        let renarrowed = narrow_structural(original, counts, &|bytes| {
+            crate::types::estimate_tokens((rest + bytes) as u64) <= budget
+        });
+        let renarrowed_len = renarrowed.to_string().len();
+        if renarrowed_len > current {
+            len = rest + renarrowed_len;
+            *result = renarrowed;
+        }
+    }
     if crate::types::estimate_tokens(len as u64) > budget {
         return Err(format!(
             "budget {budget} cannot fit required search metadata"
         ));
     }
-    serde_json::to_string(response).map_err(|e| e.to_string())
+    let output = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+    let budget_limited = response["results"]
+        .as_array()
+        .is_some_and(|results| results.iter().any(|r| r["budget_limited"] == true));
+    Ok((output, budget_limited))
+}
+
+/// A longer file list is not actionable for an agent, so it skips to directory counts.
+const MAX_LISTED_FILES: usize = 100;
+
+/// Matches per file for one structural result, counted before the retention cap.
+type FileCounts = std::collections::BTreeMap<String, usize>;
+
+/// Directory-count groups keyed by `(directory, direct)`. A `direct` group holds
+/// only that directory's own files and matches the glob `<dir>/*`; any other
+/// group holds its whole subtree and matches `<dir>/**`. Picks the smallest
+/// depth (at least 1) that yields two groups, else the deepest. Root-level
+/// files group as `.`. Values are `(matches, files)`.
+fn directory_groups(
+    counts: &FileCounts,
+) -> std::collections::BTreeMap<(String, bool), (usize, usize)> {
+    let max_depth = counts
+        .keys()
+        .map(|path| path.matches('/').count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let group = |depth: usize| {
+        let mut groups = std::collections::BTreeMap::<(String, bool), (usize, usize)>::new();
+        for (path, count) in counts {
+            let key = match path.rsplit_once('/') {
+                None => (".".to_string(), false),
+                Some((parent, _)) => {
+                    let parts: Vec<&str> = parent.split('/').collect();
+                    if parts.len() < depth {
+                        (parent.to_string(), true)
+                    } else {
+                        (parts[..depth].join("/"), false)
+                    }
+                }
+            };
+            let entry = groups.entry(key).or_default();
+            entry.0 += count;
+            entry.1 += 1;
+        }
+        groups
+    };
+    let mut groups = group(1);
+    for depth in 2..=max_depth {
+        if groups.len() >= 2 {
+            break;
+        }
+        groups = group(depth);
+    }
+    groups
+}
+
+const GLOB_METACHARS: [char; 7] = ['[', ']', '{', '}', '*', '?', '\\'];
+
+/// Escape glob metacharacters so a literal path can be a `glob` value.
+fn escape_glob(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        if GLOB_METACHARS.contains(&c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Replace a structural result's `items` that no longer fit the budget with the
+/// richest view that does: a prefix of the single matched file, per-file
+/// counts, per-directory counts, or nothing. `fits` takes the candidate
+/// result's serialized length. When no view fits, returns the plain
+/// `items`-removed result, which is never larger than any view.
+fn narrow_structural(result: &Value, counts: &FileCounts, fits: &dyn Fn(usize) -> bool) -> Value {
+    let mut base = result.clone();
+    if let Some(object) = base.as_object_mut() {
+        object.remove("items");
+    }
+    mark_partial(&mut base);
+    base["budget_limited"] = json!(true);
+    let fitting = |candidate: &Value| fits(candidate.to_string().len());
+    prefix_tier(result, &base, counts, fits)
+        .or_else(|| files_tier(&base, counts).filter(fitting))
+        .or_else(|| directories_tier(&base, counts).filter(fitting))
+        .or_else(|| none_tier(&base, counts).filter(fitting))
+        .unwrap_or(base)
+}
+
+/// Longest prefix of a single file's matches that fits. Each match is
+/// serialized once; a prefix's length is the empty candidate's length plus the
+/// match lengths, their commas, and the extra digits of the repeated count.
+fn prefix_tier(
+    result: &Value,
+    base: &Value,
+    counts: &FileCounts,
+    fits: &dyn Fn(usize) -> bool,
+) -> Option<Value> {
+    if counts.len() != 1 {
+        return None;
+    }
+    let total: usize = counts.values().sum();
+    let path = counts.keys().next()?;
+    let matches = result["items"][0]["matches"].as_array()?;
+    let build = |keep: usize| {
+        let mut candidate = base.clone();
+        candidate["items"] = json!([{"path": path, "matches": matches[..keep]}]);
+        candidate["shown"] = json!(keep);
+        candidate["note"] = json!(format!(
+            "Showing the first {keep} of {total} matches in {path}. Raise budget to see more."
+        ));
+        candidate
+    };
+    let mut prefix_sums = Vec::with_capacity(matches.len() + 1);
+    prefix_sums.push(0);
+    for item in matches {
+        prefix_sums.push(prefix_sums.last().unwrap() + item.to_string().len());
+    }
+    let empty = build(0).to_string().len();
+    let len_for = |keep: usize| {
+        let digits = keep.checked_ilog10().map_or(1, |log| log as usize + 1);
+        empty + prefix_sums[keep] + keep.saturating_sub(1) + 2 * (digits - 1)
+    };
+    let (mut low, mut high) = (0, matches.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(len_for(middle)) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    if low == 0 {
+        return None;
+    }
+    let candidate = build(low);
+    debug_assert_eq!(candidate.to_string().len(), len_for(low));
+    Some(candidate)
+}
+
+fn files_tier(base: &Value, counts: &FileCounts) -> Option<Value> {
+    if counts.len() > MAX_LISTED_FILES {
+        return None;
+    }
+    let total: usize = counts.values().sum();
+    let mut files = base.clone();
+    files["view"] = json!("files");
+    files["files"] = Value::Array(
+        counts
+            .iter()
+            .map(|(path, count)| json!([path, count]))
+            .collect(),
+    );
+    let mut note = format!(
+        "Too many matches ({total} in {} files) for the budget. Rerun this entry with glob set to a listed path.",
+        counts.len()
+    );
+    if counts.keys().any(|path| !path.contains('/')) {
+        note.push_str(" Prefix a top-level file with / to match only that file.");
+    }
+    files["note"] = json!(note);
+    Some(files)
+}
+
+fn directories_tier(base: &Value, counts: &FileCounts) -> Option<Value> {
+    let total: usize = counts.values().sum();
+    let file_total = counts.len();
+    let groups = directory_groups(counts);
+    let mut top: Vec<(&String, &usize)> = counts.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let example = groups
+        .keys()
+        .find(|(dir, _)| dir != ".")
+        .map(|(dir, direct)| format!("{}/{}", escape_glob(dir), if *direct { "*" } else { "**" }));
+    let escapes = groups.keys().any(|(dir, _)| dir.contains(GLOB_METACHARS));
+    let mut note = match &example {
+        Some(example) => format!(
+            "Too many matches ({total} in {file_total} files across {} {}) for the budget. Rerun this entry with glob set to a directory, e.g. \"{example}\".",
+            groups.len(),
+            if groups.len() == 1 { "directory" } else { "directories" },
+        ),
+        None => format!(
+            "Too many matches ({total} in {file_total} top-level files) for the budget. Rerun this entry with glob set to / plus a file name, e.g. \"/{}\".",
+            escape_glob(top[0].0)
+        ),
+    };
+    if escapes {
+        note.push_str(r" Escape [ ] { } * ? \ in a path with a backslash.");
+    }
+    let mut directories = base.clone();
+    directories["view"] = json!("directories");
+    directories["directories"] = Value::Array(
+        groups
+            .iter()
+            .map(|((dir, direct), (count, files))| {
+                let label = if *direct {
+                    format!("{dir}/*")
+                } else {
+                    dir.clone()
+                };
+                json!([label, count, files])
+            })
+            .collect(),
+    );
+    directories["top_files"] = Value::Array(
+        top.into_iter()
+            .take(10)
+            .map(|(path, count)| json!([path, count]))
+            .collect(),
+    );
+    directories["note"] = json!(note);
+    Some(directories)
+}
+
+fn none_tier(base: &Value, counts: &FileCounts) -> Option<Value> {
+    let total: usize = counts.values().sum();
+    let mut none = base.clone();
+    none["view"] = json!("none");
+    none["note"] = json!(format!(
+        "Too many matches ({total} in {} files) for the budget. Raise budget or narrow with glob.",
+        counts.len()
+    ));
+    Some(none)
 }
 
 /// Route one query through the deterministic precedence: path -> regex ->
@@ -779,6 +1163,95 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Reduce a plain response whose results carry no structural counts.
+    fn reduce(response: &Value, budget: u64) -> Result<(String, bool), String> {
+        let results = response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| (result.clone(), None))
+            .collect();
+        let hints = response["hints"].as_array().unwrap().clone();
+        reduce_response(results, &hints, &response["diagnostics"], budget)
+    }
+
+    fn structural_record(items: &Value) -> Value {
+        json!({"query": "wrap($A)", "resolved_as": "structural", "status": "ok",
+            "completeness": "complete", "view": "matches", "items": items})
+    }
+
+    #[test]
+    fn narrowed_structural_is_never_larger_than_plain_item_removal() {
+        let counts: FileCounts = (0..60)
+            .map(|i| (format!("dir{}/f{i}.py", i % 3), 2))
+            .collect();
+        let result = structural_record(&json!([]));
+        let mut plain = result.clone();
+        plain.as_object_mut().unwrap().remove("items");
+        mark_partial(&mut plain);
+        plain["budget_limited"] = json!(true);
+        let plain_len = plain.to_string().len();
+        for limit in [
+            plain_len,
+            plain_len + 10,
+            plain_len + 60,
+            plain_len + 200,
+            plain_len + 800,
+            100_000,
+        ] {
+            let narrowed = narrow_structural(&result, &counts, &|bytes| bytes <= limit);
+            assert!(
+                narrowed.to_string().len() <= limit,
+                "limit {limit}: {narrowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_tier_keeps_the_longest_prefix_that_fits() {
+        let matches: Vec<Value> = (1..=120)
+            .map(|i| json!([i, i, i * 7, i * 7 + 5, {"A": [[i, i, 1, 2]]}]))
+            .collect();
+        let counts: FileCounts = [("a.py".to_string(), 120)].into();
+        let result = structural_record(&json!([{"path": "a.py", "matches": matches}]));
+        let shown = |limit: usize| {
+            let narrowed = narrow_structural(&result, &counts, &|bytes| bytes <= limit);
+            assert!(narrowed.to_string().len() <= limit || narrowed.get("shown").is_none());
+            narrowed["shown"].as_u64()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for limit in (500..6000).step_by(53) {
+            let Some(keep) = shown(limit) else { continue };
+            seen.insert(keep);
+            let exact = narrow_structural(&result, &counts, &|bytes| bytes <= limit)
+                .to_string()
+                .len();
+            assert_eq!(shown(exact), Some(keep));
+            assert!(shown(exact - 1).is_none_or(|smaller| smaller < keep));
+        }
+        assert!(seen.len() > 10, "{seen:?}");
+    }
+
+    #[test]
+    fn structural_narrowing_runs_after_plain_payloads_are_dropped() {
+        let counts: FileCounts = (0..30).map(|i| (format!("d/f{i:02}.py"), 20)).collect();
+        let groups: Vec<Value> = counts
+            .keys()
+            .map(|path| json!({"path": path, "matches": vec![json!([1, 1, 0, 11, {}]); 20]}))
+            .collect();
+        let plain = json!({"query": "x y", "resolved_as": "literal", "status": "ok",
+            "completeness": "complete", "preview": "x".repeat(3000)});
+        let results = vec![
+            (plain, None),
+            (structural_record(&json!(groups)), Some(counts)),
+        ];
+        let (output, limited) = reduce_response(results, &[], &json!({}), 300).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert!(limited);
+        assert!(parsed["results"][0].get("preview").is_none());
+        assert_eq!(parsed["results"][1]["view"], "files");
+    }
+
     #[test]
     fn unreadable_unique_discovery_reports_partial_before_dependency_work() {
         let tmp = tempfile::tempdir().unwrap();
@@ -900,7 +1373,7 @@ mod tests {
             {"query": "two", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "second"}
         ], "hints": [], "diagnostics": {}});
         for budget in [crate::budget::DEFAULT_BUDGET, 150] {
-            let output = reduce_response(&mut response.clone(), budget).unwrap();
+            let (output, _) = reduce(&response, budget).unwrap();
             assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
             let parsed: Value = serde_json::from_str(&output).unwrap();
             assert_eq!(parsed["results"].as_array().unwrap().len(), 2);
@@ -914,23 +1387,80 @@ mod tests {
         response["results"][0]["dependency_impact"] = json!({
             "coverage": "complete", "imports": ["x".repeat(10000)], "dependents": [], "total_imports": 1
         });
-        assert!(reduce_response(&mut response, 200).is_ok());
+        let (output, _) = reduce(&response, 200).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
-            response["results"][0]["dependency_impact"]["coverage"],
+            parsed["results"][0]["dependency_impact"]["coverage"],
             "partial"
         );
     }
 
     #[test]
     fn budget_trim_keeps_ambiguous_status() {
-        let mut response = json!({"results": [{"query": "root", "resolved_as": "ambiguous",
+        let response = json!({"results": [{"query": "root", "resolved_as": "ambiguous",
             "status": "ambiguous", "completeness": "complete",
             "candidates": [{"path": "x".repeat(5000)}]}], "hints": [], "diagnostics": {}});
-        let output = reduce_response(&mut response, 100).unwrap();
+        let (output, _) = reduce(&response, 100).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["results"][0]["status"], "ambiguous");
         assert_eq!(parsed["results"][0]["completeness"], "partial");
         assert_eq!(parsed["results"][0]["budget_limited"], true);
+    }
+
+    #[test]
+    fn structural_requests_reuse_documents_and_compile_once_per_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "structural_witness_unique(value)\n";
+        let witness = crate::lang::treesitter::ParseWitness::new(source);
+        let first = tmp.path().join("first.py");
+        std::fs::write(&first, source).unwrap();
+        std::fs::write(tmp.path().join("second.py"), source).unwrap();
+        std::fs::write(
+            tmp.path().join("source.ts"),
+            "structural_witness_unique(value);\n",
+        )
+        .unwrap();
+        let (cache, session, bloom) = components();
+        let (telemetry, telemetry_dir) = telemetry();
+        let args = json!({"cwd": tmp.path(), "budget": 10000, "queries": [
+            {"pattern": "structural_witness_unique($A)", "language": "python"},
+            {"pattern": "structural_witness_unique($A)", "language": "python"},
+            {"pattern": "structural_witness_unique($A)", "language": "typescript"}
+        ]});
+        let before = crate::search::compilation_count();
+        for request in 1..=2 {
+            let response =
+                tool_search_v2(&args, &cache, &session, &bloom, &telemetry, "test", "test")
+                    .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["results"][0]["items"].as_array().unwrap().len(), 2);
+            assert_eq!(response["results"][0], response["results"][1]);
+            assert_eq!(response["results"][2]["items"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                witness.count(),
+                2,
+                "candidate files parse once across requests"
+            );
+            assert_eq!(crate::search::compilation_count() - before, request * 2);
+        }
+        assert_eq!(session.search_count(), 6);
+        assert!(
+            !session.summary().contains("structural_witness_unique($A)"),
+            "structural patterns must not leak into the session summary"
+        );
+        let records: Vec<Value> =
+            std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
+                .expect("telemetry file written")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid telemetry record"))
+                .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["first_call"], true);
+        assert_eq!(records[1]["first_call"], false);
+
+        let retained = cache.get_or_parse(&first).unwrap();
+        let again = cache.get_or_parse(&first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retained, &again));
     }
 
     #[test]

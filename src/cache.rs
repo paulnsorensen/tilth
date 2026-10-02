@@ -261,19 +261,19 @@ impl OutlineCache {
     /// `revision` under the cache lock. A change between the stat and the
     /// read, or after the read, fails that check, so no stale bytes enter
     /// the cache. Without a revision, or over the size limit, nothing is published.
-    pub(crate) fn parse_with_revision(
+    pub(crate) fn parse_with_revision<C: AsRef<str> + Into<String>>(
         &self,
         path: &Path,
-        content: &str,
+        content: C,
         revision: Option<FileRevision>,
     ) -> Option<Arc<ParsedFile>> {
         let Some(revision) = revision else {
             return Self::parse_supplied(path, content);
         };
-        if content.len() as u64 > MAX_PARSED_FILE_BYTES {
+        if content.as_ref().len() as u64 > MAX_PARSED_FILE_BYTES {
             return Self::parse_supplied(path, content);
         }
-        if let Some(file) = self.lookup_parsed(path, &revision, Some(content)) {
+        if let Some(file) = self.lookup_parsed(path, &revision, Some(content.as_ref())) {
             return Some(file);
         }
         let file = Self::parse_supplied(path, content)?;
@@ -281,14 +281,27 @@ impl OutlineCache {
             .or(Some(file))
     }
 
-    fn parse_supplied(path: &Path, content: &str) -> Option<Arc<ParsedFile>> {
+    /// Return the cached snapshot for `path` at `revision` without reading or parsing.
+    pub(crate) fn cached_parse(
+        &self,
+        path: &Path,
+        revision: &FileRevision,
+    ) -> Option<Arc<ParsedFile>> {
+        self.lookup_parsed(path, revision, None)
+    }
+
+    /// Parse supplied bytes; an owned `String` moves into the snapshot without a copy.
+    fn parse_supplied<C: AsRef<str> + Into<String>>(
+        path: &Path,
+        content: C,
+    ) -> Option<Arc<ParsedFile>> {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
         let language = crate::lang::outline::outline_language(lang)?;
-        let tree = crate::lang::treesitter::parse_source(content, &language)?;
+        let tree = crate::lang::treesitter::parse_source(content.as_ref(), &language)?;
         Some(Arc::new(ParsedFile {
-            content: Arc::new(content.to_string()),
+            content: Arc::new(content.into()),
             tree,
             lang,
         }))
