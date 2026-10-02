@@ -14,7 +14,7 @@ mod tests {
 
     #[test]
     fn kotlin_callee_query_compiles() {
-        let lang: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let lang: tree_sitter::Language = tree_sitter_kotlin_sg::LANGUAGE.into();
         let query_str = callee_query_str(Lang::Kotlin).unwrap();
         tree_sitter::Query::new(&lang, query_str).expect("kotlin callee query should compile");
     }

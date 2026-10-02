@@ -57,7 +57,7 @@ tree-sitter-php = "0.24"
 tree-sitter-scala = "0.26"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
-tree-sitter-kotlin-ng = "1.1"
+tree-sitter-kotlin-sg = "0.4.1"
 tree-sitter-elixir = "0.3"
 tree-sitter-bash = "0.25.1"
 tree-sitter-md = "0.5"
@@ -65,7 +65,24 @@ tree-sitter-md = "0.5"
 # Structural matching over the cached tree-sitter documents.
 # Exact pin: structural.rs mirrors ast-grep-core 0.45.3 single_matcher; bump both together.
 ast-grep-core = "=0.45.3"
-ast-grep-language = { version = "=0.45.3", default-features = false, features = ["tree-sitter-rust", "tree-sitter-typescript", "tree-sitter-python"] }
+ast-grep-language = { version = "=0.45.3", default-features = false, features = [
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-c-sharp",
+    "tree-sitter-elixir",
+    "tree-sitter-go",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-kotlin",
+    "tree-sitter-php",
+    "tree-sitter-python",
+    "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-scala",
+    "tree-sitter-swift",
+    "tree-sitter-typescript",
+] }
 
 # Search (ripgrep internals)
 grep-regex = "0.1"

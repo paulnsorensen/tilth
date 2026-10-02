@@ -85,6 +85,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     definition_wrappers: crate::lang::spec::DEFAULT_DEFINITION_WRAPPERS,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Go),
         import_line,
         same_package: Some(crate::lang::spec::SamePackagePolicy {
             extension: "go",

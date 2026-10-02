@@ -105,7 +105,12 @@ Use an explicit pattern entry to match syntax, rather than literal text or regul
 }
 ```
 
-Supported languages are Rust, TypeScript (`.ts`, not `.tsx`), and Python.
+Supported languages are Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, Swift, Kotlin, C#, Elixir, and Bash.
+The `language` value is the lowercase name, for example `c++` or `c#`.
+`typescript` matches `.ts` files only; use `tsx` for `.tsx` files.
+In every language, `$` followed by an uppercase letter or `_` starts a metavariable.
+So in PHP and Bash, `$this` and `$name` stay literal variables, but `$HOME` is a metavariable.
+In C, a bare call such as `wrap($A)` parses as a declaration; write `wrap($A);` to match the call statement.
 Each entry contains exactly one of `query`, `follow`, or `pattern`.
 Pattern entries require `language` and accept only an optional `glob`.
 Invalid patterns and unsupported languages fail without a text-search fallback.

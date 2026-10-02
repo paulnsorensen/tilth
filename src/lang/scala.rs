@@ -31,6 +31,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::scala::canonical_anchor,
     attach_leading_adornment: crate::lang::scala::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Scala),
         import_line,
         outline_label,
         sibling_object: Some("this"),

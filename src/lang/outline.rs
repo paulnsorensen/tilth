@@ -104,6 +104,18 @@ fn collect_sibling_entries<'tree>(
     let mut pending = Vec::new();
 
     for child in children {
+        // Kotlin wraps all imports in one `import_list`; outline each header.
+        if child.kind() == "import_list" {
+            let mut cursor = child.walk();
+            entries.extend(collect_sibling_entries(
+                child.children(&mut cursor),
+                lines,
+                lang,
+                depth,
+            ));
+            pending.clear();
+            continue;
+        }
         if let Some(mut entry) = node_to_entry(child, lines, lang, depth) {
             let attach_pending = pending.last().is_some_and(|last| contiguous(*last, child))
                 && pending
@@ -248,6 +260,7 @@ fn node_to_entry(
         "class_declaration" | "class_definition" | "class" | "class_specifier" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
+                .or_else(|| (spec.definitions.extract_name)(node, lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Class, name, None)
         }
@@ -287,6 +300,7 @@ fn node_to_entry(
         "object_declaration" | "object_definition" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
+                .or_else(|| (spec.definitions.extract_name)(node, lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Module, name, None)
         }
@@ -323,6 +337,7 @@ fn node_to_entry(
         "import_statement"
         | "import_declaration"
         | "import"
+        | "import_header"
         | "use_declaration"
         | "namespace_use_declaration"
         | "use_item"

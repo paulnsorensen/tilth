@@ -514,20 +514,40 @@ mod tests {
 
     #[test]
     fn structural_languages_come_from_the_lang_spec() {
-        assert_eq!(
-            crate::lang::spec::structural_language_names(),
-            ["rust", "typescript", "python"]
-        );
-        assert_eq!(
-            crate::lang::spec::structural_language_list(),
-            "rust, typescript, or python"
-        );
-        assert!(crate::lang::spec::structural_language("tsx").is_none());
+        const NAMES: [&str; 17] = [
+            "rust",
+            "typescript",
+            "tsx",
+            "javascript",
+            "python",
+            "go",
+            "java",
+            "scala",
+            "c",
+            "c++",
+            "ruby",
+            "php",
+            "swift",
+            "kotlin",
+            "c#",
+            "elixir",
+            "bash",
+        ];
+        assert_eq!(crate::lang::spec::structural_language_names(), NAMES);
+        let list = format!("{}, or bash", NAMES[..16].join(", "));
+        assert_eq!(crate::lang::spec::structural_language_list(), list);
+        // Grammar-less languages have no structural entry.
+        for name in ["docker", "make", "markdown"] {
+            assert!(
+                crate::lang::spec::structural_language(name).is_none(),
+                "{name}"
+            );
+        }
         let mut patterns = StructuralPatterns::default();
-        let error = patterns.prepare("go", "wrap($A)").unwrap_err();
+        let error = patterns.prepare("make", "wrap($A)").unwrap_err();
         assert_eq!(
             error,
-            "unsupported structural language; use rust, typescript, or python"
+            format!("unsupported structural language; use {list}")
         );
     }
 

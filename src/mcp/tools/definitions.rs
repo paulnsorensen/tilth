@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Languages: rust, typescript (.ts only), python. No kind/expand/context.",
+            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -452,15 +452,15 @@ mod tests {
         assert!(!compiled.is_valid(
             &serde_json::json!({"queries": [{"query": "x", "follow": {}}], "cwd": "/abs"})
         ));
-        for language in ["rust", "typescript", "python"] {
+        for language in crate::lang::spec::structural_language_names() {
             assert!(compiled.is_valid(&serde_json::json!({"queries": [
                 {"pattern": "wrap($A)", "language": language, "glob": "src/**"}
             ], "cwd": "/abs"})));
         }
         for entry in [
             serde_json::json!({"pattern": "wrap($A)"}),
-            serde_json::json!({"pattern": "wrap($A)", "language": "go"}),
-            serde_json::json!({"pattern": "wrap($A)", "language": "tsx"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "make"}),
+            serde_json::json!({"pattern": "wrap($A)", "language": "Go"}),
             serde_json::json!({"pattern": "", "language": "python"}),
             serde_json::json!({"pattern": 7, "language": "python"}),
             serde_json::json!({"pattern": "wrap($A)", "language": "python", "query": "wrap"}),

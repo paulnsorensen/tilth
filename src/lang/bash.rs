@@ -22,6 +22,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::spec::default_canonical_anchor,
     attach_leading_adornment: crate::lang::spec::default_attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Bash),
         import_line,
         import_external,
         import_resolver: resolve_import,

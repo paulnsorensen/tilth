@@ -30,6 +30,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::csharp::canonical_anchor,
     attach_leading_adornment: crate::lang::csharp::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::CSharp),
         search_priority: 9,
         search_extensions: &["cs"],
         basename_extensions: &["cs"],

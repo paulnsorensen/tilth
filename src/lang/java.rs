@@ -27,6 +27,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     canonical_anchor: crate::lang::java::canonical_anchor,
     attach_leading_adornment: crate::lang::java::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
+        structural: Some(ast_grep_language::SupportLang::Java),
         import_line,
         search_priority: 9,
         search_extensions: &["java"],

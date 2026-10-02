@@ -85,6 +85,51 @@ class StructuralSearch(unittest.TestCase):
                     "matches": [self.span(source, match) + [{"A": [self.span(source, capture)]}]],
                 }])
 
+    def test_every_grammar_language_matches_end_to_end(self):
+        fixtures = [
+            ("tsx", "view.tsx", "const view = <b>{wrap(value)}</b>;\n", "wrap($A)", "wrap(value)", "value"),
+            ("javascript", "source.js", "const answer = wrap(value);\n", "wrap($A)", "wrap(value)", "value"),
+            ("go", "main.go", "package main\n\nfunc main() {\n\twrap(value)\n}\n", "wrap($A)", "wrap(value)", "value"),
+            ("java", "A.java", "class A {\n    void f() {\n        wrap(value);\n    }\n}\n", "wrap($A)", "wrap(value)", "value"),
+            ("scala", "A.scala", "object A {\n  wrap(value)\n}\n", "wrap($A)", "wrap(value)", "value"),
+            # A bare top-level C call parses as a declaration, so the pattern ends in `;`.
+            ("c", "main.c", "int main(void) {\n    wrap(value);\n}\n", "wrap($A);", "wrap(value);", "value"),
+            ("c++", "main.cpp", "int main() {\n    wrap(value);\n}\n", "wrap($A)", "wrap(value)", "value"),
+            ("ruby", "a.rb", "def run\n  wrap(value)\nend\n", "wrap($A)", "wrap(value)", "value"),
+            ("php", "a.php", "<?php\nwrap($value);\n", "wrap($A)", "wrap($value)", "$value"),
+            ("swift", "a.swift", "func run() {\n    wrap(value)\n}\n", "wrap($A)", "wrap(value)", "value"),
+            ("kotlin", "a.kt", "fun main() {\n    wrap(value)\n}\n", "wrap($A)", "wrap(value)", "value"),
+            ("c#", "A.cs", "class A {\n    void F() {\n        Wrap(value);\n    }\n}\n", "Wrap($A)", "Wrap(value)", "value"),
+            ("elixir", "a.ex", "defmodule A do\n  def run, do: wrap(value)\nend\n", "wrap($A)", "wrap(value)", "value"),
+            ("bash", "a.sh", "run() {\n  wrap value\n}\n", "wrap $A", "wrap value", "value"),
+        ]
+        for index, (language, name, source, pattern, match, capture) in enumerate(fixtures):
+            with self.subTest(language=language):
+                path = f"lang{index:02}/{name}"
+                self.write(path, source)
+                entry = {"pattern": pattern, "language": language, "glob": f"lang{index:02}/**"}
+                result = self.result([entry])["results"][0]
+                self.assertEqual(result["resolved_as"], "structural")
+                self.assertEqual(result["completeness"], "complete")
+                self.assertEqual(result["items"], [{
+                    "path": path,
+                    "matches": [self.span(source, match) + [{"A": [self.span(source, capture)]}]],
+                }])
+
+    def test_dollar_languages_keep_lowercase_variables_literal(self):
+        php = "<?php\n$this->run($x);\n$that->run($x);\n"
+        self.write("a.php", php)
+        result = self.result([{"pattern": "$this->run($A)", "language": "php"}])["results"][0]
+        self.assertEqual(result["items"], [{"path": "a.php", "matches": [
+            self.span(php, "$this->run($x)") + [{"A": [self.span(php, "$x")]}],
+        ]}])
+        bash = "echo $home\necho $other\n"
+        self.write("a.sh", bash)
+        literal = self.result([{"pattern": "echo $home", "language": "bash"}])["results"][0]
+        self.assertEqual(literal["items"], [{"path": "a.sh", "matches": [self.span(bash, "echo $home")]}])
+        meta = self.result([{"pattern": "echo $HOME", "language": "bash"}])["results"][0]
+        self.assertEqual(meta["total_matches"], 2)
+        self.assertEqual(sorted(meta["items"][0]["matches"][0][4]), ["HOME"])
     def test_multicapture_and_no_match(self):
         source = "wrap(first, second)\n"
         self.write("source.py", source)
@@ -103,9 +148,9 @@ class StructuralSearch(unittest.TestCase):
 
     def test_invalid_requests_fail_without_fallback(self):
         invalid = [
-            ({"pattern": "wrap($A)", "language": "go"}, "unsupported structural language"),
+            ({"pattern": "wrap($A)", "language": "make"}, "unsupported structural language"),
             ({"pattern": "wrap($A)"}, "language must be"),
-            ({"pattern": "wrap($A)", "language": "tsx"}, "unsupported structural language"),
+            ({"pattern": "wrap($A)", "language": "Go"}, "unsupported structural language"),
             ({"pattern": "wrap($A)", "language": "python", "query": "wrap"}, "exactly one of query, follow, or pattern"),
             ({"pattern": "wrap($A)", "language": "python", "follow": {}}, "exactly one of query, follow, or pattern"),
             ({"pattern": "wrap($A)", "language": "python", "unknown": True}, "accept only pattern, language, and glob"),
