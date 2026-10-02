@@ -457,7 +457,7 @@ class StructuralSearch(unittest.TestCase):
         results = self.result(entries, budget=400)["results"]
         self.assertEqual(len(results), 2)
         self.assertIn(results[0]["view"], ("files", "directories"))
-        self.assertIn("items", results[0])
+        self.assertTrue(results[0][results[0]["view"]])
 
     def test_mixed_batch_preserves_entry_order(self):
         self.write("source.py", "wrap(value)\n")
