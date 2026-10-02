@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use clru::CLruCache;
 
@@ -96,10 +96,88 @@ impl ParsedFile {
     }
 }
 
-/// Cached parsed entry keyed by path.
+/// One bounded resident entry. The cell is empty while one caller loads it.
 struct ParsedEntry {
     revision: FileRevision,
-    file: Arc<ParsedFile>,
+    file: Arc<OnceLock<Option<Arc<ParsedFile>>>>,
+}
+
+#[cfg(test)]
+static READ_COUNTS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+type ReadPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static READ_PAUSES: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, ReadPause>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static READ_FAILURE_PAUSES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, ReadPause>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static RESERVATION_PAUSES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, ReadPause>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static LOAD_DECISIONS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, std::sync::mpsc::Sender<()>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn read_source(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    {
+        if let Some(count) = READ_COUNTS.lock().unwrap().get_mut(path) {
+            *count += 1;
+        }
+        let pause = READ_PAUSES.lock().unwrap().remove(path);
+        if let Some((entered, resume)) = pause {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    let result = std::fs::read_to_string(path);
+    #[cfg(test)]
+    if result.is_err() {
+        let pause = READ_FAILURE_PAUSES.lock().unwrap().remove(path);
+        if let Some((entered, resume)) = pause {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    result
+}
+
+fn pause_reservation(path: &Path) {
+    #[cfg(test)]
+    {
+        let pause = RESERVATION_PAUSES.lock().unwrap().remove(path);
+        if let Some((entered, resume)) = pause {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+fn record_load_decision(path: &Path) {
+    #[cfg(test)]
+    if let Some(notify) = LOAD_DECISIONS.lock().unwrap().get(path) {
+        let _ = notify.send(());
+    }
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 /// Bounded outline and parsed-file caches. Each entry retains its source revision.
@@ -216,31 +294,41 @@ impl OutlineCache {
 
     /// Parse a code file with tree-sitter and cache the result. Returns
     /// `None` for non-code files, files larger than the 500 KB cap, or parse
-    /// failures. Returns the freshly parsed (uncached) file, not `None`, when
-    /// the file changes during parsing.
+    /// failures. Concurrent requests for one resident revision share one load.
+    /// A file changed during parsing is returned but not retained.
     #[must_use]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
-        let meta = std::fs::metadata(path).ok()?;
-        if meta.len() > MAX_PARSED_FILE_BYTES {
-            return None;
-        }
-        let revision = FileRevision::from_metadata(path, &meta)?;
-        if let Some(file) = self.lookup_parsed(path, &revision, None) {
-            return Some(file);
-        }
         let language = crate::lang::outline::outline_language(lang)?;
-        let content = std::fs::read_to_string(path).ok()?;
-        let document = crate::lang::treesitter::parse_document(content, &language)?;
-        let file = Arc::new(ParsedFile { document, lang });
-        self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
-            .or(Some(file))
+        loop {
+            let meta = std::fs::metadata(path).ok()?;
+            if meta.len() > MAX_PARSED_FILE_BYTES {
+                return None;
+            }
+            let revision = FileRevision::from_metadata(path, &meta)?;
+            let Some(load) = self.load_for_revision(path, &revision) else {
+                continue;
+            };
+            record_load_decision(path);
+            let file = load
+                .get_or_init(|| {
+                    let content = read_source(path).ok()?;
+                    let document = crate::lang::treesitter::parse_document(content, &language)?;
+                    Some(Arc::new(ParsedFile { document, lang }))
+                })
+                .clone();
+            if file.is_none() || !revision.is_current(path) {
+                self.discard_if_entry(path, &revision, &load);
+            }
+            return file;
+        }
     }
 
-    /// Return the cached snapshot for `path` when its revision matches and,
-    /// if given, its bytes equal `content`. This never reads or parses.
+    /// Return the resident snapshot for `path` when its revision matches and,
+    /// when `content` is given, its bytes equal `content`. This never reads,
+    /// parses, or waits for a load.
     fn lookup_parsed(
         &self,
         path: &Path,
@@ -255,10 +343,11 @@ impl OutlineCache {
         if entry.revision != *revision {
             return None;
         }
-        if content.is_some_and(|c| entry.file.content().as_str() != c) {
+        let file = entry.file.get()?.as_ref()?;
+        if content.is_some_and(|c| file.content().as_str() != c) {
             return None;
         }
-        Some(Arc::clone(&entry.file))
+        Some(Arc::clone(file))
     }
 
     /// Reuse a disk snapshot only when its bytes match the caller's source.
@@ -295,7 +384,7 @@ impl OutlineCache {
             return Some(file);
         }
         let file = Self::parse_supplied(path, content)?;
-        self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
+        self.publish_or_reuse_if_current(path, &revision, Arc::clone(&file))
             .or(Some(file))
     }
 
@@ -335,7 +424,7 @@ impl OutlineCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop(path)
-            .map(|entry| entry.file)
+            .and_then(|entry| entry.file.get().and_then(Option::as_ref).cloned())
     }
 
     /// Remove `path` and its canonical spelling. `canonical` comes from the
@@ -397,41 +486,89 @@ impl OutlineCache {
             document,
             lang: previous.lang,
         });
-        let _ = self.publish_or_reuse_if_current(path, revision, file);
+        let _ = self.publish_or_reuse_if_current(path, &revision, file);
     }
 
-    /// Publish a completed parse only while it still describes the file on disk.
-    ///
-    /// This final revision check happens under the cache lock. A slow parse for
-    /// an old revision cannot replace a newer snapshot that another reader has
-    /// already published. A concurrent parse of the same revision reuses the
-    /// first published immutable snapshot.
+    /// Publish parsed bytes only while they still describe the file on disk.
     fn publish_or_reuse_if_current(
         &self,
         path: &Path,
-        revision: FileRevision,
+        revision: &FileRevision,
         file: Arc<ParsedFile>,
     ) -> Option<Arc<ParsedFile>> {
+        if !revision.is_current(path) {
+            return None;
+        }
+        pause_reservation(path);
+        let load = self.load_for_revision(path, revision)?;
+        load.get_or_init(|| Some(file)).clone()
+    }
+
+    fn load_for_revision(
+        &self,
+        path: &Path,
+        revision: &FileRevision,
+    ) -> Option<Arc<OnceLock<Option<Arc<ParsedFile>>>>> {
+        let observed = {
+            let mut parsed = self
+                .parsed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match parsed.get(path) {
+                Some(entry) if entry.revision == *revision => {
+                    return Some(Arc::clone(&entry.file));
+                }
+                Some(entry) => Some(Arc::clone(&entry.file)),
+                None => None,
+            }
+        };
+        if !revision.is_current(path) {
+            return None;
+        }
+        pause_reservation(path);
         let mut parsed = self
             .parsed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !revision.is_current(path) {
-            return None;
-        }
-        if let Some(entry) = parsed.get(path) {
-            if entry.revision == revision {
+        let unchanged = match parsed.get(path) {
+            Some(entry) if entry.revision == *revision => {
                 return Some(Arc::clone(&entry.file));
             }
+            Some(entry) => observed
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, &entry.file)),
+            None => observed.is_none(),
+        };
+        if !unchanged {
+            return None;
         }
+        let load = Arc::new(OnceLock::new());
         parsed.put(
             path.to_path_buf(),
             ParsedEntry {
-                revision,
-                file: Arc::clone(&file),
+                revision: revision.clone(),
+                file: Arc::clone(&load),
             },
         );
-        Some(file)
+        Some(load)
+    }
+
+    fn discard_if_entry(
+        &self,
+        path: &Path,
+        revision: &FileRevision,
+        load: &Arc<OnceLock<Option<Arc<ParsedFile>>>>,
+    ) {
+        let mut parsed = self
+            .parsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matches = parsed
+            .get(path)
+            .is_some_and(|entry| entry.revision == *revision && Arc::ptr_eq(&entry.file, load));
+        if matches {
+            parsed.pop(path);
+        }
     }
 }
 
@@ -759,16 +896,20 @@ mod tests {
     fn freshness_parsed_cache_preserves_size_and_type_limits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large.rs");
+        let prefix = "fn exact() {}\n";
+        let exact = format!("{prefix}{}", " ".repeat(500_000 - prefix.len()));
+        std::fs::write(&path, exact).unwrap();
+        let cache = OutlineCache::new();
+        assert!(cache.get_or_parse(&path).is_some());
         std::fs::File::create(&path)
             .unwrap()
             .set_len(500_001)
             .unwrap();
-        let cache = OutlineCache::new();
         assert!(cache.get_or_parse(&path).is_none());
         let text = dir.path().join("source.txt");
         std::fs::write(&text, "fn alpha() {}").unwrap();
         assert!(cache.get_or_parse(&text).is_none());
-        assert!(cache.parsed.lock().unwrap().is_empty());
+        assert_eq!(cache.parsed.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -823,7 +964,7 @@ mod tests {
         let newer_snapshot = cache.get_or_parse(&path).unwrap();
         assert!(
             cache
-                .publish_or_reuse_if_current(&path, old_revision, old_snapshot)
+                .publish_or_reuse_if_current(&path, &old_revision, old_snapshot)
                 .is_none(),
             "a late parse for an old disk revision must not replace a newer snapshot"
         );
@@ -832,28 +973,280 @@ mod tests {
         assert_eq!(retained.content().as_str(), "fn new() {}");
     }
 
+    struct ReadWitness {
+        path: PathBuf,
+        decisions: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl ReadWitness {
+        fn new(path: &Path) -> Self {
+            assert!(READ_COUNTS
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), 0)
+                .is_none());
+            let (notify, decisions) = std::sync::mpsc::channel();
+            assert!(LOAD_DECISIONS
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), notify)
+                .is_none());
+            Self {
+                path: path.to_path_buf(),
+                decisions,
+            }
+        }
+
+        fn count(&self) -> usize {
+            READ_COUNTS.lock().unwrap()[&self.path]
+        }
+
+        fn observe_decision(&self) {
+            self.decisions
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+
+        fn pause_next(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (entered, observed) = std::sync::mpsc::channel();
+            let (resume, release) = std::sync::mpsc::channel();
+            assert!(READ_PAUSES
+                .lock()
+                .unwrap()
+                .insert(self.path.clone(), (entered, release))
+                .is_none());
+            (observed, resume)
+        }
+
+        fn pause_failure(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (entered, observed) = std::sync::mpsc::channel();
+            let (resume, release) = std::sync::mpsc::channel();
+            assert!(READ_FAILURE_PAUSES
+                .lock()
+                .unwrap()
+                .insert(self.path.clone(), (entered, release))
+                .is_none());
+            (observed, resume)
+        }
+    }
+
+    impl Drop for ReadWitness {
+        fn drop(&mut self) {
+            READ_COUNTS.lock().unwrap().remove(&self.path);
+            READ_PAUSES.lock().unwrap().remove(&self.path);
+            READ_FAILURE_PAUSES.lock().unwrap().remove(&self.path);
+            LOAD_DECISIONS.lock().unwrap().remove(&self.path);
+        }
+    }
+
+    fn pause_next_reservation(
+        path: &Path,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        assert!(RESERVATION_PAUSES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (entered, release))
+            .is_none());
+        (observed, resume)
+    }
+
     #[test]
-    fn concurrent_misses_reuse_one_published_snapshot() {
+    fn concurrent_misses_perform_one_real_read_and_parse() {
         let dir = tempfile::tempdir().unwrap();
         let path = Arc::new(dir.path().join("source.rs"));
-        std::fs::write(&*path, "fn shared() {}").unwrap();
+        let source = format!("// {}\nfn shared() {{}}\n", dir.path().display());
+        std::fs::write(&*path, &source).unwrap();
+        let reads = ReadWitness::new(&path);
+        let parses = crate::lang::treesitter::ParseWitness::new(&source);
+        let (read_entered, resume_read) = reads.pause_next();
         let cache = Arc::new(OutlineCache::new());
-        let start = Arc::new(std::sync::Barrier::new(3));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
+
+        let first = {
             let cache = Arc::clone(&cache);
             let path = Arc::clone(&path);
-            let start = Arc::clone(&start);
-            workers.push(std::thread::spawn(move || {
-                start.wait();
-                cache.get_or_parse(&path).unwrap()
-            }));
-        }
-        start.wait();
-        let first = workers.pop().unwrap().join().unwrap();
-        let second = workers.pop().unwrap().join().unwrap();
+            std::thread::spawn(move || cache.get_or_parse(&path).unwrap())
+        };
+        reads.observe_decision();
+        read_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let second = {
+            let cache = Arc::clone(&cache);
+            let path = Arc::clone(&path);
+            std::thread::spawn(move || cache.get_or_parse(&path).unwrap())
+        };
+        reads.observe_decision();
+        resume_read.send(()).unwrap();
+
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.content().as_str(), "fn shared() {}");
+        assert_eq!(first.content().as_str(), source);
+        assert_eq!(
+            (reads.count(), parses.count()),
+            (1, 1),
+            "overlapping loads must perform one read and one parse"
+        );
+    }
+
+    #[test]
+    fn failed_initializer_cannot_remove_its_replacement_and_releases_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("retry.rs"));
+        let source = format!("// {}\nfn retry() {{}}\n", dir.path().display());
+        std::fs::write(&*path, &source).unwrap();
+        let reads = ReadWitness::new(&path);
+        let parses = crate::lang::treesitter::ParseWitness::new(&source);
+        let (read_entered, resume_read) = reads.pause_next();
+        let (failure_entered, resume_failure) = reads.pause_failure();
+        let cache = Arc::new(OutlineCache::new());
+
+        let first = {
+            let cache = Arc::clone(&cache);
+            let path = Arc::clone(&path);
+            std::thread::spawn(move || cache.get_or_parse(&path))
+        };
+        reads.observe_decision();
+        read_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let second = {
+            let cache = Arc::clone(&cache);
+            let path = Arc::clone(&path);
+            std::thread::spawn(move || cache.get_or_parse(&path))
+        };
+        reads.observe_decision();
+        cache.invalidate(&path);
+        std::fs::remove_file(&*path).unwrap();
+        resume_read.send(()).unwrap();
+        failure_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        std::fs::write(&*path, &source).unwrap();
+        let replacement = cache.get_or_parse(&path).unwrap();
+        resume_failure.send(()).unwrap();
+        assert!(first.join().unwrap().is_none());
+        assert!(second.join().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &cache.get_or_parse(&path).unwrap()
+        ));
+        assert_eq!((reads.count(), parses.count()), (2, 1));
+    }
+
+    #[test]
+    fn paused_real_read_does_not_block_an_independent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("paused.rs");
+        let second_path = dir.path().join("independent.rs");
+        let first_source = format!("// {}\nfn paused() {{}}\n", dir.path().display());
+        let second_source = "fn independent() {}\n";
+        std::fs::write(&first_path, &first_source).unwrap();
+        std::fs::write(&second_path, second_source).unwrap();
+        let reads = ReadWitness::new(&first_path);
+        let first_parse = crate::lang::treesitter::ParseWitness::new(&first_source);
+        let second_parse = crate::lang::treesitter::ParseWitness::new(second_source);
+        let (entered, resume) = reads.pause_next();
+        let cache = Arc::new(OutlineCache::new());
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = first_path.clone();
+        let worker = std::thread::spawn(move || worker_cache.get_or_parse(&worker_path));
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let independent = cache.get_or_parse(&second_path).unwrap();
+        assert_eq!(independent.content().as_str(), second_source);
+        assert_eq!(second_parse.count(), 1);
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap().is_some());
+        assert_eq!((reads.count(), first_parse.count()), (1, 1));
+    }
+
+    #[test]
+    fn stale_reader_reservation_cannot_replace_a_newer_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader-race.rs");
+        let old = format!("// {}\nfn old() {{}}\n", dir.path().display());
+        let new = old.replace("old", "new");
+        std::fs::write(&path, &old).unwrap();
+        let new_parses = crate::lang::treesitter::ParseWitness::new(&new);
+        let (entered, resume) = pause_next_reservation(&path);
+        let cache = Arc::new(OutlineCache::new());
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = path.clone();
+        let stale = std::thread::spawn(move || worker_cache.get_or_parse(&worker_path));
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        crate::util::atomic_write_bytes(&path, new.as_bytes()).unwrap();
+        let newer = cache.get_or_parse(&path).unwrap();
+        resume.send(()).unwrap();
+        let raced = stale.join().unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&newer, &raced));
+        assert!(Arc::ptr_eq(&newer, &cache.get_or_parse(&path).unwrap()));
+        assert_eq!(new_parses.count(), 1);
+    }
+
+    #[test]
+    fn stale_writer_publication_cannot_replace_a_newer_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer-race.rs");
+        let old = format!("// {}\nfn old() {{}}\n", dir.path().display());
+        let new = old.replace("old", "new");
+        std::fs::write(&path, &old).unwrap();
+        let cache = Arc::new(OutlineCache::new());
+        let old_revision = FileRevision::of(&path).unwrap();
+        let old_snapshot = cache.get_or_parse(&path).unwrap();
+        let (entered, resume) = pause_next_reservation(&path);
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = path.clone();
+        let stale = std::thread::spawn(move || {
+            worker_cache.publish_or_reuse_if_current(&worker_path, &old_revision, old_snapshot)
+        });
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        crate::util::atomic_write_bytes(&path, new.as_bytes()).unwrap();
+        let newer = cache.get_or_parse(&path).unwrap();
+        resume.send(()).unwrap();
+
+        assert!(stale.join().unwrap().is_none());
+        assert!(Arc::ptr_eq(&newer, &cache.get_or_parse(&path).unwrap()));
+    }
+    #[test]
+    fn invalidation_replaces_a_loading_entry_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.rs");
+        let source = format!("// {}\nfn identity() {{}}\n", dir.path().display());
+        std::fs::write(&path, &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let (entered, resume) = witness.pause_next();
+        let cache = Arc::new(OutlineCache::new());
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || worker_cache.get_or_parse(&worker_path));
+
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        cache.invalidate(&path);
+        let replacement = cache.get_or_parse(&path).unwrap();
+        resume.send(()).unwrap();
+        let stale = worker.join().unwrap().unwrap();
+
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &cache.get_or_parse(&path).unwrap()
+        ));
+        assert_eq!(witness.count(), 2);
     }
 
     #[test]
@@ -871,6 +1264,7 @@ mod tests {
         entered
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
+        cache.invalidate(&path);
         crate::util::atomic_write_bytes(&path, b"fn after() {}\n").unwrap();
         let current = cache.get_or_parse(&path).unwrap();
         resume.send(()).unwrap();
@@ -920,12 +1314,21 @@ mod tests {
     }
 
     #[test]
-    fn documents_parsed_capacity_is_bounded_and_missing_paths_do_not_evict() {
+    fn loading_and_ready_entries_share_the_hard_capacity() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = OutlineCache::new();
+        let cache = Arc::new(OutlineCache::new());
         let first_path = dir.path().join("first.rs");
-        std::fs::write(&first_path, "fn retained() {}").unwrap();
-        let retained = cache.get_or_parse(&first_path).unwrap();
+        let source = format!("// {}\nfn retained() {{}}\n", dir.path().display());
+        std::fs::write(&first_path, &source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(&source);
+        let (entered, resume) = witness.pause_next();
+        let worker_cache = Arc::clone(&cache);
+        let worker_path = first_path.clone();
+        let loading = std::thread::spawn(move || worker_cache.get_or_parse(&worker_path));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
         for index in 0..MAX_PARSED_ENTRIES {
             let path = dir.path().join(format!("file_{index}.rs"));
             std::fs::write(&path, format!("fn entry_{index}() {{}}")).unwrap();
@@ -933,6 +1336,12 @@ mod tests {
         }
         assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
         assert!(!cache.parsed.lock().unwrap().contains(&first_path));
+        resume.send(()).unwrap();
+        let retained = loading.join().unwrap().unwrap();
+        assert_eq!(retained.outline_entries()[0].name, "retained");
+        assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
+        assert!(!cache.parsed.lock().unwrap().contains(&first_path));
+
         let neighbor = dir
             .path()
             .join(format!("file_{}.rs", MAX_PARSED_ENTRIES - 1));
@@ -943,7 +1352,6 @@ mod tests {
             &cache.get_or_parse(&neighbor).unwrap()
         ));
         assert_eq!(cache.parsed.lock().unwrap().len(), MAX_PARSED_ENTRIES);
-        assert_eq!(retained.outline_entries()[0].name, "retained");
     }
 
     #[test]

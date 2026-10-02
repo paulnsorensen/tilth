@@ -72,12 +72,24 @@ Parse reuse is verified behavior, not a measured end-to-end latency claim.
 
 _Source: Fork shared-document implementation and regression tests · Updated: 2026-10-01 · Supersedes: no historical upstream assessment_
 
-### Reuse does not guarantee one parse
+### Coordinated resident document loads
 
-The shared-document cache guarantees snapshot reuse, not one parse execution during concurrent misses.
-Parsing occurs outside the cache mutex before guarded publication.
-A concurrent-cache migration must preserve revision checks even if it coordinates missing-key loads.
+Tilth coordinates overlapping requests for one resident path and disk revision through a shared standard-library `OnceLock`.
+One initializer reads and parses the file. Waiters share its immutable result without holding the global cache mutex.
+Loading and ready entries share the existing 500-entry bound; no separate loader registry exists.[^23]
+
+Reservation compares the observed entry identity after checking disk freshness outside the mutex.
+A competing replacement makes a reader retry. Failed initialization releases waiters and permits a later retry.
+Failure cleanup removes only its own entry, never a newer replacement.[^24]
+
+Invalidation, revision changes, and eviction can start another resident load.
+The guarantee therefore does not mean one parse forever for a revision.
 Structural search uses the retained ast-grep root directly; it does not construct a second candidate-file AST.
+
+[^23]: src/cache.rs::OutlineCache::get_or_parse; src/cache.rs::tests::concurrent_misses_perform_one_real_read_and_parse; src/cache.rs::tests::loading_and_ready_entries_share_the_hard_capacity; src/cache.rs::tests::paused_real_read_does_not_block_an_independent_key
+[^24]: src/cache.rs::OutlineCache::load_for_revision; src/cache.rs::OutlineCache::discard_if_entry; src/cache.rs::tests::stale_reader_reservation_cannot_replace_a_newer_entry; src/cache.rs::tests::stale_writer_publication_cannot_replace_a_newer_entry; src/cache.rs::tests::failed_initializer_cannot_remove_its_replacement_and_releases_waiters
+
+_Source: Local coordinated-load implementation and regression tests · Updated: 2026-10-01 · Supersedes: uncoordinated concurrent misses in the preceding document layer_
 
 Compiled queries and edit history have different validity rules from current parsed documents.
 A file edit does not change a compiled language query.
