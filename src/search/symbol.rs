@@ -861,6 +861,64 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    fn definitions_of(lang: crate::types::Lang, file: &str, code: &str, query: &str) -> usize {
+        let ts_lang = crate::lang::outline::outline_language(lang).unwrap();
+        find_defs_treesitter(
+            std::path::Path::new(file),
+            query,
+            &ts_lang,
+            Some(lang),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        )
+        .iter()
+        .filter(|found| found.is_definition)
+        .count()
+    }
+
+    #[test]
+    fn php_template_definitions_survive_inline_html() {
+        use crate::types::Lang::Php;
+        let closing = concat!(
+            "<?php\nfunction before_close() {}\n?>\n",
+            "<div class=\"x\">\n  <p>It's {here} \"quoted\" text; with (parens)</p>\n</div>\n",
+            "<?php\nfunction after_html() {}\nclass Late { function m() {} }\n"
+        );
+        let leading = concat!(
+            "<!DOCTYPE html>\n<html lang=\"en\">\n",
+            "<script>var x = {a: 1}; function js() { return \"}\"; }</script>\n",
+            "<?php\nfunction first_fn2() { return 1; }\n"
+        );
+        for name in ["before_close", "after_html", "Late"] {
+            assert_eq!(
+                definitions_of(Php, "closing.php", closing, name),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(definitions_of(Php, "lead2.phtml", leading, "first_fn2"), 1);
+    }
+
+    #[test]
+    fn kotlin_property_initializer_is_not_a_definition() {
+        use crate::types::Lang::Kotlin;
+        let code = "fun size() = 1\nval target = 2\nval total = size\nval alias = target\nval (a, b) = pair\n";
+        assert_eq!(definitions_of(Kotlin, "a.kt", code, "total"), 1);
+        assert_eq!(definitions_of(Kotlin, "a.kt", code, "alias"), 1);
+        assert_eq!(
+            definitions_of(Kotlin, "a.kt", code, "size"),
+            1,
+            "only the fun"
+        );
+        assert_eq!(
+            definitions_of(Kotlin, "a.kt", code, "target"),
+            1,
+            "only the val"
+        );
+        assert_eq!(definitions_of(Kotlin, "a.kt", code, "pair"), 0);
+    }
+
     #[test]
     fn rust_definitions_detected() {
         let code = r#"pub fn hello(name: &str) -> String {

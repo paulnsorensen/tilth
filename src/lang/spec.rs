@@ -169,6 +169,12 @@ pub(crate) struct LanguagePolicy {
     pub basename_extensions: &'static [&'static str],
     pub test_filename: Option<TestFilenamePolicy>,
     pub inline_test: Option<InlineTestPolicy>,
+    /// Container node kinds whose children the outline walk treats as siblings.
+    pub outline_flatten: &'static [&'static str],
+    /// Text that precedes a structural pattern so it parses with the document
+    /// grammar (PHP code starts after `<?php`). The pattern is the first node
+    /// after the preamble; empty when the pattern parses unchanged.
+    pub pattern_preamble: &'static str,
 }
 pub(crate) fn never_import(_line: &str) -> bool {
     false
@@ -213,6 +219,8 @@ pub(crate) const DEFAULT_POLICY: LanguagePolicy = LanguagePolicy {
     basename_extensions: &[],
     test_filename: None,
     inline_test: None,
+    outline_flatten: &[],
+    pattern_preamble: "",
 };
 
 /// All per-language data and behavior in one record. Read via `spec(lang)`.

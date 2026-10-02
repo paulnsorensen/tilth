@@ -15,7 +15,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     display: "PHP",
     extensions: &["php", "phtml"],
     filenames: &[],
-    grammar: Some(tree_sitter_php::LANGUAGE_PHP_ONLY),
+    grammar: Some(tree_sitter_php::LANGUAGE_PHP),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
     stdlib: StdlibRule::None,
@@ -30,6 +30,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     attach_leading_adornment: crate::lang::php::attach_leading_adornment,
     policy: crate::lang::spec::LanguagePolicy {
         structural: Some(ast_grep_language::SupportLang::Php),
+        pattern_preamble: "<?php ",
         search_priority: 9,
         search_extensions: &["php"],
         basename_extensions: &["php"],

@@ -35,6 +35,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         search_priority: 9,
         search_extensions: &["kt"],
         basename_extensions: &["kt"],
+        // Kotlin wraps all imports in one `import_list`; outline each header.
+        outline_flatten: &["import_list"],
         ..crate::lang::spec::DEFAULT_POLICY
     },
     semantic_start: crate::lang::spec::embedded_semantic_start,
@@ -68,11 +70,22 @@ fn outline_label(kind: crate::types::OutlineKind) -> Option<&'static str> {
 }
 
 /// The kotlin-sg grammar has no `name` fields. A declaration names itself with a
-/// direct `simple_identifier` (functions) or `type_identifier` (types) child.
+/// direct `simple_identifier` (functions, bindings) or `type_identifier` (types)
+/// child that comes before any body. A `property_declaration` has no name of its
+/// own: its `variable_declaration` child defines the name, and a destructuring
+/// property defines only the destructured names.
 pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() == "property_declaration" {
+        return None;
+    }
     let mut cursor = node.walk();
-    let name = node
-        .named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))?;
-    Some(node_text_simple(name, lines, NodeTextMode::Full))
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "simple_identifier" | "type_identifier") {
+            return Some(node_text_simple(child, lines, NodeTextMode::Full));
+        }
+        if child.kind().ends_with("_body") {
+            return None;
+        }
+    }
+    None
 }

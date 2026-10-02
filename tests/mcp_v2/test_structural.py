@@ -129,7 +129,26 @@ class StructuralSearch(unittest.TestCase):
         self.assertEqual(literal["items"], [{"path": "a.sh", "matches": [self.span(bash, "echo $home")]}])
         meta = self.result([{"pattern": "echo $HOME", "language": "bash"}])["results"][0]
         self.assertEqual(meta["total_matches"], 2)
-        self.assertEqual(sorted(meta["items"][0]["matches"][0][4]), ["HOME"])
+        self.assertEqual(meta["items"], [{"path": "a.sh", "matches": [
+            self.span(bash, "echo $home") + [{"HOME": [self.span(bash, "$home")]}],
+            self.span(bash, "echo $other") + [{"HOME": [self.span(bash, "$other")]}],
+        ]}])
+
+    def test_kotlin_string_templates_stay_literal(self):
+        source = 'fun f() {\n    wrap("v=$value")\n}\n'
+        self.write("a.kt", source)
+        whole = self.result([{"pattern": "wrap($A)", "language": "kotlin"}])["results"][0]
+        self.assertEqual(whole["items"], [{"path": "a.kt", "matches": [
+            self.span(source, 'wrap("v=$value")') + [{"A": [self.span(source, '"v=$value"')]}],
+        ]}])
+        # `$A` inside a string template is text, not a metavariable.
+        inner = self.result([{"pattern": 'wrap("v=$A")', "language": "kotlin"}])["results"][0]
+        self.assertEqual(inner["status"], "no_match")
+        literal = self.result([{"pattern": 'wrap("v=$value")', "language": "kotlin"}])["results"][0]
+        self.assertEqual(literal["items"], [{"path": "a.kt", "matches": [
+            self.span(source, 'wrap("v=$value")'),
+        ]}])
+
     def test_multicapture_and_no_match(self):
         source = "wrap(first, second)\n"
         self.write("source.py", source)

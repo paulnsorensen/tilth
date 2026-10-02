@@ -99,13 +99,13 @@ fn collect_sibling_entries<'tree>(
     lang: Lang,
     depth: usize,
 ) -> Vec<OutlineEntry> {
-    let policy = crate::lang::spec::spec(lang).attach_leading_adornment;
+    let spec = crate::lang::spec::spec(lang);
+    let policy = spec.attach_leading_adornment;
     let mut entries = Vec::new();
     let mut pending = Vec::new();
 
     for child in children {
-        // Kotlin wraps all imports in one `import_list`; outline each header.
-        if child.kind() == "import_list" {
+        if spec.policy.outline_flatten.contains(&child.kind()) {
             let mut cursor = child.walk();
             entries.extend(collect_sibling_entries(
                 child.children(&mut cursor),
