@@ -312,7 +312,7 @@ impl Follow {
                     let resolved = callees::resolve_callees_cached(
                         std::slice::from_ref(&target.name),
                         &caller.path,
-                        caller.content.content(),
+                        caller.snapshot.content(),
                         bloom,
                         cache,
                     );

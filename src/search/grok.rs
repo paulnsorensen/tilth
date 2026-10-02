@@ -498,16 +498,7 @@ fn read_code_file(path: &Path, cache: &OutlineCache) -> Result<(SourceSnapshot, 
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
-    if crate::lang::outline::outline_language(lang).is_none() {
-        return Ok((SourceSnapshot::Raw(std::sync::Arc::new(content)), lang));
-    }
-    let parsed = cache
-        .parse_source(path, &content)
-        .ok_or_else(|| TilthError::InvalidQuery {
-            query: path.display().to_string(),
-            reason: "source could not be parsed".to_string(),
-        })?;
-    Ok((SourceSnapshot::Parsed(parsed), lang))
+    Ok((SourceSnapshot::Raw(std::sync::Arc::new(content)), lang))
 }
 
 /// Read the file at `path`, find the outline entry that starts at `start_line`,

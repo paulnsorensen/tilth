@@ -42,6 +42,7 @@ src/
     strip.rs           Cognitive load stripping (comments, blank lines in expanded code).
     truncate.rs        Smart truncation to fit budget constraints.
     glob.rs            File glob search.
+    structural.rs      ast-grep structural pattern search over cached trees; language mapping via `spec(lang).policy.structural`.
   index/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
   cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.

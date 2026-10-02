@@ -62,7 +62,8 @@
 
 2026-09-30 · c970238aa51b13dc · merged · upstream-library-reuse.md · Record shared immutable parsed documents, revision-checked publication, bounded retention, uncached large-file fallback, and lock-free matching. Frozen retrieval probes pass at ranks 1, 2, 1, 1.
 
-
-
 2026-10-01 · 7c99b485d4cad9af · merged · upstream-library-reuse.md · Document verified warm incremental snapshots, bounded disk checks, cold-write behavior, and path invalidation. Exact-title and two natural retrieval probes pass.
 
+2026-10-01 · f77a006673c36f96 · merged · upstream-library-reuse.md · Record that shared parsed documents guarantee snapshot reuse, not one parse execution, and that compiled queries and edit history keep separate validity rules.
+
+2026-10-01 · 92ae5213050bd1fd · merged · upstream-library-reuse.md · Record the merge onto main and the zero-copy move of the owned read String into cold parsed documents.

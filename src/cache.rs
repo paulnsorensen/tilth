@@ -75,14 +75,6 @@ impl std::fmt::Debug for ParsedFile {
     }
 }
 
-impl std::ops::Deref for ParsedFile {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.content()
-    }
-}
-
 impl ParsedFile {
     #[must_use]
     pub fn content(&self) -> &String {
@@ -241,7 +233,7 @@ impl OutlineCache {
         }
         let language = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
-        let document = crate::lang::treesitter::parse_document(&content, &language)?;
+        let document = crate::lang::treesitter::parse_document(content, &language)?;
         let file = Arc::new(ParsedFile { document, lang });
         self.publish_or_reuse_if_current(path, revision, Arc::clone(&file))
             .or(Some(file))
@@ -287,19 +279,19 @@ impl OutlineCache {
     /// `revision` under the cache lock. A change between the stat and the
     /// read, or after the read, fails that check, so no stale bytes enter
     /// the cache. Without a revision, or over the size limit, nothing is published.
-    pub(crate) fn parse_with_revision(
+    pub(crate) fn parse_with_revision<C: AsRef<str> + Into<String>>(
         &self,
         path: &Path,
-        content: &str,
+        content: C,
         revision: Option<FileRevision>,
     ) -> Option<Arc<ParsedFile>> {
         let Some(revision) = revision else {
             return Self::parse_supplied(path, content);
         };
-        if content.len() as u64 > MAX_PARSED_FILE_BYTES {
+        if content.as_ref().len() as u64 > MAX_PARSED_FILE_BYTES {
             return Self::parse_supplied(path, content);
         }
-        if let Some(file) = self.lookup_parsed(path, &revision, Some(content)) {
+        if let Some(file) = self.lookup_parsed(path, &revision, Some(content.as_ref())) {
             return Some(file);
         }
         let file = Self::parse_supplied(path, content)?;
@@ -307,7 +299,17 @@ impl OutlineCache {
             .or(Some(file))
     }
 
-    fn parse_supplied(path: &Path, content: &str) -> Option<Arc<ParsedFile>> {
+    /// Return the cached snapshot for `path` at `revision` without reading or parsing.
+    pub(crate) fn cached_parse(
+        &self,
+        path: &Path,
+        revision: &FileRevision,
+    ) -> Option<Arc<ParsedFile>> {
+        self.lookup_parsed(path, revision, None)
+    }
+
+    /// Parse supplied bytes; an owned `String` moves into the snapshot without a copy.
+    fn parse_supplied<C: Into<String>>(path: &Path, content: C) -> Option<Arc<ParsedFile>> {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
@@ -336,6 +338,20 @@ impl OutlineCache {
             .map(|entry| entry.file)
     }
 
+    /// Remove `path` and its canonical spelling. `canonical` comes from the
+    /// caller because it must be captured before a remove or move.
+    pub(crate) fn invalidate_spellings(&self, path: &Path, canonical: &Path) {
+        self.invalidate_alias(path, canonical);
+        self.invalidate(path);
+    }
+
+    /// Remove only the canonical spelling when it differs from `path`.
+    pub(crate) fn invalidate_alias(&self, path: &Path, canonical: &Path) {
+        if canonical != path {
+            self.invalidate(canonical);
+        }
+    }
+
     /// Report whether a parsed snapshot exists for this path.
     #[cfg(test)]
     pub(crate) fn has_parsed(&self, path: &Path) -> bool {
@@ -348,21 +364,28 @@ impl OutlineCache {
     /// Publish incremental bytes only after a successful write and disk verification.
     /// Cold paths stay cold. A mismatch discards this path, never unrelated entries.
     pub(crate) fn update_after_write(&self, path: &Path, before: &str, after: &str) {
-        let previous = self.invalidate(path);
-        let Some(previous) = previous.filter(|file| file.content() == before) else {
+        let Some(previous) = self
+            .invalidate(path)
+            .filter(|file| file.content() == before)
+        else {
             return;
         };
         if after.len() as u64 > MAX_PARSED_FILE_BYTES {
             return;
         }
-        let Some(revision) = FileRevision::of(path) else {
+        let Ok(meta) = std::fs::metadata(path) else {
             return;
         };
         if !std::fs::File::open(path)
             .and_then(|file| written_bytes_match(file, after.as_bytes()))
             .unwrap_or(false)
-            || !revision.is_current(path)
         {
+            return;
+        }
+        let Some(revision) = FileRevision::from_metadata_and_bytes(&meta, after.as_bytes()) else {
+            return;
+        };
+        if !revision.is_current(path) {
             return;
         }
         let Some(document) =
@@ -413,7 +436,7 @@ impl OutlineCache {
 }
 
 fn written_bytes_match(reader: impl Read, expected: &[u8]) -> std::io::Result<bool> {
-    let mut actual = Vec::new();
+    let mut actual = Vec::with_capacity(expected.len() + 1);
     reader
         .take(expected.len() as u64 + 1)
         .read_to_end(&mut actual)?;
@@ -938,6 +961,20 @@ mod tests {
         let warm = cache.get_or_parse(&path).unwrap();
         assert!(Arc::ptr_eq(&cold, &warm));
         assert_eq!(witness.count(), 1, "get_or_parse reuses the walker parse");
+    }
+
+    #[test]
+    fn parse_with_revision_moves_owned_string_into_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned.rs");
+        std::fs::write(&path, "fn owned() {}\n").unwrap();
+        let owned = std::fs::read_to_string(&path).unwrap();
+        let before = owned.as_ptr();
+        let cache = OutlineCache::new();
+        let revision = FileRevision::of(&path);
+
+        let parsed = cache.parse_with_revision(&path, owned, revision).unwrap();
+        assert_eq!(parsed.content().as_ptr(), before);
     }
 
     #[test]

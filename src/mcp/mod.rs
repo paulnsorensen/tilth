@@ -1034,8 +1034,6 @@ mod tests {
             current.content().len(),
             current.content().capacity(),
         );
-        assert_ne!(current_allocation.0, old_allocation.0);
-        assert_ne!(current_allocation.0, replacement_input_allocation.0);
         assert_eq!(current_allocation.1, replacement_input_allocation.1);
         assert!(current_allocation.2 >= current_allocation.1);
         assert_eq!(old.content().as_str(), before);

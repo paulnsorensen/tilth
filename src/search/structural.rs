@@ -2,7 +2,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::meta_var::MetaVariable;
@@ -11,13 +11,15 @@ use ast_grep_core::{Doc, Language, Node, Pattern, PatternError};
 use ast_grep_language::SupportLang;
 use serde::Serialize;
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, ParsedFile};
 use crate::error::TilthError;
 use crate::lang::treesitter::DocumentLanguage;
 use crate::types::{FileType, Lang};
+use crate::util::FileRevision;
 
-/// Byte offsets are zero-based and half-open. Lines identify both endpoints.
-#[derive(Serialize)]
+/// Byte offsets are zero-based and half-open. Lines are one-based and identify
+/// both endpoints. Wire form: `[start_line, end_line, start_byte, end_byte]`.
+#[derive(Clone, Copy)]
 struct Location {
     start_byte: usize,
     end_byte: usize,
@@ -34,18 +36,56 @@ impl Location {
             end_line: node.end_pos().line() + 1,
         }
     }
+
+    fn span(self) -> [usize; 4] {
+        [
+            self.start_line,
+            self.end_line,
+            self.start_byte,
+            self.end_byte,
+        ]
+    }
 }
 
-#[derive(Serialize)]
-pub(crate) struct StructuralItem {
-    path: String,
+impl Serialize for Location {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.span().serialize(serializer)
+    }
+}
+
+/// One match. Wire form: its span, plus a trailing captures object when any exist.
+pub(crate) struct Match {
     range: Location,
     captures: BTreeMap<String, Vec<Location>>,
 }
 
+impl Serialize for Match {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(None)?;
+        for value in self.range.span() {
+            seq.serialize_element(&value)?;
+        }
+        if !self.captures.is_empty() {
+            seq.serialize_element(&self.captures)?;
+        }
+        seq.end()
+    }
+}
+
+/// Sorted matches of one file. Wire form: `{path, matches}`.
+#[derive(Serialize)]
+pub(crate) struct FileMatches {
+    path: String,
+    matches: Vec<Match>,
+}
+
 #[derive(Default)]
 pub(crate) struct StructuralScan {
-    pub(crate) items: Vec<StructuralItem>,
+    /// Retained matches in path/byte order, grouped by file.
+    pub(crate) groups: Vec<FileMatches>,
+    /// Number of retained matches across `groups`.
+    pub(crate) retained: usize,
     pub(crate) skipped_files: usize,
     pub(crate) limited: bool,
     /// Matches per file, counted before the retention cap.
@@ -80,15 +120,12 @@ impl StructuralPatterns {
         if self.0.contains_key(&key) {
             return Ok(());
         }
-        let (language, file_language) = match language {
-            "rust" => (SupportLang::Rust, Lang::Rust),
-            "typescript" => (SupportLang::TypeScript, Lang::TypeScript),
-            "python" => (SupportLang::Python, Lang::Python),
-            _ => {
-                return Err(
-                    "unsupported structural language; use rust, typescript, or python".into(),
-                )
-            }
+        let Some((file_language, language)) = crate::lang::spec::structural_language(language)
+        else {
+            return Err(format!(
+                "unsupported structural language; use {}",
+                crate::lang::spec::structural_language_list()
+            ));
         };
         #[cfg(test)]
         COMPILATIONS.set(COMPILATIONS.get() + 1);
@@ -119,116 +156,53 @@ impl StructuralPatterns {
         let literal = compiled.pattern.fixed_string();
         super::walker(scope, glob)?.run(|| {
             Box::new(|entry| {
+                let count_skip = || scan.lock().unwrap().skipped_files += 1;
                 let Ok(entry) = entry else {
-                    scan.lock().unwrap().skipped_files += 1;
+                    count_skip();
                     return ignore::WalkState::Continue;
                 };
-                if !entry.file_type().is_some_and(|kind| kind.is_file())
-                    || crate::lang::detect_file_type(entry.path())
-                        != FileType::Code(compiled.file_language)
+                if crate::lang::detect_file_type(entry.path())
+                    != FileType::Code(compiled.file_language)
                     || super::path_is_secret_file(entry.path())
                 {
                     return ignore::WalkState::Continue;
                 }
+                let meta = match super::classify_walk_entry(&entry) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) | Err(super::WalkSkip::TooLarge) => {
+                        count_skip();
+                        return ignore::WalkState::Continue;
+                    }
+                    Err(_) => return ignore::WalkState::Continue,
+                };
                 let path = entry.path();
-                if path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(crate::lang::detection::is_minified_by_name)
-                {
-                    return ignore::WalkState::Continue;
-                }
-                let snapshot = if literal.is_empty() {
-                    let Some(snapshot) = cache.get_or_parse(path) else {
-                        scan.lock().unwrap().skipped_files += 1;
-                        return ignore::WalkState::Continue;
-                    };
-                    if snapshot.content().len() as u64
-                        >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                        && crate::lang::detection::is_minified_by_content(
-                            snapshot.content().as_bytes(),
-                        )
-                    {
+                let snapshot = match load_candidate(path, &meta, &literal, cache) {
+                    Loaded::Snapshot(snapshot) => snapshot,
+                    Loaded::Skip => return ignore::WalkState::Continue,
+                    Loaded::Unparsed => {
+                        count_skip();
                         return ignore::WalkState::Continue;
                     }
-                    Some(snapshot)
-                } else {
-                    // Probe the literal on raw bytes so non-candidates never parse or enter the cache.
-                    let Ok(meta) = std::fs::metadata(path) else {
-                        scan.lock().unwrap().skipped_files += 1;
-                        return ignore::WalkState::Continue;
-                    };
-                    let content = if meta.len() > super::MAX_SEARCH_FILE_SIZE {
-                        None
-                    } else {
-                        std::fs::read_to_string(path).ok()
-                    };
-                    let Some(content) = content else {
-                        scan.lock().unwrap().skipped_files += 1;
-                        return ignore::WalkState::Continue;
-                    };
-                    if memchr::memmem::find(content.as_bytes(), literal.as_bytes()).is_none() {
-                        return ignore::WalkState::Continue;
-                    }
-                    if content.len() as u64 >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                        && crate::lang::detection::is_minified_by_content(content.as_bytes())
-                    {
-                        return ignore::WalkState::Continue;
-                    }
-                    cache.parse_with_revision(
-                        path,
-                        &content,
-                        // `meta` predates the read, so a stale publish fails its recheck.
-                        crate::util::FileRevision::from_metadata_and_bytes(
-                            &meta,
-                            content.as_bytes(),
-                        ),
-                    )
                 };
-                let Some(snapshot) = snapshot else {
-                    scan.lock().unwrap().skipped_files += 1;
-                    return ignore::WalkState::Continue;
-                };
-                let root = snapshot.ast();
                 let rel = crate::format::rel(path, scope);
-                let mut found = Vec::new();
-                for matched in root.root().find_all(&compiled.pattern) {
-                    let environment = matched.get_env();
-                    let mut captures = BTreeMap::new();
-                    for variable in environment.get_matched_variables() {
-                        match variable {
-                            MetaVariable::Capture(name, _) => {
-                                let locations = environment
-                                    .get_match(&name)
-                                    .map(Location::of)
-                                    .into_iter()
-                                    .collect();
-                                captures.insert(name, locations);
-                            }
-                            MetaVariable::MultiCapture(name) => {
-                                let locations = environment
-                                    .get_multiple_matches(&name)
-                                    .iter()
-                                    .map(Location::of)
-                                    .collect();
-                                captures.insert(name, locations);
-                            }
-                            MetaVariable::Dropped(_) | MetaVariable::Multiple => {}
-                        }
+                // The heap bound only shrinks, so a stale snapshot never drops a needed match.
+                let bound = {
+                    let kept = kept.lock().unwrap();
+                    if kept.len() >= MAX_MATCHES {
+                        kept.peek().map(Keyed::bound)
+                    } else {
+                        None
                     }
-                    found.push(Keyed(StructuralItem {
-                        path: rel.clone(),
-                        range: Location::of(&matched),
-                        captures,
-                    }));
-                }
-                if !found.is_empty() {
-                    scan.lock().unwrap().file_counts.insert(rel, found.len());
+                };
+                let found =
+                    collect_matches(snapshot.ast(), &compiled.pattern, &rel, bound.as_ref());
+                if found.total > 0 {
+                    scan.lock().unwrap().file_counts.insert(rel, found.total);
                 }
                 // Keep the smallest MAX_MATCHES keys so the cap ignores thread timing.
                 let mut kept = kept.lock().unwrap();
-                let mut overflowed = false;
-                for item in found {
+                let mut overflowed = found.overflowed;
+                for item in found.items {
                     kept.push(item);
                     if kept.len() > MAX_MATCHES {
                         kept.pop();
@@ -243,23 +217,151 @@ impl StructuralPatterns {
             })
         });
         let mut scan = scan.into_inner().unwrap();
-        scan.items = kept
-            .into_inner()
-            .unwrap()
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Keyed(item)| item)
-            .collect();
+        for Keyed { path, hit } in kept.into_inner().unwrap().into_sorted_vec() {
+            scan.retained += 1;
+            match scan.groups.last_mut() {
+                Some(group) if group.path == path => group.matches.push(hit),
+                _ => scan.groups.push(FileMatches {
+                    path,
+                    matches: vec![hit],
+                }),
+            }
+        }
         Ok(scan)
     }
 }
 
+enum Loaded {
+    Snapshot(Arc<ParsedFile>),
+    /// A candidate that cannot match: no literal, or minified content.
+    Skip,
+    /// A file that could not be read or parsed; the scan is partial.
+    Unparsed,
+}
+
+/// Load one walk candidate. A cached revision is scanned in place. On a miss the
+/// literal and minified checks run on the raw bytes before any parse, so
+/// non-candidates never parse or enter the cache.
+fn load_candidate(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    literal: &str,
+    cache: &OutlineCache,
+) -> Loaded {
+    let skippable = |bytes: &[u8]| {
+        (!literal.is_empty() && memchr::memmem::find(bytes, literal.as_bytes()).is_none())
+            || (bytes.len() as u64 >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(bytes))
+    };
+    if let Some(snapshot) = FileRevision::from_metadata(path, meta)
+        .and_then(|revision| cache.cached_parse(path, &revision))
+    {
+        return if skippable(snapshot.content().as_bytes()) {
+            Loaded::Skip
+        } else {
+            Loaded::Snapshot(snapshot)
+        };
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Loaded::Unparsed;
+    };
+    if skippable(content.as_bytes()) {
+        return Loaded::Skip;
+    }
+    // `meta` predates the read, so a stale publish fails its recheck.
+    let revision = FileRevision::from_metadata_and_bytes(meta, content.as_bytes());
+    cache
+        .parse_with_revision(path, content, revision)
+        .map_or(Loaded::Unparsed, Loaded::Snapshot)
+}
+
+struct Collected {
+    /// Every match in the file, retained or not.
+    total: usize,
+    /// A match was dropped because the heap was already full below it.
+    overflowed: bool,
+    items: Vec<Keyed>,
+}
+
+/// Match `pattern` in one document. Once `bound` (the full heap's largest key)
+/// is known, keys at or above it are counted without building an item.
+fn collect_matches(
+    root: &crate::lang::treesitter::ParsedDocument,
+    pattern: &Pattern,
+    rel: &str,
+    bound: Option<&(String, usize, usize)>,
+) -> Collected {
+    let mut found = Collected {
+        total: 0,
+        overflowed: false,
+        items: Vec::new(),
+    };
+    #[cfg(test)]
+    {
+        let src = &root.root().get_doc().src;
+        crate::lang::treesitter::record_scanned_document(src, src.as_ptr() as usize);
+    }
+    for matched in root.root().find_all(pattern) {
+        found.total += 1;
+        let range = Location::of(&matched);
+        if bound.is_some_and(|(path, start, end)| {
+            (rel, range.start_byte, range.end_byte) >= (path.as_str(), *start, *end)
+        }) {
+            found.overflowed = true;
+            continue;
+        }
+        let environment = matched.get_env();
+        let mut captures = BTreeMap::new();
+        for variable in environment.get_matched_variables() {
+            match variable {
+                MetaVariable::Capture(name, _) => {
+                    let locations = environment
+                        .get_match(&name)
+                        .map(Location::of)
+                        .into_iter()
+                        .collect();
+                    captures.insert(name, locations);
+                }
+                MetaVariable::MultiCapture(name) => {
+                    let locations = environment
+                        .get_multiple_matches(&name)
+                        .iter()
+                        .map(Location::of)
+                        .collect();
+                    captures.insert(name, locations);
+                }
+                MetaVariable::Dropped(_) | MetaVariable::Multiple => {}
+            }
+        }
+        found.items.push(Keyed {
+            path: rel.to_string(),
+            hit: Match { range, captures },
+        });
+    }
+    found
+}
+
 /// Orders items by path then byte range for the bounded max-heap.
-struct Keyed(StructuralItem);
+struct Keyed {
+    path: String,
+    hit: Match,
+}
 
 impl Keyed {
     fn order(&self) -> (&str, usize, usize) {
-        (&self.0.path, self.0.range.start_byte, self.0.range.end_byte)
+        (
+            &self.path,
+            self.hit.range.start_byte,
+            self.hit.range.end_byte,
+        )
+    }
+
+    fn bound(&self) -> (String, usize, usize) {
+        (
+            self.path.clone(),
+            self.hit.range.start_byte,
+            self.hit.range.end_byte,
+        )
     }
 }
 
@@ -343,12 +445,6 @@ mod tests {
         std::fs::write(&path, "wrap(value)\n").unwrap();
         let cache = OutlineCache::new();
         let snapshot = cache.get_or_parse(&path).unwrap();
-        let document = snapshot.ast().root().get_doc();
-        assert_eq!(
-            document.tree.root_node().id(),
-            snapshot.tree().root_node().id()
-        );
-        assert_eq!(document.src.as_ptr(), snapshot.content().as_ptr());
         let pattern = Pattern::try_new("wrap($A)", PatternLanguage(SupportLang::Python)).unwrap();
         let matched = snapshot.ast().root().find(&pattern).unwrap();
         assert!(matches!(matched.text(), Cow::Borrowed("wrap(value)")));
@@ -375,16 +471,74 @@ mod tests {
             let result = scan(directory.path(), "wrap($A)");
             assert!(result.limited);
             assert_eq!(result.skipped_files, 0);
+            assert_eq!(result.retained, MAX_MATCHES);
+            assert_eq!(result.file_counts.values().sum::<usize>(), 1200);
+            assert_eq!(result.file_counts.len(), 3);
             let keys: Vec<_> = result
-                .items
+                .groups
                 .iter()
-                .map(|item| (item.path.as_str(), item.range.start_byte))
+                .flat_map(|group| {
+                    group
+                        .matches
+                        .iter()
+                        .map(|hit| (group.path.as_str(), hit.range.start_byte))
+                })
                 .collect();
             let expected: Vec<_> = [("a.py", 400), ("b.py", 400), ("c.py", 200)]
                 .into_iter()
                 .flat_map(|(name, count)| (0..count).map(move |index| (name, index * line.len())))
                 .collect();
             assert_eq!(keys, expected);
+            assert_eq!(result.groups.len(), 3);
+        }
+    }
+
+    #[test]
+    fn groups_serialize_to_the_compact_wire_form() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("w.py"), "wrap(value)\nwrap(1)\n").unwrap();
+        let result = scan(directory.path(), "wrap($A)");
+        assert_eq!(
+            serde_json::to_value(&result.groups).unwrap(),
+            serde_json::json!([{"path": "w.py", "matches": [
+                [1, 1, 0, 11, {"A": [[1, 1, 5, 10]]}],
+                [2, 2, 12, 19, {"A": [[2, 2, 17, 18]]}]
+            ]}])
+        );
+        let bare = scan(directory.path(), "wrap(value)");
+        assert_eq!(
+            serde_json::to_value(&bare.groups).unwrap(),
+            serde_json::json!([{"path": "w.py", "matches": [[1, 1, 0, 11]]}])
+        );
+    }
+
+    #[test]
+    fn structural_languages_come_from_the_lang_spec() {
+        assert_eq!(
+            crate::lang::spec::structural_language_names(),
+            ["rust", "typescript", "python"]
+        );
+        assert_eq!(
+            crate::lang::spec::structural_language_list(),
+            "rust, typescript, or python"
+        );
+        assert!(crate::lang::spec::structural_language("tsx").is_none());
+        let mut patterns = StructuralPatterns::default();
+        let error = patterns.prepare("go", "wrap($A)").unwrap_err();
+        assert_eq!(
+            error,
+            "unsupported structural language; use rust, typescript, or python"
+        );
+    }
+
+    #[test]
+    fn pattern_and_document_grammars_agree_for_every_structural_language() {
+        use ast_grep_core::tree_sitter::LanguageExt;
+        for name in crate::lang::spec::structural_language_names() {
+            let (lang, support) = crate::lang::spec::structural_language(&name).unwrap();
+            let document =
+                tree_sitter::Language::new(crate::lang::spec::spec(lang).grammar.unwrap());
+            assert_eq!(support.get_ts_language(), document, "{name}");
         }
     }
 
@@ -398,8 +552,8 @@ mod tests {
         std::fs::write(directory.path().join("hit.py"), hit).unwrap();
         std::fs::write(directory.path().join("miss.py"), miss).unwrap();
         let result = scan(directory.path(), "prefilter_literal_unique($A)");
-        assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].path, "hit.py");
+        assert_eq!(result.retained, 1);
+        assert_eq!(result.groups[0].path, "hit.py");
         assert_eq!(result.skipped_files, 0);
         assert!(!result.limited);
         assert_eq!(hit_witness.count(), 1);
@@ -413,24 +567,71 @@ mod tests {
         assert!(crate::lang::detection::is_minified_by_name("bundle.min.ts"));
         std::fs::write(by_name, "wrap(value);\n").unwrap();
         let padding = " ".repeat(crate::lang::detection::MINIFIED_CHECK_THRESHOLD as usize);
-        std::fs::write(
-            directory.path().join("dense.ts"),
-            format!("wrap(value);{padding}"),
-        )
-        .unwrap();
+        let dense = format!("wrap(value);{padding}");
+        std::fs::write(directory.path().join("dense.ts"), &dense).unwrap();
+        // The second pattern has no fixed literal, so it takes the no-literal branch.
+        for pattern in ["wrap($A)", "$F($A)"] {
+            let witness = crate::lang::treesitter::ParseWitness::new(&dense);
+            let mut patterns = StructuralPatterns::default();
+            patterns.prepare("typescript", pattern).unwrap();
+            let result = patterns
+                .search(
+                    "typescript",
+                    pattern,
+                    directory.path(),
+                    None,
+                    &OutlineCache::new(),
+                )
+                .unwrap();
+            assert_eq!(result.retained, 0, "{pattern}");
+            assert_eq!(result.skipped_files, 0, "{pattern}");
+            assert!(!result.limited);
+            assert_eq!(
+                witness.count(),
+                0,
+                "{pattern}: minified content must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_files_mark_the_scan_partial_with_and_without_a_literal() {
+        let directory = tempfile::tempdir().unwrap();
+        let large = format!(
+            "{}wrap(value)\n",
+            "# large\n".repeat(super::super::MAX_SEARCH_FILE_SIZE as usize / 8 + 1)
+        );
+        std::fs::write(directory.path().join("large.py"), large).unwrap();
+        for pattern in ["wrap($A)", "$F($A)"] {
+            let result = scan(directory.path(), pattern);
+            assert_eq!(result.skipped_files, 1, "{pattern}");
+            assert_eq!(result.retained, 0, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn a_cached_revision_is_scanned_without_reading_or_reparsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "cached_probe_unique(value)\n";
+        std::fs::write(directory.path().join("c.py"), source).unwrap();
+        let witness = crate::lang::treesitter::ParseWitness::new(source);
         let mut patterns = StructuralPatterns::default();
-        patterns.prepare("typescript", "wrap($A)").unwrap();
-        let result = patterns
-            .search(
-                "typescript",
-                "wrap($A)",
-                directory.path(),
-                None,
-                &OutlineCache::new(),
-            )
+        patterns
+            .prepare("python", "cached_probe_unique($A)")
             .unwrap();
-        assert!(result.items.is_empty());
-        assert_eq!(result.skipped_files, 0);
-        assert!(!result.limited);
+        let cache = OutlineCache::new();
+        for _ in 0..2 {
+            let result = patterns
+                .search(
+                    "python",
+                    "cached_probe_unique($A)",
+                    directory.path(),
+                    None,
+                    &cache,
+                )
+                .unwrap();
+            assert_eq!(result.retained, 1);
+        }
+        assert_eq!(witness.count(), 1);
     }
 }

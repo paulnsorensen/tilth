@@ -41,21 +41,27 @@ pub(crate) fn parse_source(
     content: &str,
     language: &tree_sitter::Language,
 ) -> Option<tree_sitter::Tree> {
-    parse_with_tree(content, language, None)
+    record_parse(content, false);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(content, None);
+    pause_parse(content);
+    tree
 }
 
 /// Create the ast-grep document that owns one immutable parsed snapshot.
+/// An owned `String` moves into the document without a copy.
 pub(crate) fn parse_document(
-    content: &str,
+    content: impl Into<String>,
     language: &tree_sitter::Language,
 ) -> Option<ParsedDocument> {
-    record_parse(content, false);
-    let document = StrDoc::try_new(content, DocumentLanguage(language.clone())).ok();
-    pause_parse(content);
-    let document = document?;
-    #[cfg(test)]
-    record_candidate_root(content);
-    Some(AstGrep::doc(document))
+    let src = content.into();
+    let tree = parse_source(&src, language)?;
+    Some(AstGrep::doc(StrDoc {
+        src,
+        lang: DocumentLanguage(language.clone()),
+        tree,
+    }))
 }
 
 /// Clone one immutable snapshot and delegate its edit and reparse to ast-grep.
@@ -64,9 +70,7 @@ pub(crate) fn document_after_edit(
     after: &str,
     document: &ParsedDocument,
 ) -> Option<ParsedDocument> {
-    if document.root().get_doc().src != before {
-        return None;
-    }
+    debug_assert_eq!(document.root().get_doc().src, before);
     let mut start = before
         .bytes()
         .zip(after.bytes())
@@ -128,25 +132,19 @@ fn pause_parse(content: &str) {
     let _ = content;
 }
 
-fn parse_with_tree(
-    content: &str,
-    language: &tree_sitter::Language,
-    old_tree: Option<&tree_sitter::Tree>,
-) -> Option<tree_sitter::Tree> {
-    record_parse(content, old_tree.is_some());
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(language).ok()?;
-    let tree = parser.parse(content, old_tree);
-    pause_parse(content);
-    tree
-}
-
 #[cfg(test)]
 #[derive(Default)]
 struct ParseCounts {
     full: usize,
     incremental: usize,
-    candidate_roots: usize,
+    scanned: Vec<usize>,
+}
+
+#[cfg(test)]
+pub(crate) fn record_scanned_document(content: &str, ptr: usize) {
+    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
+        counts.scanned.push(ptr);
+    }
 }
 
 #[cfg(test)]
@@ -158,13 +156,6 @@ type ParsePause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 #[cfg(test)]
 static PARSE_PAUSES: LazyLock<Mutex<HashMap<String, ParsePause>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-pub(crate) fn record_candidate_root(content: &str) {
-    if let Some(counts) = PARSE_COUNTS.lock().unwrap().get_mut(content) {
-        counts.candidate_roots += 1;
-    }
-}
 
 /// Counts real parses of unique fixture bytes, including parallel walker threads.
 #[cfg(test)]
@@ -189,8 +180,8 @@ impl ParseWitness {
         PARSE_COUNTS.lock().unwrap()[&self.0].incremental
     }
 
-    pub(crate) fn candidate_root_count(&self) -> usize {
-        PARSE_COUNTS.lock().unwrap()[&self.0].candidate_roots
+    pub(crate) fn scanned_pointers(&self) -> Vec<usize> {
+        PARSE_COUNTS.lock().unwrap()[&self.0].scanned.clone()
     }
 
     pub(crate) fn pause_next(
@@ -779,6 +770,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_document_moves_owned_string_without_copy() {
+        let language = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let source = String::from("fn moved() {}\n");
+        let before = source.as_ptr();
+        let document = parse_document(source, &language).unwrap();
+        assert_eq!(document.root().get_doc().src.as_ptr(), before);
+    }
+
+    #[test]
     fn incremental_reparse_delegates_to_ast_grep_document() {
         let implementation = include_str!("treesitter.rs");
         let local_input_edit = ["tree_sitter::Input", "Edit"].concat();
@@ -1052,5 +1052,69 @@ mod tests {
         let lines: Vec<&str> = src.lines().collect();
         let node = find_by_kind(tree.root_node(), "impl_item");
         assert_eq!(extract_definition_name(node, &lines), None);
+    }
+
+    fn rust_language() -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+
+    fn assert_same_tree(actual: tree_sitter::Node<'_>, expected: tree_sitter::Node<'_>) {
+        assert_eq!(actual.kind(), expected.kind());
+        assert_eq!(actual.range(), expected.range());
+        assert_eq!(actual.has_error(), expected.has_error());
+        assert_eq!(actual.child_count(), expected.child_count());
+        let (mut a, mut e) = (actual.walk(), expected.walk());
+        for (a, e) in actual.children(&mut a).zip(expected.children(&mut e)) {
+            assert_same_tree(a, e);
+        }
+    }
+
+    fn document(source: &str) -> ParsedDocument {
+        parse_document(source, &rust_language()).unwrap()
+    }
+
+    fn tree(document: &ParsedDocument) -> &tree_sitter::Tree {
+        &document.root().get_doc().tree
+    }
+
+    #[test]
+    fn incremental_reparse_reuses_unchanged_sibling_nodes() {
+        let before = "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }\n";
+        let after = "fn a() { 1 }\nfn b() { 22 + 2 }\nfn c() { 3 }\n";
+        let old = document(before);
+        let new = document_after_edit(before, after, &old).unwrap();
+        let (old_root, new_root) = (tree(&old).root_node(), tree(&new).root_node());
+        assert_eq!(
+            old_root.named_child(0).unwrap().id(),
+            new_root.named_child(0).unwrap().id()
+        );
+        assert_eq!(
+            old_root.named_child(2).unwrap().id(),
+            new_root.named_child(2).unwrap().id()
+        );
+        assert_ne!(
+            old_root.named_child(1).unwrap().id(),
+            new_root.named_child(1).unwrap().id()
+        );
+    }
+
+    #[test]
+    fn incremental_reparse_matches_fresh_when_multibyte_chars_share_continuation_byte() {
+        for (before, after) in [
+            (
+                "fn main() { Some(\"\u{e9}\"); }",
+                "fn main() { Some(\"\u{a9}\"); }",
+            ),
+            (
+                "fn main() { Some(\"\u{a9}\"); }",
+                "fn main() { Some(\"\u{e9}\"); }",
+            ),
+            ("let s = \"cafe\";", "let s = \"caf\u{e9}\";"),
+        ] {
+            let incremental = document_after_edit(before, after, &document(before)).unwrap();
+            assert_eq!(incremental.root().get_doc().src, after);
+            let fresh = document(after);
+            assert_same_tree(tree(&incremental).root_node(), tree(&fresh).root_node());
+        }
     }
 }
