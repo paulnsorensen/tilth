@@ -39,14 +39,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         search_priority: 9,
         search_extensions: &["rs"],
         basename_extensions: &["rs"],
-        inline_test: Some(crate::lang::spec::InlineTestPolicy {
-            order: 3,
-            label: "in-source #[cfg(test)]",
-            extension: "rs",
-            marker: "#[cfg(test)]",
-            max_files: 5,
-            extension_ignore_ascii_case: true,
-        }),
         ..crate::lang::spec::DEFAULT_POLICY
     },
     semantic_start: crate::lang::spec::default_semantic_start,

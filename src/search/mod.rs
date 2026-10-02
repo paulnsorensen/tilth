@@ -123,18 +123,12 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// `add_custom_ignore_filename`. Gitignore syntax (supports `!` re-include).
 /// The `ignore` crate builds the custom-ignore matcher independently of the
 /// git layers (which stay disabled), so this is the one ignore mechanism tilth
-/// honors — a repo can hard-deny secret or noisy files from search/list/map
+/// honors — a repo can hard-deny secret or noisy files from search
 /// even though `.gitignore` is intentionally not consulted.
 pub(crate) const TILTHIGNORE_FILE: &str = ".tilthignore";
 /// Shared walker policy: searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files
-/// are found. Used by both the parallel search walker (`walker()`) and the
-/// sequential map walker (`crate::map::generate`), which each apply their own
-/// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
-pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    walk_builder(scope, None)
-}
-
+/// are found. Callers apply their own final `.threads()` and `.build_parallel()`.
 fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder
@@ -383,7 +377,6 @@ pub fn search_symbol(
         None,
         &bloom,
         0,
-        false,
         format::EmptyHint::Symbol,
         glob,
         None,
@@ -400,7 +393,6 @@ pub fn search_symbol_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
-    edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = symbol::search_cached(query, scope, context, glob, full, cache)?;
@@ -410,7 +402,6 @@ pub fn search_symbol_expanded(
         Some(session),
         bloom,
         expand,
-        edit_mode,
         format::EmptyHint::Symbol,
         glob,
         budget,
@@ -427,7 +418,6 @@ pub fn search_multi_symbol_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
-    edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
@@ -474,7 +464,6 @@ pub fn search_multi_symbol_expanded(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
-            edit_mode,
             &mut segments,
         );
         if result.total_found > result.matches.len() {
@@ -526,7 +515,7 @@ pub fn search_content(
     } else {
         format::EmptyHint::Content
     };
-    let body = format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)?;
+    let body = format_search_result(&result, cache, None, &bloom, 0, kind, glob, None)?;
     Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
@@ -543,7 +532,7 @@ pub fn search_regex(
     } else {
         format::EmptyHint::Regex
     };
-    let body = format_search_result(&result, cache, None, &bloom, 0, false, kind, glob, None)?;
+    let body = format_search_result(&result, cache, None, &bloom, 0, kind, glob, None)?;
     Ok(with_regex_fallback_note(body, fallback_reason))
 }
 
@@ -556,7 +545,6 @@ pub fn search_content_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
-    edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
@@ -573,7 +561,6 @@ pub fn search_content_expanded(
         Some(session),
         &bloom,
         expand,
-        edit_mode,
         kind,
         glob,
         budget,
@@ -591,7 +578,6 @@ pub fn search_regex_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
-    edit_mode: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (result, fallback_reason) = content::search(pattern, scope, true, context, glob, full)?;
@@ -607,7 +593,6 @@ pub fn search_regex_expanded(
         Some(session),
         &bloom,
         expand,
-        edit_mode,
         kind,
         glob,
         budget,
@@ -664,7 +649,6 @@ pub fn format_raw_result(
         None,
         &bloom,
         0,
-        false,
         format::EmptyHint::Merged,
         None,
         None,
@@ -710,7 +694,6 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
-    edit_mode: bool,
     segments: &mut Vec<(i64, usize, usize)>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
@@ -737,7 +720,6 @@ fn format_matches(
                 expanded_files,
                 multi_file,
                 out,
-                edit_mode,
             );
             segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
@@ -899,7 +881,6 @@ fn format_single_match(
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
-    edit_mode: bool,
 ) {
     let kind = if m.impl_target.is_some() {
         "impl"
@@ -1041,7 +1022,7 @@ fn format_single_match(
         } else {
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
-                if let Some((code, content)) = expand_match(m, scope, edit_mode) {
+                if let Some((code, content)) = expand_match(m, scope) {
                     if m.is_definition && m.def_range.is_some() {
                         if let (Some(s), Some(revision)) = (session, &current_revision) {
                             s.record_expand(&m.path, m.line, revision.clone());
@@ -1405,7 +1386,6 @@ fn format_search_result(
     session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
-    edit_mode: bool,
     kind: format::EmptyHint,
     glob: Option<&str>,
     budget: Option<u64>,
@@ -1468,7 +1448,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
                 &mut segments,
             );
             write_hidden_tail(
@@ -1494,7 +1473,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
                 &mut segments,
             );
             write_hidden_tail(
@@ -1539,7 +1517,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
                 &mut segments,
             );
             write_hidden_tail(
@@ -1565,7 +1542,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
                 &mut segments,
             );
             write_hidden_tail(
@@ -1586,7 +1562,6 @@ fn format_search_result(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
-            edit_mode,
             &mut segments,
         );
 
@@ -1623,7 +1598,7 @@ fn format_search_result(
 ///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, String)> {
+fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
@@ -1681,11 +1656,7 @@ fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, Str
                 continue;
             }
 
-            if edit_mode {
-                let _ = write!(out, "\n{i}:{line}");
-            } else {
-                let _ = write!(out, "\n{i:>4} | {line}");
-            }
+            let _ = write!(out, "\n{i:>4} | {line}");
             prev_blank = is_blank;
         }
     }
@@ -1708,27 +1679,10 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
             continue;
         }
 
-        // Extract the line number from a formatted content line. Two gutter
-        // formats exist: the default `"  42 | content"` (number before the `|`
-        // gutter) and edit-mode numbered lines `"42:content"` (number is the
-        // `line:` prefix). Parse both so noise stripping/truncation works in
-        // edit mode too.
-        let prefix_num = || {
-            segment
-                .split_once(':')
-                .and_then(|(n, _)| n.trim().parse::<u32>().ok())
-        };
-        let line_num = match segment.find('|') {
-            // Gutter format `"  42 | content"`. The `|` may also appear inside
-            // edit-mode content (a box-drawing char in a string), so when the
-            // pre-gutter text isn't a number, fall back to the `N:` prefix.
-            Some(pos) => segment[..pos]
-                .trim()
-                .parse::<u32>()
-                .ok()
-                .or_else(prefix_num),
-            None => prefix_num(),
-        };
+        // Extract the line number from the `"  42 | content"` gutter.
+        let line_num = segment
+            .split_once('|')
+            .and_then(|(n, _)| n.trim().parse::<u32>().ok());
 
         if let Some(num) = line_num {
             if skip_lines.contains(&num) {
@@ -2095,7 +2049,7 @@ mod tests {
     // ── filter_code_lines unit tests ──
 
     #[test]
-    fn filter_code_lines_strips_in_both_gutter_formats() {
+    fn filter_code_lines_strips_gutter_lines() {
         let mut skip = HashSet::new();
         skip.insert(2u32);
 
@@ -2108,66 +2062,6 @@ mod tests {
             "line 2 should be stripped: {filtered}"
         );
         assert!(filtered.contains("| c"), "{filtered}");
-
-        // Edit-mode whole-file-tag format: "N:content" (no per-line hash).
-        // Regression for the bug where filter_code_lines only recognized the |
-        // gutter, so stripping silently no-opped in edit mode.
-        let edit = "```src/x.rs:1-3\n1:a\n2:b\n3:c\n```";
-        let filtered = filter_code_lines(edit, &skip);
-        assert!(filtered.contains("1:a"), "{filtered}");
-        assert!(
-            !filtered.contains("2:b"),
-            "edit-mode line 2 should be stripped: {filtered}"
-        );
-        assert!(filtered.contains("3:c"), "{filtered}");
-    }
-
-    /// Boundary: the `N:content` parser splits on the FIRST colon, so a content
-    /// line that itself contains a colon (or starts with a digit + colon) must
-    /// have its number resolved from the line-number prefix, never from a colon
-    /// inside the content. Locks the `split_once(':')` choice against a
-    /// last-colon / inner-colon regression.
-    #[test]
-    fn filter_code_lines_uses_prefix_colon_not_content_colon() {
-        let mut skip = HashSet::new();
-        skip.insert(3u32);
-
-        // Line 3 is the strip target and its content contains a colon.
-        // Line 10's content is `3: decoy` — if the parser mistook the inner
-        // `3:` for the line number, it would wrongly strip line 10.
-        let edit = "```src/x.rs:3-10\n3:let m: i32 = 0;\n10:3: decoy\n```";
-        let filtered = filter_code_lines(edit, &skip);
-        assert!(
-            !filtered.contains("3:let m: i32 = 0;"),
-            "line 3 (colon in content) should be stripped by its prefix number: {filtered}"
-        );
-        assert!(
-            filtered.contains("10:3: decoy"),
-            "line 10 must be kept — inner `3:` is content, not the line number: {filtered}"
-        );
-    }
-
-    /// Boundary: in edit mode the content itself may contain a `|` — the same
-    /// char as the gutter separator. The gutter branch keys on `find('|')`, so it
-    /// fires on the content `|` and tries to parse the whole `N:...` prefix as
-    /// a number, which fails. The parser must fall back to the `N:` prefix so a
-    /// skip-listed edit-mode line is still stripped. Locks the gutter->prefix fallback.
-    #[test]
-    fn filter_code_lines_edit_mode_content_bar_falls_back_to_prefix() {
-        let mut skip = HashSet::new();
-        skip.insert(42u32);
-
-        // Line 42's content contains a `|`; line 43 is a plain kept line.
-        let edit = "```src/x.rs:42-43\n42:let g = \"|\";\n43:let h = 1;\n```";
-        let filtered = filter_code_lines(edit, &skip);
-        assert!(
-            !filtered.contains("42:let g"),
-            "line 42 (| in content) should be stripped via prefix fallback: {filtered}"
-        );
-        assert!(
-            filtered.contains("43:let h = 1;"),
-            "line 43 must be kept: {filtered}"
-        );
     }
 
     // ── walker unit tests ──
@@ -2572,7 +2466,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             None,
         )
         .expect("search failed");
@@ -2614,7 +2507,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             None,
         )
         .expect("search failed");
@@ -2648,7 +2540,6 @@ mod tests {
             2,
             None,
             None,
-            false,
             false,
             None,
         )
@@ -3207,7 +3098,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         assert!(
@@ -3260,7 +3150,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         let needle = "pub fn exit_code(&self) -> i32 {";
@@ -3383,7 +3272,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         assert!(
@@ -3443,7 +3331,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         // Cap is 40 lines; expect 60 - 40 = 20 truncated.
@@ -3518,7 +3405,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         // Body lines beyond the cap must still be trimmed.
@@ -3690,7 +3576,6 @@ mod tests {
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
-            false,
             &mut segments,
         );
 
@@ -3768,7 +3653,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         let (baseline, saved) = session.savings();
@@ -3827,7 +3711,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         let (baseline, saved) = session.savings();
@@ -3882,7 +3765,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             Some(400),
         )
         .unwrap();
@@ -3936,7 +3818,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             None,
         )
         .unwrap();
@@ -3951,7 +3832,6 @@ mod tests {
             2,
             None,
             None,
-            false,
             false,
             Some(crate::budget::DEFAULT_BUDGET),
         )
@@ -3978,7 +3858,6 @@ mod tests {
             2,
             None,
             None,
-            false,
             false,
             None,
         )
@@ -4015,7 +3894,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             None,
         )
         .unwrap();
@@ -4044,7 +3922,6 @@ mod tests {
             2,
             None,
             None,
-            false,
             false,
             None,
         )
@@ -4077,7 +3954,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             None,
         )
         .unwrap();
@@ -4104,7 +3980,6 @@ mod tests {
             2,
             None,
             None,
-            false,
             false,
             None,
         )

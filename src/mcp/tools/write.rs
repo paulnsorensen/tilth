@@ -298,7 +298,7 @@ fn resolve_edit(
                 // A section read carries the whole-file tag, so the cheap route
                 // has to be part of the rejection.
                 return Err(TilthError::EditRejected(
-                    "replace_text requires a tag from an edit-mode read; a section read \
+                    "replace_text requires a tag from a tilth_read; a section read \
                      (path#12-40) carries the whole-file tag without reading the file in \
                      full, but `old` must occur in the lines it displayed. Files over the \
                      tag cap mint no tag — use line ops there."
@@ -917,7 +917,6 @@ mod tests {
             &json!({"paths": [path.to_str().unwrap()], "mode": "full", "cwd": path.parent().unwrap().to_str().unwrap()}),
             &cache,
             session,
-            true,
         )
         .expect("edit-mode read");
         let marker = format!("{}#", path.display());
@@ -1136,7 +1135,6 @@ mod tests {
             &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("symbol read");
         let tag = format!("{:04X}", compute_file_hash(content));
@@ -1478,7 +1476,6 @@ mod tests {
             &json!({"paths": [format!("{}#1-2", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
@@ -1538,7 +1535,6 @@ mod tests {
             &json!({"paths": [format!("{}#1-2", p.display())], "cwd": link.to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
         let tag = format!("{:04X}", compute_file_hash("a\nb\nc\nd\n"));
@@ -1752,7 +1748,7 @@ mod tests {
             // when a section read would have supplied the same whole-file tag.
             TilthError::EditRejected(message) => {
                 assert!(
-                    message.starts_with("replace_text requires a tag from an edit-mode read"),
+                    message.starts_with("replace_text requires a tag from a tilth_read"),
                     "unexpected rejection: {message}"
                 );
                 assert!(
@@ -2224,7 +2220,6 @@ mod tests {
             &json!({"paths": [format!("{}#outer", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("symbol read");
         assert!(
@@ -2287,14 +2282,12 @@ mod tests {
             &json!({"paths": [p.to_str().unwrap()], "mode": "signature", "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("signature read");
         crate::mcp::tools::tool_read(
             &json!({"paths": [format!("{}#1-1", p.display())], "cwd": p.parent().unwrap().to_str().unwrap()}),
             &cache,
             &session,
-            true,
         )
         .expect("range read");
 

@@ -172,20 +172,6 @@ In MCP mode, use the `tilth_deps` tool.
 
 In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.
 
-## Structural diff
-
-```bash
-$ tilth diff HEAD~1
-# Diff: HEAD~1 — 3 files, 2 modified, 1 added (~350 tokens)
-
-## src/auth.rs (3 symbols)
-  [~:sig]  fn handleAuth(req) → (req, ctx)    L42
-  [~]      fn validate_session                 L88
-  [+]      fn refresh_token                    L120
-```
-
-Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. This optional CLI view remains available. MCP clients use shell `git diff` and `git log`; the `tilth_diff` MCP tool is retired.
-
 ## Benchmarks
 
 Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
@@ -246,11 +232,7 @@ tilth install crush            # ~/.config/crush/crush.json
 tilth install pi               # ~/.pi/agent/mcp.json
 ```
 
-Add `--edit` to enable tag-anchored file editing (see [Edit mode](#edit-mode)):
-
-```bash
-tilth install claude-code --edit
-```
+Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). The old `--edit` flag is still accepted and does nothing.
 
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
@@ -315,7 +297,7 @@ Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-li
 
 ## Edit mode
 
-Install with `--edit` to add `tilth_write` and switch `tilth_read` to whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
+The MCP server always registers `tilth_write`, and `tilth_read` prints whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
 
 ```
 [src/auth.ts#1A2B]
@@ -350,11 +332,9 @@ tilth <path> --deps               # imports + dependents
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
-tilth diff HEAD~1                 # structural diff (function-level)
-tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
-`--map` is available in the CLI but not exposed as an MCP tool — benchmarks showed AI agents overused it, hurting accuracy.
+Use shell `git diff` and `git log` for change review, and `ls` or `find` to browse directories.
 
 ## Speed
 
@@ -380,7 +360,7 @@ Rust. ~20,000 lines. No runtime dependencies.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
 - **ignore** crate — parallel directory walking, searches all files including gitignored
 - **memmap2** — memory-mapped file reads (no buffers)
-- **DashMap** — concurrent outline cache, invalidated by mtime
+- **clru** — bounded LRU outline cache, invalidated by file revision
 
 Search runs definitions and usages in parallel via `rayon::join`. Callee resolution runs at expand time — extract callee names via tree-sitter queries, resolve against the source file's outline and imported files. Callers query uses the same tree-sitter patterns in reverse, walking the codebase with `memchr` SIMD pre-filtering for fast elimination.
 

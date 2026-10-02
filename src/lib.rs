@@ -6,16 +6,13 @@
 pub(crate) mod budget;
 pub mod cache;
 pub(crate) mod classify;
-pub mod diff;
 pub(crate) mod edit;
 pub mod error;
 pub(crate) mod format;
 pub mod index;
 pub mod install;
 pub(crate) mod lang;
-pub mod map;
 pub mod mcp;
-pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod session;
@@ -40,12 +37,6 @@ pub mod __fuzz {
     #[must_use]
     pub fn strip_noise(content: &str, path: &Path, def_range: Option<(u32, u32)>) -> HashSet<u32> {
         crate::search::strip::strip_noise(content, path, def_range)
-    }
-
-    /// Wrapper: same pattern for `parse_unified_diff`.
-    /// Returns unit because the fuzz target doesn't introspect the result.
-    pub fn parse_unified_diff(raw: &str) {
-        let _ = crate::diff::parse::parse_unified_diff(raw);
     }
 }
 
@@ -225,7 +216,6 @@ fn run_inner(
                 None,
                 glob,
                 cli_full,
-                false,
                 budget_tokens,
             )?;
             // fit_to_budget (inside search_multi_symbol_expanded) already applied
@@ -303,7 +293,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
@@ -315,7 +304,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
@@ -332,7 +320,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Content(text) => search::search_content_expanded(
@@ -344,7 +331,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
@@ -356,7 +342,6 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
-            false,
             ctx.budget,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)

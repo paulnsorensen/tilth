@@ -1,6 +1,6 @@
 ---
 name: tilth
-description: Use the `tilth` CLI for code reading, outlining, search, callers, blast-radius deps, and structural diffs. Activate when the user asks to explore a repo, find a symbol, trace callers, read a file, view a diff, or analyze impact. Prefer `tilth` over `grep`/`cat`/`find`/`ls` — one invocation returns AST-aware outlines, definitions, callees, and usages.
+description: Use the `tilth` CLI for code reading, outlining, search, callers, and blast-radius deps. Activate when the user asks to explore a repo, find a symbol, trace callers, read a file, or analyze impact. Prefer `tilth` over `grep`/`cat`/`find`/`ls` — one invocation returns AST-aware outlines, definitions, callees, and usages.
 ---
 
 # tilth — code intelligence CLI
@@ -61,7 +61,6 @@ Output per match:
 
 ```bash
 tilth "*.test.ts" --scope <dir>   # glob (respects .gitignore)
-tilth --map --scope <dir>         # codebase skeleton with directory token rollups
 ```
 
 ## Deps (blast radius)
@@ -71,19 +70,6 @@ tilth <file> --deps               # what it imports + what depends on it
 ```
 
 Use only before renaming, removing, or changing an export's signature.
-
-## Diff (structural)
-
-```bash
-tilth diff                        # uncommitted changes
-tilth diff HEAD~1                 # vs prior commit
-tilth diff main..feat             # branch comparison
-tilth diff --log HEAD~5..HEAD     # per-commit symbol summaries
-tilth diff --blast                # warn on signature-changed exports
-tilth diff --expand 3             # inline source for top 3 changed symbols
-```
-
-Function-level change detection — `[+]` added, `[-]` removed, `[~]` modified, `[~:sig]` signature changed. Replaces `git diff` for symbol-level review.
 
 ## Budget
 

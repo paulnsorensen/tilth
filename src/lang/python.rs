@@ -64,11 +64,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
         search_priority: 9,
         search_extensions: &["py"],
         basename_extensions: &["py"],
-        test_filename: Some(crate::lang::spec::TestFilenamePolicy {
-            order: 2,
-            label: "test_*.py",
-            matches: is_test_filename,
-        }),
         ..crate::lang::spec::DEFAULT_POLICY
     },
     semantic_start: crate::lang::spec::default_semantic_start,
@@ -116,8 +111,4 @@ fn resolve_import(dir: &std::path::Path, source: &str) -> Option<std::path::Path
     }
     let package = base.join(relative).join("__init__.py");
     package.exists().then_some(package)
-}
-
-fn is_test_filename(path: &str) -> bool {
-    path.starts_with("test_") || path.contains("/test_")
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Regenerate AGENTS.md from prompts/mcp-base.md + prompts/mcp-edit.md.
+# Regenerate AGENTS.md from prompts/mcp.md.
 #
-# AGENTS.md is a generated artifact — edit the source files in prompts/, not
+# AGENTS.md is a generated artifact — edit the source file in prompts/, not
 # AGENTS.md. The contents are also embedded into the MCP server at compile time
 # via include_str! in src/mcp/mod.rs; running this script keeps the human-facing
 # AGENTS.md in lockstep with what MCP hosts receive in the `instructions` field.
@@ -11,26 +11,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-base="prompts/mcp-base.md"
-edit="prompts/mcp-edit.md"
+src="prompts/mcp.md"
 out="AGENTS.md"
 
-for src in "$base" "$edit"; do
-  if [[ ! -f $src ]]; then
-    echo "missing prompt source: $src" >&2
-    exit 1
-  fi
-done
+if [[ ! -f $src ]]; then
+  echo "missing prompt source: $src" >&2
+  exit 1
+fi
 
-# Render both mode files, clearly labeled, so AGENTS.md documents the
-# mode-select served instructions (one complete file per mode — no
-# concatenation) rather than a single composed prompt.
 {
-  printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n'
-  printf '## Base mode\n\n'
-  cat "$base"
-  printf '\n\n## Edit mode\n\n'
-  cat "$edit"
+  printf '<!-- generated from prompts/mcp.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n'
+  cat "$src"
   printf '\n'
 } > "$out"
 

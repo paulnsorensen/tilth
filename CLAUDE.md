@@ -6,21 +6,15 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ```
 src/
-  main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
+  main.rs              CLI entry (clap). Dispatches to install, MCP, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
-  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_INSTRUCTIONS via include_str! from prompts/.
+  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS via include_str! from prompts/mcp.md. Always serves the edit surface.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
     outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
     treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
-  diff/
-    mod.rs             Structural diff types, source resolution, orchestrator pipeline (diff()).
-    parse.rs           Unified diff parser: git diff output → Vec<FileDiff>.
-    matching.rs        Three-phase symbol matching: identity → structural hash → fuzzy similarity.
-    overlay.rs         Per-file structural overlay: outline old/new, match symbols, attribute hunks.
-    format.rs          Progressive-disclosure formatters: overview, file detail, function detail, log, conflicts.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
     outline/
@@ -46,7 +40,7 @@ src/
     structural.rs      ast-grep structural pattern search over cached trees; language mapping via `spec(lang).policy.structural`.
   index/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
-  cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.
+  cache.rs             OutlineCache — bounded LRU (clru) of path → (revision, outline, parsed document). Shared across tools.
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
   edit/
     mod.rs             Path-key normalization; re-exports the whole-file-tag edit modules below.
@@ -60,12 +54,11 @@ src/
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
-  map.rs               Codebase map generation (CLI only, disabled as MCP tool).
   types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-prompts/               MCP server instruction source (mcp-base.md + mcp-edit.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
+prompts/               MCP server instruction source (mcp.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
 AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
@@ -100,6 +93,8 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 
 - The whole-file-tag edit model — JSON `edits` array of `{path, tag?, ops}` sections lowered onto the tag/seen-lines-gate/3-way-merge-recovery machinery (per #116) — the fork's `tilth_write` surface, not upstream's.
 - cwd anchoring and the trust-absolute posture: every path-taking MCP tool takes a required `cwd` (renamed from upstream's optional `root`); relative paths anchor under `cwd` with `..` refused, absolute paths are trusted as-is. The MCP roots one-shot handshake is removed. The `root`→`cwd` rename and the trust-absolute posture are permanent fork patches — expect them to conflict on every upstream sync and always resolve to the fork side.
+- Edit-only MCP. The server has no read-only mode: `tilth_write` is always registered and `prompts/mcp.md` is the only instruction file. Upstream's `prompts/mcp-base.md`, `prompts/mcp-edit.md`, and `edit_mode` branches resolve to the fork side on a sync.
+- `tilth diff`, `tilth overview`, and `tilth --map` are removed with `src/diff/`, `src/overview.rs`, and `src/map.rs`. Drop upstream changes to them on a sync.
 - `tilth_grok` is retired. The fork has no `tilth_grok` MCP tool, no `tilth grok` CLI command, and no `src/search/grok.rs`, `src/mcp/tools/grok.rs`, or `src/search/fuzzy_symbol.rs`. Search continuations use the trimmed resolver in `src/search/target.rs`. On a sync, drop upstream grok changes; move any resolver fix that search needs into `target.rs`.
 
 **Never-merge upstream commits:** `399721c9` and `10bec56a` must never land on this fork. Skip them when syncing.
@@ -167,10 +162,11 @@ Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed
 
 Server instructions sent via MCP protocol live in `prompts/`:
 
-- `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
-- `prompts/mcp-edit.md` — selected in edit mode (wired in as `EDIT_MODE_INSTRUCTIONS`)
+- `prompts/mcp.md` — the one instruction file (wired in as `SERVER_INSTRUCTIONS`)
 
-`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_instructions_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
+The server has one mode: it always registers `tilth_write` and serves tagged `tilth_read` output. `--edit` and `tilth install <host> --edit` are accepted for backwards compatibility and ignored.
+
+`src/mcp/mod.rs` embeds the file at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock test in `src/mcp/mod.rs` (`server_instructions_byte_lock`) flags accidental drift and must be updated alongside intentional prompt edits.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
 

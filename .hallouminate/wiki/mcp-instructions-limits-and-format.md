@@ -57,13 +57,15 @@ transcripts (anthropic.com/engineering/writing-tools-for-agents).
 
 ## tilth-specific application
 
-- One complete instructions file per mode, chosen by the server's `--edit`
-  param — no concatenation, each file independently ≤2,048 chars, byte-locked.
+- One complete instructions file, `prompts/mcp.md` — no concatenation,
+  ≤2,048 chars, byte-locked. The MCP server is edit-only since PR #299;
+  `--edit` is a hidden no-op flag, and the old per-mode split
+  (`mcp-base.md` / `mcp-edit.md`) is gone.
 - The runtime overview preamble (`fingerprint()`, src/overview.rs) was
   dropped from MCP instructions 2026-08-02: unlabeled provenance, bound to
   the server's launch dir (wrong tree under worktrees — see
   [mcp-cwd-root-binding](mcp-cwd-root-binding.md)), stale after initialize.
-  The CLI `tilth overview` command keeps the feature.
+  PR #299 then removed the CLI `tilth overview` command and `src/overview.rs`.
 - A truncation-guard test asserts the first 2,048 chars of the served
-  instructions contain every critical span, in both modes, so "below the
+  instructions contain every critical span, so "below the
   fold" fails CI instead of silently shipping.

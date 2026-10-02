@@ -38,7 +38,7 @@ impl Session {
         }
         let stderr = fs::File::create(root.path().join("stderr")).expect("create stderr log");
         let child = Command::new(env!("CARGO_BIN_EXE_tilth"))
-            .args(["--mcp", "--edit"])
+            .arg("--mcp")
             .current_dir(&workspace)
             .env("XDG_CACHE_HOME", root.path().join("cache"))
             .stdin(Stdio::piped())
