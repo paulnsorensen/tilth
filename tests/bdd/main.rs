@@ -473,10 +473,15 @@ fn assert_literal_preview(world: &TilthWorld, result: &Value, path: &str, line: 
     );
     assert_eq!(header_line, line.to_string(), "{world:?}");
 
-    let source_prefix = format!("-> [{line}]   ");
+    // A hit in a small file prints the whole file as `N:text`; other hits print `-> [N]   text`.
+    let marker_prefix = format!("-> [{line}]   ");
+    let whole_file_prefix = format!("{line}:");
     let matched_source = preview
         .lines()
-        .find_map(|line| line.strip_prefix(&source_prefix))
+        .find_map(|line| {
+            line.strip_prefix(&marker_prefix)
+                .or_else(|| line.strip_prefix(&whole_file_prefix))
+        })
         .expect("literal matched source");
     assert_eq!(matched_source, source, "{world:?}");
 }

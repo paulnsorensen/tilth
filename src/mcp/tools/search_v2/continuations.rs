@@ -117,7 +117,12 @@ impl Target {
         if let Some(line) = self.line {
             let (target, _, _) = match (self.name.as_deref(), self.occurrence) {
                 (Some(name), Some(occurrence)) => target::resolve_by_path_line_occurrence(
-                    &full, line, name, occurrence, cwd, cache,
+                    &full,
+                    line,
+                    name,
+                    occurrence,
+                    (cwd, self.glob.as_deref()),
+                    cache,
                 ),
                 _ => target::resolve_by_path_line(&full, line, cache),
             }
@@ -206,9 +211,14 @@ impl Follow {
         let full = cwd.join(&self.target.path);
         let line = self.target.line.unwrap();
         let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
-            (Some(name), Some(occurrence)) => {
-                target::resolve_by_path_line_occurrence(&full, line, name, occurrence, cwd, cache)
-            }
+            (Some(name), Some(occurrence)) => target::resolve_by_path_line_occurrence(
+                &full,
+                line,
+                name,
+                occurrence,
+                (cwd, self.target.glob.as_deref()),
+                cache,
+            ),
             _ => target::resolve_by_path_line(&full, line, cache),
         }
         .map_err(|e| e.to_string())?;
@@ -536,6 +546,53 @@ mod tests {
         std::fs::write(tmp.path().join("dupes.rs"), "fn run() {}\n").unwrap();
         let err = Follow::parse(&hint(ranges[1]), tmp.path(), &OutlineCache::new()).unwrap_err();
         assert!(err.contains("occurrence changed"), "{err}");
+    }
+
+    #[test]
+    fn glob_scoped_follows_resolve_among_many_same_name_defs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("render")).unwrap();
+        for n in 0..30 {
+            std::fs::write(
+                tmp.path().join(format!("render/r{n:02}.go")),
+                "package render\n\nfunc Render() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("context.go"),
+            "package gin\n\nfunc Render() { helper() }\n\nfunc helper() {}\n",
+        )
+        .unwrap();
+        let found = crate::search::search_symbol_raw_cached(
+            "Render",
+            tmp.path(),
+            Some("context.go"),
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        let occurrence = found
+            .matches
+            .iter()
+            .find(|candidate| candidate.is_definition)
+            .and_then(|candidate| candidate.def_byte_range)
+            .expect("context.go occurrence");
+        for kind in [
+            "fetch_callers",
+            "fetch_callees",
+            "fetch_siblings",
+            "fetch_tests",
+        ] {
+            let hint = json!({"kind": kind, "target": {
+                "path": "context.go", "line": 3, "name": "Render", "occurrence": occurrence,
+                "scope": tmp.path().to_string_lossy(), "glob": "context.go"
+            }});
+            let result = run(tmp.path(), &hint);
+            assert!(
+                matches!(result["status"].as_str(), Some("ok" | "no_match")),
+                "{kind}: {result}"
+            );
+        }
     }
 
     #[test]

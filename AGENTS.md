@@ -13,6 +13,8 @@ BATCH related work; array parameters never accept singular values:
 
 SEE BEFORE WRITE: `tilth_read` prints `[path#TAG]` above 1-based numbered lines; `tilth_search` shows `path#TAG` too. Copy TAG and integer line numbers; NEVER invent either. Edit only lines a read or search showed. DO NOT use `mode: full` to edit; read the section you change. `tilth_write` accepts `{path, tag?, ops}` sections. `replace_text` swaps one exact `old` (`all: true` for every match); `rewrite` swaps every ast-grep `pattern` match; `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for a new file or one too large to tag. Conflicts reject that section—re-read and retry it.
 
+Pair `tilth_write` with `tilth_read` of the next files in one turn.
+
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
 ROUTE: find/explore → `tilth_search` (`queries: [{query, glob?} | {follow: hint} | {pattern: "Some($A)", language, glob?}]`; routing is automatic); repeated call-site edits → `pattern` search, then `rewrite`; read → `tilth_read` (omit `mode`); changes/history → shell `git diff` or `git log`; browse directories → shell `ls` or `find`.

@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-09-06
+last_verified: 2026-10-03
 confidence: high
 sources:
   - https://github.com/paulnsorensen/tilth/pull/189
@@ -42,13 +42,16 @@ The server validates the concrete target and scope again when it executes the co
 
 Responses remain JSON text with top-level results, hints, and diagnostics.
 Result order matches request order.
-Statuses are ok, partial, no_match, and ambiguous.
+Statuses are ok, partial, no_match, ambiguous, and error.
+A failed entry reports error in its own result.
+A batch call fails only when every query entry fails.[^4]
 Completeness describes actual output coverage.
 An incomplete scan cannot establish no_match.
 Routes tried remain telemetry-only.[^1][^2]
 
 Budget reduction preserves JSON and one result record for every input.
-The server rejects a budget that cannot fit required metadata.[^2]
+A budget below the metadata size returns the metadata alone.
+The server sets budget_limited: true on every result in that response.[^2][^4]
 
 ## Non-code Filename Queries
 
@@ -76,3 +79,4 @@ The 2026-09-06 correction selects glob without assuming that directory-valued pa
 [^3]: [Issue #202](https://github.com/paulnsorensen/tilth/issues/202).
 
 _Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the original path-filter request sketch; preserves server-owned initial routing._
+[^4]: Edit-efficiency request cuts, specs B2 and B3 in `.cheese/specs/edit-efficiency-request-cuts.md`.

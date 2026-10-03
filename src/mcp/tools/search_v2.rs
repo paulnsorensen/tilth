@@ -120,8 +120,13 @@ fn run_search_v2(
         .keys()
         .any(|k| !matches!(k.as_str(), "queries" | "cwd" | "budget"))
     {
+        let hint = if object.contains_key("glob") {
+            "; glob goes inside each query entry: queries: [{query, glob}]"
+        } else {
+            ""
+        };
         return Err(SearchFailure::new(
-            "search accepts only queries, cwd, and budget",
+            format!("search accepts only queries, cwd, and budget{hint}"),
             "unknown_keys",
         ));
     }
@@ -193,6 +198,9 @@ fn run_search_v2(
     let mut pending_seen = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
+    let mut failed = 0;
+    let mut first_failure: Option<String> = None;
+    let entry_budget = budget / entries.len().max(1) as u64;
     for (entry, follow) in entries.iter().zip(&follows) {
         let mut counts = None;
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
@@ -217,14 +225,26 @@ fn run_search_v2(
             counts = Some(file_counts);
             (result, "structural".into(), Vec::new(), None)
         } else {
-            route_query(
-                entry["query"].as_str().unwrap(),
+            let query = entry["query"].as_str().unwrap();
+            match route_query(
+                query,
                 entry.get("glob").and_then(Value::as_str),
                 cwd,
                 cache,
                 session,
-            )
-            .map_err(|e| SearchFailure::new(e.to_string(), "route_error"))?
+                entry_budget,
+            ) {
+                Ok(routed) => routed,
+                Err(error) => {
+                    let message = error.to_string();
+                    let mut result = base_result(query, "error", "error");
+                    result["error"] = json!(message);
+                    result["completeness"] = json!("partial");
+                    failed += 1;
+                    first_failure.get_or_insert(message);
+                    (result, "error".to_string(), Vec::new(), None)
+                }
+            }
         };
         routes_tried.push(route);
         hints.append(&mut entry_hints);
@@ -233,6 +253,12 @@ fn run_search_v2(
         if let Some(diagnostic) = diagnostic {
             normalizations.push(diagnostic);
         }
+    }
+    if failed == entries.len() {
+        return Err(SearchFailure::new(
+            first_failure.unwrap_or_default(),
+            "route_error",
+        ));
     }
     let partial = results.iter().any(|(r, _)| r["completeness"] == "partial");
     let route = if routes_tried.len() > 1 {
@@ -255,7 +281,7 @@ fn run_search_v2(
         output = serde_json::to_string(&response)
             .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
     }
-    debug_assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
+    debug_assert!(budget_limited || crate::types::estimate_tokens(output.len() as u64) <= budget);
     Ok(SearchRun {
         response: output,
         route,
@@ -383,8 +409,8 @@ const REMOVABLE: [(Option<&str>, &str); 4] = [
 /// the length the other drops left, and re-serialized per narrowed result.
 /// Length is tracked by exact deltas, so the whole response is serialized once
 /// more at the end. Entries and hints are never removed, so a budget too small
-/// for the required metadata is an error rather than a lossy answer. Returns
-/// the output and whether any result was budget-limited.
+/// for the required metadata returns them over budget, every result flagged
+/// `budget_limited`. Returns the output and whether any result was budget-limited.
 fn reduce_response(
     results: Vec<(Value, Option<FileCounts>)>,
     hints: &[Value],
@@ -488,9 +514,11 @@ fn reduce_response(
         }
     }
     if crate::types::estimate_tokens(len as u64) > budget {
-        return Err(format!(
-            "budget {budget} cannot fit required search metadata"
-        ));
+        // Entries and hints are required metadata, so a budget below their size
+        // cannot be honored. Return them, flagged, instead of failing the call.
+        for result in response["results"].as_array_mut().into_iter().flatten() {
+            result["budget_limited"] = json!(true);
+        }
     }
     let output = serde_json::to_string(&response).map_err(|e| e.to_string())?;
     let budget_limited = response["results"]
@@ -735,6 +763,7 @@ fn route_query(
     cwd: &Path,
     cache: &OutlineCache,
     session: &Session,
+    budget: u64,
 ) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
     session.record_search(query);
 
@@ -762,7 +791,8 @@ fn route_query(
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
-            let (result, route) = content_route(query, glob, cwd, cache, session, Some("path"))?;
+            let (result, route) =
+                content_route(query, glob, cwd, cache, session, Some("path"), budget)?;
             return Ok((result, route, Vec::new(), None));
         }
         let result = base_result(query, "path", "ok");
@@ -777,7 +807,7 @@ fn route_query(
         let mut result = raw_result(query, "regex", &search_result);
         set_preview(
             &mut result,
-            crate::search::format_raw_result_deferred(&search_result, cache, session)?,
+            crate::search::format_raw_result_deferred(&search_result, cache, session, budget)?,
         );
         return Ok((result, "regex".to_string(), Vec::new(), None));
     }
@@ -787,7 +817,8 @@ fn route_query(
     // signature-shaped phrase still hits the underlying symbol.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
-            let (mut result, route, hints) = route_identifier(ident, glob, cwd, cache, session)?;
+            let (mut result, route, hints) =
+                route_identifier(ident, glob, cwd, cache, session, budget)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -823,12 +854,12 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session)?;
+        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session, budget)?;
         return Ok((result, route, hints, None));
     }
 
     // 6. literal — content search (non-identifier phrases only).
-    let (result, route) = content_route(query, glob, cwd, cache, session, None)?;
+    let (result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
     Ok((result, route, Vec::new(), None))
 }
 
@@ -842,6 +873,7 @@ fn route_identifier(
     cwd: &Path,
     cache: &OutlineCache,
     session: &Session,
+    budget: u64,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
     let sym_result = crate::search::search_symbol_raw_cached(query, cwd, glob, cache)?;
     let discovery_partial = sym_result.files_unreadable > 0
@@ -917,7 +949,7 @@ fn route_identifier(
         if content_result.total_found > 0 {
             set_preview(
                 &mut result,
-                crate::search::format_raw_result_deferred(&content_result, cache, session)?,
+                crate::search::format_raw_result_deferred(&content_result, cache, session, budget)?,
             );
         }
         return Ok((result, "ambiguous".to_string(), Vec::new()));
@@ -926,11 +958,11 @@ fn route_identifier(
         let mut result = raw_result(query, "literal", &sym_result);
         set_preview(
             &mut result,
-            crate::search::format_raw_result_deferred(&sym_result, cache, session)?,
+            crate::search::format_raw_result_deferred(&sym_result, cache, session, budget)?,
         );
         return Ok((result, "literal".to_string(), Vec::new()));
     }
-    let (mut result, route) = content_route(query, glob, cwd, cache, session, None)?;
+    let (mut result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
     if sym_result.files_unreadable > 0 {
         mark_partial(&mut result);
     }
@@ -948,6 +980,7 @@ fn content_route(
     cache: &OutlineCache,
     session: &Session,
     route_name: Option<&str>,
+    budget: u64,
 ) -> Result<(Value, String), crate::error::TilthError> {
     let content_result = crate::search::search_content_raw(query, cwd, glob)?;
     let route = route_name.unwrap_or(if content_result.total_found > 0 {
@@ -959,7 +992,7 @@ fn content_route(
     if content_result.total_found > 0 {
         set_preview(
             &mut result,
-            crate::search::format_raw_result_deferred(&content_result, cache, session)?,
+            crate::search::format_raw_result_deferred(&content_result, cache, session, budget)?,
         );
     }
     Ok((result, route.to_string()))
@@ -1082,12 +1115,11 @@ fn unique_hit(
         )
     } else {
         let (target, content, _) = match occurrence {
-            Some(occurrence) => crate::search::target::resolve_candidate_with_source_occurrence(
+            Some(_) => crate::search::target::resolve_candidate_with_source_exact(
                 target_path,
                 target_line,
                 semantic_end,
                 query,
-                occurrence,
                 cache,
             )?,
             None => crate::search::target::resolve_candidate_with_source(
@@ -1216,7 +1248,8 @@ fn record_structural_snapshots(response: &mut Value, cwd: &Path, session: &Sessi
         if result["resolved_as"] != "structural" || result["view"] != "matches" {
             continue;
         }
-        let Some(items) = result["items"].as_array_mut() else {
+        // `get_mut`, not `IndexMut`: indexing a missing key would insert `null`.
+        let Some(items) = result.get_mut("items").and_then(Value::as_array_mut) else {
             continue;
         };
         for item in items {
@@ -1404,7 +1437,7 @@ mod tests {
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let (cache, session, _bloom) = components();
         let (result, route, hints) =
-            route_identifier("root", None, tmp.path(), &cache, &session).unwrap();
+            route_identifier("root", None, tmp.path(), &cache, &session, 24_000).unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -1489,6 +1522,27 @@ mod tests {
             .unwrap();
             assert_eq!(record["partial"], true);
         }
+    }
+
+    #[test]
+    fn mixed_batch_error_entry_marks_telemetry_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
+        std::fs::write(tmp.path().join("invalid_utf8.rs"), [0xff, 0xfe, 0xfd]).unwrap();
+        let (result, telemetry_dir) = call_with_telemetry(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "root"}, {"query": "invalid_utf8.rs"}]
+        }))
+        .unwrap();
+        assert_eq!(result["results"][1]["status"], "error", "{result}");
+        assert_eq!(result["results"][1]["completeness"], "partial");
+        let record: Value = serde_json::from_str(
+            std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(record["partial"], true);
     }
 
     #[test]
@@ -1823,8 +1877,9 @@ mod tests {
     fn search_tag_rejects_edit_on_a_line_search_did_not_show() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("n.txt");
-        let source = "alpha\nneedle\ngamma\ndelta\n";
-        std::fs::write(&path, source).unwrap();
+        // Over the whole-file print threshold, so the last line stays unprinted.
+        let source = format!("alpha\nneedle\ngamma\n{}delta\n", "filler\n".repeat(70));
+        std::fs::write(&path, &source).unwrap();
         let h = Harness::new();
         let found = h.search(dir.path(), json!({"query": "needle"}));
         let tag = header_tag(found["results"][0]["preview"].as_str().unwrap(), "n.txt");
@@ -1889,16 +1944,11 @@ mod tests {
             .contains("let v = 2;"));
     }
 
-    /// Run a search at `budget` tokens; `None` when the budget cannot fit the metadata.
-    fn search_at(
-        h: &Harness,
-        session: &Session,
-        cwd: &Path,
-        entry: &Value,
-        budget: u64,
-    ) -> Option<Value> {
+    /// Run a search at `budget` tokens. A budget below the required metadata
+    /// still returns the entries, flagged `budget_limited`.
+    fn search_at(h: &Harness, session: &Session, cwd: &Path, entry: &Value, budget: u64) -> Value {
         let args = json!({"cwd": cwd.to_str().unwrap(), "queries": [entry], "budget": budget});
-        tool_search_v2(
+        let out = tool_search_v2(
             &args,
             &h.cache,
             session,
@@ -1907,11 +1957,13 @@ mod tests {
             "test-client",
             "test-worktree",
         )
-        .ok()
-        .map(|out| {
-            assert!(crate::types::estimate_tokens(out.len() as u64) <= budget);
-            serde_json::from_str(&out).expect("valid json response")
-        })
+        .expect("search succeeds at any budget");
+        let response: Value = serde_json::from_str(&out).expect("valid json response");
+        let limited = response["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|r| r["budget_limited"] == true));
+        assert!(limited || crate::types::estimate_tokens(out.len() as u64) <= budget);
+        response
     }
 
     /// Search `h.session` at the loosest budget where `trimmed` holds. Probes
@@ -1926,11 +1978,10 @@ mod tests {
             .rev()
             .map(|step| step * 4)
             .find(|&budget| {
-                search_at(h, &Session::new(), cwd, entry, budget)
-                    .is_some_and(|response| trimmed(&response["results"][0]))
+                trimmed(&search_at(h, &Session::new(), cwd, entry, budget)["results"][0])
             })
             .expect("some budget trims the response");
-        search_at(h, &h.session, cwd, entry, budget).unwrap()
+        search_at(h, &h.session, cwd, entry, budget)
     }
 
     fn head_seen(h: &Harness, path: &Path) -> std::collections::BTreeSet<u32> {
@@ -2020,36 +2071,63 @@ mod tests {
                 for index in 0..file_count {
                     let path = format!("{index}.py");
                     let mut returned = false;
-                    if let Some(response) = &response {
-                        let result = &response["results"][0];
-                        saw_counts |= result["view"] == "files";
-                        saw_no_items |= result.get("items").is_none();
-                        if let Some(items) = result["items"].as_array() {
-                            for item in items {
-                                if item["path"] != path {
-                                    continue;
-                                }
-                                returned = true;
-                                saw_matches = true;
-                                assert_eq!(result["view"], "matches");
-                                assert_eq!(
-                                    item["tag"],
-                                    crate::edit::tag::format_tag(
-                                        crate::edit::tag::compute_file_hash(&source)
-                                    )
-                                );
+                    let result = &response["results"][0];
+                    saw_counts |= result["view"] == "files";
+                    saw_no_items |= result.get("items").is_none();
+                    assert!(
+                        result.get("items").is_none_or(Value::is_array),
+                        "budget={budget}: items must be absent or an array: {result}"
+                    );
+                    if let Some(items) = result["items"].as_array() {
+                        for item in items {
+                            if item["path"] != path {
+                                continue;
                             }
+                            returned = true;
+                            saw_matches = true;
+                            assert_eq!(result["view"], "matches");
+                            assert_eq!(
+                                item["tag"],
+                                crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(
+                                    &source
+                                ))
+                            );
                         }
                     }
                     assert_eq!(
                         session.snapshots().head(dir.path().join(path)).is_some(),
                         returned,
-                        "budget={budget}, response={response:?}"
+                        "budget={budget}, response={response}"
                     );
                 }
             }
         }
         assert!(saw_counts && saw_no_items && saw_matches);
+    }
+
+    #[test]
+    fn small_budget_keeps_a_preview_per_small_file_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..5 {
+            use std::fmt::Write as _;
+            let mut body = String::new();
+            for i in 0..40 {
+                let _ = writeln!(body, "filler line {i} of file {n} padding padding");
+            }
+            std::fs::write(
+                dir.path().join(format!("f{n}.txt")),
+                format!("{body}needle here\n"),
+            )
+            .unwrap();
+        }
+        let h = Harness::new();
+        let found = search_at(&h, &h.session, dir.path(), &json!({"query": "needle"}), 700);
+        let preview = found["results"][0]["preview"]
+            .as_str()
+            .unwrap_or_else(|| panic!("preview survives the budget: {found}"));
+        for n in 0..5 {
+            assert!(preview.contains(&format!("f{n}.txt")), "{preview}");
+        }
     }
 
     #[test]
@@ -2100,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_only_search_records_nothing() {
+    fn outline_search_records_only_the_printed_lines() {
         use std::fmt::Write as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.rs");
@@ -2113,8 +2191,12 @@ mod tests {
         let h = Harness::new();
         let found = h.search(dir.path(), json!({"query": "marker_call"}));
         let preview = found["results"][0]["preview"].as_str().unwrap();
-        assert!(!preview.contains("big.rs#"), "{preview}");
-        assert!(h.session.snapshots().head_tag(&path).is_none());
+        // host() starts at line 2401; its two marker_call lines are 2402-2403.
+        let tag = u16::from_str_radix(&header_tag(preview, "big.rs"), 16).unwrap();
+        assert!(preview.contains("marker_call();"), "{preview}");
+        let snapshot = h.session.snapshots().by_tag(&path, tag).expect("snapshot");
+        assert_eq!(snapshot.first_unseen_anchor([2402, 2403]), None);
+        assert_eq!(snapshot.first_unseen_anchor([2404]), Some(2404));
     }
 
     #[test]
@@ -2184,7 +2266,7 @@ mod tests {
         assert_eq!(result["status"], "ok");
         let preview = result["preview"].as_str().expect("literal preview");
         assert!(
-            preview.contains("src/mcp/tools/search_v2.rs:"),
+            preview.contains("src/mcp/tools/search_v2.rs#"),
             "literal fallback must stay within the exact file: {preview}"
         );
         assert!(
@@ -2192,7 +2274,7 @@ mod tests {
             "literal fallback must return the exact source usage: {preview}"
         );
         assert!(
-            !preview.contains("src/telemetry.rs:"),
+            !preview.contains("src/telemetry.rs"),
             "literal fallback must exclude the external definition: {preview}"
         );
 
@@ -2224,7 +2306,7 @@ mod tests {
         assert_eq!(result["status"], "ok");
         let preview = result["preview"].as_str().expect("literal preview");
         assert!(
-            preview.contains("src/mcp/tools/search_v2.rs:"),
+            preview.contains("src/mcp/tools/search_v2.rs#"),
             "literal fallback must return the exact file: {preview}"
         );
         assert!(
@@ -2232,7 +2314,7 @@ mod tests {
             "literal fallback must return embedded content: {preview}"
         );
         assert!(
-            !preview.contains("src/telemetry.rs:"),
+            !preview.contains("src/telemetry.rs"),
             "exact-file literal fallback must exclude external content: {preview}"
         );
     }
@@ -2270,11 +2352,11 @@ mod tests {
         assert_eq!(result["resolved_as"], "regex");
         let preview = result["preview"].as_str().expect("regex preview");
         assert!(
-            preview.contains("src/mcp/tools/search_v2.rs:"),
+            preview.contains("src/mcp/tools/search_v2.rs#"),
             "regex preview must include the exact-glob file: {preview}"
         );
         assert!(
-            !preview.contains("src/telemetry.rs:"),
+            !preview.contains("src/telemetry.rs"),
             "regex preview must exclude files outside the exact glob: {preview}"
         );
     }
@@ -2683,8 +2765,8 @@ mod tests {
             "queries": [{"query": "detect_file_type"}],
             "budget": 1,
         }))
-        .expect_err("required metadata cannot fit one token");
-        assert!(response.contains("budget"), "{response}");
+        .expect("required metadata over budget degrades instead of failing");
+        assert_eq!(response["results"][0]["budget_limited"], true);
     }
 
     #[test]
@@ -2827,12 +2909,6 @@ mod tests {
                 "UTF-8",
                 "route_error",
             ),
-            (
-                "budget exhaustion",
-                json!({"cwd": root, "queries": [{"query": secret}], "budget": 1}),
-                "budget 1 cannot fit required search metadata",
-                "budget_error",
-            ),
         ];
 
         for (name, args, expected_error, expected_class) in cases {
@@ -2934,5 +3010,257 @@ mod tests {
         assert_eq!(records[0]["route"], "batch");
         assert_eq!(records[0]["routes_tried"], json!(["symbol", "symbol"]));
         assert_eq!(records[0]["budget_limited"], true);
+    }
+
+    #[test]
+    fn glob_scoped_symbol_with_defs_in_other_files_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("render")).unwrap();
+        // More definitions than a bare symbol scan retains (cap of 10).
+        for name in (0..30).map(|i| format!("r{i:02}")) {
+            std::fs::write(
+                tmp.path().join(format!("render/{name}.go")),
+                "package render\n\nfunc (r R) Render(w int) error {\n\treturn nil\n}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("context.go"),
+            "package gin\n\nfunc (c *Context) Render(code int) {\n}\n",
+        )
+        .unwrap();
+        let result = call(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "Render", "glob": "context.go"}]
+        }))
+        .expect("glob-scoped unique definition must resolve");
+        assert_eq!(result["results"][0]["resolved_as"], "symbol");
+        assert_eq!(result["results"][0]["target"]["path"], "context.go");
+    }
+
+    #[test]
+    fn one_failing_entry_does_not_abort_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
+        std::fs::write(tmp.path().join("invalid_utf8.rs"), [0xff, 0xfe]).unwrap();
+        let result = call(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "invalid_utf8.rs"}, {"query": "root"}]
+        }))
+        .expect("a failing entry must not fail the batch");
+        assert_eq!(result["results"][0]["status"], "error");
+        assert!(result["results"][0]["error"].as_str().is_some());
+        assert_eq!(result["results"][1]["resolved_as"], "symbol");
+    }
+
+    #[test]
+    fn tiny_budget_returns_limited_results_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
+        let result = call(&json!({
+            "cwd": tmp.path(),
+            "queries": [{"query": "root"}],
+            "budget": 1
+        }))
+        .expect("a tiny budget must degrade, not fail");
+        assert_eq!(result["results"][0]["budget_limited"], true);
+        assert_eq!(result["results"][0]["query"], "root");
+    }
+
+    #[test]
+    fn top_level_glob_rejection_says_where_glob_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = call(&json!({
+            "cwd": tmp.path(),
+            "glob": "*.go",
+            "queries": [{"query": "root"}]
+        }))
+        .expect_err("top-level glob stays rejected");
+        assert!(
+            error.contains("glob goes inside each query entry"),
+            "{error}"
+        );
+    }
+
+    // ---- press attack: request-cuts adversarial ----
+
+    fn tokened_root_file(total: usize) -> String {
+        (1..=total)
+            .map(|n| {
+                if n == 10 {
+                    format!("fn root() {{}} // tok_{n} pad")
+                } else {
+                    format!("// tok_{n} padding padding padding padding")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn search_with(h: &Harness, args: &Value) -> Result<Value, String> {
+        let out = tool_search_v2(
+            args,
+            &h.cache,
+            &h.session,
+            &h.bloom,
+            &h.telemetry,
+            "test-client",
+            "test-worktree",
+        )?;
+        Ok(serde_json::from_str(&out).expect("response must be valid JSON"))
+    }
+
+    fn seen_lines_of(h: &Harness, path: &Path) -> Vec<u32> {
+        let head = h.session.snapshots().head_tag(path);
+        match head {
+            None => Vec::new(),
+            Some(tag) => h
+                .session
+                .snapshots()
+                .by_tag(path, tag)
+                .map(|s| s.seen_lines.into_iter().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn batch_with_a_failing_entry_records_seen_lines_only_for_the_successful_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), tokened_root_file(30)).unwrap();
+        let bad = tmp.path().join("invalid_utf8.rs");
+        std::fs::write(&bad, [0xff, 0xfe, 0xfd]).unwrap();
+        let h = Harness::new();
+        let result = search_with(
+            &h,
+            &json!({"cwd": tmp.path(), "queries": [{"query": "invalid_utf8.rs"}, {"query": "root"}]}),
+        )
+        .expect("batch with one good entry succeeds");
+        let solo = search_with(
+            &Harness::new(),
+            &json!({"cwd": tmp.path(), "queries": [{"query": "root"}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            result["results"][1]["completeness"], solo["results"][0]["completeness"],
+            "a sibling failure must not change the successful entry: {result} vs {solo}"
+        );
+        assert_eq!(result["results"][0]["status"], "error");
+        assert_ne!(result["results"][1]["status"], "error", "{result}");
+        assert!(result["results"][0]
+            .get("preview")
+            .is_none_or(serde_json::Value::is_null));
+        assert!(
+            seen_lines_of(&h, &bad).is_empty(),
+            "failed entry must record nothing"
+        );
+        let preview = format!(
+            "{}{}",
+            result["results"][1]["preview"].as_str().unwrap_or(""),
+            result["results"][1]["core"].as_str().unwrap_or("")
+        );
+        let a = tmp.path().join("a.rs");
+        let seen = seen_lines_of(&h, &a);
+        assert!(!seen.is_empty(), "{preview}");
+        for n in seen {
+            assert!(
+                preview.contains(&format!("tok_{n} ")),
+                "line {n} seen, not printed: {preview}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_where_every_entry_fails_still_returns_the_route_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("invalid_utf8.rs"), [0xff, 0xfe]).unwrap();
+        let h = Harness::new();
+        let error = search_with(
+            &h,
+            &json!({"cwd": tmp.path(), "queries": [{"query": "invalid_utf8.rs"}, {"query": "invalid_utf8.rs"}]}),
+        )
+        .expect_err("all entries failed");
+        assert!(error.contains("UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn tiny_budgets_return_valid_json_and_record_only_returned_lines() {
+        for budget in [1u64, 2, 5, 10, 25, 50, 100, 200, 400] {
+            let tmp = tempfile::tempdir().unwrap();
+            let a = tmp.path().join("a.rs");
+            std::fs::write(&a, tokened_root_file(30)).unwrap();
+            let h = Harness::new();
+            let result = search_with(
+                &h,
+                &json!({"cwd": tmp.path(), "queries": [{"query": "root"}], "budget": budget}),
+            )
+            .unwrap_or_else(|e| panic!("budget {budget} must not fail: {e}"));
+            let preview = format!(
+                "{}{}",
+                result["results"][0]["preview"].as_str().unwrap_or(""),
+                result["results"][0]["core"].as_str().unwrap_or("")
+            );
+            let tagged =
+                preview.contains("a.rs#") || result["results"][0]["target"].get("tag").is_some();
+            let seen = seen_lines_of(&h, &a);
+            if !tagged {
+                assert!(
+                    seen.is_empty(),
+                    "budget {budget}: seen {seen:?} but no tagged header: {preview}"
+                );
+            }
+            for n in seen {
+                assert!(
+                    preview.contains(&format!("tok_{n} ")),
+                    "budget {budget}: line {n} seen but not returned: {preview}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn budget_one_flags_budget_limited_on_every_result_of_a_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), tokened_root_file(30)).unwrap();
+        let h = Harness::new();
+        let result = search_with(
+            &h,
+            &json!({"cwd": tmp.path(), "queries": [{"query": "root"}, {"query": "tok_3"}], "budget": 1}),
+        )
+        .expect("degrades");
+        for r in result["results"].as_array().unwrap() {
+            assert_eq!(r["budget_limited"], true, "{r}");
+        }
+    }
+
+    #[test]
+    fn extra_top_level_keys_keep_the_generic_message_without_the_glob_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Harness::new();
+        let error = search_with(
+            &h,
+            &json!({"cwd": tmp.path(), "queries": [{"query": "root"}], "scope": "src"}),
+        )
+        .expect_err("unknown key rejected");
+        assert!(
+            error.contains("search accepts only queries, cwd, and budget"),
+            "{error}"
+        );
+        assert!(!error.contains("glob"), "{error}");
+    }
+
+    #[test]
+    fn top_level_null_glob_is_still_rejected_with_the_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = Harness::new();
+        let error = search_with(
+            &h,
+            &json!({"cwd": tmp.path(), "queries": [{"query": "root"}], "glob": null}),
+        )
+        .expect_err("top-level glob rejected even when null");
+        assert!(
+            error.contains("glob goes inside each query entry"),
+            "{error}"
+        );
     }
 }
