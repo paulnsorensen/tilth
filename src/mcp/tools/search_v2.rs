@@ -213,7 +213,7 @@ fn run_search_v2(
                     cache,
                 )
                 .map_err(|error| SearchFailure::new(error.to_string(), "structural_error"))?;
-            let (result, file_counts) = structural_result(scan, pattern, language, cwd, session);
+            let (result, file_counts) = structural_result(scan, pattern, language);
             counts = Some(file_counts);
             (result, "structural".into(), Vec::new(), None)
         } else {
@@ -247,7 +247,13 @@ fn run_search_v2(
     };
     let (output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
-    record_returned_seen(&output, &pending_seen, cwd, session);
+    let mut response: Value = serde_json::from_str(&output)
+        .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
+    record_structural_snapshots(&mut response, cwd, session);
+    record_returned_seen(&response, &pending_seen, cwd, session);
+    let output = serde_json::to_string(&response)
+        .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
+    debug_assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
     Ok(SearchRun {
         response: output,
         route,
@@ -316,8 +322,6 @@ fn structural_result(
     mut scan: crate::search::StructuralScan,
     pattern: &str,
     language: &str,
-    cwd: &Path,
-    session: &Session,
 ) -> (Value, FileCounts) {
     let mut result = base_result(
         pattern,
@@ -329,13 +333,9 @@ fn structural_result(
     let total: usize = scan.file_counts.values().sum();
     result["total_matches"] = json!(total);
     result["files_matched"] = json!(scan.file_counts.len());
-    // Mint tags now; `record_returned_seen` marks lines seen once trimming settles.
+    let tag_budget_placeholder = crate::edit::tag::format_tag(0);
     for group in &mut scan.groups {
-        let spec = crate::read::SeenSpec::Ranges(Vec::new());
-        let path = cwd.join(group.path());
-        if let Some(tag) = crate::read::record_edit_snapshot(session, &path, &spec) {
-            group.set_tag(crate::edit::tag::format_tag(tag));
-        }
+        group.set_tag(tag_budget_placeholder.clone());
     }
     result["items"] = json!(scan.groups);
     if scan.limited {
@@ -1206,15 +1206,43 @@ fn take_pending_seen(result: &mut Value, index: usize) -> Vec<PendingSeen> {
         .collect()
 }
 
-/// Mark seen only the lines the final response still carries: a surviving
-/// `core` or `preview`, and the matches of surviving tagged structural items.
-fn record_returned_seen(output: &str, pending: &[PendingSeen], cwd: &Path, session: &Session) {
-    if pending.is_empty() && !output.contains("\"tag\"") {
-        return;
-    }
-    let Ok(response) = serde_json::from_str::<Value>(output) else {
+fn record_structural_snapshots(response: &mut Value, cwd: &Path, session: &Session) {
+    let Some(results) = response["results"].as_array_mut() else {
         return;
     };
+    for result in results {
+        if result["resolved_as"] != "structural" || result["view"] != "matches" {
+            continue;
+        }
+        let Some(items) = result["items"].as_array_mut() else {
+            continue;
+        };
+        for item in items {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            item.remove("tag");
+            if item
+                .get("matches")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                continue;
+            }
+            let Some(path) = item.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let spec = crate::read::SeenSpec::Ranges(Vec::new());
+            if let Some(tag) = crate::read::record_edit_snapshot(session, &cwd.join(path), &spec) {
+                item.insert("tag".into(), json!(crate::edit::tag::format_tag(tag)));
+            }
+        }
+    }
+}
+
+/// Mark seen only the lines the final response still carries: a surviving
+/// `core` or `preview`, and the matches of surviving tagged structural items.
+fn record_returned_seen(response: &Value, pending: &[PendingSeen], cwd: &Path, session: &Session) {
     let Some(results) = response["results"].as_array() else {
         return;
     };
@@ -1847,7 +1875,10 @@ mod tests {
             "test-worktree",
         )
         .ok()
-        .map(|out| serde_json::from_str(&out).expect("valid json response"))
+        .map(|out| {
+            assert!(crate::types::estimate_tokens(out.len() as u64) <= budget);
+            serde_json::from_str(&out).expect("valid json response")
+        })
     }
 
     /// Search `h.session` at the loosest budget where `trimmed` holds. Probes
@@ -1935,6 +1966,57 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         assert!(outcome.is_err() || outcome.unwrap().contains("seen"));
+    }
+
+    #[test]
+    fn structural_snapshots_exist_only_for_returned_match_groups() {
+        let mut saw_counts = false;
+        let mut saw_no_items = false;
+        let mut saw_matches = false;
+        for file_count in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = "wrap(value)\n".repeat(30);
+            for index in 0..file_count {
+                std::fs::write(dir.path().join(format!("{index}.py")), &source).unwrap();
+            }
+            let h = Harness::new();
+            let entry = json!({"pattern": "wrap($A)", "language": "python"});
+            for budget in (1..1200).step_by(4) {
+                let session = Session::new();
+                let response = search_at(&h, &session, dir.path(), &entry, budget);
+                for index in 0..file_count {
+                    let path = format!("{index}.py");
+                    let mut returned = false;
+                    if let Some(response) = &response {
+                        let result = &response["results"][0];
+                        saw_counts |= result["view"] == "files";
+                        saw_no_items |= result.get("items").is_none();
+                        if let Some(items) = result["items"].as_array() {
+                            for item in items {
+                                if item["path"] != path {
+                                    continue;
+                                }
+                                returned = true;
+                                saw_matches = true;
+                                assert_eq!(result["view"], "matches");
+                                assert_eq!(
+                                    item["tag"],
+                                    crate::edit::tag::format_tag(
+                                        crate::edit::tag::compute_file_hash(&source)
+                                    )
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        session.snapshots().head(dir.path().join(path)).is_some(),
+                        returned,
+                        "budget={budget}, response={response:?}"
+                    );
+                }
+            }
+        }
+        assert!(saw_counts && saw_no_items && saw_matches);
     }
 
     #[test]

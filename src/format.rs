@@ -29,6 +29,7 @@ pub fn set_display_base(base: &Path) -> DisplayBaseGuard {
 
 /// The label for `path`: relative to the active display base when inside it.
 pub fn display_path(path: &Path) -> String {
+    let path = crate::edit::lexical_normalize(path);
     DISPLAY_BASE.with(|b| {
         let base = b.borrow();
         match base
@@ -209,6 +210,9 @@ mod tests {
             );
             assert_eq!(display_path_str("/elsewhere/a.rs"), "/elsewhere/a.rs");
             assert_eq!(display_path_str("/w/repo"), "/w/repo");
+            assert_eq!(display_path_str("/w/repo/../outside.rs"), "/w/outside.rs");
+            assert_eq!(display_path_str("/w/repo/src/../a.rs"), "a.rs");
+            assert_eq!(display_path_str("/w/other/../repo/a.rs"), "a.rs");
         }
         assert_eq!(display_path(p), "/w/repo/src/a.rs");
     }

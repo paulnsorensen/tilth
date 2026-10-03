@@ -84,10 +84,6 @@ pub(crate) struct FileMatches {
 }
 
 impl FileMatches {
-    pub(crate) fn path(&self) -> &str {
-        &self.path
-    }
-
     pub(crate) fn set_tag(&mut self, tag: String) {
         self.tag = Some(tag);
     }

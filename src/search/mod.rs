@@ -488,7 +488,10 @@ pub fn search_multi_symbol_expanded(
     let fitted = alloc::fit_sections_to_budget(sections, budget_tokens);
     if let Some(session) = session {
         for (header, entries) in pending_seen {
-            if fitted.iter().any(|s| s.contains(&header)) {
+            if fitted
+                .iter()
+                .any(|s| s.lines().next() == Some(header.as_str()))
+            {
                 record_seen(session, entries);
             }
         }

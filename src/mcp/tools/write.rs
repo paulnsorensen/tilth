@@ -382,7 +382,8 @@ fn recover_edit(
             source: ApplyError::TextUnmatched { preview },
         }) => {
             return Err(TilthError::EditRejected(format!(
-                "Edit rejected for {p}: {}. The file also changed since the read that minted this tag — re-read to refresh it.",
+                "Edit rejected for {}: {}. The file also changed since the read that minted this tag — re-read to refresh it.",
+                crate::format::display_path_str(&p),
                 text_unmatched_message(path, tag, &preview)
             )));
         }
@@ -1877,7 +1878,7 @@ mod tests {
         )
         .expect_err("all sections failed → isError");
         assert!(
-            out.contains("Edit rejected for"),
+            out.contains("Edit rejected for drift_swap.rs:"),
             "expected an Edit rejected message, got:\n{out}"
         );
         assert!(
