@@ -46,6 +46,16 @@ enum JsonOp {
     TextSwap {
         old: String,
         new: String,
+        #[serde(default)]
+        all: Option<bool>,
+        #[serde(default)]
+        count: Option<usize>,
+    },
+    Rewrite {
+        pattern: String,
+        rewrite: String,
+        #[serde(default)]
+        count: Option<usize>,
     },
     Delete {
         start: u32,
@@ -133,7 +143,33 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
             payload: split_content(&content),
         },
         JsonOp::Delete { start, end } => Op::Del { start, end },
-        JsonOp::TextSwap { old, new } => Op::TextSwap { old, new },
+        JsonOp::TextSwap {
+            old,
+            new,
+            all,
+            count,
+        } => match (all, count) {
+            (_, Some(0)) => return Err("replace_text `count` must be at least 1".to_string()),
+            (Some(false), Some(_)) => {
+                return Err("replace_text `count` implies `all`; remove `all:false`".to_string())
+            }
+            (Some(true), _) | (_, Some(_)) => Op::TextSwapAll { old, new, count },
+            (_, None) => Op::TextSwap { old, new },
+        },
+        JsonOp::Rewrite {
+            pattern,
+            rewrite,
+            count,
+        } => {
+            if count == Some(0) {
+                return Err("rewrite `count` must be at least 1".to_string());
+            }
+            Op::Rewrite {
+                pattern,
+                rewrite,
+                count,
+            }
+        }
         JsonOp::InsertBefore { line, content } => Op::Ins {
             cursor: Cursor::Pre(line),
             payload: split_content(&content),
@@ -188,6 +224,7 @@ const VALID_OPS: &[&str] = &[
     "create_file",
     "delete_file",
     "move_file",
+    "rewrite",
 ];
 
 fn valid_ops_list() -> String {
@@ -221,7 +258,15 @@ fn op_error_hint(verb: &str) -> &'static str {
         "replace_text" => {
             "Example op: \
              {\"op\":\"replace_text\",\"old\":\"exact existing text\",\"new\":\"replacement\"} — \
-             old must match the file exactly once."
+             old must match the file exactly once; add \"all\":true to replace every exact match, \
+             or \"count\":N to require exactly N matches."
+        }
+        "rewrite" => {
+            "Example op: \
+             {\"op\":\"rewrite\",\"pattern\":\"$R.Render($W)\",\"rewrite\":\"$R.Render(ctx, $W)\"} — \
+             pattern is an ast-grep pattern for the file's language ($X matches one node, \
+             $$$X many); rewrite reuses the same metavariables; add \"count\":N to require \
+             exactly N matches."
         }
         "create_file" | "delete_file" | "move_file" => {
             "Example op: {\"op\":\"create_file\",\"content\":\"...\"} — file ops take no line \
@@ -387,6 +432,24 @@ fn render_op_as_json(op: &Op) -> Value {
         }),
         Op::TextSwap { old, new } => {
             json!({ "op": "replace_text", "old": old, "new": new })
+        }
+        Op::TextSwapAll { old, new, count } => {
+            let mut v = json!({ "op": "replace_text", "old": old, "new": new, "all": true });
+            if let Some(n) = count {
+                v["count"] = json!(n);
+            }
+            v
+        }
+        Op::Rewrite {
+            pattern,
+            rewrite,
+            count,
+        } => {
+            let mut v = json!({ "op": "rewrite", "pattern": pattern, "rewrite": rewrite });
+            if let Some(n) = count {
+                v["count"] = json!(n);
+            }
+            v
         }
         Op::Del { start, end } => json!({ "op": "delete", "start": start, "end": end }),
         Op::Ins { cursor, payload } => {
@@ -804,6 +867,7 @@ mod tests {
                 JsonOp::CreateFile { .. } => "create_file",
                 JsonOp::DeleteFile => "delete_file",
                 JsonOp::MoveFile { .. } => "move_file",
+                JsonOp::Rewrite { .. } => "rewrite",
             }
         }
         let samples: Vec<(&str, Value)> = VALID_OPS
@@ -825,6 +889,9 @@ mod tests {
                     "create_file" => json!({ "op": "create_file", "content": "x" }),
                     "delete_file" => json!({ "op": "delete_file" }),
                     "move_file" => json!({ "op": "move_file", "dest": "b.rs" }),
+                    "rewrite" => {
+                        json!({ "op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)" })
+                    }
                     other => panic!("unhandled VALID_OPS entry: {other}"),
                 };
                 (name, sample)
@@ -839,5 +906,78 @@ mod tests {
                 "VALID_OPS entry `{name}` must round-trip"
             );
         }
+    }
+
+    #[test]
+    fn rewrite_lowers_to_rewrite_op_and_rejects_bad_fields() {
+        let lower = |op: Value| {
+            lower_edits(&json!([{ "path": "a.go", "tag": "0000", "ops": [op] }]))
+                .map(|mut s| s.remove(0).ops.remove(0))
+        };
+        let base = json!({ "op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)" });
+        let expect = |count| Op::Rewrite {
+            pattern: "f($A)".into(),
+            rewrite: "g($A)".into(),
+            count,
+        };
+        assert_eq!(lower(base.clone()).unwrap(), expect(None));
+        let mut counted = base.clone();
+        counted["count"] = json!(12);
+        let lowered = lower(counted).unwrap();
+        assert_eq!(lowered, expect(Some(12)));
+        assert_eq!(
+            render_op_as_json(&lowered),
+            json!({ "op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)", "count": 12 })
+        );
+        let mut zero = base.clone();
+        zero["count"] = json!(0);
+        assert!(lower(zero).is_err(), "count 0 must be rejected");
+        let mut unknown = base.clone();
+        unknown["all"] = json!(true);
+        assert!(lower(unknown).is_err(), "unknown field must be rejected");
+        assert!(
+            lower(json!({ "op": "rewrite", "pattern": "f($A)" })).is_err(),
+            "rewrite template is required"
+        );
+    }
+
+    #[test]
+    fn replace_text_all_and_count_lower_to_text_swap_all() {
+        let lower = |op: Value| {
+            lower_edits(&json!([{ "path": "a.rs", "tag": "0000", "ops": [op] }]))
+                .map(|mut s| s.remove(0).ops.remove(0))
+        };
+        let base = |extra: Value| {
+            let mut v = json!({ "op": "replace_text", "old": "a", "new": "b" });
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            v
+        };
+        let all = |count| Op::TextSwapAll {
+            old: "a".into(),
+            new: "b".into(),
+            count,
+        };
+        assert_eq!(lower(base(json!({ "all": true }))).unwrap(), all(None));
+        assert_eq!(
+            lower(base(json!({ "count": 3 }))).unwrap(),
+            all(Some(3)),
+            "count implies all"
+        );
+        assert_eq!(
+            lower(base(json!({ "all": true, "count": 2 }))).unwrap(),
+            all(Some(2))
+        );
+        assert_eq!(
+            lower(base(json!({ "all": false }))).unwrap(),
+            Op::TextSwap {
+                old: "a".into(),
+                new: "b".into()
+            }
+        );
+        assert!(lower(base(json!({ "all": false, "count": 2 }))).is_err());
+        assert!(lower(base(json!({ "count": 0 }))).is_err());
+        assert!(lower(base(json!({ "replace_all": true }))).is_err());
     }
 }

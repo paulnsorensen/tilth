@@ -162,3 +162,30 @@ Session 2026-08-02; spec at the durable corpus
 - **Verification:** Test large files, long lines, multiple sections, partial failures, stale recovery, and `diff: true`.[^bounded-write]
 
 [^bounded-write]: `src/mcp/tools/write.rs`; `src/edit/snapshots.rs`; `src/edit/recovery.rs`. Decision: September 19, 2026, after the measured coder context-loss investigation. The implementation PR records gate results and release status.
+
+### ADR-009: Multi-match unseen rejections name one unblocking call (amends ADR-005) [status: accepted]
+
+- **Context:** `rewrite` and `replace_text all` touch many matches that can sit far apart. The ADR-005 re-read caps at 60 lines, so agents re-read in steps or read the whole file. Sonnet 5.5 benchmark runs showed this on `render/render_test.go` (`count: 43`).
+- **Decision:**
+  1. `replace_text all` and `rewrite` name one batched read: `DO NOT re-read the file: tilth_read paths ["{path}#{lo}-{hi}", ...] shows every unseen match; retry with the same tag`.
+  2. For `replace_text all`, each range is the first line of one unseen occurrence. One displayed line passes the overlap gate.
+  3. For `rewrite`, each range is one full match span. The full-span gate needs every line of each match.
+  4. Ranges within 3 lines merge. The closest neighbours then merge until at most 20 ranges remain, because `tilth_read` takes at most 20 paths. A test in `src/mcp/tools/definitions.rs` pins the two caps together.
+  5. Single `replace_text` and line ops keep the ADR-005 message unchanged.
+- **Alternatives:**
+  1. A literal `{query, glob}` search hint for `replace_text all`. `tilth_search` routes queries automatically, so the hinted search can hide occurrences in five ways:
+     - A same-file definition takes the symbol route, which shows only the definition.
+     - A word-bounded symbol match misses substrings.
+     - Metacharacters take the regex route.
+     - Matches inside functions show outline context with no tag.
+     - Test files go to the compact facet.
+
+     In each case the retry loops.
+  2. A structural `tilth_search` hint for `rewrite`. The structural walker skips some files that a glob names: `build`, `vendor`, `dist` and `target` directories, root names with glob metacharacters, and ignored or large files. The search then shows no match, and the retry loops.
+  3. A single-file search cap of 1000 matches. It does not fix routing. It costs about 20x tokens on routine single-file searches. It overflows the 24k budget for long lines.
+  4. One covering re-read from the first to the last unseen occurrence. An over-budget section read shows few lines but marks the whole range as seen, so the retry applies to unseen lines.
+- **Consequences:** Small ranges keep the hinted read under its budget. The gate checks one op at a time, so a section with two multi-match ops can need two hinted calls. Each call shrinks the unseen set, so the retries converge.
+- **Open issue:** A truncated `tilth_read` section records its whole requested range as seen (paulnsorensen/tilth#305). ADR-008 fixes the same class of bug for write output. Until #305 lands, more than 20 spread-out matches can merge into wide ranges that truncate.
+- **Verification:** `tests/mcp_v2/test_unseen_match_hint.py` runs the first read, the hinted read, and the retry in one session. The retry must apply, and the hinted read must not truncate. One case documents the #305 residual as an expected failure.[^multi-match]
+
+[^multi-match]: `src/edit/recovery.rs` (`merge_ranges`, `MAX_READ_RANGES`); `src/edit/mismatch.rs` (`unseen_message`). Decision: October 3, 2026, after three /age passes on `feat/edit-efficiency` that reproduced each rejected design against the built binary.

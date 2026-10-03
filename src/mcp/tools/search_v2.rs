@@ -1793,7 +1793,7 @@ mod tests {
         "package main\n\nfunc a() {\n\tx := w.Render(p)\n}\n\nfunc b() {\n\ty := t.Render(q)\n}\n";
 
     #[test]
-    fn search_tag_lets_replace_text_apply_without_a_read() {
+    fn search_tag_lets_replace_text_all_apply_without_a_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("r.go");
         std::fs::write(&path, GO_SRC).unwrap();
@@ -1805,13 +1805,13 @@ mod tests {
             .write(
                 dir.path(),
                 json!({"path": "r.go", "tag": tag, "ops": [
-                    {"op": "replace_text", "old": "w.Render(", "new": "w.Draw("}]}),
+                    {"op": "replace_text", "old": ".Render(", "new": ".Draw(", "all": true}]}),
             )
             .expect("search-shown lines are editable without a read");
         assert!(!out.contains("rejected"), "{out}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            GO_SRC.replace("w.Render(", "w.Draw(")
+            GO_SRC.replace(".Render(", ".Draw(")
         );
 
         let again = h.search(dir.path(), json!({"query": "Draw"}));
@@ -1838,6 +1838,32 @@ mod tests {
         assert!(
             message.contains("seen") || message.contains("read"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn structural_search_tag_lets_rewrite_apply_without_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let h = Harness::new();
+        let found = h.search(
+            dir.path(),
+            json!({"pattern": "$R.Render($W)", "language": "go"}),
+        );
+        let tag = found["results"][0]["items"][0]["tag"]
+            .as_str()
+            .expect("structural file entry carries a tag")
+            .to_string();
+        h.write(
+            dir.path(),
+            json!({"path": "r.go", "tag": tag, "ops": [
+                {"op": "rewrite", "pattern": "$R.Render($W)", "rewrite": "$R.Draw($W)"}]}),
+        )
+        .expect("structural-shown lines are editable without a read");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            GO_SRC.replace(".Render(", ".Draw(")
         );
     }
 

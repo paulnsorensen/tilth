@@ -283,16 +283,18 @@ The MCP server always registers `tilth_write`. `tilth_read` prints a `[path#TAG]
 43:  return x;
 ```
 
-`tilth_write` takes an op-grammar blob: `[path#TAG]` sections with op lines (`SWAP`, `DEL`, `INS.PRE`/`INS.POST`, block ops) that reference those line numbers. Copy the `[path#TAG]` header verbatim — it binds the edit to the content you read. If the file changed since, tilth 3-way-merges your ops onto the live file and rejects the section only when the merge conflicts:
+`tilth_write` takes a JSON `edits` array of `{path, tag, ops}` sections. Copy the TAG verbatim — it binds the edit to the content you saw. Every edit must fall on lines a read or search showed. If the file changed since, tilth 3-way-merges your ops onto the live file and rejects the section only when the merge conflicts:
 
-```
-[src/auth.ts#1A2B]
-SWAP 42:
-  let x = recompute();
-DEL 44.=46
+```json
+{"path": "src/auth.ts", "tag": "1A2B", "ops": [
+  {"op": "replace_text", "old": "compute()", "new": "recompute()", "all": true},
+  {"op": "rewrite", "pattern": "$R.Render($W)", "rewrite": "$R.Render(ctx, $W)"}
+]}
 ```
 
-Large files still outline first — use `section` to get numbered content for the part you need.
+`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces every ast-grep pattern match in the file's language.
+
+Large files still outline first — read a `path#n-m` section to get numbered content for the part you need.
 
 Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/).
 

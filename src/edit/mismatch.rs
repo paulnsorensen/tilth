@@ -41,6 +41,35 @@ pub(super) fn format_ranges(ranges: &[(u32, u32)], anchor: u32) -> String {
     }
 }
 
+fn unseen_message(
+    path: &str,
+    line: u32,
+    displayed: &[(u32, u32)],
+    reread: (u32, u32),
+    reads: &[(u32, u32)],
+) -> String {
+    let p = crate::format::display_path_str(path);
+    let ranges = format_ranges(displayed, line);
+    let head = format!(
+        "Edit rejected for {p}: line {line} was never displayed under this tag (displayed: {ranges})."
+    );
+    if reads.is_empty() {
+        return format!(
+            "{head} Re-read {p}#{}-{} to cover line {line}.",
+            reread.0, reread.1
+        );
+    }
+    let paths: Vec<String> = reads
+        .iter()
+        .map(|(lo, hi)| format!("{p}#{lo}-{hi}"))
+        .collect();
+    let paths = serde_json::Value::from(paths);
+    format!(
+        "{head} DO NOT re-read the file: tilth_read paths {paths} shows every unseen match; \
+         retry with the same tag."
+    )
+}
+
 /// A tag/content mismatch that recovery could not resolve.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MismatchError {
@@ -69,19 +98,17 @@ pub enum MismatchError {
     /// the ranges that WERE displayed and the exact re-read that would cover the
     /// unseen line, so the fix is one bounded read rather than a guess. `reread`
     /// is the smallest span joining `line` to the nearest displayed range, capped
-    /// at 60 lines.
-    #[error(
-        "Edit rejected for {p}: line {line} was never displayed under this tag \
-             (displayed: {}). Re-read {p}#{reread_lo}-{reread_hi} to cover line {line}.",
-        format_ranges(displayed, *line),
-        p = crate::format::display_path_str(path)
-    )]
+    /// at 60 lines. Multi-match ops (`replace_text all`, `rewrite`) set `reads`:
+    /// one small range per unseen match for one batched `tilth_read`, which
+    /// replaces the re-read. Single-anchor ops leave `reads` empty.
+    #[error("{}", unseen_message(path, *line, displayed, (*reread_lo, *reread_hi), reads))]
     UnseenAnchor {
         path: String,
         line: u32,
         displayed: Vec<(u32, u32)>,
         reread_lo: u32,
         reread_hi: u32,
+        reads: Vec<(u32, u32)>,
     },
     /// A `replace_text` anchor did not resolve against the live file. The
     /// specific match failure is what the caller must act on — reporting it as
@@ -125,11 +152,31 @@ mod tests {
             displayed: vec![(2655, 2700), (3250, 3270)],
             reread_lo: 2764,
             reread_hi: 2823,
+            reads: Vec::new(),
         };
         assert_eq!(
             e.to_string(),
             "Edit rejected for src/a.rs: line 2823 was never displayed under this tag \
              (displayed: 2655-2700, 3250-3270). Re-read src/a.rs#2764-2823 to cover line 2823."
+        );
+    }
+
+    #[test]
+    fn unseen_match_message_names_one_batched_read() {
+        let e = MismatchError::UnseenAnchor {
+            path: "src/a.go".into(),
+            line: 39,
+            displayed: vec![(1, 36)],
+            reread_lo: 1,
+            reread_hi: 39,
+            reads: vec![(39, 39), (120, 122)],
+        };
+        assert_eq!(
+            e.to_string(),
+            "Edit rejected for src/a.go: line 39 was never displayed under this tag \
+             (displayed: 1-36). DO NOT re-read the file: tilth_read paths \
+             [\"src/a.go#39-39\",\"src/a.go#120-122\"] shows every unseen match; retry with \
+             the same tag."
         );
     }
 

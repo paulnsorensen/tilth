@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Match headers carry `path#TAG`; lines a search shows are editable by `tilth_write` with no read. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.",
+            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Match headers carry `path#TAG`; lines a search shows are editable by `tilth_write` with no read. For repeated call-site changes, search `{pattern: \"$R.Render($W)\", language: \"go\"}`, then use a `rewrite` op. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -115,7 +115,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
     tools.push(serde_json::json!({
         "name": "tilth_write",
         "annotations": { "readOnlyHint": false },
-        "description": "Edit after a tagged read or search. `tilth_read` prints `[path#TAG]` above `N:content`; `tilth_search` shows `path#TAG` too. Copy its TAG and shown 1-based integer lines—NEVER invent either. Edit only lines a read or search showed. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
+        "description": "Edit after a tagged read or search. `tilth_read` prints `[path#TAG]` above `N:content`; `tilth_search` shows `path#TAG` too. Copy its TAG and shown 1-based integer lines—NEVER invent either. Edit only lines a read or search showed. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once (all:true replaces every exact match; count:N requires exactly N; all/count match against the version you saw; every match must be on shown lines); rewrite uses {pattern,rewrite,count?} to replace every ast-grep match of pattern ($X, $$$X) in the file's language, against the version you saw; every line a match spans must be shown, e.g. {op: \"rewrite\", pattern: \"$R.Render($W)\", rewrite: \"$R.Render(context.Background(), $W)\"}; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
         "inputSchema": {
             "type": "object",
             "required": ["edits", "cwd"],
@@ -135,8 +135,9 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                     "type": "object",
                                     "required": ["op"],
                                     "oneOf": [
-                                        { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" } } },
+                                        { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" }, "all": { "type": "boolean" }, "count": { "type": "integer", "minimum": 1 } } },
                                         { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } },
+                                        { "required": ["op", "pattern", "rewrite"], "additionalProperties": false, "properties": { "op": { "const": "rewrite" }, "pattern": { "type": "string", "minLength": 1 }, "rewrite": { "type": "string" }, "count": { "type": "integer", "minimum": 1 } } },
                                         { "required": ["op", "start", "end", "content"], "additionalProperties": false, "properties": { "op": { "const": "replace" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                         { "required": ["op", "start", "end"], "additionalProperties": false, "properties": { "op": { "const": "delete" }, "start": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "end": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 } } },
                                         { "required": ["op", "line", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_before" }, "line": { "type": "integer", "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
@@ -176,6 +177,17 @@ fn cwd_property() -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn read_paths_cap_matches_the_edit_hint_cap() {
+        let tools = tool_definitions();
+        let read = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_read"))
+            .expect("tilth_read tool definition");
+        let cap = read["inputSchema"]["properties"]["paths"]["maxItems"].as_u64();
+        // An unseen-match rejection names one batched read; it must fit this cap.
+        assert_eq!(cap, Some(crate::edit::recovery::MAX_READ_RANGES as u64));
+    }
     #[test]
     fn tilth_write_surface_teaches_replace_text_first() {
         let tools = tool_definitions();
@@ -233,7 +245,7 @@ mod tests {
             item_required.contains(&"path") && item_required.contains(&"ops"),
             "each section must require path and ops: {item_required:?}"
         );
-        // The ops oneOf must name every one of the 13 verbs via `op` const.
+        // The ops oneOf must name every one of the 14 verbs via `op` const.
         let ops_item = &schema["properties"]["edits"]["items"]["properties"]["ops"]["items"];
         let branches = ops_item["oneOf"].as_array().expect("ops oneOf present");
         let verbs: Vec<&str> = branches
@@ -254,6 +266,7 @@ mod tests {
             "move_file",
             "replace_text",
             "create_file",
+            "rewrite",
         ] {
             assert!(
                 verbs.contains(&verb),
@@ -262,8 +275,8 @@ mod tests {
         }
         assert_eq!(
             branches.len(),
-            13,
-            "exactly 13 verbs expected in the ops oneOf: {verbs:?}"
+            14,
+            "exactly 14 verbs expected in the ops oneOf: {verbs:?}"
         );
         // The old per-file `files` array surface stays gone.
         assert!(
@@ -589,5 +602,33 @@ mod tests {
             .find(|branch| branch["properties"]["op"]["const"] == "create_file")
             .expect("create_file branch");
         assert_eq!(branch["required"], serde_json::json!(["op", "content"]));
+    }
+
+    #[test]
+    fn tilth_write_schema_accepts_rewrite_and_rejects_unknown_fields() {
+        let tools = tool_definitions();
+        let write = tools
+            .iter()
+            .find(|t| t["name"] == "tilth_write")
+            .expect("tilth_write tool definition present");
+        assert!(write["description"]
+            .as_str()
+            .unwrap()
+            .contains("rewrite uses {pattern,rewrite,count?}"));
+        let compiled = jsonschema::JSONSchema::compile(&write["inputSchema"]).expect("schema");
+        let with = |op: serde_json::Value| serde_json::json!({"cwd": "/abs", "edits": [{"path": "a.go", "tag": "1A2B", "ops": [op]}]});
+        let ok = serde_json::json!({"op": "rewrite", "pattern": "$R.Render($W)",
+            "rewrite": "$R.Render(ctx, $W)", "count": 12});
+        assert!(compiled.is_valid(&with(ok)));
+        let no_count = serde_json::json!({"op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)"});
+        assert!(compiled.is_valid(&with(no_count)));
+        for bad in [
+            serde_json::json!({"op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)", "all": true}),
+            serde_json::json!({"op": "rewrite", "pattern": "f($A)", "rewrite": "g($A)", "count": 0}),
+            serde_json::json!({"op": "rewrite", "pattern": "", "rewrite": "g"}),
+            serde_json::json!({"op": "rewrite", "pattern": "f($A)"}),
+        ] {
+            assert!(!compiled.is_valid(&with(bad.clone())), "{bad}");
+        }
     }
 }

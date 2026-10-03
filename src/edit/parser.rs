@@ -64,6 +64,21 @@ pub enum Op {
     },
     /// Replace one exact text occurrence, expanding to its covering lines.
     TextSwap { old: String, new: String },
+    /// Replace every exact, non-overlapping occurrence of `old`. `count`, when
+    /// set, is the exact number of occurrences the file must contain.
+    TextSwapAll {
+        old: String,
+        new: String,
+        count: Option<usize>,
+    },
+    /// Replace every ast-grep match of `pattern` with the `rewrite` template.
+    /// Language comes from the file path. `count`, when set, is the exact number
+    /// of matches the file must contain.
+    Rewrite {
+        pattern: String,
+        rewrite: String,
+        count: Option<usize>,
+    },
     /// Delete lines `[start, end]` (inclusive).
     Del { start: u32, end: u32 },
     /// Insert `payload` at `cursor`.
