@@ -275,7 +275,7 @@ Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-li
 
 ## Edit mode
 
-The MCP server always registers `tilth_write`, and `tilth_read` prints whole-file-tag output — a `[path#TAG]` header over 1-based numbered lines:
+The MCP server always registers `tilth_write`. `tilth_read` prints a `[path#TAG]` header over 1-based numbered lines. `tilth_search` shows `path#TAG` in match headers too, so lines a search shows are editable with no read:
 
 ```
 [src/auth.ts#1A2B]

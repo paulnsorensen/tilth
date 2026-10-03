@@ -167,7 +167,11 @@ pub fn file_changed_since(path: &Path, since: SystemTime) -> bool {
 
 /// `(unchanged @ <ts>)` stub for a single path.
 pub fn unchanged_stub(path: &Path, since: SystemTime) -> String {
-    format!("# {} (unchanged @ {})", path.display(), iso_ts(since))
+    format!(
+        "# {} (unchanged @ {})",
+        crate::format::display_path(path),
+        iso_ts(since)
+    )
 }
 
 #[cfg(test)]

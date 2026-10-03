@@ -190,11 +190,12 @@ fn run_search_v2(
     }
     let mut results: Vec<(Value, Option<FileCounts>)> = Vec::with_capacity(entries.len());
     let mut hints = Vec::new();
+    let mut pending_seen = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
     for (entry, follow) in entries.iter().zip(&follows) {
         let mut counts = None;
-        let (result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
+        let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             let result = follow
                 .execute(cwd, bloom, cache)
@@ -212,7 +213,7 @@ fn run_search_v2(
                     cache,
                 )
                 .map_err(|error| SearchFailure::new(error.to_string(), "structural_error"))?;
-            let (result, file_counts) = structural_result(scan, pattern, language);
+            let (result, file_counts) = structural_result(scan, pattern, language, cwd, session);
             counts = Some(file_counts);
             (result, "structural".into(), Vec::new(), None)
         } else {
@@ -227,6 +228,7 @@ fn run_search_v2(
         };
         routes_tried.push(route);
         hints.append(&mut entry_hints);
+        pending_seen.extend(take_pending_seen(&mut result, results.len()));
         results.push((result, counts));
         if let Some(diagnostic) = diagnostic {
             normalizations.push(diagnostic);
@@ -245,6 +247,7 @@ fn run_search_v2(
     };
     let (output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
+    record_returned_seen(&output, &pending_seen, cwd, session);
     Ok(SearchRun {
         response: output,
         route,
@@ -310,9 +313,11 @@ fn parse_structural_entry(
 /// Build the result record for one structural scan, returning it with the
 /// per-file match counts the budget trim needs.
 fn structural_result(
-    scan: crate::search::StructuralScan,
+    mut scan: crate::search::StructuralScan,
     pattern: &str,
     language: &str,
+    cwd: &Path,
+    session: &Session,
 ) -> (Value, FileCounts) {
     let mut result = base_result(
         pattern,
@@ -324,6 +329,14 @@ fn structural_result(
     let total: usize = scan.file_counts.values().sum();
     result["total_matches"] = json!(total);
     result["files_matched"] = json!(scan.file_counts.len());
+    // Mint tags now; `record_returned_seen` marks lines seen once trimming settles.
+    for group in &mut scan.groups {
+        let spec = crate::read::SeenSpec::Ranges(Vec::new());
+        let path = cwd.join(group.path());
+        if let Some(tag) = crate::read::record_edit_snapshot(session, &path, &spec) {
+            group.set_tag(crate::edit::tag::format_tag(tag));
+        }
+    }
     result["items"] = json!(scan.groups);
     if scan.limited {
         result["note"] = json!(format!(
@@ -583,9 +596,14 @@ fn prefix_tier(
     let total: usize = counts.values().sum();
     let path = counts.keys().next()?;
     let matches = result["items"][0]["matches"].as_array()?;
+    let tag = result["items"][0].get("tag");
     let build = |keep: usize| {
         let mut candidate = base.clone();
-        candidate["items"] = json!([{"path": path, "matches": matches[..keep]}]);
+        let mut item = json!({"path": path, "matches": matches[..keep]});
+        if let Some(tag) = tag {
+            item["tag"] = tag.clone();
+        }
+        candidate["items"] = json!([item]);
         candidate["shown"] = json!(keep);
         candidate["note"] = json!(format!(
             "Showing the first {keep} of {total} matches in {path}. Raise budget to see more."
@@ -737,11 +755,12 @@ fn route_query(
                     cwd,
                     glob,
                     cache,
+                    session,
                 )?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
             }
-            let (result, route) = content_route(query, glob, cwd, cache, Some("path"))?;
+            let (result, route) = content_route(query, glob, cwd, cache, session, Some("path"))?;
             return Ok((result, route, Vec::new(), None));
         }
         let result = base_result(query, "path", "ok");
@@ -754,7 +773,10 @@ fn route_query(
     if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
         let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
         let mut result = raw_result(query, "regex", &search_result);
-        result["preview"] = json!(crate::search::format_raw_result(&search_result, cache)?);
+        set_preview(
+            &mut result,
+            crate::search::format_raw_result_deferred(&search_result, cache, session)?,
+        );
         return Ok((result, "regex".to_string(), Vec::new(), None));
     }
 
@@ -763,7 +785,7 @@ fn route_query(
     // signature-shaped phrase still hits the underlying symbol.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
-            let (mut result, route, hints) = route_identifier(ident, glob, cwd, cache)?;
+            let (mut result, route, hints) = route_identifier(ident, glob, cwd, cache, session)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -799,12 +821,12 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) = route_identifier(query, glob, cwd, cache)?;
+        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session)?;
         return Ok((result, route, hints, None));
     }
 
     // 6. literal — content search (non-identifier phrases only).
-    let (result, route) = content_route(query, glob, cwd, cache, None)?;
+    let (result, route) = content_route(query, glob, cwd, cache, session, None)?;
     Ok((result, route, Vec::new(), None))
 }
 
@@ -817,6 +839,7 @@ fn route_identifier(
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
+    session: &Session,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
     let sym_result = crate::search::search_symbol_raw_cached(query, cwd, glob, cache)?;
     let discovery_partial = sym_result.files_unreadable > 0
@@ -872,6 +895,7 @@ fn route_identifier(
             cwd,
             glob,
             cache,
+            session,
         )?;
         if discovery_partial {
             mark_partial(&mut result);
@@ -889,16 +913,22 @@ fn route_identifier(
         }
         result["candidates"] = json!(candidates(&code_defs, cwd));
         if content_result.total_found > 0 {
-            result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
+            set_preview(
+                &mut result,
+                crate::search::format_raw_result_deferred(&content_result, cache, session)?,
+            );
         }
         return Ok((result, "ambiguous".to_string(), Vec::new()));
     }
     if sym_result.total_found > 0 {
         let mut result = raw_result(query, "literal", &sym_result);
-        result["preview"] = json!(crate::search::format_raw_result(&sym_result, cache)?);
+        set_preview(
+            &mut result,
+            crate::search::format_raw_result_deferred(&sym_result, cache, session)?,
+        );
         return Ok((result, "literal".to_string(), Vec::new()));
     }
-    let (mut result, route) = content_route(query, glob, cwd, cache, None)?;
+    let (mut result, route) = content_route(query, glob, cwd, cache, session, None)?;
     if sym_result.files_unreadable > 0 {
         mark_partial(&mut result);
     }
@@ -914,6 +944,7 @@ fn content_route(
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
+    session: &Session,
     route_name: Option<&str>,
 ) -> Result<(Value, String), crate::error::TilthError> {
     let content_result = crate::search::search_content_raw(query, cwd, glob)?;
@@ -924,7 +955,10 @@ fn content_route(
     });
     let mut result = raw_result(query, route, &content_result);
     if content_result.total_found > 0 {
-        result["preview"] = json!(crate::search::format_raw_result(&content_result, cache)?);
+        set_preview(
+            &mut result,
+            crate::search::format_raw_result_deferred(&content_result, cache, session)?,
+        );
     }
     Ok((result, route.to_string()))
 }
@@ -1024,8 +1058,9 @@ fn unique_hit(
     cwd: &Path,
     glob: Option<&str>,
     cache: &OutlineCache,
+    session: &Session,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let (source_path, line, name, body, core_partial) = if resolved_as == "path" {
+    let (source_path, line, name, body, core_partial, shown) = if resolved_as == "path" {
         let content = std::fs::read_to_string(target_path).map_err(|source| {
             crate::error::TilthError::IoError {
                 path: target_path.to_path_buf(),
@@ -1034,7 +1069,15 @@ fn unique_hit(
         })?;
         let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
         let core_partial = content.lines().count() > 60;
-        (target_path.to_path_buf(), None, None, body, core_partial)
+        let shown_count = u32::try_from(content.lines().take(60).count()).unwrap_or(60);
+        (
+            target_path.to_path_buf(),
+            None,
+            None,
+            body,
+            core_partial,
+            (1, shown_count),
+        )
     } else {
         let (target, content, _) = match occurrence {
             Some(occurrence) => crate::search::target::resolve_candidate_with_source_occurrence(
@@ -1067,13 +1110,14 @@ fn unique_hit(
             Some(target.name),
             body,
             end - span_start + 1 > 60,
+            (span_start, span_start + (end - span_start).min(59)),
         )
     };
     let target = Target {
         path: display_rel(&source_path, cwd),
         line,
         name,
-        scope: cwd.to_string_lossy().into(),
+        scope: display_scope(cwd, cwd),
         occurrence,
         glob: glob.map(str::to_string),
     };
@@ -1083,6 +1127,13 @@ fn unique_hit(
     let mut result = base_result(query, resolved_as, "ok");
     result["core"] = json!(redact_secret_text(&source_path, body));
     result["target"] = json!(target);
+    if shown.1 >= shown.0 && !crate::search::path_is_secret_file(&source_path) {
+        let spec = crate::read::SeenSpec::Ranges(Vec::new());
+        if let Some(tag) = crate::read::record_edit_snapshot(session, &source_path, &spec) {
+            result["target"]["tag"] = json!(crate::edit::tag::format_tag(tag));
+            stage_seen(&mut result, "core", &source_path, tag, &[shown]);
+        }
+    }
     if core_partial {
         mark_partial(&mut result);
     }
@@ -1097,6 +1148,115 @@ fn is_identifier(query: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Lines shown by `field` of a result, under a snapshot minted with an empty
+/// seen set. They count as seen only if `field` survives budget trimming.
+struct PendingSeen {
+    result: usize,
+    field: String,
+    path: std::path::PathBuf,
+    tag: u16,
+    lines: Vec<(u32, u32)>,
+}
+
+/// Park the lines `field` shows on the result until trimming settles.
+fn stage_seen(result: &mut Value, field: &str, path: &Path, tag: u16, lines: &[(u32, u32)]) {
+    let staged =
+        json!({"field": field, "path": path.to_string_lossy(), "tag": tag, "lines": lines});
+    match result["seen_pending"].as_array_mut() {
+        Some(list) => list.push(staged),
+        None => result["seen_pending"] = json!([staged]),
+    }
+}
+
+fn set_preview(result: &mut Value, rendered: (String, Vec<crate::search::SeenEntry>)) {
+    let (preview, entries) = rendered;
+    result["preview"] = json!(preview);
+    for entry in entries {
+        stage_seen(result, "preview", &entry.path, entry.tag, &entry.lines);
+    }
+}
+
+/// Detach what `stage_seen` parked on a result.
+fn take_pending_seen(result: &mut Value, index: usize) -> Vec<PendingSeen> {
+    let Some(Value::Array(staged)) = result
+        .as_object_mut()
+        .and_then(|o| o.remove("seen_pending"))
+    else {
+        return Vec::new();
+    };
+    let bound = |v: &Value| u32::try_from(v.as_u64()?).ok();
+    staged
+        .iter()
+        .filter_map(|s| {
+            let lines = s["lines"]
+                .as_array()?
+                .iter()
+                .map(|r| Some((bound(&r[0])?, bound(&r[1])?)))
+                .collect::<Option<Vec<_>>>()?;
+            Some(PendingSeen {
+                result: index,
+                field: s["field"].as_str()?.to_string(),
+                path: s["path"].as_str()?.into(),
+                tag: u16::try_from(s["tag"].as_u64()?).ok()?,
+                lines,
+            })
+        })
+        .collect()
+}
+
+/// Mark seen only the lines the final response still carries: a surviving
+/// `core` or `preview`, and the matches of surviving tagged structural items.
+fn record_returned_seen(output: &str, pending: &[PendingSeen], cwd: &Path, session: &Session) {
+    if pending.is_empty() && !output.contains("\"tag\"") {
+        return;
+    }
+    let Ok(response) = serde_json::from_str::<Value>(output) else {
+        return;
+    };
+    let Some(results) = response["results"].as_array() else {
+        return;
+    };
+    let mut snapshots = session.snapshots();
+    for p in pending {
+        if results
+            .get(p.result)
+            .is_some_and(|r| r.get(p.field.as_str()).is_some())
+        {
+            let lines = p.lines.iter().flat_map(|&(s, e)| s..=e.max(s));
+            snapshots.record_seen_lines(&p.path, p.tag, lines);
+        }
+    }
+    for item in results
+        .iter()
+        .filter_map(|r| r["items"].as_array())
+        .flatten()
+    {
+        let (Some(path), Some(tag), Some(matches)) = (
+            item["path"].as_str(),
+            item["tag"].as_str().and_then(crate::edit::tag::parse_tag),
+            item["matches"].as_array(),
+        ) else {
+            continue;
+        };
+        let line = |m: &Value, i: usize| m[i].as_u64().and_then(|n| u32::try_from(n).ok());
+        let lines = matches.iter().filter_map(|m| {
+            let (start, end) = (line(m, 0)?, line(m, 1)?);
+            Some(start..=end.max(start))
+        });
+        snapshots.record_seen_lines(cwd.join(path), tag, lines.flatten());
+    }
+}
+
+/// Render a scope relative to `cwd`: `.` for cwd itself, a relative path
+/// inside it, and the absolute path only when it lies outside.
+fn display_scope(scope: &Path, cwd: &Path) -> String {
+    match scope.strip_prefix(cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".into(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => scope.display().to_string(),
+    }
 }
 
 fn display_rel(path: &Path, cwd: &Path) -> String {
@@ -1207,8 +1367,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
-        let (cache, _session, _bloom) = components();
-        let (result, route, hints) = route_identifier("root", None, tmp.path(), &cache).unwrap();
+        let (cache, session, _bloom) = components();
+        let (result, route, hints) =
+            route_identifier("root", None, tmp.path(), &cache, &session).unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -1232,6 +1393,7 @@ mod tests {
             tmp.path(),
             None,
             &OutlineCache::new(),
+            &Session::new(),
         )
         .expect("fresh symbol resolution must replace the stale candidate line");
 
@@ -1538,6 +1700,306 @@ mod tests {
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{"query": query}],
         }))
+    }
+
+    struct Harness {
+        cache: OutlineCache,
+        session: Session,
+        bloom: std::sync::Arc<BloomFilterCache>,
+        telemetry: TelemetrySink,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (telemetry, tmp) = telemetry();
+            Self {
+                cache: OutlineCache::new(),
+                session: Session::new(),
+                bloom: std::sync::Arc::new(BloomFilterCache::new()),
+                telemetry,
+                _tmp: tmp,
+            }
+        }
+
+        #[allow(clippy::needless_pass_by_value)]
+        fn search(&self, cwd: &Path, entry: Value) -> Value {
+            let args = json!({"cwd": cwd.to_str().unwrap(), "queries": [entry]});
+            let out = tool_search_v2(
+                &args,
+                &self.cache,
+                &self.session,
+                &self.bloom,
+                &self.telemetry,
+                "test-client",
+                "test-worktree",
+            )
+            .expect("search succeeds");
+            serde_json::from_str(&out).expect("valid json response")
+        }
+
+        #[allow(clippy::needless_pass_by_value)]
+        fn write(&self, cwd: &Path, section: Value) -> Result<String, String> {
+            let args = json!({"cwd": cwd.to_str().unwrap(), "edits": [section]});
+            crate::mcp::tools::write::tool_write(&args, &self.session, &self.bloom, &self.cache)
+        }
+    }
+
+    fn header_tag(preview: &str, file: &str) -> String {
+        preview
+            .split(&format!("{file}#"))
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .unwrap_or_else(|| panic!("no tag after {file}# in {preview}"))
+            .to_string()
+    }
+
+    const GO_SRC: &str =
+        "package main\n\nfunc a() {\n\tx := w.Render(p)\n}\n\nfunc b() {\n\ty := t.Render(q)\n}\n";
+
+    #[test]
+    fn search_tag_lets_replace_text_apply_without_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let h = Harness::new();
+        let found = h.search(dir.path(), json!({"query": "Render"}));
+        let preview = found["results"][0]["preview"].as_str().unwrap();
+        let tag = header_tag(preview, "r.go");
+        let out = h
+            .write(
+                dir.path(),
+                json!({"path": "r.go", "tag": tag, "ops": [
+                    {"op": "replace_text", "old": "w.Render(", "new": "w.Draw("}]}),
+            )
+            .expect("search-shown lines are editable without a read");
+        assert!(!out.contains("rejected"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            GO_SRC.replace("w.Render(", "w.Draw(")
+        );
+
+        let again = h.search(dir.path(), json!({"query": "Draw"}));
+        let preview = again["results"][0]["preview"].as_str().unwrap();
+        assert_ne!(header_tag(preview, "r.go"), tag, "new content, new tag");
+    }
+
+    #[test]
+    fn search_tag_rejects_edit_on_a_line_search_did_not_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n.txt");
+        let source = "alpha\nneedle\ngamma\ndelta\n";
+        std::fs::write(&path, source).unwrap();
+        let h = Harness::new();
+        let found = h.search(dir.path(), json!({"query": "needle"}));
+        let tag = header_tag(found["results"][0]["preview"].as_str().unwrap(), "n.txt");
+        let outcome = h.write(
+            dir.path(),
+            json!({"path": "n.txt", "tag": tag, "ops": [
+                {"op": "replace_text", "old": "delta", "new": "omega"}]}),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        let message = outcome.unwrap_or_else(|e| e);
+        assert!(
+            message.contains("seen") || message.contains("read"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unique_symbol_hit_tag_covers_the_core_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn root() {\n    let v = 1;\n}\n\nfn other() {}\n").unwrap();
+        let h = Harness::new();
+        let found = h.search(dir.path(), json!({"query": "root"}));
+        let tag = found["results"][0]["target"]["tag"]
+            .as_str()
+            .expect("unique hit target carries a tag")
+            .to_string();
+        h.write(
+            dir.path(),
+            json!({"path": "a.rs", "tag": tag, "ops": [
+                {"op": "replace_text", "old": "let v = 1;", "new": "let v = 2;"}]}),
+        )
+        .expect("core lines are editable without a read");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("let v = 2;"));
+    }
+
+    /// Run a search at `budget` tokens; `None` when the budget cannot fit the metadata.
+    fn search_at(
+        h: &Harness,
+        session: &Session,
+        cwd: &Path,
+        entry: &Value,
+        budget: u64,
+    ) -> Option<Value> {
+        let args = json!({"cwd": cwd.to_str().unwrap(), "queries": [entry], "budget": budget});
+        tool_search_v2(
+            &args,
+            &h.cache,
+            session,
+            &h.bloom,
+            &h.telemetry,
+            "test-client",
+            "test-worktree",
+        )
+        .ok()
+        .map(|out| serde_json::from_str(&out).expect("valid json response"))
+    }
+
+    /// Search `h.session` at the loosest budget where `trimmed` holds. Probes
+    /// use throwaway sessions so only the returned search records seen lines.
+    fn trimmed_search(
+        h: &Harness,
+        cwd: &Path,
+        entry: &Value,
+        trimmed: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let budget = (1..1500u64)
+            .rev()
+            .map(|step| step * 4)
+            .find(|&budget| {
+                search_at(h, &Session::new(), cwd, entry, budget)
+                    .is_some_and(|response| trimmed(&response["results"][0]))
+            })
+            .expect("some budget trims the response");
+        search_at(h, &h.session, cwd, entry, budget).unwrap()
+    }
+
+    fn head_seen(h: &Harness, path: &Path) -> std::collections::BTreeSet<u32> {
+        let head = h.session.snapshots().head(path).expect("snapshot exists");
+        head.seen_lines.iter().copied().collect()
+    }
+
+    #[test]
+    fn budget_trimmed_preview_marks_no_lines_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n.txt");
+        let source = (1..=40)
+            .map(|i| format!("needle line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, &source).unwrap();
+        let h = Harness::new();
+        let entry = json!({"query": "needle"});
+        let found = trimmed_search(&h, dir.path(), &entry, |r| r.get("preview").is_none());
+        assert_eq!(found["results"][0]["budget_limited"], true, "{found}");
+        assert!(head_seen(&h, &path).is_empty());
+
+        let tag = crate::edit::tag::format_tag(h.session.snapshots().head_tag(&path).unwrap());
+        let outcome = h.write(
+            dir.path(),
+            json!({"path": "n.txt", "tag": tag, "ops": [
+                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        let message = outcome.unwrap_or_else(|e| e);
+        assert!(
+            message.contains("seen") || message.contains("read"),
+            "{message}"
+        );
+
+        let full = h.search(dir.path(), entry);
+        let tag = header_tag(full["results"][0]["preview"].as_str().unwrap(), "n.txt");
+        h.write(
+            dir.path(),
+            json!({"path": "n.txt", "tag": tag, "ops": [
+                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+        )
+        .expect("untrimmed preview lines stay editable");
+    }
+
+    #[test]
+    fn budget_trimmed_core_marks_no_lines_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let body = (0..40)
+            .map(|i| format!("    let v{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let source = format!("fn root() {{\n{body}}}\n");
+        std::fs::write(&path, &source).unwrap();
+        let h = Harness::new();
+        let entry = json!({"query": "root"});
+        let found = trimmed_search(&h, dir.path(), &entry, |r| r.get("core").is_none());
+        let tag = found["results"][0]["target"]["tag"].as_str().unwrap();
+        assert!(head_seen(&h, &path).is_empty());
+        let outcome = h.write(
+            dir.path(),
+            json!({"path": "a.rs", "tag": tag, "ops": [
+                {"op": "replace_text", "old": "let v1 = 1;", "new": "let v1 = 9;"}]}),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(outcome.is_err() || outcome.unwrap().contains("seen"));
+    }
+
+    #[test]
+    fn structural_prefix_marks_only_returned_matches_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        let calls = (0..30)
+            .map(|i| format!("\tx{i} := w.Render(p{i})\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::write(&path, format!("package main\n\nfunc a() {{\n{calls}}}\n")).unwrap();
+        let h = Harness::new();
+        let entry = json!({"pattern": "$R.Render($W)", "language": "go"});
+        let found = trimmed_search(&h, dir.path(), &entry, |r| {
+            r["view"] == "matches" && r["shown"].is_number()
+        });
+        let item = &found["results"][0]["items"][0];
+        let matches = item["matches"].as_array().unwrap();
+        assert!(!matches.is_empty() && matches.len() < 30, "{found}");
+        let returned: std::collections::BTreeSet<u32> = matches
+            .iter()
+            .map(|m| u32::try_from(m[0].as_u64().unwrap()).unwrap())
+            .collect();
+        assert_eq!(head_seen(&h, &path), returned);
+    }
+
+    #[test]
+    fn hint_scope_is_dot_and_echoes_round_trip() {
+        let (tmp, initial) = continuation_fixture();
+        let cwd = tmp.path().to_str().unwrap();
+        let hints = initial["hints"].as_array().unwrap();
+        assert_eq!(hints.len(), 4, "{initial}");
+        for hint in hints {
+            let target = hint["target"].as_object().unwrap();
+            assert_eq!(target["scope"], ".", "{hint}");
+            assert!(target.values().all(|v| !v.is_null()), "{hint}");
+            let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
+            assert_eq!(followed["results"][0]["status"], "ok", "{followed}");
+        }
+    }
+
+    #[test]
+    fn display_scope_is_relative_inside_cwd_and_absolute_outside() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(display_scope(cwd, cwd), ".");
+        assert_eq!(display_scope(&cwd.join("src/a"), cwd), "src/a");
+        assert_eq!(display_scope(Path::new("/elsewhere"), cwd), "/elsewhere");
+    }
+
+    #[test]
+    fn outline_only_search_records_nothing() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.rs");
+        let mut source = String::new();
+        for i in 0..600 {
+            let _ = writeln!(source, "fn pad{i}() {{\n    let _ = {i};\n}}\n");
+        }
+        source.push_str("fn host() {\n    marker_call();\n    marker_call();\n}\n");
+        std::fs::write(&path, &source).unwrap();
+        let h = Harness::new();
+        let found = h.search(dir.path(), json!({"query": "marker_call"}));
+        let preview = found["results"][0]["preview"].as_str().unwrap();
+        assert!(!preview.contains("big.rs#"), "{preview}");
+        assert!(h.session.snapshots().head_tag(&path).is_none());
     }
 
     #[test]

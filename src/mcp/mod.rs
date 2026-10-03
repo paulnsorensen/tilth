@@ -512,6 +512,138 @@ mod tests {
         );
     }
 
+    /// A read inside `cwd` prints the cwd-relative path in its `[path#TAG]`
+    /// line, and that relative path plus tag round-trips into `tilth_write`.
+    #[test]
+    fn relative_read_tag_round_trips_into_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.txt"), "alpha\nbeta\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new();
+
+        let read = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["sub/a.txt"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(!read.contains(cwd), "in-cwd path must be relative: {read}");
+        let tag = read
+            .lines()
+            .find_map(|l| l.strip_prefix("[sub/a.txt#")?.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("relative tag line missing: {read}"));
+
+        let write = dispatch_tool(
+            "tilth_write",
+            &serde_json::json!({
+                "cwd": cwd,
+                "edits": [{ "path": "sub/a.txt", "tag": tag,
+                    "ops": [{ "op": "replace_text", "old": "beta", "new": "BETA" }] }]
+            }),
+            &services,
+        )
+        .unwrap();
+        assert!(write.starts_with("## sub/a.txt\napplied"), "{write}");
+        assert!(!write.contains(cwd), "{write}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/a.txt")).unwrap(),
+            "alpha\nBETA\n"
+        );
+    }
+
+    /// File content that mentions the absolute cwd must never be rewritten:
+    /// only path labels (headers, tags, receipts) render relative.
+    #[test]
+    fn content_containing_cwd_is_not_rewritten_in_any_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let source = format!("pub const ROOT: &str = \"{cwd}/data\";\n\npub fn f() {{}}\n");
+        std::fs::write(dir.path().join("c.rs"), &source).unwrap();
+        let needle = format!("{cwd}/data");
+        let services = Services::new();
+
+        for mode in ["signature", "stripped", "full"] {
+            let out = dispatch_tool(
+                "tilth_read",
+                &serde_json::json!({ "paths": ["c.rs"], "mode": mode, "cwd": cwd }),
+                &services,
+            )
+            .unwrap();
+            assert!(
+                out.contains(&needle),
+                "{mode} view lost the absolute path: {out}"
+            );
+            let header = out.lines().next().unwrap();
+            assert!(
+                !header.contains(cwd),
+                "{mode} header must be relative: {header}"
+            );
+        }
+
+        let read = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["c.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        let tag = read
+            .lines()
+            .find_map(|l| l.strip_prefix("[c.rs#")?.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("relative tag line missing: {read}"));
+        let err = dispatch_tool(
+            "tilth_write",
+            &serde_json::json!({
+                "cwd": cwd,
+                "edits": [{ "path": "c.rs", "tag": tag,
+                    "ops": [{ "op": "replace_text", "old": format!("{cwd}/missing"), "new": "x" }] }]
+            }),
+            &services,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&format!("{cwd}/missing")),
+            "error must echo `old` verbatim: {err}"
+        );
+    }
+
+    /// A path outside `cwd` stays absolute in read and write output.
+    #[test]
+    fn outside_cwd_path_stays_absolute() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("o.txt");
+        std::fs::write(&outside, "one\ntwo\n").unwrap();
+        let cwd = cwd_dir.path().to_str().unwrap();
+        let abs = outside.to_str().unwrap();
+        let services = Services::new();
+
+        let read = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": [abs], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        let tag_line = read
+            .lines()
+            .find(|l| l.starts_with('[') && l.contains('#'))
+            .unwrap();
+        assert!(tag_line.starts_with(&format!("[{abs}#")), "{read}");
+        let tag = tag_line.rsplit_once('#').unwrap().1.trim_end_matches(']');
+
+        let write = dispatch_tool(
+            "tilth_write",
+            &serde_json::json!({
+                "cwd": cwd,
+                "edits": [{ "path": abs, "tag": tag,
+                    "ops": [{ "op": "replace_text", "old": "two", "new": "TWO" }] }]
+            }),
+            &services,
+        )
+        .unwrap();
+        assert!(write.starts_with(&format!("## {abs}\napplied")), "{write}");
+    }
+
     #[test]
     fn unregistered_tool_names_get_the_plain_unknown_tool_error() {
         let services = Services::new();
@@ -771,7 +903,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1966,
+            1976,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -1569,7 +1701,8 @@ mod tests {
         );
 
         // Miss must use the qualified `path#symbol` form in the footer.
-        let qualified = format!("{}#ghost_symbol", p2.display());
+        // These tests anchor at cwd `/`, so labels drop the leading slash.
+        let qualified = format!("{}#ghost_symbol", p2.strip_prefix("/").unwrap().display());
         assert!(
             nf_section.contains(&qualified),
             "missing symbol must appear as `<path>#<symbol>` in footer: {nf_section}"

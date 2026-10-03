@@ -107,7 +107,10 @@ fn absolute_lexical(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn blocked_notice(path: &Path) -> String {
-    format!("# {}\nblocked: denied by .tilthignore", path.display())
+    format!(
+        "# {}\nblocked: denied by .tilthignore",
+        format::display_path(path)
+    )
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -228,10 +231,10 @@ pub fn read_file(
 
     // Canonical full-content view — shared by the small-file gate and OGATE below.
     let full_view = || {
-        let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
-            edit_whole_view(path, &content, &header)
+            edit_whole_view(path, &content, byte_len, line_count)
         } else {
+            let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
             format!("{header}\n\n{content}")
         }
     };
@@ -540,21 +543,24 @@ struct Block {
     text: String,
 }
 
-/// Edit-mode whole-file view: tilth's `# path (...) [full]` header, then the
-/// whole-file-tag section header `[path#TAG]` and `N:content` numbered lines
-/// (`split('\n')`, phantom trailing row included). Files over the per-file
-/// snapshot cap mint no tag (spec) — they render numbered lines with a plain
-/// `# <path>` marker so the model can read but not tag-verify an edit.
-fn edit_whole_view(path: &Path, content: &str, file_header: &str) -> String {
+/// Edit-mode whole-file view: tilth's `# (N lines, ...) [full]` stats header,
+/// then the whole-file-tag section header `[path#TAG]` (the only place the
+/// path appears) and `N:content` numbered lines (`split('\n')`, phantom
+/// trailing row included). Files over the per-file snapshot cap mint no tag
+/// (spec) — they render numbered lines under the full `# <path> (...)` header
+/// and a plain marker so the model can read but not tag-verify an edit.
+fn edit_whole_view(path: &Path, content: &str, byte_len: u64, line_count: u32) -> String {
     let numbered = crate::edit::tag::render_numbered_whole(content);
     if content.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP {
+        let file_header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         return format!(
             "{file_header}\n\n# {} (too large to tag; edits cannot be tag-verified)\n{numbered}",
-            path.display()
+            format::display_path(path)
         );
     }
+    let file_header = format::tagged_file_header(byte_len, line_count, ViewMode::Full);
     let tag = crate::edit::tag::compute_file_hash(content);
-    let tag_header = crate::edit::tag::format_header(&path.display().to_string(), tag);
+    let tag_header = crate::edit::tag::format_header(&format::display_path(path), tag);
     format!("{file_header}\n\n{tag_header}\n{numbered}")
 }
 
@@ -570,18 +576,21 @@ pub enum SeenSpec {
 /// store, tagged by the file's live content and stamped with the line numbers
 /// the read displayed. Best-effort: an unreadable file (binary, deleted mid-
 /// call) records nothing. Keyed by canonical realpath so a later `tilth_write`
-/// finds the snapshot regardless of path spelling.
-pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec: &SeenSpec) {
+/// finds the snapshot regardless of path spelling. Returns the minted tag, or
+/// `None` when nothing was recorded.
+pub fn record_edit_snapshot(
+    session: &crate::session::Session,
+    path: &Path,
+    spec: &SeenSpec,
+) -> Option<u16> {
     // `SnapshotStore::record` drops anything over the per-file cap — skip
     // the full-file read and seen materialization entirely for those.
     let over_cap = fs::metadata(path)
         .is_ok_and(|m| m.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP as u64);
     if over_cap {
-        return;
+        return None;
     }
-    let Ok(text) = fs::read_to_string(path) else {
-        return;
-    };
+    let text = fs::read_to_string(path).ok()?;
     let seen: Vec<u32> = match spec {
         SeenSpec::Whole => {
             let n = u32::try_from(text.split('\n').count()).unwrap_or(u32::MAX);
@@ -589,7 +598,7 @@ pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec
         }
         SeenSpec::Ranges(ranges) => ranges.iter().flat_map(|&(s, e)| s..=e.max(s)).collect(),
     };
-    session.record_snapshot(path, &text, seen);
+    session.record_snapshot(path, &text, seen)
 }
 
 /// Resolve a markdown `#heading` anchor to its 1-based inclusive line span,
@@ -644,7 +653,7 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
         let whole = String::from_utf8_lossy(buf);
         let tag = crate::edit::tag::compute_file_hash(&whole);
         Some(crate::edit::tag::format_header(
-            &path.display().to_string(),
+            &format::display_path(path),
             tag,
         ))
     } else {
@@ -686,11 +695,14 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
         });
     }
 
-    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
-    // In edit mode the tag header sits between the file header and the blocks.
+    // In edit mode the stats header drops the path: the tag header that
+    // follows names the file.
     let header = match &tag_header {
-        Some(t) => format!("{header}\n\n{t}"),
-        None => header,
+        Some(t) => format!(
+            "{}\n\n{t}",
+            format::tagged_file_header(total_bytes, total_lines, ViewMode::Section)
+        ),
+        None => format::file_header(path, total_bytes, total_lines, ViewMode::Section),
     };
 
     if blocks.len() == 1 {

@@ -73,11 +73,24 @@ impl Serialize for Match {
     }
 }
 
-/// Sorted matches of one file. Wire form: `{path, matches}`.
+/// Sorted matches of one file. Wire form: `{path, tag?, matches}`; `tag` is the
+/// whole-file edit tag when the caller minted one.
 #[derive(Serialize)]
 pub(crate) struct FileMatches {
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
     matches: Vec<Match>,
+}
+
+impl FileMatches {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn set_tag(&mut self, tag: String) {
+        self.tag = Some(tag);
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +237,7 @@ impl StructuralPatterns {
                 Some(group) if group.path == path => group.matches.push(hit),
                 _ => scan.groups.push(FileMatches {
                     path,
+                    tag: None,
                     matches: vec![hit],
                 }),
             }
@@ -405,7 +419,13 @@ impl PatternLanguage {
 
     fn compile(&self, source: &str) -> Result<Pattern, String> {
         if self.preamble.is_empty() {
-            return Pattern::try_new(source, self.clone()).map_err(|error| error.to_string());
+            let plain = Pattern::try_new(source, self.clone()).map_err(|error| error.to_string());
+            if self.support == SupportLang::Go && self.go_needs_function_context(source) {
+                if let Ok(contextual) = self.compile_in_go_function(source) {
+                    return Ok(contextual);
+                }
+            }
+            return plain;
         }
         // ast-grep selects a pattern node from the document root, which holds the
         // preamble. Select the node by kind instead.
@@ -413,6 +433,47 @@ impl PatternLanguage {
         let document = StrDoc::try_new(&processed, self.clone())?;
         let kind = self.select(&document.tree)?.kind().to_string();
         Pattern::contextual(source, &kind, self.clone()).map_err(|error| error.to_string())
+    }
+
+    /// Go parses a top-level `a.b(c)` as a type conversion, and a bare call
+    /// fails to parse at all. Such patterns only parse as calls inside a body.
+    fn go_needs_function_context(&self, source: &str) -> bool {
+        let processed = self.pre_process_pattern(source);
+        StrDoc::try_new(&processed, self.clone())
+            .ok()
+            .and_then(|document| {
+                self.select(&document.tree)
+                    .ok()
+                    .map(|node| node.kind() == "type_conversion_expression")
+            })
+            .unwrap_or(true)
+    }
+
+    fn compile_in_go_function(&self, source: &str) -> Result<Pattern, String> {
+        let context = format!("package p\nfunc _() {{\n{source}\n}}");
+        let processed = self.pre_process_pattern(&context);
+        let document = StrDoc::try_new(&processed, self.clone())?;
+        let root = document.tree.root_node();
+        let mut cursor = root.walk();
+        let function = root
+            .children(&mut cursor)
+            .find(|child| child.kind() == "function_declaration")
+            .ok_or("structural pattern must be a single node")?;
+        let mut node = function
+            .child_by_field_name("body")
+            .ok_or("structural pattern must be a single node")?;
+        if node.has_error() {
+            return Err("syntax error or missing syntax in structural pattern".into());
+        }
+        if node.named_child_count() != 1 {
+            return Err("structural pattern must be a single node".into());
+        }
+        node = node.named_child(0).unwrap();
+        while node.child_count() == 1 {
+            node = node.child(0).unwrap();
+        }
+        let kind = node.kind().to_string();
+        Pattern::contextual(&context, &kind, self.clone()).map_err(|error| error.to_string())
     }
 
     /// Select the pattern node, mirroring `single_matcher` in pinned ast-grep-core

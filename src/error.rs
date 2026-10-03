@@ -5,23 +5,23 @@ use thiserror::Error;
 /// Every error tilth can produce. Displayed as user-facing messages with suggestions.
 #[derive(Debug, Error)]
 pub enum TilthError {
-    #[error("not found: {}{}", path.display(), suggestion.as_deref().map_or(String::new(), |s| format!(" — did you mean: {s}")))]
+    #[error("not found: {}{}", crate::format::display_path(path), suggestion.as_deref().map_or(String::new(), |s| format!(" — did you mean: {s}")))]
     NotFound {
         path: PathBuf,
         suggestion: Option<String>,
     },
-    #[error("{} [permission denied]", path.display())]
+    #[error("{} [permission denied]", crate::format::display_path(path))]
     PermissionDenied { path: PathBuf },
-    #[error("{} [denied by .tilthignore]", path.display())]
+    #[error("{} [denied by .tilthignore]", crate::format::display_path(path))]
     IgnoreDenied { path: PathBuf },
     #[error("invalid query \"{query}\": {reason}")]
     InvalidQuery { query: String, reason: String },
-    #[error("{}: {source}", path.display())]
+    #[error("{}: {source}", crate::format::display_path(path))]
     IoError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("parse error in {}: {reason}", path.display())]
+    #[error("parse error in {}: {reason}", crate::format::display_path(path))]
     ParseError { path: PathBuf, reason: String },
     /// A whole-file-tag edit was rejected: the section's tag no longer matches
     /// live content and recovery declined (Drift), the tag was never minted this

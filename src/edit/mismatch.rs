@@ -47,9 +47,10 @@ pub enum MismatchError {
     /// The expected tag was recorded this session, but the live file hashes to
     /// something else and recovery declined the merge.
     #[error(
-        "Edit rejected for {path}: file changed between read and edit. \
+        "Edit rejected for {p}: file changed between read and edit. \
              Section is bound to #{expected_tag:04X}, but the current file hashes to \
-             #{actual_tag:04X}. Re-read to refresh the tag before retrying."
+             #{actual_tag:04X}. Re-read to refresh the tag before retrying.",
+        p = crate::format::display_path_str(path)
     )]
     Drift {
         path: String,
@@ -59,8 +60,9 @@ pub enum MismatchError {
     /// The expected tag was never recorded — likely a hallucinated tag or one
     /// reused from a prior session.
     #[error(
-        "Edit rejected for {path}: tag #{expected_tag:04X} is not from this session. \
-             Re-read the file to copy a current [path#tag] header — never invent a tag."
+        "Edit rejected for {p}: tag #{expected_tag:04X} is not from this session. \
+             Re-read the file to copy a current [path#tag] header — never invent a tag.",
+        p = crate::format::display_path_str(path)
     )]
     Fabricated { path: String, expected_tag: u16 },
     /// An edit anchored on a line the read never displayed under this tag. Names
@@ -69,9 +71,10 @@ pub enum MismatchError {
     /// is the smallest span joining `line` to the nearest displayed range, capped
     /// at 60 lines.
     #[error(
-        "Edit rejected for {path}: line {line} was never displayed under this tag \
-             (displayed: {}). Re-read {path}#{reread_lo}-{reread_hi} to cover line {line}.",
-        format_ranges(displayed, *line)
+        "Edit rejected for {p}: line {line} was never displayed under this tag \
+             (displayed: {}). Re-read {p}#{reread_lo}-{reread_hi} to cover line {line}.",
+        format_ranges(displayed, *line),
+        p = crate::format::display_path_str(path)
     )]
     UnseenAnchor {
         path: String,
@@ -86,8 +89,9 @@ pub enum MismatchError {
     /// Carries the [`ApplyError`] itself so callers can branch on which kind of
     /// match failure it was, rather than parsing its rendered text.
     #[error(
-        "Edit rejected for {path}: {source}. The file also changed since the read \
-             that minted this tag — re-read to refresh it."
+        "Edit rejected for {p}: {source}. The file also changed since the read \
+             that minted this tag — re-read to refresh it.",
+        p = crate::format::display_path_str(path)
     )]
     TextMatch {
         path: String,
