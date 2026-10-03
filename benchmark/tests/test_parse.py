@@ -62,7 +62,7 @@ def test_tool_batch_sizes_records_batchable_calls_in_order():
     """Batch-size capture is the needle for batching instrumentation: array
     params record their length; the upstream singular fallbacks (path/query)
     count as 1; both write shapes (upstream files, fork edits) are covered;
-    non-batchable tools (Bash, Glob, tilth_deps) are excluded entirely."""
+    non-batchable tools (Bash, Glob, tilth_files) are excluded entirely."""
     events = [
         _tool_use_event("mcp__tilth__tilth_read", {"paths": ["a.rs", "b.rs", "c.rs"]}, "t1"),
         _tool_use_event("mcp__tilth__tilth_read", {"path": "d.rs"}, "t2"),
@@ -73,7 +73,7 @@ def test_tool_batch_sizes_records_batchable_calls_in_order():
                                    {"path": "c", "ops": []}]}, "t5"),
         _tool_use_event("Bash", {"command": "ls"}, "t6"),
         _tool_use_event("Glob", {"pattern": "**/*.rs", "path": "src"}, "t7"),
-        _tool_use_event("mcp__tilth__tilth_deps", {"path": "src/cache.rs"}, "t8"),
+        _tool_use_event("mcp__tilth__tilth_files", {"pattern": "*.rs"}, "t8"),
         _result_event(),
     ]
 

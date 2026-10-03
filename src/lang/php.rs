@@ -1,6 +1,6 @@
 //! PHP language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(function_call_expression function: (name) @callee)\n",
@@ -18,8 +18,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_php::LANGUAGE_PHP),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &["composer.json"],
     has_lifetimes: false,
     strip_family: None,

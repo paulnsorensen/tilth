@@ -1,6 +1,6 @@
 //! JavaScript language spec. Shares callee/sibling queries with TS/TSX.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 /// Callee query shared by JavaScript, TypeScript, and TSX.
 pub(crate) const CALLEE_QUERY: &str = concat!(
@@ -22,8 +22,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_javascript::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &["package.json"],
     has_lifetimes: false,
     strip_family: Some(StripFamily::JsTs),

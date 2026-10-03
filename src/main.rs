@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
 use clap::{CommandFactory, Parser};
@@ -67,12 +67,8 @@ struct Cli {
     glob: Option<String>,
 
     /// Find all callers of a symbol.
-    #[arg(long, conflicts_with = "deps")]
+    #[arg(long)]
     callers: bool,
-
-    /// Analyze blast-radius dependencies of a file.
-    #[arg(long, conflicts_with = "callers")]
-    deps: bool,
 
     /// Print shell completions for the given shell.
     #[arg(long, value_name = "SHELL")]
@@ -179,28 +175,6 @@ fn main() {
         return;
     }
 
-    // Deps mode
-    if cli.deps {
-        let path = if Path::new(&query).is_absolute() {
-            PathBuf::from(&query)
-        } else {
-            let scope_path = scope.join(&query);
-            if scope_path.exists() {
-                scope_path
-            } else {
-                let cwd_path = current_dir_or_log().join(&query);
-                if cwd_path.exists() {
-                    cwd_path
-                } else {
-                    scope_path // fall back, let analyze_deps report the error
-                }
-            }
-        };
-        let result = tilth::run_deps(&path, &scope, cli.budget);
-        emit_result(result, &query, cli.json, is_tty);
-        return;
-    }
-
     let result = if expand > 0 {
         tilth::run_expanded(
             &query,
@@ -234,16 +208,6 @@ fn main() {
     };
 
     emit_result(result, &query, cli.json, is_tty);
-}
-
-fn current_dir_or_log() -> PathBuf {
-    match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("tilth: failed to read current dir: {e}");
-            PathBuf::new()
-        }
-    }
 }
 
 fn emit_result(

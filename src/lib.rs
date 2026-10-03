@@ -159,18 +159,6 @@ pub fn run_callers(
     }
 }
 
-/// Analyze blast-radius dependencies of a file.
-pub fn run_deps(
-    path: &Path,
-    scope: &Path,
-    budget_tokens: Option<u64>,
-) -> Result<String, TilthError> {
-    let bloom = index::bloom::BloomFilterCache::new();
-    let result = search::deps::analyze_deps(path, scope, &bloom)?;
-    let budget_usize = budget_tokens.map(|b| b as usize);
-    Ok(search::deps::format_deps(&result, scope, budget_usize))
-}
-
 fn run_inner(
     query: &str,
     scope: &Path,

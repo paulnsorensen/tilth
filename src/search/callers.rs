@@ -82,6 +82,7 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
 /// Returns tuples of (`target_name`, match) so callers know which symbol was matched,
 /// plus the count of code files the walk could not read.
+#[cfg(test)]
 pub(crate) fn find_callers_batch(
     targets: &HashSet<String>,
     scope: &Path,

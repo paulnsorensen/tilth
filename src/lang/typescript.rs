@@ -1,7 +1,7 @@
 //! TypeScript language spec. Shares callee/sibling queries with JS/TSX.
 
 use crate::lang::javascript::{CALLEE_QUERY, SIBLING_QUERY};
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "TypeScript",
@@ -10,8 +10,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: Some(StripFamily::JsTs),

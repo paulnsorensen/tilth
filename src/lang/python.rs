@@ -1,6 +1,6 @@
-//! Python language spec. Diverges on: stdlib first-segment rule (`.` separator).
+//! Python language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call function: (identifier) @callee)\n",
@@ -9,33 +9,6 @@ const CALLEE_QUERY: &str = concat!(
 
 const SIBLING_QUERY: &str = "(attribute object: (identifier) @obj attribute: (identifier) @ref)\n";
 
-/// Common stdlib modules — not exhaustive, but covers the noisy ones.
-const STDLIB_MODULES: &[&str] = &[
-    "os",
-    "sys",
-    "re",
-    "json",
-    "math",
-    "time",
-    "datetime",
-    "pathlib",
-    "typing",
-    "collections",
-    "functools",
-    "itertools",
-    "abc",
-    "io",
-    "logging",
-    "unittest",
-    "dataclasses",
-    "enum",
-    "copy",
-    "hashlib",
-    "subprocess",
-    "threading",
-    "asyncio",
-];
-
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Python",
     extensions: &["py", "pyi"],
@@ -43,8 +16,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_python::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::PythonSegment(STDLIB_MODULES),
-    scoped_imports: true,
     manifests: &["pyproject.toml", "setup.py"],
     has_lifetimes: false,
     strip_family: Some(StripFamily::Python),

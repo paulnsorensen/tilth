@@ -1,6 +1,6 @@
 //! Ruby language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = "(call method: (identifier) @callee)\n";
 
@@ -11,8 +11,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_ruby::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: None,

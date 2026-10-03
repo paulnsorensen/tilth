@@ -14,7 +14,7 @@ mod iso;
 mod path_suffix;
 mod tools;
 
-use tools::{tool_definitions, tool_deps, tool_read, tool_search_v2, tool_write};
+use tools::{tool_definitions, tool_read, tool_search_v2, tool_write};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -59,7 +59,7 @@ impl Services {
         &self.telemetry
     }
 
-    /// The deps-index cache key: the client-declared name normalized at
+    /// The telemetry client key: the client-declared name normalized at
     /// `initialize`, or a stable fallback when the host omitted `clientInfo`.
     fn client_key(&self) -> &str {
         self.client_profile
@@ -112,14 +112,9 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
-/// Normalizes an MCP client's declared name into a filesystem-safe, stable
-/// deps-index cache key: lowercase, internal whitespace runs collapsed to
-/// `-`. Absent or blank names fall back to a stable placeholder so the
-/// deps-index path stays deterministic even when a host omits `clientInfo`.
-// The dash/lowercase normalization here is the display-facing client key
-// (used as a redb cache-directory component name); `deps::paths::normalize_client_key`
-// is a separate function that applies the actual filesystem-safe sanitization
-// downstream, in `redb_path`.
+/// Normalizes an MCP client's declared name into a stable telemetry client
+/// key: lowercase, internal whitespace runs collapsed to `-`. Absent or blank
+/// names fall back to a stable placeholder when a host omits `clientInfo`.
 fn normalize_client_key(name: Option<&str>) -> String {
     match name.map(str::trim) {
         Some(n) if !n.is_empty() => n
@@ -319,7 +314,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     // Budget validation only applies to tools that honour the budget param.
     // tilth_write ignores budget; rejecting budget:0 for it
     // produces a confusing read-oriented error on non-read operations.
-    let budget_aware = matches!(tool, "tilth_read" | "tilth_deps");
+    let budget_aware = tool == "tilth_read";
     if budget_aware {
         if let Some(b) = args.get("budget") {
             if !matches!(b.as_u64(), Some(n) if n >= 1) {
@@ -333,7 +328,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     let result = match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session()),
         "tilth_search" => dispatch_search_v2(args, services),
-        "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_write" => tool_write(args, services.session(), services.bloom(), services.cache()),
         _ => Err(format!("unknown tool: {tool}")),
     };
@@ -350,14 +344,9 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     result.map(|body| append_nudge(body, tip))
 }
 
-/// Search owns dependency refresh so coverage and output use the same evidence.
 fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, String> {
     let client = services.client_key();
-    let worktree = args
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(|cwd| crate::index::deps::worktree_key(Path::new(cwd)))
-        .unwrap_or_default();
+    let worktree = args.get("cwd").and_then(Value::as_str).unwrap_or_default();
     tool_search_v2(
         args,
         services.cache(),
@@ -365,7 +354,7 @@ fn dispatch_search_v2(args: &Value, services: &Services) -> Result<String, Strin
         services.bloom(),
         services.telemetry(),
         client,
-        &worktree,
+        worktree,
     )
 }
 
@@ -607,11 +596,11 @@ mod tests {
             if path == "b.rs" {
                 // Errored non-batchable call between the two reads.
                 dispatch_tool(
-                    "tilth_deps",
-                    &serde_json::json!({ "path": "x.rs" }),
+                    "tilth_write",
+                    &serde_json::json!({ "edits": [] }),
                     &services,
                 )
-                .expect_err("deps without cwd must error");
+                .expect_err("write without cwd must error");
             }
             let body = dispatch_tool(
                 "tilth_read",
@@ -681,7 +670,6 @@ mod tests {
                 "tilth_search",
                 serde_json::json!({ "queries": [{ "query": "x" }] }),
             ),
-            ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
             (
                 "tilth_write",
                 serde_json::json!({ "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 1 }] }] }),
@@ -1129,13 +1117,10 @@ mod tests {
         let response: Value = serde_json::from_str(&result).unwrap();
         let hints = response["hints"].as_array().unwrap();
         assert!(
-            hints.iter().any(|h| h["kind"] != "fetch_dependencies"),
+            !hints.is_empty(),
             "search must emit a followable hint: {hints:?}"
         );
         for hint in hints {
-            if hint["kind"] == "fetch_dependencies" {
-                continue;
-            }
             let follow = serde_json::json!({"cwd": dir.path(), "queries": [{"follow": hint}]});
             for _ in 0..2 {
                 let response = dispatch_tool("tilth_search", &follow, &services).unwrap();
@@ -1155,137 +1140,6 @@ mod tests {
             witness.count(),
             cold,
             "symbol read reparses the shared snapshot"
-        );
-    }
-
-    #[test]
-    fn documents_python_dependencies_reuse_trees_and_refresh_reexports() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
-        std::fs::create_dir_all(dir.path().join("src/pkg/sub")).unwrap();
-        let fixtures = [
-            (
-                "src/consumer.py",
-                "from pkg import exported\ndef py_target():\n    return exported()\n",
-            ),
-            ("src/pkg/__init__.py", "from .sub import exported\n"),
-            (
-                "src/pkg/sub/__init__.py",
-                "from .old import old_name as exported\n",
-            ),
-            ("src/pkg/sub/old.py", "def old_name():\n    return 1\n"),
-            ("src/pkg/sub/new.py", "def new_name():\n    return 2\n"),
-        ];
-        let sources: Vec<_> = fixtures
-            .iter()
-            .map(|(path, body)| {
-                let source = format!("# {} {path}\n{body}", dir.path().display());
-                std::fs::write(dir.path().join(path), &source).unwrap();
-                source
-            })
-            .collect();
-        let witnesses: Vec<_> = sources
-            .iter()
-            .map(|s| crate::lang::treesitter::ParseWitness::new(s))
-            .collect();
-        let services = Services::new();
-        let search = |name: &str| -> Value {
-            let args = serde_json::json!({"cwd": dir.path(), "queries": [{"query": name}]});
-            serde_json::from_str(&dispatch_tool("tilth_search", &args, &services).unwrap()).unwrap()
-        };
-        let first = search("py_target");
-        assert_eq!(
-            first["results"][0]["dependency_impact"]["imports"],
-            serde_json::json!(["src/pkg/__init__.py", "src/pkg/sub/old.py"])
-        );
-        assert_eq!(
-            first["results"][0]["dependency_impact"]["coverage"],
-            "complete"
-        );
-        let cold: Vec<_> = witnesses
-            .iter()
-            .map(crate::lang::treesitter::ParseWitness::count)
-            .collect();
-        assert!(cold.iter().all(|count| *count > 0));
-        let hint = first["hints"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|hint| hint["kind"] == "fetch_dependencies")
-            .unwrap();
-        for _ in 0..2 {
-            let repeated = search("py_target");
-            assert_eq!(
-                repeated["results"][0]["dependency_impact"]["imports"],
-                first["results"][0]["dependency_impact"]["imports"]
-            );
-            let follow = serde_json::json!({"cwd": dir.path(), "queries": [{"follow": hint}]});
-            let result: Value =
-                serde_json::from_str(&dispatch_tool("tilth_search", &follow, &services).unwrap())
-                    .unwrap();
-            assert_eq!(
-                result["results"][0]["dependency_impact"]["imports"],
-                first["results"][0]["dependency_impact"]["imports"]
-            );
-            let warm: Vec<_> = witnesses
-                .iter()
-                .map(crate::lang::treesitter::ParseWitness::count)
-                .collect();
-            assert_eq!(
-                warm, cold,
-                "warm Python search/follow reparses target or initializer"
-            );
-        }
-        assert_eq!(cold, vec![1; fixtures.len()]);
-        assert!(
-            search("old_name")["results"][0]["dependency_impact"]["dependents"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("src/consumer.py"))
-        );
-        let updated = format!(
-            "# {} replacement\nfrom .new import new_name as exported\n",
-            dir.path().display()
-        );
-        let changed = crate::lang::treesitter::ParseWitness::new(&updated);
-        crate::util::atomic_write_bytes(
-            &dir.path().join("src/pkg/sub/__init__.py"),
-            updated.as_bytes(),
-        )
-        .unwrap();
-        let refreshed = search("py_target");
-        assert_eq!(
-            refreshed["results"][0]["dependency_impact"]["imports"],
-            serde_json::json!(["src/pkg/__init__.py", "src/pkg/sub/new.py"])
-        );
-        assert_eq!(
-            refreshed["results"][0]["dependency_impact"]["coverage"],
-            "complete"
-        );
-        assert!(
-            !search("old_name")["results"][0]["dependency_impact"]["dependents"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("src/consumer.py"))
-        );
-        assert!(
-            search("new_name")["results"][0]["dependency_impact"]["dependents"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("src/consumer.py"))
-        );
-        assert_eq!(changed.count(), 1);
-        assert_eq!(
-            witnesses
-                .iter()
-                .map(crate::lang::treesitter::ParseWitness::count)
-                .collect::<Vec<_>>(),
-            cold
         );
     }
 
@@ -2456,7 +2310,7 @@ mod tests {
             s.len()
         );
         assert!(s.contains(CWD_PATHS_SPAN), "missing PATHS span");
-        for tool in ["tilth_search", "tilth_read", "tilth_deps", "tilth_write"] {
+        for tool in ["tilth_search", "tilth_read", "tilth_write"] {
             assert!(s.contains(tool), "missing tool {tool}");
         }
         assert!(

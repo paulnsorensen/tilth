@@ -14,10 +14,10 @@ def setUpModule():
 
 
 class AC14Preserve(unittest.TestCase):
-    def test_deps_unchanged(self):
+    def test_read_unchanged(self):
         requests = [
             harness.initialize_request(1),
-            harness.tools_call_request(2, "tilth_deps", {"path": "src/types.rs", "cwd": CWD}),
+            harness.tools_call_request(2, "tilth_read", {"paths": ["src/types.rs"], "cwd": CWD}),
         ]
         res = harness.run_mcp([], requests)
         self.assertEqual(res.returncode, 0, msg=harness.WITNESS[_AC])

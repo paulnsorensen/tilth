@@ -146,28 +146,6 @@ The scan retains at most 1,000 matches, sets `match_limited` with a `note` when 
 Files above the existing 500,000-byte parse limit are skipped.
 Skipped files are counted in `skipped_files`.
 
-### Blast-radius deps
-
-See what a file imports and what depends on it — useful before renaming or changing exports:
-
-```bash
-$ tilth src/auth.ts --deps
-# deps: src/auth.ts
-
-## Imports (3)
-  jsonwebtoken      (external)
-  @/config          src/config.ts
-  express           (external)
-
-## Dependents (4)
-  src/routes/api.ts        uses: handleAuth, AuthManager
-  src/middleware/cors.ts   uses: validateToken
-  src/app.ts               uses: AuthManager
-  test/auth.test.ts        uses: handleAuth, AuthManager
-```
-
-In MCP mode, use the `tilth_deps` tool.
-
 ### Session dedup
 
 In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.
@@ -328,7 +306,6 @@ tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
 tilth <symbol> --expand=5         # inline source for top 5 matches
 tilth <symbol> --callers          # find call sites (structural)
-tilth <path> --deps               # imports + dependents
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files

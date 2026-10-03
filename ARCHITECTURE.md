@@ -22,7 +22,7 @@ The single most useful function for orienting yourself is
 ```
 src/
 ├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
-│                    run_callers / run_deps)
+│                    run_callers)
 ├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
 ├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
@@ -56,7 +56,6 @@ src/
 │   ├── callers.rs       Find call sites of a symbol (`tilth_search
 │   │                    kind:callers`); enclosing-scope annotation
 │   ├── callees.rs       Resolve function calls inside a definition
-│   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
@@ -109,7 +108,7 @@ shell with its own concurrency model.
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
 plus flags. The mode is determined by mutually-exclusive flags
-(`--callers`, `--deps`, `--mcp`, `--full`,
+(`--callers`, `--mcp`, `--full`,
 `--expand`, `--section`). One subcommand sits alongside the
 free-form path: `tilth install <host>` delegates to `install::run`.
 The structural diff (`tilth diff`), project fingerprint
@@ -117,7 +116,7 @@ The structural diff (`tilth diff`), project fingerprint
 use shell `git diff`, `git log`, `ls`, and `find` instead.
 
 The default (no-subcommand) mode dispatches into `lib::run` (or
-`run_full`, `run_expanded`, `run_callers`, `run_deps`) based on the
+`run_full`, `run_expanded`, `run_callers`) based on the
 active flags. The output is printed
 verbatim to stdout. JSON output (`--json`) emits a serde-serialized
 `SearchResult`; otherwise the human-readable formatter wins.
@@ -154,7 +153,7 @@ methods worth describing in detail:
   and goes through `handle_tool_call`.
 
 Tool dispatch is routed by name through `dispatch_tool` to
-`tool_read` / `tool_search_v2` / `tool_deps` / `tool_write`.
+`tool_read` / `tool_search_v2` / `tool_write`.
 `tilth_map` is no longer reachable through MCP or the CLI; benchmark
 data showed structural maps hurt agent task success rates.
 
@@ -435,7 +434,7 @@ consecutive blank lines — to fit more useful content in the same
 budget. Per-language rules in `StripLang` (Rust, Python, Go, JS/TS,
 Java/Kotlin/C#, C/C++).
 
-### Relational queries (`callers.rs`, `callees.rs`, `siblings.rs`, `deps.rs`, `blast.rs`)
+### Relational queries (`callers.rs`, `callees.rs`, `siblings.rs`)
 
 These produce derived views from the same walker + tree-sitter
 machinery:
@@ -443,7 +442,7 @@ machinery:
 - **Callers** (`callers.rs`). `find_callers_batch` is the single
   tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
-  one-element set, the deps / blast / 2nd-hop paths call it with the
+  one-element set, the 2nd-hop path calls it with the
   full set. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. When the walk returns
@@ -463,12 +462,6 @@ machinery:
   the capture nodes of each match and can stop early; `query_captures`
   collects them. Cache keys use actual `tree_sitter::Language` values and
   query content.
-- **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
-  Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
-  `format_deps` does the human output. The external-dep stdlib
-  heuristic (`is_stdlib`) is per-language; module-path validation
-  (`is_valid_module_path`) avoids treating relative paths as packages.
-
 ### Glob (`glob.rs`)
 
 Thin wrapper that builds a walker with a single override pattern and
@@ -793,7 +786,7 @@ tracking.
 - **MCP per-request thread model.** Every `tools/call` spawns a fresh
   thread; on timeout the thread is abandoned. This is correct given
   Rust's lack of safe thread cancellation, but it means a
-  pathological query (regex on a giant log file, `tilth_deps` on a
+  pathological query (regex on a giant log file, a callers search on a
   symbol with thousands of usages) leaks until process exit. The
   abandoned-thread counter exists but only warns at 3; nothing
   aborts the host process when leakage is excessive. Switching to

@@ -127,6 +127,7 @@ fn resolve_from_entries(
 ///
 /// Strategy: check the source file's own outline first (cheapest), then scan
 /// imported files resolved from the source's import statements.
+#[cfg(test)]
 pub fn resolve_callees(
     callee_names: &[String],
     source_path: &Path,

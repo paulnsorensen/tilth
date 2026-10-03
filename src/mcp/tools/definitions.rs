@@ -42,10 +42,8 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                             "description": "One unchanged server-emitted continuation hint.",
                                             "required": ["kind", "target"],
                                             "additionalProperties": false,
-                                            "if": {"properties": {"kind": {"not": {"const": "fetch_dependencies"}}}},
-                                            "then": {"properties": {"target": {"properties": {"line": {"type": "integer"}}}}},
                                             "properties": {
-                                                "kind": {"enum": ["fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests", "fetch_dependencies"]},
+                                                "kind": {"enum": ["fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests"]},
                                                 "target": {
                                                     "type": "object",
                                                     "required": ["path", "scope", "line", "name"],
@@ -53,14 +51,10 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                                     "properties": {
                                                         "path": {"type": "string", "minLength": 1},
                                                         "scope": {"type": "string", "minLength": 1},
-                                                        "line": {"type": ["integer", "null"], "minimum": 1, "maximum": 4_294_967_295_u64},
-                                                        "name": {"type": ["string", "null"], "minLength": 1},
+                                                        "line": {"type": "integer", "minimum": 1, "maximum": 4_294_967_295_u64},
+                                                        "name": {"type": "string", "minLength": 1},
                                                         "glob": {"type": ["string", "null"]}
-                                                    },
-                                                    "oneOf": [
-                                                        {"properties": {"line": {"type": "integer"}, "name": {"type": "string"}}},
-                                                        {"properties": {"line": {"type": "null"}, "name": {"type": "null"}}}
-                                                    ]
+                                                    }
                                                 }
                                             }
                                         }
@@ -112,30 +106,6 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                         "type": "number",
                         "description": "Max response tokens."
                     }
-                }
-            }
-        }),
-        serde_json::json!({
-            "name": "tilth_deps",
-            "annotations": { "readOnlyHint": true },
-            "description": "Check a file's imports and dependent callers before changing/removing an export or relied-on behavior. DO NOT use for ordinary reads or internal edits. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/repo\").",
-            "inputSchema": {
-                "type": "object",
-                "required": ["path", "cwd"],
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File whose blast radius to check."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Dependent-search directory; defaults to the checkout."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max tokens; truncates dependents first."
-                    },
-                    "cwd": cwd_prop.clone()
                 }
             }
         }),
@@ -503,12 +473,12 @@ mod tests {
     }
 
     /// Every path-taking tool must carry a required `cwd` property, and the old
-    /// `root` property must be gone from every tool. All four tools in edit mode
+    /// `root` property must be gone from every tool. All three tools in edit mode
     /// take paths and require cwd.
     #[test]
     fn every_tool_requires_cwd_and_drops_root() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 4, "edit mode advertises 4 path-taking tools");
+        assert_eq!(tools.len(), 3, "edit mode advertises 3 path-taking tools");
         for tool in &tools {
             let name = tool["name"].as_str().expect("tool name");
             let schema = &tool["inputSchema"];

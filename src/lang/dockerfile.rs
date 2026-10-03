@@ -1,6 +1,6 @@
 //! Dockerfile spec. No tree-sitter grammar shipped — outline returns `None`.
 
-use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, DEFAULT_DEFS};
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Docker",
@@ -9,8 +9,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: None,
     callee_query: None,
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: None,

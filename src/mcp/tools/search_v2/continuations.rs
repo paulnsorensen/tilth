@@ -1,6 +1,5 @@
 //! Stateless, resolved search continuations.
 use std::path::{Component, Path};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,14 +10,6 @@ use crate::search::{callees, callers, target};
 use crate::types::is_test_file;
 
 const SECTION_CAP: usize = 30;
-/// Deps enrichment is best-effort: a cold or stale index must never block a
-/// search, so reconcile/impact get this much wall clock and then report
-/// partial. Bounded above 200ms to keep headroom for a cold reconcile of a
-/// larger repo now that named re-export chain invalidation (hop-reverse +
-/// pending-rescan bookkeeping) adds a small, correctness-required constant
-/// cost per pass.
-const DEPS_WARM_DEADLINE: Duration = Duration::from_millis(500);
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Target {
@@ -34,21 +25,18 @@ pub(super) struct Target {
 
 impl Target {
     pub(super) fn hints(&self) -> Vec<Value> {
-        let kinds: &[&str] = if self.line.is_some() {
-            &[
-                "fetch_callers",
-                "fetch_callees",
-                "fetch_siblings",
-                "fetch_tests",
-                "fetch_dependencies",
-            ]
-        } else {
-            &["fetch_dependencies"]
-        };
-        kinds
-            .iter()
-            .map(|kind| json!({"kind": kind, "target": self}))
-            .collect()
+        if self.line.is_none() {
+            return Vec::new();
+        }
+        [
+            "fetch_callers",
+            "fetch_callees",
+            "fetch_siblings",
+            "fetch_tests",
+        ]
+        .iter()
+        .map(|kind| json!({"kind": kind, "target": self}))
+        .collect()
     }
 
     pub(super) fn allows(&self, path: &Path, cwd: &Path) -> bool {
@@ -168,11 +156,7 @@ impl Follow {
             .ok_or("follow hint requires kind")?;
         if !matches!(
             kind,
-            "fetch_callers"
-                | "fetch_callees"
-                | "fetch_siblings"
-                | "fetch_tests"
-                | "fetch_dependencies"
+            "fetch_callers" | "fetch_callees" | "fetch_siblings" | "fetch_tests"
         ) {
             return Err("unknown continuation kind".into());
         }
@@ -185,7 +169,7 @@ impl Follow {
         let follow: Self = serde_json::from_value(value.clone())
             .map_err(|e| format!("invalid follow hint: {e}"))?;
         follow.target.validate(cwd, cache)?;
-        if follow.kind != "fetch_dependencies" && follow.target.line.is_none() {
+        if follow.target.line.is_none() {
             return Err("this continuation requires a symbol target".into());
         }
         Ok(follow)
@@ -195,24 +179,11 @@ impl Follow {
         &self,
         cwd: &Path,
         bloom: &BloomFilterCache,
-        client: &str,
         cache: &OutlineCache,
     ) -> Result<Value, String> {
         let query = self.target.name.as_deref().unwrap_or(&self.target.path);
         let mut result = super::base_result(query, &self.kind, "ok");
         result["target"] = json!(self.target);
-        if self.kind == "fetch_dependencies" {
-            let deps = dependencies(&self.target, cwd, client, cache)?;
-            let empty = deps["imports"].as_array().unwrap().is_empty()
-                && deps["dependents"].as_array().unwrap().is_empty();
-            if deps["coverage"] != "complete" {
-                super::mark_partial(&mut result);
-            } else if empty {
-                result["status"] = json!("no_match");
-            }
-            result["dependency_impact"] = deps;
-            return Ok(result);
-        }
         let full = cwd.join(&self.target.path);
         let line = self.target.line.unwrap();
         let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
@@ -358,110 +329,6 @@ impl Follow {
         Ok(result)
     }
 }
-
-pub(super) fn dependencies(
-    target: &Target,
-    cwd: &Path,
-    client: &str,
-    cache: &OutlineCache,
-) -> Result<Value, String> {
-    dependencies_within(target, cwd, client, DEPS_WARM_DEADLINE, cache)
-}
-
-/// `budget` is the wall clock granted to reconcile + impact once the index
-/// handle is open; opening (git identity lookups, redb creation) is not
-/// charged against it, so a cold first call on a slow host still completes.
-fn dependencies_within(
-    target: &Target,
-    cwd: &Path,
-    client: &str,
-    budget: Duration,
-    cache: &OutlineCache,
-) -> Result<Value, String> {
-    let full = cwd
-        .join(&target.path)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    let content = std::fs::read_to_string(&full).map_err(|e| e.to_string())?;
-    // Discover package roots once and reuse them for both the imports list and
-    // the uncertainty check below, instead of re-walking the Python import AST
-    // a second time for the same file.
-    let py_roots = crate::read::imports::PyRoots::discover(cwd);
-    let own_uncertain;
-    let mut imports: Vec<_> = if matches!(
-        crate::lang::detect_file_type(&full),
-        crate::types::FileType::Code(lang) if crate::lang::spec::spec(lang).scoped_imports
-    ) {
-        let resolution =
-            crate::read::imports::resolve_python_scoped_cached(&full, &content, &py_roots, cache);
-        own_uncertain = !resolution.uncertain.is_empty();
-        resolution
-            .paths()
-            .into_iter()
-            .filter(|p| target.allows(p, cwd))
-            .map(|p| super::display_rel(&p, cwd))
-            .collect()
-    } else {
-        own_uncertain = false;
-        crate::read::imports::resolve_related_files_with_content(&full, &content)
-            .into_iter()
-            .filter(|p| target.allows(p, cwd))
-            .map(|p| super::display_rel(&p, cwd))
-            .collect()
-    };
-    imports.sort();
-    imports.dedup();
-    let (refresh, impact, state) = match crate::index::deps::open(cwd, client) {
-        Ok(handle) => {
-            let deadline = Instant::now() + budget;
-            let refresh = crate::index::deps::reconcile_cached(
-                &handle,
-                handle.worktree_root(),
-                deadline,
-                cache,
-            );
-            let impact = crate::index::deps::impact_cached(&handle, &full, deadline, cache);
-            (refresh, Some(impact), "open")
-        }
-        Err(_) => (crate::index::deps::Coverage::default(), None, "unavailable"),
-    };
-    let traversal = impact.as_ref().map(|i| i.coverage).unwrap_or_default();
-    let mut dependents: Vec<_> = impact
-        .into_iter()
-        .flat_map(|i| i.dependents)
-        .filter(|p| target.allows(p, cwd))
-        .map(|p| super::display_rel(&p, cwd))
-        .collect();
-    dependents.sort();
-    dependents.dedup();
-    let total_imports = imports.len();
-    let total_dependents = dependents.len();
-    // An ambiguous target module identity (duplicate package roots) makes the
-    // reverse edge set unreliable: report partial rather than a guessed
-    // complete answer. This is not a timeout.
-    let ambiguous_identity = crate::read::imports::target_ambiguity(&full, &py_roots).is_some();
-    // `own_uncertain` (computed above, alongside `imports`) covers Python's own
-    // forward imports carrying unresolved uncertainty (ambiguous module,
-    // blocked re-export ownership) that a plain path list silently drops;
-    // surface that as partial coverage rather than a guess.
-    let complete = refresh.complete
-        && traversal.complete
-        && !ambiguous_identity
-        && !own_uncertain
-        && total_imports <= SECTION_CAP
-        && total_dependents <= SECTION_CAP;
-    imports.truncate(SECTION_CAP);
-    dependents.truncate(SECTION_CAP);
-    Ok(
-        json!({"coverage": if complete { "complete" } else { "partial" },
-        "index_state": state, "timed_out": refresh.timed_out || traversal.timed_out,
-        "refresh": {"complete": refresh.complete, "files_scanned": refresh.files_scanned, "files_changed": refresh.files_changed, "uncertain_sources": refresh.uncertain_sources},
-        "traversal": {"complete": traversal.complete, "files_scanned": traversal.files_scanned},
-        "imports": imports, "dependents": dependents,
-        "total_imports": total_imports, "total_dependents": total_dependents}),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +358,7 @@ mod tests {
         let cache = OutlineCache::new();
         Follow::parse(hint, cwd, &cache)
             .unwrap()
-            .execute(cwd, &BloomFilterCache::new(), "scope-test", &cache)
+            .execute(cwd, &BloomFilterCache::new(), &cache)
             .unwrap()
     }
 
@@ -546,89 +413,6 @@ mod tests {
             let err = Follow::parse(&linked, tmp.path(), &OutlineCache::new()).unwrap_err();
             assert!(err.contains("outside cwd"), "{err}");
         }
-    }
-
-    #[test]
-    fn expired_dependency_deadline_reports_actual_partial_coverage() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success());
-        std::fs::write(tmp.path().join("root.rs"), "fn root() {}\n").unwrap();
-        let target = Target {
-            path: "root.rs".into(),
-            line: Some(1),
-            name: Some("root".into()),
-            occurrence: None,
-            scope: tmp.path().to_string_lossy().into(),
-            glob: None,
-        };
-        let result = dependencies_within(
-            &target,
-            tmp.path(),
-            "deadline-test",
-            Duration::ZERO,
-            &OutlineCache::new(),
-        )
-        .unwrap();
-        assert_eq!(result["coverage"], "partial");
-        assert_eq!(result["timed_out"], true);
-        assert_eq!(result["refresh"]["complete"], false);
-        assert_eq!(result["refresh"]["files_scanned"], 0);
-    }
-
-    #[test]
-    fn uncertain_python_consumer_keeps_dependency_coverage_partial() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success());
-        for (rel, body) in [
-            (
-                "src/pkg/__init__.py",
-                "from .a import Name\nfrom .b import Name\n",
-            ),
-            ("src/pkg/a.py", "class Name:\n    pass\n"),
-            ("src/pkg/b.py", "class Name:\n    pass\n"),
-            ("src/app/__init__.py", ""),
-            ("src/app/direct.py", "from pkg.a import Name\n"),
-            ("src/app/surface.py", "from pkg import Name\n"),
-        ] {
-            let path = tmp.path().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-        }
-        let target = Target {
-            path: "src/pkg/a.py".into(),
-            line: Some(1),
-            name: Some("Name".into()),
-            occurrence: None,
-            scope: tmp.path().to_string_lossy().into(),
-            glob: None,
-        };
-        let result = dependencies_within(
-            &target,
-            tmp.path(),
-            "uncertain-consumer-test",
-            Duration::from_secs(30),
-            &OutlineCache::new(),
-        )
-        .unwrap();
-        // surface.py's owner is blocked, so it can be a hidden dependent.
-        assert_eq!(result["coverage"], "partial", "{result}");
-        assert_eq!(result["timed_out"], false, "{result}");
-        assert_eq!(result["refresh"]["uncertain_sources"], 1, "{result}");
-        let dependents = result["dependents"].as_array().unwrap();
-        assert!(
-            dependents.iter().any(|d| d == "src/app/direct.py"),
-            "the proven edge stays available: {result}"
-        );
     }
 
     #[test]

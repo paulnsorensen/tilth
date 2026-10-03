@@ -561,7 +561,7 @@ mod tests {
             None
         );
         assert_eq!(
-            session.batch_nudge("tilth_deps", &serde_json::json!({ "path": "x.rs" }), true),
+            session.batch_nudge("tilth_write", &serde_json::json!({ "edits": [] }), true),
             None
         );
         assert_eq!(

@@ -1,6 +1,6 @@
-//! Go language spec. Diverges on: stdlib rule and method-receiver extraction.
+//! Go language spec. Diverges on: method-receiver extraction.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call_expression function: (identifier) @callee)\n",
@@ -10,56 +10,6 @@ const CALLEE_QUERY: &str = concat!(
 const SIBLING_QUERY: &str =
     "(selector_expression operand: (identifier) @recv field: (field_identifier) @ref)\n";
 
-/// Root (first `/`-segment) of each Go stdlib package. A Go import is stdlib
-/// when its first path segment is one of these — covering both single-segment
-/// (`fmt`) and multi-segment (`net/http`, `encoding/json`) forms. Matching the
-/// root (not the whole path) avoids misclassifying a local package like
-/// `mypackage` while still suppressing the noisy multi-segment stdlib paths.
-const GO_STDLIB_ROOTS: &[&str] = &[
-    "archive",
-    "bufio",
-    "bytes",
-    "cmp",
-    "compress",
-    "container",
-    "context",
-    "crypto",
-    "database",
-    "debug",
-    "embed",
-    "encoding",
-    "errors",
-    "flag",
-    "fmt",
-    "go",
-    "hash",
-    "html",
-    "image",
-    "index",
-    "io",
-    "log",
-    "maps",
-    "math",
-    "mime",
-    "net",
-    "os",
-    "path",
-    "plugin",
-    "reflect",
-    "regexp",
-    "runtime",
-    "slices",
-    "sort",
-    "strconv",
-    "strings",
-    "sync",
-    "syscall",
-    "testing",
-    "text",
-    "time",
-    "unicode",
-    "unsafe",
-];
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Go",
     extensions: &["go"],
@@ -67,8 +17,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_go::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::GoRoots(GO_STDLIB_ROOTS),
-    scoped_imports: false,
     manifests: &["go.mod"],
     has_lifetimes: false,
     strip_family: Some(StripFamily::Go),
