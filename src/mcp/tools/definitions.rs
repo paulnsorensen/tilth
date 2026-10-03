@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.",
+            "description": "Auto-route query entries; follow unchanged hints; match ASTs with {pattern: \"Some($A)\", language, glob?}. Match headers carry `path#TAG`; lines a search shows are editable by `tilth_write` with no read. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -53,7 +53,8 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                                         "scope": {"type": "string", "minLength": 1},
                                                         "line": {"type": "integer", "minimum": 1, "maximum": 4_294_967_295_u64},
                                                         "name": {"type": "string", "minLength": 1},
-                                                        "glob": {"type": ["string", "null"]}
+                                                        "glob": {"type": ["string", "null"]},
+                                                        "occurrence": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2}
                                                     }
                                                 }
                                             }
@@ -114,7 +115,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
     tools.push(serde_json::json!({
         "name": "tilth_write",
         "annotations": { "readOnlyHint": false },
-        "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
+        "description": "Edit after a tagged read or search. `tilth_read` prints `[path#TAG]` above `N:content`; `tilth_search` shows `path#TAG` too. Copy its TAG and shown 1-based integer lines—NEVER invent either. Edit only lines a read or search showed. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace_text uses {old,new}, must match once; create_file uses {content}; replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Block ops span the tree-sitter definition at a line or `#symbol`. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"replace_text\", old: \"let x = 1;\", new: \"let y = 2;\"}]}], cwd: \"/abs/repo\").",
         "inputSchema": {
             "type": "object",
             "required": ["edits", "cwd"],

@@ -411,7 +411,6 @@ pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
     cache: &OutlineCache,
-    session: &Session,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
@@ -454,16 +453,18 @@ pub fn search_multi_symbol_expanded(
             result.files_unreadable,
         );
         let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut seen = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
             cache,
-            Some(session),
+            None,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
             &mut segments,
+            &mut seen,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -478,7 +479,8 @@ pub fn search_multi_symbol_expanded(
     // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
     // identical to before this fix (see format_search_result's own comment).
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-    Ok(alloc::fit_sections_to_budget(sections, budget_tokens).join(alloc::SECTION_SEPARATOR))
+    let fitted = alloc::fit_sections_to_budget(sections, budget_tokens);
+    Ok(fitted.join(alloc::SECTION_SEPARATOR))
 }
 
 /// Formats the leading disclosure note when a regex pattern failed to
@@ -654,6 +656,36 @@ pub fn format_raw_result(
     )
 }
 
+/// The lines one tagged entry shows. The entry's `#TAG` snapshot starts with an
+/// empty seen set; the caller marks `lines` seen once it knows the entry
+/// reached the agent.
+pub struct SeenEntry {
+    pub path: PathBuf,
+    pub tag: u16,
+    pub lines: Vec<(u32, u32)>,
+}
+
+/// Like `format_raw_result`, but every entry that shows real source lines gets
+/// the file's `#TAG` in its header. Returns the entries that survived the
+/// budget fit, unrecorded, so `tilth_write` accepts only lines the agent got.
+pub fn format_raw_result_deferred(
+    result: &SearchResult,
+    cache: &OutlineCache,
+    session: &Session,
+) -> Result<(String, Vec<SeenEntry>), TilthError> {
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result_seen(
+        result,
+        cache,
+        Some(session),
+        &bloom,
+        0,
+        format::EmptyHint::Merged,
+        None,
+        None,
+    )
+}
+
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
@@ -694,6 +726,7 @@ fn format_matches(
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
     segments: &mut Vec<(i64, usize, usize)>,
+    seen: &mut Vec<(usize, SeenEntry)>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -719,6 +752,7 @@ fn format_matches(
                 expanded_files,
                 multi_file,
                 out,
+                seen,
             );
             segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
@@ -856,6 +890,32 @@ fn format_line_list(lines: &[u32]) -> String {
     parts.join(",")
 }
 
+/// Splice the file's `#TAG` into the entry header at `at` and log the `lines`
+/// the entry shows, keyed by `at`. Silent when there is no session or the file
+/// is untaggable.
+fn insert_tag(
+    out: &mut String,
+    at: usize,
+    session: Option<&Session>,
+    seen: &mut Vec<(usize, SeenEntry)>,
+    path: &Path,
+    lines: &[(u32, u32)],
+) {
+    let Some(session) = session else { return };
+    let spec = crate::read::SeenSpec::Ranges(Vec::new());
+    if let Some(tag) = crate::read::record_edit_snapshot(session, path, &spec) {
+        out.insert_str(at, &format!("#{}", crate::edit::tag::format_tag(tag)));
+        seen.push((
+            at,
+            SeenEntry {
+                path: path.to_path_buf(),
+                tag,
+                lines: lines.to_vec(),
+            },
+        ));
+    }
+}
+
 /// The symbol to feed query-aware truncation when expanding a match's body.
 ///
 /// For `impl`/`implements` matches the user searched for the trait or interface,
@@ -880,6 +940,7 @@ fn format_single_match(
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
+    seen: &mut Vec<(usize, SeenEntry)>,
 ) {
     let kind = if m.impl_target.is_some() {
         "impl"
@@ -899,26 +960,18 @@ fn format_single_match(
             .unwrap_or_default()
     };
 
-    // Show line range for definitions with def_range, otherwise just the line
+    // Show line range for definitions with def_range, otherwise just the line.
+    // `tag_at` marks where a `#TAG` goes if the entry shows real source lines.
+    let _ = write!(out, "\n\n### {}", rel(&m.path, scope));
+    let tag_at = out.len();
     if m.is_definition {
         if let Some((start, end)) = m.def_range {
-            let _ = write!(
-                out,
-                "\n\n### {}:{}-{} [{kind}]",
-                rel(&m.path, scope),
-                start,
-                end
-            );
+            let _ = write!(out, ":{start}-{end} [{kind}]");
         } else {
-            let _ = write!(out, "\n\n### {}:{} [{kind}]", rel(&m.path, scope), m.line);
+            let _ = write!(out, ":{} [{kind}]", m.line);
         }
     } else {
-        let _ = write!(
-            out,
-            "\n\n### {}:{} [{kind}{scope_suffix}]",
-            rel(&m.path, scope),
-            m.line
-        );
+        let _ = write!(out, ":{} [{kind}{scope_suffix}]", m.line);
     }
 
     // Secrets denylist: the path is listed (above) so the agent knows there's a
@@ -949,6 +1002,9 @@ fn format_single_match(
                 if body_start < body_end {
                     let total_body_lines = body_end - body_start;
                     let take_n = total_body_lines.min(MARKDOWN_PREVIEW_MAX_LINES);
+                    let first = u32::try_from(body_start + 1).unwrap_or(u32::MAX);
+                    let last = u32::try_from(body_start + take_n).unwrap_or(u32::MAX);
+                    insert_tag(out, tag_at, session, seen, &m.path, &[(first, last)]);
                     out.push('\n');
                     for line in &lines[body_start..body_start + take_n] {
                         out.push_str(line);
@@ -998,11 +1054,13 @@ fn format_single_match(
     // Skip outline for small files — the expanded code speaks for itself
     if m.file_lines < 50 {
         if !fence_will_follow {
+            insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
             let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
     } else if !fence_will_follow {
+        insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
@@ -1378,6 +1436,8 @@ fn basename_file_outline(
     ))
 }
 
+/// Format a result and mark the lines its surviving tagged entries show as
+/// seen right away.
 #[allow(clippy::too_many_arguments)]
 fn format_search_result(
     result: &SearchResult,
@@ -1389,16 +1449,47 @@ fn format_search_result(
     glob: Option<&str>,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
+    let (out, seen) =
+        format_search_result_seen(result, cache, session, bloom, expand, kind, glob, budget)?;
+    if let Some(session) = session {
+        record_seen(session, seen);
+    }
+    Ok(out)
+}
+
+/// Mark the lines of `entries` seen under their tags.
+fn record_seen(session: &Session, entries: impl IntoIterator<Item = SeenEntry>) {
+    let mut snapshots = session.snapshots();
+    for entry in entries {
+        let lines = entry.lines.iter().flat_map(|&(s, e)| s..=e.max(s));
+        snapshots.record_seen_lines(&entry.path, entry.tag, lines);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_search_result_seen(
+    result: &SearchResult,
+    cache: &OutlineCache,
+    session: Option<&Session>,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    kind: format::EmptyHint,
+    glob: Option<&str>,
+    budget: Option<u64>,
+) -> Result<(String, Vec<SeenEntry>), TilthError> {
     if result.matches.is_empty() {
         let (files_matched_glob, files_searched) = count_files_for_empty(&result.scope, glob);
-        return Ok(format::search_empty_header(
-            &result.query,
-            &result.scope,
-            files_matched_glob,
-            files_searched,
-            result.total_found,
-            result.files_unreadable,
-            kind,
+        return Ok((
+            format::search_empty_header(
+                &result.query,
+                &result.scope,
+                files_matched_glob,
+                files_searched,
+                result.total_found,
+                result.files_unreadable,
+                kind,
+            ),
+            Vec::new(),
         ));
     }
     let header = format::search_header(
@@ -1413,6 +1504,7 @@ fn format_search_result(
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+    let mut seen: Vec<(usize, SeenEntry)> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -1448,6 +1540,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 &mut segments,
+                &mut seen,
             );
             write_hidden_tail(
                 &mut out,
@@ -1473,6 +1566,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 &mut segments,
+                &mut seen,
             );
             write_hidden_tail(
                 &mut out,
@@ -1517,6 +1611,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 &mut segments,
+                &mut seen,
             );
             write_hidden_tail(
                 &mut out,
@@ -1542,6 +1637,7 @@ fn format_search_result(
                 &mut expanded_files,
                 &mut out,
                 &mut segments,
+                &mut seen,
             );
             write_hidden_tail(
                 &mut out,
@@ -1562,6 +1658,7 @@ fn format_search_result(
             &mut expanded_files,
             &mut out,
             &mut segments,
+            &mut seen,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1582,13 +1679,25 @@ fn format_search_result(
     // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
     // longer a hardcode that shadows a real caller-supplied budget.
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+    let fitted = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+    // A tagged entry reached the agent only if its whole block survived the fit.
+    let seen: Vec<SeenEntry> = seen
+        .into_iter()
+        .filter(|(at, _)| {
+            segments
+                .iter()
+                .find(|&&(_, start, end)| (start..end).contains(at))
+                .is_none_or(|&(_, start, end)| fitted.contains(&out[start..end]))
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+    out = fitted;
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
     let _ = write!(out, "\n\n({token_str} tokens)");
 
-    Ok(out)
+    Ok((out, seen))
 }
 
 /// Inline the actual code for a match. Returns `(formatted_block, raw_content)`.
@@ -2805,20 +2914,23 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let (rs_callers, _) = callers::find_callers_batch(
+        let cache = crate::cache::OutlineCache::new();
+        let (rs_callers, _) = callers::find_callers_batch_cached(
             &single,
             &scope,
             &bloom,
             Some("*.rs"),
             callers::BATCH_EARLY_QUIT,
+            &cache,
         )
         .expect("callers failed");
-        let (toml_callers, _) = callers::find_callers_batch(
+        let (toml_callers, _) = callers::find_callers_batch_cached(
             &single,
             &scope,
             &bloom,
             Some("*.toml"),
             callers::BATCH_EARLY_QUIT,
+            &cache,
         )
         .expect("callers toml failed");
 
@@ -3097,6 +3209,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         assert!(
@@ -3149,6 +3262,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         let needle = "pub fn exit_code(&self) -> i32 {";
@@ -3271,6 +3385,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         assert!(
@@ -3330,6 +3445,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         // Cap is 40 lines; expect 60 - 40 = 20 truncated.
@@ -3404,6 +3520,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         // Body lines beyond the cap must still be trimmed.
@@ -3576,6 +3693,7 @@ mod tests {
             &mut expanded_files,
             &mut out,
             &mut segments,
+            &mut Vec::new(),
         );
 
         // One segment per match (all singletons — definitions are never grouped).
@@ -3652,6 +3770,7 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         let (baseline, saved) = session.savings();
@@ -3710,11 +3829,54 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
+            &mut Vec::new(),
         );
 
         let (baseline, saved) = session.savings();
         assert_eq!(baseline, 0, "no truncation => no savings recorded");
         assert_eq!(saved, 0, "no truncation => no savings recorded");
+    }
+
+    /// Only tagged entries whose block survives `fit_to_budget` are returned
+    /// as shown; a dropped block's lines must never count as seen.
+    #[test]
+    fn budget_dropped_blocks_are_not_returned_as_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["one.txt", "two.txt"] {
+            let pad = "x".repeat(1500);
+            std::fs::write(tmp.path().join(name), format!("needle {pad}\n")).unwrap();
+        }
+        let result = search_content_raw("needle", tmp.path(), None).unwrap();
+        assert_eq!(result.matches.len(), 2);
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::new();
+        let (out, seen) = format_search_result_seen(
+            &result,
+            &cache,
+            Some(&session),
+            &bloom,
+            0,
+            format::EmptyHint::Merged,
+            None,
+            Some(450),
+        )
+        .unwrap();
+        assert_eq!(out.matches("### ").count(), 1, "{out}");
+        assert_eq!(seen.len(), 1, "one block dropped, one kept");
+        let kept = seen[0].path.file_name().unwrap().to_str().unwrap();
+        assert!(out.contains(&format!("### {kept}#")), "{out}");
+        assert_eq!(seen[0].lines, vec![(1, 1)]);
+        let dropped = if kept == "one.txt" {
+            "two.txt"
+        } else {
+            "one.txt"
+        };
+        let head = session
+            .snapshots()
+            .head(tmp.path().join(dropped))
+            .expect("tag was minted before the fit");
+        assert!(head.seen_lines.is_empty());
     }
 
     /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must

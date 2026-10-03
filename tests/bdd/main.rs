@@ -229,7 +229,7 @@ fn read(world: &mut TilthWorld, selector: String) {
     let path = selector
         .split_once('#')
         .map_or(selector.as_str(), |(path, _)| path);
-    let prefix = format!("[{}#", world.session().workspace().join(path).display());
+    let prefix = format!("[{path}#");
     let tag = world
         .successful_text()
         .lines()
@@ -463,7 +463,15 @@ fn assert_literal_preview(world: &TilthWorld, result: &Value, path: &str, line: 
                 .map(|pair| pair.0)
         })
         .expect("literal match location");
-    assert_eq!(location, format!("{path}:{line}"), "{world:?}");
+    // The header carries the file tag because the preview shows its real source.
+    let (header_path, tag_and_line) = location.split_once('#').expect("tagged location");
+    assert_eq!(header_path, path, "{world:?}");
+    let (tag, header_line) = tag_and_line.split_once(':').expect("tag then line");
+    assert!(
+        tag.len() == 4 && tag.chars().all(|c| c.is_ascii_hexdigit()),
+        "{world:?}"
+    );
+    assert_eq!(header_line, line.to_string(), "{world:?}");
 
     let source_prefix = format!("-> [{line}]   ");
     let matched_source = preview

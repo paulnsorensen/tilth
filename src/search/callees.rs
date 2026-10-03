@@ -127,22 +127,6 @@ fn resolve_from_entries(
 ///
 /// Strategy: check the source file's own outline first (cheapest), then scan
 /// imported files resolved from the source's import statements.
-#[cfg(test)]
-pub fn resolve_callees(
-    callee_names: &[String],
-    source_path: &Path,
-    source_content: &str,
-    bloom: &crate::index::bloom::BloomFilterCache,
-) -> Vec<ResolvedCallee> {
-    resolve_callees_cached(
-        callee_names,
-        source_path,
-        source_content,
-        bloom,
-        &crate::cache::OutlineCache::new(),
-    )
-}
-
 pub(crate) fn resolve_callees_cached(
     callee_names: &[String],
     source_path: &Path,
@@ -657,11 +641,12 @@ end
             .collect();
         names.extend(["ExcludedTest".to_string(), "WrongExtension".to_string()]);
 
-        let resolved = resolve_callees(
+        let resolved = resolve_callees_cached(
             &names,
             &source_path,
             source_content,
             &crate::index::bloom::BloomFilterCache::new(),
+            &crate::cache::OutlineCache::new(),
         );
         let actual: Vec<(String, PathBuf)> = resolved
             .into_iter()
@@ -705,11 +690,12 @@ end
         )
         .unwrap();
 
-        let resolved = resolve_callees(
+        let resolved = resolve_callees_cached(
             &["AtLimit".to_string(), "OverLimit".to_string()],
             &source_path,
             source_content,
             &crate::index::bloom::BloomFilterCache::new(),
+            &crate::cache::OutlineCache::new(),
         );
         let actual: Vec<(String, PathBuf)> = resolved
             .into_iter()

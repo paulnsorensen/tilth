@@ -58,7 +58,7 @@ pub(crate) fn normalize_path_key(path: &Path) -> String {
 /// the same logical target through the lexical lens — `foo.rs` and
 /// `./foo.rs` collide; `a/../b.rs` and `b.rs` collide; **`../foo.rs`
 /// and `foo.rs` do NOT collide** (different parent dirs).
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut is_absolute = false;
     // Count of `Normal` segments currently on the stack. Lets us decide

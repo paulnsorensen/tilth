@@ -1,21 +1,91 @@
+use std::cell::RefCell;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::types::{estimate_tokens, ViewMode};
+
+/// The display base as given and, when different, its canonical realpath.
+/// Error paths carry canonical keys, so both prefixes must strip.
+struct DisplayBase {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+thread_local! {
+    static DISPLAY_BASE: RefCell<Option<DisplayBase>> = const { RefCell::new(None) };
+}
+
+/// Scope guard from [`set_display_base`]; restores the previous base on drop.
+pub struct DisplayBaseGuard(Option<DisplayBase>);
+
+impl Drop for DisplayBaseGuard {
+    fn drop(&mut self) {
+        DISPLAY_BASE.with(|b| *b.borrow_mut() = self.0.take());
+    }
+}
+
+/// Render paths printed on this thread relative to `base` until the guard drops.
+/// Only path labels (headers, tags, receipts, error paths) go through
+/// [`display_path`]; file content is never touched. Paths outside `base` stay
+/// absolute, and snapshot keys stay canonical.
+#[must_use]
+pub fn set_display_base(base: &Path) -> DisplayBaseGuard {
+    let canonical = std::fs::canonicalize(base)
+        .ok()
+        .filter(|canonical| canonical != base);
+    let new = DisplayBase {
+        raw: base.to_path_buf(),
+        canonical,
+    };
+    let prev = DISPLAY_BASE.with(|b| b.borrow_mut().replace(new));
+    DisplayBaseGuard(prev)
+}
+
+/// The label for `path`: relative to the active display base when inside it.
+pub fn display_path(path: &Path) -> String {
+    let path = crate::edit::lexical_normalize(path);
+    DISPLAY_BASE.with(|b| {
+        let base = b.borrow();
+        match base.as_ref().and_then(|base| {
+            path.strip_prefix(&base.raw)
+                .ok()
+                .or_else(|| path.strip_prefix(base.canonical.as_deref()?).ok())
+        }) {
+            Some(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+            _ => path.display().to_string(),
+        }
+    })
+}
+
+/// [`display_path`] for a path already held as a string.
+pub fn display_path_str(path: &str) -> String {
+    display_path(Path::new(path))
+}
 
 /// Build the standard header line:
 /// `# path/to/file.ts (N lines, ~X.Xk tokens) [mode]`
 pub fn file_header(path: &Path, byte_len: u64, line_count: u32, mode: ViewMode) -> String {
+    format!(
+        "# {} {}",
+        display_path(path),
+        file_stats(byte_len, line_count, mode)
+    )
+}
+
+/// Header line for a tagged view, whose `[path#TAG]` line already names the
+/// file: `# (N lines, ~X.Xk tokens) [mode]`.
+pub fn tagged_file_header(byte_len: u64, line_count: u32, mode: ViewMode) -> String {
+    format!("# {}", file_stats(byte_len, line_count, mode))
+}
+
+fn file_stats(byte_len: u64, line_count: u32, mode: ViewMode) -> String {
     let tokens = estimate_tokens(byte_len);
     let token_str = if tokens >= 1000 {
         format!("~{}.{}k tokens", tokens / 1000, (tokens % 1000) / 100)
     } else {
         format!("~{tokens} tokens")
     };
-    format!(
-        "# {} ({line_count} lines, {token_str}) [{mode}]",
-        path.display()
-    )
+    format!("({line_count} lines, {token_str}) [{mode}]")
 }
 
 /// Build header for binary files: `# path (binary, size, mime) [skipped]`
@@ -23,7 +93,7 @@ pub fn binary_header(path: &Path, byte_len: u64, mime: &str) -> String {
     let size_str = format_size(byte_len);
     format!(
         "# {} (binary, {size_str}, {mime}) [skipped]",
-        path.display()
+        display_path(path)
     )
 }
 
@@ -141,6 +211,42 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_path_is_relative_only_inside_the_base_and_restores_on_drop() {
+        let p = Path::new("/w/repo/src/a.rs");
+        assert_eq!(display_path(p), "/w/repo/src/a.rs");
+        {
+            let _g = set_display_base(Path::new("/w/repo"));
+            assert_eq!(display_path(p), "src/a.rs");
+            assert_eq!(
+                display_path_str("/w/repo-sibling/b.rs"),
+                "/w/repo-sibling/b.rs"
+            );
+            assert_eq!(display_path_str("/elsewhere/a.rs"), "/elsewhere/a.rs");
+            assert_eq!(display_path_str("/w/repo"), "/w/repo");
+            assert_eq!(display_path_str("/w/repo/../outside.rs"), "/w/outside.rs");
+            assert_eq!(display_path_str("/w/repo/src/../a.rs"), "a.rs");
+            assert_eq!(display_path_str("/w/other/../repo/a.rs"), "a.rs");
+        }
+        assert_eq!(display_path(p), "/w/repo/src/a.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_path_strips_the_canonical_base_when_cwd_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let _g = set_display_base(&link);
+        assert_eq!(display_path(&canonical.join("src/a.rs")), "src/a.rs");
+        assert_eq!(display_path(&link.join("src/a.rs")), "src/a.rs");
+        let outside = canonical.parent().unwrap().join("other/b.rs");
+        assert_eq!(display_path(&outside), outside.display().to_string());
+    }
 
     /// G3: a zero-match search must carry an actionable hint so agents stop
     /// retrying the same query blindly, not just report "0 matches".
