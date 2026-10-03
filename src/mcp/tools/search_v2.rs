@@ -1,6 +1,6 @@
 //! The canonical `tilth_search` engine: deterministic query routing (path ->
 //! regex -> signature-prefix normalization -> filename-shaped miss ->
-//! symbol/ambiguous -> literal -> miss) with bounded definition/deps enrichment on
+//! symbol/ambiguous -> literal -> miss) with bounded definition enrichment on
 //! unique hits, plus a `follow` branch that executes the continuation hints a
 //! prior result handed back (see
 //! `.hallouminate/wiki/adr/tilth-search-v2-roadmap-006.md`).
@@ -47,9 +47,6 @@ struct SearchRun {
     route: String,
     routes_tried: Vec<String>,
     partial: bool,
-    timeout: bool,
-    dependency_coverage: f64,
-    shard_state: String,
     budget_limited: bool,
 }
 
@@ -64,7 +61,7 @@ pub(in crate::mcp) fn tool_search_v2(
 ) -> Result<String, String> {
     let start = Instant::now();
     let first_call = session.search_count() == 0;
-    let run = run_search_v2(args, cache, session, bloom, client);
+    let run = run_search_v2(args, cache, session, bloom);
     let mut record = SearchTelemetryRecord {
         verb: "tilth_search".into(),
         version: crate::telemetry::SCHEMA_VERSION,
@@ -74,10 +71,7 @@ pub(in crate::mcp) fn tool_search_v2(
         latency_ms: 0,
         result_tokens: 0,
         partial: false,
-        timeout: false,
         budget_limited: false,
-        dependency_coverage: 0.0,
-        shard_state: "none".into(),
         client: client.into(),
         worktree: worktree.into(),
         outcome: "ok".into(),
@@ -89,10 +83,7 @@ pub(in crate::mcp) fn tool_search_v2(
             record.routes_tried = success.routes_tried;
             record.result_tokens = crate::types::estimate_tokens(success.response.len() as u64);
             record.partial = success.partial;
-            record.timeout = success.timeout;
             record.budget_limited = success.budget_limited;
-            record.dependency_coverage = success.dependency_coverage;
-            record.shard_state = success.shard_state;
             Ok(success.response)
         }
         Err(failure) => {
@@ -112,7 +103,6 @@ fn run_search_v2(
     cache: &OutlineCache,
     session: &Session,
     bloom: &BloomFilterCache,
-    client: &str,
 ) -> Result<SearchRun, SearchFailure> {
     let object = args
         .as_object()
@@ -204,10 +194,10 @@ fn run_search_v2(
     let mut normalizations = Vec::new();
     for (entry, follow) in entries.iter().zip(&follows) {
         let mut counts = None;
-        let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
+        let (result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             let result = follow
-                .execute(cwd, bloom, client, cache)
+                .execute(cwd, bloom, cache)
                 .map_err(|e| SearchFailure::new(e, "follow_error"))?;
             (result, follow.kind.clone(), Vec::new(), None)
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
@@ -235,15 +225,6 @@ fn run_search_v2(
             )
             .map_err(|e| SearchFailure::new(e.to_string(), "route_error"))?
         };
-        if result.get("target").is_some() && follow.is_none() {
-            let target: Target = serde_json::from_value(result["target"].clone())
-                .map_err(|e| SearchFailure::new(e.to_string(), "dependency_error"))?;
-            result["dependency_impact"] = continuations::dependencies(&target, cwd, client, cache)
-                .map_err(|e| SearchFailure::new(e, "dependency_error"))?;
-            if result["dependency_impact"]["coverage"] != "complete" {
-                mark_partial(&mut result);
-            }
-        }
         routes_tried.push(route);
         hints.append(&mut entry_hints);
         results.push((result, counts));
@@ -251,33 +232,7 @@ fn run_search_v2(
             normalizations.push(diagnostic);
         }
     }
-    let dependency_states: Vec<(bool, bool, bool)> = results
-        .iter()
-        .filter_map(|(r, _)| r.get("dependency_impact"))
-        .map(|d| {
-            (
-                d["coverage"] == "complete",
-                d["timed_out"] == true,
-                d["index_state"] == "unavailable",
-            )
-        })
-        .collect();
     let partial = results.iter().any(|(r, _)| r["completeness"] == "partial");
-    let timeout = dependency_states.iter().any(|&(_, timed_out, _)| timed_out);
-    let dependency_coverage = if dependency_states.is_empty() {
-        1.0
-    } else {
-        let complete = dependency_states.iter().filter(|&&(c, _, _)| c).count();
-        f64::from(u32::try_from(complete).unwrap())
-            / f64::from(u32::try_from(dependency_states.len()).unwrap())
-    };
-    let shard_state = if dependency_states.is_empty() {
-        "none"
-    } else if dependency_states.iter().any(|&(_, _, missing)| missing) {
-        "unavailable"
-    } else {
-        "open"
-    };
     let route = if routes_tried.len() > 1 {
         "batch".to_string()
     } else {
@@ -295,9 +250,6 @@ fn run_search_v2(
         route,
         routes_tried,
         partial,
-        timeout,
-        dependency_coverage,
-        shard_state: shard_state.into(),
         budget_limited,
     })
 }
@@ -401,13 +353,11 @@ fn mark_partial(result: &mut Value) {
 
 /// Optional payloads a budget trim may drop, as `(owner, field)`. A `None`
 /// owner addresses the result record itself, `Some(key)` a nested object.
-const REMOVABLE: [(Option<&str>, &str); 6] = [
+const REMOVABLE: [(Option<&str>, &str); 4] = [
     (None, "core"),
     (None, "preview"),
     (None, "items"),
     (None, "candidates"),
-    (Some("dependency_impact"), "imports"),
-    (Some("dependency_impact"), "dependents"),
 ];
 
 /// Serialize the response, dropping optional payloads until the token estimate
@@ -1253,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_unique_discovery_reports_partial_before_dependency_work() {
+    fn unreadable_unique_discovery_reports_partial() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
@@ -1263,7 +1213,7 @@ mod tests {
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
         assert_eq!(result["core"], "fn root() {}");
-        assert_eq!(hints.len(), 5);
+        assert_eq!(hints.len(), 4);
     }
 
     #[test]
@@ -1288,7 +1238,7 @@ mod tests {
         assert_eq!(result["core"], "fn root() {}");
         assert_eq!(result["target"]["line"], 1);
         assert_eq!(result["target"]["name"], "root");
-        assert_eq!(hints.len(), 5);
+        assert_eq!(hints.len(), 4);
     }
 
     #[test]
@@ -1368,7 +1318,7 @@ mod tests {
             result["hints"].as_array().unwrap().as_slice(),
             [] as [serde_json::Value; 0]
         );
-        let mut response = json!({"results": [
+        let response = json!({"results": [
             {"query": "one", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "\\\"".repeat(100_000)},
             {"query": "two", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "second"}
         ], "hints": [], "diagnostics": {}});
@@ -1380,19 +1330,6 @@ mod tests {
             assert_eq!(parsed["results"][0]["status"], "partial");
             assert_eq!(parsed["results"][0]["budget_limited"], true);
         }
-        response["results"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("preview");
-        response["results"][0]["dependency_impact"] = json!({
-            "coverage": "complete", "imports": ["x".repeat(10000)], "dependents": [], "total_imports": 1
-        });
-        let (output, _) = reduce(&response, 200).unwrap();
-        let parsed: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(
-            parsed["results"][0]["dependency_impact"]["coverage"],
-            "partial"
-        );
     }
 
     #[test]
@@ -1538,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn file_query_hints_respect_glob_and_long_core_is_partial() {
+    fn file_query_emits_no_hints() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("a.rs"),
@@ -1554,11 +1491,10 @@ mod tests {
             [] as [serde_json::Value; 0]
         );
         let initial = call(&json!({"cwd": tmp.path(), "queries": [{"query": "a.rs"}]})).unwrap();
-        assert_eq!(initial["hints"].as_array().unwrap().len(), 1);
-        let followed =
-            call(&json!({"cwd": tmp.path(), "queries": [{"follow": initial["hints"][0]}]}))
-                .unwrap();
-        assert_eq!(followed["results"][0]["resolved_as"], "fetch_dependencies");
+        assert_eq!(
+            initial["hints"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     fn repo_root() -> PathBuf {
@@ -1853,11 +1789,10 @@ mod tests {
     }
 
     #[test]
-    fn unique_symbol_hit_carries_core_and_complete_dependency_impact_and_hints() {
+    fn unique_symbol_hit_carries_core_and_hints() {
         let resp = single_query("detect_file_type").expect("symbol query succeeds");
         let result = &resp["results"][0];
         assert!(result["core"].is_string(), "unique hit must carry core");
-        assert_eq!(result["dependency_impact"]["coverage"], "complete");
 
         let hint_kinds: Vec<&str> = resp["hints"]
             .as_array()
@@ -1870,7 +1805,6 @@ mod tests {
             "fetch_callees",
             "fetch_siblings",
             "fetch_tests",
-            "fetch_dependencies",
         ] {
             assert!(
                 hint_kinds.contains(&expected),
@@ -2033,34 +1967,21 @@ mod tests {
             "fetch_callees" => "leaf",
             "fetch_siblings" => "sibling",
             "fetch_tests" => "test_root",
-            "fetch_dependencies" => "helper.ts",
             _ => unreachable!(),
         }
     }
 
-    /// Flatten a followed result's identities: `dependency_impact` arrays for
-    /// `fetch_dependencies`, `items[].name`/`items[].path` otherwise.
-    fn identities_from_result(hint: &Value, result: &Value) -> Vec<String> {
-        if hint["kind"] == "fetch_dependencies" {
-            let impact = &result["dependency_impact"];
-            impact["imports"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .chain(impact["dependents"].as_array().unwrap())
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect()
-        } else {
-            result["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|item| [item.get("name"), item.get("path")])
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }
+    /// Flatten a followed result's `items[].name`/`items[].path` identities.
+    fn identities_from_result(result: &Value) -> Vec<String> {
+        result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| [item.get("name"), item.get("path")])
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
@@ -2068,13 +1989,13 @@ mod tests {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
         let hints = initial["hints"].as_array().unwrap();
-        assert_eq!(hints.len(), 5, "{initial}");
+        assert_eq!(hints.len(), 4, "{initial}");
         for hint in hints {
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
             let expected = expected_identity_for_kind(hint["kind"].as_str().unwrap());
             assert_eq!(result["status"], "ok", "{followed}");
-            let identities = identities_from_result(hint, result);
+            let identities = identities_from_result(result);
             assert!(identities.iter().any(|s| s == expected), "{followed}");
             assert!(
                 !identities.iter().any(|s| s == "wrong_caller"),
@@ -2098,30 +2019,17 @@ mod tests {
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
             // The duplicate preview payload is gone; identities live only in
-            // the canonical `items`/`dependency_impact` arrays (#238).
+            // the canonical `items` array (#238).
             assert!(
                 result.get("preview").is_none(),
                 "follow result must not carry preview: {followed}"
             );
-            if hint["kind"] == "fetch_dependencies" {
-                let impact = &result["dependency_impact"];
-                assert!(impact["imports"].is_array(), "{followed}");
-                assert!(impact["dependents"].is_array(), "{followed}");
-                let identities = identities_from_result(hint, result);
-                assert!(
-                    identities
-                        .iter()
-                        .any(|s| s == expected_identity_for_kind("fetch_dependencies")),
-                    "{followed}"
-                );
-            } else {
-                let items = result["items"].as_array().unwrap();
-                assert_eq!(
-                    result["total_found"].as_u64().unwrap() as usize,
-                    items.len(),
-                    "{followed}"
-                );
-            }
+            let items = result["items"].as_array().unwrap();
+            assert_eq!(
+                result["total_found"].as_u64().unwrap() as usize,
+                items.len(),
+                "{followed}"
+            );
         }
     }
 
@@ -2203,15 +2111,16 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_index_and_budget_never_claim_complete() {
+    fn budget_never_claims_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("root.rs"), "fn root() {}\n").unwrap();
+        let body = "    let _value = 1;\n".repeat(300);
+        std::fs::write(
+            tmp.path().join("root.rs"),
+            format!("fn root() {{\n{body}}}\n"),
+        )
+        .unwrap();
         let args = json!({"cwd": tmp.path(), "queries": [{"query": "root"}]});
         let response = call(&args).unwrap();
-        assert_eq!(
-            response["results"][0]["dependency_impact"]["coverage"],
-            "partial"
-        );
         assert_eq!(response["results"][0]["status"], "partial");
         let mut small_args = args.clone();
         small_args["budget"] = json!(450);
@@ -2387,9 +2296,8 @@ mod tests {
     }
 
     /// Telemetry describes the search that ran, not the trimmed envelope: a
-    /// budget-trimmed batch reports `budget_limited` while `dependency_coverage`
-    /// keeps its pre-trim value, `route` collapses to `batch`, and `first_call`
-    /// is a session fact rather than a constant.
+    /// budget-trimmed batch reports `budget_limited`, `route` collapses to
+    /// `batch`, and `first_call` is a session fact rather than a constant.
     #[test]
     fn telemetry_snapshots_pretrim_inputs_and_session_first_call() {
         let root = tempfile::tempdir().unwrap();
@@ -2449,8 +2357,5 @@ mod tests {
         assert_eq!(records[0]["route"], "batch");
         assert_eq!(records[0]["routes_tried"], json!(["symbol", "symbol"]));
         assert_eq!(records[0]["budget_limited"], true);
-        // Pre-trim coverage: both hits resolved complete dependency impact even
-        // though the trim downgraded the coverage in the emitted response.
-        assert_eq!(records[0]["dependency_coverage"], 1.0);
     }
 }

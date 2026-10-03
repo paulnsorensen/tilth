@@ -1,6 +1,6 @@
 //! Swift language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call_expression (simple_identifier) @callee)\n",
@@ -17,8 +17,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_swift::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: None,

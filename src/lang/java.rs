@@ -1,6 +1,6 @@
 //! Java language spec.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = "(method_invocation name: (identifier) @callee)\n";
 
@@ -16,8 +16,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_java::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: Some(SIBLING_QUERY),
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &["pom.xml", "build.gradle"],
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),

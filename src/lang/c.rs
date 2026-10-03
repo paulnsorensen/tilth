@@ -1,6 +1,6 @@
 //! C language spec. Shares its callee query with C++.
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 /// Callee query shared by C and C++.
 pub(crate) const CALLEE_QUERY: &str = concat!(
@@ -15,8 +15,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_c::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: Some(StripFamily::CppC),

@@ -1,7 +1,7 @@
 //! C++ language spec. Shares its callee query with C.
 
 use crate::lang::c::CALLEE_QUERY;
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{LangSpec, StripFamily, DEFAULT_DEFS};
 
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "C++",
@@ -10,8 +10,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_cpp::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: Some(StripFamily::CppC),

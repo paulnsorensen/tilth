@@ -44,9 +44,9 @@ class Continuations(unittest.TestCase):
             "query": "root", "glob": "{fixture.ts,fixture.test.ts,helper.ts}",
         }])
         hints = first["hints"]
-        expected = ["production_caller", "leaf", "sibling", "test_root", "helper.ts"]
+        expected = ["production_caller", "leaf", "sibling", "test_root"]
         self.assertEqual([h["kind"] for h in hints], [
-            "fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests", "fetch_dependencies",
+            "fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests",
         ])
         requests = [harness.initialize_request(1)]
         for req_id in range(2, 5):
@@ -61,7 +61,7 @@ class Continuations(unittest.TestCase):
             payload = json.loads(text)
             self.assertNotIn("TIP:", text)
             self.assertEqual(payload["hints"], [])
-            self.assertEqual(len(payload["results"]), 5)
+            self.assertEqual(len(payload["results"]), 4)
             for result, needle, hint in zip(payload["results"], expected, hints):
                 self.assertEqual(result["resolved_as"], hint["kind"])
                 self.assertEqual(result["target"], hint["target"])
@@ -69,18 +69,14 @@ class Continuations(unittest.TestCase):
                 # The duplicate preview payload is dropped for every follow
                 # kind; canonical arrays carry the identities (#238).
                 self.assertNotIn("preview", result)
-                if hint["kind"] == "fetch_dependencies":
-                    impact = result["dependency_impact"]
-                    identities = impact["imports"] + impact["dependents"]
-                else:
-                    items = result["items"]
-                    self.assertEqual(result["total_found"], len(items))
-                    identities = [
-                        value
-                        for item in items
-                        for value in (item.get("name"), item.get("path"))
-                        if value is not None
-                    ]
+                items = result["items"]
+                self.assertEqual(result["total_found"], len(items))
+                identities = [
+                    value
+                    for item in items
+                    for value in (item.get("name"), item.get("path"))
+                    if value is not None
+                ]
                 self.assertIn(needle, identities)
                 self.assertNotIn("wrong_caller", identities)
 

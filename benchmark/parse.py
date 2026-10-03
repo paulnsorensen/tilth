@@ -470,8 +470,7 @@ def tool_call_counts(result: RunResult) -> dict[str, int]:
 
 
 # Tools with a batch (array) form, matched on the bare server-side name so
-# mcp__tilth__-prefixed and bare call records both qualify. tilth_deps and the
-# native tools are single-target by design and must stay out of the metric.
+# mcp__tilth__-prefixed and bare call records both qualify. The native tools are single-target by design and must stay out of the metric.
 _BATCHABLE_TOOLS = ("tilth_read", "tilth_search", "tilth_list", "tilth_write")
 # Array params across schema generations: this fork uses paths/queries/
 # patterns/edits; the upstream and PR #196 binaries the pinned arms run use

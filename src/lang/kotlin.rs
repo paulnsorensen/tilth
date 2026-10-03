@@ -1,6 +1,6 @@
 //! Kotlin language spec.
 
-use crate::lang::spec::{DefinitionOps, LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
+use crate::lang::spec::{DefinitionOps, LangSpec, StripFamily, DEFAULT_DEFS};
 use crate::lang::treesitter::{node_text_simple, NodeTextMode};
 
 const CALLEE_QUERY: &str = concat!(
@@ -15,8 +15,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     grammar: Some(tree_sitter_kotlin_sg::LANGUAGE),
     callee_query: Some(CALLEE_QUERY),
     sibling_query: None,
-    stdlib: StdlibRule::None,
-    scoped_imports: false,
     manifests: &[],
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),

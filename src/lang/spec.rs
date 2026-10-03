@@ -217,10 +217,6 @@ pub(crate) struct LangSpec {
     pub callee_query: Option<&'static str>,
     /// Tree-sitter query for self/this sibling references (`sibling_query_str`).
     pub sibling_query: Option<&'static str>,
-    /// How to recognise a stdlib import for this language (`is_stdlib`).
-    pub stdlib: StdlibRule,
-    /// Whether imports are resolved through scoped module roots.
-    pub scoped_imports: bool,
     /// Manifest filenames used for dependency discovery.
     pub manifests: &'static [&'static str],
     /// Whether this language's signatures use lifetime tick stripping.
@@ -262,37 +258,6 @@ pub(crate) fn default_attach_leading_adornment(
     _lines: &[&str],
 ) -> bool {
     false
-}
-
-/// How an import source is recognised as standard-library (and thus noise that
-/// `tilth_deps` suppresses). Replaces the per-language `is_stdlib` match. Each
-/// variant encodes one language's historical rule byte-for-byte.
-pub(crate) enum StdlibRule {
-    /// Language has no stdlib suppression.
-    None,
-    /// Source matches if it starts with any of these prefixes (Rust:
-    /// `std::` / `core::` / `alloc::`).
-    Prefixes(&'static [&'static str]),
-    /// Source matches if its first `'.'`-delimited segment is in `set` (Python).
-    PythonSegment(&'static [&'static str]),
-    /// Source matches if its first `'/'`-delimited segment is in `set` (Go:
-    /// the import's root path segment is a stdlib package root).
-    GoRoots(&'static [&'static str]),
-}
-
-impl StdlibRule {
-    /// Returns `true` if `source` names a standard-library module under this rule.
-    pub(crate) fn matches(&self, source: &str) -> bool {
-        match self {
-            StdlibRule::None => false,
-            StdlibRule::Prefixes(prefixes) => prefixes.iter().any(|p| source.starts_with(p)),
-            StdlibRule::PythonSegment(set) => {
-                let first = source.split('.').next().unwrap_or("");
-                set.contains(&first)
-            }
-            StdlibRule::GoRoots(set) => set.contains(&source.split('/').next().unwrap_or(source)),
-        }
-    }
 }
 
 /// Coarse 6-way grouping of comment / log syntax for `strip::strip_noise`.
@@ -424,71 +389,6 @@ mod tests {
     use super::*;
     use crate::lang::mod_all_langs_for_test;
 
-    // ── StdlibRule::matches — locks each variant's historical `is_stdlib` rule ──
-
-    #[test]
-    fn stdlib_none_never_matches() {
-        let rule = StdlibRule::None;
-        assert!(!rule.matches("std"));
-        assert!(!rule.matches(""));
-        assert!(!rule.matches("anything.at.all"));
-    }
-
-    #[test]
-    fn stdlib_prefixes_matches_only_listed_prefixes() {
-        let rule = StdlibRule::Prefixes(&["std::", "core::", "alloc::"]);
-        assert!(rule.matches("std::collections::HashMap"));
-        assert!(rule.matches("core::mem"));
-        assert!(rule.matches("alloc::vec::Vec"));
-        // Bare segment without `::` separator is not a prefix match.
-        assert!(!rule.matches("std"));
-        // A crate that merely starts with the letters but not the prefix.
-        assert!(!rule.matches("standard::thing"));
-        assert!(!rule.matches("serde::Deserialize"));
-    }
-
-    #[test]
-    fn stdlib_python_segment_matches_first_dotted_segment() {
-        let rule = StdlibRule::PythonSegment(&["os", "sys", "json"]);
-        assert!(rule.matches("os"));
-        assert!(rule.matches("os.path"));
-        assert!(rule.matches("json.decoder"));
-        // First segment must match exactly — a longer name sharing a prefix must not.
-        assert!(!rule.matches("ossify"));
-        assert!(!rule.matches("requests"));
-        assert!(!rule.matches("mypackage.os"));
-    }
-
-    // Go's rule (post-PR-71): a GoRoots allowlist keyed on the first `/`-segment.
-    // A multi-segment import (`net/http`) is stdlib when its root (`net`) is in the
-    // set; a bare local package (`mypackage`) is NOT stdlib. These pin that rule.
-    #[test]
-    fn stdlib_go_root_segment_is_stdlib() {
-        let rule = StdlibRule::GoRoots(&["fmt", "net", "encoding"]);
-        assert!(rule.matches("fmt"), "bare stdlib root");
-        assert!(rule.matches("net/http"), "multi-segment stdlib via root");
-        assert!(
-            rule.matches("encoding/json"),
-            "multi-segment stdlib via root"
-        );
-    }
-
-    #[test]
-    fn stdlib_go_non_root_is_not_stdlib() {
-        let rule = StdlibRule::GoRoots(&["fmt", "net"]);
-        // Local/third-party roots are not in the set.
-        assert!(
-            !rule.matches("mypackage"),
-            "bare local package is not stdlib"
-        );
-        assert!(!rule.matches("github.com/gin-gonic/gin"));
-        assert!(!rule.matches("golang.org/x/sync"));
-        // Empty string has no stdlib root.
-        assert!(!rule.matches(""));
-        // A root that merely shares a prefix with a stdlib root must not match.
-        assert!(!rule.matches("fmtlib"));
-    }
-
     // ── spec() table invariants — every Lang resolves and its data is coherent ──
 
     #[test]
@@ -519,17 +419,6 @@ mod tests {
                 spec(lang).has_lifetimes,
                 matches!(lang, Lang::Rust),
                 "{lang:?} lifetime flag mismatch — only Rust uses `'` for lifetime ticks"
-            );
-        }
-    }
-
-    #[test]
-    fn only_python_has_scoped_imports() {
-        for &lang in mod_all_langs_for_test() {
-            assert_eq!(
-                spec(lang).scoped_imports,
-                matches!(lang, Lang::Python),
-                "{lang:?} scoped_imports mismatch — only Python resolves absolute in-scope imports"
             );
         }
     }

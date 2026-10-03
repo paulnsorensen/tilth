@@ -74,11 +74,6 @@ fn search(world: &mut TilthWorld, query: String) {
     world.call("tilth_search", json!({"queries": [{"query": query}]}));
 }
 
-#[when(expr = "I inspect dependencies of {string}")]
-fn dependencies(world: &mut TilthWorld, path: String) {
-    world.call("tilth_deps", json!({"path": path}));
-}
-
 #[when("I search for the fixture marker")]
 fn search_fixture(world: &mut TilthWorld) {
     search(
@@ -344,71 +339,6 @@ fn cli_section(world: &mut TilthWorld, section: String, step: &cucumber::gherkin
         .collect::<Vec<_>>();
     assert_eq!(rows.join("\n"), docstring(step), "{}", world.cli_output);
 }
-#[then(expr = "the dependency report has exactly 1 local dependency {string}")]
-fn exact_local_dependency(world: &mut TilthWorld, path: String) {
-    let text = world.successful_text();
-    assert!(
-        text.lines()
-            .next()
-            .is_some_and(|line| line.contains("— 1 local,")),
-        "{world:?}"
-    );
-    let local_paths = dependency_section_paths(text, "## Uses (local)");
-    assert_eq!(local_paths, [path], "{world:?}");
-}
-
-#[then(
-    expr = "the dependency report has exactly 1 caller dependent {string} at line {int} owned by {string} calling {string}"
-)]
-fn exact_caller_dependent(
-    world: &mut TilthWorld,
-    path: String,
-    line: u64,
-    owner: String,
-    symbol: String,
-) {
-    let text = world.successful_text();
-    assert!(
-        text.lines()
-            .next()
-            .is_some_and(|line| line.contains("1 dependent")),
-        "{world:?}"
-    );
-    let used_by = text.split_once("## Used by\n").expect("used-by section").1;
-    let rows: Vec<Vec<&str>> = used_by
-        .lines()
-        .take_while(|line| !line.is_empty())
-        .map(|row| row.split_whitespace().collect())
-        .collect();
-    assert_eq!(
-        rows,
-        [vec![
-            format!("{path}:{line}").as_str(),
-            owner.as_str(),
-            "→",
-            symbol.as_str()
-        ]],
-        "{world:?}"
-    );
-}
-
-fn dependency_section_paths(text: &str, heading: &str) -> Vec<String> {
-    text.split_once(&format!("{heading}\n"))
-        .map(|(_, section)| {
-            section
-                .lines()
-                .take_while(|line| !line.is_empty())
-                .map(|line| {
-                    line.split_whitespace()
-                        .next()
-                        .expect("dependency path")
-                        .to_owned()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[when(expr = "another editor replaces {string} with {string} in {string}")]
 fn external_edit(world: &mut TilthWorld, old: String, new: String, path: String) {
     let path = world.session().workspace().join(path);

@@ -1,6 +1,6 @@
 # tilth
 
-Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, symbol search, callers/callees, file-level deps analysis. Replaces grep/cat/find for AI agents with structured, token-efficient output.
+Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, symbol search, callers/callees. Replaces grep/cat/find for AI agents with structured, token-efficient output.
 
 ## Project structure
 
@@ -22,7 +22,7 @@ src/
       markdown.rs      Markdown heading-based outlines.
       structured.rs    JSON/YAML/TOML structured outlines.
       test_file.rs     Test file detection (suppresses outline noise).
-    imports.rs         Import extraction for deps analysis.
+    imports.rs         Import extraction for caller and sibling resolution.
   search/
     mod.rs             Search orchestration. Symbol, content, regex, callers search types.
     symbol.rs          AST-based symbol search (definitions first, then usages).
@@ -31,7 +31,6 @@ src/
     callees.rs         Callee extraction and resolution for expanded definitions.
     siblings.rs        Sibling symbol surfacing in search results.
     target.rs          Definition-target resolution (path:line, occurrence, candidate) and sibling collection for search continuations.
-    deps.rs            File-level dependency analysis (imports + dependents with symbols).
     rank.rs            Result ranking (definition weight, basename boost, context proximity).
     facets.rs          Faceted result grouping (definitions, usages, implementations).
     strip.rs           Cognitive load stripping (comments, blank lines in expanded code).

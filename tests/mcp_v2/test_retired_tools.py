@@ -21,7 +21,7 @@ class RetiredTools(unittest.TestCase):
                 ])
                 self.assertEqual(result.returncode, 0)
                 names = result.tool_names()
-                for retired in ["tilth_diff", "tilth_grok", "tilth_files", "tilth_list"]:
+                for retired in ["tilth_diff", "tilth_grok", "tilth_deps", "tilth_files", "tilth_list"]:
                     self.assertNotIn(retired, names)
                 self.assertIn("tilth_read", names)
 
@@ -35,5 +35,5 @@ class RetiredTools(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(
                     sorted(result.tool_names()),
-                    ["tilth_deps", "tilth_read", "tilth_search", "tilth_write"],
+                    ["tilth_read", "tilth_search", "tilth_write"],
                 )
