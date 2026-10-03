@@ -197,7 +197,6 @@ fn run_inner(
                 &parts,
                 scope,
                 cache,
-                None,
                 &bloom,
                 expand,
                 None,

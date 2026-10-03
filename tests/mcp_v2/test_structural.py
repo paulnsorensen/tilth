@@ -52,6 +52,7 @@ class StructuralSearch(unittest.TestCase):
         target = self.write("source.py", source)
         response = self.call([{"pattern": "wrap($A)", "language": "python"}])
         group = json.loads(harness.tool_result_text(response))["results"][0]["items"][0]
+        self.assertNotEqual(group["tag"], "0000")
         edit = {"cwd": str(self.root), "edits": [{"path": "source.py", "tag": group["tag"], "ops": [
             {"op": "replace_text", "old": "wrap(value)", "new": "wrapped(value)"}]}]}
         written = harness.run_mcp([], [

@@ -4,12 +4,19 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{estimate_tokens, ViewMode};
 
+/// The display base as given and, when different, its canonical realpath.
+/// Error paths carry canonical keys, so both prefixes must strip.
+struct DisplayBase {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
 thread_local! {
-    static DISPLAY_BASE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static DISPLAY_BASE: RefCell<Option<DisplayBase>> = const { RefCell::new(None) };
 }
 
 /// Scope guard from [`set_display_base`]; restores the previous base on drop.
-pub struct DisplayBaseGuard(Option<PathBuf>);
+pub struct DisplayBaseGuard(Option<DisplayBase>);
 
 impl Drop for DisplayBaseGuard {
     fn drop(&mut self) {
@@ -23,7 +30,14 @@ impl Drop for DisplayBaseGuard {
 /// absolute, and snapshot keys stay canonical.
 #[must_use]
 pub fn set_display_base(base: &Path) -> DisplayBaseGuard {
-    let prev = DISPLAY_BASE.with(|b| b.borrow_mut().replace(base.to_path_buf()));
+    let canonical = std::fs::canonicalize(base)
+        .ok()
+        .filter(|canonical| canonical != base);
+    let new = DisplayBase {
+        raw: base.to_path_buf(),
+        canonical,
+    };
+    let prev = DISPLAY_BASE.with(|b| b.borrow_mut().replace(new));
     DisplayBaseGuard(prev)
 }
 
@@ -32,10 +46,11 @@ pub fn display_path(path: &Path) -> String {
     let path = crate::edit::lexical_normalize(path);
     DISPLAY_BASE.with(|b| {
         let base = b.borrow();
-        match base
-            .as_deref()
-            .and_then(|base| path.strip_prefix(base).ok())
-        {
+        match base.as_ref().and_then(|base| {
+            path.strip_prefix(&base.raw)
+                .ok()
+                .or_else(|| path.strip_prefix(base.canonical.as_deref()?).ok())
+        }) {
             Some(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
             _ => path.display().to_string(),
         }
@@ -215,6 +230,22 @@ mod tests {
             assert_eq!(display_path_str("/w/other/../repo/a.rs"), "a.rs");
         }
         assert_eq!(display_path(p), "/w/repo/src/a.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_path_strips_the_canonical_base_when_cwd_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let _g = set_display_base(&link);
+        assert_eq!(display_path(&canonical.join("src/a.rs")), "src/a.rs");
+        assert_eq!(display_path(&link.join("src/a.rs")), "src/a.rs");
+        let outside = canonical.parent().unwrap().join("other/b.rs");
+        assert_eq!(display_path(&outside), outside.display().to_string());
     }
 
     /// G3: a zero-match search must carry an actionable hint so agents stop

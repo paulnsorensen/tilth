@@ -73,8 +73,9 @@ impl Serialize for Match {
     }
 }
 
-/// Sorted matches of one file. Wire form: `{path, tag?, matches}`; `tag` is the
-/// whole-file edit tag when the caller minted one.
+/// Sorted matches of one file. Wire fields: `path`, `matches`, and optional
+/// `tag`, the whole-file edit tag when the caller minted one. Key order is not
+/// part of the contract.
 #[derive(Serialize)]
 pub(crate) struct FileMatches {
     path: String,

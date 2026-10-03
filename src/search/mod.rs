@@ -411,7 +411,6 @@ pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
     cache: &OutlineCache,
-    session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
@@ -428,7 +427,6 @@ pub fn search_multi_symbol_expanded(
     };
     let mut expanded_files = HashSet::new();
     let mut sections: Vec<alloc::BudgetedSection> = Vec::with_capacity(queries.len());
-    let mut pending_seen: Vec<(String, Vec<SeenEntry>)> = Vec::new();
 
     for query in queries {
         let result = symbol::search_cached(query, scope, context, glob, full, cache)?;
@@ -460,7 +458,7 @@ pub fn search_multi_symbol_expanded(
             &result.matches,
             &result.scope,
             cache,
-            session,
+            None,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -468,10 +466,6 @@ pub fn search_multi_symbol_expanded(
             &mut segments,
             &mut seen,
         );
-        if session.is_some() {
-            let header = out.lines().next().unwrap_or_default().to_string();
-            pending_seen.push((header, seen.into_iter().map(|(_, entry)| entry).collect()));
-        }
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
             let _ = write!(
@@ -486,16 +480,6 @@ pub fn search_multi_symbol_expanded(
     // identical to before this fix (see format_search_result's own comment).
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
     let fitted = alloc::fit_sections_to_budget(sections, budget_tokens);
-    if let Some(session) = session {
-        for (header, entries) in pending_seen {
-            if fitted
-                .iter()
-                .any(|s| s.lines().next() == Some(header.as_str()))
-            {
-                record_seen(session, entries);
-            }
-        }
-    }
     Ok(fitted.join(alloc::SECTION_SEPARATOR))
 }
 

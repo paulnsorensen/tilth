@@ -245,14 +245,16 @@ fn run_search_v2(
     } else {
         json!({"normalizations": normalizations})
     };
-    let (output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
+    let (mut output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
-    let mut response: Value = serde_json::from_str(&output)
-        .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
-    record_structural_snapshots(&mut response, cwd, session);
-    record_returned_seen(&response, &pending_seen, cwd, session);
-    let output = serde_json::to_string(&response)
-        .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
+    if !pending_seen.is_empty() || routes_tried.iter().any(|r| r == "structural") {
+        let mut response: Value = serde_json::from_str(&output)
+            .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
+        record_structural_snapshots(&mut response, cwd, session);
+        record_returned_seen(&response, &pending_seen, cwd, session);
+        output = serde_json::to_string(&response)
+            .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
+    }
     debug_assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
     Ok(SearchRun {
         response: output,
@@ -1221,20 +1223,25 @@ fn record_structural_snapshots(response: &mut Value, cwd: &Path, session: &Sessi
             let Some(item) = item.as_object_mut() else {
                 continue;
             };
-            item.remove("tag");
-            if item
+            let tag = if item
                 .get("matches")
                 .and_then(Value::as_array)
                 .is_none_or(Vec::is_empty)
             {
-                continue;
-            }
-            let Some(path) = item.get("path").and_then(Value::as_str) else {
-                continue;
+                None
+            } else {
+                item.get("path").and_then(Value::as_str).and_then(|path| {
+                    let spec = crate::read::SeenSpec::Ranges(Vec::new());
+                    crate::read::record_edit_snapshot(session, &cwd.join(path), &spec)
+                })
             };
-            let spec = crate::read::SeenSpec::Ranges(Vec::new());
-            if let Some(tag) = crate::read::record_edit_snapshot(session, &cwd.join(path), &spec) {
-                item.insert("tag".into(), json!(crate::edit::tag::format_tag(tag)));
+            match tag {
+                Some(tag) => {
+                    item.insert("tag".into(), json!(crate::edit::tag::format_tag(tag)));
+                }
+                None => {
+                    item.remove("tag");
+                }
             }
         }
     }
