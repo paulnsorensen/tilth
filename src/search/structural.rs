@@ -73,11 +73,21 @@ impl Serialize for Match {
     }
 }
 
-/// Sorted matches of one file. Wire form: `{path, matches}`.
+/// Sorted matches of one file. Wire fields: `path`, `matches`, and optional
+/// `tag`, the whole-file edit tag when the caller minted one. Key order is not
+/// part of the contract.
 #[derive(Serialize)]
 pub(crate) struct FileMatches {
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
     matches: Vec<Match>,
+}
+
+impl FileMatches {
+    pub(crate) fn set_tag(&mut self, tag: String) {
+        self.tag = Some(tag);
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +234,7 @@ impl StructuralPatterns {
                 Some(group) if group.path == path => group.matches.push(hit),
                 _ => scan.groups.push(FileMatches {
                     path,
+                    tag: None,
                     matches: vec![hit],
                 }),
             }
@@ -405,7 +416,13 @@ impl PatternLanguage {
 
     fn compile(&self, source: &str) -> Result<Pattern, String> {
         if self.preamble.is_empty() {
-            return Pattern::try_new(source, self.clone()).map_err(|error| error.to_string());
+            let plain = Pattern::try_new(source, self.clone()).map_err(|error| error.to_string());
+            if self.support == SupportLang::Go && self.go_needs_function_context(source) {
+                if let Ok(contextual) = self.compile_in_go_function(source) {
+                    return Ok(contextual);
+                }
+            }
+            return plain;
         }
         // ast-grep selects a pattern node from the document root, which holds the
         // preamble. Select the node by kind instead.
@@ -413,6 +430,47 @@ impl PatternLanguage {
         let document = StrDoc::try_new(&processed, self.clone())?;
         let kind = self.select(&document.tree)?.kind().to_string();
         Pattern::contextual(source, &kind, self.clone()).map_err(|error| error.to_string())
+    }
+
+    /// Go parses a top-level `a.b(c)` as a type conversion, and a bare call
+    /// fails to parse at all. Such patterns only parse as calls inside a body.
+    fn go_needs_function_context(&self, source: &str) -> bool {
+        let processed = self.pre_process_pattern(source);
+        StrDoc::try_new(&processed, self.clone())
+            .ok()
+            .and_then(|document| {
+                self.select(&document.tree)
+                    .ok()
+                    .map(|node| node.kind() == "type_conversion_expression")
+            })
+            .unwrap_or(true)
+    }
+
+    fn compile_in_go_function(&self, source: &str) -> Result<Pattern, String> {
+        let context = format!("package p\nfunc _() {{\n{source}\n}}");
+        let processed = self.pre_process_pattern(&context);
+        let document = StrDoc::try_new(&processed, self.clone())?;
+        let root = document.tree.root_node();
+        let mut cursor = root.walk();
+        let function = root
+            .children(&mut cursor)
+            .find(|child| child.kind() == "function_declaration")
+            .ok_or("structural pattern must be a single node")?;
+        let mut node = function
+            .child_by_field_name("body")
+            .ok_or("structural pattern must be a single node")?;
+        if node.has_error() {
+            return Err("syntax error or missing syntax in structural pattern".into());
+        }
+        if node.named_child_count() != 1 {
+            return Err("structural pattern must be a single node".into());
+        }
+        node = node.named_child(0).unwrap();
+        while node.child_count() == 1 {
+            node = node.child(0).unwrap();
+        }
+        let kind = node.kind().to_string();
+        Pattern::contextual(&context, &kind, self.clone()).map_err(|error| error.to_string())
     }
 
     /// Select the pattern node, mirroring `single_matcher` in pinned ast-grep-core
@@ -492,6 +550,15 @@ impl Language for PatternLanguage {
             Ok(document)
         })
     }
+}
+
+/// Compile a structural pattern for `lang`, shared with the edit rewrite op.
+pub(crate) fn compile_pattern(
+    lang: Lang,
+    support: SupportLang,
+    source: &str,
+) -> Result<Pattern, String> {
+    PatternLanguage::new(lang, support).compile(source)
 }
 
 #[cfg(test)]
@@ -754,5 +821,87 @@ mod tests {
             assert_eq!(result.retained, 1);
         }
         assert_eq!(witness.count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod go_pattern_tests {
+    use super::*;
+
+    fn matches(lang: Lang, support: SupportLang, pattern: &str, source: &str) -> Vec<String> {
+        let grammar =
+            tree_sitter::Language::new(crate::lang::spec::spec(lang).grammar.expect("grammar"));
+        let compiled = compile_pattern(lang, support, pattern).unwrap();
+        let document = crate::lang::treesitter::parse_document(source, &grammar).unwrap();
+        document
+            .root()
+            .find_all(&compiled)
+            .map(|node| node.text().into_owned())
+            .collect()
+    }
+
+    const GO: &str =
+        "package main\n\nfunc a() {\n\tw.Render(p)\n\ts.tpl.Render(q.Z())\n\tRender(r)\n}\n";
+
+    #[test]
+    fn go_selector_call_pattern_matches_varied_receivers() {
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "$R.Render($W)", GO),
+            ["w.Render(p)", "s.tpl.Render(q.Z())"]
+        );
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "w.Render($$$A)", GO),
+            ["w.Render(p)"]
+        );
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "Render($W)", GO),
+            ["Render(r)"]
+        );
+    }
+
+    #[test]
+    fn go_declaration_pattern_still_matches() {
+        let source = "package main\n\nfunc a(x int) int {\n\treturn x\n}\n";
+        assert_eq!(
+            matches(
+                Lang::Go,
+                SupportLang::Go,
+                "func $F($$$) $$$ { $$$ }",
+                source
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn other_languages_match_member_calls() {
+        assert_eq!(
+            matches(
+                Lang::Rust,
+                SupportLang::Rust,
+                "$X.foo($Y)",
+                "fn f() { a.foo(1); }\n"
+            ),
+            ["a.foo(1)"]
+        );
+        assert_eq!(
+            matches(
+                Lang::JavaScript,
+                SupportLang::JavaScript,
+                "$X.foo($Y)",
+                "a.foo(1);\n"
+            ),
+            ["a.foo(1)"]
+        );
+        assert_eq!(
+            matches(
+                Lang::Python,
+                SupportLang::Python,
+                "$X.foo($Y)",
+                "a.foo(1)\n"
+            ),
+            ["a.foo(1)"]
+        );
     }
 }

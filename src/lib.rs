@@ -191,14 +191,12 @@ fn run_inner(
             .collect();
         let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
         if parts.len() >= 2 && all_identifiers {
-            let session = session::Session::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
                 &parts,
                 scope,
                 cache,
-                &session,
                 &bloom,
                 expand,
                 None,
@@ -582,6 +580,21 @@ mod multi_symbol_tests {
             output.matches("— 1 matches").count(),
             NAMES.len(),
             "every symbol must report its real hit: {output}"
+        );
+    }
+
+    /// The CLI has no edit session, so multi-symbol output carries no
+    /// `[path#TAG]` read tags.
+    #[test]
+    fn multi_symbol_cli_output_has_no_read_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        write_source(dir.path(), 0);
+
+        let output = search_all(dir.path(), None);
+
+        assert!(
+            !output.contains(".rs#"),
+            "CLI output leaked a tag: {output}"
         );
     }
 

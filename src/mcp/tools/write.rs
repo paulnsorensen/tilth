@@ -68,6 +68,7 @@ pub(crate) fn tool_write(
     cache: &OutlineCache,
 ) -> Result<String, String> {
     let (sections, cwd, show_diff) = parse_write_args(args)?;
+    let _display_base = crate::format::set_display_base(cwd);
 
     let section_count = sections.len() as u64;
     let metadata_reserve = section_count.saturating_mul(80);
@@ -134,13 +135,16 @@ fn apply_section(
     if !seen_paths.insert(crate::edit::normalize_path_key(&path)) {
         return Err(format!(
             "## {}\nerror: duplicate path in this call — group all ops for a file under one section",
-            path.display()
+            crate::format::display_path(&path)
         ));
     }
 
     match commit_section(section, &path, ctx) {
         Ok(block) => Ok(block),
-        Err(e) => Err(format!("## {}\nerror: {e}", path.display())),
+        Err(e) => Err(format!(
+            "## {}\nerror: {e}",
+            crate::format::display_path(&path)
+        )),
     }
 }
 
@@ -150,7 +154,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     if section.ops.iter().any(|op| matches!(op, Op::Create { .. })) && section.tag.is_some() {
         return Err(TilthError::EditRejected(format!(
             "create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
-            path.display()
+            crate::format::display_path(path)
         )));
     }
     let session = ctx.session;
@@ -190,7 +194,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     if new_text == live {
         return Ok(format!(
             "## {}\nno change (edit was a no-op)",
-            path.display()
+            crate::format::display_path(path)
         ));
     }
 
@@ -223,10 +227,10 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     } else {
         "applied"
     };
-    let mut block = format!("## {}\n{status}", path.display());
+    let mut block = format!("## {}\n{status}", crate::format::display_path(path));
     match new_tag {
         Some(tag) => {
-            let header = format_header(&path.display().to_string(), tag);
+            let header = format_header(&crate::format::display_path(path), tag);
             let _ = write!(block, "\n{header}");
             if !numbered.is_empty() {
                 let _ = write!(block, "\n{numbered}");
@@ -241,7 +245,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             let _ = write!(
                 block,
                 "\n# {} (too large to tag; edits cannot be tag-verified)",
-                path.display()
+                crate::format::display_path(path)
             );
         }
     }
@@ -257,7 +261,7 @@ fn text_unmatched_message(path: &Path, tag: u16, preview: &str) -> String {
     format!(
         "text to replace was not found; copy old verbatim from the numbered lines of \
          {} — do not retype it from memory or shell output (preview: {preview})",
-        format_header(&path.display().to_string(), tag)
+        format_header(&crate::format::display_path(path), tag)
     )
 }
 
@@ -289,19 +293,21 @@ fn resolve_edit(
     match section.tag {
         // Tagless [path]: seed a new file or edit live with no source-line provenance.
         None => {
-            if section
-                .ops
-                .iter()
-                .any(|op| matches!(op, Op::TextSwap { .. }))
-            {
+            if section.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
+                )
+            }) {
                 // Naming only the requirement sent agents into a full re-read.
                 // A section read carries the whole-file tag, so the cheap route
                 // has to be part of the rejection.
                 return Err(TilthError::EditRejected(
-                    "replace_text requires a tag from a tilth_read; a section read \
-                     (path#12-40) carries the whole-file tag without reading the file in \
-                     full, but `old` must occur in the lines it displayed. Files over the \
-                     tag cap mint no tag — use line ops there."
+                    "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search \
+                     result; a search match header or a section read (path#12-40) carries the \
+                     whole-file tag without reading the file in full, but the matched text must \
+                     occur in the lines it displayed. Files over the tag cap mint no tag — use \
+                     line ops there."
                         .into(),
                 ));
             }
@@ -378,7 +384,8 @@ fn recover_edit(
             source: ApplyError::TextUnmatched { preview },
         }) => {
             return Err(TilthError::EditRejected(format!(
-                "Edit rejected for {p}: {}. The file also changed since the read that minted this tag — re-read to refresh it.",
+                "Edit rejected for {}: {}. The file also changed since the read that minted this tag — re-read to refresh it.",
+                crate::format::display_path_str(&p),
                 text_unmatched_message(path, tag, &preview)
             )));
         }
@@ -390,7 +397,7 @@ fn recover_edit(
 fn create_target_exists_error(path: &Path) -> TilthError {
     TilthError::EditRejected(format!(
         "create_file target already exists: {} — use a tagged read with replace instead",
-        path.display()
+        crate::format::display_path(path)
     ))
 }
 
@@ -434,9 +441,9 @@ fn commit_file_op(
                 .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
             let new_tag = session.record_snapshot(path, content, std::iter::empty());
-            let mut block = format!("## {}\ncreated{suffix}", path.display());
+            let mut block = format!("## {}\ncreated{suffix}", crate::format::display_path(path));
             if let Some(tag) = new_tag {
-                let header = format_header(&path.display().to_string(), tag);
+                let header = format_header(&crate::format::display_path(path), tag);
                 let _ = write!(block, "\n{header}");
             }
             Ok(block)
@@ -454,7 +461,10 @@ fn commit_file_op(
             })?;
             ctx.cache.invalidate_spellings(path, &canonical);
             session.invalidate_snapshot(&canonical);
-            Ok(format!("## {}\nremoved{suffix}", path.display()))
+            Ok(format!(
+                "## {}\nremoved{suffix}",
+                crate::format::display_path(path)
+            ))
         }
         FileOp::Move(dest_raw) => {
             let dest = super::resolve_anchored(std::path::Path::new(dest_raw), ctx.cwd)
@@ -464,7 +474,7 @@ fn commit_file_op(
             {
                 return Err(TilthError::EditRejected(format!(
                     "move destination already exists: {} — delete it or choose another destination",
-                    dest.display()
+                    crate::format::display_path(&dest)
                 )));
             }
             // Capture the canonical source key before the fs op — see the
@@ -498,8 +508,8 @@ fn commit_file_op(
             session.relocate_snapshot(&canonical_src, &dest);
             Ok(format!(
                 "## {}\nmoved{suffix} → {}",
-                path.display(),
-                dest.display()
+                crate::format::display_path(path),
+                crate::format::display_path(&dest)
             ))
         }
     }
@@ -579,7 +589,11 @@ fn render_changed_window(
         let Some(row) = row else {
             continue;
         };
-        let mut numbered = render_numbered_slice(row, line);
+        // The slice ends in '\n' and rows are joined with '\n' below; drop it
+        // here so consecutive receipt rows have no blank line between them.
+        let mut numbered = render_numbered_slice(row, line)
+            .trim_end_matches('\n')
+            .to_string();
         if numbered.is_empty() {
             numbered = format!("{line}:");
         }
@@ -615,7 +629,7 @@ fn render_changed_window(
             "... omitted lines {}-{}; re-read {}#{}-{}",
             reread_lo,
             total,
-            path.display(),
+            crate::format::display_path(path),
             reread_lo,
             reread_hi
         )
@@ -664,6 +678,184 @@ mod tests {
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
     use serde_json::json;
+
+    #[test]
+    fn receipt_rows_have_no_blank_line_between_them() {
+        let text = "one\ntwo\nthree\nfour\nfive\n";
+        let (rendered, seen, _) = render_changed_window(text, Some(3), Path::new("a.txt"), 1_000);
+        assert_eq!(seen.len(), 5);
+        assert!(
+            !rendered.contains("\n\n"),
+            "blank row in receipt: {rendered:?}"
+        );
+        assert_eq!(rendered.lines().count(), 5, "{rendered:?}");
+    }
+
+    #[test]
+    fn tool_write_replace_text_all_with_count_mismatch_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.txt");
+        let source = "foo\nfoo\nfoo\n";
+        std::fs::write(&path, source).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let read = json!({"cwd": dir.path(), "paths": [path.to_str().unwrap()]});
+        let read_out = crate::mcp::tools::read::tool_read(&read, &cache, &session).unwrap();
+        let tag = read_out
+            .split("m.txt#")
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .expect("tag in read output")
+            .to_string();
+        let edit = |count: u64| {
+            json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+                "ops": [{"op": "replace_text", "old": "foo", "new": "bar", "count": count}]}]})
+        };
+        let bad = super::tool_write(&edit(5), &session, &bloom, &cache);
+        let msg = match bad {
+            Ok(out) => out,
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("expected 5 matches") && msg.contains("found 3"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        super::tool_write(&edit(3), &session, &bloom, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bar\nbar\nbar\n");
+    }
+
+    const GO_SRC: &str = "package main\n\nfunc a() {\n\tx := w.Render(p)\n}\n\nfunc b() {\n\ty := t.inner.Render(q.Z())\n}\n";
+
+    fn read_tag(
+        dir: &Path,
+        spec: &str,
+        needle: &str,
+        session: &Session,
+        cache: &OutlineCache,
+    ) -> String {
+        let read = json!({"cwd": dir, "paths": [spec]});
+        let out = crate::mcp::tools::read::tool_read(&read, cache, session).unwrap();
+        out.split(needle)
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .expect("tag in read output")
+            .to_string()
+    }
+
+    #[test]
+    fn tool_write_rewrite_replaces_every_match_and_reports_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let tag = read_tag(
+            dir.path(),
+            path.to_str().unwrap(),
+            "r.go#",
+            &session,
+            &cache,
+        );
+        let edit = |count: u64| {
+            json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+                "ops": [{"op": "rewrite", "pattern": "$R.Render($W)",
+                         "rewrite": "$R.Render(context.Background(), $W)", "count": count}]}]})
+        };
+        let msg = match super::tool_write(&edit(5), &session, &bloom, &cache) {
+            Ok(out) => out,
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("rewrite expected 5 matches of pattern") && msg.contains("found 2"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), GO_SRC);
+        let out = super::tool_write(&edit(2), &session, &bloom, &cache).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            GO_SRC
+                .replace("w.Render(p)", "w.Render(context.Background(), p)")
+                .replace(
+                    "t.inner.Render(q.Z())",
+                    "t.inner.Render(context.Background(), q.Z())"
+                )
+        );
+        assert!(out.contains("context.Background(), p"), "{out}");
+    }
+
+    #[test]
+    fn tool_write_rewrite_without_tag_or_on_unseen_match_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "w.Render(p)\n").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let op = json!([{"op": "rewrite", "pattern": "$R.Render($W)", "rewrite": "$R.Draw($W)"}]);
+        let run = |edits: Value| {
+            let args = json!({"cwd": dir.path(), "edits": edits});
+            match super::tool_write(&args, &session, &bloom, &cache) {
+                Ok(out) => out,
+                Err(e) => e,
+            }
+        };
+        let tagless = run(json!([{"path": path.to_str().unwrap(), "ops": op}]));
+        assert!(
+            tagless.contains("requires the [path#TAG] from a tilth_read or tilth_search"),
+            "{tagless}"
+        );
+
+        // Only the first function was displayed, so the second match is unseen.
+        let spec = format!("{}#1-5", path.to_str().unwrap());
+        let tag = read_tag(dir.path(), &spec, "r.go#", &session, &cache);
+        let unseen = run(json!([{"path": path.to_str().unwrap(), "tag": tag, "ops": op}]));
+        assert!(
+            unseen.contains("never displayed") && unseen.contains('8'),
+            "{unseen}"
+        );
+        // The fix is one batched read of each unseen match span, not a whole-file re-read.
+        let Some((reads, _)) = unseen
+            .split_once("tilth_read paths ")
+            .and_then(|(_, rest)| rest.split_once(" shows"))
+        else {
+            panic!("no batched read hint: {unseen}");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(reads).unwrap(),
+            json!(["r.go#8-8"]),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), GO_SRC);
+
+        let txt_tag = read_tag(
+            dir.path(),
+            txt.to_str().unwrap(),
+            "notes.txt#",
+            &session,
+            &cache,
+        );
+        let unsupported = run(json!([{"path": txt.to_str().unwrap(), "tag": txt_tag, "ops": op}]));
+        assert!(unsupported.contains("notes.txt"), "{unsupported}");
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), "w.Render(p)\n");
+    }
+
+    #[test]
+    fn tool_write_rewrite_rejects_capture_that_spans_unseen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.rs");
+        let source = "fn a() {\n    x();\n    y();\n    z();\n}\n";
+        std::fs::write(&path, source).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let spec = format!("{}#2-2", path.to_str().unwrap());
+        let tag = read_tag(dir.path(), &spec, "m.rs#", &session, &cache);
+        let args = json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+            "ops": [{"op": "rewrite", "pattern": "fn a() { $$$B }", "rewrite": "fn a() {}"}]}]});
+        let msg = super::tool_write(&args, &session, &bloom, &cache).unwrap_err();
+        assert!(msg.contains("never displayed"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
 
     #[test]
     fn incremental_write_create_evicts_parsed_entry() {
@@ -919,7 +1111,8 @@ mod tests {
             session,
         )
         .expect("edit-mode read");
-        let marker = format!("{}#", path.display());
+        // cwd is the parent, so the header names the file relative to it.
+        let marker = format!("{}#", rel(path));
         let idx = out
             .find(&marker)
             .unwrap_or_else(|| panic!("read must emit [path#TAG] header, got:\n{out}"));
@@ -1748,7 +1941,9 @@ mod tests {
             // when a section read would have supplied the same whole-file tag.
             TilthError::EditRejected(message) => {
                 assert!(
-                    message.starts_with("replace_text requires a tag from a tilth_read"),
+                    message.starts_with(
+                        "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search"
+                    ),
                     "unexpected rejection: {message}"
                 );
                 assert!(
@@ -1816,7 +2011,7 @@ mod tests {
             out,
             format!(
                 "## {p}\nerror: text to replace was not found; copy old verbatim from the numbered lines of [{p}#{tag}] — do not retype it from memory or shell output (preview: missing)",
-                p = p.display()
+                p = rel(&p)
             )
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
@@ -1842,7 +2037,7 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: text to replace matched at least 2 times; add context so it matches once",
-                p.display()
+                rel(&p)
             )
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
@@ -1869,7 +2064,7 @@ mod tests {
         )
         .expect_err("all sections failed → isError");
         assert!(
-            out.contains("Edit rejected for"),
+            out.contains("Edit rejected for drift_swap.rs:"),
             "expected an Edit rejected message, got:\n{out}"
         );
         assert!(
@@ -1922,9 +2117,9 @@ mod tests {
         )
         .expect("create_file succeeds");
 
-        let header_line = format!("[{}#", p.display());
+        let header_line = format!("[{}#", rel(&p));
         assert!(
-            out.starts_with(&format!("## {}\ncreated\n{header_line}", p.display())),
+            out.starts_with(&format!("## {}\ncreated\n{header_line}", rel(&p))),
             "expected created output with tag header, got: {out}"
         );
         assert!(
@@ -1955,8 +2150,8 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: create_file target already exists: {} — use a tagged read with replace instead",
-                p.display(),
-                p.display()
+                rel(&p),
+                rel(&p)
             )
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
@@ -1984,8 +2179,8 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: create_file target already exists: {} — use a tagged read with replace instead",
-                link.display(),
-                link.display()
+                rel(&link),
+                rel(&link)
             )
         );
         assert!(link.is_symlink(), "dangling symlink must remain untouched");
@@ -2018,8 +2213,8 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
-                p.display(),
-                p.display()
+                rel(&p),
+                rel(&p)
             )
         );
         assert!(!p.exists(), "tagged create must not create the file");
@@ -2158,8 +2353,8 @@ mod tests {
             2,
             "both sections must apply, got:\n{out}"
         );
-        assert!(out.contains(&format!("## {}", a.display())));
-        assert!(out.contains(&format!("## {}", b.display())));
+        assert!(out.contains(&format!("## {}", rel(&a))));
+        assert!(out.contains(&format!("## {}", rel(&b))));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn ONE() {}\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "fn TWO() {}\n");
     }
@@ -2447,7 +2642,7 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
-                p.display()
+                rel(&p)
             )
         );
         assert!(
@@ -2476,7 +2671,7 @@ mod tests {
             out,
             format!(
                 "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
-                p.display()
+                rel(&p)
             )
         );
         assert!(
@@ -2621,11 +2816,11 @@ mod tests {
         )
         .expect_err("every section failed → isError:true");
         assert!(
-            out.contains(&format!("## {}\nerror:", a.display())),
+            out.contains(&format!("## {}\nerror:", rel(&a))),
             "missing a's block, got:\n{out}"
         );
         assert!(
-            out.contains(&format!("## {}\nerror:", b.display())),
+            out.contains(&format!("## {}\nerror:", rel(&b))),
             "missing b's block, got:\n{out}"
         );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "fn a() {}\n");
@@ -2721,8 +2916,13 @@ mod tests {
         );
     }
 
+    /// The label a write/read prints for a file directly under `cwd`.
+    fn rel(path: &Path) -> String {
+        path.file_name().unwrap().to_str().unwrap().to_string()
+    }
+
     fn tag_from_output(path: &Path, output: &str) -> String {
-        let marker = format!("{}#", path.display());
+        let marker = format!("{}#", rel(path));
         let idx = output
             .find(&marker)
             .unwrap_or_else(|| panic!("write must emit [path#TAG] header, got:\n{output}"));
@@ -3030,7 +3230,7 @@ mod tests {
             out.len()
         );
         for p in paths {
-            let marker = format!("## {}\n", p.display());
+            let marker = format!("## {}\n", rel(&p));
             let start = out.find(&marker).unwrap();
             let rest = &out[start..];
             let block = rest.split("\n\n---\n\n").next().unwrap();
@@ -3040,7 +3240,7 @@ mod tests {
             );
             let fresh_tag = format!("{:04X}", session.snapshots().head(&p).unwrap().tag);
             assert!(
-                block.contains(&format!("[{}#{}]", p.display(), fresh_tag)),
+                block.contains(&format!("[{}#{}]", rel(&p), fresh_tag)),
                 "missing fresh tag for {p:?}: {block}"
             );
             assert!(

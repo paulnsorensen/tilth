@@ -136,6 +136,8 @@ fn tool_read_paths(
 
     // The absolute checkout directory anchors every relative path.
     let cwd = super::require_cwd(args)?;
+    // Path labels print relative to cwd; file content is never rewritten.
+    let _display_base = crate::format::set_display_base(Path::new(cwd));
 
     // Resolve suffix grammar on each path spec into (PathBuf, Suffix). Relative
     // paths anchor under `cwd`; absolute paths pass through (trust-absolute).
@@ -168,14 +170,17 @@ fn tool_read_paths(
         let outcomes: Vec<PerPath> = parsed
             .par_iter()
             .map(|(path, suffix)| {
+                let _display_base = crate::format::set_display_base(Path::new(cwd));
                 // Label used for the `── omitted (raise budget) ──` footer when
                 // this part's rendered body does not fit the batch budget.
                 let label = match suffix {
-                    PathSuffix::Symbol(name) => format!("{}#{}", path.display(), name),
-                    _ => path.display().to_string(),
+                    PathSuffix::Symbol(name) => {
+                        format!("{}#{}", crate::format::display_path(path), name)
+                    }
+                    _ => crate::format::display_path(path),
                 };
                 if !path.exists() {
-                    return PerPath::NotFound(path.display().to_string());
+                    return PerPath::NotFound(crate::format::display_path(path));
                 }
                 if crate::read::tilthignore_denies(path) {
                     return PerPath::Content(label, crate::read::blocked_notice(path));
@@ -188,7 +193,11 @@ fn tool_read_paths(
                 // error path so we don't misclassify them as "not found".
                 if let PathSuffix::Symbol(name) = suffix {
                     if matches!(resolve_symbol(path, name, cache), SymbolLookup::Missing) {
-                        return PerPath::NotFound(format!("{}#{}", path.display(), name));
+                        return PerPath::NotFound(format!(
+                            "{}#{}",
+                            crate::format::display_path(path),
+                            name
+                        ));
                     }
                 }
                 session.record_read(path);
@@ -206,8 +215,10 @@ fn tool_read_paths(
                         && matches!(suffix, PathSuffix::None)
                         && should_auto_signature(path));
                 let (body, spec) = if force_full && matches!(suffix, PathSuffix::None) {
-                    let b = crate::read::read_file(path, None, true, cache, true)
-                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e));
+                    let b =
+                        crate::read::read_file(path, None, true, cache, true).unwrap_or_else(|e| {
+                            format!("# {}\nerror: {}", crate::format::display_path(path), e)
+                        });
                     (b, crate::read::SeenSpec::Whole)
                 } else {
                     read_single_with_suffix(path, suffix, signature, force_stripped, cache)
@@ -461,7 +472,7 @@ fn tool_read_paths(
                 if i > 0 {
                     output.push_str(", ");
                 }
-                let _ = write!(output, "{}", p.display());
+                let _ = write!(output, "{}", crate::format::display_path(p));
             }
         }
     }
@@ -515,7 +526,9 @@ pub(crate) fn read_single_with_suffix(
 ) -> (String, crate::read::SeenSpec) {
     use crate::read::SeenSpec;
     let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    let render_err = |e: crate::error::TilthError| format!("# {}\nerror: {}", path.display(), e);
+    let render_err = |e: crate::error::TilthError| {
+        format!("# {}\nerror: {}", crate::format::display_path(path), e)
+    };
     match suffix {
         PathSuffix::LineRange(s, e) => {
             let range = format!("{s}-{e}");
@@ -559,7 +572,7 @@ pub(crate) fn read_single_with_suffix(
                 None => (
                     format!(
                         "# {}\nerror: symbol '{}' not found in outline",
-                        path.display(),
+                        crate::format::display_path(path),
                         name
                     ),
                     SeenSpec::Whole,
@@ -1154,7 +1167,7 @@ mod tests {
         assert!(!out.contains("... truncated"), "{out}");
 
         let tag = crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(&source));
-        assert!(out.contains(&format!("[{}#{tag}]", path.display())));
+        assert!(out.contains(&format!("[range.rs#{tag}]")));
         let bloom = Arc::new(BloomFilterCache::new());
         let write = |line| {
             crate::mcp::tools::tool_write(
@@ -1223,7 +1236,7 @@ mod tests {
             &serde_json::json!({
                 "paths": path_refs,
                 "mode": "full",
-                "budget": 120,
+                "budget": 90,
                 "cwd": dir.path().to_str().unwrap()
             }),
             &cache,

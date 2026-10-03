@@ -10,6 +10,10 @@ use crate::search::{callees, callers, target};
 use crate::types::is_test_file;
 
 const SECTION_CAP: usize = 30;
+
+fn normalized(path: &Path) -> std::path::PathBuf {
+    path.components().collect()
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Target {
@@ -17,9 +21,12 @@ pub(super) struct Target {
     pub(super) line: Option<u32>,
     pub(super) name: Option<String>,
     /// Optional source-byte range that distinguishes same-line declarations.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) occurrence: Option<(usize, usize)>,
+    /// The searched directory: `.` for cwd, a cwd-relative path inside it, or
+    /// an absolute path (trusted as-is) outside it.
     pub(super) scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) glob: Option<String>,
 }
 
@@ -57,8 +64,20 @@ impl Target {
                 .is_ok_and(|filter| !filter.matched(path, false).is_ignore())
     }
 
+    /// Anchor a relative scope under `cwd`; refuse `..`; trust an absolute scope.
+    fn resolve_scope(&self, cwd: &Path) -> Result<std::path::PathBuf, String> {
+        let scope = Path::new(&self.scope);
+        if scope.is_absolute() {
+            return Ok(normalized(scope));
+        }
+        if scope.components().any(|c| c == Component::ParentDir) {
+            return Err("follow target scope requires a normalized path".into());
+        }
+        Ok(normalized(&cwd.join(scope)))
+    }
+
     fn validate(&self, cwd: &Path, cache: &OutlineCache) -> Result<(), String> {
-        if self.scope != cwd.to_string_lossy() {
+        if self.resolve_scope(cwd)? != normalized(cwd) {
             return Err("follow target scope does not match cwd".into());
         }
         if Path::new(&self.path).is_absolute() {
@@ -363,6 +382,49 @@ mod tests {
     }
 
     #[test]
+    fn emitted_hints_validate_against_follow_schema() {
+        let tools = crate::mcp::tools::definitions::tool_definitions();
+        let search = tools.iter().find(|t| t["name"] == "tilth_search").unwrap();
+        let follow = &search["inputSchema"]["properties"]["queries"]["items"]["oneOf"][2]
+            ["properties"]["follow"];
+        let schema_target = &follow["properties"]["target"];
+        let props = schema_target["properties"].as_object().unwrap();
+        let required: Vec<&str> = schema_target["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let kinds = follow["properties"]["kind"]["enum"].as_array().unwrap();
+        let target = Target {
+            path: "a.rs".into(),
+            line: Some(3),
+            name: Some("f".into()),
+            occurrence: Some((10, 20)),
+            scope: ".".into(),
+            glob: Some("*.rs".into()),
+        };
+        let hints = target.hints();
+        assert_eq!(hints.len(), 4);
+        for hint in hints {
+            assert!(kinds.contains(&hint["kind"]), "kind not in schema: {hint}");
+            let emitted = hint["target"].as_object().unwrap();
+            for key in emitted.keys() {
+                assert!(props.contains_key(key), "schema lacks emitted key {key}");
+            }
+            for key in &required {
+                assert!(emitted.contains_key(*key), "hint lacks required key {key}");
+            }
+            let occ = props["occurrence"]["items"]["minimum"].as_u64().unwrap();
+            assert!(emitted["occurrence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n.as_u64().unwrap() >= occ));
+        }
+    }
+
+    #[test]
     fn glob_scoped_follows_exclude_out_of_scope_items() {
         let tmp = scoped_fixture();
         let cwd = tmp.path();
@@ -382,6 +444,41 @@ mod tests {
         assert_eq!(
             scoped_callers["items"].as_array().unwrap().as_slice(),
             [] as [serde_json::Value; 0]
+        );
+    }
+
+    #[test]
+    fn relative_scope_anchors_under_cwd() {
+        let tmp = scoped_fixture();
+        let cwd = tmp.path();
+        let cache = OutlineCache::new();
+        for scope in [".", "./"] {
+            let mut hint = follow_hint(cwd, "fetch_callees", &Value::Null);
+            hint["target"]["scope"] = json!(scope);
+            hint["target"].as_object_mut().unwrap().remove("glob");
+            assert_eq!(run(cwd, &hint)["items"][0]["name"], "leaf", "{scope}");
+        }
+        for scope in ["..", "sub/..", "sub", "/tmp"] {
+            let mut hint = follow_hint(cwd, "fetch_callees", &Value::Null);
+            hint["target"]["scope"] = json!(scope);
+            assert!(Follow::parse(&hint, cwd, &cache).is_err(), "{scope}");
+        }
+    }
+
+    #[test]
+    fn hints_omit_null_optional_keys() {
+        let target = Target {
+            path: "root.ts".into(),
+            line: Some(2),
+            name: Some("root".into()),
+            occurrence: None,
+            scope: ".".into(),
+            glob: None,
+        };
+        let hint = &target.hints()[0];
+        assert_eq!(
+            hint["target"],
+            json!({"path": "root.ts", "line": 2, "name": "root", "scope": "."})
         );
     }
 

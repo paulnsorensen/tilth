@@ -15,6 +15,7 @@ use std::path::Path;
 
 use super::block::{outline_for, resolve_block_in};
 use super::parser::{BlockMode, Cursor, Op};
+use super::rewrite::rewrite_spans;
 
 /// File-level operation surfaced separately from the text edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,33 @@ pub enum ApplyError {
     /// `old` was empty; a match-once anchor cannot be empty.
     #[error("replace_text \"old\" must not be empty")]
     TextOldEmpty,
+    /// `all`/`count` found occurrences that overlap each other, so the
+    /// replacement set is not well defined.
+    #[error("text to replace overlaps itself at byte {at}; add context so occurrences do not overlap (preview: {preview})")]
+    TextSelfOverlap { at: usize, preview: String },
+    /// `count` did not equal the number of occurrences found.
+    #[error(
+        "replace_text expected {expected} matches of \"old\" but found {found}; no change written"
+    )]
+    TextCountMismatch { expected: usize, found: usize },
+    /// The file's language has no structural grammar, or the file did not parse.
+    #[error("rewrite needs a language with a structural grammar; cannot rewrite {path}")]
+    RewriteLanguage { path: String },
+    /// The `rewrite` pattern did not compile.
+    #[error("rewrite pattern is invalid: {message}")]
+    RewritePattern { message: String },
+    /// The `rewrite` pattern matched nothing.
+    #[error("rewrite pattern \"{pattern}\" matched nothing")]
+    RewriteUnmatched { pattern: String },
+    /// `count` did not equal the number of `rewrite` matches.
+    #[error(
+        "rewrite expected {expected} matches of pattern \"{pattern}\" but found {found}; no change written"
+    )]
+    RewriteCountMismatch {
+        pattern: String,
+        expected: usize,
+        found: usize,
+    },
 }
 
 impl ApplyError {
@@ -116,6 +144,12 @@ impl ApplyError {
             ApplyError::TextUnmatched { .. }
                 | ApplyError::TextAmbiguous { .. }
                 | ApplyError::TextOldEmpty
+                | ApplyError::TextSelfOverlap { .. }
+                | ApplyError::TextCountMismatch { .. }
+                | ApplyError::RewriteLanguage { .. }
+                | ApplyError::RewritePattern { .. }
+                | ApplyError::RewriteUnmatched { .. }
+                | ApplyError::RewriteCountMismatch { .. }
         )
     }
 }
@@ -167,6 +201,51 @@ fn find_text_span(text: &str, old: &str) -> Result<(usize, usize), ApplyError> {
         return Err(ApplyError::TextAmbiguous { count: 2 });
     }
     Ok((start, start + old.len()))
+}
+
+/// Resolve every exact occurrence of `old` for `all`/`count` replacement.
+/// Byte-exact only: the whitespace-normalized fallback never applies. Zero
+/// occurrences are [`ApplyError::TextUnmatched`]; occurrences that overlap each
+/// other are [`ApplyError::TextSelfOverlap`]; a `count` that differs from the
+/// number found is [`ApplyError::TextCountMismatch`].
+pub(super) fn find_all_text_spans(
+    text: &str,
+    old: &str,
+    count: Option<usize>,
+) -> Result<Vec<(usize, usize)>, ApplyError> {
+    let Some(lead) = old.chars().next() else {
+        return Err(ApplyError::TextOldEmpty);
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(old) {
+        let start = from + rel;
+        if let Some(&(_, prev_end)) = spans.last() {
+            if start < prev_end {
+                return Err(ApplyError::TextSelfOverlap {
+                    at: start,
+                    preview: preview_of(old),
+                });
+            }
+        }
+        spans.push((start, start + old.len()));
+        // Step one char past the start so overlapping occurrences are seen.
+        from = start + lead.len_utf8();
+    }
+    if spans.is_empty() {
+        return Err(ApplyError::TextUnmatched {
+            preview: preview_of(old),
+        });
+    }
+    if let Some(expected) = count {
+        if spans.len() != expected {
+            return Err(ApplyError::TextCountMismatch {
+                expected,
+                found: spans.len(),
+            });
+        }
+    }
+    Ok(spans)
 }
 
 /// Resolve a `replace_text` span, exact first and whitespace-normalized second.
@@ -380,21 +459,43 @@ fn resolve_text_swap(
 /// [`reject_overlaps`]. Two swaps whose matched byte ranges genuinely overlap
 /// still error. Returns one slot per op index in `ops`; `None` for
 /// non-`TextSwap` ops and for ops merged into an earlier slot.
-fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool), ApplyError> {
+fn lower_text_swaps(
+    path: &Path,
+    text: &str,
+    ops: &[Op],
+) -> Result<(Vec<Vec<LineOp>>, bool), ApplyError> {
     struct Resolved<'a> {
         op_idx: usize,
         start: usize,
         end: usize,
-        new: &'a str,
+        new: Cow<'a, str>,
         line_span: (u32, u32),
     }
 
     let mut resolved: Vec<Resolved> = Vec::new();
     let mut normalized = false;
     for (op_idx, op) in ops.iter().enumerate() {
-        if let Op::TextSwap { old, new } = op {
-            let (start, end, was_normalized) = match_text_span(text, old)?;
-            normalized |= was_normalized;
+        let spans: Vec<(usize, usize, Cow<str>)> = match op {
+            Op::TextSwap { old, new } => {
+                let (start, end, was_normalized) = match_text_span(text, old)?;
+                normalized |= was_normalized;
+                vec![(start, end, Cow::Borrowed(new.as_str()))]
+            }
+            Op::TextSwapAll { old, new, count } => find_all_text_spans(text, old, *count)?
+                .into_iter()
+                .map(|(start, end)| (start, end, Cow::Borrowed(new.as_str())))
+                .collect(),
+            Op::Rewrite {
+                pattern,
+                rewrite,
+                count,
+            } => rewrite_spans(path, text, pattern, rewrite, *count)?
+                .into_iter()
+                .map(|(start, end, new)| (start, end, Cow::Owned(new)))
+                .collect(),
+            _ => continue,
+        };
+        for (start, end, new) in spans {
             resolved.push(Resolved {
                 op_idx,
                 start,
@@ -412,7 +513,7 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool
     // left it dependent on iteration order.
     resolved.sort_by_key(|r| r.start);
 
-    let mut out: Vec<Option<LineOp>> = vec![None; ops.len()];
+    let mut out: Vec<Vec<LineOp>> = vec![Vec::new(); ops.len()];
     let mut run_start = 0;
     while run_start < resolved.len() {
         // Extend the run while the next swap's covering lines touch it. Keying
@@ -434,11 +535,13 @@ fn lower_text_swaps(text: &str, ops: &[Op]) -> Result<(Vec<Option<LineOp>>, bool
         }
 
         let run = &resolved[run_start..run_end];
-        let edits: Vec<(usize, usize, &str)> =
-            run.iter().map(|r| (r.start, r.end, r.new)).collect();
+        let edits: Vec<(usize, usize, &str)> = run
+            .iter()
+            .map(|r| (r.start, r.end, r.new.as_ref()))
+            .collect();
         let payload = render_swapped_lines(text, &edits);
         let primary = run.iter().map(|r| r.op_idx).min().unwrap_or(0);
-        out[primary] = Some(LineOp::Swap {
+        out[primary].push(LineOp::Swap {
             start: run[0].line_span.0,
             end: last_line,
             payload,
@@ -475,7 +578,7 @@ pub(super) fn lower_ops(path: &Path, text: &str, ops: &[Op]) -> Result<Lowered, 
     };
     // Text swaps resolve against the pristine `text` up front so overlapping
     // and same-line groups can be detected/coalesced before lowering.
-    let (mut text_swaps, normalized) = lower_text_swaps(text, ops)?;
+    let (mut text_swaps, normalized) = lower_text_swaps(path, text, ops)?;
     for (i, op) in ops.iter().enumerate() {
         match op {
             Op::Swap {
@@ -526,10 +629,8 @@ pub(super) fn lower_ops(path: &Path, text: &str, ops: &[Op]) -> Result<Lowered, 
                     }),
                 }
             }
-            Op::TextSwap { .. } => {
-                if let Some(line_op) = text_swaps[i].take() {
-                    line_ops.push(line_op);
-                }
+            Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. } => {
+                line_ops.append(&mut text_swaps[i]);
             }
             Op::Create { .. } | Op::Rem | Op::Mv { .. } => {}
         }
@@ -1547,5 +1648,90 @@ mod tests {
             err.to_string(),
             "CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section"
         );
+    }
+
+    fn all_op(old: &str, new: &str, count: Option<usize>) -> Op {
+        Op::TextSwapAll {
+            old: old.into(),
+            new: new.into(),
+            count,
+        }
+    }
+
+    fn apply_all(text: &str, ops: &[Op]) -> Result<String, ApplyError> {
+        apply_ops(Path::new("a.rs"), text, ops).map(|r| r.text)
+    }
+
+    #[test]
+    fn all_replaces_every_occurrence() {
+        let text = "foo a\nb foo foo\nc\nfoo\n";
+        let out = apply_all(text, &[all_op("foo", "bar", None)]).expect("apply");
+        assert_eq!(out, "bar a\nb bar bar\nc\nbar\n");
+    }
+
+    #[test]
+    fn count_exact_match_succeeds() {
+        let text = "x\nx\nx\n";
+        let out = apply_all(text, &[all_op("x", "y", Some(3))]).expect("apply");
+        assert_eq!(out, "y\ny\ny\n");
+    }
+
+    #[test]
+    fn count_mismatch_reports_expected_and_found() {
+        let text = "x\nx\nx\n";
+        let err = apply_all(text, &[all_op("x", "y", Some(12))]).unwrap_err();
+        assert_eq!(
+            err,
+            ApplyError::TextCountMismatch {
+                expected: 12,
+                found: 3
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "replace_text expected 12 matches of \"old\" but found 3; no change written"
+        );
+        assert!(err.is_text_match_failure());
+    }
+
+    #[test]
+    fn all_with_zero_matches_is_unmatched() {
+        let err = apply_all("abc\n", &[all_op("zzz", "y", None)]).unwrap_err();
+        assert!(matches!(err, ApplyError::TextUnmatched { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn all_rejects_self_overlapping_occurrences() {
+        let err = apply_all("aaa\n", &[all_op("aa", "b", None)]).unwrap_err();
+        assert!(matches!(err, ApplyError::TextSelfOverlap { .. }), "{err:?}");
+        assert!(err.is_text_match_failure());
+    }
+
+    #[test]
+    fn all_does_not_use_whitespace_normalized_fallback() {
+        let text = "fn f() {\n\tlet y = 2;\n}\n";
+        let err = apply_all(text, &[all_op("    let y = 2;", "z", None)]).unwrap_err();
+        assert!(matches!(err, ApplyError::TextUnmatched { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn all_overlapping_another_op_in_section_is_rejected() {
+        let text = "foo\nfoo\nlast\n";
+        let ops = vec![
+            all_op("foo", "bar", None),
+            Op::Swap {
+                start: 2,
+                end: 2,
+                payload: vec!["other".into()],
+            },
+        ];
+        let err = apply_all(text, &ops).unwrap_err();
+        assert!(matches!(err, ApplyError::Overlap { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn all_coalesces_same_line_occurrences() {
+        let out = apply_all("a a a\n", &[all_op("a", "b", None)]).expect("apply");
+        assert_eq!(out, "b b b\n");
     }
 }
