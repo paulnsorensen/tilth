@@ -40,15 +40,16 @@ pub struct ResolvedTarget {
 
 /// Resolve a path/line target by its stable source-byte occurrence identity.
 /// The identity prevents same-line declarations from being re-resolved by line alone.
+/// The rescan uses the hint's glob, so a follow never resolves outside its glob.
 pub(crate) fn resolve_by_path_line_occurrence(
     path: &Path,
     line: u32,
     name: &str,
     occurrence: (usize, usize),
-    scope: &Path,
+    (scope, glob): (&Path, Option<&str>),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
+    let result = super::search_symbol_raw_cached(name, scope, glob, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
@@ -224,37 +225,20 @@ pub(crate) fn resolve_candidate_with_source(
     )
 }
 
-pub(crate) fn resolve_candidate_with_source_occurrence(
+/// Resolve a candidate minted moments ago by the caller's own scan. The line
+/// is exact, so the outline is read at it directly; rescanning the symbol here
+/// would apply the bare scan's match cap and drop a glob-scoped definition.
+pub(crate) fn resolve_candidate_with_source_exact(
     path: &Path,
     start_line: u32,
     semantic_end: Option<u32>,
     name: &str,
-    occurrence: (usize, usize),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let scope = path.parent().unwrap_or_else(|| Path::new("."));
-    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
-    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let candidate = result.matches.iter().find(|candidate| {
-        candidate.is_definition
-            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
-            && candidate.line == start_line
-            && candidate.def_name.as_deref() == Some(name)
-            && candidate.def_byte_range == Some(occurrence)
-    });
-    let Some(candidate) = candidate else {
-        return Err(TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: Some("target occurrence changed; search again".to_string()),
-        });
-    };
     enrich_from_outline(
-        candidate.path.clone(),
-        candidate.line,
-        semantic_end.or_else(|| candidate.def_range.map(|(_, end)| end)),
+        path.to_path_buf(),
+        start_line,
+        semantic_end,
         name.to_string(),
         false,
         cache,

@@ -99,10 +99,11 @@ class ContinuationBoundary(unittest.TestCase):
         self.assertEqual(payload["results"][0]["resolved_as"], "fetch_callers")
         self.assertEqual(payload["results"][1]["query"], "caller")
 
-    def test_unfittable_budget_returns_explicit_error(self):
+    def test_unfittable_budget_returns_limited_results(self):
         response = self.call([{"query": "root"}], budget=1)
-        self.assertTrue(harness.tool_is_error(response), response)
-        self.assertIn("budget", harness.tool_result_text(response).lower())
+        self.assertFalse(harness.tool_is_error(response), response)
+        results = json.loads(harness.tool_result_text(response))["results"]
+        self.assertTrue(all(r["budget_limited"] for r in results), results)
 
     def test_follow_budget_reduction_keeps_one_result_per_entry(self):
         # Many callers make the canonical `items` array the largest droppable

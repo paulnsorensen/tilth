@@ -292,7 +292,8 @@ class StructuralSearch(unittest.TestCase):
             for index in range(shown)
         ]
         self.assertEqual(result["items"], [{"path": "source.py", "matches": expected}])
-        self.assertTrue(harness.tool_is_error(self.call([entry], budget=1)))
+        for limited in self.result([entry], budget=1)["results"]:
+            self.assertTrue(limited["budget_limited"])
 
     def test_default_budget_returns_tier_one_for_many_matches(self):
         self.many(["a/one.py", "a/two.py", "b/three.py"], 200)
@@ -414,7 +415,7 @@ class StructuralSearch(unittest.TestCase):
         self.assertEqual(result["view"], "files")
         self.assertEqual(result["files_matched"], 100)
 
-    def test_tier_four_removes_listing_but_budget_one_still_errors(self):
+    def test_tier_four_removes_listing_and_budget_one_is_limited_not_error(self):
         for directory in ("alpha", "beta"):
             for index in range(30):
                 self.many([f"{directory}/module_number_{index:02}.py"], 2)
@@ -426,7 +427,8 @@ class StructuralSearch(unittest.TestCase):
         self.assertEqual(result["completeness"], "partial")
         self.assertEqual(result["view"], "none")
         self.assertEqual(result["note"], "Too many matches (120 in 60 files) for the budget. Raise budget or narrow with glob.")
-        self.assertTrue(harness.tool_is_error(self.call([entry], budget=1)))
+        for limited in self.result([entry], budget=1)["results"]:
+            self.assertTrue(limited["budget_limited"])
 
     def test_unparsed_file_marks_scan_partial(self):
         self.write("large.py", "# large\n" * 70000 + "wrap(value)\n")

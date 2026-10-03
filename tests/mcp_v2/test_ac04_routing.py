@@ -59,8 +59,8 @@ class AC04Routing(unittest.TestCase):
         result = json.loads(harness.tool_result_text(response))["results"][0]
         self.assertEqual(result["resolved_as"], "literal")
         self.assertEqual(result["status"], "ok")
-        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
-        self.assertNotIn("src/telemetry.rs:", result["preview"])
+        self.assertIn("src/mcp/tools/search_v2.rs#", result["preview"])
+        self.assertNotIn("src/telemetry.rs", result["preview"])
         self.assertIn(
             "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
             result["preview"],
@@ -74,12 +74,12 @@ class AC04Routing(unittest.TestCase):
         self.assertEqual(result["query"], query)
         self.assertEqual(result["resolved_as"], "literal")
         self.assertEqual(result["status"], "ok")
-        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
+        self.assertIn("src/mcp/tools/search_v2.rs#", result["preview"])
         self.assertIn(
             "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
             result["preview"],
         )
-        self.assertNotIn("src/telemetry.rs:", result["preview"])
+        self.assertNotIn("src/telemetry.rs", result["preview"])
 
     def test_regex_in_exact_file_stays_bounded_to_requested_path(self):
         response = self._call(
@@ -89,8 +89,8 @@ class AC04Routing(unittest.TestCase):
         result = json.loads(harness.tool_result_text(response))["results"][0]
         self.assertEqual(result["resolved_as"], "regex")
         self.assertEqual(result["status"], "ok")
-        self.assertIn("src/mcp/tools/search_v2.rs:", result["preview"])
-        self.assertNotIn("src/telemetry.rs:", result["preview"])
+        self.assertIn("src/mcp/tools/search_v2.rs#", result["preview"])
+        self.assertNotIn("src/telemetry.rs", result["preview"])
         self.assertIn(
             "use crate::telemetry::{SearchTelemetryRecord, TelemetrySink};",
             result["preview"],
