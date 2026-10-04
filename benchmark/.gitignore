@@ -1,0 +1,3 @@
+# Evolve run logs and candidate worktrees/binaries (benchmark/evolve, run.build_candidate).
+results/evolve/
+results/candidates/
