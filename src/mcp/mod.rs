@@ -934,6 +934,10 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("mcp__"),
             "instructions must use protocol tool names, not client-specific prefixes"
         );
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("tilth_deps"),
+            "instructions must not route to the retired tilth_deps tool"
+        );
     }
 
     /// ADR-003's hard surface cap. The spec elevated "the cap never yields" to
