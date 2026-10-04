@@ -259,3 +259,15 @@ def test_retried_cell_keeps_each_attempts_sidecar(world) -> None:
     assert len(failed) == 2 and all(row.get("error") for row in failed)
     paths = [row["trajectory_path"] for row in failed]
     assert len(set(paths)) == 2 and all(Path(path).is_file() for path in paths)
+
+
+def test_failed_candidate_build_reports_cargo_error(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, candidate, _builds = candidate_repo
+
+    def failing_cargo(argv, *, cwd, env, **kwargs):
+        subprocess.run(["git", "worktree", "remove", "--force", str(cwd)], cwd=repo, check=True)
+        return subprocess.CompletedProcess(argv, 101, "", "error[E0425]: cannot find value `x`")
+
+    monkeypatch.setattr(run, "_run_cargo", failing_cargo)
+    with pytest.raises(RuntimeError, match=r"E0425"):
+        run.build_candidate(candidate, repo=repo)

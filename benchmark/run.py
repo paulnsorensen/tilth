@@ -1473,7 +1473,8 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
         # The shared target dir is overwritten by the next build: keep this binary beside its sha.
         shutil.copy2(target_dir / "release" / "tilth", binary)
     finally:
-        _git("worktree", "remove", "--force", str(worktree), cwd=repo)
+        # Never raise here: a cleanup failure must not hide the build error already propagating.
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
     digest = _file_sha256(binary)
     record.write_text(json.dumps({"git_sha": sha, "binary_sha256": digest}) + "\n")
     return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=digest)
