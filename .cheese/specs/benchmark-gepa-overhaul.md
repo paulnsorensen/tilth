@@ -17,7 +17,7 @@ gate_applicability:
   ui_surface: non-browser
 landing:
   shape: diamond_stack
-  layers: [["c1-result-substrate", "c0-prompt-files"], ["c2-external-task-adapter", "c4-model-judge"], ["c3-panel-manifest"], ["c5-evolution-loop"]]
+  layers: [["c1-result-substrate", "c0-prompt-files"], ["c2-external-task-adapter"], ["c3-panel-manifest", "c4-model-judge"], ["c5-evolution-loop"]]
   per_layer_green: required
   review_fixes: fold
 ---
@@ -183,7 +183,7 @@ arrows:           run.py -> external, baselines, panels; evolve -> run.py, basel
 - **c0-prompt-files** — one-time byte-identical move of the `tilth_search` and `tilth_write` tool descriptions into `prompts/tools/search.md` and `prompts/tools/write.md` via `include_str!`, refactor-only, gated by `just check`. Covers G-4 as an enabler for c5. Parent ACs: none directly; c5 AC-12 depends on it. Depends on: none. Child: `bench-prompt-files` (split out of c5 by user choice on 2026-10-04). State: proposed.
 - **c1-result-substrate** — run key, trajectory sidecar, result store, `--max-usd` spend ledger, auth guard, quota stop, CLI pin, power gate retired. Covers G-4, G-5. Parent ACs: AC-2, AC-3, AC-7, AC-8 (substrate half). Depends on: none. Child: `bench-result-substrate` (`/root/.local/share/cheese/paulnsorensen-tilth/specs/bench-result-substrate.md`); route: Cook here in isolation, pending its coherence verdict. State: draft.
 - **c2-external-task-adapter** — `prepare` and `grade_details` hooks, native checkout, masked-state reconstruction, `uv` and Go/Rust environments, native F2P/P2P grading, contamination flag, preflight. Covers G-1, G-3. Parent ACs: AC-1 (admission half). Depends on: c1. Child: `bench-external-tasks`. State: draft.
-- **c4-model-judge** — applicability labels and analysis slicing, per-rollout critiques, calibration gate. Covers G-6. Parent ACs: AC-4 (label half), AC-7 (judge calls). Depends on: c1. Child: `bench-model-judge`. State: draft.
+- **c4-model-judge** — applicability labels and analysis slicing, per-rollout critiques, calibration gate. Covers G-6. Parent ACs: AC-4 (label half), AC-7 (judge calls). Depends on: c1, c2. Child: `bench-model-judge`. State: draft.
 - **c3-panel-manifest** — pre-registered panel, task families, split lock. Covers G-1, G-2, G-3. Parent ACs: AC-1. Depends on: c2. Child: `bench-panel-manifest`. State: draft.
 - **c5-evolution-loop** — multi-component candidate with isolated `src_patch` proposer, applier, cascade, GEPA engine, delta reports, frontier re-runs, held-out scoring, draft PR. Covers G-4, G-5. Parent ACs: AC-2 to AC-8 (loop half). Depends on: c0, c1, c3, c4. Child: `bench-evolution-loop`. State: draft.
 
