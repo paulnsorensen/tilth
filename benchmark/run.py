@@ -7,7 +7,9 @@ Records token usage, cost, correctness, and tool usage to JSONL format.
 """
 
 import argparse
+import functools
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -20,7 +22,7 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -28,10 +30,12 @@ from typing import Optional
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
+import baselines
 from claude_bash_guard import allowed_command
 from config import (
     DEFAULT_MAX_BUDGET_USD,
     DEFAULT_REPS,
+    FIXTURES_DIR,
     MODELS,
     MODES,
     OPENCODE_CONFIG_HOME,
@@ -46,10 +50,13 @@ from config import (
 )
 from fixtures.reset import ensure_repo_clean, reset_repo
 from parse import (
+    detect_quota_rejection,
     extract_stream_error,
+    extract_trajectory,
     parse_codex_json,
     parse_opencode_json,
     parse_stream_json,
+    stream_native_cost,
     tool_batch_sizes,
     tool_call_counts,
     tool_op_kinds,
@@ -178,6 +185,23 @@ _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
 _DEFAULT_TILTH_BIN = object()
 
 
+class ClaudeAuthError(RuntimeError):
+    """A Claude subprocess would bill an API key instead of the subscription."""
+
+
+def guard_claude_auth(env: Mapping[str, str]) -> None:
+    """Refuse a Claude call whose environment carries ``ANTHROPIC_API_KEY``.
+
+    Under ``claude -p`` the API key silently overrides ``CLAUDE_CODE_OAUTH_TOKEN``,
+    switching billing off the subscription. Judge and proposer callers reuse this.
+    """
+    if env.get("ANTHROPIC_API_KEY"):
+        raise ClaudeAuthError(
+            "ANTHROPIC_API_KEY is set; it overrides CLAUDE_CODE_OAUTH_TOKEN and bills "
+            "the API instead of the subscription. Unset it before running Claude cells."
+        )
+
+
 def build_runner_env(
     runner: str,
     *,
@@ -188,6 +212,8 @@ def build_runner_env(
 ) -> dict[str, str]:
     """Build a minimal environment for one runner subprocess."""
     source = os.environ if ambient is None else ambient
+    if runner == "claude":
+        guard_claude_auth(source)
     env = {
         key: value
         for key, value in source.items()
@@ -197,6 +223,8 @@ def build_runner_env(
         or key.startswith(_PROVIDER_AUTH_PREFIXES)
         or key.startswith("LC_")
     }
+    # Pin the agent CLI for the whole run: a mid-run update changes the run key.
+    env["DISABLE_AUTOUPDATER"] = "1"
 
     selected_tilth_bin = TILTH_BIN if tilth_bin is _DEFAULT_TILTH_BIN else tilth_bin
     if isinstance(selected_tilth_bin, str):
@@ -463,6 +491,165 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
     return sum(not allowed_command(command) for command in calls.values())
 
 
+CELL_TIMEOUT_S = 600
+_TOOLCHAIN_PROBES = {
+    "rustc": ("rustc", "--version"),
+    "cargo": ("cargo", "--version"),
+    "go": ("go", "version"),
+    "node": ("node", "--version"),
+    "python3": ("python3", "--version"),
+}
+_LOCKFILES = (
+    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _probe_version(argv: tuple[str, ...]) -> str | None:
+    """Return a tool's version line once per run, or None when it is unavailable."""
+    try:
+        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (probe.stdout or probe.stderr).strip().splitlines()
+    return lines[0] if probe.returncode == 0 and lines else None
+
+
+def cli_version(runner: str) -> str | None:
+    """Return the agent CLI version that a runner subprocess will use."""
+    return _probe_version((runner, "--version"))
+
+
+def _file_sha256(path: Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def env_fingerprint(repo_name: str) -> str:
+    """Fingerprint the toolchains and the task repo's dependency lockfiles."""
+    repo_path = get_repo_path(repo_name)
+    lockfiles = {
+        name: _file_sha256(repo_path / name)
+        for name in _LOCKFILES if (repo_path / name).is_file()
+    }
+    return baselines.env_fingerprint(
+        toolchains={name: _probe_version(argv) for name, argv in _TOOLCHAIN_PROBES.items()},
+        lockfile_hash=hashlib.sha256(json.dumps(lockfiles, sort_keys=True).encode()).hexdigest(),
+    )
+
+
+def _is_tilth_arm(mode: ModeConfig) -> bool:
+    return mode.mcp_config_path is not None and mode.plugin_dir is None
+
+
+def _mcp_shape(mode: ModeConfig, runner: str, mode_name: str) -> dict:
+    """Describe the MCP servers a runner attaches, minus binary paths the key hashes separately."""
+    if runner == "opencode":
+        config_path = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
+        if config_path is None:
+            return {}
+        try:
+            return json.loads(Path(config_path).read_text())
+        except FileNotFoundError:
+            return {"opencode_config": config_path}
+    if not mode.mcp_config_path:
+        return {}
+    if runner == "codex":
+        return {"tilth": {"args": ["--mcp", "--edit"], "required": True}}
+    servers = claude_mcp_config(mode).get("mcpServers", {})
+    return {
+        name: {key: value for key, value in server.items() if key != "command"}
+        for name, server in servers.items()
+    }
+
+
+def _task_fixture_files(task: object) -> dict[str, str]:
+    """Hash the fixture files a task grades or runs against."""
+    roots = []
+    module_file = inspect.getsourcefile(type(task))
+    if module_file:
+        module_path = Path(module_file)
+        roots.append(module_path.with_name(f"{module_path.stem}_fixtures"))
+    if getattr(task, "repo", None) == "synthetic":
+        roots.append(FIXTURES_DIR / "template")
+    return {
+        str(path.relative_to(root.parent)): _file_sha256(path)
+        for root in roots if root.is_dir()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+
+
+def _cell_task_digest(task: object) -> str:
+    ground_truth = getattr(task, "ground_truth", None)
+    mutations = getattr(task, "mutations", ()) or ()
+    return baselines.task_digest(
+        prompt=task.prompt,
+        ground_truth=asdict(ground_truth) if is_dataclass(ground_truth) else ground_truth,
+        test_command=list(getattr(task, "test_command", ()) or ()),
+        fixture_files=_task_fixture_files(task),
+        repo_commit=REPOS[task.repo].commit_sha if task.repo in REPOS else None,
+        mutations=[asdict(mutation) if is_dataclass(mutation) else mutation for mutation in mutations],
+        hide_git=bool(getattr(task, "hide_git", False)),
+    )
+
+
+def cell_identity(
+    task_name: str,
+    mode_name: str,
+    model_name: str,
+    repetition: int,
+    *,
+    bare: bool,
+    reasoning_effort: str | None,
+    max_budget_usd: float,
+    strict_file_tools: bool,
+) -> dict:
+    """Return the run key and the key-input fields one cell's row records."""
+    task = TASKS[task_name]
+    mode = MODES[mode_name]
+    runner = RUNNERS[model_name]
+    if strict_file_tools:
+        tools = list(_STRICT_BASELINE_TOOLS) if not mode.mcp_config_path else ["Bash"]
+    else:
+        tools = list(mode.tools)
+    identity = {
+        "harness_digest": baselines.harness_digest(
+            system_prompt=SYSTEM_PROMPT + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
+            tools=tools,
+            strict_file_tools=strict_file_tools,
+            bare=bare,
+            max_budget_usd=max_budget_usd if runner == "claude" else None,
+            mcp_shape=_mcp_shape(mode, runner, mode_name),
+        ),
+        "task_digest": _cell_task_digest(task),
+        "env_fingerprint": env_fingerprint(task.repo),
+        "cli_version": cli_version(runner),
+        "timeout_s": CELL_TIMEOUT_S,
+        **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
+    }
+    key_inputs = {
+        **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
+        "repetition": repetition, "reasoning_effort": reasoning_effort,
+    }
+    return {"run_key": baselines.run_key(key_inputs), **identity}
+
+
+def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
+    """Write the tool-call sidecar beside a teed claude or codex stream."""
+    if runner not in {"claude", "codex"} or stream_log_path is None or not stream_log_path.is_file():
+        return None
+    calls = extract_trajectory(stream_log_path.read_text(), runner)
+    sidecar = stream_log_path.with_name(f"{stream_log_path.stem}.trajectory.jsonl")
+    sidecar.write_text("".join(json.dumps(call) + "\n" for call in calls))
+    return str(sidecar)
+
+
+class QuotaExhaustedError(RuntimeError):
+    """A subscription usage limit rejected the cell; later cells would fail too."""
+
+
 def run_single(
     task_name: str,
     mode_name: str,
@@ -522,6 +709,11 @@ def _run_single_in_repo(
     opencode_config: Optional[str] = None
     skill_paths: list[str] = []
     skill_roots: list[str] = []
+    identity = cell_identity(
+        task_name, mode_name, model_name, repetition,
+        bare=bare, reasoning_effort=reasoning_effort,
+        max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+    )
 
     # Build command based on runner
     if runner == "codex":
@@ -682,7 +874,7 @@ def _run_single_in_repo(
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
-        timer = threading.Timer(600, _kill_on_timeout)
+        timer = threading.Timer(CELL_TIMEOUT_S, _kill_on_timeout)
         timer.start()
         try:
             with open(stream_log_path, "w") as logf:
@@ -701,7 +893,7 @@ def _run_single_in_repo(
         if runner == "codex":
             stream_log_path.with_suffix(".stderr").write_text(stderr_text)
         if timed_out:
-            raise subprocess.TimeoutExpired(cmd, 600)
+            raise subprocess.TimeoutExpired(cmd, CELL_TIMEOUT_S)
 
         result = subprocess.CompletedProcess(
             args=cmd,
@@ -716,10 +908,15 @@ def _run_single_in_repo(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=CELL_TIMEOUT_S,
             env=env,
         )
     elapsed_ms = int((time.time() - start_time) * 1000)
+    trajectory_path = write_trajectory(stream_log_path, runner)
+
+    # A usage limit surfaces as a rejected rate_limit_event or a limit result.
+    if runner == "claude" and (quota := detect_quota_rejection(result.stdout)):
+        raise QuotaExhaustedError(f"claude -p hit a usage limit: {quota}")
 
     if result.returncode != 0:
         runner_name = {"codex": "codex exec", "opencode": "opencode run"}.get(runner, "claude -p")
@@ -854,6 +1051,10 @@ def _run_single_in_repo(
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
         "op_kinds": tool_op_kinds(run_result),
+        "cost_source": run_result.cost_source,
+        "trajectory_path": trajectory_path,
+        "reused": False,
+        **identity,
     }
 
 
@@ -910,6 +1111,52 @@ def enforce_cell_ceiling(planned: int, *, maximum: int | None) -> None:
             f"planned {planned} benchmark cells exceeds --max-cells {maximum}"
         )
 
+
+
+def estimate_cell_cost(
+    rows: list[dict],
+    *,
+    task: str,
+    mode: str,
+    model: str,
+    run_max_cost: float | None,
+    fallback: float,
+) -> float:
+    """Estimate a cell's cost: stored mean for its task and arm, else run maximum, else fallback."""
+    costs = [
+        row["total_cost_usd"] for row in rows
+        if row.get("task") == task and row.get("mode") == mode and row.get("model") == model
+        and baselines.is_completed(row) and isinstance(row.get("total_cost_usd"), (int, float))
+    ]
+    if costs:
+        return sum(costs) / len(costs)
+    if run_max_cost is not None:
+        return run_max_cost
+    return fallback
+
+
+@dataclass(frozen=True)
+class PlannedCell:
+    """One scheduled benchmark cell and the key it is stored under."""
+
+    task_name: str
+    model_name: str
+    repetition: int
+    mode_name: str
+    arm_order: tuple[str, ...]
+    arm_index: int
+    identity: dict
+
+    @property
+    def run_key(self) -> str:
+        return self.identity["run_key"]
+
+
+def _read_stream(stream_log_path: Path) -> str:
+    try:
+        return stream_log_path.read_text()
+    except FileNotFoundError:
+        return ""
 
 
 def mcp_server_commands(mode_name: str, runner: str | None) -> dict[str, str]:
@@ -977,6 +1224,19 @@ Examples:
         help="Abort before model calls when the expanded schedule exceeds this count",
     )
     parser.add_argument(
+        "--max-usd", type=float,
+        help="Run-wide spend ceiling in USD; required when any cell is not answered from the result store",
+    )
+    parser.add_argument(
+        "--cell-estimate-usd", type=float,
+        help="Cost estimate for a cell with no stored or earlier cost in this run "
+             "(default: --max-budget-usd)",
+    )
+    parser.add_argument(
+        "--refreeze-baselines", action="store_true",
+        help="Run baseline cells whose stored baseline rows were recorded under different key inputs",
+    )
+    parser.add_argument(
         "--tasks",
         default="all",
         help="Comma-separated task names or 'all' (default: all)",
@@ -1021,6 +1281,9 @@ Examples:
         parser.error("--max-cells must be at least 1")
     if not math.isfinite(args.max_budget_usd) or args.max_budget_usd <= 0:
         parser.error("--max-budget-usd must be a positive finite number")
+    for flag, value in (("--max-usd", args.max_usd), ("--cell-estimate-usd", args.cell_estimate_usd)):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f"{flag} must be a positive finite number")
     if args.experiment and args.arm_order_seed is not None:
         parser.error("--arm-order-seed applies only to legacy modes")
 
@@ -1139,6 +1402,73 @@ Examples:
             print(f"Cleaned repo: {repo_name}")
 
 
+    bare = args.bare or experiment is not None or args.wozcode_plugin_dir is not None or args.strict_file_tools
+    cells: list[PlannedCell] = []
+    for task_name in tasks_list:
+        for model_name in models:
+            for rep in range(args.reps):
+                # Experiment arms are shuffled within each matched task/model/
+                # repetition block from the manifest seed, never run in long arm runs.
+                arm_order = (
+                    randomized_arm_order(
+                        modes,
+                        seed=experiment.arm_order_seed if experiment else (args.arm_order_seed or 0),
+                        task=task_name,
+                        model=model_name,
+                        repetition=rep,
+                    )
+                    if experiment or args.arm_order_seed is not None
+                    else list(modes)
+                )
+                for arm_index, mode_name in enumerate(arm_order):
+                    cells.append(PlannedCell(
+                        task_name, model_name, rep, mode_name, tuple(arm_order), arm_index,
+                        cell_identity(
+                            task_name, mode_name, model_name, rep,
+                            bare=bare, reasoning_effort=args.reasoning_effort,
+                            max_budget_usd=args.max_budget_usd,
+                            strict_file_tools=args.strict_file_tools,
+                        ),
+                    ))
+
+    # A cell whose key matches a completed stored row is answered from the
+    # store. Any other cell spawns a model runner, which makes this a paid run.
+    store_path = RESULTS_DIR / baselines.STORE_FILENAME
+    history = baselines.load_rows(store_path)
+    reusable = baselines.completed_by_key(history)
+    pending = [cell for cell in cells if cell.run_key not in reusable]
+    if pending:
+        if args.max_usd is None:
+            parser.error(
+                f"{len(pending)} of {len(cells)} cells have no reusable stored row; "
+                "a paid run requires --max-usd"
+            )
+        if any(RUNNERS[cell.model_name] == "claude" for cell in pending):
+            try:
+                guard_claude_auth(os.environ)
+            except ClaudeAuthError as error:
+                parser.error(str(error))
+        drift = {}
+        for cell in pending:
+            if cell.mode_name != "baseline":
+                continue
+            planned = {
+                **cell.identity, "task": cell.task_name, "model": MODELS[cell.model_name],
+                "mode": cell.mode_name, "repetition": cell.repetition,
+                "reasoning_effort": args.reasoning_effort,
+            }
+            changed = baselines.baseline_drift(planned, history)
+            if changed:
+                drift[f"{cell.task_name}/{cell.model_name}/rep{cell.repetition}"] = changed
+        if drift and not args.refreeze_baselines:
+            details = "; ".join(f"{slot}: {', '.join(fields)}" for slot, fields in drift.items())
+            parser.error(
+                "stored baseline rows were recorded under different key inputs "
+                f"({details}); pass --refreeze-baselines to re-run them"
+            )
+        if drift:
+            print(f"Refreezing {len(drift)} drifted baseline cell(s).")
+
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
     output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
@@ -1154,157 +1484,205 @@ Examples:
     repos_used = sorted(set(TASKS[t].repo for t in tasks_list))
     print(f"Repos:       {', '.join(repos_used)}")
     print(f"Repetitions: {args.reps}")
+    print(f"Reused:      {len(cells) - len(pending)} of {len(cells)} cells from {store_path}")
+    if args.max_usd is not None:
+        print(f"Spend cap:   ${args.max_usd:.2f}")
     print(f"Output:      {output_file}")
     print(f"Streams:     {stream_log_dir}/<cell>.jsonl  (tail -f for live agent output)")
     print("=" * 70)
     print()
 
-    current_run = 0
+    spent = 0.0
+    run_max_cost: float | None = None
+    stop_reason: str | None = None
+    fallback_estimate = args.cell_estimate_usd or args.max_budget_usd
 
-    # Run matched task/model/repetition blocks. Experiment arms are shuffled
-    # within each block from the manifest seed, never scheduled in long arm runs.
     with open(output_file, "w") as output:
-        for task_name in tasks_list:
+
+        def record(row: dict) -> None:
+            output.write(json.dumps(row) + "\n")
+            output.flush()
+
+        def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
+            """Store a failed cell, charging its native cost or else its pre-run estimate."""
+            nonlocal spent, run_max_cost
+            native = stream_native_cost(_read_stream(stream_log_path))
+            amount = native if native is not None else estimate
+            failed = {
+                **row,
+                "total_cost_usd": amount,
+                "cost_source": "native" if native is not None else "estimate",
+                "trajectory_path": write_trajectory(stream_log_path, runner),
+            }
+            spent += amount
+            run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
+            baselines.store(failed, path=store_path)
+            history.append(failed)
+            record(failed)
+            return failed
+
+        for current_run, cell in enumerate(cells, start=1):
+            task_name, model_name, rep, mode_name = (
+                cell.task_name, cell.model_name, cell.repetition, cell.mode_name,
+            )
             task = TASKS[task_name]
-            for model_name in models:
-                for rep in range(args.reps):
-                    arm_order = (
-                        randomized_arm_order(
-                            modes,
-                            seed=experiment.arm_order_seed if experiment else (args.arm_order_seed or 0),
-                            task=task_name,
-                            model=model_name,
-                            repetition=rep,
-                        )
-                        if experiment or args.arm_order_seed is not None
-                        else list(modes)
-                    )
-                    for arm_index, mode_name in enumerate(arm_order):
-                        current_run += 1
-                        run_id = f"{task_name}/{mode_name}/{model_name}/rep{rep}"
-                        print(f"[{current_run}/{total_runs}] {run_id}")
+            runner = RUNNERS[model_name]
+            run_id = f"{task_name}/{mode_name}/{model_name}/rep{rep}"
+            print(f"[{current_run}/{total_runs}] {run_id}")
+            experiment_metadata = {
+                "experiment_manifest": str(experiment.path) if experiment else None,
+                "arm_order_seed": experiment.arm_order_seed if experiment else args.arm_order_seed,
+                "arm_order": list(cell.arm_order),
+                "arm_order_index": cell.arm_index,
+            }
 
-                        cell_slug = (
-                            f"{current_run:02d}_{task_name}_{mode_name}"
-                            f"_{model_name}_rep{rep}"
-                        )
-                        mode = MODES[mode_name]
-                        variant_metadata = _variant_metadata(mode)
-                        experiment_metadata = {
-                            "experiment_manifest": (
-                                str(experiment.path) if experiment else None
-                            ),
-                            "arm_order_seed": (
-                                experiment.arm_order_seed if experiment else args.arm_order_seed
-                            ),
-                            "arm_order": arm_order,
-                            "arm_order_index": arm_index,
-                        }
-                        record_metadata = {
-                            "task": task_name,
-                            "mode": mode_name,
-                            "model": MODELS[model_name],
-                            "model_alias": model_name,
-                            **({"reasoning_effort": args.reasoning_effort} if args.reasoning_effort is not None else {}),
-                            **({"max_budget_usd": args.max_budget_usd} if RUNNERS[model_name] == "claude" else {}),
-                            **({"strict_file_tools": True} if args.strict_file_tools else {}),
-                            "capability": task.capability,
-                            "source": asdict(task.source),
-                            "repetition": rep,
-                            "per_turn_output_tokens": [],
-                            "variant": variant_metadata,
-                            **experiment_metadata,
-                        }
+            stored = reusable.get(cell.run_key)
+            if stored is not None:
+                # Written like a fresh row: this run's schedule metadata, the stored outcome.
+                record({**stored, **experiment_metadata, "reused": True})
+                print(f"  ↺ reused stored row ({'✓' if stored.get('correct') else '✗'})")
+                continue
 
-                        try:
-                            result = run_single(
-                                task_name,
-                                mode_name,
-                                model_name,
-                                rep,
-                                verbose=args.verbose,
-                                stream_log_path=stream_log_dir / f"{cell_slug}.jsonl",
-                                bare=args.bare or experiment is not None or args.wozcode_plugin_dir is not None or args.strict_file_tools,
-                                reasoning_effort=args.reasoning_effort,
-                                max_budget_usd=args.max_budget_usd,
-                                strict_file_tools=args.strict_file_tools,
-                            )
-                            result.update(experiment_metadata)
-                            if args.reasoning_effort is not None:
-                                result["reasoning_effort"] = args.reasoning_effort
-                            if RUNNERS[model_name] == "claude":
-                                result["max_budget_usd"] = args.max_budget_usd
-                            if args.strict_file_tools:
-                                result["strict_file_tools"] = True
-                            output.write(json.dumps(result) + "\n")
-                            output.flush()
+            estimate = estimate_cell_cost(
+                history, task=task_name, mode=mode_name, model=MODELS[model_name],
+                run_max_cost=run_max_cost, fallback=fallback_estimate,
+            )
+            if spent + estimate > args.max_usd:
+                stop_reason = (
+                    f"spend ceiling: ${spent:.4f} spent + ${estimate:.4f} estimated for "
+                    f"{run_id} exceeds --max-usd {args.max_usd}"
+                )
+                break
 
-                            status = "✓" if result["correct"] else "✗"
-                            print(
-                                f"  {status} "
-                                f"{result['num_turns']}t "
-                                f"{result['context_tokens']:,}ctx "
-                                f"{result['output_tokens']:,}out "
-                                f"${result['total_cost_usd']:.4f} "
-                                f"{result['duration_ms']:,}ms"
-                            )
-                            if not result["correct"]:
-                                print(f"  → {result['correctness_reason']}")
+            cell_slug = f"{current_run:02d}_{task_name}_{mode_name}_{model_name}_rep{rep}"
+            stream_log_path = stream_log_dir / f"{cell_slug}.jsonl"
+            mode = MODES[mode_name]
+            record_metadata = {
+                "task": task_name,
+                "mode": mode_name,
+                "model": MODELS[model_name],
+                "model_alias": model_name,
+                **({"reasoning_effort": args.reasoning_effort} if args.reasoning_effort is not None else {}),
+                **({"max_budget_usd": args.max_budget_usd} if runner == "claude" else {}),
+                **({"strict_file_tools": True} if args.strict_file_tools else {}),
+                "capability": task.capability,
+                "source": asdict(task.source),
+                "repetition": rep,
+                "per_turn_output_tokens": [],
+                "variant": _variant_metadata(mode),
+                **experiment_metadata,
+                **cell.identity,
+                "reused": False,
+            }
 
-                        except InvalidCodexCellError as error:
-                            print(f"  ✗ INVALID CODEX CELL: {error}")
-                            error_result = {
-                                **record_metadata,
-                                "error": f"invalid_codex_cell: {error}",
-                                "correct": False,
-                                "correctness_reason": f"Invalid cell: {error}",
-                            }
-                            output.write(json.dumps(error_result) + "\n")
-                            output.flush()
-                            print("\nAborting run: invalid Codex cell; inspect its raw stream.")
-                            sys.exit(1)
+            try:
+                result = run_single(
+                    task_name,
+                    mode_name,
+                    model_name,
+                    rep,
+                    verbose=args.verbose,
+                    stream_log_path=stream_log_path,
+                    bare=bare,
+                    reasoning_effort=args.reasoning_effort,
+                    max_budget_usd=args.max_budget_usd,
+                    strict_file_tools=args.strict_file_tools,
+                )
+                result.update(experiment_metadata)
+                if args.reasoning_effort is not None:
+                    result["reasoning_effort"] = args.reasoning_effort
+                if runner == "claude":
+                    result["max_budget_usd"] = args.max_budget_usd
+                if args.strict_file_tools:
+                    result["strict_file_tools"] = True
+                result.update(cell.identity)
+                result["reused"] = False
+                result.setdefault("trajectory_path", None)
+                spent += result["total_cost_usd"]
+                run_max_cost = (
+                    result["total_cost_usd"] if run_max_cost is None
+                    else max(run_max_cost, result["total_cost_usd"])
+                )
+                baselines.store(result, path=store_path)
+                history.append(result)
+                record(result)
 
-                        except McpUnavailableError as error:
-                            # Config-level failure: every later cell in this
-                            # mode would fail identically. Abort instead of
-                            # burning budget on an invalid comparison.
-                            print(f"  ✗ MCP UNAVAILABLE: {error}")
-                            error_result = {
-                                **record_metadata,
-                                "error": f"mcp_unavailable: {error}",
-                                "correct": False,
-                                "correctness_reason": f"Exception: {error}",
-                            }
-                            output.write(json.dumps(error_result) + "\n")
-                            output.flush()
-                            print("\nAborting run: the MCP-armed mode is "
-                                  "misconfigured; fix it and re-run.")
-                            sys.exit(1)
+                status = "✓" if result["correct"] else "✗"
+                print(
+                    f"  {status} "
+                    f"{result['num_turns']}t "
+                    f"{result['context_tokens']:,}ctx "
+                    f"{result['output_tokens']:,}out "
+                    f"${result['total_cost_usd']:.4f} "
+                    f"{result['duration_ms']:,}ms"
+                )
+                if not result["correct"]:
+                    print(f"  → {result['correctness_reason']}")
 
-                        except subprocess.TimeoutExpired:
-                            print("  ✗ TIMEOUT (>600s)")
-                            error_result = {
-                                **record_metadata,
-                                "error": "timeout",
-                                "correct": False,
-                                "correctness_reason": "Subprocess timed out",
-                            }
-                            output.write(json.dumps(error_result) + "\n")
-                            output.flush()
+            except InvalidCodexCellError as error:
+                print(f"  ✗ INVALID CODEX CELL: {error}")
+                record_failure({
+                    **record_metadata,
+                    "error": f"invalid_codex_cell: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Invalid cell: {error}",
+                }, stream_log_path, runner, estimate)
+                print("\nAborting run: invalid Codex cell; inspect its raw stream.")
+                sys.exit(1)
 
-                        except Exception as error:
-                            print(f"  ✗ ERROR: {error}")
-                            if args.verbose:
-                                import traceback
-                                traceback.print_exc()
-                            error_result = {
-                                **record_metadata,
-                                "error": str(error),
-                                "correct": False,
-                                "correctness_reason": f"Exception: {error}",
-                            }
-                            output.write(json.dumps(error_result) + "\n")
-                            output.flush()
+            except McpUnavailableError as error:
+                # Config-level failure: every later cell in this
+                # mode would fail identically. Abort instead of
+                # burning budget on an invalid comparison.
+                print(f"  ✗ MCP UNAVAILABLE: {error}")
+                record_failure({
+                    **record_metadata,
+                    "error": f"mcp_unavailable: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Exception: {error}",
+                }, stream_log_path, runner, estimate)
+                print("\nAborting run: the MCP-armed mode is "
+                      "misconfigured; fix it and re-run.")
+                sys.exit(1)
+
+            except subprocess.TimeoutExpired:
+                print(f"  ✗ TIMEOUT (>{CELL_TIMEOUT_S}s)")
+                record_failure({
+                    **record_metadata,
+                    "error": "timeout",
+                    "timed_out": True,
+                    "correct": False,
+                    "correctness_reason": "Subprocess timed out",
+                }, stream_log_path, runner, estimate)
+
+            except Exception as error:
+                quota = (
+                    str(error) if isinstance(error, QuotaExhaustedError)
+                    else detect_quota_rejection(_read_stream(stream_log_path))
+                )
+                if quota:
+                    # Every later cell would be rejected too; stop and
+                    # leave completed rows reusable for a resumed run.
+                    print(f"  ✗ USAGE LIMIT: {quota}")
+                    record_failure({
+                        **record_metadata,
+                        "infra": "quota",
+                        "error": f"infra:quota: {quota}",
+                        "correct": False,
+                        "correctness_reason": f"Usage limit: {quota}",
+                    }, stream_log_path, runner, estimate)
+                    stop_reason = f"usage limit: {quota}"
+                    break
+                print(f"  ✗ ERROR: {error}")
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                record_failure({
+                    **record_metadata,
+                    "error": str(error),
+                    "correct": False,
+                    "correctness_reason": f"Exception: {error}",
+                }, stream_log_path, runner, estimate)
 
     # Clean real-world repos after run (remove junk files written by Claude sessions)
     for repo_name in selected_repos:
@@ -1314,13 +1692,19 @@ Examples:
     # Print summary
     print()
     print("=" * 70)
-    print("Benchmark complete!")
+    print("Benchmark stopped early." if stop_reason else "Benchmark complete!")
+    if stop_reason:
+        print(f"Stop reason: {stop_reason}")
+        print("Re-run the same command to resume; completed cells are reused from the store.")
+    print(f"Spend: ${spent:.4f}" + (f" of ${args.max_usd:.2f}" if args.max_usd is not None else ""))
     print(f"Results saved to: {output_file}")
     print("=" * 70)
     print()
     print("To generate a report, run:")
     print(f"  python benchmark/analyze.py {output_file}")
     print()
+    if stop_reason:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
