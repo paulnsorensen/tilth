@@ -90,6 +90,11 @@ class GinRenderContextTask(Task):
         return GroundTruth()
 
     @property
+    def trusted_reference(self) -> str:
+        """The held-out fixture tests, for the applicability judge; never shown to the agent."""
+        return "\n".join(f"// {path.name}\n{path.read_text()}" for path in sorted(HELD_OUT.glob("*_heldout_test.go")))
+
+    @property
     def prompt(self) -> str:
         return (
             "Migrate Gin's render.Render interface to Render(context.Context, "

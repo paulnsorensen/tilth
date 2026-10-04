@@ -97,6 +97,21 @@ Grading copies the agent's changes onto a clean prepared tree, restores the held
 
 Every row records `contaminated` and `contamination_hits`: a tool input that reads the `benchmark/` tree or the harness data directory, fetches the task's upstream repository or package, or, in an external cell, reads a clone under `/tmp/tilth_bench/repos/` is a hit. A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
 
+## Applicability judge
+
+`benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability and critiques stripped rollouts for reflection, with the pinned `claude-sonnet-5` through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN` (no tools, MCP servers, settings, or hooks; the prompt on stdin).
+A critique sees only the task prompt, allowlisted row fields, and the verbatim trajectory sidecar, never `correctness_reason`, ground truth, gold patches, or held-out tests.
+Labels and critiques are cached under the gitignored `benchmark/results/judge/` and never enter result rows or scores.
+
+```bash
+python3 benchmark/judge/cli.py label --tasks rg_search_dispatch,gin_edit_render_context --max-usd 2 --cell-estimate-usd 0.05
+python3 benchmark/judge/cli.py calibrate --max-usd 5 --cell-estimate-usd 0.05
+```
+
+Both spend flags are required whenever a call is uncached; judge calls share the `--max-usd` ceiling and stop at the first usage-limit rejection.
+The maintainer hand-labels `benchmark/judge/calibration.json` (`{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, verdict `apt`, `missed`, or `misapplied`): every task an analyzed run holds plus at least 20 clean, completed rollouts with trajectories.
+The judge is calibrated when unweighted Cohen's kappa reaches 0.6 on both labels and verdicts; until then critiques are withheld and `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
+
 ## Larger Luna edit task
 
 `gin_edit_render_context` migrates Gin's renderer API to accept request context.
