@@ -132,7 +132,7 @@ def test_completed_row_reused_error_row_rerun(bench) -> None:
     rows = {row["task"]: row for row in bench.output_rows()}
     schedule = {"experiment_manifest": None, "arm_order_seed": None, "arm_order": ["plain"], "arm_order_index": 0}
     variant = {"tilth_version": None, "variant": run._variant_metadata(run.MODES["plain"])}
-    assert rows["cell_a"] == {**completed, **schedule, **variant, "reused": True}
+    assert rows["cell_a"] == {**completed, **schedule, **variant, "charged_usd": 0.0, "reused": True}
     assert rows["cell_b"]["reused"] is False and "error" not in rows["cell_b"]
     assert rows["cell_c"]["reused"] is False and "infra" not in rows["cell_c"]
     assert rows["cell_b"]["run_key"] == bench.identity("cell_b", "plain", 0)["run_key"]
@@ -311,6 +311,78 @@ def test_harness_variant_of_a_baseline_is_not_drift(bench) -> None:
 
     assert code == 0
     assert bench.calls == [("cell_a", "baseline", 0)]
+
+
+@pytest.mark.parametrize("variant", [("--strict-file-tools",), ("--max-budget-usd", "2.5")])
+def test_strict_and_budget_variants_of_a_baseline_are_not_drift(bench, variant: tuple[str, ...]) -> None:
+    bench.seed(bench.row("cell_a", "baseline", 0))
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline",
+                      "--reps", "1", "--max-usd", "5", *variant)
+
+    assert code == 0
+    assert bench.calls == [("cell_a", "baseline", 0)]
+
+
+def test_harness_change_to_a_baseline_requires_refreeze(bench, monkeypatch: pytest.MonkeyPatch,
+                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    """A harness edit that is not a --bare/strict/budget variant is drift, not a new slot."""
+    bench.seed(bench.row("cell_a", "baseline", 0))
+    monkeypatch.setattr(run, "SYSTEM_PROMPT", run.SYSTEM_PROMPT + " Be terse.")
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == []
+    assert "harness_digest" in capsys.readouterr().err
+
+
+def test_stock_arms_with_different_modes_are_separate_slots(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mode is in the slot: a stored baseline row does not freeze a no_tilth cell."""
+    _stock_arm(monkeypatch, "no_tilth")
+    monkeypatch.setitem(run.MODES, "baseline", run.MODES["no_tilth"])
+    bench.seed(bench.row("cell_a", "baseline", 0))
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "no_tilth",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code == 0
+    assert bench.calls == [("cell_a", "no_tilth", 0)]
+
+
+def test_drift_report_names_each_drifted_mode(bench, monkeypatch: pytest.MonkeyPatch,
+                                             capsys: pytest.CaptureFixture[str]) -> None:
+    _stock_arm(monkeypatch, "no_tilth")
+    bench.cli = "2.0.0"
+    bench.seed(bench.row("cell_a", "baseline", 0))
+    bench.seed(bench.row("cell_a", "no_tilth", 0))
+    bench.cli = "2.1.0"
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline,no_tilth",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    error = capsys.readouterr().err
+    assert "cell_a/baseline/sonnet5/rep0" in error and "cell_a/no_tilth/sonnet5/rep0" in error
+
+
+def test_rows_record_the_harness_variant_flags(bench) -> None:
+    bench.runner(lambda _stream: 0.1)
+
+    assert bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline",
+                      "--reps", "1", "--max-usd", "5", "--bare") == 0
+    [row] = bench.stored_rows()
+    assert (row["bare"], row["strict_file_tools"], row["max_budget_usd"]) == (True, False, run.DEFAULT_MAX_BUDGET_USD)
+
+
+def test_baseline_slot_is_the_variant_flags_not_the_harness_digest() -> None:
+    assert "harness_digest" not in baselines.BASELINE_SLOT_FIELDS
+    assert {"mode", "bare", "strict_file_tools", "max_budget_usd"} <= set(baselines.BASELINE_SLOT_FIELDS)
 
 
 def test_load_rows_skips_a_torn_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

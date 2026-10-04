@@ -10,11 +10,11 @@ row it is given, keyed by run key, but only a completed row is reusable.
 import hashlib
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from parse import tolerant_jsonl
+from jsonl import tolerant_jsonl
 
 STORE_FILENAME = "result_store.jsonl"
 
@@ -26,10 +26,12 @@ CELL_KEY_FIELDS = (
 DIGEST_FIELDS = ("harness_digest", "task_digest", "env_fingerprint")
 
 # Coordinates under which two stock-arm rows describe the same frozen cell. The
-# harness digest is part of the slot: a --bare or strict-file-tools baseline is a
-# different harness, not a drifted copy of the default one.
+# harness variant flags every row records are part of the slot: a --bare,
+# strict-file-tools, or budget variant is its own baseline. Any other harness
+# change (system prompt, disallowed tools, runner flags) is drift.
 BASELINE_SLOT_FIELDS = (
-    "task", "model", "mode", "reasoning_effort", "timeout_s", "repetition", "harness_digest",
+    "task", "model", "mode", "reasoning_effort", "timeout_s", "repetition",
+    "bare", "strict_file_tools", "max_budget_usd",
 )
 
 
@@ -46,7 +48,7 @@ def harness_digest(
     bare: bool,
     max_budget_usd: float | None,
     mcp_shape: Mapping[str, Any],
-    command: list[str] = (),
+    command: Sequence[str] = (),
     bash_guard_sha256: str | None = None,
 ) -> str:
     """Hash the runner configuration a cell's agent sees.

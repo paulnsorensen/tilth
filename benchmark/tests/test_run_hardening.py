@@ -1510,6 +1510,25 @@ def test_quota_rejection_stops_run(bench) -> None:
     assert run.baselines.lookup(stored["cell_b"]["run_key"], path=bench.store_path) is None
 
 
+def test_rejected_rate_limit_event_without_a_result_stops_run(bench, capsys: pytest.CaptureFixture[str]) -> None:
+    def rejected_before_any_result(stream: Path) -> float:
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour"}}) + "\n")
+        raise RuntimeError("claude -p failed with code 1")
+
+    bench.runner(rejected_before_any_result)
+
+    code = bench.main("--tasks", "cell_a,cell_b", "--models", "sonnet5", "--modes", "plain",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == [("cell_a", "plain", 0)]
+    [row] = bench.stored_rows()
+    assert row["infra"] == "quota"
+    assert "Stop reason: usage limit" in capsys.readouterr().out
+
+
 def test_api_key_refuses_claude_cell(bench, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api")
     bench.runner(lambda _stream: pytest.fail("model call started"))

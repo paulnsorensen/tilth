@@ -56,19 +56,35 @@ def test_disallowed_tools_feed_the_strict_key(monkeypatch: pytest.MonkeyPatch) -
 
 def test_strict_bash_settings_feed_the_strict_key(monkeypatch: pytest.MonkeyPatch) -> None:
     before = _key(strict=True)
-    monkeypatch.setattr(run, "_strict_bash_settings", lambda: json.dumps({"hooks": {}}))
+    monkeypatch.setattr(run, "_strict_bash_settings", lambda *_args: json.dumps({"hooks": {}}))
 
     assert _key(strict=True) != before
 
 
 def test_bash_guard_source_feeds_only_the_strict_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Same path, new content: only the guard's content hash can move the key."""
+    guard = tmp_path / "claude_bash_guard.py"
+    guard.write_text(run._BASH_GUARD.read_text())
+    monkeypatch.setattr(run, "_BASH_GUARD", guard)
     strict_before, plain_before = _key(strict=True), _key()
-    edited = tmp_path / "claude_bash_guard.py"
-    edited.write_text(run._BASH_GUARD.read_text() + "\n# allow cat\n")
-    monkeypatch.setattr(run, "_BASH_GUARD", edited)
+    guard.write_text(guard.read_text() + "\n# allow cat\n")
 
     assert _key(strict=True) != strict_before
     assert _key() == plain_before
+
+
+def test_strict_key_ignores_interpreter_and_checkout_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    before = _key(strict=True)
+    moved = tmp_path / "other-checkout" / "claude_bash_guard.py"
+    moved.parent.mkdir()
+    moved.write_text(run._BASH_GUARD.read_text())
+    monkeypatch.setattr(run, "_BASH_GUARD", moved)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "venv" / "bin" / "python3"))
+
+    assert _key(strict=True) == before
+    template = run._command_template(StoreTask(), run.MODES["baseline"], "baseline", "sonnet5", bare=True,
+                                     reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=True)
+    assert not any(str(tmp_path) in arg for arg in template)
 
 
 def test_setting_sources_reach_the_hashed_command() -> None:

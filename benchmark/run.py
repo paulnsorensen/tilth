@@ -474,11 +474,16 @@ _STRICT_SYSTEM_GUIDANCE = (
 _BASH_GUARD = Path(__file__).with_name("claude_bash_guard.py")
 
 
-def _strict_bash_settings() -> str:
-    guard = _BASH_GUARD.resolve()
-    command = f"{shlex.quote(str(Path(sys.executable).resolve()))} {shlex.quote(str(guard))}"
+# The hashed command template names the hook by placeholder: the interpreter and
+# checkout paths are host details, and the guard's content is keyed by its hash.
+_STRICT_HOOK_PLACEHOLDER = "<python> <bash-guard>"
+
+
+def _strict_bash_settings(hook_command: str | None = None) -> str:
+    if hook_command is None:
+        hook_command = f"{shlex.quote(str(Path(sys.executable).resolve()))} {shlex.quote(str(_BASH_GUARD.resolve()))}"
     return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-        {"type": "command", "command": command},
+        {"type": "command", "command": hook_command},
     ]}]}})
 
 
@@ -702,9 +707,10 @@ def _command_template(
     """Return the runner argv a cell will run, with its per-cell paths normalized.
 
     The disposable workspace path, the host skill paths codex disables, the
-    tilth binary path (keyed by its SHA-256), and the task prompt (keyed by the
-    task digest) become placeholders, so the template changes only when the
-    runner configuration does.
+    tilth binary path (keyed by its SHA-256), the strict Bash hook's interpreter
+    and guard paths (the guard keyed by its SHA-256), and the task prompt (keyed
+    by the task digest) become placeholders, so the template changes only when
+    the runner configuration does.
     """
     if _is_tilth_arm(mode):
         mode = replace(mode, binary_path=_TILTH_BIN_PLACEHOLDER)
@@ -714,6 +720,7 @@ def _command_template(
             template_task, mode, mode_name, model_name, _REPO_PLACEHOLDER,
             bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
             strict_file_tools=strict_file_tools, skill_paths=[],
+            strict_hook_command=_STRICT_HOOK_PLACEHOLDER,
         )
     except (ValueError, RuntimeError) as error:
         # The cell fails when it runs; key it by the reason it cannot be built.
@@ -732,7 +739,7 @@ def cell_identity(
     max_budget_usd: float,
     strict_file_tools: bool,
 ) -> dict:
-    """Return the run key and the key-input fields one cell's row records."""
+    """Return the run key, the key-input fields, and the harness variant flags one cell's row records."""
     task = TASKS[task_name]
     mode = MODES[mode_name]
     runner = RUNNERS[model_name]
@@ -764,7 +771,13 @@ def cell_identity(
         **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
         "repetition": repetition, "reasoning_effort": reasoning_effort,
     }
-    return {"run_key": baselines.run_key(key_inputs), **identity}
+    # The harness digest already keys these; rows record them so a baseline
+    # variant is its own frozen slot (baselines.BASELINE_SLOT_FIELDS).
+    variant_flags = {
+        "bare": bare, "strict_file_tools": strict_file_tools,
+        "max_budget_usd": max_budget_usd if runner == "claude" else None,
+    }
+    return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags}
 
 
 def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
@@ -841,6 +854,7 @@ def _runner_command(
     max_budget_usd: float,
     strict_file_tools: bool,
     skill_paths: list[str],
+    strict_hook_command: str | None = None,
 ) -> tuple[list[str], Optional[str]]:
     """Build one cell's runner argv and, for opencode, the config it selects."""
     model_id = MODELS[model_name]
@@ -936,7 +950,7 @@ def _runner_command(
             cmd += ["--plugin-dir", mode.plugin_dir, "--agent", "woz:code"]
 
         if strict_file_tools:
-            cmd += ["--settings", _strict_bash_settings()]
+            cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
         tools_list = (list(_STRICT_BASELINE_TOOLS) if not mode.mcp_config_path else ["Bash"]) if strict_file_tools else list(mode.tools)
 
         # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
@@ -1616,7 +1630,7 @@ Examples:
             }
             changed = baselines.baseline_drift(planned, history)
             if changed:
-                drift[f"{cell.task_name}/{cell.model_name}/rep{cell.repetition}"] = changed
+                drift[f"{cell.task_name}/{cell.mode_name}/{cell.model_name}/rep{cell.repetition}"] = changed
         if drift and not args.refreeze_baselines:
             details = "; ".join(f"{slot}: {', '.join(fields)}" for slot, fields in drift.items())
             parser.error(
@@ -1653,6 +1667,7 @@ Examples:
     run_max_cost: float | None = None
     stop_reason: str | None = None
     fallback_estimate = args.cell_estimate_usd or args.max_budget_usd
+    reported_versions: dict[str, Optional[str]] = {}
 
     with open(output_file, "w") as output:
 
@@ -1661,14 +1676,27 @@ Examples:
             output.flush()
 
         def settle(row: dict, amount: float) -> None:
-            """Charge, store, and record one paid cell; called exactly once per cell."""
+            """Charge and store one paid cell; called exactly once per cell."""
             nonlocal run_max_cost
             row["charged_usd"] = amount
             ledger.charge(amount, source=row.get("cost_source") or "native")
             run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
             baselines.store(row, path=store_path)
             history.append(row)
+
+        def report(row: dict) -> None:
             record(row)
+            status = "✓" if row["correct"] else "✗"
+            print(
+                f"  {status} "
+                f"{row['num_turns']}t "
+                f"{row['context_tokens']:,}ctx "
+                f"{row['output_tokens']:,}out "
+                f"${row['total_cost_usd']:.4f} "
+                f"{row['duration_ms']:,}ms"
+            )
+            if not row["correct"]:
+                print(f"  → {row['correctness_reason']}")
 
         def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
             """Store a failed cell, charging its native cost or else its pre-run estimate.
@@ -1684,6 +1712,7 @@ Examples:
                 "trajectory_path": write_trajectory(stream_log_path, runner),
             }
             settle(failed, native if native is not None else estimate)
+            record(failed)
             return failed
 
         for current_run, cell in enumerate(cells, start=1):
@@ -1705,11 +1734,14 @@ Examples:
             if stored is not None:
                 # Written like a fresh row: this run's schedule and variant metadata,
                 # the stored outcome. The run key already pins what the variant runs.
-                reported_version = _reported_tilth_version(MODES[mode_name])
+                # This run charged nothing for it, whatever the storing run did.
+                if mode_name not in reported_versions:
+                    reported_versions[mode_name] = _reported_tilth_version(MODES[mode_name])
+                reported_version = reported_versions[mode_name]
                 record({
                     **stored, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
-                    "reused": True,
+                    "charged_usd": 0.0, "reused": True,
                 })
                 print(f"  ↺ reused stored row ({'✓' if stored.get('correct') else '✗'})")
                 continue
@@ -1727,6 +1759,8 @@ Examples:
             current_cli = cli_version(runner, fresh=True)
             if current_cli != cell.identity["cli_version"]:
                 stop_reason = (
+                    f"agent CLI version probe failed: {runner} --version before {run_id}"
+                    if current_cli is None else
                     f"agent CLI version changed mid-run: {runner} was "
                     f"{cell.identity['cli_version']!r} when planned, now {current_cli!r}"
                 )
@@ -1845,17 +1879,11 @@ Examples:
             else:
                 # Outside the try: an error from here on must not settle the cell twice.
                 settle(result, result["total_cost_usd"])
-                status = "✓" if result["correct"] else "✗"
-                print(
-                    f"  {status} "
-                    f"{result['num_turns']}t "
-                    f"{result['context_tokens']:,}ctx "
-                    f"{result['output_tokens']:,}out "
-                    f"${result['total_cost_usd']:.4f} "
-                    f"{result['duration_ms']:,}ms"
-                )
-                if not result["correct"]:
-                    print(f"  → {result['correctness_reason']}")
+                try:
+                    report(result)
+                except Exception as error:
+                    stop_reason = f"reporting failed after cell {run_id} was stored: {error!r}"
+                    break
 
     # Clean real-world repos after run (remove junk files written by Claude sessions)
     for repo_name in selected_repos:

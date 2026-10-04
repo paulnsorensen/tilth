@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
+from jsonl import tolerant_jsonl
 from pricing import compute_cost_breakdown
 
 
@@ -631,19 +632,6 @@ def extract_stream_error(stdout: str) -> Optional[str]:
     return found
 
 
-def tolerant_jsonl(raw: str) -> list[dict]:
-    """Decode a teed JSONL stream, skipping a line a killed runner left torn."""
-    events = []
-    for line in raw.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-    return events
-
-
 def stream_native_cost(raw: str) -> Optional[float]:
     """Return the last result event's reported ``total_cost_usd``, or None when absent."""
     costs = [
@@ -660,12 +648,20 @@ _USAGE_LIMIT_TEXT = re.compile(r"(?:you['’]ve hit your|usage limit reached)", 
 def detect_quota_rejection(raw: str) -> Optional[str]:
     """Return why a claude stream was rejected by a subscription usage limit, or None.
 
-    Only the terminal result decides: it must carry usage-limit text or a rate-limit
-    subtype. A rejected rate_limit_event (for example an overage tier) on a stream
-    that ended for another reason, such as ``error_max_budget_usd``, is not quota.
+    When the stream has a result, only the terminal result decides: it must carry
+    usage-limit text or a rate-limit subtype. A rejected rate_limit_event (for
+    example an overage tier) on a stream that ended for another reason, such as
+    ``error_max_budget_usd``, is not quota. A stream with no result event has only
+    its rate_limit_events to decide by, so a rejected one there is quota.
     """
-    results = [event for event in tolerant_jsonl(raw) if event.get("type") == "result"]
+    events = tolerant_jsonl(raw)
+    results = [event for event in events if event.get("type") == "result"]
     if not results:
+        for event in reversed(events):
+            info = event.get("rate_limit_info")
+            if (event.get("type") == "rate_limit_event" and isinstance(info, dict)
+                    and info.get("status") == "rejected"):
+                return f"rejected {info.get('rateLimitType') or 'unknown'} rate limit"
         return None
     final = results[-1]
     result_text = final.get("result")

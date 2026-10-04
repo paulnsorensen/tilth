@@ -620,6 +620,26 @@ def test_rejected_overage_event_on_a_budget_failure_is_not_quota():
     assert detect_quota_rejection("\n".join(map(json.dumps, events))) is None
 
 
+def test_rejected_rate_limit_event_without_a_result_is_quota():
+    """A stream cut off before its result has only the rate_limit_event to decide by."""
+    from parse import detect_quota_rejection
+
+    events = [
+        {"type": "system", "subtype": "init", "model": "claude-sonnet-5"},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}},
+    ]
+
+    assert "five_hour" in detect_quota_rejection("\n".join(map(json.dumps, events)))
+
+
+def test_allowed_rate_limit_event_without_a_result_is_not_quota():
+    from parse import detect_quota_rejection
+
+    event = {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour"}}
+
+    assert detect_quota_rejection(json.dumps(event)) is None
+
+
 def test_rate_limit_result_subtype_is_quota():
     from parse import detect_quota_rejection
 

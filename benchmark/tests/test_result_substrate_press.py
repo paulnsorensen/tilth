@@ -264,7 +264,9 @@ def test_cli_version_change_mid_run_stops_before_the_next_paid_cell(
     assert "CLI version changed" in out and "2.1.0" in out and "2.2.0" in out
 
 
-def test_a_cell_is_stored_and_charged_once_when_reporting_fails(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_cell_is_stored_and_charged_once_when_reporting_fails(
+    bench, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
     def run_single_missing_report_fields(task_name, mode_name, model_name, repetition, **_kwargs):
         bench.calls.append((task_name, mode_name, repetition))
         return {"task": task_name, "mode": mode_name, "model": run.MODELS[model_name],
@@ -273,10 +275,79 @@ def test_a_cell_is_stored_and_charged_once_when_reporting_fails(bench, monkeypat
 
     monkeypatch.setattr(run, "run_single", run_single_missing_report_fields)
 
-    try:
-        bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5")
-    except KeyError:
-        pass
+    assert bench.main("--tasks", "cell_a,cell_b", *_ARGS, "--max-usd", "5") != 0
+    assert bench.calls == [("cell_a", "plain", 0)]
     assert len(bench.stored_rows()) == 1
     assert bench.stored_rows()[0]["charged_usd"] == 0.2
     assert len(bench.output_rows()) == 1
+    out = capsys.readouterr().out
+    assert "reporting failed after cell cell_a/plain/sonnet5/rep0 was stored" in out
+    assert "Spend: $0.2000" in out
+
+
+# --- independent-review cure of 8efe6bd ---
+
+
+def test_scheduler_reprobes_the_cli_fresh_before_each_paid_cell(
+    bench, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only a fresh probe sees the update; a cached probe would let the cell run."""
+    probes: list[bool] = []
+
+    def probe(_runner: str, *, fresh: bool = False) -> str:
+        probes.append(fresh)
+        return "9.9.9" if fresh else bench.cli
+
+    monkeypatch.setattr(run, "cli_version", probe)
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5") != 0
+    assert bench.calls == []
+    assert probes[-1] is True
+    assert "CLI version changed" in capsys.readouterr().out
+
+
+def test_fresh_cli_version_bypasses_the_probe_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    import functools
+
+    versions = iter(["2.1.0", "2.2.0", "2.3.0"])
+    monkeypatch.setattr(run, "_run_probe", lambda _argv: next(versions))
+    monkeypatch.setattr(run, "_probe_version", functools.lru_cache(maxsize=None)(lambda argv: run._run_probe(argv)))
+
+    assert run.cli_version("claude") == "2.1.0"
+    assert run.cli_version("claude") == "2.1.0"
+    assert run.cli_version("claude", fresh=True) == "2.2.0"
+
+
+def test_failed_cli_probe_stops_with_its_own_reason(
+    bench, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(run, "cli_version", lambda _runner, *, fresh=False: None if fresh else bench.cli)
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5") != 0
+    out = capsys.readouterr().out
+    assert "agent CLI version probe failed" in out
+    assert "now None" not in out
+
+
+def test_reused_rows_carry_no_charge_from_the_run_that_stored_them(bench) -> None:
+    bench.seed(bench.row("cell_a", "plain", 0, charged_usd=0.4))
+    bench.runner(lambda _stream: 0.3)
+
+    assert bench.main("--tasks", "cell_a,cell_b", *_ARGS, "--max-usd", "5") == 0
+    rows = bench.output_rows()
+    assert sum(row.get("charged_usd", 0) for row in rows) == pytest.approx(0.3)
+    assert bench.stored_rows()[0]["charged_usd"] == 0.4
+
+
+def test_reused_rows_probe_the_tilth_version_once_per_mode(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    for task in ("cell_a", "cell_b", "cell_c"):
+        bench.seed(bench.row(task, "plain", 0))
+    probes: list[str] = []
+    monkeypatch.setattr(run, "_reported_tilth_version", lambda mode: probes.append(mode.name) or "0.8.4")
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    assert bench.main("--tasks", "cell_a,cell_b,cell_c", *_ARGS) == 0
+    assert probes == ["plain"]
+    assert {row["tilth_version"] for row in bench.output_rows()} == {"0.8.4"}
