@@ -219,18 +219,20 @@ fn run_search_v2(
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
             let language = entry["language"].as_str().unwrap();
             session.record_structural_search();
-            let scan = structural
-                .search(
-                    language,
-                    pattern,
-                    cwd,
-                    entry.get("glob").and_then(Value::as_str),
-                    cache,
-                )
-                .map_err(|error| SearchFailure::new(error.to_string(), "structural_error"))?;
-            let (result, file_counts) = structural_result(scan, pattern, language);
-            counts = Some(file_counts);
-            (result, "structural".into(), Vec::new(), None)
+            let (result, route, file_counts, failure) = execute_structural_entry(
+                &structural,
+                language,
+                pattern,
+                cwd,
+                entry.get("glob").and_then(Value::as_str),
+                cache,
+            );
+            counts = file_counts;
+            if let Some(message) = failure {
+                failed += 1;
+                first_failure.get_or_insert(message);
+            }
+            (result, route, Vec::new(), None)
         } else {
             let query = entry["query"].as_str().unwrap();
             match route_query(
@@ -382,6 +384,30 @@ fn structural_result(
         mark_partial(&mut result);
     }
     (result, scan.file_counts)
+}
+
+/// Execute one prepared structural entry without aborting sibling entries.
+fn execute_structural_entry(
+    structural: &crate::search::StructuralPatterns,
+    language: &str,
+    pattern: &str,
+    cwd: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+) -> (Value, String, Option<FileCounts>, Option<String>) {
+    match structural.search(language, pattern, cwd, glob, cache) {
+        Ok(scan) => {
+            let (result, counts) = structural_result(scan, pattern, language);
+            (result, "structural".into(), Some(counts), None)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let mut result = base_result(pattern, "error", "error");
+            result["error"] = json!(&message);
+            result["completeness"] = json!("partial");
+            (result, "error".into(), None, Some(message))
+        }
+    }
 }
 
 /// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
@@ -3020,6 +3046,30 @@ mod tests {
         assert_eq!(result["results"][0]["status"], "error");
         assert!(result["results"][0]["error"].as_str().is_some());
         assert_eq!(result["results"][1]["resolved_as"], "symbol");
+    }
+
+    #[test]
+    fn structural_execution_failure_returns_an_entry_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut structural = crate::search::StructuralPatterns::default();
+        let pattern = "structural_witness_unique($A)";
+        structural.prepare("python", pattern).unwrap();
+
+        let (result, route, counts, failure) = execute_structural_entry(
+            &structural,
+            "python",
+            pattern,
+            tmp.path(),
+            Some("["),
+            &OutlineCache::new(),
+        );
+
+        assert_eq!(route, "error");
+        assert_eq!(result["status"], "error");
+        assert_eq!(result["completeness"], "partial");
+        assert!(result["error"].as_str().unwrap().contains("invalid glob"));
+        assert!(counts.is_none());
+        assert!(failure.is_some());
     }
 
     #[test]
