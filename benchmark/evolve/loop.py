@@ -99,7 +99,7 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check"}:
+        if self.stage in {"apply", "just check", "build"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -313,7 +313,7 @@ class Evolution:
         return result.score(example), result.side_info(example)
 
     def cascade(self, candidate: Mapping[str, str]) -> Cascade:
-        """Apply, ``just check``, cheap tier, paid tier; each stage memoized per content id."""
+        """Apply, ``just check``, build, cheap tier, paid tier; each stage memoized per content id."""
         result = self.new_cascade(candidate)
         if result.done:
             return result
@@ -327,6 +327,13 @@ class Evolution:
             result.just_check_ok, result.check_tail = ok, tail(output)
         if not result.just_check_ok:
             return result.fail("just check", result.check_tail)
+        try:
+            return self._tiers(result)
+        except run.CandidateBuildFailed as failed:
+            return result.fail("build", tail(str(failed)))
+
+    def _tiers(self, result: Cascade) -> Cascade:
+        """The cheap and paid tiers; the first cell of either builds the candidate binary."""
         if result.cheap_score is None:
             rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [1]), result.sha)
             records = self._records(rows)

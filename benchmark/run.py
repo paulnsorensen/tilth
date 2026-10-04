@@ -1436,6 +1436,10 @@ class BaselineDrift(ValueError):
     """A planned stock-arm cell has a completed stored row only under different key inputs."""
 
 
+class CandidateBuildFailed(RuntimeError):
+    """``run_plan`` could not build ``candidate_sha``; the message ends with the failing build output."""
+
+
 _CANDIDATE_BUILDS: dict[str, CandidateBuild] = {}
 
 
@@ -1517,7 +1521,8 @@ def run_plan(
     ``panel.stamp(task)`` into every row before ``baselines.store``. Tilth arms are
     served from the binary built at ``candidate_sha``. ``store_only`` returns only
     stored rows and never starts a runner. Every row returned is also appended to
-    ``output``. ``repo`` holds ``candidate_sha`` (default: this checkout). Raises ``BaselineDrift`` before any cell when a stock-arm cell
+    ``output``. ``repo`` holds ``candidate_sha`` (default: this checkout). Raises ``CandidateBuildFailed``
+    when ``candidate_sha`` does not build, ``BaselineDrift`` before any cell when a stock-arm cell
     drifted without ``refreeze_baselines``, and ``PlanStopped`` when the ledger or
     a usage limit stops it before a cell.
     """
@@ -1525,7 +1530,11 @@ def run_plan(
     cells = [CellSpec(*cell) for cell in cells]
     saved: dict[str, ModeConfig] = {}
     if candidate_sha is not None:
-        build = build_candidate(candidate_sha, repo=repo)
+        try:
+            build = build_candidate(candidate_sha, repo=repo)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            output = getattr(error, "stderr", None) or ""
+            raise CandidateBuildFailed(f"{error}\n{output}".strip()) from error
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)

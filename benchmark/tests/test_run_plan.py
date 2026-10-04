@@ -271,3 +271,14 @@ def test_failed_candidate_build_reports_cargo_error(candidate_repo, monkeypatch:
     monkeypatch.setattr(run, "_run_cargo", failing_cargo)
     with pytest.raises(RuntimeError, match=r"E0425"):
         run.build_candidate(candidate, repo=repo)
+
+
+def test_run_plan_reports_any_build_failure_as_candidate_build_failed(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing(sha, repo):
+        raise subprocess.CalledProcessError(128, ["git", "worktree", "add"], stderr="fatal: invalid reference")
+
+    monkeypatch.setattr(run, "_build_candidate", failing)
+    with pytest.raises(run.CandidateBuildFailed, match="fatal: invalid reference"):
+        plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
+    assert world.runner_calls() == []
+    assert run.MODES["tilth"].git_sha is None

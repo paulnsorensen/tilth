@@ -496,6 +496,52 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
         assert {task for task, *_ in non_seed} == set(CHEAP)
 
 
+def test_failed_candidate_build_is_a_cascade_stage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    broken = "BUILDFAIL\n" + mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="1")
+    real_build = world.fake_build
+
+    def build_candidate(sha: str, repo: Path | None = None) -> run.CandidateBuild:
+        if "BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo):
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0308]: mismatched types")
+        return real_build(sha, repo)
+
+    def spawn(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, result_stream(f"<new_text>{broken}</new_text>", cost=0.0), "")
+
+    monkeypatch.setattr(run, "_build_candidate", build_candidate)
+    monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
+
+    evo = build(world, calls="12", spawn=spawn)
+    assert evo.run() == 0
+
+    [failed] = [result for result in evo.results.values() if "BUILDFAIL" in result.candidate["prompts/mcp.md"]]
+    assert failed.stage == "build" and "error[E0308]: mismatched types" in failed.tail
+    assert "finish: " in log_text(world)
+    assert not any("BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo)
+                   for _task, mode, _rep, sha in world.calls if mode == "tilth")
+
+
+def test_build_failure_side_info_names_stage(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    seed_sha = world.seed_sha
+
+    def build_candidate(sha: str, repo: Path | None = None) -> run.CandidateBuild:
+        if sha != seed_sha:
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0308]: mismatched types")
+        return world.fake_build(sha, repo)
+
+    monkeypatch.setattr(run, "_build_candidate", build_candidate)
+    failing = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1")
+    score, info = evo.evaluate(failing, "dev_a")
+
+    assert score == 0
+    assert info["stage"] == "build" and "error[E0308]: mismatched types" in info["tail"]
+    result = evo.results[candidates.content_id(failing)]
+    assert result.stage == "build" and not result.reached_paid
+    assert evo.evaluate(failing, "dev_b")[1]["stage"] == "build"
+
+
 def test_cheap_tier_threshold(world) -> None:
     evo = ready(world)
     equal = child(evo.seed, dev_a="1", dev_b="0", cheap_a="1")
