@@ -1053,10 +1053,39 @@ def test_press_cli_refuses_unknown_task_without_spawn() -> None:
 
 
 def test_press_cli_runs_as_script_without_spawning(tmp_path: Path) -> None:
+    # An argument error reads no judge cache, so the result does not depend on local state.
     completed = subprocess.run(
-        [sys.executable, str(BENCHMARK_DIR / "judge" / "cli.py"), "label", "--tasks", "rg_search_dispatch"],
+        [sys.executable, str(BENCHMARK_DIR / "judge" / "cli.py"), "calibrate", "--max-usd", "-1"],
         capture_output=True, text=True, cwd=tmp_path,
         env={**os.environ, "PATH": str(tmp_path)},
     )
     assert completed.returncode != 0
-    assert "--max-usd" in completed.stderr
+    assert "not a positive amount" in completed.stderr
+
+
+# Cure pass 1: age findings.
+
+
+def test_missing_calibration_file_reports_uncalibrated(no_judge_calls: None) -> None:
+    seed_agreement(tasks=("alpha", "beta"))
+    judge_config.CALIBRATION_FILE.unlink()
+    assert store.current_agreement() is None
+    assert "## Applicability (uncalibrated)" in analyze.generate_report(report_rows())
+
+
+def test_verdict_must_open_the_answer(judge_home: Path) -> None:
+    seed_agreement()
+    row, sidecar = rollout(judge_home)
+    with pytest.raises(core.CritiqueRejected):
+        make_judge(StubClient(answer="\n\nverdict: apt\nLate verdict.")).critique(row, sidecar)
+    assert core.parse_verdict("verdict: missed  \nreason") == "missed"
+
+
+def test_cached_labels_hash_the_prompt_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_report_labels(alpha="strong", beta="none")
+    reads = []
+    real_template = store.prompt_template
+    monkeypatch.setattr(store, "prompt_template", lambda kind: reads.append(kind) or real_template(kind))
+    assert store.cached_labels(["digest-alpha", "digest-beta", "digest-gamma"]) == {
+        "digest-alpha": "strong", "digest-beta": "none"}
+    assert reads == ["applicability"]

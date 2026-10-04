@@ -156,7 +156,7 @@ def critique_prompt(record: Mapping[str, object]) -> str:
 
 
 def parse_verdict(answer: str) -> str | None:
-    first_line = answer.strip().splitlines()[0].strip() if answer.strip() else ""
+    first_line = answer.split("\n", 1)[0].strip()
     verdict = first_line.removeprefix("verdict: ")
     return verdict if first_line.startswith("verdict: ") and verdict in config.VERDICTS else None
 

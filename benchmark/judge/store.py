@@ -72,8 +72,8 @@ def current_stamp() -> dict[str, str]:
     return {**judge_stamp(), "calibration_digest": calibration_digest()}
 
 
-def _key(kind: Kind, subject: str) -> str:
-    return _sha256(json.dumps([subject, config.JUDGE_MODEL, prompt_hash(kind)]).encode())
+def _key(kind: Kind, subject: str, kind_prompt_hash: str | None = None) -> str:
+    return _sha256(json.dumps([subject, config.JUDGE_MODEL, kind_prompt_hash or prompt_hash(kind)]).encode())
 
 
 def label_key(task_digest: str) -> str:
@@ -114,7 +114,11 @@ def cached_label(task_digest: str) -> str | None:
 def cached_labels(task_digests: Iterable[str]) -> dict[str, str]:
     """Map each task digest with a cached label to that label, reading the cache once."""
     by_key = {entry.get("key"): entry["label"] for entry in entries("applicability")}
-    return {digest: by_key[key] for digest in set(task_digests) if (key := label_key(digest)) in by_key}
+    applicability_hash = prompt_hash("applicability")
+    return {
+        digest: by_key[key] for digest in set(task_digests)
+        if (key := _key("applicability", digest, applicability_hash)) in by_key
+    }
 
 
 def cached_critique(run_key: str) -> str | None:
@@ -141,7 +145,12 @@ def write_agreement(agreement: Agreement) -> None:
 
 
 def current_agreement() -> Agreement | None:
-    """The newest stored agreement whose model, prompt hashes, and calibration digest are current."""
+    """The newest stored agreement whose model, prompt hashes, and calibration digest are current.
+
+    None when no record matches, or when the calibration file is missing.
+    """
+    if not config.CALIBRATION_FILE.is_file():
+        return None
     stamp = current_stamp()
     names = {field.name for field in fields(Agreement)}
     for record in reversed(_read(_AGREEMENT_FILE)):
