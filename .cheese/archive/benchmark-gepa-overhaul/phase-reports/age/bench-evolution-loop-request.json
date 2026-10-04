@@ -1,0 +1,313 @@
+{
+ "entry": "age",
+ "context": {
+  "scope": "diff",
+  "effort": "normal",
+  "snapshot": "9e0384c...2ab667e",
+  "changed_paths": [
+   "benchmark/.gitignore",
+   "benchmark/README.md",
+   "benchmark/analyze.py",
+   "benchmark/evolve/__init__.py",
+   "benchmark/evolve/calls.py",
+   "benchmark/evolve/candidate.py",
+   "benchmark/evolve/cli.py",
+   "benchmark/evolve/engine.py",
+   "benchmark/evolve/finish.py",
+   "benchmark/evolve/gitops.py",
+   "benchmark/evolve/loop.py",
+   "benchmark/evolve/materialize.py",
+   "benchmark/evolve/proposer.py",
+   "benchmark/evolve/rust.py",
+   "benchmark/paired.py",
+   "benchmark/requirements.txt",
+   "benchmark/run.py",
+   "benchmark/spend.py",
+   "benchmark/tests/evolve_support.py",
+   "benchmark/tests/test_analyze_reporting.py",
+   "benchmark/tests/test_evolve.py",
+   "benchmark/tests/test_evolve_press.py",
+   "benchmark/tests/test_invariants.py",
+   "benchmark/tests/test_run_plan.py",
+   "benchmark/tests/test_spend.py"
+  ],
+  "surface_score": 4272.0,
+  "components": [
+   {
+    "id": "evolve",
+    "role": "application",
+    "paths": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ]
+   },
+   {
+    "id": "tests",
+    "role": "test",
+    "paths": [
+     "benchmark/tests/evolve_support.py",
+     "benchmark/tests/test_analyze_reporting.py",
+     "benchmark/tests/test_evolve.py",
+     "benchmark/tests/test_evolve_press.py",
+     "benchmark/tests/test_invariants.py",
+     "benchmark/tests/test_run_plan.py",
+     "benchmark/tests/test_spend.py"
+    ]
+   },
+   {
+    "id": "docs-build",
+    "role": "other",
+    "paths": [
+     "benchmark/.gitignore",
+     "benchmark/README.md",
+     "benchmark/requirements.txt"
+    ]
+   }
+  ],
+  "subjects": [
+   {
+    "subject": "changed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "caller-impact",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "security",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "spec-tests",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "reuse",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "simplification",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "efficiency",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "conventions",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "altitude",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/__init__.py",
+     "benchmark/evolve/calls.py",
+     "benchmark/evolve/candidate.py",
+     "benchmark/evolve/cli.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/finish.py",
+     "benchmark/evolve/gitops.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/evolve/proposer.py",
+     "benchmark/evolve/rust.py",
+     "benchmark/paired.py",
+     "benchmark/run.py",
+     "benchmark/spend.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "removed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py"
+    ],
+    "evidence": [
+     "is_contaminated_panel_row moved to paired"
+    ]
+   }
+  ],
+  "risks": [],
+  "is_subagent": true,
+  "can_fan_out": false,
+  "concurrency_limit": null
+ }
+}

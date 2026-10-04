@@ -1,0 +1,15 @@
+{
+  "slug": "bench-evolution-loop",
+  "attempt": 1,
+  "outcome": "green",
+  "repair_cycles": 0,
+  "changed_file_count": 1,
+  "changed_file_classes": [
+    "tests"
+  ],
+  "production_source_files": [],
+  "boundary_consistent": true,
+  "tool_error_count": 0,
+  "operations": [],
+  "delegations": []
+}

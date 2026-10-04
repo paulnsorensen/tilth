@@ -1,0 +1,187 @@
+{
+ "entry": "age",
+ "context": {
+  "scope": "diff",
+  "effort": "normal",
+  "snapshot": "2ab667e...c3f2ac5",
+  "changed_paths": [
+   "benchmark/analyze.py",
+   "benchmark/evolve/engine.py",
+   "benchmark/evolve/loop.py",
+   "benchmark/evolve/materialize.py",
+   "benchmark/run.py",
+   "benchmark/tests/evolve_support.py",
+   "benchmark/tests/test_evolve_press.py",
+   "benchmark/tests/test_run_plan.py"
+  ],
+  "surface_score": 200.0,
+  "components": [
+   {
+    "id": "evolve",
+    "role": "application",
+    "paths": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ]
+   },
+   {
+    "id": "tests",
+    "role": "test",
+    "paths": [
+     "benchmark/tests/evolve_support.py",
+     "benchmark/tests/test_evolve_press.py",
+     "benchmark/tests/test_run_plan.py"
+    ]
+   }
+  ],
+  "subjects": [
+   {
+    "subject": "changed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "caller-impact",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "security",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "spec-tests",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "reuse",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "simplification",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "efficiency",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "conventions",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "altitude",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new evolve package and run.run_plan"
+    ]
+   },
+   {
+    "subject": "removed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py",
+     "benchmark/evolve/engine.py",
+     "benchmark/evolve/loop.py",
+     "benchmark/evolve/materialize.py",
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "is_contaminated_panel_row moved to paired"
+    ]
+   }
+  ],
+  "risks": [],
+  "is_subagent": true,
+  "can_fan_out": false,
+  "concurrency_limit": null
+ }
+}

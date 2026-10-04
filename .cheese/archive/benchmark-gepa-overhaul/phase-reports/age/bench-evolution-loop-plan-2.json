@@ -1,0 +1,341 @@
+{
+  "policy_version": "age-review-plan.v1",
+  "scope": "diff",
+  "input_digest": "88c1d30a74a85c11fabd273d2788b0cdcc753e2d7d2667d7d16518cf7e82344d",
+  "n": 1,
+  "effort": "normal",
+  "assignments": [
+    {
+      "id": "combined",
+      "subjects": [
+        "changed-behavior",
+        "removed-behavior",
+        "caller-impact",
+        "security",
+        "spec-tests",
+        "reuse",
+        "simplification",
+        "efficiency",
+        "conventions",
+        "altitude"
+      ],
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    }
+  ],
+  "subject_dispositions": [
+    {
+      "subject": "changed-behavior",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "removed-behavior",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "is_contaminated_panel_row moved to paired"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "caller-impact",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "security",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "spec-tests",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "reuse",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "simplification",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "efficiency",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "conventions",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    },
+    {
+      "subject": "altitude",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new evolve package and run.run_plan"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable"
+      ]
+    }
+  ],
+  "rationale": [
+    "scope:diff",
+    "effort:normal",
+    "surface-band:medium",
+    "ordinary-budget:2",
+    "protected:conventions",
+    "protected:altitude",
+    "degraded:subagent execution restriction; agent fan-out unavailable"
+  ],
+  "verification": {
+    "required": true,
+    "status": "unavailable",
+    "candidate_batches": [],
+    "reason": "subagent execution restriction; agent fan-out unavailable"
+  },
+  "gap_sweep": {
+    "required": false,
+    "after": "verification",
+    "status": "not-required"
+  },
+  "dispatch_batches": [
+    [
+      "combined"
+    ]
+  ],
+  "degraded_reason": "subagent execution restriction; agent fan-out unavailable",
+  "desired_n": 4,
+  "desired_assignments": [
+    {
+      "id": "general",
+      "subjects": [
+        "changed-behavior",
+        "removed-behavior",
+        "caller-impact",
+        "spec-tests",
+        "reuse",
+        "simplification",
+        "efficiency"
+      ],
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "ordinary-general"
+      ]
+    },
+    {
+      "id": "security",
+      "subjects": [
+        "security"
+      ],
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "optional-specialist"
+      ]
+    },
+    {
+      "id": "conventions",
+      "subjects": [
+        "conventions"
+      ],
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "protected:conventions"
+      ]
+    },
+    {
+      "id": "altitude",
+      "subjects": [
+        "altitude"
+      ],
+      "targets": [
+        "benchmark/analyze.py",
+        "benchmark/evolve/engine.py",
+        "benchmark/evolve/loop.py",
+        "benchmark/evolve/materialize.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "protected:altitude"
+      ]
+    }
+  ]
+}
