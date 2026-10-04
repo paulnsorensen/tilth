@@ -1,0 +1,50 @@
+[
+ {
+  "instance_id": "fixture__shapes.0a1b2c3d.test_area.5e6f7a8b.lv1",
+  "patch": "diff --git a/shapes/area.py b/shapes/area.py\nindex 21703b0..d9afa4b 100644\n--- a/shapes/area.py\n+++ b/shapes/area.py\n@@ -2,11 +2,6 @@\n import math\n \n \n-def square_area(side):\n-    \"\"\"Return the area of a square.\"\"\"\n-    return side * side\n-\n-\n def _unit():\n     return 1\n \n@@ -17,8 +12,3 @@ def _scale(value):\n \n def _half(value):\n     return value / 2\n-\n-\n-def circle_area(radius):\n-    \"\"\"Return the area of a circle.\"\"\"\n-    return math.pi * radius * radius\n",
+  "test_patch": "diff --git a/tests/test_area.py b/tests/test_area.py\ndeleted file mode 100644\nindex c5bf5bf..0000000\n--- a/tests/test_area.py\n+++ /dev/null\n@@ -1,11 +0,0 @@\n-import math\n-\n-from shapes.area import circle_area, square_area\n-\n-\n-def test_square_area():\n-    assert square_area(3) == 9\n-\n-\n-def test_circle_area():\n-    assert circle_area(1) == math.pi\n",
+  "FAIL_TO_PASS": [
+   "tests/test_area.py"
+  ],
+  "PASS_TO_PASS": [
+   "tests/test_misc.py"
+  ],
+  "image_name": "libercoders/featurebench-specs_shapes-instance_00000000",
+  "repo": "fixture/shapes",
+  "base_commit": "4e185666db6ca79d584115b42703451d1042cc8a",
+  "problem_statement": "## Task\n**Task Statement:**\n\nImplement ``square_area`` and ``circle_area`` in ``shapes.area``: return the\narea of a square from its side length and of a circle from its radius.\n\nYou are forbidden to access the following URLs:\nblack_links:\n- https://github.com/fixture/shapes\n",
+  "repo_settings": "{\"repository\": \"fixture/shapes\", \"commit\": \"4e18566\", \"clone_method\": \"https\", \"base_url\": null, \"base_image\": \"python311\", \"rebuild_base_image\": false, \"rebuild_instance_image\": false, \"custom_instance_image_build\": [], \"pre_install\": [], \"install\": \"pip install -e .\", \"pip_packages\": [\"pytest\"], \"docker_specs\": {\"run_args\": {\"cuda_visible_devices\": \"6,7\", \"shm_size\": null, \"cap_add\": []}, \"custom_docker_args\": []}, \"test_cmd\": \"pytest -rA --tb=short --color=no\", \"timeout_run\": 600, \"library_name\": \"shapes\", \"black_links\": [\"https://github.com/fixture/shapes\"], \"technical_docs\": []}"
+ },
+ {
+  "instance_id": "fixture__shapes.0a1b2c3d.test_area.9c0d1e2f.lv1",
+  "patch": "diff --git a/shapes/area.py b/shapes/area.py\nindex 21703b0..d9afa4b 100644\n--- a/shapes/area.py\n+++ b/shapes/area.py\n@@ -2,11 +2,6 @@\n import math\n \n \n-def square_area(side):\n-    \"\"\"Return the area of a square.\"\"\"\n-    return side * side\n-\n-\n def _unit():\n     return 1\n \n@@ -17,8 +12,3 @@ def _scale(value):\n \n def _half(value):\n     return value / 2\n-\n-\n-def circle_area(radius):\n-    \"\"\"Return the area of a circle.\"\"\"\n-    return math.pi * radius * radius\ndiff --git a/tests/test_area.py b/tests/test_area.py\nindex c5bf5bf..f139cf9 100644\n--- a/tests/test_area.py\n+++ b/tests/test_area.py\n@@ -1,6 +1,5 @@\n import math\n \n-from shapes.area import circle_area, square_area\n \n \n def test_square_area():\n",
+  "test_patch": "diff --git a/tests/test_area.py b/tests/test_area.py\ndeleted file mode 100644\nindex c5bf5bf..0000000\n--- a/tests/test_area.py\n+++ /dev/null\n@@ -1,11 +0,0 @@\n-import math\n-\n-from shapes.area import circle_area, square_area\n-\n-\n-def test_square_area():\n-    assert square_area(3) == 9\n-\n-\n-def test_circle_area():\n-    assert circle_area(1) == math.pi\n",
+  "FAIL_TO_PASS": [
+   "tests/test_area.py"
+  ],
+  "PASS_TO_PASS": [
+   "tests/test_misc.py"
+  ],
+  "image_name": "libercoders/featurebench-specs_shapes-instance_00000000",
+  "repo": "fixture/shapes",
+  "base_commit": "4e185666db6ca79d584115b42703451d1042cc8a",
+  "problem_statement": "## Task\n**Task Statement:**\n\nImplement ``square_area`` and ``circle_area`` in ``shapes.area``: return the\narea of a square from its side length and of a circle from its radius.\n\nYou are forbidden to access the following URLs:\nblack_links:\n- https://github.com/fixture/shapes\n",
+  "repo_settings": "{\"repository\": \"fixture/shapes\", \"commit\": \"4e18566\", \"clone_method\": \"https\", \"base_url\": null, \"base_image\": \"python311\", \"rebuild_base_image\": false, \"rebuild_instance_image\": false, \"custom_instance_image_build\": [], \"pre_install\": [], \"install\": \"pip install -e .\", \"pip_packages\": [\"pytest\"], \"docker_specs\": {\"run_args\": {\"cuda_visible_devices\": \"6,7\", \"shm_size\": null, \"cap_add\": []}, \"custom_docker_args\": []}, \"test_cmd\": \"pytest -rA --tb=short --color=no\", \"timeout_run\": 600, \"library_name\": \"shapes\", \"black_links\": [\"https://github.com/fixture/shapes\"], \"technical_docs\": []}"
+ },
+ {
+  "instance_id": "fixture__shapes.0a1b2c3d.test_area.5e6f7a8b.lv2",
+  "patch": "diff --git a/shapes/area.py b/shapes/area.py\nindex 21703b0..d9afa4b 100644\n--- a/shapes/area.py\n+++ b/shapes/area.py\n@@ -2,11 +2,6 @@\n import math\n \n \n-def square_area(side):\n-    \"\"\"Return the area of a square.\"\"\"\n-    return side * side\n-\n-\n def _unit():\n     return 1\n \n@@ -17,8 +12,3 @@ def _scale(value):\n \n def _half(value):\n     return value / 2\n-\n-\n-def circle_area(radius):\n-    \"\"\"Return the area of a circle.\"\"\"\n-    return math.pi * radius * radius\n",
+  "test_patch": "diff --git a/tests/test_area.py b/tests/test_area.py\ndeleted file mode 100644\nindex c5bf5bf..0000000\n--- a/tests/test_area.py\n+++ /dev/null\n@@ -1,11 +0,0 @@\n-import math\n-\n-from shapes.area import circle_area, square_area\n-\n-\n-def test_square_area():\n-    assert square_area(3) == 9\n-\n-\n-def test_circle_area():\n-    assert circle_area(1) == math.pi\n",
+  "FAIL_TO_PASS": [
+   "tests/test_area.py"
+  ],
+  "PASS_TO_PASS": [
+   "tests/test_misc.py"
+  ],
+  "image_name": "libercoders/featurebench-specs_shapes-instance_00000000",
+  "repo": "fixture/shapes",
+  "base_commit": "4e185666db6ca79d584115b42703451d1042cc8a",
+  "problem_statement": "## Task\n**Task Statement:**\n\nImplement ``square_area`` and ``circle_area`` in ``shapes.area``: return the\narea of a square from its side length and of a circle from its radius.\n\nYou are forbidden to access the following URLs:\nblack_links:\n- https://github.com/fixture/shapes\n",
+  "repo_settings": "{\"repository\": \"fixture/shapes\", \"commit\": \"4e18566\", \"clone_method\": \"https\", \"base_url\": null, \"base_image\": \"python311\", \"rebuild_base_image\": false, \"rebuild_instance_image\": false, \"custom_instance_image_build\": [], \"pre_install\": [], \"install\": \"pip install -e .\", \"pip_packages\": [\"pytest\"], \"docker_specs\": {\"run_args\": {\"cuda_visible_devices\": \"6,7\", \"shm_size\": null, \"cap_add\": []}, \"custom_docker_args\": []}, \"test_cmd\": \"pytest -rA --tb=short --color=no\", \"timeout_run\": 600, \"library_name\": \"shapes\", \"black_links\": [\"https://github.com/fixture/shapes\"], \"technical_docs\": []}"
+ }
+]
