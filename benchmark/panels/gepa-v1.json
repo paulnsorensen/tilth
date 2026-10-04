@@ -30,6 +30,30 @@
       "id": "mwaskom__seaborn.7001ebe7.test_algorithms.1f0181c2.lv1",
       "family": "featurebench",
       "language": "python",
+      "split": "test"
+    },
+    {
+      "id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "dev"
+    },
+    {
+      "id": "Netflix__metaflow.b390a8d4.test_stub_generator.7bf08c98.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "dev"
+    },
+    {
+      "id": "sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "test"
+    },
+    {
+      "id": "sympy__sympy.c1097516.test_nullspace.f14fc970.lv1",
+      "family": "featurebench",
+      "language": "python",
       "split": "dev"
     },
     {
