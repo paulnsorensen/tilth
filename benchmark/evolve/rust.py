@@ -1,9 +1,10 @@
-"""Just enough Rust lexing for the applier: ``#[cfg(test)]`` item spans and the MCP instruction byte lock."""
+"""Just enough Rust lexing for the applier: test-``cfg`` item spans and the MCP instruction byte lock."""
 
 import re
 from pathlib import PurePosixPath
 
-_CFG_TEST = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+_CFG_ATTR = re.compile(r"#(!?)\[\s*(?:cfg|cfg_attr)\s*\(")
+_TEST_TOKEN = re.compile(r"\btest\b")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
 _STRING = r'("(?:[^"\\]|\\.)*")'
@@ -65,12 +66,12 @@ def code_mask(text: str) -> str:
     return "".join(out)
 
 
-def _match_brace(mask: str, open_index: int) -> int:
+def _match_brace(mask: str, open_index: int, pair: str = "{}") -> int:
     depth = 0
     for index in range(open_index, len(mask)):
-        if mask[index] == "{":
+        if mask[index] == pair[0]:
             depth += 1
-        elif mask[index] == "}":
+        elif mask[index] == pair[1]:
             depth -= 1
             if depth == 0:
                 return index
@@ -82,15 +83,26 @@ def _line(text: str, index: int) -> int:
 
 
 def cfg_test_items(text: str) -> list[tuple[int, int, str]]:
-    """``(first_line, last_line, head)`` of each ``#[cfg(test)]`` item; ``head`` is its code before ``{`` or ``;``."""
+    """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``.
+
+    That covers ``cfg(test)``, ``cfg(any(.., test))``, ``cfg(all(test, ..))``, ``cfg(not(test))``, and
+    ``cfg_attr(test, ..)``; the span starts at the attribute, so the attribute itself is part of the item.
+    ``head`` is the item's code before ``{`` or ``;``. An inner ``#![cfg(..test..)]`` spans the whole file.
+    """
     mask = code_mask(text)
     items = []
-    for match in _CFG_TEST.finditer(mask):
-        terminator = re.compile(r"[{;]").search(mask, match.end())
+    for match in _CFG_ATTR.finditer(mask):
+        close = _match_brace(mask, mask.index("[", match.start()), "[]")
+        if not _TEST_TOKEN.search(mask, match.end(), close):
+            continue
+        if match[1]:
+            items.append((_line(text, match.start()), _line(text, max(len(text) - 1, 0)), ""))
+            continue
+        terminator = re.compile(r"[{;]").search(mask, close + 1)
         if terminator is None:
             continue
         end = terminator.start() if terminator[0] == ";" else _match_brace(mask, terminator.start())
-        items.append((_line(text, match.start()), _line(text, end), mask[match.end():terminator.start()].strip()))
+        items.append((_line(text, match.start()), _line(text, end), mask[close + 1:terminator.start()].strip()))
     return items
 
 

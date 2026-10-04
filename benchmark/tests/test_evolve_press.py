@@ -218,3 +218,45 @@ def test_byte_lock_count_and_lead_literal_edits_are_rewritten(tilth, tmp_path: P
     sha = materializer.materialize({**base, "prompts/mcp.md": new_mcp, "src_patch": patch})
     rewritten = git("show", f"{sha}:src/mcp/mod.rs", cwd=repo)
     assert f"            {len(new_mcp.encode())},\n" in rewritten and "guess —" not in rewritten
+
+
+def test_any_cfg_predicate_naming_test_marks_test_code() -> None:
+    text = "\n".join([
+        "#[cfg(any(not(unix), test))]",                   # 1
+        "fn fingerprint() -> u8 {",                       # 2
+        "    1",                                          # 3
+        "}",                                              # 4
+        "#[cfg(all(test, unix))]",                        # 5
+        "const ONLY_TEST: u8 = 2;",                       # 6
+        "#[cfg_attr(test, derive(Debug))]",               # 7
+        "struct Probe {",                                 # 8
+        "    field: u8,",                                 # 9
+        "}",                                              # 10
+        "fn live() {",                                    # 11
+        "    #[cfg(not(test))]",                          # 12
+        "    let _ = 3;",                                 # 13
+        "}",                                              # 14
+        '#[cfg(feature = "test")]',                       # 15
+        "fn feature_gated() {}",                          # 16
+        "#[cfg(unix)]",                                   # 17
+        "fn unix_only() {}",                              # 18
+        "#[cfg( test )]",                                 # 19
+        "fn spaced() {}",                                 # 20
+    ])
+    assert rust.cfg_test_spans(text) == [(1, 4), (5, 6), (7, 10), (12, 13), (19, 20)]
+    assert rust.cfg_test_spans("#![cfg(test)]\nfn a() {}\nfn b() {}\n") == [(1, 3)]
+
+
+@pytest.mark.parametrize("path, old, new", [
+    ("src/util.rs", "    let mut buffer = [0; 8192];", "    let mut buffer = [0; 4096];"),
+    ("src/util.rs", "#[cfg(any(not(unix), test))]", "#[cfg(not(unix))]"),
+    ("src/util.rs", "pub(crate) fn content_fingerprint(", "#[cfg(not(test))]\npub(crate) fn content_fingerprint("),
+    ("src/cache.rs", "    #[cfg(not(test))]\n    let _ = path;\n}", "    let _ = path;\n}"),
+], ids=["inside-any-test", "edit-attribute", "add-not-test", "remove-not-test"])
+def test_test_cfg_attributes_and_items_are_refused(tilth, tmp_path: Path, path: str, old: str, new: str) -> None:
+    repo, seed = tilth
+    base = candidates.read_seed(repo, seed)
+    materializer = Materializer(repo, seed, "press-cfg", tmp_path / "work")
+
+    with pytest.raises(Exception, match=r"cfg\(test\)"):
+        materializer.materialize({**base, "src_patch": _patch(repo, seed, path, old, new)})
