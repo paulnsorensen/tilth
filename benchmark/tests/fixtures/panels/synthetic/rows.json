@@ -1,0 +1,60 @@
+[
+ {
+  "base_commit": "7708195c07d1e022d7a450e2314fe80dcdd8f7e1",
+  "created_at": "2026-01-01 00:00:00",
+  "eval_type": "pass_and_fail",
+  "image": "synthetic",
+  "instance_id": "gin-gonic__gin-3741",
+  "log_parser": "parse_log_gotest",
+  "repo": "fixture/panelgo",
+  "version": "0",
+  "patch": "diff --git a/panel.go b/panel.go\nindex 8ba3ed3..21f1c35 100644\n--- a/panel.go\n+++ b/panel.go\n@@ -11,8 +11,8 @@ func Max(a, b int) int {\n // Sum adds every value.\n func Sum(values []int) int {\n \ttotal := 0\n-\tfor range values {\n-\t\ttotal++\n+\tfor _, value := range values {\n+\t\ttotal += value\n \t}\n \treturn total\n }\n",
+  "test_patch": "diff --git a/panel_test.go b/panel_test.go\nindex 02476df..643e67c 100644\n--- a/panel_test.go\n+++ b/panel_test.go\n@@ -7,3 +7,9 @@ func TestMax(t *testing.T) {\n \t\tt.Fatal(\"max\")\n \t}\n }\n+\n+func TestSum(t *testing.T) {\n+\tif Sum([]int{1, 2, 3}) != 6 {\n+\t\tt.Fatal(\"sum\")\n+\t}\n+}\n",
+  "eval_script": "#!/bin/bash\nset -uxo pipefail\ncd /testbed\ngit checkout 7708195c07d1e022d7a450e2314fe80dcdd8f7e1 panel_test.go\ngit apply -v - <<'EOF_PANEL'\ndiff --git a/panel_test.go b/panel_test.go\nindex 02476df..643e67c 100644\n--- a/panel_test.go\n+++ b/panel_test.go\n@@ -7,3 +7,9 @@ func TestMax(t *testing.T) {\n \t\tt.Fatal(\"max\")\n \t}\n }\n+\n+func TestSum(t *testing.T) {\n+\tif Sum([]int{1, 2, 3}) != 6 {\n+\t\tt.Fatal(\"sum\")\n+\t}\n+}\nEOF_PANEL\n: '>>>>> Start Test Output'\n(go test -v . -run \"^Test\") | cat\n: '>>>>> End Test Output'\ngit checkout 7708195c07d1e022d7a450e2314fe80dcdd8f7e1 panel_test.go\n",
+  "problem_statement": "fixture/panelgo: sum returns the count, not the total.\n",
+  "hints_text": "",
+  "FAIL_TO_PASS": [
+   "TestSum"
+  ],
+  "PASS_TO_PASS": [
+   "TestMax"
+  ]
+ },
+ {
+  "base_commit": "ebdd9ee969d33c4d1133cc3b90d786ff7195c660",
+  "created_at": "2026-01-01 00:00:00",
+  "eval_type": "pass_and_fail",
+  "image": "synthetic",
+  "instance_id": "sharkdp__bat-2650",
+  "log_parser": "parse_log_cargo",
+  "repo": "fixture/panelrs",
+  "version": "0",
+  "patch": "diff --git a/src/lib.rs b/src/lib.rs\nindex 9e1f5ce..0a5af42 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -3,5 +3,5 @@ pub fn max(a: i64, b: i64) -> i64 {\n }\n \n pub fn sum(values: &[i64]) -> i64 {\n-    values.len() as i64\n+    values.iter().sum()\n }\n",
+  "test_patch": "diff --git a/tests/panel.rs b/tests/panel.rs\nindex 637eda0..8dd700c 100644\n--- a/tests/panel.rs\n+++ b/tests/panel.rs\n@@ -1,6 +1,11 @@\n-use panelrs::max;\n+use panelrs::{max, sum};\n \n #[test]\n fn max_works() {\n     assert_eq!(max(2, 3), 3);\n }\n+\n+#[test]\n+fn sum_works() {\n+    assert_eq!(sum(&[1, 2, 3]), 6);\n+}\n",
+  "eval_script": "#!/bin/bash\nset -uxo pipefail\ncd /testbed\ngit checkout ebdd9ee969d33c4d1133cc3b90d786ff7195c660 tests/panel.rs\ngit apply -v - <<'EOF_PANEL'\ndiff --git a/tests/panel.rs b/tests/panel.rs\nindex 637eda0..8dd700c 100644\n--- a/tests/panel.rs\n+++ b/tests/panel.rs\n@@ -1,6 +1,11 @@\n-use panelrs::max;\n+use panelrs::{max, sum};\n \n #[test]\n fn max_works() {\n     assert_eq!(max(2, 3), 3);\n }\n+\n+#[test]\n+fn sum_works() {\n+    assert_eq!(sum(&[1, 2, 3]), 6);\n+}\nEOF_PANEL\n: '>>>>> Start Test Output'\n(RUSTFLAGS=-Awarnings cargo test --test panel) | cat\n: '>>>>> End Test Output'\ngit checkout ebdd9ee969d33c4d1133cc3b90d786ff7195c660 tests/panel.rs\n",
+  "problem_statement": "fixture/panelrs: sum returns the count, not the total.\n",
+  "hints_text": "",
+  "FAIL_TO_PASS": [
+   "sum_works"
+  ],
+  "PASS_TO_PASS": [
+   "max_works"
+  ]
+ },
+ {
+  "instance_id": "fixture__panelpy.00000000.test_total.00000000.lv1",
+  "patch": "diff --git a/panelpy/core.py b/panelpy/core.py\nindex 9159857..ce9ad14 100644\n--- a/panelpy/core.py\n+++ b/panelpy/core.py\n@@ -4,8 +4,3 @@\n def biggest(values):\n     \"\"\"Return the largest value.\"\"\"\n     return max(values)\n-\n-\n-def total(values):\n-    \"\"\"Return the sum of the values.\"\"\"\n-    return sum(values)\n",
+  "test_patch": "diff --git a/tests/test_total.py b/tests/test_total.py\ndeleted file mode 100644\nindex fb2f3db..0000000\n--- a/tests/test_total.py\n+++ /dev/null\n@@ -1,5 +0,0 @@\n-from panelpy.core import total\n-\n-\n-def test_total():\n-    assert total([1, 2, 3]) == 6\n",
+  "FAIL_TO_PASS": [
+   "tests/test_total.py"
+  ],
+  "PASS_TO_PASS": [
+   "tests/test_biggest.py"
+  ],
+  "image_name": "synthetic",
+  "repo": "fixture/panelpy",
+  "base_commit": "4c32dd2ed5df5fd97b9b452ca6ff4c0f1e76f369",
+  "problem_statement": "Implement ``total`` in ``panelpy.core``: return the sum of the values.\n",
+  "repo_settings": "{\"repository\": \"fixture/panelpy\", \"commit\": \"4c32dd2\", \"base_image\": \"python311\", \"pre_install\": [], \"install\": \"\", \"pip_packages\": [], \"test_cmd\": \"pytest -rA --tb=short --color=no\", \"library_name\": \"panelpy\"}"
+ }
+]
