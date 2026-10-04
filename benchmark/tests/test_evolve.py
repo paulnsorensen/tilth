@@ -23,7 +23,7 @@ from evolve import candidate as candidates
 from evolve import engine
 from evolve.finish import GitHubPRClient
 from evolve.loop import Cascade
-from evolve.materialize import Materializer
+from evolve.materialize import ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
     main, make_world, mcp, quota_stream, result_stream, scripted_engine, seed_candidate, seed_files,
@@ -297,6 +297,48 @@ def test_rejects_out_of_allowlist_diff(world, path: str) -> None:
 
     with pytest.raises(Exception, match=path):
         materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+LIB = "pub mod mcp;\npub mod edit;\n\npub fn lib_marker() -> u8 {\n    1\n}\n"
+
+
+@pytest.mark.parametrize("line", [
+    'pub const P: &str = include_str!("../Cargo.toml");',
+    'pub const P: &[u8] = include_bytes!(\n    "../../outside.bin"\n);',
+    'pub const P: &str = include_str!("/etc/hostname");',
+    'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));',
+    'pub const P: &str = include_str!(env!("HOME"));',
+    "pub const P: &str = include_str!(PATH);",
+    'pub const P: &str = include_str!["../Cargo.toml"];',
+], ids=["parent", "multiline-bytes", "absolute", "concat-env", "env", "not-a-literal", "brackets"])
+def test_rejects_include_outside_src_and_prompts(world, line: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + line + "\n"})
+
+    with pytest.raises(ApplyRejected, match="include"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+def test_includes_inside_src_and_prompts_are_kept(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    lines = 'pub const A: &str = include_str!("main.rs");\npub const B: &str = include_str!("../prompts/mcp.md");\n'
+    sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
+    assert "include_str!(\"main.rs\")" in git("show", f"{sha}:src/lib.rs", cwd=world.repo)
+
+
+@pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "TILTH_BENCH_DATA",
+                                  "panel-path", "panel-name", "data-dir"])
+def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, term: str) -> None:
+    data = world.tmp / "harness-data"
+    monkeypatch.setenv("TILTH_BENCH_DATA", str(data))
+    evo = build(world)
+    text = {"panel-path": str(world.tmp / "panel.json"), "panel-name": "panel.json", "data-dir": str(data)}.get(term, term)
+    patch = patch_for(world, {"src/lib.rs": LIB + f"// reads {text} at run time\n"})
+
+    with pytest.raises(ApplyRejected, match="names"):
+        evo.materializer.materialize({**seed_candidate(), "src_patch": patch})
     assert refs(world) == []
 
 

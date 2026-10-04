@@ -1,10 +1,11 @@
 """The applier: one commit per candidate content id, on top of the seed commit."""
 
 import difflib
+import os
 import re
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from . import rust
@@ -12,6 +13,8 @@ from .candidate import SRC_PATCH, TEXT_COMPONENTS, content_id, read_seed, ref_na
 from .gitops import GitError, git
 
 ALLOWED_PREFIXES = ("src/", "prompts/")
+# Names that point a candidate's code at the harness; the loop adds the panel file and the data directory.
+HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "TILTH_BENCH_DATA")
 BYTE_LOCK_FILE = "src/mcp/mod.rs"
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -57,13 +60,16 @@ class Materializer:
 
     The first call for a content id writes the text components into a worktree at
     the seed, applies the cumulative ``src_patch``, refuses changes outside
-    ``src/**`` and ``prompts/**`` or inside ``#[cfg(test)]`` code, regenerates
+    ``src/**`` and ``prompts/**``, inside ``#[cfg(test)]`` code, or reaching for the
+    harness (a harness name, or an ``include*!`` outside ``src/`` and ``prompts/``), regenerates
     ``AGENTS.md``, rewrites the byte-lock literals, commits with the seed as
     parent, and points ``evolve/<run-id>/<content-id>`` at the commit.
     """
 
-    def __init__(self, repo: Path, seed_sha: str, run_id: str, work_dir: Path) -> None:
+    def __init__(self, repo: Path, seed_sha: str, run_id: str, work_dir: Path, *,
+                 forbidden: Iterable[str] = ()) -> None:
         self.repo = Path(repo)
+        self.forbidden = [term for term in dict.fromkeys((*HARNESS_TERMS, *forbidden)) if term]
         self.seed_sha = seed_sha
         self.run_id = run_id
         self.work_dir = Path(work_dir)
@@ -135,7 +141,10 @@ class Materializer:
         outside = [path for path in changed if not path.startswith(ALLOWED_PREFIXES)]
         if outside:
             raise ApplyRejected(f"changes outside src/** and prompts/**: {', '.join(outside)}")
-        self._refuse_cfg_test(worktree)
+        diff = git("diff", "--cached", "-U0", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                   self.seed_sha, "--", "src", cwd=worktree)
+        self._refuse_harness_reach(worktree, diff)
+        self._refuse_cfg_test(worktree, diff)
         regen = subprocess.run(["bash", "scripts/regen-agents-md.sh"], cwd=worktree, capture_output=True, text=True)
         if regen.returncode != 0:
             raise ApplyRejected("scripts/regen-agents-md.sh failed", regen.stdout + regen.stderr)
@@ -157,13 +166,40 @@ class Materializer:
         except GitError:
             return None
 
-    def _refuse_cfg_test(self, worktree: Path) -> None:
+    def _refuse_harness_reach(self, worktree: Path, diff: str) -> None:
+        """Refuse added ``src/**`` lines that name the harness or include a file outside ``src/`` and ``prompts/``."""
+        root = Path(worktree).resolve()
+        allowed = [root / prefix.rstrip("/") for prefix in ALLOWED_PREFIXES]
+        for path, (_removed, added) in changed_lines(diff).items():
+            new_file = worktree / path
+            if not added or not new_file.is_file():
+                continue
+            text = new_file.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            for number in sorted(added):
+                line = lines[number - 1].lower() if number <= len(lines) else ""
+                if term := next((term for term in self.forbidden if term.lower() in line), None):
+                    raise ApplyRejected(f"{path}:{number} names {term}, which points at the benchmark harness")
+            if not path.endswith(".rs"):
+                continue
+            for first, last, macro, argument in rust.include_invocations(text):
+                if not any(first <= number <= last for number in added):
+                    continue
+                where = f"{path}:{first} {macro}!"
+                if "concat!" in argument or "env!" in argument:
+                    raise ApplyRejected(f"{where} builds its path with concat! or env!")
+                value = rust.string_literal(argument)
+                if value is None:
+                    raise ApplyRejected(f"{where} takes {argument!r}, not a string literal")
+                target = Path(os.path.realpath(new_file.parent / value))
+                if not any(target.is_relative_to(prefix) for prefix in allowed):
+                    raise ApplyRejected(f"{where} reaches {value}, outside src/** and prompts/**")
+
+    def _refuse_cfg_test(self, worktree: Path, diff: str) -> None:
         """Refuse any changed line inside a ``#[cfg(test)]`` item or in a ``#[cfg(test)]`` module file.
 
         The three byte-lock literals are exempt, and nothing else on their lines: the applier rewrites them itself.
         """
-        diff = git("diff", "--cached", "-U0", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
-                   self.seed_sha, "--", "src", cwd=worktree)
         for path, (removed, added) in changed_lines(diff).items():
             if not path.endswith(".rs"):
                 continue

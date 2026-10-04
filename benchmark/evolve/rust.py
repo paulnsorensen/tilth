@@ -5,6 +5,7 @@ from pathlib import PurePosixPath
 
 _CFG_ATTR = re.compile(r"#(!?)\[\s*(?:cfg|cfg_attr)\s*\(")
 _TEST_TOKEN = re.compile(r"\btest\b")
+_INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)!\s*([(\[{])")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
 _STRING = r'("(?:[^"\\]|\\.)*")'
@@ -119,6 +120,29 @@ def test_module_files(path: str, text: str) -> set[str]:
         if declared := _MODULE_DECL.search(head.split("]")[-1]):
             files |= {str(base / f"{declared[1]}.rs"), str(base / declared[1] / "mod.rs")}
     return files
+
+
+def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
+    """``(first_line, last_line, macro, argument)`` of each ``include!``, ``include_str!``, or ``include_bytes!``.
+
+    ``argument`` is the source text between the macro's delimiters, stripped.
+    """
+    mask = code_mask(text)
+    found = []
+    for match in _INCLUDE.finditer(mask):
+        close = _match_brace(mask, match.end() - 1, {"(": "()", "[": "[]", "{": "{}"}[match[2]])
+        found.append((_line(text, match.start()), _line(text, close), match[1], text[match.end():close].strip()))
+    return found
+
+
+def string_literal(source: str) -> str | None:
+    """The value of a plain or raw Rust string literal that is the whole of ``source``; None otherwise."""
+    if raw := re.fullmatch(r'r(#*)"(.*)"\1', source, re.S):
+        return raw[2]
+    if plain := re.fullmatch(r'"((?:[^"\\]|\\.)*)"', source, re.S):
+        return re.sub(r"\\(.)", lambda escape: {"n": "\n", "t": "\t", "r": "\r"}.get(escape[1], escape[1]),
+                      plain[1])
+    return None
 
 
 def declaring_files(path: str) -> list[str]:

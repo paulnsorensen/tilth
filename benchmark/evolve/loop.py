@@ -147,7 +147,8 @@ class Evolution:
         self.proposer = Proposer(settings.repo, settings.seed_sha, self.paid, settings.helper_model, log=self.log,
                                  forbidden=self._forbidden_terms())
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch)
-        self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees")
+        self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
+                                         forbidden=self._forbidden_terms())
         self.results: dict[str, Cascade] = {}
         self.frontier: list[Cascade] = []
         self.deltas: list[dict] = []
