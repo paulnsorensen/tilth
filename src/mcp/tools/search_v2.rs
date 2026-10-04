@@ -1820,6 +1820,33 @@ mod tests {
     }
 
     #[test]
+    fn search_tag_lets_replace_text_apply_without_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let h = Harness::new();
+        let found = h.search(dir.path(), json!({"query": "Render"}));
+        let preview = found["results"][0]["preview"].as_str().unwrap();
+        let tag = header_tag(preview, "r.go");
+        let out = h
+            .write(
+                dir.path(),
+                json!({"path": "r.go", "tag": tag, "ops": [
+                    {"op": "replace_text", "old": "w.Render(", "new": "w.Draw("}]}),
+            )
+            .expect("search-shown lines are editable without a read");
+        assert!(!out.contains("rejected"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            GO_SRC.replace("w.Render(", "w.Draw(")
+        );
+
+        let again = h.search(dir.path(), json!({"query": "Draw"}));
+        let preview = again["results"][0]["preview"].as_str().unwrap();
+        assert_ne!(header_tag(preview, "r.go"), tag, "new content, new tag");
+    }
+
+    #[test]
     fn search_tag_rejects_edit_on_a_line_search_did_not_show() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("n.txt");
