@@ -18,6 +18,7 @@ Reading anything under `.cheese/` from a benchmark cell counts as contamination 
 | `evidence/` | Model-free admission results: preflight logs before and after the tampered-rule fix, cached admission verdicts (counts only), the COSPA Pareto-12 config, and the c2 follow-up finding list. |
 
 To resume with easy-cheese, copy the corpus back: `cp -r corpus/. ~/.local/share/cheese/paulnsorensen-tilth/`, then `/cheese --continue benchmark-gepa-overhaul`.
+The latest wheypoint is revision `rev-2468787853cb` (status `ok`, `next: hold`); its projection is `phase-reports/notes/benchmark-gepa-overhaul.md`.
 
 ## Curds
 

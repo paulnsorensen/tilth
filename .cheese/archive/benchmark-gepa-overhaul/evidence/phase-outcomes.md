@@ -85,3 +85,31 @@ Full phase report bodies survive in `phase-reports/` for c1 and c5 only. For c0,
 ## Review process note
 
 The phase agents could not dispatch fresh-context reviewers, so their own Age passes were self-reviews. The orchestrating session ran independent reviews of c1 twice and of every spec through fresh-context fork-coherence rounds.
+
+## Independent review of c3, c4, and c5, and the hardening cure
+
+- Review at 34e29c8: 44 mutants run, 38 caught. Every cross-curd invariant verified to hold, including:
+  - stripped records only;
+  - proposer isolation;
+  - one ledger with a reserve;
+  - stop states;
+  - frontier, finalist, and winner logic;
+  - stamping before store;
+  - the calibration gate;
+  - no merge in finish.
+- B1 (blocking): the byte-lock exemption covered whole lines, so a candidate could append `return;` and skip later assertions. Fixed in a85a7bf: only the three literal spans may differ.
+- S1: a failed release build crashed the run; it now scores 0 as a build stage (1d15137).
+- S2: test-split drift was found only at finish; it is now refused in preflight, and finish never raises a traceback (5c7d59f).
+- S3: the candidate diff was not scanned; harness terms and out-of-tree include macros are now refused (9aee4fe).
+- S4: only the literal `#[cfg(test)]` was guarded; any cfg or cfg_attr naming test is now protected (b853216).
+- S5 and S6: the stop-callback and dominance tests now catch their mutants (53e1257, 756b3a7).
+- Nits fixed in 7ecaba8 and earlier commits:
+  - finish logs the real stop reason;
+  - build-failure tails reach the proposer;
+  - run_plan re-probes the CLI;
+  - Glob patterns are normalised;
+  - existing winner branches are refused cleanly;
+  - reused rows are re-stamped;
+  - dev deltas are store-only.
+- Skipped by choice: N2 (the reserve over-counts baseline cells) and N8 (a Panel can be constructed directly).
+- Final gates: 768 passed and 1 skipped; verify.py exit 0.
