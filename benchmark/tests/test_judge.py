@@ -1089,3 +1089,15 @@ def test_cached_labels_hash_the_prompt_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert store.cached_labels(["digest-alpha", "digest-beta", "digest-gamma"]) == {
         "digest-alpha": "strong", "digest-beta": "none"}
     assert reads == ["applicability"]
+
+
+# Cure pass 2.
+
+
+def test_missing_calibration_file_is_refused_cleanly() -> None:
+    judge_config.CALIBRATION_FILE.unlink()
+    with pytest.raises(core.CalibrationInvalid, match="missing"):
+        core.load_calibration()
+    client = StubClient()
+    assert cli.main(["calibrate", "--max-usd", "5", "--cell-estimate-usd", "0.1"], client=client) != 0
+    assert client.prompts == []

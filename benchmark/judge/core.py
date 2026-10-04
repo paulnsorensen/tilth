@@ -199,7 +199,10 @@ def load_calibration(
 ) -> CalibrationSet:
     """Validate the hand-labelled calibration file against the result store before any judge call."""
     path = path or config.CALIBRATION_FILE
-    raw = path.read_bytes()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as error:
+        raise CalibrationInvalid(f"{path}: missing") from error
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as error:
