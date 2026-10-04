@@ -13,12 +13,12 @@ from jsonl import tolerant_jsonl
 from parse import detect_quota_rejection, stream_native_cost
 from spend import SpendLedger
 
-STOP_REASONS = ("ceiling", "quota", "plateau")
+STOP_REASONS = ("ceiling", "quota", "plateau", "cli-version")
 
 
 @dataclass
 class StopState:
-    """Why the search stopped, if it has: ``ceiling``, ``quota``, or ``plateau``.
+    """Why the search stopped, if it has: ``ceiling``, ``quota``, ``plateau``, or ``cli-version``.
 
     gepa swallows proposer exceptions and retries, so evolve never stops by
     raising: the engine's stop callback reads this state instead. ``quota`` is

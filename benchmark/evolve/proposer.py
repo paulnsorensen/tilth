@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import tarfile
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
@@ -113,8 +114,10 @@ class Proposer:
             if isinstance(tool_input, dict):
                 paths = [tool_input.get(key) for key in PATH_KEYS]
                 if name == "Glob" and isinstance(tool_input.get("pattern"), str):
-                    pattern = tool_input["pattern"]
-                    paths.append(pattern.split("*", 1)[0].split("?", 1)[0].split("[", 1)[0] or ".")
+                    # Resolve ``..`` first: one after a wildcard (``**/../..``) still climbs out of the export.
+                    base = os.path.join(export, os.path.expanduser(tool_input.get("path") or ""))
+                    pattern = os.path.normpath(os.path.join(base, os.path.expanduser(tool_input["pattern"])))
+                    paths.append(re.split(r"[*?\[{]", pattern, maxsplit=1)[0] or os.sep)
                 for value in paths:
                     if not isinstance(value, str) or not value:
                         continue

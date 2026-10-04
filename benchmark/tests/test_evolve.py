@@ -1189,6 +1189,17 @@ def test_stop_state_neutralizes_calls(world) -> None:
     assert refs(world) == []
 
 
+def test_cli_change_mid_search_stops_the_run(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    calls = len(world.calls)
+    monkeypatch.setattr(run, "cli_version", lambda runner, *, fresh=False: "9.9.9" if fresh else "2.1.0")
+
+    assert evo.evaluate(child(evo.seed, dev_a="1", cheap_a="1"), "dev_a") == (0.0, {"stopped": "cli-version"})
+    assert evo.stop.reason == "cli-version" and len(world.calls) == calls
+    assert evo.finish() is None and world.pr.calls == []
+    assert "finish: incomplete (cli-version)" in log_text(world)
+
+
 def test_run_log_has_no_gate_verdict(world, monkeypatch: pytest.MonkeyPatch) -> None:
     use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     evo = build(world)
@@ -1328,6 +1339,36 @@ def test_dispatcher_routes_components_without_litellm(world) -> None:
     assert routed == [("reflect", name) for name in TEXTS] + [("propose", "src_patch")]
     assert proposal == {**{name: seed[name] + "!" for name in TEXTS}, "src_patch": "patch"}
     assert "litellm" not in sys.modules
+
+
+def test_dispatcher_passes_failure_tail_to_every_component() -> None:
+    seen: dict[str, list[dict]] = {}
+    dispatcher = engine.Dispatcher(
+        engine.StopState(),
+        reflect=lambda name, text, records: seen.setdefault(name, records) and text,
+        propose=lambda candidate, records: seen.setdefault("src_patch", records) and "patch",
+    )
+    failed = {"stage": "just check", "tail": "error[E0425]: cannot find value `x` in this scope"}
+    paid = {"stage": "paid", "task_scores": {"dev_a": 1.0}, "records": [{"prompt": "p", "row": {}, "trajectory": ""}]}
+    cheap = {"stage": "cheap tier", "task_scores": {"cheap_a": 0.0}, "records": []}
+    dataset = {name: [failed, failed, paid, cheap] for name in ("prompts/mcp.md", "src_patch")}
+
+    dispatcher(seed_candidate(), dataset, ["prompts/mcp.md", "src_patch"])
+
+    for name in ("prompts/mcp.md", "src_patch"):
+        assert seen[name] == [failed, *paid["records"]]
+
+
+@pytest.mark.parametrize("glob", [{"pattern": "**/../../*"}, {"pattern": "src/*/../../../secret/*"},
+                                  {"pattern": "*/../../../*", "path": "src"}])
+def test_proposer_glob_climbing_after_a_wildcard_is_rejected(world, glob: dict) -> None:
+    evo = ready(world)
+    export = world.tmp / "export" / "tilth"
+    (export / "src").mkdir(parents=True)
+    inside = [{"name": "Glob", "input": {"pattern": "src/**/*.rs"}}, {"name": "Glob", "input": {"pattern": "src/*/../lib.rs"}}]
+
+    assert evo.proposer.scan(inside, export) is None
+    assert "outside the export" in evo.proposer.scan([{"name": "Glob", "input": glob, "output": ""}], export)
 
 
 def test_real_gepa_drives_evaluate(world, monkeypatch: pytest.MonkeyPatch) -> None:

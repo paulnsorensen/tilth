@@ -1421,7 +1421,8 @@ class CandidateBuild:
 
 
 class PlanStopped(RuntimeError):
-    """``run_plan`` stopped before a cell: ``ceiling`` (spend) or ``quota`` (usage limit).
+    """``run_plan`` stopped before a cell: ``ceiling`` (spend), ``quota`` (usage limit), or ``cli-version``
+    (the agent CLI changed or stopped answering ``--version`` since the cell was planned).
 
     ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
     """
@@ -1626,6 +1627,11 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${estimate:.4f} estimated for {cell_id} "
                                          f"+ ${ledger.reserve:.4f} reserved exceeds ${ledger.max_usd}", rows)
         runner = RUNNERS[cell.model]
+        # As in main: a mid-run CLI update must not run a cell under a key planned for the old version.
+        current_cli = cli_version(runner, fresh=True)
+        if current_cli != identity["cli_version"]:
+            raise PlanStopped("cli-version", f"{runner} --version probe failed before {cell_id}" if current_cli is None
+                              else f"{runner} was {identity['cli_version']!r} when planned, now {current_cli!r}", rows)
         # A per-attempt suffix: a retried cell has the same key and must not overwrite its earlier sidecar.
         attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"

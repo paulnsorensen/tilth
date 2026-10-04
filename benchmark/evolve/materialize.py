@@ -178,8 +178,9 @@ class Materializer:
             lines = text.splitlines()
             for number in sorted(added):
                 line = lines[number - 1].lower() if number <= len(lines) else ""
-                if term := next((term for term in self.forbidden if term.lower() in line), None):
-                    raise ApplyRejected(f"{path}:{number} names {term}, which points at the benchmark harness")
+                if any(term.lower() in line for term in self.forbidden):
+                    # The tail reaches the proposer, so it does not repeat the harness name.
+                    raise ApplyRejected(f"{path}:{number} names the benchmark harness")
             if not path.endswith(".rs"):
                 continue
             for first, last, macro, argument in rust.include_invocations(text):

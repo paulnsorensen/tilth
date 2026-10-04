@@ -183,6 +183,26 @@ def test_run_plan_stops_on_quota(world, monkeypatch: pytest.MonkeyPatch) -> None
     assert world.stored()[0]["infra"] == "quota"
 
 
+@pytest.mark.parametrize("current", ["2.2.0", None], ids=["changed", "probe-failed"])
+def test_run_plan_reprobes_cli_before_each_paid_cell(world, monkeypatch: pytest.MonkeyPatch, current) -> None:
+    plan(world, cells("dev_a"))
+    probes: list[str] = []
+
+    def cli_version(runner: str, *, fresh: bool = False) -> str | None:
+        if fresh:
+            probes.append(runner)
+            return "2.1.0" if len(probes) == 1 else current
+        return "2.1.0"
+
+    monkeypatch.setattr(run, "cli_version", cli_version)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells(*DEV, "cheap_a"))
+
+    assert stopped.value.reason == "cli-version"
+    assert len(probes) == 2
+    assert [call[0] for call in world.runner_calls()] == ["dev_a", "dev_b"]
+
+
 def test_run_plan_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     with pytest.raises(run.ClaudeAuthError):

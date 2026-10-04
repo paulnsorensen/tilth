@@ -69,6 +69,10 @@ class ReflectionClient:
         return match[1].removeprefix("\n")
 
 
+def _failure(entry: Mapping) -> list[dict]:
+    return [{"stage": entry["stage"], "tail": entry["tail"]}] if entry.get("tail") else []
+
+
 class Dispatcher:
     """gepa ``custom_candidate_proposer``: text components to reflection, ``src_patch`` to the proposer.
 
@@ -87,8 +91,10 @@ class Dispatcher:
         proposal = {}
         for name in components_to_update:
             # gepa pads a minibatch with repeated examples; each distinct record goes into a prompt once.
+            # An apply, just check, or build failure contributes its stage and tail (tilth build output).
             unique = {json.dumps(record, sort_keys=True): record
-                      for entry in reflective_dataset.get(name, ()) for record in entry.get("records", ())}
+                      for entry in reflective_dataset.get(name, ())
+                      for record in (*_failure(entry), *entry.get("records", ()))}
             records = list(unique.values())
             if self.stop.is_set:
                 break
