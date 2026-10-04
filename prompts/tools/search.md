@@ -1,0 +1,1 @@
+Auto-route query entries; follow unchanged hints; match ASTs with {pattern: "Some($A)", language, glob?}. Languages: the language enum; typescript is .ts only, tsx is .tsx. No kind/expand/context.
