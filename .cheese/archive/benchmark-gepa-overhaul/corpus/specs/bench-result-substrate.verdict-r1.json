@@ -1,0 +1,23 @@
+{
+ "draft_sha256": "b9fe671a0e7842536066807a294d7e15772a60a093b3e24730c5a6efb10749b1",
+ "verdict": "fail",
+ "forks": [
+  {
+   "id": "F-6",
+   "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  }
+ ],
+ "contradictions": [],
+ "orphaned_decisions": [],
+ "unsupported_assumptions": [],
+ "acceptance_gaps": [
+  "Test Contracts, AC-4 row (F-6): AC-4 has three clauses: the paid run requires --max-usd, the pricing fallback records cost_source: pricing, and the run stops before a cell when cumulative cost plus the next cell's estimate would cross the ceiling. The row names 'run.py --max-usd spend ledger' as the referent, but its only expected failures are test_paid_run_requires_max_usd (the flag is present) and test_missing_native_cost_uses_pricing (the parser fallback). No contracted test drives the cell loop to the ceiling and observes the stop. No test exercises the three-tier estimate either (mean stored cost for the task and arm, else the run's maximum cell cost, else --cell-estimate-usd). An implementation that parses and requires --max-usd but never compares spend against it passes every listed test. That leaves the enforcement half of F-6 unverified. The r0 verdict already raised this point ('no test observes ... the stop-before-cell logic'). r1 fixed the fallback half but not this half.",
+  "Test Contracts, AC-2 row (G-5): AC-2 requires that 'WHEN any harness digest, task digest, env fingerprint, or candidate identity input changes THE SYSTEM SHALL compute a different run key'. The only contracted test is test_completed_row_reused_error_row_rerun, which seeds one completed row and one error row and checks whether the runner is invoked. A run_key that hashes only task, arm, model, and repetition passes it. Such a key leaves out SYSTEM_PROMPT, the tool allowlist, the task prompt or ground truth, the lockfile hash, and the candidate git_sha or binary_sha256. Under G-5, a missing input means stale baselines are reused silently, or old tilth-arm rows answer cells for a new candidate. Both corrupt the stored-baseline A/B with no failing test. The key-sensitivity clause is the property G-5 reuse depends on, and the spec's verification plan does not cover it. The plan needs an expected-failure test that changes each digest input and the candidate identity and asserts a different key or a runner invocation."
+ ]
+}

@@ -1,0 +1,123 @@
+{
+  "holds": [
+    {
+      "evidence": [],
+      "hold_id": "lifecycle-draft",
+      "kind": "preparation",
+      "reason": "draft specs require explicit approval before execution"
+    }
+  ],
+  "preparation_result": {
+    "approval_kind": null,
+    "approved_plan_ref": null,
+    "approved_scope_ref": null,
+    "contract_version": {
+      "major": "1",
+      "minor": "0",
+      "schema_uri": "https://schemas.easy-cheese.dev/cook-preparation-result"
+    },
+    "coverage": null,
+    "findings": [],
+    "handoff_ref": null,
+    "holds": [
+      {
+        "evidence": [],
+        "hold_id": "lifecycle-draft",
+        "kind": "preparation",
+        "reason": "draft specs require explicit approval before execution"
+      }
+    ],
+    "input_kind": "direct_spec",
+    "missing_decision": null,
+    "outcome": "blocked",
+    "planner_request": null,
+    "proposal_digest": null,
+    "proposal_ref": null,
+    "references": [
+      {
+        "artifact_id": "spec-13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb",
+        "digest": "sha256:13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb",
+        "media_type": "text/markdown",
+        "role": "spec",
+        "schema_uri": null,
+        "size_bytes": 8161,
+        "uri": "file:///root/.local/share/cheese/paulnsorensen-tilth/handoffs/bench-result-substrate/sha256-13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb"
+      },
+      {
+        "artifact_id": "approval-5b1bda7cd0b52a06dbc5b5d94b1b957697ca7cbde59f2a29428a03217e2ba3d8",
+        "digest": "sha256:5b1bda7cd0b52a06dbc5b5d94b1b957697ca7cbde59f2a29428a03217e2ba3d8",
+        "media_type": "application/json",
+        "role": "approval",
+        "schema_uri": "https://schemas.easy-cheese.dev/mold-cook-approval",
+        "size_bytes": 1455,
+        "uri": "file:///root/.local/share/cheese/paulnsorensen-tilth/handoffs/bench-result-substrate/sha256-5b1bda7cd0b52a06dbc5b5d94b1b957697ca7cbde59f2a29428a03217e2ba3d8"
+      }
+    ],
+    "request_id": "bench-result-substrate-c1b",
+    "requirements": [
+      {
+        "description": "spec lifecycle must be approved before publication",
+        "evidence": [],
+        "kind": "approval",
+        "requirement_id": "lifecycle-approval"
+      },
+      {
+        "description": "taste verdict is required and was not supplied",
+        "evidence": [],
+        "kind": "evidence",
+        "requirement_id": "taste-verdict"
+      },
+      {
+        "description": "a protected taste decision ledger reference is required",
+        "evidence": [],
+        "kind": "evidence",
+        "requirement_id": "taste-ledger"
+      },
+      {
+        "description": "host-proposed scope coverage is required before finalization",
+        "evidence": [],
+        "kind": "scope",
+        "requirement_id": "host-coverage"
+      }
+    ],
+    "setup_authorization": null
+  },
+  "ready": false,
+  "requirements": [
+    {
+      "description": "spec lifecycle must be approved before publication",
+      "evidence": [],
+      "kind": "approval",
+      "requirement_id": "lifecycle-approval"
+    },
+    {
+      "description": "taste verdict is required and was not supplied",
+      "evidence": [],
+      "kind": "evidence",
+      "requirement_id": "taste-verdict"
+    },
+    {
+      "description": "a protected taste decision ledger reference is required",
+      "evidence": [],
+      "kind": "evidence",
+      "requirement_id": "taste-ledger"
+    },
+    {
+      "description": "host-proposed scope coverage is required before finalization",
+      "evidence": [],
+      "kind": "scope",
+      "requirement_id": "host-coverage"
+    }
+  ],
+  "saved": true,
+  "spec_ref": {
+    "artifact_id": "spec-13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb",
+    "digest": "sha256:13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb",
+    "media_type": "text/markdown",
+    "role": "spec",
+    "schema_uri": null,
+    "size_bytes": 8161,
+    "uri": "file:///root/.local/share/cheese/paulnsorensen-tilth/handoffs/bench-result-substrate/sha256-13d94b5e00e8211b9e9af0cdbb0d84dfdf6e05d982f08bab5b05a4e9625785bb"
+  },
+  "status": "saved-not-ready"
+}

@@ -1,0 +1,15 @@
+{
+  "goal": "Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.",
+  "goal_clauses": [
+    {
+      "id": "G-4",
+      "text": "The research model reasons over raw result JSONL"
+    }
+  ],
+  "forks": [
+    {
+      "id": "F-2",
+      "decision": "One evolutionary loop mutates code and text; a candidate is a commit"
+    }
+  ]
+}

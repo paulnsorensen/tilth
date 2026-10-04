@@ -1,0 +1,23 @@
+{
+  "draft_sha256": "267aca12fd6afdfa27e8b243cef50363383f3eff9078bf08d3b4a26f3a27c2cf",
+  "verdict": "fail",
+  "forks": [
+    {
+      "id": "F-1",
+      "decision": "External tasks run fully native with a local checkout without upstream history, a local uv venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker",
+      "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]
+    }
+  ],
+  "contradictions": [
+    "Contract 'Store read' / 'Split lock' and Interface sketches (bench-panel-manifest.md:54,61,62,86,89) define baselines.rows(*, panel_name=None) with no path and have load_panel(store=baselines) call store.rows(panel_name=name). That does not match c1's landed code. Every c1 store accessor takes an explicit path: load_rows(path), lookup(key, *, path), store(row, *, path) (benchmark/baselines.py:83,97,102). baselines.py has no default store location, and run.py owns the location as RESULTS_DIR / baselines.STORE_FILENAME (benchmark/run.py:1436), which tests redirect by monkeypatching run.RESULTS_DIR (benchmark/tests/test_run_hardening.py:541). A path-less rows() has to hard-code a location, so the default-store load_panel that run.py --panel and c5 use can read a different file from the one run.py writes. Cook then has to invent the store-location seam, and the AC-5 lock tests 'against a temp c1 store' (:115) pass or fail depending on which file rows() picks.",
+    "Contract 'Row stamp' and Approach 5 (bench-panel-manifest.md:60,78) say 'c5 run.run_plan passes the loaded panel so its rows are stamped on the same path'. c5's seam is run.run_plan(cells, *, ledger, candidate_sha, refreeze_baselines) with no panel parameter (bench-evolution-loop.md:105; parent benchmark-gepa-overhaul.md:144). c5 states it does not change c3's panel or split lock (bench-evolution-loop.md:147), and no c5 AC or test checks a stamp. Evolve is the main paid consumer, and the rows it stores therefore carry no panel_name or panel_split_digest. The split lock reads only stamped rows (:62), so it never engages for evolve-only results, and the parent rule 'locks at the first recorded result' (benchmark-gepa-overhaul.md:90) fails for c5. No c3 AC or test can observe this."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Test Contracts AC-7 (bench-panel-manifest.md:117) stubs only admit and the store, but load_panel resolves every external member through the real external.featurebench.load / external.swebench_ml.load and checks languages against their dataset rows (:49,76). c2 builds those tasks only from rows cached in $TILTH_BENCH_DATA (default ~/.local/share/tilth-bench/external; bench-external-tasks.md:47-48), and c2's tests make no network call (:79). test_committed_panel_is_complete therefore depends on host state: it fails on any host where preflight has not fetched the real gepa-v1 rows, which makes the spec's verification gate (:24) host-dependent. If Cook stubs the loaders to avoid that, the committed panel's language-vs-dataset-row check goes untested.",
+    "Test Contracts AC-1 test_external_cell_never_invokes_container (bench-panel-manifest.md:111) loads a complete panel through the real c2 loaders using 'c2's synthetic external instance'. A complete panel needs at least one FeatureBench id plus a Go slot member (gin-gonic__gin-3741 or prometheus__prometheus-14861) and a Rust slot member (sharkdp__bat-2650 or tokio-rs__tokio-6724), whose dataset-row languages must be go and rust (:46,49). c2's fixture set is one stdlib-only Python instance, a FeatureBench-shaped variant, and canned go/cargo outputs (bench-external-tasks.md:79), with no rows under the slot ids and no runnable Go or Rust instance. The vacuity guard ('every external member cell records a non-runner argv from prepare or grading') relies on fixture rows that neither spec commits to creating."
+  ],
+  "acceptance_gaps": [
+    "Contract 'Required members' (bench-panel-manifest.md:45-48) says any member outside the fixed families and ids is refused, and AC-6 (:104) lists 'a member outside the required families and ids'. test_malformed_panel_refused (:116) checks this only with an extra local member (gin_radix_tree). No test covers an unknown family value or a third swebench_ml member whose id is outside the Go/Rust slot pair table (for example an admitted non-slot instance). The fallback tests (:113) check only which slot pairs are present. An implementation that validates each slot but accepts extra swebench_ml or unknown-family members, which then flow into stratify and the split, passes every listed test."
+  ]
+}

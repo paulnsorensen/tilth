@@ -1,0 +1,23 @@
+{
+  "goal": "Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.",
+  "goal_clauses": [
+    {
+      "id": "G-1",
+      "text": "FeatureBench tasks run in our harness"
+    },
+    {
+      "id": "G-2",
+      "text": "Gin render-context task is in the panel"
+    },
+    {
+      "id": "G-3",
+      "text": "A couple of other cherry-picked tasks: the three local hard tasks plus one Go and one Rust SWE-bench Multilingual instance"
+    }
+  ],
+  "forks": [
+    {
+      "id": "F-1",
+      "decision": "External tasks run fully native with a local checkout without upstream history, a local uv venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker"
+    }
+  ]
+}

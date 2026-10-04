@@ -1,0 +1,35 @@
+{
+  "draft_sha256": "9129c025da3e696d98e3506df71e6d952eb6da73b82abb023133a408cef4cae7",
+  "verdict": "fail",
+  "forks": [
+    {"id": "F-1", "decision": "FeatureBench runs through our runner with the agent inside the task container and the pinned upstream fb eval grader in a fresh container", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-2", "decision": "One evolutionary loop mutates code and text; a candidate is a commit", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-3", "decision": "The loop engine is GEPA optimize_anything with repeat runs on frontier candidates", "reflected_in": ["approach", "interface sketches", "acceptance"]},
+    {"id": "F-4", "decision": "The loop may mutate all of src and prompts except evaluator paths; winners land as human-reviewed draft PRs", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-5", "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-6", "decision": "The Phase 4 power gate is retired; every paid run requires an explicit dollar ceiling", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]}
+  ],
+  "contradictions": [
+    "Approach step 5 and AC-11 say prompt mutations are allowed and the applier 'updates the byte lock mechanically', but AC-11 rejects diffs to #[cfg(test)] spans. The byte lock (src/mcp/mod.rs:771, inside `mod tests` at :456) is more than a length: it asserts starts_with/ends_with/contains on specific prompt phrases. cwd_guidance_spans_present (:2292) also checks the #[cfg(test)] CWD_PATHS_SPAN const (:81). Only the 1966 byte count can be updated mechanically. A prompts/** mutation that touches any asserted phrase fails `cargo test` and can never be repaired, so F-4's 'all of prompts' is not actually available. The same rule freezes any src/** behavior that an in-source unit test asserts.",
+    "F-4 and Approach step 5 frame mutation as an allowlist (src/** and prompts/** minus evaluator paths), but AC-11 is a denylist: benchmark/**, tests/**, .github/**, the Cargo.toml version line, and #[cfg(test)] spans. Under AC-11 a diff to the rest of Cargo.toml, justfile, npm/, CLAUDE.md, or scripts/ (including scripts/regen-agents-md.sh, which the applier itself runs, and scripts/verify.py) is admissible, which contradicts the src+prompts scope. Some of those are evaluator paths that the denylist misses.",
+    "The minor decision says 'the judge model is pinned and recorded in the run key', but the run key bound in entity_referent_bindings (model id, agent CLI version, dataset revision, effort, timeout, task, arm, repetition) has no judge model. AC-8 keys the label cache on a separate tuple (task, dataset revision, judge model, prompt hash) while also saying 'for its run key'."
+  ],
+  "orphaned_decisions": [
+    "F-6 first half ('The Phase 4 power gate is retired'): only Approach step 1 and the crust delta mention marking PHASE4_PLAN.md superseded. No Acceptance criterion or test contract enforces or observes the retirement. AC-7 covers only the dollar-ceiling half."
+  ],
+  "unsupported_assumptions": [
+    "That a GEPA optimize_anything candidate can represent and mutate an arbitrary whole-src/** plus prompts/** change. F-2, F-3, AC-11 and evolve.materialize all depend on this, yet the spec defers it to an Open Question [TBD] (unified diff as a text component vs a custom coding-agent proposer) and cites only the optimize_anything blog post.",
+    "That --max-usd can be 'summed from native cost'. Codex rows have no native cost: parse.py:337-341 computes total_cost_usd from pricing.yaml via compute_cost_breakdown, and the wiki records 33.7% pricing drift. The 'next cell's estimate' in AC-7 also has no stated source.",
+    "That the pinned fb eval can correctly grade a patch extracted by our own replayed Level 1 container setup. AC-3 preflight grades only the dataset's gold, empty, and tampered patches. It never round-trips a patch produced by our prepare_container + `git diff --cached`, so nothing shows our base state matches the state fb eval applies patches against.",
+    "That the run key identifies a stock baseline. For the in-house tasks (gin_edit_render_context, rg_*, gin_servehttp_flow), the key has only the task name: no hash of the task prompt, ground_truth, test_command, or fixture commit. Editing a task in benchmark/tasks/*.py would silently reuse stale 'frozen' baselines (G-5, AC-6, AC-13)."
+  ],
+  "acceptance_gaps": [
+    "G-4 (research model reasons over raw result JSONL): AC-5 proves only that a sidecar exists. AC-10's test contract (test_score_ignores_judge) proves only that the score ignores critiques. No AC or test asserts that the reflection or research model's input actually contains the untruncated row and trajectory content.",
+    "G-6 (judge decides where structural tools apply): AC-8 and AC-9 produce and cache labels and gate them on calibration. No AC requires a consumer of the labels, such as slicing or reporting results by applicability or routing them into reflection, so the 'decides where' outcome is never observed.",
+    "F-5 'critiques each rollout': no AC requires judge.critique to run for each rollout. AC-9 and AC-10 refer to critiques, but nothing makes the system produce one per rollout.",
+    "F-3: AC-13's test contract (test_paid_tier_reuses_baselines) tests baseline reuse only. No test covers the 'repeat runs on frontier candidates' requirement, and no AC or test ties the engine to GEPA optimize_anything.",
+    "F-6 'every paid run requires an explicit dollar ceiling': AC-7 and its test cover only run.py cells. evolve.main takes --max-usd in the sketch, but no AC requires the optimizer run to refuse to start without it. No AC counts the judge calls and GEPA reflection-LM spend against the ceiling, and both are paid.",
+    "F-4 'the cascade is the backstop': AC-12 runs tests/mcp_v2 only when src/edit/** changed. tests/mcp_v2 also guards fork-law surfaces outside src/edit, such as test_retired_tools.py and cwd anchoring/routing. A src/mcp/** mutation could re-register a retired tool or weaken cwd handling and still pass the cascade. The cascade is also not the CI gate (`just check`).",
+    "G-3 (and the goal's 'grow the benchmark'): the cherry-picks are three tasks already registered in benchmark/tasks/__init__.py (rg_search_dispatch, rg_trait_implementors, gin_servehttp_flow), and gin_edit_render_context already exists too. AC-4 only re-lists existing tasks in a panel. External cherry-picks were moved to an [AGENT-INTRODUCED] non-goal, so no AC shows the benchmark grows beyond FeatureBench."
+  ]
+}

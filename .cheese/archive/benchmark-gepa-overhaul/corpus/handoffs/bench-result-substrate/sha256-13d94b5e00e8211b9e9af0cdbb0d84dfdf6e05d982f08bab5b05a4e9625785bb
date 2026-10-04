@@ -1,0 +1,88 @@
+---
+slug: bench-result-substrate
+status: draft
+source: mold-curd-mini-spec
+created: 2026-10-04
+confidence: medium
+intent: Give every benchmark row a run key and an untruncated trajectory, store rows so matching cells are reused instead of re-run, and add run-wide spend, auth, and quota controls for subscription runs.
+blast_radius: medium
+leverage: []
+inputs: benchmark/run.py cell loop, runner environment, stream tee, and row builder; benchmark/analyze.py power readout
+outputs: run_key and trajectory fields on every row; a reusable result store; --max-usd, --refreeze-baselines, and --cell-estimate-usd flags; auth guard and quota stop; informational power readout
+agent_resolution: []
+gate_applicability:
+  disposition: red-required
+  work_class: behavior
+  ui_surface: non-browser
+landing:
+  shape: single
+  layers: []
+  per_layer_green: required
+  review_fixes: fold
+verification: cd benchmark && python3 -m pytest tests exits 0, including the new test_baselines.py and test_analyze.py and the extended test_run_hardening.py
+---
+
+## Parent
+- Spec: benchmark-gepa-overhaul
+- Goals: G-4, G-5
+- Depends on: none
+- Frozen decisions: F-1, F-6
+
+## Contract
+
+The result substrate (parent curd c1) changes only the benchmark harness.
+
+- **Row fields.** Every row from `benchmark/run.py` gains `run_key`, `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, and `trajectory_path`.
+- **Run key.** It hashes:
+  - model ID, agent CLI version, effort, timeout, arm, and repetition;
+  - the harness digest (`SYSTEM_PROMPT`, tool allowlist, strict-file-tools, bare, per-cell `--max-budget-usd`, MCP config shape);
+  - the task digest (prompt, ground truth, test command, fixture files, repo commit);
+  - the env fingerprint (toolchain versions plus lockfile hash);
+  - for tilth arms, the candidate `git_sha` and `binary_sha256`.
+- **Trajectory sidecar.** It holds every tool call's input and output, untruncated, derived from the stream the runner already tees.
+- **Result store.** It keeps every row. A cell whose key matches is answered from the store without a model call. Frozen baselines are reused this way, and an interrupted run resumes this way.
+- **CLI pinning.** Runner subprocesses set `DISABLE_AUTOUPDATER=1`. A paid run whose agent CLI version differs from the version in its stored baseline keys refuses to start unless `--refreeze-baselines` is passed.
+- **Spend ceiling.** Paid runs require `--max-usd`.
+  - Spend is summed from native `total_cost_usd` when present, else the `pricing.yaml` computation.
+  - The run stops before a cell whose estimate would cross the ceiling. The estimate is the mean stored cost for that task and arm, else the run's maximum cell cost so far, else `--cell-estimate-usd`.
+- **Auth guard.** A Claude cell refuses to start when `ANTHROPIC_API_KEY` is set, because it silently overrides `CLAUDE_CODE_OAUTH_TOKEN`. The guard lives in a shared helper that later judge and proposer callers reuse.
+- **Quota stop.** A usage-limit rejection marks the cell `infra:quota` and stops the run.
+- **Serial cells.** Cells stay serial, and Codex cells use the host `CODEX_HOME`.
+- **Recorded fixture.** The work starts by committing a scrubbed stream recorded from a real `claude -p` run on OAuth. The cost parser and quota classifier are tested against it.
+- **Power gate.** `analyze.py` labels the power readout informational and drops the task-growth verdict. `PHASE4_PLAN.md` gains a superseded marker naming the parent spec.
+
+## Grounding
+
+| Probe | Outcome | Evidence |
+| --- | --- | --- |
+| wiki | hit | `.hallouminate/wiki/benchmark-harness-gotchas.md`: per-cell Claude config copies auth only, revoked tokens invalidated run `20260928_201559`, `--bare` refuses OAuth |
+| explorer | hit | Explorer digest at HEAD `4cafeea`: row built at `benchmark/run.py:803-857`, streams teed at `run.py:656-692,1145`, runner env built at `run.py:185-215` (already passes `CLAUDE_CODE_OAUTH_TOKEN`), no run key or result reuse, `tool_sequence` truncates at `run.py:291-319`, per-cell `--max-budget-usd` at `run.py:953` is Claude's own cap, power readout at `analyze.py:1058-1147` |
+
+## Acceptance
+- AC-1: WHEN any cell completes THE SYSTEM SHALL write an untruncated trajectory sidecar with every tool call's input and output, and the row SHALL carry `run_key`, `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, `trajectory_path`, and, for tilth arms, the candidate `git_sha` and `binary_sha256`.
+- AC-2: WHEN any cell is requested and the result store holds a row with the same run key THE SYSTEM SHALL reuse that row without a model call; WHEN any harness digest, task digest, env fingerprint, or candidate identity input changes THE SYSTEM SHALL compute a different run key; WHEN no row matches THE SYSTEM SHALL run the cell and store it.
+- AC-3: WHEN a paid run's agent CLI version differs from the version in its stored baseline keys THE SYSTEM SHALL refuse to start unless `--refreeze-baselines` is passed, and every runner subprocess SHALL run with `DISABLE_AUTOUPDATER=1`.
+- AC-4: WHEN a paid run starts without `--max-usd` THE SYSTEM SHALL exit before any model call, and WHEN cumulative cost, taken from native `total_cost_usd` or else the `pricing.yaml` computation, plus the next cell's estimate exceeds the ceiling THE SYSTEM SHALL stop before that cell.
+- AC-5: WHEN a Claude cell starts with `ANTHROPIC_API_KEY` set THE SYSTEM SHALL exit before the model call; WHEN a stream, including the committed recorded OAuth fixture, reports a usage-limit rejection THE SYSTEM SHALL record the cell as `infra:quota`, stop the run, and leave completed rows reusable.
+- AC-6: WHEN `analyze.py` reports a run THE SYSTEM SHALL label the power readout informational and SHALL NOT emit a task-growth gate verdict, and `PHASE4_PLAN.md` SHALL carry a superseded marker naming `benchmark-gepa-overhaul`.
+
+## Test Contracts
+
+| Acceptance ID | Interface referent | Outermost stable seam | Expected failure | Mode | Interface version | Matrix rows |
+| --- | --- | --- | --- | --- | --- | --- |
+| AC-1 | `baselines.run_key`, trajectory sidecar writer | `run._run_single_in_repo` with a canned stream | `test_run_hardening.py::test_row_has_run_key_and_sidecar` fails: row lacks `run_key` and no sidecar file exists | tracer | | |
+| AC-2 | `baselines.lookup` / `baselines.store` | `run.main` with a pre-seeded result store | `test_baselines.py::test_matching_key_skips_model_call` fails: runner invoked despite stored row | tracer | | |
+| AC-3 | `run.main` CLI version check, `run._runner_env` | `run.main` with a pre-seeded result store and a stubbed CLI version | `test_baselines.py::test_cli_version_change_requires_refreeze` fails: run starts with a different CLI version and no flag | tracer | | |
+| AC-4 | `run.py --max-usd` spend ledger | `run.main` argument parsing and cell loop | `test_run_hardening.py::test_paid_run_requires_max_usd` fails: run starts without the flag | tracer | | |
+| AC-5 | `run._runner_env` auth guard and quota classifier | `run._run_single_in_repo` replaying the recorded OAuth stream fixture | `test_run_hardening.py::test_quota_rejection_stops_run` fails: next cell starts after a rejected `rate_limit_event` | tracer | | |
+| AC-6 | `analyze._power_readout` | `analyze.main` on a fixture JSONL | `test_analyze.py::test_power_readout_is_informational` fails: output contains `grow TASK pool` | tracer | | |
+
+## Non-goals
+- External task adapters, panels, the model judge, and the evolution loop (parent curds c2 to c5).
+- Changes to `src/**`, `prompts/**`, or any tilth binary behavior.
+- Concurrency in the cell loop.
+- Changing the existing per-cell `--max-budget-usd` semantics.
+- Bumping the crate or npm version (fork law).
+
+## Provenance (tier 2 only)
+- briesearch: `claude setup-token` gives a one-year static OAuth token, `ANTHROPIC_API_KEY` overrides it under `-p`, `--bare` refuses OAuth, `total_cost_usd` is a client-side estimate, and quota surfaces as `rate_limit_event` and "hit your … limit" results; artifact: /root/.local/share/cheese/paulnsorensen-tilth/research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md

@@ -1,0 +1,171 @@
+{
+ "entry": "age",
+ "context": {
+  "scope": "diff",
+  "effort": "normal",
+  "snapshot": "working tree on claude/beautiful-mccarthy-uprx32 over 4cafeea, including untracked benchmark/baselines.py and new tests",
+  "changed_paths": [
+   "benchmark/run.py",
+   "benchmark/parse.py",
+   "benchmark/baselines.py",
+   "benchmark/analyze.py",
+   "benchmark/PHASE4_PLAN.md",
+   "benchmark/README.md",
+   "benchmark/tests/conftest.py",
+   "benchmark/tests/test_baselines.py",
+   "benchmark/tests/test_analyze.py",
+   "benchmark/tests/test_parse.py",
+   "benchmark/tests/test_run_hardening.py",
+   "benchmark/tests/test_result_substrate_press.py",
+   "benchmark/tests/test_gin_render_context.py",
+   "benchmark/tests/fixtures/streams/claude_native_cost.jsonl",
+   "benchmark/tests/fixtures/streams/claude_no_native_cost.jsonl",
+   "benchmark/tests/fixtures/streams/claude_quota_rejected.jsonl"
+  ],
+  "surface_score": 1313.5,
+  "components": [
+   {
+    "id": "benchmark-harness",
+    "role": "application",
+    "paths": [
+     "benchmark/run.py",
+     "benchmark/parse.py",
+     "benchmark/baselines.py",
+     "benchmark/analyze.py"
+    ]
+   },
+   {
+    "id": "benchmark-tests",
+    "role": "test",
+    "paths": [
+     "benchmark/tests"
+    ]
+   },
+   {
+    "id": "benchmark-docs",
+    "role": "documentation",
+    "paths": [
+     "benchmark/README.md",
+     "benchmark/PHASE4_PLAN.md"
+    ]
+   }
+  ],
+  "subjects": [
+   {
+    "subject": "changed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py",
+     "benchmark/parse.py",
+     "benchmark/baselines.py"
+    ],
+    "evidence": [
+     "new cell loop, store reuse, spend ledger"
+    ]
+   },
+   {
+    "subject": "removed-behavior",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/analyze.py"
+    ],
+    "evidence": [
+     "task-growth verdict removed"
+    ]
+   },
+   {
+    "subject": "caller-impact",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "paid runs now require --max-usd; build_runner_env raises for claude with ANTHROPIC_API_KEY"
+    ]
+   },
+   {
+    "subject": "security",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "auth guard on ANTHROPIC_API_KEY; env allowlist"
+    ]
+   },
+   {
+    "subject": "spec-tests",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/tests"
+    ],
+    "evidence": [
+     "spec test contracts"
+    ]
+   },
+   {
+    "subject": "reuse",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "new helpers"
+    ]
+   },
+   {
+    "subject": "simplification",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py"
+    ],
+    "evidence": [
+     "main loop rewrite"
+    ]
+   },
+   {
+    "subject": "efficiency",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/run.py",
+     "benchmark/baselines.py"
+    ],
+    "evidence": [
+     "store reads, probes"
+    ]
+   },
+   {
+    "subject": "conventions",
+    "applicability": "yes",
+    "targets": [
+     "benchmark"
+    ],
+    "evidence": [
+     "CLAUDE.md, README"
+    ]
+   },
+   {
+    "subject": "altitude",
+    "applicability": "yes",
+    "targets": [
+     "benchmark/baselines.py"
+    ],
+    "evidence": [
+     "new module placement"
+    ]
+   }
+  ],
+  "risks": [
+   {
+    "flag": "auth",
+    "state": "yes",
+    "evidence": [
+     "ANTHROPIC_API_KEY guard"
+    ]
+   }
+  ],
+  "is_subagent": true,
+  "can_fan_out": false,
+  "concurrency_limit": null
+ }
+}

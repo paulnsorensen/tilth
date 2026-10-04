@@ -1,0 +1,68 @@
+{
+  "draft_sha256": "7f0d20964ed9690326589098dab3dc31b7f868afb56cf287ae9cdeddb92f8f24",
+  "verdict": "fail",
+  "forks": [
+    {
+      "id": "F-2",
+      "decision": "One evolutionary loop mutates code and text; a candidate is a commit",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    },
+    {
+      "id": "F-3",
+      "decision": "The loop engine is GEPA optimize_anything with repeat runs on frontier candidates",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    },
+    {
+      "id": "F-4",
+      "decision": "The loop may mutate only src and prompts; winners land as human-reviewed draft PRs",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    },
+    {
+      "id": "F-5",
+      "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    },
+    {
+      "id": "F-6",
+      "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    }
+  ],
+  "contradictions": [
+    "Contract Candidate (spec line 47), Applier step 6 (line 70), Interface sketches materialize (line 129) and AC-10 tie rule (line 149) name each candidate's ref and identity by 'GEPA's candidate index', but in gepa==0.1.4 the evaluator receives only the candidate dict and `example`, and a child is evaluated on its minibatch before it has any index (gepa/proposer/reflective_mutation/reflective_mutation.py:517 builds it, :533-550 evaluates it with candidate_idx=None 'because the child is not in the candidate pool yet'); children that fail minibatch acceptance never receive an index. Since materialize and cascade must run inside that evaluation, the ref `evolve/<run-id>/<candidate-id>` cannot be named and the 'lower candidate id' tie-break is undefined for the commits evolve actually creates. AC-6 and AC-10 tests pass the id in directly or stub the engine, so they never observe this.",
+    "Contract Spend and auth (line 95: 'A usage-limit rejection in any call stops the run'), Stop and finish (line 85: a ceiling or quota stop skips finish) and Proposer isolation (line 63: a rejected candidate is not committed) assume a stop or rejection raised from the `custom_candidate_proposer` dispatcher ends the run or drops the child. In gepa==0.1.4, `_propose_texts_batch_safe` (reflective_mutation.py:203-225) catches any exception from the proposer, logs it, calls the same proposer a second time per task, and turns a second failure into a skipped proposal. The engine then continues to its next iteration (gepa/core/engine.py:846-849). So a quota rejection or `would_cross` stop in a reflection or proposer call starts another paid call, and the search keeps running. The spec gives no other mechanism, such as a stop flag read by an EngineConfig stopper or an empty-dict return for a rejected proposal. test_quota_in_proposer_stops_run and test_ceiling_stop_skips_finish (AC-11 row) use a stubbed engine, per AC-12 ('Unit tests stub it'), so they pass against this broken behavior.",
+    "Contract Frontier re-runs (line 83) says a dominated candidate is not re-run and that 'Only the mean over all 1 + R rollouts reaches GEPA, so no candidate joins the frontier on one rollout'. Parent AC-8 (benchmark-gepa-overhaul.md:121) also requires every candidate accepted onto the GEPA frontier to have been re-run. But a dominated candidate's one-rollout per-task scores still reach GEPA. gepa 0.1.4 adds any candidate that ties the best score on a validation instance to that instance's Pareto front (gepa/core/state.py:496-508, `elif score == prev_score: pareto_front.add`), and ties at 0 or 1 are routine with 0/1 grader correctness. A dominated, single-rollout candidate therefore joins the frontier. `evolve.finish(frontier)` (line 86) can then choose it as a finalist. The spec never says whether `frontier` means GEPA's Pareto set or an evolve-owned set of re-run candidates. test_frontier_needs_reruns_and_frozen_delta (AC-9 row) runs with a stubbed engine, so it cannot observe this."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Contract Judge gating (line 58) and AC-4 (line 143) require a cached label for every panel task, and a label and critique on every record while the judge is calibrated. c4 makes a bad answer raise with no retry: `JudgeAnswerInvalid` for a label (bench-model-judge.md:46) and `CritiqueRejected` for a critique verdict (bench-model-judge.md:58). The spec assumes those calls always succeed and never says what evolve does when they raise: refuse to start, drop the label or critique, or abort. A critique raised inside `evolve.evaluate` propagates under gepa's default `raise_on_exception=True` (gepa/optimize_anything.py:468, :1056-1058) and kills the run without finish. No AC or test covers this path."
+  ],
+  "acceptance_gaps": [
+    "Contract Candidate and Engine (lines 47-53) and the Interface sketches (`materialize(candidate) -> sha`, `cascade(sha)`, lines 127-130) never say that one candidate maps to one commit across evaluator calls. gepa calls the evaluator once per (candidate, example). It re-evaluates every selected parent on a fresh minibatch each iteration (reflective_mutation.py:280-306), and its evaluation cache is off by default (`cache_evaluation: bool = False`, optimize_anything.py:494). A fresh materialize commit gets a new sha, and `git_sha` is a run-key input (benchmark/baselines.py:19-22 at 87f2e73). So an implementation that materializes per call re-runs `just check` and re-buys the cheap tier, the paid tier, and the re-runs on every call, and the store cannot answer any of them. No AC or test checks that repeated `evaluate` calls for an identical candidate dict reuse one commit and make no new runner calls."
+  ]
+}

@@ -1,0 +1,1 @@
+{"draft_sha256": "68a49d89af5b0b9ed9edf75c25c39d3998bc3aa2a0f7192bd2b206ffad498c54", "verdict": "pass", "forks": [{"id": "F-2", "decision": "One evolutionary loop mutates code and text; a candidate is a commit", "reflected_in": ["approach", "interface sketches", "acceptance"]}], "contradictions": [], "orphaned_decisions": [], "unsupported_assumptions": [], "acceptance_gaps": []}

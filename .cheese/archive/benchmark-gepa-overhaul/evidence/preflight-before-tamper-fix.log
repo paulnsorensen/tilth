@@ -1,0 +1,13 @@
+sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1: tampered_resolved gold=6/6 empty=5/6 tampered=6/6
+Netflix__metaflow.b390a8d4.test_stub_generator.7bf08c98.lv1: tampered_resolved gold=6/6 empty=5/6 tampered=6/6
+mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1: tampered_resolved gold=6/6 empty=5/6 tampered=6/6
+mwaskom__seaborn.7001ebe7.test_algorithms.1f0181c2.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=1/6
+pydantic__pydantic.e1dcaf9e.test_deprecated_fields.40a2ec54.lv1: gold_unresolved gold=4/6 empty=4/6 tampered=4/6
+pydata__xarray.97f3a746.test_backends_chunks.fa55f68a.lv1: gold_unresolved gold=0/6 empty=0/6 tampered=0/6
+sympy__sympy.c1097516.test_nullspace.f14fc970.lv1: tampered_resolved gold=6/6 empty=5/6 tampered=6/6
+gin-gonic__gin-3741: admitted gold=2/2 empty=1/2 tampered=1/2
+sharkdp__bat-2650: admitted gold=2/2 empty=1/2 tampered=1/2
+featurebench_admitted: 1
+go_admitted: 1
+rust_admitted: 1
+preflight exit 0

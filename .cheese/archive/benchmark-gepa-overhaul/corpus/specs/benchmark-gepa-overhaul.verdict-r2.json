@@ -1,0 +1,77 @@
+{
+ "draft_sha256": "538ab7ab43c8d916a5588d5108d4ba8178e57d353d05e621d22e1cc9406ec139",
+ "verdict": "fail",
+ "forks": [
+  {
+   "id": "F-1",
+   "decision": "External tasks run fully native with a local checkout without upstream history, a local uv venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  },
+  {
+   "id": "F-2",
+   "decision": "One evolutionary loop mutates code and text; a candidate is a commit",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  },
+  {
+   "id": "F-3",
+   "decision": "The loop engine is GEPA optimize_anything with repeat runs on frontier candidates",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  },
+  {
+   "id": "F-4",
+   "decision": "The loop may mutate only src and prompts; winners land as human-reviewed draft PRs",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  },
+  {
+   "id": "F-5",
+   "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  },
+  {
+   "id": "F-6",
+   "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  }
+ ],
+ "contradictions": [
+  "AC-15 requires a delta report 'against frozen baseline rows ... without re-running baseline arms', but AC-6 and Approach step 1 put the agent CLI version and env fingerprint in the run key, and Risks says toolchain drift 'invalidates frozen baselines'. Nothing pins the CLI. run.py sets no auto-update guard (no DISABLE_AUTOUPDATER anywhere in benchmark/run.py), and Risks expects multi-day runs that stop and resume across quota windows. A Claude Code auto-update or toolchain change mid-run therefore leaves no matching baseline row, and AC-15 forbids re-buying one. No section says whether evolve refuses to continue, skips the report, or re-runs baselines, so AC-15 cannot be satisfied in that state, and G-5's 'run once' becomes 'run once per CLI version' without that being stated.",
+  "AC-10 and Approach step 3 produce every panel task's applicability label 'from its problem statement and gold patch' and cache it by 'dataset revision'. Three panel tasks have neither input: rg_search_dispatch, rg_trait_implementors, and gin_servehttp_flow are Q&A navigation tasks. The Task ABC carries only GroundTruth required_strings and forbidden_strings (benchmark/tasks/base.py:21-31) and has no gold patch or dataset revision. gin_edit_render_context has only a fixture reference.py. As written, AC-10 cannot label the navigation tasks, which are exactly where structural-tool applicability matters for G-6. The spec does not name a substitute input."
+ ],
+ "orphaned_decisions": [],
+ "unsupported_assumptions": [
+  "F-5's rationale ('the loop cannot game a score it cannot touch') and Risks' claim that 'the held-out test split' guards against overfitting both assume the optimizer cannot read grader inputs. The coding-agent src_patch proposer (Approach step 5, AC-13) runs claude -p with Bash inside a tilth worktree. That worktree contains every local task's ground_truth (benchmark/tasks/*.py), the gin held-out tests (benchmark/tasks/gin_render_context_fixtures/*_heldout_test.go, HELD_OUT at gin_render_context_tasks.py:17), and the panel manifest naming the test split. The proposer also has host access to the harness data directory, which holds external held-out tests and gold patches. AC-17 scans only external-task cell sidecars. No AC or test scans the proposer's trajectory, limits what it can read, or checks src_patch for embedded grader content. A src/** mutation can therefore encode grader knowledge, including test-split knowledge that AC-16's held-out scoring depends on, and nothing would detect it."
+ ],
+ "acceptance_gaps": [
+  "G-1 (FeatureBench tasks run in our harness) has no AC that requires at least one admitted FeatureBench instance. AC-4 lists 'the admitted FeatureBench tasks', which the empty set satisfies. AC-3 rejects any task that fails native admission. The AC-1, AC-2, and AC-3 test contracts use fixture instances only, and Risks expects about six Pareto-12 tasks to build, marked [speculating]. Every AC and quality gate can pass with zero FeatureBench tasks in the panel, so no check observes G-1's outcome. The r1 Gin fallback fix did not get an equivalent minimum for FeatureBench."
+ ]
+}

@@ -1,0 +1,197 @@
+---
+slug: benchmark-gepa-overhaul
+status: draft
+source: mold-handshake
+created: 2026-10-03
+confidence: medium
+leverage: ["contract", "irreversible-effects", "new-slice", "auth"]
+gates_overridden: []
+execution_holds: []
+agent_introduced_scope: ["optimize_anything", "evaluator cascade", "run key", "task digest", "env fingerprint", "trajectory sidecar", "max-usd", "dev/test split", "applicability label", "trajectory critique", "src_patch component", "applier-owned byte lock", "contamination flag", "infra:quota", "masked-state reconstruction"]
+goal_coverage: {"G-1": "covered", "G-2": "covered", "G-3": "covered", "G-4": "covered", "G-5": "covered", "G-6": "covered"}
+entity_referent_bindings: [{"noun": "cell", "verdict": "bound", "referent": "benchmark/run.py planned_cell_count", "citation": "benchmark/run.py:895-903", "note": "task x model x mode x repetition"}, {"noun": "arm", "verdict": "bound", "referent": "benchmark/config.py MODES and variants.py experiment arms", "citation": "benchmark/config.py:142-165", "note": "stock baseline arms are no_tilth (claude) and the codex runner without MCP"}, {"noun": "task", "verdict": "bound", "referent": "benchmark/tasks/base.py Task ABC and TASKS registry", "citation": "benchmark/tasks/base.py:58-179", "note": "external tasks subclass Task and override check_correctness, as gin_edit_render_context does"}, {"noun": "candidate", "verdict": "NEW ENTITY", "referent": "git commit plus binary_sha256 recorded in row.variant", "citation": "benchmark/run.py:803-857", "note": "reuses existing variant.git_sha and binary_sha256 fields"}, {"noun": "panel", "verdict": "NEW ENTITY", "referent": "benchmark/panels/<name>.json", "citation": "none", "note": "pre-registered task list with dev/test split"}, {"noun": "run key", "verdict": "NEW ENTITY", "referent": "benchmark/baselines.py run_key", "citation": "none", "note": "hash of model id, agent CLI version, task digest, env fingerprint, effort, timeout, arm, repetition"}, {"noun": "grader", "verdict": "NEW ENTITY", "referent": "benchmark/external/grade.py", "citation": "none", "note": "native replay of the instance FAIL_TO_PASS and PASS_TO_PASS tests in a clean copy, following the gin_edit_render_context held-out-test pattern (benchmark/tasks/gin_render_context_tasks.py:116-167)"}]
+agent_resolution: []
+gate_applicability:
+  disposition: red-required
+  work_class: behavior
+  ui_surface: non-browser
+landing:
+  shape: diamond_stack
+  layers: [["c1-result-substrate"], ["c2-external-task-adapter", "c4-model-judge"], ["c3-panel-manifest"], ["c5-evolution-loop"]]
+  per_layer_green: required
+  review_fixes: fold
+---
+
+# Benchmark overhaul: FeatureBench, Gin, and a GEPA evolution loop against frozen baselines
+
+## Problem
+
+Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.
+
+Today the harness cannot do any of that. Every run rewrites a fresh timestamped JSONL with no run key, so stock baselines are re-bought on every A/B (`benchmark/run.py:1144`). The row truncates arguments to 60–80 characters and drops `queries` and `edits` (`benchmark/run.py:291-319`); full traces exist only as unindexed stream files for the claude and codex runners (`benchmark/run.py:1145-1226`), so a reflection model has nothing structured to reason over. There is no external-task grading, no judge, and no spend ceiling (`--max-cells` caps calls only, `benchmark/run.py:906-911`). The MCP instruction text is compiled in (`src/mcp/mod.rs:76`), so any optimizer must produce builds, not text swaps. The maintainer runs on a Claude and Codex subscription, not an API key, and wants no container infrastructure. The maintainer feels this: every experiment costs a full re-run and yields only pass/fail.
+
+## Goals
+
+- G-1: FeatureBench tasks run in our harness.
+- G-2: The Gin render-context task is in the panel.
+- G-3: A couple of other cherry-picked tasks are in the panel: the three local hard tasks plus one Go and one Rust SWE-bench Multilingual instance.
+- G-4: The research model reasons over raw result JSONL.
+- G-5: Stock baselines run once, are stored, and are reused.
+- G-6: A model judge decides where structural tools apply.
+
+## Non-goals
+
+- A structural write op in `tilth_write`; tracked as issue #310 (user-filed in the prior session).
+- Docker, Harbor, or native `fb infer`/`fb eval` execution (F-1 picked fully native).
+- FeatureBench tasks that need a GPU, Level 2 tasks, and tasks whose environment does not build in a local `uv` venv or whose masked state cannot be reconstructed natively [AGENT-INTRODUCED].
+- Matching published leaderboard numbers; published scores stay sanity checks.
+- Auto-merging any optimizer winner (F-4: winners land as draft PRs).
+- Bumping the crate or npm version (fork law).
+
+## Deferred follow-ups
+
+- **bench-gpu-host** — rent a GPU host to admit the GPU-flagged FeatureBench Lite tasks.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: this spec, Non-goals
+- **bench-heavy-python-envs** — admit pandas, astropy, transformers, Lightning, and mlflow Pareto-12 tasks once a reproducible native environment recipe exists.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: this spec, Non-goals
+- **bench-hgm-parent-selection** — swap GEPA parent selection for clade-metaproductivity (HGM) if frontier noise dominates.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: arXiv 2510.21614
+- **fix-tilth-deps-route** — `prompts/mcp.md:16` and `AGENTS.md:18` still route imports to the retired `tilth_deps`.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: commit 4cafeea
+
+## Grounding
+
+| Probe | Outcome | Evidence |
+| --- | --- | --- |
+| wiki | hit | `hallouminate ground` on `repo:tilth:wiki`: `benchmark-harness-gotchas.md` (attach-or-abort guard, per-cell Claude config copies auth only, revoked tokens invalidated run `20260928_201559`, `--bare` refuses OAuth) |
+| explorer | hit | Explorer digest at HEAD `4cafeea`: no run key or result reuse, `tool_sequence` drops `queries`/`edits` (`run.py:291-319`), instructions and tool descriptions compiled in with byte-lock and 2KB tests (`src/mcp/mod.rs:76,771,1249`), no judge code, power gate at `PHASE4_PLAN.md:3-25` with no exception process, `gin_edit_render_context` grades by held-out test replay (`gin_render_context_tasks.py:116-167`); research sub-agents: `research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md`: subscription auth for `claude -p` (`setup-token`, API key precedence, `--bare`), Codex `auth.json` rotation, quota and `rate_limit_event`, FeatureBench dataset fields, SWE-bench Multilingual grading and candidate instances |
+
+## Approach
+
+Build a result substrate first, then two independent adapters, then the panel, then the loop.
+
+1. **Result substrate (G-4, G-5, F-6).** Every row gains a `run_key`, the agent CLI version, the timeout, a `task_digest`, an `env_fingerprint`, and a pointer to an untruncated trajectory sidecar holding every tool call with its input and output. The run key hashes model ID, agent CLI version, task digest (prompt, ground truth, test command, fixture files, repo commit), env fingerprint (toolchain versions plus lockfile hash), effort, timeout, arm, and repetition. A baseline store returns an existing row for a matching key instead of calling a model. `run.py` gains a required `--max-usd` ceiling on paid runs. Cost per row is today's `total_cost_usd` (Claude's client-side estimate, Codex's `pricing.yaml` computation); under subscription auth it is notional and bounds effort, not billing. A usage-limit rejection marks the cell `infra:quota`, stops the run, and a rerun resumes through the baseline store. Claude cells refuse to start when `ANTHROPIC_API_KEY` is set, because it silently overrides `CLAUDE_CODE_OAUTH_TOKEN`; Codex cells run serially against one `CODEX_HOME`. `PHASE4_PLAN.md` is marked superseded and the power readout in `analyze.py` is labelled informational (F-6).
+2. **External task adapter (F-1, G-1, G-3).** FeatureBench Lite Level 1 and SWE-bench Multilingual instances run fully native. The adapter exports the instance's `base_commit` tree into a fresh `git init` checkout with no upstream history, reconstructs FeatureBench's masked state by reverse-applying the gold `patch`, and keeps the `test_patch` and FAIL_TO_PASS/PASS_TO_PASS lists outside the agent's checkout. Python tasks get a local `uv` venv from `repo_settings`; Go and Rust tasks use the local toolchain with `go.sum`/`Cargo.lock`. The grader copies the agent's source changes into a clean checkout, applies the held-out tests, and runs the FAIL_TO_PASS and PASS_TO_PASS tests natively, as `gin_edit_render_context` already does. A task enters a panel only after a round trip through our own pipeline: gold resolves, and empty and tampered patches do not. Trajectories that reach the upstream repository or package source are flagged contaminated and excluded from scores.
+3. **Model judge (F-5, G-6).** A pinned judge labels each panel task once for structural-tool applicability from its problem statement and gold patch, cached by task, dataset revision, judge model, and judge prompt hash. It critiques every paid-tier rollout from its trajectory. Both outputs are gated by agreement with a hand-labeled calibration set. Labels slice the analysis report and enter reflection; critiques enter reflection only; neither enters a score.
+4. **Panel manifest (G-2, G-3).** A pre-registered panel lists the admitted FeatureBench tasks, `gin_edit_render_context`, `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, `gin-gonic__gin-3741`, and `sharkdp__bat-2650`, with a stratified dev/test split committed before the first paid run.
+5. **Evolution loop (F-2, F-3, F-4).** GEPA `optimize_anything` evolves a multi-component candidate: `prompts/mcp.md` and each tool description as text components, plus one `src_patch` component holding a unified diff over `src/**`. The applier writes the text components, `git apply`s the patch, commits on a scratch branch (F-2), regenerates `AGENTS.md`, and rewrites only the expected values of `server_instructions_byte_lock` (F-4). Each candidate runs an evaluator cascade: apply, `just check`, the cheap tier, then the paid tier against frozen baseline rows (F-3, G-5). The score is grader correctness only; untruncated rows, trajectories, labels, and critiques are reflection side information (F-5, G-4). Frontier candidates are re-run before acceptance (F-3). At the end, the best frontier candidates are scored once on the held-out test split and the winner opens as a draft PR (F-4).
+
+## Decisions
+
+- F-1: External tasks run fully native — local checkout without upstream history, local `uv` venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker — the user runs on a subscription on their own machine and wants no container infrastructure; host preflight replaces image fidelity.
+- F-2: One evolutionary loop mutates code and text; a candidate is a commit — instructions are compiled in, and `variant.git_sha` / `binary_sha256` already prove what was served.
+- F-3: The loop engine is GEPA `optimize_anything` with repeat runs on frontier candidates — trajectory reflection matches G-4 and it has the best measured budget (150–600 metric calls).
+- F-4: The loop may mutate only `src/**` and `prompts/**`; winners land as human-reviewed draft PRs — user chose the widest search space; `just check` in the cascade is the backstop.
+- F-5: The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective — the loop cannot game a score it cannot touch.
+- F-6: The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling — user retired the gate; `--max-usd` replaces it as the spend control.
+- _Minor decisions:_ the three existing hard tasks are cherry-picks and form the cheap tier; SWE-bench Multilingual picks are Go `gin-gonic__gin-3741` and Rust `sharkdp__bat-2650` (fallback `tokio-rs__tokio-6724`) at HF revision `846e647b`; FeatureBench dataset v1.1, CPU-only Level 1; the judge model is pinned and its label cache key is separate from the run key; mutations are a strict `src/**` and `prompts/**` allowlist; diffs inside `#[cfg(test)]` spans are rejected except the applier's rewrite of `server_instructions_byte_lock`'s expected values, while `cwd_guidance_spans_present` and the 2KB instruction cap stay as guards; `--max-usd` has no default and the next-cell estimate is the mean stored cost for that task and arm, else the run's maximum cell cost so far, else `--cell-estimate-usd`; Claude authenticates with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`; Codex runs serially with the host `CODEX_HOME`.
+
+## Acceptance
+
+- AC-1: WHEN `run.py` prepares an external task THE SYSTEM SHALL export the instance's `base_commit` tree into a fresh `git init` checkout with no upstream history, reverse-apply the gold patch for FeatureBench, and keep the test patch and FAIL_TO_PASS/PASS_TO_PASS lists outside the agent's checkout.  (F-1, G-1, G-3)
+- AC-2: WHEN an external task cell finishes THE SYSTEM SHALL copy the agent's source changes into a clean checkout, apply the held-out test patch, run the FAIL_TO_PASS and PASS_TO_PASS tests natively, and write `correct` as all of them passing, plus `pass_rate` and F2P/P2P counts, into the row.  (F-1, G-1, G-3)
+- AC-3: WHEN an external task is admitted to a panel THE SYSTEM SHALL require that its gold patch, written into our prepared checkout and extracted and graded through our own pipeline, resolves, and that its empty and tampered patches do not resolve on this host, and SHALL refuse GPU-flagged tasks, Level 2 tasks, and tasks whose environment fails to build.  (F-1, G-1, G-3)
+- AC-4: WHEN a panel manifest is loaded THE SYSTEM SHALL list the admitted FeatureBench tasks, `gin_edit_render_context`, `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, and the two SWE-bench Multilingual instances with a dev/test split, and SHALL refuse a paid run against a manifest whose split changed after its first recorded result.  (G-2, G-3)
+- AC-5: WHEN any cell completes THE SYSTEM SHALL write an untruncated trajectory sidecar with every tool call's input and output, and the row SHALL carry `run_key`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, and the candidate `git_sha` and `binary_sha256`.  (G-4, F-2)
+- AC-6: WHEN a baseline-arm cell is requested and the baseline store holds a row with the same run key THE SYSTEM SHALL reuse that row without a model call, WHEN any task digest or env fingerprint input changes THE SYSTEM SHALL compute a different run key, and WHEN no row matches THE SYSTEM SHALL run the cell and store it.  (G-5, F-3)
+- AC-7: WHEN a paid `run.py` or `evolve.py` run starts without `--max-usd` THE SYSTEM SHALL exit before any model call, and WHEN cumulative cost of agent cells, judge calls, and reflection calls plus the next call's estimate exceeds the ceiling THE SYSTEM SHALL stop before that call.  (F-6)
+- AC-8: WHEN `analyze.py` reports a run THE SYSTEM SHALL label the power readout informational and SHALL NOT emit a task-growth gate verdict, and `PHASE4_PLAN.md` SHALL carry a superseded marker naming this spec.  (F-6)
+- AC-9: WHEN a Claude cell starts with `ANTHROPIC_API_KEY` set in its environment THE SYSTEM SHALL exit before the model call, and WHEN a cell's stream reports a usage-limit rejection THE SYSTEM SHALL record the cell as `infra:quota`, stop the run, and leave completed rows reusable.  (F-1, F-6)
+- AC-10: WHEN a panel task lacks a cached applicability label THE SYSTEM SHALL produce one from the problem statement and gold patch with the pinned judge and cache it by task, dataset revision, judge model, and judge prompt hash; WHEN `analyze.py` reports a panel run THE SYSTEM SHALL slice accuracy and cost by applicability label.  (F-5, G-6)
+- AC-11: WHEN the judge's agreement with the hand-labeled calibration set is below the configured threshold THE SYSTEM SHALL refuse to supply labels or critiques to an optimizer run, and WHEN it meets the threshold THE SYSTEM SHALL produce one critique per paid-tier rollout.  (F-5, G-6)
+- AC-12: WHEN the optimizer scores a candidate THE SYSTEM SHALL use grader correctness as the only score, and SHALL pass each rollout's untruncated row, trajectory sidecar content, applicability label, and critique into the reflective dataset.  (F-5, F-3, G-4)
+- AC-13: WHEN the optimizer proposes a candidate THE SYSTEM SHALL write its text components, apply its `src_patch`, reject any change outside `src/**` and `prompts/**` or inside a `#[cfg(test)]` span other than the expected values of `server_instructions_byte_lock`, commit it on a scratch branch, and regenerate `AGENTS.md`.  (F-2, F-4)
+- AC-14: WHEN a candidate commit exists THE SYSTEM SHALL evaluate it through the cascade of patch apply, `just check`, the cheap tier, then the paid tier, and SHALL stop at the first failing stage with score 0 and that stage recorded.  (F-3, F-4)
+- AC-15: WHEN a candidate reaches the paid tier THE SYSTEM SHALL compare it against frozen baseline rows without re-running baseline arms, and SHALL re-run a frontier candidate the configured number of times before accepting it onto the GEPA frontier.  (F-3, G-5)
+- AC-16: WHEN the optimizer run ends THE SYSTEM SHALL score the best frontier candidates once on the held-out test split and open the winner as a draft PR without merging it.  (F-4, F-2)
+- AC-17: WHEN an external task's trajectory fetches the upstream repository or the package's source distribution THE SYSTEM SHALL mark the row contaminated and exclude it from scores and reports while keeping it in the denominator count.  (F-1, G-1)
+
+## Test Contracts
+
+| Acceptance ID | Interface referent | Outermost stable seam | Expected failure | Mode | Interface version | Matrix rows |
+| --- | --- | --- | --- | --- | --- | --- |
+| AC-1 | `external.checkout.prepare` (F-1) | `ExternalTask.prepare` against a temp git repo fixture | `test_external.py::test_prepare_hides_tests_and_history` fails: checkout contains the F2P test file or upstream commits | tracer | | |
+| AC-2 | `external.grade.grade` (F-1) | `ExternalTask.check_correctness` with a fixture repo and canned test output | `test_external.py::test_row_carries_resolved_and_pass_rate` fails: row has no `pass_rate` key | tracer | | |
+| AC-3 | `external.preflight.admit` (F-1) | `external.preflight` CLI against fixture instances | `test_external.py::test_preflight_rejects_tampered_resolve` fails: a task whose tampered patch resolves is admitted | tracer | | |
+| AC-4 | `panels.load_panel` (F-1) | `run.main` with `--panel` | `test_panels.py::test_split_change_after_results_refused` fails: run proceeds after split edit | tracer | | |
+| AC-5 | `baselines.run_key`, trajectory sidecar writer (F-2) | `run._run_single_in_repo` with a canned stream | `test_run_hardening.py::test_row_has_run_key_and_sidecar` fails: row lacks `run_key` and no sidecar file exists | tracer | | |
+| AC-6 | `baselines.lookup` / `baselines.store` (F-3) | `run.main` with a pre-seeded baseline store | `test_baselines.py::test_matching_key_skips_model_call` fails: runner invoked despite stored row | tracer | | |
+| AC-7 | `run.py` and `evolve.py` `--max-usd` (F-6) | `run.main` and `evolve.main` argument parsing and spend ledger | `test_run_hardening.py::test_paid_run_requires_max_usd` fails: run starts without the flag | tracer | | |
+| AC-8 | `analyze._power_readout` (F-6) | `analyze.main` on a fixture JSONL | `test_analyze.py::test_power_readout_is_informational` fails: output contains `grow TASK pool` | tracer | | |
+| AC-9 | `run._runner_env` auth guard and quota classifier (F-1, F-6) | `run._run_single_in_repo` with a canned rate-limit stream | `test_run_hardening.py::test_quota_rejection_stops_run` fails: next cell starts after a rejected `rate_limit_event` | tracer | | |
+| AC-10 | `judge.applicability` (F-5) | `judge.applicability` with a stubbed judge client | `test_judge.py::test_label_cached_by_full_key` fails: second call with same key hits the client | tracer | | |
+| AC-11 | `judge.calibrate` / `judge.critique` (F-5) | `evolve.main` preflight | `test_judge.py::test_low_agreement_blocks_optimizer` fails: optimizer starts with agreement below threshold | tracer | | |
+| AC-12 | `evolve.evaluate` (F-5, F-3) | `evolve.evaluate` with stubbed cascade output and a canned sidecar | `test_evolve.py::test_reflective_dataset_has_full_trajectory` fails: reflective record lacks a tool output longer than 80 characters | tracer | | |
+| AC-13 | `evolve.materialize` (F-2, F-4) | `evolve.materialize` against a temp git repo | `test_evolve.py::test_rejects_out_of_allowlist_diff` fails: a patch touching `benchmark/run.py` is committed | tracer | | |
+| AC-14 | `evolve.cascade` (F-4) | `evolve.cascade` with stubbed stage commands | `test_evolve.py::test_cascade_stops_at_first_failure` fails: paid tier runs after a `just check` failure | tracer | | |
+| AC-15 | `evolve.cascade` paid tier (F-3) | `evolve.cascade` with a pre-seeded baseline store | `test_evolve.py::test_frontier_candidate_is_rerun` fails: candidate joins the frontier after one rollout | tracer | | |
+| AC-16 | `evolve.finish` (F-4) | `evolve.finish` with a stubbed PR client | `test_evolve.py::test_finish_opens_draft_never_merges` fails: merge call recorded or PR not draft | tracer | | |
+| AC-17 | `external.contamination.scan` (F-1) | `ExternalTask.check_correctness` with a canned trajectory | `test_external.py::test_upstream_fetch_marks_contaminated` fails: row scored after a `git clone` of the upstream repository | tracer | | |
+
+## Interface sketches
+
+```text
+slice:            benchmark (existing harness) + NEW SLICE benchmark/external/, benchmark/judge/, benchmark/evolve/
+spine step:       workflow (run.py cell loop) + infra (native checkout and env builder, baseline store)
+public interface: external.ExternalTask(Task).prepare() / check_correctness()  (F-1)
+public interface: external.featurebench.load(instance_id, data_rev) / external.swebench_ml.load(instance_id, data_rev) -> ExternalTask  (F-1)
+public interface: external.grade.grade(task, candidate_tree) -> GradeReport(resolved, pass_rate, f2p, p2p)  (F-1)
+public interface: external.preflight.admit(instance_id) -> PreflightVerdict  (F-1)
+public interface: baselines.run_key(cell) -> str; baselines.lookup(key) -> Row | None; baselines.store(row)  (F-3)
+public interface: run.py --panel PATH --max-usd FLOAT --cell-estimate-usd FLOAT --candidate-sha SHA  (F-6, F-2)
+public interface: panels.load_panel(path) -> Panel(dev, test)  (F-1)
+public interface: judge.applicability(task) -> Label; judge.critique(row, trajectory) -> str; judge.calibrate(labels) -> Agreement  (F-5)
+public interface: evolve.main(--panel, --max-usd, --max-metric-calls, --seed-sha); evolve.materialize(candidate) -> sha; evolve.cascade(sha) -> (score, side_info); evolve.finish(frontier)  (F-2, F-3, F-4)
+private:          uv venv build from repo_settings; Go/Rust test-output parsers; masked-state reconstruction; trajectory sidecar format; judge prompts; GEPA engine config; mutation allowlist; AGENTS.md regen and byte-lock rewrite; quota classifier
+crust delta:      new run.py flags (--panel, --max-usd, --cell-estimate-usd, --candidate-sha); new row fields (run_key, task_digest, env_fingerprint, cli_version, timeout_s, trajectory_path, pass_rate, contaminated); new packages external/judge/evolve; PHASE4_PLAN.md superseded
+arrows:           run.py -> external, baselines, panels; evolve -> run.py, baselines, judge, panels; judge -> baselines (row and sidecar read); no arrow from tilth src/ into benchmark/
+```
+
+## Risks
+
+- Masked-state reconstruction by reverse-applying the gold patch is [speculating]; AC-3's round trip is the only proof, and tasks that fail it drop out.
+- About six of Pareto-12 are expected to build in a local `uv` venv (sympy, metaflow, seaborn ×2, xarray, pydantic) [speculating]; the FeatureBench share of the panel may be small.
+- Native execution has no network isolation; an agent can fetch the upstream fix. The contamination flag detects known paths, not every leak.
+- Host toolchain drift changes results; the env fingerprint invalidates frozen baselines rather than mixing them.
+- Anthropic's Consumer Terms bar automated access except via an API key "or where we otherwise explicitly permit it", while Anthropic documents `setup-token` for scripts; the exposure falls on the maintainer's account.
+- Subscription quota (5-hour and weekly windows) bounds throughput; long runs will stop and resume.
+- Per-instance Pareto selection chases noise on expensive rollouts; frontier re-runs cost extra budget.
+- Mutating `src/` invites overfitting to a small dev split; `just check` and the held-out test split are the guards.
+- Retiring the power gate removes the statistical stop; `--max-usd` limits effort but not false-positive conclusions.
+
+## Open questions
+
+- [TBD] Judge agreement threshold and calibration-set size (default proposal: every panel task for applicability plus 20 trajectories, Cohen's kappa ≥ 0.6).
+- [TBD] Frontier re-run count and plateau window (default proposal: 3 re-runs; stop after 5 rounds without dev improvement).
+
+## Quality gates
+
+- `just check`: exits 0 (fmt, clippy, cargo test, `tests/mcp_v2`, `tests/scripts`, bash-guard self-test).
+- `cd benchmark && python3 -m pytest tests`: exits 0, including the new `test_external.py`, `test_panels.py`, `test_baselines.py`, `test_judge.py`, `test_evolve.py`, `test_analyze.py`.
+- `python3 benchmark/external/preflight.py --panel benchmark/panels/<name>.json`: every admitted task reports gold resolved, empty and tampered unresolved.
+
+## Curds
+
+- **c1-result-substrate** — run key with task digest and env fingerprint, untruncated trajectory sidecar, row fields, baseline store, `--max-usd`, auth guard and quota stop, PHASE4_PLAN superseded and power readout informational. Covers G-4, G-5. ACs 5, 6, 7, 8, 9. Depends on: none. State: proposed.
+- **c2-external-task-adapter** — native checkout, masked-state reconstruction, `uv` and Go/Rust environments, native F2P/P2P grading, contamination flag, preflight. Covers G-1, G-3. ACs 1, 2, 3, 17. Depends on: c1. State: proposed.
+- **c4-model-judge** — applicability labels and analysis slicing, per-rollout critiques, calibration gate. Covers G-6. ACs 10, 11. Depends on: c1. State: proposed.
+- **c3-panel-manifest** — pre-registered panel with Gin, local cherry-picks, SWE-bench Multilingual picks, admitted FeatureBench tasks, and the split lock. Covers G-2, G-3. AC 4. Depends on: c2. State: proposed.
+- **c5-evolution-loop** — multi-component candidate, applier with allowlist and byte-lock rewrite, cascade, GEPA engine, frontier re-runs, held-out scoring, draft PR. Covers G-4, G-5. ACs 12–16. Depends on: c1, c3, c4. State: proposed.
+
+## References
+
+- Subscription and native-harness research: `/root/.local/share/cheese/paulnsorensen-tilth/research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md` (accessed 2026-10-03)
+- FeatureBench dataset fields: https://huggingface.co/datasets/LiberCoders/FeatureBench (accessed 2026-10-03)
+- COSPA Pareto-12: https://raw.githubusercontent.com/shisa-ai/cospa/main/configs/featurebench_lite_pareto12_v1.json (accessed 2026-10-03)
+- SWE-bench Multilingual: https://www.swebench.com/multilingual.html (accessed 2026-10-03)
+- Claude Code authentication: https://code.claude.com/docs/en/authentication (accessed 2026-10-03)
+- GEPA `optimize_anything`: https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/ (accessed 2026-10-03)
+- Huxley-Gödel Machine: https://arxiv.org/html/2510.21614v2 (accessed 2026-10-03)

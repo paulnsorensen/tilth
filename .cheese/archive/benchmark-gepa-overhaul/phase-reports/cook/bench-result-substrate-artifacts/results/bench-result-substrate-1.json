@@ -1,0 +1,120 @@
+{
+  "holds": [
+    {
+      "evidence": [],
+      "hold_id": "curdle-anyway",
+      "kind": "preparation",
+      "reason": "curdle anyway saved this design with unchecked handshake items: fork-taste-third-failure: on 2026-10-04 the user authorized one fresh coherence round on the amended draft after the r2 test-contract gaps were folded in, fork-taste-r3-failure: on 2026-10-04 the user selected override and cook now after the r3 findings (failed-cell spend, reused-row output, baseline drift comparison set, OpenCode sidecar scope) were folded in; /press and /age backstop residual test gaps"
+    }
+  ],
+  "preparation_result": {
+    "approval_kind": null,
+    "approved_plan_ref": null,
+    "approved_scope_ref": null,
+    "contract_version": {
+      "major": "1",
+      "minor": "0",
+      "schema_uri": "https://schemas.easy-cheese.dev/cook-preparation-result"
+    },
+    "coverage": null,
+    "findings": [],
+    "handoff_ref": null,
+    "holds": [
+      {
+        "evidence": [],
+        "hold_id": "curdle-anyway",
+        "kind": "preparation",
+        "reason": "curdle anyway saved this design with unchecked handshake items: fork-taste-third-failure: on 2026-10-04 the user authorized one fresh coherence round on the amended draft after the r2 test-contract gaps were folded in, fork-taste-r3-failure: on 2026-10-04 the user selected override and cook now after the r3 findings (failed-cell spend, reused-row output, baseline drift comparison set, OpenCode sidecar scope) were folded in; /press and /age backstop residual test gaps"
+      }
+    ],
+    "input_kind": "direct_spec",
+    "missing_decision": null,
+    "outcome": "blocked",
+    "planner_request": null,
+    "proposal_digest": null,
+    "proposal_ref": null,
+    "references": [
+      {
+        "artifact_id": "spec-d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+        "digest": "sha256:d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+        "media_type": "text/markdown",
+        "role": "spec",
+        "schema_uri": null,
+        "size_bytes": 17380,
+        "uri": "file:///home/user/tilth/.cheese/cook/bench-result-substrate-artifacts/sha256-d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a"
+      },
+      {
+        "artifact_id": "approval-c2c2e1607f68868419ca368207ce2587d5214a60789caac4f595b613be95b2e7",
+        "digest": "sha256:c2c2e1607f68868419ca368207ce2587d5214a60789caac4f595b613be95b2e7",
+        "media_type": "application/json",
+        "role": "approval",
+        "schema_uri": "https://schemas.easy-cheese.dev/mold-cook-approval",
+        "size_bytes": 1421,
+        "uri": "file:///home/user/tilth/.cheese/cook/bench-result-substrate-artifacts/sha256-c2c2e1607f68868419ca368207ce2587d5214a60789caac4f595b613be95b2e7"
+      },
+      {
+        "artifact_id": "taste_ledger-3386c1b322337aa265744730952c907e7d144305174b4046e1febcf83512f183",
+        "digest": "sha256:3386c1b322337aa265744730952c907e7d144305174b4046e1febcf83512f183",
+        "media_type": "application/json",
+        "role": "taste_ledger",
+        "schema_uri": "https://schemas.easy-cheese.dev/taste-ledger",
+        "size_bytes": 504,
+        "uri": "file:///home/user/tilth/.cheese/cook/bench-result-substrate-artifacts/sha256-3386c1b322337aa265744730952c907e7d144305174b4046e1febcf83512f183"
+      }
+    ],
+    "request_id": "bench-result-substrate",
+    "requirements": [
+      {
+        "description": "unchecked handshake items require explicit follow-up before execution",
+        "evidence": [],
+        "kind": "evidence",
+        "requirement_id": "handshake-coherence"
+      },
+      {
+        "description": "taste verdict did not pass: Contract 'Trajectory sidecar' and Approach step 2 say the sidecar is 'derived from the stream the runner already tees', but AC-1 requires a sidecar 'WHEN any cell completes'. run.py:656 tees only claude and codex cells. The OpenCode lane (config.py:47, gpt5mini) goes through the untee'd subprocess.run branch (run.py:712-721), so no stream file exists to derive from. An implementation that follows the Contract literally leaves OpenCode rows without trajectory_path. The AC-1 contract tests use only a canned Claude stream, so that implementation passes. The Contract should say the sidecar is derived from runner stdout for every runner, or AC-1 should scope OpenCode out., Contract 'Spend ceiling' and AC-4 (F-6): the ceiling compares cumulative spend, but spend is only ever read from a successfully parsed row. A Claude cell that ends with is_error, including subtype error_max_budget_usd when it exhausts the per-cell cap, raises before parse_stream_json (run.py:735-740, pinned by tests/test_run_hardening.py:944-956). A non-zero exit also raises before parsing (run.py:724-733), and so does a timeout (run.py:1284-1291). The generic handler then writes an error row with no total_cost_usd (run.py:1295-1311). These are exactly the cells that spend the most. No AC clause or Test Contract row says whether a failed cell's stream cost counts toward the ledger, and test_ceiling_stops_before_crossing_cell seeds spend only through completed cells. An implementation that sums row costs therefore passes every listed test, and a run of budget-capped failures never trips --max-usd. That defeats F-6's 'explicit spend ceiling'., Contract 'CLI pinning' and AC-3 (G-5): the refusal compares against 'the version in its stored baseline keys'. cli_version is itself a run-key input, so a key lookup can never find a stored row with a different version. The Contract also keeps every row, so the store holds both pre- and post-refreeze rows, and rows from other runners whose CLIs differ (claude vs codex, config.py:39-48). No section defines which stored rows a paid run's CLI version is compared against, for example rows matching every key input except cli_version, newest wins. test_cli_version_change_requires_refreeze only checks that a run with a different CLI version and no flag refuses. An implementation that refuses whenever any stored row carries a different cli_version passes it, yet after one --refreeze-baselines it refuses every later paid run forever, because the old-version rows are never deleted., Contract 'Result store' ('A cell whose key matches a completed row is answered from the store') and AC-2 (G-5): the only observation is that the runner is not invoked (test_completed_row_reused_error_row_rerun). No AC or test row checks that the reused row is emitted into the run's output JSONL. That file is what analyze.py pairs arms from (analyze.py:1058-1147, 'analyze.py unchanged dependencies'), and it is what G-4's research model reads. An implementation that simply skips a matched cell passes every listed test. Its candidate run's JSONL then has no stock-baseline rows, so the stored baselines G-5 promises to reuse never reach the A/B readout., stale-draft-digest",
+        "evidence": [],
+        "kind": "evidence",
+        "requirement_id": "taste-verdict"
+      },
+      {
+        "description": "host-proposed scope coverage is unreadable or malformed: invalid coverage: coverage contains unknown fields: clauses, covered, total",
+        "evidence": [],
+        "kind": "scope",
+        "requirement_id": "host-coverage"
+      }
+    ],
+    "setup_authorization": null
+  },
+  "ready": false,
+  "requirements": [
+    {
+      "description": "unchecked handshake items require explicit follow-up before execution",
+      "evidence": [],
+      "kind": "evidence",
+      "requirement_id": "handshake-coherence"
+    },
+    {
+      "description": "taste verdict did not pass: Contract 'Trajectory sidecar' and Approach step 2 say the sidecar is 'derived from the stream the runner already tees', but AC-1 requires a sidecar 'WHEN any cell completes'. run.py:656 tees only claude and codex cells. The OpenCode lane (config.py:47, gpt5mini) goes through the untee'd subprocess.run branch (run.py:712-721), so no stream file exists to derive from. An implementation that follows the Contract literally leaves OpenCode rows without trajectory_path. The AC-1 contract tests use only a canned Claude stream, so that implementation passes. The Contract should say the sidecar is derived from runner stdout for every runner, or AC-1 should scope OpenCode out., Contract 'Spend ceiling' and AC-4 (F-6): the ceiling compares cumulative spend, but spend is only ever read from a successfully parsed row. A Claude cell that ends with is_error, including subtype error_max_budget_usd when it exhausts the per-cell cap, raises before parse_stream_json (run.py:735-740, pinned by tests/test_run_hardening.py:944-956). A non-zero exit also raises before parsing (run.py:724-733), and so does a timeout (run.py:1284-1291). The generic handler then writes an error row with no total_cost_usd (run.py:1295-1311). These are exactly the cells that spend the most. No AC clause or Test Contract row says whether a failed cell's stream cost counts toward the ledger, and test_ceiling_stops_before_crossing_cell seeds spend only through completed cells. An implementation that sums row costs therefore passes every listed test, and a run of budget-capped failures never trips --max-usd. That defeats F-6's 'explicit spend ceiling'., Contract 'CLI pinning' and AC-3 (G-5): the refusal compares against 'the version in its stored baseline keys'. cli_version is itself a run-key input, so a key lookup can never find a stored row with a different version. The Contract also keeps every row, so the store holds both pre- and post-refreeze rows, and rows from other runners whose CLIs differ (claude vs codex, config.py:39-48). No section defines which stored rows a paid run's CLI version is compared against, for example rows matching every key input except cli_version, newest wins. test_cli_version_change_requires_refreeze only checks that a run with a different CLI version and no flag refuses. An implementation that refuses whenever any stored row carries a different cli_version passes it, yet after one --refreeze-baselines it refuses every later paid run forever, because the old-version rows are never deleted., Contract 'Result store' ('A cell whose key matches a completed row is answered from the store') and AC-2 (G-5): the only observation is that the runner is not invoked (test_completed_row_reused_error_row_rerun). No AC or test row checks that the reused row is emitted into the run's output JSONL. That file is what analyze.py pairs arms from (analyze.py:1058-1147, 'analyze.py unchanged dependencies'), and it is what G-4's research model reads. An implementation that simply skips a matched cell passes every listed test. Its candidate run's JSONL then has no stock-baseline rows, so the stored baselines G-5 promises to reuse never reach the A/B readout., stale-draft-digest",
+      "evidence": [],
+      "kind": "evidence",
+      "requirement_id": "taste-verdict"
+    },
+    {
+      "description": "host-proposed scope coverage is unreadable or malformed: invalid coverage: coverage contains unknown fields: clauses, covered, total",
+      "evidence": [],
+      "kind": "scope",
+      "requirement_id": "host-coverage"
+    }
+  ],
+  "saved": true,
+  "spec_ref": {
+    "artifact_id": "spec-d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+    "digest": "sha256:d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+    "media_type": "text/markdown",
+    "role": "spec",
+    "schema_uri": null,
+    "size_bytes": 17380,
+    "uri": "file:///home/user/tilth/.cheese/cook/bench-result-substrate-artifacts/sha256-d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a"
+  },
+  "status": "saved-not-ready"
+}

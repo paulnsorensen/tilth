@@ -1,0 +1,8 @@
+sphinx-doc__sphinx.e347e59c.test_domain_c.4068b9e8.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=5/6
+Netflix__metaflow.b390a8d4.test_stub_generator.7bf08c98.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=5/6
+mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=5/6
+mwaskom__seaborn.7001ebe7.test_algorithms.1f0181c2.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=1/6
+sympy__sympy.c1097516.test_nullspace.f14fc970.lv1: admitted:mask_patch_forward gold=6/6 empty=5/6 tampered=0/6
+gin-gonic__gin-3741: admitted gold=2/2 empty=1/2 tampered=1/2
+sharkdp__bat-2650: admitted gold=2/2 empty=1/2 tampered=1/2
+exit=0

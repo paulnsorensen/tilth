@@ -1,0 +1,353 @@
+{
+  "policy_version": "age-review-plan.v1",
+  "scope": "diff",
+  "input_digest": "9b8b518f961439f6bd3f547e7d2d2025b74e10557da4c3645a64b318e95228b3",
+  "n": 1,
+  "effort": "normal",
+  "assignments": [
+    {
+      "id": "combined",
+      "subjects": [
+        "changed-behavior",
+        "removed-behavior",
+        "caller-impact",
+        "security",
+        "spec-tests",
+        "reuse",
+        "simplification",
+        "efficiency",
+        "conventions",
+        "altitude"
+      ],
+      "targets": [
+        "benchmark",
+        "benchmark/analyze.py",
+        "benchmark/baselines.py",
+        "benchmark/parse.py",
+        "benchmark/run.py",
+        "benchmark/tests"
+      ],
+      "effort": "high",
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    }
+  ],
+  "subject_dispositions": [
+    {
+      "subject": "changed-behavior",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/baselines.py",
+        "benchmark/parse.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new cell loop, store reuse, spend ledger"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "removed-behavior",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/analyze.py"
+      ],
+      "evidence": [
+        "task-growth verdict removed"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "caller-impact",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "paid runs now require --max-usd; build_runner_env raises for claude with ANTHROPIC_API_KEY"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "security",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "auth guard on ANTHROPIC_API_KEY; env allowlist"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "spec-tests",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/tests"
+      ],
+      "evidence": [
+        "spec test contracts"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "reuse",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "new helpers"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "simplification",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "main loop rewrite"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "efficiency",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/baselines.py",
+        "benchmark/run.py"
+      ],
+      "evidence": [
+        "store reads, probes"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "conventions",
+      "applicability": "yes",
+      "targets": [
+        "benchmark"
+      ],
+      "evidence": [
+        "CLAUDE.md, README"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    },
+    {
+      "subject": "altitude",
+      "applicability": "yes",
+      "targets": [
+        "benchmark/baselines.py"
+      ],
+      "evidence": [
+        "new module placement"
+      ],
+      "owner": "combined",
+      "assigned": true,
+      "reasons": [
+        "combined-coverage",
+        "degraded:subagent execution restriction; agent fan-out unavailable",
+        "risk:auth"
+      ]
+    }
+  ],
+  "rationale": [
+    "scope:diff",
+    "effort:normal",
+    "surface-band:large",
+    "ordinary-budget:5",
+    "risk:auth->security",
+    "protected:conventions",
+    "protected:altitude",
+    "degraded:subagent execution restriction; agent fan-out unavailable"
+  ],
+  "verification": {
+    "required": true,
+    "status": "unavailable",
+    "candidate_batches": [],
+    "reason": "subagent execution restriction; agent fan-out unavailable"
+  },
+  "gap_sweep": {
+    "required": false,
+    "after": "verification",
+    "status": "not-required"
+  },
+  "dispatch_batches": [
+    [
+      "combined"
+    ]
+  ],
+  "degraded_reason": "subagent execution restriction; agent fan-out unavailable",
+  "desired_n": 8,
+  "desired_assignments": [
+    {
+      "id": "general",
+      "subjects": [
+        "changed-behavior",
+        "reuse",
+        "simplification"
+      ],
+      "targets": [
+        "benchmark/baselines.py",
+        "benchmark/parse.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "ordinary-general"
+      ]
+    },
+    {
+      "id": "security",
+      "subjects": [
+        "security"
+      ],
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "effort": "high",
+      "reasons": [
+        "mandatory-risk",
+        "risk:auth"
+      ]
+    },
+    {
+      "id": "caller-impact",
+      "subjects": [
+        "caller-impact"
+      ],
+      "targets": [
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "optional-specialist"
+      ]
+    },
+    {
+      "id": "removed-behavior",
+      "subjects": [
+        "removed-behavior"
+      ],
+      "targets": [
+        "benchmark/analyze.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "optional-specialist"
+      ]
+    },
+    {
+      "id": "spec-tests",
+      "subjects": [
+        "spec-tests"
+      ],
+      "targets": [
+        "benchmark/tests"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "optional-specialist"
+      ]
+    },
+    {
+      "id": "efficiency",
+      "subjects": [
+        "efficiency"
+      ],
+      "targets": [
+        "benchmark/baselines.py",
+        "benchmark/run.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "optional-specialist"
+      ]
+    },
+    {
+      "id": "conventions",
+      "subjects": [
+        "conventions"
+      ],
+      "targets": [
+        "benchmark"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "protected:conventions"
+      ]
+    },
+    {
+      "id": "altitude",
+      "subjects": [
+        "altitude"
+      ],
+      "targets": [
+        "benchmark/baselines.py"
+      ],
+      "effort": "medium",
+      "reasons": [
+        "protected:altitude"
+      ]
+    }
+  ]
+}

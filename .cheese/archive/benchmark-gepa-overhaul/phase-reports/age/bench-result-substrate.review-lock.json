@@ -1,0 +1,33 @@
+{
+  "digest": "67fe88da772270362cd7ffc1d1124f78e20ef1efdc40b256d9d30441e719d783",
+  "evidence_files": {
+    ".cheese/age/bench-result-substrate-plan.json": "mode:100644:sha256:95df0ac1ae36b964fe512d55c0343dcd32c5a5bb6ffb754e39f3f11b10312078",
+    ".cheese/age/bench-result-substrate-route-request.json": "mode:100644:sha256:efa2901f5cc841525ec762a4722d12644070db876836fe2be959c28eefca4ba3",
+    ".cheese/cook/bench-result-substrate-artifacts/results/bench-result-substrate-1.json": "mode:100600:sha256:39f4f6e075bef777e547a300c7d0ec4d9a2ee403d7236367612288a1eb4aaef7",
+    ".cheese/cook/bench-result-substrate-artifacts/results/bench-result-substrate-2.json": "mode:100600:sha256:c6d410f7bdeefd074affc0a0c2c7dd9869b702da54962c35804e232a418d105b",
+    ".cheese/cook/bench-result-substrate-artifacts/sha256-1efb670f1c411c4b5c27d639847496814a658b96902635353f01bdb349618491": "mode:100600:sha256:1efb670f1c411c4b5c27d639847496814a658b96902635353f01bdb349618491",
+    ".cheese/cook/bench-result-substrate-artifacts/sha256-3386c1b322337aa265744730952c907e7d144305174b4046e1febcf83512f183": "mode:100600:sha256:3386c1b322337aa265744730952c907e7d144305174b4046e1febcf83512f183",
+    ".cheese/cook/bench-result-substrate-artifacts/sha256-c2c2e1607f68868419ca368207ce2587d5214a60789caac4f595b613be95b2e7": "mode:100600:sha256:c2c2e1607f68868419ca368207ce2587d5214a60789caac4f595b613be95b2e7",
+    ".cheese/cook/bench-result-substrate-artifacts/sha256-d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a": "mode:100600:sha256:d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+    ".cheese/cook/bench-result-substrate-artifacts/sha256-f43c36f0f8df74c073efd9008ceb9430d18135b96cdd413694dddecf36ef5c8d": "mode:100600:sha256:f43c36f0f8df74c073efd9008ceb9430d18135b96cdd413694dddecf36ef5c8d",
+    ".cheese/cook/bench-result-substrate-baseline.yaml": "mode:100644:sha256:3568b11d5c378231dd71f55ffba38a7a4b03dfbe83c1ddcfdfa276f014ee7181",
+    ".cheese/cook/bench-result-substrate.md": "mode:100600:sha256:127de4812eae97216d0eee90e18b5e3396474b9f2676629036bb11e0e8bf8fe0",
+    ".cheese/cure/bench-result-substrate.md": "mode:100600:sha256:c2b72a57bf8e6eb4980f7aac7620a14cefd5c50c690cdcc931c58a8a672ca961",
+    ".cheese/notes/benchmark-gepa-overhaul.md": "mode:100600:sha256:0042783f7481d9cd2792c3293aaae8875dbf5beee204c31363bc6bade06b28be",
+    ".cheese/press/bench-result-substrate.attempt-1.route.json": "mode:100644:sha256:3bd4f0d5f9e529fc895d75a4080fc41aff51744eba31c3b81388f037fedb1a69",
+    ".cheese/press/bench-result-substrate.attempt-1.telemetry-request.json": "mode:100644:sha256:d51cdcef72b45326a54bbd1204af0042e6e06974deed6921eb1ca93baceb06f0",
+    ".cheese/press/bench-result-substrate.attempt-1.telemetry.json": "mode:100644:sha256:57ba70620d8d9f6590b8aaf52bbbf39e5caec1e1f0d98b057f16572619b4015c",
+    ".cheese/press/bench-result-substrate.md": "mode:100600:sha256:6359127b61eb1f26efcc04b24d571620e339affcd53e98f9c82138487e8b7f07",
+    ".cheese/press/candidates/bench-result-substrate.attempt-1.json": "mode:100644:sha256:9f1749f2c3847e62d9edd30833c39906d4fd9e849350fe3e4667fcf32c701ba6",
+    ".cheese/specs/bench-result-substrate.md": "mode:100644:sha256:d03b8e64c55ce28bb6fc6e199df2c09297d54a42421bb655db475a27172cb17a",
+    ".cheese/specs/benchmark-gepa-overhaul.md": "mode:100644:sha256:1afe66ee38fca34b15300ed3740d163ea1d0ba1023fc69a79fc5a4b3170420de",
+    ".cheese/specs/fuzzy-path-resolution.md": "mode:100644:sha256:a8c1f03e7a61e976eedac638b1336055a568cdc2e227f2c36a104a9e8f3ebf42",
+    ".cheese/specs/grok-qualifier-disambiguation.md": "mode:100644:sha256:e4e2d6d4c891c426a7ad498c6ea8890800fea68cb6d459569e8c6335fdf3a664",
+    ".cheese/specs/post-edit-parse-check.md": "mode:100644:sha256:518e5648c22d4dc339fdc9c31c85bf94653a036e6c6a3177fd07d8c030b3137e",
+    ".cheese/specs/tilth-api-adoption.md": "mode:100644:sha256:f29aff3d9cda233156b32a613592b3a525c76eba78ad3ba78ae612e70fade8bf",
+    ".cheese/specs/tilth-mcp-overhaul.md": "mode:100644:sha256:cbe4c12f6b0662e5b99e8acd5cb0d777bc86ec98b0be803035ba1ece13e16e98",
+    ".cheese/specs/tilth-search-revival.md": "mode:100644:sha256:96fb71972e40894d381b647cf8311b8e4dda37a3b8a107c436b33376196fbdce"
+  },
+  "slug": "bench-result-substrate",
+  "source_digest": "adecbcc6f835ac03c6ab9517bebb5041e7de682a990b9bb71c72d0a5ddbf76aa"
+}

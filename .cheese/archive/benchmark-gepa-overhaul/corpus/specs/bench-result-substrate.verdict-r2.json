@@ -1,0 +1,25 @@
+{
+ "draft_sha256": "66889213b8af4b9dd322a7eba7017e754c8fdbcf3c99c63d070154c27609cdc7",
+ "verdict": "fail",
+ "forks": [
+  {
+   "id": "F-6",
+   "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  }
+ ],
+ "contradictions": [],
+ "orphaned_decisions": [],
+ "unsupported_assumptions": [],
+ "acceptance_gaps": [
+  "Test Contracts, AC-5 row (F-6): AC-5's first clause is 'WHEN a Claude cell starts with ANTHROPIC_API_KEY set THE SYSTEM SHALL exit before the model call'. The row's only expected failure is test_quota_rejection_stops_run, so no contracted test observes the auth guard. The guard is load-bearing because build_runner_env currently passes every ANTHROPIC_* variable through to the runner (benchmark/run.py:174, 197). An implementation that omits the guard passes every listed test while billing silently switches from the subscription to the API key. Add an expected failure such as test_run_hardening.py::test_api_key_blocks_claude_cell: with ANTHROPIC_API_KEY set, the Claude runner is still invoked.",
+  "Test Contracts, AC-3 row (G-5): AC-3 says every runner subprocess SHALL run with DISABLE_AUTOUPDATER=1, and the row names run._runner_env as a referent. Its only expected failure, test_cli_version_change_requires_refreeze, checks the refreeze refusal. build_runner_env (benchmark/run.py:181-220) sets no such variable today, and no listed test checks the env it returns. An implementation that skips the variable passes. The CLI can then auto-update in the middle of a run and change cli_version under stored baselines, which is the failure G-5 pinning exists to prevent.",
+  "Test Contracts, AC-1 row (G-4): AC-1 requires an untruncated sidecar holding every tool call's input and output. The only expected failure, 'row lacks run_key and no sidecar file exists', is a presence check. A sidecar built the way _compact_tool_sequence works passes it: inputs cut to 60-80 characters, unknown args dropped, no tool outputs (benchmark/run.py:291-319). That is exactly what G-4 replaces. The contract should name a failure such as 'a canned tool_use input longer than 80 characters, or its tool_result output, is missing from the sidecar or differs from it'.",
+  "Test Contracts, AC-2/AC-5 rows (G-5): the Contract says stored quota rows are re-run and that a completed row has no infra:quota. AC-5 says a rejected cell is recorded as infra:quota and completed rows stay reusable. AC-2's test seeds only a completed row and an error row. Timeouts are covered because they already store error:'timeout' (benchmark/run.py:1288). AC-5's test checks only that the second runner is not invoked. No test observes that a quota row is written as infra:quota, or that a stored infra:quota row without an error field gets re-run on resume. An implementation that records quota rows as plain completed rows, or reuses them, passes every listed test and poisons the stored baselines."
+ ]
+}

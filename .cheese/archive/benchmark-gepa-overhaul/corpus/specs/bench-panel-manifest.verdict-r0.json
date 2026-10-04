@@ -1,0 +1,28 @@
+{
+  "draft_sha256": "f2dec023ee4cee68dd8477903a8509a37ca3c7c464fa4a594c209fbc273b0cf8",
+  "verdict": "fail",
+  "forks": [
+    {
+      "id": "F-1",
+      "decision": "External tasks run fully native with a local checkout without upstream history, a local uv venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker",
+      "reflected_in": [
+        "approach",
+        "interface sketches",
+        "acceptance",
+        "test contracts"
+      ]
+    }
+  ],
+  "contradictions": [
+    "Test Contracts AC-1 (bench-panel-manifest.md:107): the seam replaces run.run_single with a recorder and stubs the c2 loaders, yet test_external_cell_never_invokes_container must fail when 'no argv is recorded for some external member cell (vacuity guard)'. c2 calls prepare inside run_single (bench-external-tasks.md:44, run.py:479-483 is where the workspace is built), so with run_single replaced no external-cell subprocess ever runs. The vacuity guard always fails, or Cook has to drop the stated seam, which leaves the 'no container' clause of AC-1 unobserved.",
+    "Contract Completeness/Split lock (bench-panel-manifest.md:53,59) and Approach 2-5 (:72-75) put completeness, admission, the row stamp, and the split lock only in run.py --panel and panels.require_complete. panels.load_panel checks only schema and family rules. Parent AC-1 (benchmark-gepa-overhaul.md:114), which c3 closes, refuses ANY paid run that loads the panel. The paid consumer c5 gets only panels.load_panel (parent :149; bench-evolution-loop.md:87,106) and runs cells through run.run_plan, not run.py --panel. Evolve paid runs therefore bypass completeness, admission, the stamp, and the split lock."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "The split lock reads 'the c1 store rows' and scans them by panel_name (Contract :59, Approach 5 :75, Interface sketches :88 'c1 result store rows (read only)'). c1 exposes only baselines.run_key, baselines.lookup(key), and baselines.store(row) (bench-result-substrate.md:96; parent :143), with no row enumeration. c3's crust delta (:90) adds no such API, so the seam the lock depends on does not exist in either spec."
+  ],
+  "acceptance_gaps": [
+    "AC-5 (:99) / Test Contracts AC-5 (:111): the lock tests pre-seed the store directly through baselines.store, and test_rows_carry_panel_stamp checks only output rows. No test checks that a row run.py itself stores during a panel run carries panel_name and panel_split_digest. In HEAD, run metadata is merged after run_single returns (run.py:1232), and where c1 writes to the store is not pinned down. An implementation that stores rows before stamping them passes every listed test while the lock never engages. No test covers the reused-row output stamp (:58) either.",
+    "Contract (:47, :51): FeatureBench members must have language python, and the claim that the Go and Rust members sort so that the Rust slot lands in test depends on swebench_ml language values being go and rust. No AC (AC-6 :100 covers only a local member's language against REPOS) or test (:112) refuses a wrong language on an external member. Language is the primary stratify sort key, so an unvalidated language lets a hand-chosen value steer the dev/test assignment and still pass the stratify-equality check meant to stop hand-picked splits."
+  ]
+}

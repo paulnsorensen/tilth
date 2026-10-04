@@ -1,0 +1,28 @@
+{
+ "draft_sha256": "d159098d84a45a2514c6b8517a415c011af8b5aafd505509103cd9f58a3b89b4",
+ "verdict": "fail",
+ "forks": [
+  {
+   "id": "F-6",
+   "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling",
+   "reflected_in": [
+    "approach",
+    "interface sketches",
+    "acceptance",
+    "test contracts"
+   ]
+  }
+ ],
+ "contradictions": [
+  "Contract 'Result store' says the store 'keeps every row' and that 'an interrupted run resumes this way', and AC-2 reuses any stored row with the same run key without a model call. The cell loop writes a row for every failure (timeout, generic exception, mcp_unavailable, invalid_codex_cell; benchmark/run.py:1240-1300), and AC-5 adds an infra:quota row. The run key covers only cell inputs (model, CLI, harness, task, env, arm, repetition), so a quota-rejected or timed-out cell gets the same key on resume. That cell is then 'answered from the store' with its failure and never re-run. This contradicts the resume promise and AC-5's 'leave completed rows reusable', which implies non-completed rows are not reusable. It also freezes infra failures into the stock baselines G-5 reuses. No section says which rows are eligible for reuse, and the AC-2 and AC-5 tests do not cover a stored failure row.",
+  "Contract 'Spend ceiling' and AC-4 sum 'native total_cost_usd when present, else the pricing.yaml computation'. In the codebase, parse_stream_json sets total_cost_usd=final_summary.get(\"total_cost_usd\", 0.0) (benchmark/parse.py:173), and the OpenCode parser sums `cost or 0.0` (parse.py:449-452). Every row therefore has a numeric total_cost_usd, and a missing field cannot be told apart from $0. As written, the fallback never fires. An OAuth stream without the field adds $0, so the F-6 ceiling never trips. The parent spec's Risks marks the field's presence under OAuth as [speculating]. The spec does not require the parser to keep the field's absence. The only F-6 spend test, test_paid_run_requires_max_usd, checks only that the flag is present, so no test observes the fallback or the stop-before-cell logic."
+ ],
+ "orphaned_decisions": [
+  "Contract 'Serial cells' says cells stay serial and that Codex cells use the host CODEX_HOME. The parent AC-9 enforced this ('run cells one at a time with Codex cells using the host CODEX_HOME'), but the child's AC-5 drops that clause, and no other AC or test contract states it. This slice rewrites the cell loop to add store lookup, resume, and quota stop, and it extends build_runner_env with the auth guard. That is exactly the code that carries both behaviors (run.py:206-207 passes CODEX_HOME), and no acceptance criterion now protects them from regressing."
+ ],
+ "unsupported_assumptions": [
+  "AC-5 and its test contract ('run._run_single_in_repo replaying the recorded OAuth stream fixture', which fails when the 'next cell starts after a rejected rate_limit_event') assume the committed fixture contains a real usage-limit rejection. Approach step 1 only records 'a real claude -p run on OAuth'. An ordinary run contains no rejection, and getting one means exhausting a subscription quota window while recording, which no step plans for. The cited research marks two things as speculating or untested: whether `-p` stream-json emits rate_limit_event at all, and what exit code a usage limit produces. The Contract names no classifier signal. The 'hit your ... limit' text appears only in Provenance. If the recorded stream has no rejection, the quota classifier has no grounded positive case. The test also uses a single-cell seam (`_run_single_in_repo`) that cannot observe 'next cell starts'. Today, an is_error result or a non-zero exit raises RuntimeError (run.py:733-748), and the generic handler in main continues the loop.",
+  "AC-3, AC-4, and test_paid_run_requires_max_usd all depend on whether a run is 'paid', but no section defines the term, and benchmark/ has no such concept (grep finds none). The Problem says runs use a Claude subscription. The auth guard forbids API-key billing for Claude cells. Provenance says total_cost_usd is a notional client-side estimate under subscription. Read as 'billed', no Claude run is ever paid, so neither the F-6 ceiling nor the AC-3 CLI pin ever applies. Read as 'makes a model call', the spec does not decide two things. First, whether a run answered entirely from the store under AC-2 must still pass --max-usd. Second, whether reused rows' stored cost counts toward AC-4's cumulative spend. As written, the AC-4 test cannot pick its trigger condition."
+ ],
+ "acceptance_gaps": []
+}

@@ -1,0 +1,4 @@
+{"mode": "commit-only", "topology": "n/a", "provider": "n/a",
+ "artifacts": [{"target": ".cheese/cook/bench-result-substrate.md", "backend": "cook.pyz", "verified": true}],
+ "gate": {"command": "python3 scripts/verify.py", "result": "pass"},
+ "commits": ["87f2e736ca4946bfefd026541aea442430a45bc4"], "prs": [], "risk": "none"}

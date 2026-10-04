@@ -1,0 +1,16 @@
+{
+  "draft_sha256": "280e29d2d2fc429be28906660b61913fefddbc560850da93c2e80c956b097a13",
+  "verdict": "fail",
+  "forks": [
+    {"id": "F-5", "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-6", "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]}
+  ],
+  "contradictions": [
+    "Parent block (bench-model-judge.md:30) says the curd depends only on bench-result-substrate, and the umbrella puts c2 and c4 in the same parallel layer (benchmark-gepa-overhaul.md:20, :186 'Depends on: c1'). But the Contract's default resolver (bench-model-judge.md:43), the interface sketch (:116), and the arrows (:122) hard-wire `judge.default_resolve_task` to c2's `external.resolve_task`. AC-1's test_external_instance_labelled_and_calibrated (:137) stubs that function. At 806ea7b there is no `benchmark/external` package (`git ls-tree 806ea7b benchmark/`), so a Cook run in c4's own layer has nothing to import or stub. It must either author c2's module itself, which collides with c2's ownership (bench-external-tasks.md:105,117,120), or invent an absent-module fallback that the spec never defines. The dependency on c2 must be declared, or the missing-module behavior specified."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Contract > Critiques > One stripped record (bench-model-judge.md:53) assumes `default_resolve_task(row[\"task\"])` always returns a task for a stored row. c2's `external.resolve_task` returns None for any instance that lacks an admitted verdict under the *current* env fingerprint (bench-external-tasks.md:55), so a stored external row goes unresolvable after a toolchain or lockfile change. Calibration validation (bench-model-judge.md:61, AC-4 :129) checks resolvability only for `tasks` entries. A `trajectories` run_key whose row's task cannot resolve passes validation. `calibrate` then either fails mid-run, after the label calls are already paid, or silently builds a prompt-less record. The validation step is meant to rule this out 'before any judge call'. No AC or test pins either behavior, so an implementation that drops the prompt part passes every listed test."
+  ],
+  "acceptance_gaps": []
+}

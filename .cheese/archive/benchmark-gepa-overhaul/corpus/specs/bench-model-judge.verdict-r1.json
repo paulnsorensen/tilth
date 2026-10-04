@@ -1,0 +1,16 @@
+{
+  "draft_sha256": "fbd4457778fc62fbdd5074ddfd02f1fb20941d0d1b587a481a00439b5b0c2e74",
+  "verdict": "fail",
+  "forks": [
+    {"id": "F-5", "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-6", "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]}
+  ],
+  "contradictions": [],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Contract > Labels > Cache (bench-model-judge.md:50) keys a label only on c1's task_digest, JUDGE_MODEL, and the prompt hash, and assumes task_digest covers every label input. It does not cover the new gin_edit_render_context trusted_reference (:49). At HEAD 87f2e73, _task_fixture_files hashes the directory `<module stem>_fixtures` (benchmark/run.py:573), which is `gin_render_context_tasks_fixtures`. That directory does not exist; the held-out tests live in `gin_render_context_fixtures` (benchmark/tasks/gin_render_context_tasks.py:17; `git ls-tree HEAD benchmark/tasks/` lists only that directory). An edit to the held-out test source therefore changes the judge's label input but not the cache key, so the stale label keeps being served. test_label_cache_key_parts (:137) only mutates the digest directly, so it passes anyway."
+  ],
+  "acceptance_gaps": [
+    "Contract > Spend > Ceiling (bench-model-judge.md:73) ends the canonical estimate rule at '--cell-estimate-usd' and says callers 'pass the ledger and the floor'. But `Judge(ledger, client, resolve_task)` (:43, :117) has no floor parameter, and the CLI makes `--cell-estimate-usd` optional (:118) with no default. run.py's own default (`args.cell_estimate_usd or args.max_budget_usd`, benchmark/run.py:1498) relies on a --max-budget-usd flag that the judge CLI does not have. HEAD also has no shareable ledger object: spend is a closure local in run.main (benchmark/run.py:1495). So the first uncached call of a fresh run, with no cached cost and no flag, has an undefined estimate. An implementation that uses 0 there lets a call cross --max-usd and still passes test_judge_ceiling_stops_before_crossing_call, which supplies an estimate of 0.2, and test_judge_estimate_tiers (:142). No AC-6 test pins the floor's source or default."
+  ]
+}

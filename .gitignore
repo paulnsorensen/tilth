@@ -23,9 +23,10 @@ Thumbs.db
 .serena/*
 !.serena/project.yml
 
-# Cheese workflow artifacts — track specs only
+# Cheese workflow artifacts — track specs and session archives only
 .cheese/*
 !.cheese/specs/
+!.cheese/archive/
 
 # Python
 __pycache__/

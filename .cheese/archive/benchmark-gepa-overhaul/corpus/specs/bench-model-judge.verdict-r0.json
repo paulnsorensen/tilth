@@ -1,0 +1,21 @@
+{
+  "draft_sha256": "cd8461e14e1a436ade580c61d917eaaac640fabfb92905cf3671c0f32705df02",
+  "verdict": "fail",
+  "forks": [
+    {"id": "F-5", "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-6", "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]}
+  ],
+  "contradictions": [
+    "Contract > Critiques > Inputs (bench-model-judge.md:53) re-strips the raw row with a c4-only allowlist that omits `prompt` and adds `num_tool_calls`, but the parent invariant says 'Critique inputs are that same stripped record' reflection receives (benchmark-gepa-overhaul.md:96, parent AC-2 :115) and c5 builds that record with `prompt` and makes it 'the judge.critique input' (bench-evolution-loop.md:45, c5 AC-1 :113). Two different 'same' records exist, and the critique judge, which grades whether structural tools were apt or missed, never sees the task it was asked; Cook cannot satisfy both seams.",
+    "Contract > Spend > Ceiling (bench-model-judge.md:72) and the AGENT-DECIDED tier item (:103) set the judge-call estimate to the mean cached cost of the same kind, then the largest judge call this run, then --cell-estimate-usd; c5 sets a judge call's estimate to 'the mean cost of earlier calls of the same kind in this run, else --cell-estimate-usd' (bench-evolution-loop.md:68). The Judge performs the ledger check itself, so inside evolve one sibling's rule is necessarily violated."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Contract > Judge object (bench-model-judge.md:43) assumes 'c3 or c5 pass a resolver that also loads external tasks', but no sibling mentions `resolve_task`: c3 excludes judge work (bench-panel-manifest.md:117), and c5 consumes only judge.applicability/critique/calibrate (bench-evolution-loop.md:106). The c4 CLI (`label`, `calibrate`, Interface sketches :115) uses the default `TASKS.get`, so it refuses every FeatureBench or SWE-bench instance name as an unresolvable task (:60). Report slicing requires every task in the results to be hand-labelled (:68), so no path the spec defines can label, calibrate, or slice a panel run that holds external tasks. No AC or test exercises an external task through the CLI or calibrate."
+  ],
+  "acceptance_gaps": [
+    "Contract > Judge calls (bench-model-judge.md:44) requires `--strict-mcp-config`, `--setting-sources \"\"`, `--no-session-persistence`, `--disable-slash-commands`, and an empty temporary cwd. AC-6 (:128) and test_judge_argv_is_toolless_and_pinned (:139) check only `--tools \"\"`, the model, the absence of `--bare`, and stdin. `--tools \"\"` disables built-ins only (benchmark/run.py:630-634 at HEAD), so an implementation that drops `--strict-mcp-config` or `--setting-sources \"\"` loads the user's MCP servers and hooks, which can read benchmark/ ground truth and held-out tests. That breaks F-5 critique isolation while every listed test passes.",
+    "Calibration (bench-model-judge.md:60,62) accepts any run_key that has a completed stored row with a trajectory and critiques it 'without the calibration gate'. The contaminated guard (:58) still raises CritiqueWithheld for a row with `contaminated: true` or no `contaminated` field, which includes every row stored before c2 lands. The spec does not say whether calibrate refuses such an entry at load, counts it as a disagreement, or aborts, and no AC-4 test covers the case.",
+    "AC-4 file validation (:126) and test_calibration_file_rejects_bad_entries (:137) cover an unknown label, an unknown task, and a run key with no completed row. They omit two refusals the Contract requires (:60): an unknown critique verdict, and a completed row with no trajectory. An implementation that admits an extra verdict category into the kappa, or a trajectory-less calibration row, passes every test."
+  ]
+}

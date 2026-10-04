@@ -1,0 +1,9 @@
+captured_at: 2026-10-04T00:40:00Z
+gates:
+  - cmd: cd benchmark && python3 -m pytest tests
+    failures:
+      - {suite: benchmark/tests, test_id: test_gin_render_context.py (collection), signature: "ModuleNotFoundError: No module named 'benchmark'"}
+  - cmd: python3 -m pytest benchmark/tests
+    failures: []
+resolved:
+  - {suite: benchmark/tests, test_id: test_gin_render_context.py (collection), note: "collateral repair: repo root added to sys.path so the spec gate runs from benchmark/"}

@@ -1,0 +1,1 @@
+{"attack_id": "bench-result-substrate/press-1", "test_file": "benchmark/tests/test_result_substrate_press.py", "test_digest": "sha256:f8368bcba9f27140ba11163203165ffab8b9828c868bfc386327f5160be517d6", "command": "cd benchmark && python3 -m pytest tests/test_result_substrate_press.py", "result": "10 passed"}

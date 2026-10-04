@@ -1,0 +1,19 @@
+{
+  "goal": "Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.",
+  "goal_clauses": [
+    {
+      "id": "G-4",
+      "text": "The research model reasons over raw result JSONL"
+    },
+    {
+      "id": "G-5",
+      "text": "Stock baselines run once, stored, and reused"
+    }
+  ],
+  "forks": [
+    {
+      "id": "F-6",
+      "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling"
+    }
+  ]
+}

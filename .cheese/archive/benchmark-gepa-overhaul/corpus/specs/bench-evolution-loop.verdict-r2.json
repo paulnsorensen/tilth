@@ -1,0 +1,20 @@
+{
+  "draft_sha256": "6b22a5e75d1cca918ec788dc032079689c3607025ab19e8ea422d2993586229a",
+  "verdict": "fail",
+  "forks": [
+    {"id": "F-2", "decision": "One evolutionary loop mutates code and text; a candidate is a commit", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-3", "decision": "The loop engine is GEPA optimize_anything with repeat runs on frontier candidates", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-4", "decision": "The loop may mutate only src and prompts; winners land as human-reviewed draft PRs", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-5", "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]},
+    {"id": "F-6", "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling", "reflected_in": ["approach", "interface sketches", "acceptance", "test contracts"]}
+  ],
+  "contradictions": [
+    "Contract Spend and auth (spec lines 101 and 103) requires every search-phase judge call to pass `SpendLedger.would_cross(estimate + reserve)`. It also says evolve hands the c4 `Judge` the one shared ledger and the floor and 'defines no judge estimate of its own'. But the accepted c4 seam runs the ceiling check inside the Judge as `ledger.would_cross(estimate)`, with no reserve term, and raises `JudgeSpendCeiling` (bench-model-judge.md:73, AC-6 line 131). Evolve cannot add the reserve to that check: it cannot see the Judge's estimate, and a wrapper ledger would break the single-instance rule (line 43, `test_one_spend_ledger_instance`). So search-phase critiques inside `evaluate` can spend the finish reserve, and `JudgeSpendCeiling` falls into the generic `critique_error` branch (line 64) instead of setting `ceiling`. No test observes this: `test_one_ceiling_spans_all_paid_calls` checks only the full `--max-usd`, and `test_real_gepa_ceiling_stop` uses a proposer estimate.",
+    "Test Contracts AC-6 (spec line 174), `test_text_only_child_of_patched_parent_materializes`, fails when a child that 'changes only `prompts/mcp.md`' yields a commit 'whose `src/` differs from the parent candidate's'. But Applier step 5 (line 75) and AC-6 (line 156) require materialize to rewrite the byte-count, `starts_with`, and `ends_with` literals of `server_instructions_byte_lock` in `src/mcp/mod.rs` (806ea7b src/mcp/mod.rs:774-780, currently 1966) to match the new `prompts/mcp.md`. So any real mcp.md change gives the child a different `src/mcp/mod.rs` from its parent, and a correct implementation fails this test. Cook either drops the rewrite or writes a vacuous same-length fixture."
+  ],
+  "orphaned_decisions": [],
+  "unsupported_assumptions": [
+    "Contract Proposer isolation (spec line 67) and AC-5 (line 155, `test_proposer_command_disables_tools`: the config dir holds nothing but 'the copied auth file') assume `_cell_claude_config` copies a Claude auth file. At 806ea7b, benchmark/run.py:424-447 copies only `wozcode/auth.json`, and only for a Woz plugin mode. For a plain claude call it yields an empty dir, or None when `CLAUDE_CONFIG_DIR` is unset, and Claude auth comes from `CLAUDE_CODE_OAUTH_TOKEN` through `build_runner_env` (run.py:225). So 'the copied auth file' names no file. Unlike the reflection call (line 59), the proposer contract never says it authenticates through `CLAUDE_CODE_OAUTH_TOKEN`. Cook is left to copy the Woz file or the user's Claude credentials file, neither of which the parent auth decision sanctions."
+  ],
+  "acceptance_gaps": []
+}

@@ -1,0 +1,183 @@
+---
+slug: benchmark-gepa-overhaul
+status: draft
+source: mold-handshake
+created: 2026-10-03
+confidence: medium
+leverage: ["contract", "irreversible-effects", "new-slice"]
+gates_overridden: []
+execution_holds: []
+agent_introduced_scope: ["optimize_anything", "evaluator cascade", "run key", "trajectory sidecar", "max-usd", "dev/test split", "applicability label", "trajectory critique", "ShinkaEvolve", "HGM", "OpenEvolve"]
+goal_coverage: {"G-1": "covered", "G-2": "covered", "G-3": "covered", "G-4": "covered", "G-5": "covered", "G-6": "covered"}
+entity_referent_bindings: [{"noun": "cell", "verdict": "bound", "referent": "benchmark/run.py planned_cell_count", "citation": "benchmark/run.py:895-903", "note": "task x model x mode x repetition"}, {"noun": "arm", "verdict": "bound", "referent": "benchmark/config.py MODES and variants.py experiment arms", "citation": "benchmark/config.py:142-165", "note": "stock baseline arms are no_tilth (claude) and the codex runner without MCP"}, {"noun": "candidate", "verdict": "NEW ENTITY", "referent": "git commit plus binary_sha256 recorded in row.variant", "citation": "benchmark/run.py:803-857", "note": "reuses existing variant.git_sha and binary_sha256 fields"}, {"noun": "panel", "verdict": "NEW ENTITY", "referent": "benchmark/panels/<name>.json", "citation": "none", "note": "pre-registered task list with dev/test split"}, {"noun": "run key", "verdict": "NEW ENTITY", "referent": "benchmark/baselines.py run_key", "citation": "none", "note": "hash of model id, agent CLI version, dataset revision, effort, timeout, task, arm, repetition"}, {"noun": "grader", "verdict": "bound", "referent": "FeatureBench fb eval (featurebench.harness.run_evaluation)", "citation": "LiberCoders/FeatureBench@8d4e347 harness/utils.py:23", "note": "pinned upstream; not vendored"}]
+agent_resolution: []
+gate_applicability:
+  disposition: red-required
+  work_class: behavior
+  ui_surface: non-browser
+landing:
+  shape: diamond_stack
+  layers: [["c1-result-substrate"], ["c2-featurebench-adapter", "c4-model-judge"], ["c3-panel-manifest"], ["c5-evolution-loop"]]
+  per_layer_green: required
+  review_fixes: fold
+---
+
+# Benchmark overhaul: FeatureBench, Gin, and a GEPA evolution loop against frozen baselines
+
+## Problem
+
+Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.
+
+Today the harness cannot do any of that. Every run rewrites a fresh timestamped JSONL with no run key, so stock baselines are re-bought on every A/B (`benchmark/run.py:1144`). The row discards tool results and truncates arguments to 60–80 characters (`benchmark/parse.py:10-16`, `benchmark/run.py:291-319`), so a reflection model has nothing to reason over. There is no Docker grading, no judge, and no dollar ceiling (`--max-cells` caps calls only, `benchmark/run.py:906-911`). The MCP instruction text is compiled in (`src/mcp/mod.rs:76`), so any optimizer must produce builds, not text swaps. The maintainer feels this: every experiment costs a full re-run and yields only pass/fail.
+
+## Goals
+
+- G-1: FeatureBench tasks run in our harness.
+- G-2: The Gin render-context task is in the panel.
+- G-3: A couple of other cherry-picked tasks are in the panel.
+- G-4: The research model reasons over raw result JSONL.
+- G-5: Stock baselines run once, are stored, and are reused.
+- G-6: A model judge decides where structural tools apply.
+
+## Non-goals
+
+- A structural write op in `tilth_write`; tracked as issue #310 (user-filed in the prior session).
+- Harbor or a forked native FeatureBench harness (F-1 picked our runner).
+- FeatureBench tasks that need a GPU, and Level 2 tasks (no gold patch) [AGENT-INTRODUCED].
+- SWE-bench Multilingual or Pro task imports [AGENT-INTRODUCED].
+- Auto-merging any optimizer winner (F-4: winners land as draft PRs).
+- Bumping the crate or npm version (fork law).
+
+## Deferred follow-ups
+
+- **bench-gpu-host** — rent a GPU host to admit the GPU-flagged FeatureBench Lite tasks.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: this spec, Non-goals
+- **bench-multilingual-panel** — add Go/Rust/TypeScript tasks from SWE-bench Multilingual or Pro to the panel.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: this spec, Non-goals
+- **bench-hgm-parent-selection** — swap GEPA parent selection for clade-metaproductivity (HGM) if frontier noise dominates.
+  - Destination: local_draft
+  - State: prepared
+  - Reference: arXiv 2510.21614
+
+## Grounding
+
+| Probe | Outcome | Evidence |
+| --- | --- | --- |
+| wiki | unavailable | `hallouminate ground --corpus repo:tilth:wiki` returned 0 hits with index coverage 0/43; fallback read of `.hallouminate/wiki/benchmark-harness-gotchas.md` (stale-binary instructions, pricing drift 33.7%, safe-mode MCP stripping, credential lifetime) |
+| explorer | hit | Explorer digest this session: no run key or cache (`run.py:1144`), tool results discarded (`parse.py:10-16`), instructions compiled in (`src/mcp/mod.rs:76`, `definitions.rs:4,10,117`), byte-lock and AGENTS.md lockstep tests (`mod.rs:771-803`, `mod.rs:1231`), power gate (`PHASE4_PLAN.md:3-25`); FeatureBench research at `8d4e347` (agent in container, separable `fb eval`, `/root/my_repo` leak, 10–19 GB images, GPU flags) |
+
+## Approach
+
+Build a result substrate first, then two independent adapters, then the panel, then the loop.
+
+1. **Result substrate (G-4, G-5, F-6).** Every row gains a `run_key`, the agent CLI version, the timeout, and a pointer to an untruncated trajectory sidecar holding every tool call with its input and output. A baseline store returns an existing row for a matching key instead of calling a model. `run.py` gains a required `--max-usd` ceiling on paid runs, summed from native cost. `PHASE4_PLAN.md` is marked superseded by this spec (F-6).
+2. **FeatureBench adapter (F-1, G-1).** Our runner starts the agent inside a container from the digest-pinned per-repo image, reproduces the native Level 1 setup exactly (copy, mask patch, F2P test deletion, `/root/my_repo` deletion, git init), runs the claude or codex CLI with the candidate tilth binary mounted, and extracts `git diff --cached` as the patch. The pinned upstream `fb eval` grades it in a fresh container. A task enters a panel only after gold, empty, and tampered patches grade correctly on this host. Dataset v1.1 and grader `8d4e347` are pinned.
+3. **Model judge (F-5, G-6).** A pinned judge labels each panel task once for structural-tool applicability from its problem statement and gold patch, cached by task, dataset revision, judge model, and prompt hash. It critiques each rollout from its trajectory. Both outputs are gated by agreement with a hand-labeled calibration set. Critiques feed reflection only; they never enter a score.
+4. **Panel manifest (G-2, G-3).** A pre-registered panel lists the admitted FeatureBench tasks, `gin_edit_render_context`, and the cherry-picks `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, with a stratified dev/test split committed before the first paid run.
+5. **Evolution loop (F-2, F-3, F-4).** GEPA `optimize_anything` evolves candidates; each candidate is materialized as a commit on a scratch branch (F-2). A mutation may touch any of `src/**` and `prompts/**` except evaluator paths (F-4); the applier then regenerates `AGENTS.md` and updates the byte lock mechanically. Each candidate runs an evaluator cascade: cargo build, test, and clippy; `tests/mcp_v2` when `src/edit/**` changed; the cheap tier; then the paid tier against frozen baseline rows (F-3, G-5). The score is grader correctness only; trajectories and judge critiques are reflection side information (F-5). Frontier candidates are re-run before acceptance (F-3). At the end, the best frontier candidates are scored once on the held-out test split and the winner opens as a draft PR (F-4).
+
+## Decisions
+
+- F-1: FeatureBench runs through our runner with the agent inside the task container and the pinned upstream `fb eval` grader in a fresh container — keeps rows in our JSONL and avoids grading in the agent-touched container.
+- F-2: One evolutionary loop mutates code and text; a candidate is a commit — instructions are compiled in, and `variant.git_sha` / `binary_sha256` already prove what was served.
+- F-3: The loop engine is GEPA `optimize_anything` with repeat runs on frontier candidates — trajectory reflection matches G-4 and it has the best measured budget (150–600 metric calls).
+- F-4: The loop may mutate all of `src/**` and `prompts/**` except evaluator paths; winners land as human-reviewed draft PRs — user chose the widest search space; the cascade is the backstop.
+- F-5: The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective — the loop cannot game a score it cannot touch.
+- F-6: The Phase 4 power gate is retired; every paid run requires an explicit dollar ceiling — user retired the gate; `--max-usd` replaces it as the spend control.
+- _Minor decisions:_ cherry-picks are existing hard tasks (also the cheap tier); dataset v1.1 + grader `8d4e347`; CPU-only Level 1 panel; `src/edit/**` mutations also gate on `tests/mcp_v2`; diffs inside `#[cfg(test)]` spans are rejected except the applier's byte-lock update; the judge model is pinned and recorded in the run key; `--max-usd` has no default.
+
+## Acceptance
+
+- AC-1: WHEN `run.py` runs a FeatureBench cell THE SYSTEM SHALL start the agent inside a container from the digest-pinned image, apply the native Level 1 setup including deletion of the F2P test file and `/root/my_repo`, and record `git diff --cached` as the cell's patch.  (F-1, G-1)
+- AC-2: WHEN a FeatureBench cell finishes THE SYSTEM SHALL grade its patch with the pinned `fb eval` in a fresh container and write `correct` from `resolved`, plus `pass_rate` and F2P/P2P counts, into the row.  (F-1, G-1)
+- AC-3: WHEN a FeatureBench task is admitted to a panel THE SYSTEM SHALL require that its gold patch resolves and its empty and tampered patches do not resolve on this host, and SHALL refuse GPU-flagged and Level 2 tasks.  (F-1, G-1)
+- AC-4: WHEN a panel manifest is loaded THE SYSTEM SHALL list the admitted FeatureBench tasks, `gin_edit_render_context`, `rg_search_dispatch`, `rg_trait_implementors`, and `gin_servehttp_flow` with a dev/test split, and SHALL refuse a paid run against a manifest whose split changed after its first recorded result.  (G-2, G-3)
+- AC-5: WHEN any cell completes THE SYSTEM SHALL write an untruncated trajectory sidecar with every tool call's input and output, and the row SHALL carry `run_key`, `cli_version`, `timeout_s`, and the candidate `git_sha` and `binary_sha256`.  (G-4, F-2)
+- AC-6: WHEN a baseline-arm cell is requested and the baseline store holds a row with the same run key THE SYSTEM SHALL reuse that row without a model call, and WHEN no row matches THE SYSTEM SHALL run the cell and store it.  (G-5, F-3)
+- AC-7: WHEN a paid run starts without `--max-usd` THE SYSTEM SHALL exit before any model call, and WHEN cumulative native cost plus the next cell's estimate exceeds the ceiling THE SYSTEM SHALL stop before that cell.  (F-6)
+- AC-8: WHEN a panel task lacks a cached applicability label for its run key THE SYSTEM SHALL produce one from the problem statement and gold patch with the pinned judge and cache it by task, dataset revision, judge model, and judge prompt hash.  (F-5, G-6)
+- AC-9: WHEN the judge's agreement with the hand-labeled calibration set is below the configured threshold THE SYSTEM SHALL refuse to supply labels or critiques to an optimizer run.  (F-5, G-6)
+- AC-10: WHEN the optimizer scores a candidate THE SYSTEM SHALL use grader correctness as the only score and pass trajectories and judge critiques only as reflection side information.  (F-5, F-3, G-4)
+- AC-11: WHEN the optimizer proposes a candidate THE SYSTEM SHALL materialize it as a commit on a scratch branch, reject any diff touching `benchmark/**`, `tests/**`, `.github/**`, the `Cargo.toml` version line, or a `#[cfg(test)]` span, and then regenerate `AGENTS.md` and the byte lock mechanically.  (F-2, F-4)
+- AC-12: WHEN a candidate commit exists THE SYSTEM SHALL evaluate it through the cascade of cargo build, test, and clippy; `tests/mcp_v2` when `src/edit/**` changed; the cheap tier; then the paid tier, and SHALL stop at the first failing stage with score 0 and that stage recorded.  (F-3, F-4)
+- AC-13: WHEN a candidate reaches the paid tier THE SYSTEM SHALL compare it against frozen baseline rows without re-running baseline arms, and SHALL re-run a frontier candidate the configured number of times before accepting it onto the frontier.  (F-3, G-5)
+- AC-14: WHEN the optimizer run ends THE SYSTEM SHALL score the best frontier candidates once on the held-out test split and open the winner as a draft PR without merging it.  (F-4, F-2)
+
+## Test Contracts
+
+| Acceptance ID | Interface referent | Outermost stable seam | Expected failure | Mode | Interface version | Matrix rows |
+| --- | --- | --- | --- | --- | --- | --- |
+| AC-1 | `featurebench.FeatureBenchTask.prepare_container` (F-1) | `run._run_single_in_repo` with a fake container runner | `test_featurebench.py::test_setup_deletes_solution_copy` fails: recorded container commands lack `rm -rf /root/my_repo` | tracer | | |
+| AC-2 | `featurebench.grade` (F-1) | `FeatureBenchTask.check_correctness` with a stubbed `fb eval` report | `test_featurebench.py::test_row_carries_resolved_and_pass_rate` fails: row has no `pass_rate` key | tracer | | |
+| AC-3 | `featurebench.preflight` (F-1) | `featurebench.preflight` CLI with stubbed grader verdicts | `test_featurebench.py::test_preflight_rejects_tampered_resolve` fails: a task whose tampered patch resolves is admitted | tracer | | |
+| AC-4 | `panels.load_panel` (F-1) | `run.main` with `--panel` | `test_panels.py::test_split_change_after_results_refused` fails: run proceeds after split edit | tracer | | |
+| AC-5 | `baselines.run_key`, trajectory sidecar writer (F-2) | `run._run_single_in_repo` with a canned stream | `test_run_hardening.py::test_row_has_run_key_and_sidecar` fails: row lacks `run_key` and no sidecar file exists | tracer | | |
+| AC-6 | `baselines.lookup` / `baselines.store` (F-3) | `run.main` with a pre-seeded baseline store | `test_baselines.py::test_matching_key_skips_model_call` fails: runner invoked despite stored row | tracer | | |
+| AC-7 | `run.py --max-usd` (F-6) | `run.main` argument parsing and cell loop | `test_run_hardening.py::test_paid_run_requires_max_usd` fails: run starts without the flag | tracer | | |
+| AC-8 | `judge.applicability` (F-5) | `judge.applicability` with a stubbed judge client | `test_judge.py::test_label_cached_by_full_key` fails: second call with same key hits the client | tracer | | |
+| AC-9 | `judge.calibrate` (F-5) | `evolve.main` preflight | `test_judge.py::test_low_agreement_blocks_optimizer` fails: optimizer starts with agreement below threshold | tracer | | |
+| AC-10 | `evolve.evaluate` (F-5) | `evolve.evaluate` with stubbed cascade output | `test_evolve.py::test_score_ignores_judge` fails: score changes when only the critique changes | tracer | | |
+| AC-11 | `evolve.materialize` (F-2, F-4) | `evolve.materialize` against a temp git repo | `test_evolve.py::test_rejects_evaluator_path_diff` fails: a diff touching `benchmark/run.py` is committed | tracer | | |
+| AC-12 | `evolve.cascade` (F-4) | `evolve.cascade` with stubbed stage commands | `test_evolve.py::test_cascade_stops_at_first_failure` fails: paid tier runs after a clippy failure | tracer | | |
+| AC-13 | `evolve.cascade` paid tier (F-3) | `evolve.cascade` with a pre-seeded baseline store | `test_evolve.py::test_paid_tier_reuses_baselines` fails: baseline arm cells are scheduled | tracer | | |
+| AC-14 | `evolve.finish` (F-4) | `evolve.finish` with a stubbed PR client | `test_evolve.py::test_finish_opens_draft_never_merges` fails: merge call recorded or PR not draft | tracer | | |
+
+## Interface sketches
+
+```text
+slice:            benchmark (existing harness) + NEW SLICE benchmark/featurebench/, benchmark/judge/, benchmark/evolve/
+spine step:       workflow (run.py cell loop) + infra (container runner, baseline store)
+public interface: featurebench.FeatureBenchTask(Task).prepare_container(image_digest) / extract_patch() / check_correctness()  (F-1)
+public interface: featurebench.grade(predictions, *, grader_pin, data_rev) -> list[FbReport]  (F-1)
+public interface: featurebench.preflight(instance_id) -> PreflightVerdict  (F-1)
+public interface: baselines.run_key(cell) -> str; baselines.lookup(key) -> Row | None; baselines.store(row)  (F-3)
+public interface: run.py --panel PATH --max-usd FLOAT --candidate-sha SHA  (F-6, F-2)
+public interface: panels.load_panel(path) -> Panel(dev, test)  (F-1)
+public interface: judge.applicability(task) -> Label; judge.critique(row, trajectory) -> str; judge.calibrate(labels) -> Agreement  (F-5)
+public interface: evolve.main(--panel, --max-usd, --max-metric-calls, --seed-sha); evolve.materialize(candidate) -> sha; evolve.cascade(sha) -> (score, side_info); evolve.finish(frontier)  (F-2, F-3, F-4)
+private:          docker lifecycle and image digest pinning; native Level 1 setup replay; trajectory sidecar format; judge prompts; GEPA engine config; mutation path allowlist; AGENTS.md regen + byte-lock update
+crust delta:      new run.py flags (--panel, --max-usd, --candidate-sha); new row fields (run_key, cli_version, timeout_s, trajectory_path, pass_rate); new packages featurebench/judge/evolve; PHASE4_PLAN.md superseded
+arrows:           run.py -> featurebench, baselines, panels; evolve -> run.py, baselines, judge, panels; judge -> baselines (row + sidecar read); no arrow from tilth src/ into benchmark/
+```
+
+## Risks
+
+- FeatureBench images are 10–19 GB each (~167 GB for Lite); disk and pull time bound which hosts can run the panel.
+- GPU-flagged tasks may shrink the CPU-only panel well below 12; admission may yield fewer FeatureBench tasks than hoped.
+- Per-instance Pareto selection chases noise on $3–10 rollouts; frontier re-runs cost extra budget.
+- Mutating all of `src/` invites overfitting to a ~10-task dev split and quiet weakening of edit safety; the cascade and held-out test split are the only guards.
+- Retiring the power gate removes the statistical stop; `--max-usd` limits spend but not false-positive conclusions.
+- The `fb eval` pin may disagree with dataset v1.1 environment fixes (mlflow); preflight must catch it.
+- Running the claude CLI inside third-party images needs credentials copied in; the wiki records revoked tokens invalidating a whole run.
+
+## Open questions
+
+- [TBD] Candidate representation for `optimize_anything` when the whole `src/` is mutable: a unified diff as one text component, or a custom proposer that runs a coding agent in a worktree. Resolve with a prototype cycle as the first step of the evolution loop curd.
+- [TBD] Judge agreement threshold and calibration-set size (default proposal: every panel task for applicability plus 20 trajectories, Cohen's kappa ≥ 0.6).
+- [TBD] Frontier re-run count and plateau window (default proposal: 3 re-runs; stop after 5 rounds without dev improvement).
+
+## Quality gates
+
+- `just check`: exits 0 (fmt, clippy, cargo test, `tests/mcp_v2`, `tests/scripts`, bash-guard self-test).
+- `cd benchmark && python3 -m pytest tests`: exits 0, including the new `test_featurebench.py`, `test_panels.py`, `test_baselines.py`, `test_judge.py`, `test_evolve.py`.
+- `python3 benchmark/featurebench/preflight.py --panel benchmark/panels/<name>.json`: every admitted task reports gold resolved, empty and tampered unresolved.
+
+## Curds
+
+- **c1-result-substrate** — run key, untruncated trajectory sidecar, `cli_version`/`timeout_s` fields, baseline store, `--max-usd`, PHASE4_PLAN superseded. Covers G-4, G-5. ACs 5, 6, 7. Depends on: none. State: proposed.
+- **c2-featurebench-adapter** — container runner, native setup replay, patch extraction, pinned `fb eval` grading, preflight. Covers G-1. ACs 1, 2, 3. Depends on: c1. State: proposed.
+- **c4-model-judge** — applicability labels, rollout critiques, calibration gate. Covers G-6. ACs 8, 9. Depends on: c1. State: proposed.
+- **c3-panel-manifest** — pre-registered panel with Gin, cherry-picks, admitted FeatureBench tasks, and the split lock. Covers G-2, G-3. AC 4. Depends on: c2. State: proposed.
+- **c5-evolution-loop** — candidate materialization, mutation allowlist, cascade, GEPA engine, frontier re-runs, held-out scoring, draft PR. Covers G-4, G-5. ACs 10–14. Depends on: c1, c3, c4. State: proposed.
+
+## References
+
+- FeatureBench at `8d4e347`: https://github.com/LiberCoders/FeatureBench (accessed 2026-10-03)
+- GEPA `optimize_anything`: https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/ (accessed 2026-10-03)
+- Darwin Gödel Machine cost: https://arxiv.org/html/2505.22954v1 App. B.1 (accessed 2026-10-03)
+- Huxley-Gödel Machine: https://arxiv.org/html/2510.21614v2 (accessed 2026-10-03)
+- COSPA Pareto-12: https://raw.githubusercontent.com/shisa-ai/cospa/main/configs/featurebench_lite_pareto12_v1.json (accessed 2026-10-03)

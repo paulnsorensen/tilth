@@ -1,0 +1,55 @@
+{
+  "goal": "Grow the benchmark with FeatureBench, the Gin render-context task, and a few cherry-picked tasks, in a format GEPA can optimize against once-run stored baselines, with a model judge for structural-tool applicability.",
+  "goal_clauses": [
+    {
+      "id": "G-1",
+      "text": "FeatureBench tasks run in our harness"
+    },
+    {
+      "id": "G-2",
+      "text": "Gin render-context task is in the panel"
+    },
+    {
+      "id": "G-3",
+      "text": "A couple of other cherry-picked tasks: the three local hard tasks plus one Go and one Rust SWE-bench Multilingual instance"
+    },
+    {
+      "id": "G-4",
+      "text": "The research model reasons over raw result JSONL"
+    },
+    {
+      "id": "G-5",
+      "text": "Stock baselines run once, stored, and reused"
+    },
+    {
+      "id": "G-6",
+      "text": "A model judge decides where structural tools apply"
+    }
+  ],
+  "forks": [
+    {
+      "id": "F-1",
+      "decision": "External tasks run fully native with a local checkout without upstream history, a local uv venv or Go/Rust toolchain, and our replay of the instance's FAIL_TO_PASS/PASS_TO_PASS tests; no Docker"
+    },
+    {
+      "id": "F-2",
+      "decision": "One evolutionary loop mutates code and text; a candidate is a commit"
+    },
+    {
+      "id": "F-3",
+      "decision": "The loop engine is GEPA optimize_anything with repeat runs on frontier candidates"
+    },
+    {
+      "id": "F-4",
+      "decision": "The loop may mutate only src and prompts; winners land as human-reviewed draft PRs"
+    },
+    {
+      "id": "F-5",
+      "decision": "The judge labels per-task applicability and critiques each rollout for reflection only; grader correctness is the only objective"
+    },
+    {
+      "id": "F-6",
+      "decision": "The Phase 4 power gate is retired; every paid run requires an explicit spend ceiling"
+    }
+  ]
+}
