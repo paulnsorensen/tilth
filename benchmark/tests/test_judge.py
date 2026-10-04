@@ -897,3 +897,166 @@ def test_judge_estimate_tiers(judge_home: Path) -> None:
     next_run = make_judge(StubClient(), floor=0.07)
     assert next_run._estimate("critique") == pytest.approx(0.07)
     assert next_run._estimate("applicability") == pytest.approx(0.3)
+
+
+# Press attacks: adversarial edges of the approved contract.
+
+
+def test_press_external_record_holds_agent_prompt_only(external_instance: FakeExternalTask, judge_home: Path) -> None:
+    row, sidecar = rollout(judge_home, task=EXTERNAL_ID)
+    record = core.stripped_record(row, sidecar)
+    text = json.dumps(record)
+    assert record["prompt"] == external_instance.problem_statement
+    assert "GOLD_TEXT" not in text and "HELDOUT_TEXT" not in text
+
+
+def test_press_count_fields_admit_integers_only(judge_home: Path) -> None:
+    row, sidecar = rollout(judge_home, p2p_total=7, f2p_flag=True, f2p_ratio=0.5, p2p_log="SECRET_GT")
+    kept = core.stripped_record(row, sidecar)["row"]
+    assert kept["p2p_total"] == 7 and kept["f2p_passed"] == 3
+    assert not {"f2p_flag", "f2p_ratio", "p2p_log", "f2p_output"} & set(kept)
+
+
+def test_press_large_trajectory_goes_whole_on_stdin(judge_home: Path) -> None:
+    seed_agreement()
+    row, _ = rollout(judge_home)
+    sidecar = json.dumps({"name": "Bash", "input": {"command": "cat"}, "output": "y" * 200_000}) + "\n"
+    recorder = Recorder(claude_stream("verdict: apt\nfine", 0.01))
+    make_judge(core.ClaudeJudgeClient(spawn=recorder)).critique(row, sidecar)
+    (call,) = recorder.calls
+    assert sidecar in call["input"]
+    assert all(len(part) < 1000 for part in call["argv"])
+
+
+def test_press_full_judge_argv() -> None:
+    assert core.ClaudeJudgeClient.argv() == [
+        "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-sonnet-5",
+        "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+        "--no-session-persistence", "--disable-slash-commands",
+    ]
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_press_contamination_must_be_exactly_false(judge_home: Path, value: object) -> None:
+    seed_agreement()
+    row, sidecar = rollout(judge_home, contaminated=value)
+    client = echo_client()
+    with pytest.raises(core.CritiqueWithheld) as withheld:
+        make_judge(client).critique(row, sidecar)
+    assert withheld.value.reason == "contaminated"
+    assert client.prompts == []
+
+
+def test_press_cached_critique_still_guarded(judge_home: Path) -> None:
+    seed_agreement()
+    row, sidecar = rollout(judge_home)
+    make_judge(StubClient(answer="verdict: apt")).critique(row, sidecar)
+    with pytest.raises(core.CritiqueWithheld):
+        make_judge(StubClient()).critique({**row, "contaminated": True}, sidecar)
+    judge_config.CALIBRATION_FILE.write_text(json.dumps({"tasks": {"rg_search_dispatch": "weak"}, "trajectories": []}))
+    with pytest.raises(core.CritiqueWithheld) as withheld:
+        make_judge(StubClient()).critique(row, sidecar)
+    assert withheld.value.reason == "uncalibrated"
+
+
+def test_press_critique_cache_tracks_model(monkeypatch: pytest.MonkeyPatch, judge_home: Path) -> None:
+    seed_agreement()
+    row, sidecar = rollout(judge_home)
+    client = StubClient(answer="verdict: apt")
+    make_judge(client).critique(row, sidecar)
+    monkeypatch.setattr(judge_config, "JUDGE_MODEL", "claude-opus-5")
+    seed_agreement()
+    make_judge(client).critique(row, sidecar)
+    assert len(client.prompts) == 2
+
+
+def test_press_cached_calls_spend_nothing() -> None:
+    task = TASKS["rg_search_dispatch"]
+    make_judge(StubClient(cost=0.4)).applicability(task)
+    ledger = SpendLedger(0.0)
+    assert make_judge(StubClient(), ledger=ledger).applicability(task) == "strong"
+    assert ledger.spent == 0 and ledger.charges == []
+
+
+def test_press_timeout_is_charged_as_estimate() -> None:
+    def hang(argv: list[str], **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(argv, 1, output=b"")
+    ledger = SpendLedger(10.0)
+    with pytest.raises(core.JudgeCallFailed):
+        make_judge(core.ClaudeJudgeClient(spawn=hang), ledger=ledger, floor=0.2).applicability(
+            TASKS["rg_search_dispatch"])
+    assert ledger.charges == [(pytest.approx(0.2), "estimate")]
+    assert store.cached_label(run._cell_task_digest(TASKS["rg_search_dispatch"])) is None
+
+
+def test_press_quota_stops_critiques_too(judge_home: Path) -> None:
+    seed_agreement()
+    recorder = Recorder((STREAMS / "claude_quota_rejected.jsonl").read_text())
+    with pytest.raises(core.JudgeQuota):
+        make_judge(core.ClaudeJudgeClient(spawn=recorder)).applicability(TASKS["rg_search_dispatch"])
+    row, sidecar = rollout(judge_home)
+    with pytest.raises(core.JudgeQuota):
+        make_judge(core.ClaudeJudgeClient(spawn=recorder)).critique(row, sidecar)
+    assert len(recorder.calls) == 1
+    assert store.cached_critique(row["run_key"]) is None
+
+
+def test_press_undefined_verdict_kappa_is_uncalibrated(judge_home: Path, calibration_tasks: list[str]) -> None:
+    rows = seed_rollouts(judge_home, 20)
+    write_calibration({name: ("strong" if index < 5 else "none") for index, name in enumerate(calibration_tasks)},
+                      [{"run_key": row["run_key"], "verdict": "apt"} for row in rows])
+    labels = core.load_calibration()
+    judge_labels = {name: ("strong" if index < 5 else "none") for index, name in enumerate(calibration_tasks)}
+    agreement = make_judge(StubClient(answer=scripted(judge_labels, {index: "apt" for index in range(20)}))).calibrate(labels)
+    assert agreement.label_kappa == pytest.approx(1.0)
+    assert agreement.verdict_kappa is None
+    assert agreement.calibrated is False
+    assert store.current_agreement() == agreement
+
+
+def test_press_calibration_edit_makes_agreement_stale(judge_home: Path, calibration_tasks: list[str]) -> None:
+    rows = seed_rollouts(judge_home, 20)
+    labels = calibration_set(calibration_tasks, rows)
+    judge_labels = {name: ("strong" if index < 5 else "none") for index, name in enumerate(calibration_tasks)}
+    judge_verdicts = {index: ("apt" if index < 10 else "missed") for index in range(20)}
+    assert make_judge(StubClient(answer=scripted(judge_labels, judge_verdicts))).calibrate(labels).calibrated
+    assert store.current_agreement() is not None
+    judge_config.CALIBRATION_FILE.write_text(judge_config.CALIBRATION_FILE.read_text() + "\n")
+    assert store.current_agreement() is None
+    assert "## Applicability (uncalibrated)" in analyze.generate_report(report_rows())
+
+
+def test_press_calibration_leaves_result_store_unchanged(judge_home: Path, calibration_tasks: list[str]) -> None:
+    rows = seed_rollouts(judge_home, 20)
+    calibration_set(calibration_tasks, rows)
+    before = judge_config.RESULT_STORE.read_bytes()
+    client = StubClient(answer=lambda prompt: "strong" if is_label_prompt(prompt) else "verdict: apt")
+    assert cli.main(["calibrate", "--max-usd", "5", "--cell-estimate-usd", "0.1"], client=client) == 0
+    assert judge_config.RESULT_STORE.read_bytes() == before
+
+
+def test_press_changed_task_digest_is_unlabelled(no_judge_calls: None) -> None:
+    seed_agreement(tasks=("alpha", "beta"))
+    seed_report_labels(alpha="strong", beta="none")
+    rows = report_rows()
+    rows[0]["task_digest"] = "digest-alpha-edited"
+    text = section(analyze.generate_report(rows))
+    assert "| Label | Mode |" not in text
+    assert "alpha" in text.splitlines()[0] and "beta" not in text.splitlines()[0]
+
+
+def test_press_cli_refuses_unknown_task_without_spawn() -> None:
+    client = StubClient()
+    assert cli.main(["label", "--tasks", "no_such_task", "--max-usd", "5", "--cell-estimate-usd", "0.1"],
+                    client=client) != 0
+    assert client.prompts == []
+
+
+def test_press_cli_runs_as_script_without_spawning(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(BENCHMARK_DIR / "judge" / "cli.py"), "label", "--tasks", "rg_search_dispatch"],
+        capture_output=True, text=True, cwd=tmp_path,
+        env={**os.environ, "PATH": str(tmp_path)},
+    )
+    assert completed.returncode != 0
+    assert "--max-usd" in completed.stderr
