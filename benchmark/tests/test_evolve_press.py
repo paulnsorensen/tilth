@@ -179,3 +179,42 @@ def test_run_removes_its_candidate_worktrees(monkeypatch: pytest.MonkeyPatch, tm
     assert "evolve" not in listed and str(other) in listed
     refs = git("for-each-ref", "--format=%(objectname)", "refs/evolve/run1", cwd=world.repo).split()
     assert len(refs) == 2 and all(git("cat-file", "-t", sha, cwd=world.repo).strip() == "commit" for sha in refs)
+
+
+ENDS_LINE = 'assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));'
+
+
+@pytest.mark.parametrize("probe", [
+    ENDS_LINE[:-1] + "; return;",
+    'let _ = SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content.");',
+    'assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content.") || true);',
+], ids=["return", "let-underscore", "or-true"])
+def test_byte_lock_line_code_edits_are_refused(tilth, tmp_path: Path, probe: str) -> None:
+    repo, seed = tilth
+    base = candidates.read_seed(repo, seed)
+    materializer = Materializer(repo, seed, "press-probe", tmp_path / "work")
+    patch = _patch(repo, seed, "src/mcp/mod.rs", ENDS_LINE, probe)
+
+    with pytest.raises(Exception, match=r"cfg\(test\)"):
+        materializer.materialize({**base, "src_patch": patch})
+
+
+def test_byte_lock_count_and_lead_literal_edits_are_rewritten(tilth, tmp_path: Path) -> None:
+    repo, seed = tilth
+    base = candidates.read_seed(repo, seed)
+    materializer = Materializer(repo, seed, "press-literals", tmp_path / "work")
+    mod = git("show", f"{seed}:src/mcp/mod.rs", cwd=repo)
+    count = mod[mod.index("SERVER_INSTRUCTIONS.len(),"):].split(",", 2)[1].strip()
+    lead = 'starts_with(\n            "tilth — code intelligence MCP server.'
+    scratch = repo.parent / "press-scratch-literals"
+    git("worktree", "add", "-q", "--detach", str(scratch), seed, cwd=repo)
+    edited = mod.replace(f"            {count},\n", "            7,\n", 1).replace(lead, lead.replace("tilth —", "guess —"), 1)
+    assert edited.count("guess —") == 1 and "            7,\n" in edited
+    (scratch / "src/mcp/mod.rs").write_text(edited)
+    patch = git("diff", seed, cwd=scratch)
+    git("worktree", "remove", "--force", str(scratch), cwd=repo)
+    new_mcp = base["prompts/mcp.md"] + "\nA new last line."
+
+    sha = materializer.materialize({**base, "prompts/mcp.md": new_mcp, "src_patch": patch})
+    rewritten = git("show", f"{sha}:src/mcp/mod.rs", cwd=repo)
+    assert f"            {len(new_mcp.encode())},\n" in rewritten and "guess —" not in rewritten

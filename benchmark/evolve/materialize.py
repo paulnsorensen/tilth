@@ -1,5 +1,6 @@
 """The applier: one commit per candidate content id, on top of the seed commit."""
 
+import difflib
 import re
 import shutil
 import subprocess
@@ -37,6 +38,18 @@ def changed_lines(diff: str) -> dict[str, tuple[set[int], set[int]]]:
             files[current][0].update(range(old, old + old_count))
             files[current][1].update(range(new, new + new_count))
     return files
+
+
+def _line_changes(old: str, new: str) -> tuple[set[int], set[int]]:
+    """(removed ``old`` lines, added ``new`` lines), 1-based, of a line diff between two texts."""
+    removed: set[int] = set()
+    added: set[int] = set()
+    matcher = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag != "equal":
+            removed.update(range(old_start + 1, old_end + 1))
+            added.update(range(new_start + 1, new_end + 1))
+    return removed, added
 
 
 class Materializer:
@@ -147,7 +160,7 @@ class Materializer:
     def _refuse_cfg_test(self, worktree: Path) -> None:
         """Refuse any changed line inside a ``#[cfg(test)]`` item or in a ``#[cfg(test)]`` module file.
 
-        The byte-lock literals are exempt: the applier rewrites them itself.
+        The three byte-lock literals are exempt, and nothing else on their lines: the applier rewrites them itself.
         """
         diff = git("diff", "--cached", "-U0", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
                    self.seed_sha, "--", "src", cwd=worktree)
@@ -163,9 +176,12 @@ class Materializer:
                          declared_new.read_text(encoding="utf-8") if declared_new.is_file() else ""]
                 if any(path in rust.test_module_files(declarer, text) for text in texts):
                     raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
+            if path == BYTE_LOCK_FILE:
+                # Only the three literals the applier rewrites may differ; the rest of their lines may not.
+                old_text, new_text = rust.blank_byte_lock(old_text), rust.blank_byte_lock(new_text)
+                removed, added = _line_changes(old_text, new_text)
             for lines, text in ((removed, old_text), (added, new_text)):
-                exempt = rust.byte_lock_lines(text) if path == BYTE_LOCK_FILE else set()
                 for first, last in rust.cfg_test_spans(text):
-                    touched = sorted(line for line in lines if first <= line <= last and line not in exempt)
+                    touched = sorted(line for line in lines if first <= line <= last)
                     if touched:
                         raise ApplyRejected(f"{path}:{touched[0]} is inside a #[cfg(test)] item (lines {first}-{last})")

@@ -130,13 +130,20 @@ def _byte_lock_matches(text: str) -> list[re.Match]:
     return matches
 
 
-def byte_lock_lines(text: str) -> set[int]:
-    """Lines holding the three byte-lock literals the applier rewrites; empty when there is no byte lock."""
+def blank_byte_lock(text: str) -> str:
+    """``text`` with only the three byte-lock literals the applier rewrites replaced by fixed placeholders.
+
+    Everything else, including the rest of each literal's line, is kept byte for byte;
+    ``text`` comes back unchanged when it has no byte lock.
+    """
     try:
-        matches = _byte_lock_matches(text)
+        count, starts, ends = _byte_lock_matches(text)
     except ValueError:
-        return set()
-    return {line for match in matches for line in range(_line(text, match.start(1)), _line(text, match.end(1)) + 1)}
+        return text
+    spans = [(count.span(1), "0"), (starts.span(1), '""'), (ends.span(1), '""')]
+    for (begin, finish), placeholder in sorted(spans, reverse=True):
+        text = text[:begin] + placeholder + text[finish:]
+    return text
 
 
 def rust_literal(value: str) -> str:
