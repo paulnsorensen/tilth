@@ -20,8 +20,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use super::apply::{
-    anchor_lines, apply_ops, content_line_span, find_all_text_spans, lower_ops, match_text_span,
-    ApplyError, ApplyResult,
+    anchor_lines, apply_ops, find_all_text_spans, lower_ops, match_text_span, ApplyError,
+    ApplyResult, NewlineIndex,
 };
 use super::mismatch::MismatchError;
 use super::parser::Op;
@@ -172,10 +172,11 @@ fn check_text_swap_overlap(
     path: &Path,
     ops: &[Op],
 ) -> Result<(), MismatchError> {
+    let lines = NewlineIndex::new(&snapshot.text);
     for op in ops {
         if let Op::TextSwap { old, .. } = op {
             if let Ok((start, end, _)) = match_text_span(&snapshot.text, old) {
-                check_span_seen(snapshot, start, end)?;
+                check_span_seen(snapshot, &lines, start, end)?;
             }
         }
         // all/count: every occurrence must overlap a seen line, not just one.
@@ -183,7 +184,7 @@ fn check_text_swap_overlap(
             if let Ok(spans) = find_all_text_spans(&snapshot.text, old, *count) {
                 let unseen: Vec<(u32, u32)> = spans
                     .iter()
-                    .map(|&(start, end)| content_line_span(&snapshot.text, start, end))
+                    .map(|&(start, end)| lines.content_line_span(start, end))
                     .filter(|&(lo, hi)| !span_overlaps_seen(snapshot, lo, hi))
                     .collect();
                 if let Some(&(lo, hi)) = unseen.first() {
@@ -202,7 +203,7 @@ fn check_text_swap_overlap(
             if let Ok(spans) = rewrite_match_spans(path, &snapshot.text, pattern, *count) {
                 let unseen: Vec<(u32, u32)> = spans
                     .iter()
-                    .map(|&(start, end)| content_line_span(&snapshot.text, start, end))
+                    .map(|&(start, end)| lines.content_line_span(start, end))
                     .filter(|&(lo, hi)| (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l)))
                     .collect();
                 if let Some(&(lo, hi)) = unseen.first() {
@@ -224,8 +225,13 @@ fn span_overlaps_seen(snapshot: &Snapshot, lo: u32, hi: u32) -> bool {
     (lo..=hi).any(|l| snapshot.seen_lines.contains(&l))
 }
 
-fn check_span_seen(snapshot: &Snapshot, start: usize, end: usize) -> Result<(), MismatchError> {
-    let (lo, hi) = content_line_span(&snapshot.text, start, end);
+fn check_span_seen(
+    snapshot: &Snapshot,
+    lines: &NewlineIndex,
+    start: usize,
+    end: usize,
+) -> Result<(), MismatchError> {
+    let (lo, hi) = lines.content_line_span(start, end);
     if span_overlaps_seen(snapshot, lo, hi) {
         Ok(())
     } else {
@@ -259,24 +265,42 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
             _ => merged.push((lo, hi)),
         }
     }
-    while merged.len() > MAX_READ_RANGES {
-        let Some(i) = (0..merged.len() - 1).min_by_key(|&i| merged[i + 1].0 - merged[i].1) else {
-            break;
-        };
-        merged[i].1 = merged[i].1.max(merged[i + 1].1);
-        merged.remove(i + 1);
+    if merged.len() <= MAX_READ_RANGES {
+        return merged;
     }
-    merged
+    let mut gaps: Vec<_> = merged
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0 - pair[0].1, i))
+        .collect();
+    gaps.sort_unstable();
+    let mut join = vec![false; gaps.len()];
+    for &(_, i) in gaps.iter().take(merged.len() - MAX_READ_RANGES) {
+        join[i] = true;
+    }
+    let mut compacted = Vec::with_capacity(MAX_READ_RANGES);
+    let mut current = merged[0];
+    for (i, next) in merged.into_iter().enumerate().skip(1) {
+        if join[i - 1] {
+            current.1 = next.1;
+        } else {
+            compacted.push(current);
+            current = next;
+        }
+    }
+    compacted.push(current);
+    compacted
 }
 
 pub(crate) fn current_match_ranges(path: &Path, text: &str, ops: &[Op]) -> Vec<(u32, u32)> {
     let mut ranges = Vec::new();
+    let lines = NewlineIndex::new(text);
     for op in ops {
         match op {
             Op::TextSwapAll { old, .. } => {
                 if let Ok(spans) = find_all_text_spans(text, old, None) {
                     ranges.extend(spans.into_iter().map(|(start, end)| {
-                        let (lo, _) = content_line_span(text, start, end);
+                        let (lo, _) = lines.content_line_span(start, end);
                         (lo, lo)
                     }));
                 }
@@ -286,7 +310,7 @@ pub(crate) fn current_match_ranges(path: &Path, text: &str, ops: &[Op]) -> Vec<(
                     ranges.extend(
                         spans
                             .into_iter()
-                            .map(|(start, end)| content_line_span(text, start, end)),
+                            .map(|(start, end)| lines.content_line_span(start, end)),
                     );
                 }
             }
@@ -302,7 +326,6 @@ fn is_text_swap(op: &Op) -> bool {
         Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
     )
 }
-
 // Line/insert/block ops stay strict. Lower only the non-text-swap ops (text
 // swaps handled above); a lowering failure skips the gate — apply_ops
 // re-lowers this same text and reports the real ApplyError. Live-lowering
@@ -399,6 +422,31 @@ mod tests {
     use super::super::parser::Cursor;
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn many_ranges_keep_leftmost_equal_gap_merges() {
+        let ranges: Vec<_> = (0..10_000).map(|i| (i * 10 + 1, i * 10 + 1)).collect();
+        let merged = merge_ranges(ranges);
+        assert_eq!(merged.len(), MAX_READ_RANGES);
+        assert_eq!(merged[0], (1, 99_801));
+        assert_eq!(merged[1], (99_811, 99_811));
+        assert_eq!(merged[19], (99_991, 99_991));
+    }
+
+    #[test]
+    fn many_matches_map_first_and_last_lines() {
+        let text = "target\n".repeat(2_000);
+        let ranges = current_match_ranges(
+            &p(),
+            &text,
+            &[Op::TextSwapAll {
+                old: "target".into(),
+                new: "done".into(),
+                count: None,
+            }],
+        );
+        assert_eq!(ranges, vec![(1, 2_000)]);
+    }
 
     fn p() -> PathBuf {
         PathBuf::from("recovery_fixture.rs")

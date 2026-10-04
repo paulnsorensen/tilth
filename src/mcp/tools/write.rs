@@ -458,7 +458,8 @@ fn commit_file_op(
             ctx.cache
                 .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
-            let new_tag = session.record_snapshot(path, content, std::iter::empty());
+            let authored_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+            let new_tag = session.record_snapshot(path, content, 1..=authored_lines);
             let mut block = format!("## {}\ncreated{suffix}", crate::format::display_path(path));
             if let Some(tag) = new_tag {
                 let header = format_header(&crate::format::display_path(path), tag);
@@ -3123,8 +3124,27 @@ mod tests {
         );
     }
 
+    fn create_for_test(
+        p: &std::path::Path,
+        root: &std::path::Path,
+        content: &str,
+        session: &crate::session::Session,
+        bloom: &std::sync::Arc<crate::index::bloom::BloomFilterCache>,
+    ) -> String {
+        let created = tool_write_cold_cache(
+            &json!({
+                "edits": edits(p, None, json!([{ "op": "create_file", "content": content }])),
+                "cwd": root.to_str().unwrap()
+            }),
+            session,
+            bloom,
+        )
+        .expect("create");
+        tag_from_output(p, &created)
+    }
+
     #[test]
-    fn create_tag_does_not_authorize_source_lines() {
+    fn create_tag_authorizes_edits_to_created_lines() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let p = root.join("created.rs");
@@ -3133,39 +3153,97 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (session, bloom) = services();
-        let created = tool_write_cold_cache(
+        let tag = create_for_test(&p, root, &content, &session, &bloom);
+        tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
-                    None,
-                    json!([{ "op": "create_file", "content": content }])
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 2, "end": 2, "content": "edited" }])
                 ),
                 "cwd": root.to_str().unwrap()
             }),
             &session,
             &bloom,
         )
-        .expect("create");
-        let tag = tag_from_output(&p, &created);
+        .expect("line edit on created line");
+        tool_write_cold_cache(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace_text", "old": "line 9", "new": "nine" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("replace_text on created line");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("edited") && text.contains("nine"), "{text}");
+    }
+
+    #[test]
+    fn create_tag_survives_external_format_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("created.go");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, &content, &session, &bloom);
+        std::fs::write(&p, format!("{content}\n\n\n")).unwrap();
+        tool_write_cold_cache(
+            &json!({
+                "edits": edits(
+                    &p,
+                    Some(&tag),
+                    json!([{ "op": "replace", "start": 3, "end": 3, "content": "edited" }])
+                ),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("edit of created line applies through drift recovery");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("edited") && !text.contains("line 3\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn create_tag_rejects_lines_beyond_created_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("created.go");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, &content, &session, &bloom);
+        std::fs::write(&p, format!("{content}\nextra 11\nextra 12\n")).unwrap();
         let err = tool_write_cold_cache(
             &json!({
                 "edits": edits(
                     &p,
                     Some(&tag),
-                    json!([{ "op": "replace", "start": 2, "end": 2, "content": "hidden" }])
+                    json!([{ "op": "replace", "start": 12, "end": 12, "content": "x" }])
                 ),
                 "cwd": root.to_str().unwrap()
             }),
             &session,
             &bloom,
         )
-        .expect_err("create source body was not displayed");
-        assert!(
-            err.contains("never displayed"),
-            "expected create provenance error: {err}"
-        );
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+        .expect_err("line outside created content");
+        assert!(err.contains("never displayed"), "{err}");
     }
+
     #[test]
     fn huge_single_line_edit_stays_bounded() {
         let dir = tempfile::tempdir().unwrap();
@@ -3378,5 +3456,133 @@ mod tests {
             "missing provenance error: {err}"
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), current);
+    }
+
+    // ---- press attack: request-cuts adversarial ----
+
+    fn line_edit(
+        p: &std::path::Path,
+        root: &std::path::Path,
+        tag: &str,
+        line: u32,
+        content: &str,
+        session: &crate::session::Session,
+        bloom: &std::sync::Arc<crate::index::bloom::BloomFilterCache>,
+    ) -> Result<String, String> {
+        tool_write_cold_cache(
+            &json!({
+                "edits": edits(p, Some(tag), json!([{ "op": "replace", "start": line, "end": line, "content": content }])),
+                "cwd": root.to_str().unwrap()
+            }),
+            session,
+            bloom,
+        )
+    }
+
+    #[test]
+    fn create_empty_file_authorizes_no_line_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("empty.rs");
+        let (session, bloom) = services();
+        let created = tool_write_cold_cache(
+            &json!({"edits": edits(&p, None, json!([{ "op": "create_file", "content": "" }])), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("create empty");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        if created.contains(&format!("{}#", rel(&p))) {
+            let tag = tag_from_output(&p, &created);
+            let outcome = line_edit(&p, root, &tag, 1, "x", &session, &bloom);
+            assert!(
+                outcome.is_err(),
+                "line 1 of an empty create was never authored: {outcome:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn create_without_trailing_newline_authorizes_exactly_its_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("nonl.go");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, "a\nb\nc", &session, &bloom);
+        line_edit(&p, root, &tag, 3, "C", &session, &bloom)
+            .expect("last unterminated line is authored");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\nC");
+        let (session, bloom) = services();
+        let tag = create_for_test(&root.join("nonl2.go"), root, "a\nb\nc", &session, &bloom);
+        let err = line_edit(&root.join("nonl2.go"), root, &tag, 4, "d", &session, &bloom)
+            .expect_err("line 4 was never authored");
+        assert!(err.contains("never displayed"), "{err}");
+    }
+
+    #[test]
+    fn create_with_trailing_newline_does_not_authorize_the_phantom_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("nl.go");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, "a\nb\n", &session, &bloom);
+        let outcome = line_edit(&p, root, &tag, 3, "phantom", &session, &bloom);
+        assert!(outcome.is_err(), "line 3 does not exist: {outcome:?}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn create_crlf_content_authorizes_every_created_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for line in 1..=3u32 {
+            let p = root.join(format!("crlf{line}.go"));
+            let (session, bloom) = services();
+            let tag = create_for_test(&p, root, "a\r\nb\r\nc\r\n", &session, &bloom);
+            let outcome = line_edit(&p, root, &tag, line, "z", &session, &bloom);
+            assert!(outcome.is_ok(), "line {line} of a CRLF create: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn create_tag_after_external_top_insertion_edits_the_authored_line_not_the_intruder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("shift.go");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, "one\ntwo\nthree\n", &session, &bloom);
+        std::fs::write(&p, "ext1\next2\none\ntwo\nthree\n").unwrap();
+        let outcome = line_edit(&p, root, &tag, 1, "ONE", &session, &bloom);
+        let text = std::fs::read_to_string(&p).unwrap();
+        // Either the edit is refused (file untouched) or it lands on the authored
+        // line; it must never overwrite the external line the model never saw.
+        assert!(
+            text.contains("ext1") && text.contains("ext2"),
+            "{outcome:?} {text}"
+        );
+        if outcome.is_ok() {
+            assert!(text.contains("ONE") && !text.contains("\none\n"), "{text}");
+        }
+    }
+
+    #[test]
+    fn create_tag_after_external_top_insertion_rejects_shifted_line_numbers_beyond_created_content()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("shift2.go");
+        let (session, bloom) = services();
+        let tag = create_for_test(&p, root, "one\ntwo\nthree\n", &session, &bloom);
+        let drifted = "ext1\next2\none\ntwo\nthree\n";
+        std::fs::write(&p, drifted).unwrap();
+        for line in [4u32, 5] {
+            let outcome = line_edit(&p, root, &tag, line, "HIJACK", &session, &bloom);
+            assert!(
+                outcome.is_err(),
+                "line {line} was never authored: {outcome:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), drifted);
+        }
     }
 }

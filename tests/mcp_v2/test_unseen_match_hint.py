@@ -9,9 +9,11 @@ match. A search hint is not used: auto-routing and walker skips can hide matches
 import json
 import os
 import re
-import tempfile
-import unittest
+import selectors
 import subprocess
+import tempfile
+import time
+import unittest
 from pathlib import Path
 
 import harness
@@ -111,34 +113,61 @@ class UnseenMatchHint(unittest.TestCase):
     def test_drifted_read_hint_retry_uses_current_tag(self):
         source = f"a = token\n{BODY}b = token\n"
         target = self.write("drift.py", source)
-        with subprocess.Popen([str(harness.BIN), "--mcp"], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
-            def call(request):
-                proc.stdin.write(json.dumps(request) + "\n")
-                proc.stdin.flush()
-                return json.loads(proc.stdout.readline())
+        proc = subprocess.Popen([str(harness.BIN), "--mcp"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                pending = bytearray()
 
-            call(harness.initialize_request())
-            read = harness.tools_call_request(
-                2, "tilth_read", {"cwd": self.cwd, "paths": ["drift.py#1-2"]})
-            tag = re.search(r"#([0-9A-F]{4})\]",
-                            harness.tool_result_text(call(read))).group(1)
-            target.write_text("# drift\n" + source)
-            edit = {"cwd": self.cwd, "edits": [{"path": "drift.py", "tag": tag,
-                                                  "ops": [REPLACE_ALL]}]}
-            rejected = harness.tool_result_text(call(
-                harness.tools_call_request(3, "tilth_write", edit)))
-            paths = json.loads(READS.search(rejected).group(1))
-            self.assertEqual(paths, ["drift.py#2-2", "drift.py#83-83"])
-            shown = harness.tool_result_text(call(harness.tools_call_request(
-                4, "tilth_read", {"cwd": self.cwd, "paths": paths})))
-            current_tag = re.search(r"#([0-9A-F]{4})\]", shown).group(1)
-            self.assertNotEqual(current_tag, tag)
-            edit["edits"][0]["tag"] = current_tag
-            written = call(harness.tools_call_request(5, "tilth_write", edit))
-            self.assertFalse(harness.tool_is_error(written),
-                             harness.tool_result_text(written))
-            proc.stdin.close()
+                def call(request):
+                    nonlocal pending
+                    proc.stdin.write((json.dumps(request) + "\n").encode())
+                    proc.stdin.flush()
+                    deadline = time.monotonic() + 30
+                    while b"\n" not in pending:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not selector.select(remaining):
+                            raise TimeoutError(f"MCP response timed out for {request['id']}")
+                        chunk = os.read(proc.stdout.fileno(), 4096)
+                        if not chunk:
+                            raise EOFError(f"MCP closed before response {request['id']}")
+                        pending.extend(chunk)
+                    line, _, rest = pending.partition(b"\n")
+                    pending = bytearray(rest)
+                    return json.loads(line)
+
+                call(harness.initialize_request())
+                read = harness.tools_call_request(
+                    2, "tilth_read", {"cwd": self.cwd, "paths": ["drift.py#1-2"]})
+                tag = re.search(r"#([0-9A-F]{4})\]",
+                                harness.tool_result_text(call(read))).group(1)
+                target.write_text("# drift\n" + source)
+                edit = {"cwd": self.cwd, "edits": [{"path": "drift.py", "tag": tag,
+                                                      "ops": [REPLACE_ALL]}]}
+                rejected = harness.tool_result_text(call(
+                    harness.tools_call_request(3, "tilth_write", edit)))
+                paths = json.loads(READS.search(rejected).group(1))
+                self.assertEqual(paths, ["drift.py#2-2", "drift.py#83-83"])
+                shown = harness.tool_result_text(call(harness.tools_call_request(
+                    4, "tilth_read", {"cwd": self.cwd, "paths": paths})))
+                current_tag = re.search(r"#([0-9A-F]{4})\]", shown).group(1)
+                self.assertNotEqual(current_tag, tag)
+                edit["edits"][0]["tag"] = current_tag
+                written = call(harness.tools_call_request(5, "tilth_write", edit))
+                self.assertFalse(harness.tool_is_error(written),
+                                 harness.tool_result_text(written))
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc.stdout.close()
         self.assertEqual(target.read_text(), "# drift\n" + source.replace("token", "marker"))
 
     def test_replace_all_regex_metacharacters(self):

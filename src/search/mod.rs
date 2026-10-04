@@ -13,6 +13,8 @@ pub mod target;
 pub mod truncate;
 #[cfg(test)]
 pub(crate) use structural::compilation_count;
+#[cfg(test)]
+mod edit_ready_tests;
 pub(crate) use structural::{StructuralPatterns, StructuralScan};
 
 mod bloom_walk;
@@ -80,6 +82,10 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 ];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
+
+/// A hit in a file of at most this many lines prints the whole file, so the
+/// agent can edit any line of it without a separate read.
+const WHOLE_FILE_MAX_LINES: u32 = 60;
 
 pub(crate) const SECRET_REDACTION_NOTICE: &str =
     "\n-> contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
@@ -465,6 +471,7 @@ pub fn search_multi_symbol_expanded(
             &mut out,
             &mut segments,
             &mut seen,
+            crate::budget::DEFAULT_BUDGET,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -663,15 +670,19 @@ pub struct SeenEntry {
     pub path: PathBuf,
     pub tag: u16,
     pub lines: Vec<(u32, u32)>,
+    /// The entry printed the whole file.
+    pub whole_file: bool,
 }
 
 /// Like `format_raw_result`, but every entry that shows real source lines gets
 /// the file's `#TAG` in its header. Returns the entries that survived the
 /// budget fit, unrecorded, so `tilth_write` accepts only lines the agent got.
+/// `budget` is the token share of this entry; it gates whole-file blocks.
 pub fn format_raw_result_deferred(
     result: &SearchResult,
     cache: &OutlineCache,
     session: &Session,
+    budget: u64,
 ) -> Result<(String, Vec<SeenEntry>), TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result_seen(
@@ -682,10 +693,9 @@ pub fn format_raw_result_deferred(
         0,
         format::EmptyHint::Merged,
         None,
-        None,
+        Some(budget),
     )
 }
-
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
@@ -727,6 +737,7 @@ fn format_matches(
     out: &mut String,
     segments: &mut Vec<(i64, usize, usize)>,
     seen: &mut Vec<(usize, SeenEntry)>,
+    budget_tokens: u64,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -753,12 +764,13 @@ fn format_matches(
                 multi_file,
                 out,
                 seen,
+                budget_tokens,
             );
             segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
             // Multiple usages collapsed into one entry
             let start = out.len();
-            format_grouped_usages(group, scope, cache, out);
+            format_grouped_usages(group, scope, cache, session, out, seen);
             let value = group
                 .iter()
                 .map(|m| i64::from(m.def_weight))
@@ -826,8 +838,52 @@ fn group_matches<'a>(matches: &'a [Match], cache: &OutlineCache) -> Vec<Vec<&'a 
     groups
 }
 
-/// Format a group of usages collapsed into a single entry.
-fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, out: &mut String) {
+/// The whole file of a hit in a small file as `N:content` lines, with its last
+/// line number. `None` when the file is too large, unreadable, or the block
+/// would take more than half the response budget on top of what `out` holds.
+fn whole_file_block(
+    m: &Match,
+    out_len: usize,
+    budget_tokens: u64,
+) -> Option<(String, u32, String)> {
+    // `file_lines` is a bytes/40 estimate, so bound the read by size and count
+    // the real lines below.
+    if fs::metadata(&m.path).ok()?.len() > u64::from(WHOLE_FILE_MAX_LINES) * 400 {
+        return None;
+    }
+    let content = fs::read_to_string(&m.path).ok()?;
+    let last = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+    if last == 0 || last > WHOLE_FILE_MAX_LINES {
+        return None;
+    }
+    let numbered = crate::edit::tag::render_numbered_slice(&content, 1);
+    let block = format!("\n{}", numbered.strip_suffix('\n').unwrap_or(&numbered));
+    if estimate_tokens((out_len + block.len()) as u64) > budget_tokens / 2 {
+        return None;
+    }
+    Some((block, last, content))
+}
+
+/// True when an earlier entry already printed `path` whole.
+fn whole_file_printed(seen: &[(usize, SeenEntry)], path: &Path) -> bool {
+    seen.iter()
+        .any(|(_, entry)| entry.whole_file && entry.path == path)
+}
+
+fn lines_as_ranges(lines: &[u32]) -> Vec<(u32, u32)> {
+    lines.iter().map(|&n| (n, n)).collect()
+}
+
+/// Format a group of usages collapsed into a single entry. Each matched line
+/// prints as `N:text` under a tagged header, and only those lines are recorded.
+fn format_grouped_usages(
+    group: &[&Match],
+    scope: &Path,
+    cache: &OutlineCache,
+    session: Option<&Session>,
+    out: &mut String,
+    seen: &mut Vec<(usize, SeenEntry)>,
+) {
     let first = group[0];
     let path_str = rel(&first.path, scope);
 
@@ -837,23 +893,39 @@ fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, o
 
     let scope_label = enclosing_scope_label(&first.path, first.line, cache);
 
-    let _ = write!(out, "\n\n### {path_str}:{line_str} [{} usages", group.len());
+    let _ = write!(out, "\n\n### {path_str}");
+    let tag_at = out.len();
+    let _ = write!(out, ":{line_str} [{} usages", group.len());
     if let Some(ref label) = scope_label {
         let _ = write!(out, " in {label}");
     }
     out.push(']');
 
-    // Secrets denylist: list the path but suppress the outline (it can leak
-    // structured key/value pairs from a credentials file).
+    // Secrets denylist: list the path but suppress the matched lines (they can
+    // leak structured key/value pairs from a credentials file).
     if is_secret_match(first) {
         out.push_str(SECRET_REDACTION_NOTICE);
         return;
     }
 
-    // Show outline context once for the group
-    if let Some(context) = outline_context_for_match(&first.path, first.line, cache) {
-        out.push_str(&context);
+    for m in group {
+        let _ = write!(out, "\n{}:{}", m.line, m.text);
     }
+    let content = fs::read_to_string(&first.path).ok();
+    let source = content.as_deref().filter(|source| {
+        group
+            .iter()
+            .all(|m| source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str()))
+    });
+    insert_tag(
+        out,
+        tag_at,
+        session,
+        seen,
+        &first.path,
+        &lines_as_ranges(&lines),
+        source,
+    );
 }
 
 /// Format a comma-separated line list, collapsing consecutive runs.
@@ -900,10 +972,26 @@ fn insert_tag(
     seen: &mut Vec<(usize, SeenEntry)>,
     path: &Path,
     lines: &[(u32, u32)],
+    source: Option<&str>,
 ) {
-    let Some(session) = session else { return };
-    let spec = crate::read::SeenSpec::Ranges(Vec::new());
-    if let Some(tag) = crate::read::record_edit_snapshot(session, path, &spec) {
+    insert_entry_tag(out, at, session, seen, path, lines, false, source);
+}
+
+/// `insert_tag` for an entry that may print its file whole.
+fn insert_entry_tag(
+    out: &mut String,
+    at: usize,
+    session: Option<&Session>,
+    seen: &mut Vec<(usize, SeenEntry)>,
+    path: &Path,
+    lines: &[(u32, u32)],
+    whole_file: bool,
+    source: Option<&str>,
+) {
+    let (Some(session), Some(source)) = (session, source) else {
+        return;
+    };
+    if let Some(tag) = session.record_snapshot(path, source, Vec::new()) {
         out.insert_str(at, &format!("#{}", crate::edit::tag::format_tag(tag)));
         seen.push((
             at,
@@ -911,11 +999,11 @@ fn insert_tag(
                 path: path.to_path_buf(),
                 tag,
                 lines: lines.to_vec(),
+                whole_file,
             },
         ));
     }
 }
-
 /// The symbol to feed query-aware truncation when expanding a match's body.
 ///
 /// For `impl`/`implements` matches the user searched for the trait or interface,
@@ -941,6 +1029,7 @@ fn format_single_match(
     multi_file: bool,
     out: &mut String,
     seen: &mut Vec<(usize, SeenEntry)>,
+    budget_tokens: u64,
 ) {
     let kind = if m.impl_target.is_some() {
         "impl"
@@ -1004,7 +1093,15 @@ fn format_single_match(
                     let take_n = total_body_lines.min(MARKDOWN_PREVIEW_MAX_LINES);
                     let first = u32::try_from(body_start + 1).unwrap_or(u32::MAX);
                     let last = u32::try_from(body_start + take_n).unwrap_or(u32::MAX);
-                    insert_tag(out, tag_at, session, seen, &m.path, &[(first, last)]);
+                    insert_tag(
+                        out,
+                        tag_at,
+                        session,
+                        seen,
+                        &m.path,
+                        &[(first, last)],
+                        Some(&content),
+                    );
                     out.push('\n');
                     for line in &lines[body_start..body_start + take_n] {
                         out.push_str(line);
@@ -1051,16 +1148,73 @@ fn format_single_match(
     let fence_will_follow =
         *expand_remaining > 0 && !deduped && !(multi_file && expanded_files.contains(&m.path));
 
-    // Skip outline for small files — the expanded code speaks for itself
-    if m.file_lines < 50 {
+    // A small file prints whole, so the agent can edit any line of it. Only a
+    // session-backed (taggable) search does this; a second hit in the same file
+    // falls through to its one-line preview.
+    let whole_file =
+        if session.is_some() && !fence_will_follow && !whole_file_printed(seen, &m.path) {
+            whole_file_block(m, out.len(), budget_tokens)
+        } else {
+            None
+        };
+
+    let preview_content = if !fence_will_follow && whole_file.is_none() {
+        fs::read_to_string(&m.path).ok().filter(|source| {
+            source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str())
+        })
+    } else {
+        None
+    };
+    if let Some((block, last_line, content)) = whole_file {
+        insert_entry_tag(
+            out,
+            tag_at,
+            session,
+            seen,
+            &m.path,
+            &[(1, last_line)],
+            true,
+            Some(&content),
+        );
+        out.push_str(&block);
+    } else if m.file_lines < 50 {
+        // Skip outline for small files — the expanded code speaks for itself
         if !fence_will_follow {
-            insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
+            insert_tag(
+                out,
+                tag_at,
+                session,
+                seen,
+                &m.path,
+                &[(m.line, m.line)],
+                preview_content.as_deref(),
+            );
             let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
+        if !fence_will_follow {
+            insert_tag(
+                out,
+                tag_at,
+                session,
+                seen,
+                &m.path,
+                &[(m.line, m.line)],
+                preview_content.as_deref(),
+            );
+            let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
+        }
     } else if !fence_will_follow {
-        insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
+        insert_tag(
+            out,
+            tag_at,
+            session,
+            seen,
+            &m.path,
+            &[(m.line, m.line)],
+            preview_content.as_deref(),
+        );
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
@@ -1079,7 +1233,7 @@ fn format_single_match(
         } else {
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
-                if let Some((code, content)) = expand_match(m, scope) {
+                if let Some((code, content, printed)) = expand_match(m, scope) {
                     if m.is_definition && m.def_range.is_some() {
                         if let (Some(s), Some(revision)) = (session, &current_revision) {
                             s.record_expand(&m.path, m.line, revision.clone());
@@ -1149,6 +1303,19 @@ fn format_single_match(
                         filter_code_lines(&code, &skip_lines)
                     };
 
+                    let shown: Vec<u32> = printed
+                        .into_iter()
+                        .filter(|n| !skip_lines.contains(n))
+                        .collect();
+                    insert_tag(
+                        out,
+                        tag_at,
+                        session,
+                        seen,
+                        &m.path,
+                        &lines_as_ranges(&shown),
+                        Some(&content),
+                    );
                     out.push('\n');
                     out.push_str(&stripped_code);
 
@@ -1505,6 +1672,7 @@ fn format_search_result_seen(
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<(i64, usize, usize)> = Vec::new();
     let mut seen: Vec<(usize, SeenEntry)> = Vec::new();
+    let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -1541,6 +1709,7 @@ fn format_search_result_seen(
                 &mut out,
                 &mut segments,
                 &mut seen,
+                budget_tokens,
             );
             write_hidden_tail(
                 &mut out,
@@ -1567,6 +1736,7 @@ fn format_search_result_seen(
                 &mut out,
                 &mut segments,
                 &mut seen,
+                budget_tokens,
             );
             write_hidden_tail(
                 &mut out,
@@ -1612,6 +1782,7 @@ fn format_search_result_seen(
                 &mut out,
                 &mut segments,
                 &mut seen,
+                budget_tokens,
             );
             write_hidden_tail(
                 &mut out,
@@ -1638,6 +1809,7 @@ fn format_search_result_seen(
                 &mut out,
                 &mut segments,
                 &mut seen,
+                budget_tokens,
             );
             write_hidden_tail(
                 &mut out,
@@ -1659,6 +1831,7 @@ fn format_search_result_seen(
             &mut out,
             &mut segments,
             &mut seen,
+            budget_tokens,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1678,7 +1851,6 @@ fn format_search_result_seen(
     // budget.unwrap_or(DEFAULT_BUDGET) keeps the no-budget path byte-identical
     // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
     // longer a hardcode that shadows a real caller-supplied budget.
-    let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
     let fitted = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
     // A tagged entry reached the agent only if its whole block survived the fit.
     let seen: Vec<SeenEntry> = seen
@@ -1706,7 +1878,8 @@ fn format_search_result_seen(
 ///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
+/// The third value lists the line numbers the fence prints.
+fn expand_match(m: &Match, scope: &Path) -> Option<(String, String, Vec<u32>)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
@@ -1753,6 +1926,7 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
 
     // Track consecutive blank lines for collapsing
     let mut prev_blank = false;
+    let mut printed = Vec::new();
     for i in start..=end {
         let idx = (i - 1) as usize;
         if idx < lines.len() {
@@ -1765,11 +1939,12 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
             }
 
             let _ = write!(out, "\n{i:>4} | {line}");
+            printed.push(i);
             prev_blank = is_blank;
         }
     }
     out.push_str("\n```");
-    Some((out, content))
+    Some((out, content, printed))
 }
 
 /// Filter formatted code lines using a set of line numbers to skip.
@@ -3210,6 +3385,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         assert!(
@@ -3263,6 +3439,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         let needle = "pub fn exit_code(&self) -> i32 {";
@@ -3386,6 +3563,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         assert!(
@@ -3446,6 +3624,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         // Cap is 40 lines; expect 60 - 40 = 20 truncated.
@@ -3521,6 +3700,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         // Body lines beyond the cap must still be trimmed.
@@ -3591,7 +3771,7 @@ mod tests {
         let group: Vec<&Match> = vec![&m1, &m2, &m3];
         let cache = OutlineCache::new();
         let mut out = String::new();
-        format_grouped_usages(&group, tmp.path(), &cache, &mut out);
+        format_grouped_usages(&group, tmp.path(), &cache, None, &mut out, &mut Vec::new());
 
         assert!(
             out.starts_with("\n\n### "),
@@ -3632,7 +3812,7 @@ mod tests {
         let group: Vec<&Match> = vec![&m1, &m2];
         let cache = OutlineCache::new();
         let mut out = String::new();
-        format_grouped_usages(&group, tmp.path(), &cache, &mut out);
+        format_grouped_usages(&group, tmp.path(), &cache, None, &mut out, &mut Vec::new());
 
         assert!(
             out.contains("credentials.json"),
@@ -3694,6 +3874,7 @@ mod tests {
             &mut out,
             &mut segments,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         // One segment per match (all singletons — definitions are never grouped).
@@ -3771,6 +3952,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         let (baseline, saved) = session.savings();
@@ -3830,6 +4012,7 @@ mod tests {
             false,
             &mut out,
             &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
         );
 
         let (baseline, saved) = session.savings();
@@ -4154,5 +4337,32 @@ mod tests {
             !out.contains("regex matched zero content"),
             "escaped-literal fallback with zero matches must not blame a regex: {out}"
         );
+    }
+    #[test]
+    fn tag_uses_displayed_source_after_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let shown = "fn before() {}\n";
+        std::fs::write(&path, shown).unwrap();
+        let captured = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "fn after() {}\n").unwrap();
+        let session = Session::new();
+        let mut out = "### a.rs:1".to_string();
+        let mut seen = Vec::new();
+        insert_tag(
+            &mut out,
+            "### a.rs".len(),
+            Some(&session),
+            &mut seen,
+            &path,
+            &[(1, 1)],
+            Some(&captured),
+        );
+        assert!(out.contains(&crate::edit::tag::format_tag(
+            crate::edit::tag::compute_file_hash(shown)
+        )));
+        let snapshot = session.snapshots().head(&path).unwrap();
+        assert_eq!(snapshot.text, shown);
+        assert_eq!(seen[0].1.tag, snapshot.tag);
     }
 }

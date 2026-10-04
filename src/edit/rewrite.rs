@@ -103,6 +103,56 @@ fn resolve_rewrite(
     let mut total = 0usize;
     let mut spans = Vec::with_capacity(matches.len());
     for matched in matches {
+        if rewrite.contains('$') {
+            let env = matched.get_env();
+            let mut upper = rewrite.len();
+            let mut newlines = memchr::memchr_iter(b'\n', rewrite.as_bytes()).count();
+            let mut from = 0;
+            while let Some(relative) = rewrite[from..].find('$') {
+                let start = from + relative;
+                let bytes = rewrite.as_bytes();
+                let marks = bytes[start..]
+                    .iter()
+                    .take(3)
+                    .take_while(|&&b| b == b'$')
+                    .count();
+                let name_start = start + marks;
+                let mut name_end = name_start;
+                while bytes
+                    .get(name_end)
+                    .is_some_and(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+                {
+                    name_end += 1;
+                }
+                if name_end > name_start {
+                    let name = &rewrite[name_start..name_end];
+                    let capture = if marks == 3 {
+                        let nodes = env.get_multiple_matches(name);
+                        nodes.first().zip(nodes.last()).map(|(first, last)| {
+                            &text.as_bytes()[first.range().start..last.range().end]
+                        })
+                    } else {
+                        env.get_match(name)
+                            .map(|node| &text.as_bytes()[node.range()])
+                            .or_else(|| env.get_transformed(name).map(Vec::as_slice))
+                    };
+                    if let Some(capture) = capture {
+                        upper = upper.saturating_add(capture.len());
+                        let capture_newlines = memchr::memchr_iter(b'\n', capture).count();
+                        newlines = newlines.saturating_add(capture_newlines);
+                        upper =
+                            upper.saturating_add(capture_newlines.saturating_mul(rewrite.len()));
+                    }
+                    from = name_end;
+                } else {
+                    from = start + 1;
+                }
+            }
+            upper = upper.saturating_add(newlines.saturating_mul(512));
+            if total.saturating_add(upper) > MAX_REWRITE_OUTPUT {
+                return Err(ApplyError::RewriteOutputTooLarge);
+            }
+        }
         let edit = matched.make_edit(&compiled, &rewrite);
         total = total.saturating_add(edit.inserted_text.len());
         if total > MAX_REWRITE_OUTPUT {
@@ -321,5 +371,30 @@ mod tests {
             .expect("rendered output below limit");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].2, format!("g({capture})"));
+    }
+    #[test]
+    fn large_match_with_tiny_capture_remains_allowed() {
+        let text = format!(
+            "fn tiny() {{ let data = \"{}\"; }}",
+            "x".repeat(17 * 1024 * 1024)
+        );
+        let spans = rewrite_spans(
+            Path::new("a.rs"),
+            &text,
+            "fn $NAME() { $$$BODY }",
+            "$NAME",
+            Some(1),
+        )
+        .expect("small captured output stays below the limit");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, "tiny");
+    }
+
+    #[test]
+    fn repeated_large_capture_rejects_before_rendering() {
+        let capture = format!("\"{}\"", "x".repeat(6 * 1024 * 1024));
+        let text = format!("f({capture})");
+        let err = rewrite_spans(Path::new("a.rs"), &text, "f($A)", "$A$A$A", Some(1)).unwrap_err();
+        assert!(matches!(err, ApplyError::RewriteOutputTooLarge));
     }
 }

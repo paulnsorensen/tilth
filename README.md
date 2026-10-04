@@ -125,6 +125,8 @@ Byte offsets are zero-based and half-open. Line numbers are one-based.
 The end line identifies the exclusive end position, including the next line when the range ends after a newline.
 Multi-captures retain matched punctuation, such as commas, in source order.
 Results contain owned ranges, not source text or borrowed syntax nodes.
+Structural coordinates do not include edit tags because they do not include source text.
+Read the matched ranges before using `rewrite`.
 
 When the response exceeds the budget, a structural result steps down the first of these tiers that fits.
 Every step sets `completeness: "partial"` and `budget_limited: true`, and adds a `note`.

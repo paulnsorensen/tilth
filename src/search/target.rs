@@ -40,15 +40,16 @@ pub struct ResolvedTarget {
 
 /// Resolve a path/line target by its stable source-byte occurrence identity.
 /// The identity prevents same-line declarations from being re-resolved by line alone.
+/// The rescan uses the hint's glob, so a follow never resolves outside its glob.
 pub(crate) fn resolve_by_path_line_occurrence(
     path: &Path,
     line: u32,
     name: &str,
     occurrence: (usize, usize),
-    scope: &Path,
+    (scope, glob): (&Path, Option<&str>),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
+    let result = super::search_symbol_raw_cached(name, scope, glob, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
@@ -224,7 +225,9 @@ pub(crate) fn resolve_candidate_with_source(
     )
 }
 
-pub(crate) fn resolve_candidate_with_source_occurrence(
+/// Resolve a candidate minted moments ago by the caller's own scan.
+/// Rescan only the exact file and require the same source-byte occurrence.
+pub(crate) fn resolve_candidate_with_source_exact(
     path: &Path,
     start_line: u32,
     semantic_end: Option<u32>,
@@ -232,33 +235,43 @@ pub(crate) fn resolve_candidate_with_source_occurrence(
     occurrence: (usize, usize),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let scope = path.parent().unwrap_or_else(|| Path::new("."));
-    let result = super::search_symbol_raw_cached(name, scope, None, cache)?;
-    let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let candidate = result.matches.iter().find(|candidate| {
-        candidate.is_definition
-            && candidate.path.canonicalize().ok().as_ref() == Some(&canonical)
-            && candidate.line == start_line
-            && candidate.def_name.as_deref() == Some(name)
-            && candidate.def_byte_range == Some(occurrence)
-    });
-    let Some(candidate) = candidate else {
+    let (target, content, lang) = enrich_from_outline(
+        path.to_path_buf(),
+        start_line,
+        semantic_end,
+        name.to_string(),
+        false,
+        cache,
+    )?;
+    let canonical = path.canonicalize().ok();
+    let valid = path
+        .file_name()
+        .and_then(|file| file.to_str())
+        .and_then(|file| {
+            super::search_symbol_raw_cached(
+                name,
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                Some(&globset::escape(file)),
+                cache,
+            )
+            .ok()
+        })
+        .is_some_and(|result| {
+            result.matches.iter().any(|candidate| {
+                candidate.is_definition
+                    && candidate.path.canonicalize().ok() == canonical
+                    && candidate.line == start_line
+                    && candidate.def_name.as_deref() == Some(name)
+                    && candidate.def_byte_range == Some(occurrence)
+            })
+        });
+    if !valid || target.name != name {
         return Err(TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: Some("target occurrence changed; search again".to_string()),
         });
-    };
-    enrich_from_outline(
-        candidate.path.clone(),
-        candidate.line,
-        semantic_end.or_else(|| candidate.def_range.map(|(_, end)| end)),
-        name.to_string(),
-        false,
-        cache,
-    )
+    }
+    Ok((target, content, lang))
 }
 
 fn target_from_entry(entry: &OutlineEntry, path: PathBuf) -> ResolvedTarget {
@@ -599,6 +612,97 @@ mod tests {
 
         assert_eq!((inner.span_start_line, inner.end_line), (1, 1));
         assert_eq!((outer.span_start_line, outer.end_line), (1, 3));
+    }
+
+    #[test]
+    fn exact_occurrence_accepts_grouped_declaration_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "package sample\n\nconst (\n    StatusActive = 1\n    StatusInactive = 2\n)\n";
+        let path = write_fixture(tmp.path(), "consts.go", source);
+        let found = crate::search::search_symbol_raw("StatusInactive", tmp.path(), None).unwrap();
+        let candidate = found
+            .matches
+            .iter()
+            .find(|candidate| candidate.is_definition)
+            .unwrap();
+        assert_eq!(candidate.line, 5, "{candidate:?}");
+        assert_eq!(candidate.def_name.as_deref(), Some("StatusInactive"));
+        let cache = OutlineCache::new();
+        let (enriched, _, _) = enrich_from_outline(
+            path.clone(),
+            candidate.line,
+            candidate.def_range.map(|(_, end)| end),
+            "StatusInactive".into(),
+            false,
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(
+            (enriched.name.as_str(), enriched.start_line),
+            ("StatusInactive", 3)
+        );
+        let (target, _, _) = resolve_candidate_with_source_exact(
+            &path,
+            candidate.line,
+            candidate.def_range.map(|(_, end)| end),
+            "StatusInactive",
+            candidate.def_byte_range.unwrap(),
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(target.name, "StatusInactive");
+        assert_eq!(target.start_line, 3);
+    }
+
+    #[test]
+    fn exact_occurrence_accepts_glob_metacharacters_in_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            tmp.path(),
+            "[id].py",
+            "def named_handler():\n    return 1\n",
+        );
+        let found = crate::search::search_symbol_raw("named_handler", tmp.path(), None).unwrap();
+        let candidate = found
+            .matches
+            .iter()
+            .find(|candidate| candidate.is_definition)
+            .unwrap();
+        let (target, _, _) = resolve_candidate_with_source_exact(
+            &path,
+            candidate.line,
+            candidate.def_range.map(|(_, end)| end),
+            "named_handler",
+            candidate.def_byte_range.unwrap(),
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        assert_eq!(target.name, "named_handler");
+    }
+
+    #[test]
+    fn exact_occurrence_rejects_changed_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(tmp.path(), "dupes.rs", "fn run() {} fn run() {}\n");
+        let found = crate::search::search_symbol_raw("run", tmp.path(), None).unwrap();
+        let occurrence = found
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .filter_map(|m| m.def_byte_range)
+            .max()
+            .unwrap();
+        fs::write(&path, "fn run() {}\n").unwrap();
+        let err = resolve_candidate_with_source_exact(
+            &path,
+            1,
+            Some(1),
+            "run",
+            occurrence,
+            &OutlineCache::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("occurrence changed"), "{err}");
     }
 
     #[test]
