@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -40,6 +41,8 @@ _PREPARED_COMMIT_ENV = {
     "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000",
 }
 _ENV_STEP_TIMEOUT_S = 1800
+_CONTAINER_TOOLS = {"docker", "podman"}
+_SHELL_WORD_SEPARATORS = re.compile(r"[\s;&|()`'\"]+")
 _PYTHON_TIMEOUT_S = 1200
 _COMPILED_TIMEOUT_S = 1800
 
@@ -311,6 +314,9 @@ class ExternalTask(Task):
             steps = [["uv", "venv", *version, str(venv)]]
             steps += [_install_argv(step, venv) for step in self.install_steps()]
         for argv in steps:
+            words = [word for part in argv for word in _SHELL_WORD_SEPARATORS.split(part)]
+            if any(Path(word).name in _CONTAINER_TOOLS for word in words if word):
+                raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
             try:
                 result = proc.run(argv, cwd=workdir, env=env, timeout=_ENV_STEP_TIMEOUT_S)
             except (OSError, subprocess.TimeoutExpired) as error:
