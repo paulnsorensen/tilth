@@ -83,8 +83,8 @@ class SweBenchTask(ExternalTask):
         if not apply_patch(checkout, test_patch):
             raise PrepareError("test_patch does not apply to the restored test files")
 
-    def test_output(self, checkout: Path, workdir: Path) -> str:
-        env = self.venv_env(workdir) if self.language == "python" else dict(os.environ)
+    def test_output(self, checkout: Path) -> str:
+        env = self.grading_env(checkout) if self.language == "python" else dict(os.environ)
         # Cargo builds in the fresh checkout's own target/: a shared target directory would
         # reuse an earlier grade's build, because exported sources keep the commit's mtime.
         env.pop("CARGO_TARGET_DIR", None)

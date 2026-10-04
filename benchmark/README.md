@@ -89,10 +89,13 @@ python3 benchmark/external/preflight.py
 python3 benchmark/external/preflight.py --panel path/to/panel.json
 ```
 
-Admission prepares each instance on this host and grades its gold, empty, and tampered patches; only an instance whose gold resolves and whose empty and tampered patches do not is admitted.
+Admission prepares each instance on this host and grades its gold, empty, and tampered patches; only an instance whose gold resolves, whose empty patch does not, and whose tampered check fails is admitted.
+The tampered check removes one gold hunk at a time, largest first, up to `$TILTH_BENCH_TAMPER_MAX_HUNKS` hunks (default 8), and passes when any single removal fails the held-out tests; the verdict names that hunk.
 Verdicts are cached by instance ID, data revision, and environment fingerprint; delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
+A verdict from an older admission version or another tamper bound is recomputed.
 `run.py --tasks <instance_id>` runs an admitted instance: its workdir is the `base_commit` tree (FeatureBench: with the mask applied and the FAIL_TO_PASS tests deleted) as the single commit of a fresh repository, with a `uv` venv for Python or the host Go or Rust toolchain.
-Grading copies the agent's changes onto a clean prepared tree, restores the held-out tests, and runs FAIL_TO_PASS and PASS_TO_PASS natively; rows add `pass_rate`, `f2p_passed`, `f2p_total`, `p2p_passed`, and `p2p_total`.
+Grading copies the agent's changes onto a clean prepared tree, restores the held-out tests and every pytest configuration file (`conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg`, a `pyproject.toml` with `[tool.pytest`) from `base_commit`, and runs FAIL_TO_PASS and PASS_TO_PASS natively.
+Python tests run in a grading venv built once per instance and environment fingerprint under `$TILTH_BENCH_DATA/envs/`, never in the agent's `.venv`; rows add `pass_rate`, `f2p_passed`, `f2p_total`, `p2p_passed`, and `p2p_total`.
 `--tasks all` stays the local registry.
 
 Every row records `contaminated` and `contamination_hits`: a tool input that reads the `benchmark/` tree or the harness data directory, fetches the task's upstream repository or package, or, in an external cell, reads a clone under `/tmp/tilth_bench/repos/` is a hit. A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.

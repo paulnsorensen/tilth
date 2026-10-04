@@ -128,13 +128,14 @@ class FeatureBenchTask(ExternalTask):
                 break
         return tokens if "-rA" in tokens else ["-rA", *tokens]
 
-    def test_output(self, checkout: Path, workdir: Path) -> str:
-        argv = [str(workdir / ".venv" / "bin" / "python"), "-m", "pytest", *self._pytest_options(),
+    def test_output(self, checkout: Path) -> str:
+        env = self.grading_env(checkout)
+        argv = [str(Path(env["VIRTUAL_ENV"]) / "bin" / "python"), "-m", "pytest", *self._pytest_options(),
                 "--continue-on-collection-errors", "-p", "no:cacheprovider",
                 # pytest-pretty replaces the -rA summary these results are parsed from.
                 "-p", "no:pretty",
                 *self.fail_to_pass, *self.pass_to_pass]
-        result = proc.run(argv, cwd=checkout, env=self.venv_env(workdir), timeout=self.timeout_s)
+        result = proc.run(argv, cwd=checkout, env=env, timeout=self.timeout_s)
         return result.stdout + result.stderr
 
     def entry_results(self, output: str) -> dict[str, bool]:

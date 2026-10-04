@@ -2,6 +2,7 @@
 
 import io
 import json
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ import external.featurebench
 import external.patches
 import external.preflight
 import external.swebench_ml
+import external.task
 import run
 from conftest import STREAMS, StoreTask
 from external_support import FB_LV1, SWE_GO, SWE_PY, SWE_RS, git, rows
@@ -280,6 +282,22 @@ def test_identity_inputs_change_run_key(external_bench, monkeypatch: pytest.Monk
     assert _identity(SWE_RS)["run_key"] != before
 
 
+def test_external_helper_edit_changes_only_external_run_key(bench, external_bench,
+                                                            monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    external_bench.seed(SWE_RS)
+    monkeypatch.setitem(run.TASKS, SWE_RS, load(SWE_RS))
+    package = tmp_path / "external"
+    shutil.copytree(Path(external.task.__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    external_before, local_before = _identity(SWE_RS)["run_key"], _identity("cell_a")["run_key"]
+
+    patches_py = package / "patches.py"
+    patches_py.write_text(patches_py.read_text() + "\n# a grading helper edit\n")
+
+    assert _identity(SWE_RS)["run_key"] != external_before
+    assert _identity("cell_a")["run_key"] == local_before
+
+
 # --- AC-3: grading rows ---
 
 
@@ -289,7 +307,7 @@ def _partial_fix_workdir(external_bench, tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setitem(run.TASKS, SWE_PY, task)
     workdir = tmp_path / "workdir"
     task.prepare(workdir)
-    first_hunk = external.patches.tampered(task.gold_patch)
+    first_hunk = {index: patch for index, _, patch in external.patches.hunk_removals(task.gold_patch, max_hunks=8)}[1]
     subprocess.run(["git", "apply", "-"], cwd=workdir, input=first_hunk, text=True, check=True)
     return workdir
 

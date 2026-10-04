@@ -86,7 +86,7 @@ def test_patch_editing_f2p_file_is_admitted(external_bench, tmp_path: Path) -> N
     task = external.featurebench.load(FB_F2P_EDIT, external.FEATUREBENCH_REVISION)
     workdir = tmp_path / "workdir"
     task.prepare(workdir)
-    tampered = external.patches.tampered(task.gold_patch)
+    _, _, tampered = external.patches.hunk_removals(task.gold_patch, max_hunks=8)[0]
     subprocess.run(["git", "apply", "-"], cwd=workdir, input=tampered, text=True, check=True)
 
     assert task.check_correctness("", str(workdir))[0] is False
@@ -138,7 +138,8 @@ def test_cached_verdict_skips_round_trip(external_bench, monkeypatch: pytest.Mon
         first.append(fingerprint)
         return external.preflight.PreflightVerdict(
             instance_id=task.name, dataset=task.dataset, data_rev=task.data_rev, env_fingerprint=fingerprint,
-            admitted=True, reason="admitted", gold=(3, 3), empty=(1, 3), tampered=(2, 3))
+            admitted=True, reason="admitted", gold=(3, 3), empty=(1, 3), tampered=(2, 3), tampered_hunk=0,
+            tamper_max_hunks=external.preflight.tamper_max_hunks())
 
     monkeypatch.setattr(external.preflight, "round_trip", stub_round_trip)
     assert external.preflight.admit(SWE_PY).admitted is True
@@ -171,13 +172,50 @@ def test_preflight_rejects_non_discriminating(external_bench, reason: str) -> No
     elif reason == "empty_resolved":
         fields = {"FAIL_TO_PASS": ["tests/test_ops.py::test_add"], "PASS_TO_PASS": []}
     else:
-        notes = patch_for(external_bench, "fixture/calc", {"calc/notes.py": "NOTE = 1\n"})
-        fields = {"patch": row["patch"] + notes}
+        # Two redundant fixes of mul: removing either single hunk still resolves.
+        init = external_support.projects()["fixture/calc"]["calc/__init__.py"]
+        redundant = patch_for(external_bench, "fixture/calc", {
+            "calc/ops.py": ops.replace("    # Multiply two integers.\n    return left + right",
+                                       "    # Multiply two integers.\n    return left * right"),
+            "calc/__init__.py": init + "\n\ndef mul(left, right):\n    return left * right\n",
+        })
+        fields = {"patch": redundant, "FAIL_TO_PASS": ["tests/test_ops.py::test_mul"],
+                  "PASS_TO_PASS": ["tests/test_ops.py::test_add"]}
     instance_id = _variant(external_bench, row, f"fixture__calc-{reason}", **fields)
 
     result = external.preflight.admit(instance_id)
 
     assert result.admitted is False and result.reason == reason
+    if reason == "tampered_resolved":
+        assert result.tampered_hunk is None and "hunks 0, 1" in result.detail
+
+
+def _unexercised_last_hunk(bench, instance_id: str) -> str:
+    """SWE_PY's gold plus a final, largest hunk no held-out test exercises."""
+    row = bench.row(SWE_PY)
+    notes = patch_for(bench, "fixture/calc", {"calc/notes.py": "".join(f"NOTE_{n} = {n}\n" for n in range(5))})
+    return _variant(bench, row, instance_id, patch=row["patch"] + notes)
+
+
+def test_tampered_check_admits_when_another_hunk_is_exercised(external_bench) -> None:
+    instance_id = _unexercised_last_hunk(external_bench, "fixture__calc-unexercised-last")
+
+    result = external.preflight.admit(instance_id)
+
+    # The notes hunk is tried first (largest) and still resolves; dropping the mul hunk fails.
+    assert (result.admitted, result.reason, result.tampered_hunk) == (True, "admitted", 0)
+    assert result.tampered[0] < result.tampered[1]
+    assert "hunk 0" in result.detail and "calc/ops.py" in result.detail
+
+
+def test_tampered_check_is_bounded_by_max_hunks(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    instance_id = _unexercised_last_hunk(external_bench, "fixture__calc-bounded")
+    monkeypatch.setenv("TILTH_BENCH_TAMPER_MAX_HUNKS", "1")
+
+    result = external.preflight.admit(instance_id)
+
+    assert (result.admitted, result.reason, result.tamper_max_hunks) == (False, "tampered_resolved", 1)
+    assert "hunks 2" in result.detail
 
 
 def test_preflight_refuses_by_reason(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,7 +379,15 @@ def test_preflight_panel_form(external_bench, monkeypatch: pytest.MonkeyPatch, t
     assert "featurebench" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("stored", [{"instance_id": SWE_PY, "admitted": True}, ["admitted"],
+_PRE_VERSION_VERDICT = {"instance_id": SWE_PY, "dataset": "swebench_ml", "data_rev": external.SWEBENCH_ML_REVISION,
+                        "env_fingerprint": "y", "admitted": True, "reason": "admitted", "gold": [3, 3],
+                        "empty": [1, 3], "tampered": [2, 3], "detail": ""}
+
+
+@pytest.mark.parametrize("stored", [{"instance_id": SWE_PY, "admitted": True}, ["admitted"], _PRE_VERSION_VERDICT,
+                                    {**_PRE_VERSION_VERDICT, "version": 0},
+                                    {**_PRE_VERSION_VERDICT, "version": external.preflight.VERDICT_VERSION,
+                                     "tamper_max_hunks": 3},
                                     {"instance_id": SWE_PY, "admitted": True, "reason": "admitted",
                                      "dataset": "swebench_ml", "data_rev": "x", "env_fingerprint": "y",
                                      "schema": 2}])

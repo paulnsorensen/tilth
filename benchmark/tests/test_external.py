@@ -218,6 +218,74 @@ def test_agent_test_edits_do_not_mask_heldout(external_bench, tmp_path: Path, in
     assert task.grade_details()["f2p_passed"] < task.grade_details()["f2p_total"]
 
 
+_FORCE_PASS = (
+    "import pytest\n\n\n"
+    "@pytest.hookimpl(hookwrapper=True)\n"
+    "def pytest_runtest_makereport(item, call):\n"
+    "    outcome = yield\n"
+    "    report = outcome.get_result()\n"
+    "    report.outcome = 'passed'\n"
+    "    report.longrepr = None\n"
+)
+_ADDOPTS = "addopts = -p forcepass\n"
+
+
+def _wrong_fix(workdir: Path) -> None:
+    """Make the held-out tests collect but fail: the functions exist with wrong results."""
+    area = workdir / "shapes" / "area.py"
+    if area.is_file():
+        area.write_text(area.read_text() + "\n\ndef square_area(side):\n    return 0\n\n\n"
+                        "def circle_area(radius):\n    return 0\n")
+
+
+@pytest.mark.parametrize(("instance_id", "infra"), [
+    (SWE_PY, {"conftest.py": _FORCE_PASS}),
+    (FB_LV1, {"conftest.py": _FORCE_PASS}),
+    (FB_LV1, {"tests/conftest.py": _FORCE_PASS}),
+    (SWE_PY, {"pytest.ini": "[pytest]\n" + _ADDOPTS, "forcepass.py": _FORCE_PASS}),
+    (SWE_PY, {"tox.ini": "[pytest]\n" + _ADDOPTS, "forcepass.py": _FORCE_PASS}),
+    (SWE_PY, {"setup.cfg": "[tool:pytest]\n" + _ADDOPTS, "forcepass.py": _FORCE_PASS}),
+    (FB_LV1, {"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-p forcepass"\n',
+              "forcepass.py": _FORCE_PASS}),
+], ids=["swe-conftest", "fb-conftest", "fb-tests-conftest", "pytest-ini", "tox-ini", "setup-cfg", "pyproject"])
+def test_agent_test_infrastructure_does_not_change_grade(external_bench, tmp_path: Path, instance_id: str,
+                                                         infra: dict[str, str]) -> None:
+    task, workdir = prepared(external_bench, instance_id, tmp_path)
+    _wrong_fix(workdir)
+    for relative, content in infra.items():
+        (workdir / relative).write_text(content)
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
+    assert task.grade_details()["f2p_passed"] == 0
+
+
+def _fake_pytest(site_packages: Path, entries: list[str]) -> None:
+    lines = [f"PASSED {entry}" if "::" in entry else f"PASSED {entry}::test_forced" for entry in entries]
+    package = site_packages / "pytest"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "__main__.py").write_text("".join(f"print({line!r})\n" for line in lines))
+
+
+@pytest.mark.parametrize("instance_id", [SWE_PY, FB_LV1])
+def test_agent_venv_cannot_change_grade(external_bench, tmp_path: Path, instance_id: str) -> None:
+    task, workdir = prepared(external_bench, instance_id, tmp_path)
+    [site_packages] = (workdir / ".venv" / "lib").glob("python*/site-packages")
+    _fake_pytest(site_packages, [*task.fail_to_pass, *task.pass_to_pass])
+
+    correct, reason = task.check_correctness("", str(workdir))
+    task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
+    assert task.grade_details()["f2p_passed"] == 0
+    # One grading venv per instance, built once under the harness data directory.
+    grading_venvs = [argv for argv in external_bench.commands
+                     if argv[:2] == ["uv", "venv"] and Path(argv[-1]).is_relative_to(external_bench.data)]
+    assert len(grading_venvs) == 1
+
+
 def test_featurebench_file_entries_aggregate() -> None:
     output = (OUTPUTS / "pytest_rA.txt").read_text()
     entries = ["tests/test_a.py", "tests/test_ab.py", "tests/test_b.py", "tests/test_c.py",
@@ -431,16 +499,30 @@ def test_featurebench_candidates_curated() -> None:
     assert not [instance_id for instance_id in default if instance_id.startswith(deferred)]
 
 
-def test_patch_helpers_split_reverse_and_tamper() -> None:
+def _notes_hunk(lines: int) -> str:
+    body = "".join(f"+NOTE_{index} = {index}\n" for index in range(lines))
+    return ("diff --git a/calc/notes.py b/calc/notes.py\nnew file mode 100644\nindex 0000000..1111111\n"
+            f"--- /dev/null\n+++ b/calc/notes.py\n@@ -0,0 +1,{lines} @@\n{body}")
+
+
+def test_patch_helpers_split_reverse_and_remove_hunks() -> None:
     row = rows("featurebench")[FB_F2P_EDIT]
-    gold = rows("swebench_ml")[SWE_PY]["patch"]
+    gold = rows("swebench_ml")[SWE_PY]["patch"] + _notes_hunk(3)
 
     assert [path for path, _ in external.patches.split_files(row["patch"])] == ["shapes/area.py", "tests/test_area.py"]
     assert external.patches.reverse(external.patches.reverse(row["patch"])) == row["patch"]
-    tampered = external.patches.tampered(gold)
-    assert "+    return left * right" in tampered
-    assert "+    return left // right\n" not in tampered
-    single = external.patches.tampered(external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1])
+    removals = external.patches.hunk_removals(gold, max_hunks=8)
+    # Largest hunk first, then patch order; each variant drops exactly that one hunk.
+    assert [(index, path) for index, path, _ in removals] == [(2, "calc/notes.py"), (0, "calc/ops.py"),
+                                                              (1, "calc/ops.py")]
+    without = {index: patch for index, _, patch in removals}
+    assert "calc/notes.py" not in without[2] and "+    return left * right" in without[2]
+    assert "+    return left * right" not in without[0] and "+    return left // right\n" in without[0]
+    assert "+    return left // right\n" not in without[1] and "NOTE_0" in without[1]
+    assert [index for index, _, _ in external.patches.hunk_removals(gold, max_hunks=1)] == [2]
+    [(index, _, single)] = external.patches.hunk_removals(
+        external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1], max_hunks=8)
+    assert index == 0
     assert not [line for line in single.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
 
@@ -486,7 +568,7 @@ def test_grader_disables_summary_replacing_reporter(external_bench, tmp_path: Pa
     recording = external.proc.run
 
     def record(argv, **kwargs):
-        if "pytest" in argv:
+        if list(argv[1:3]) == ["-m", "pytest"]:
             grading.append(list(argv))
         return recording(argv, **kwargs)
 

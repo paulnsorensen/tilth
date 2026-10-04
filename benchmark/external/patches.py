@@ -1,4 +1,4 @@
-"""Unified-diff helpers: split by file, reverse, and build the tampered gold patch."""
+"""Unified-diff helpers: split by file, reverse, and build single-hunk tampered gold patches."""
 
 import re
 from dataclasses import dataclass, field
@@ -144,20 +144,37 @@ def _without_added_lines(hunk: list[str]) -> list[str] | None:
     return [head, *(line for unit in units for line in unit)]
 
 
-def tampered(patch: str) -> str:
-    """The gold patch minus its last source hunk, or minus a single source hunk's added lines."""
+def _changed_lines(hunk: list[str]) -> int:
+    return sum(1 for line in hunk[1:] if line[:1] in {"+", "-"})
+
+
+def _replace_hunk(sections: list[_Section], index: int, position: int, hunk: list[str] | None) -> str:
+    """The patch text with one hunk replaced, or removed when ``hunk`` is None."""
+    variant = [_Section(section.header, list(section.hunks)) for section in sections]
+    if hunk is None:
+        del variant[index].hunks[position]
+    else:
+        variant[index].hunks[position] = hunk
+    return "".join(section.text() for section in variant if section.hunks)
+
+
+def hunk_removals(patch: str, max_hunks: int) -> list[tuple[int, str, str]]:
+    """Single-hunk tampered variants of ``patch``: ``(hunk index, path, patch without that hunk)``.
+
+    The index counts hunks in patch order. Source hunks are tried (documentation
+    hunks only when there is no other), largest first, at most ``max_hunks`` of
+    them. A patch with one such hunk yields it minus its added lines instead,
+    since removing it would only repeat the empty patch.
+    """
     sections = _sections(patch)
     hunks = [(index, position) for index, section in enumerate(sections)
              for position in range(len(section.hunks))]
-    source = [(index, position) for index, position in hunks if not _is_doc(sections[index].path)] or hunks
-    if len(source) > 1:
-        index, position = source[-1]
-        del sections[index].hunks[position]
-    elif source:
-        index, position = source[0]
+    number = {hunk: count for count, hunk in enumerate(hunks)}
+    source = [hunk for hunk in hunks if not _is_doc(sections[hunk[0]].path)] or hunks
+    if len(source) == 1:
+        [(index, position)] = source
         stripped = _without_added_lines(sections[index].hunks[position])
-        if stripped is None:
-            del sections[index].hunks[position]
-        else:
-            sections[index].hunks[position] = stripped
-    return "".join(section.text() for section in sections if section.hunks)
+        return [(number[source[0]], sections[index].path, _replace_hunk(sections, index, position, stripped))]
+    ranked = sorted(source, key=lambda hunk: (-_changed_lines(sections[hunk[0]].hunks[hunk[1]]), number[hunk]))
+    return [(number[(index, position)], sections[index].path, _replace_hunk(sections, index, position, None))
+            for index, position in ranked[:max_hunks]]

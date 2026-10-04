@@ -5,6 +5,10 @@ the per-language SWE-bench Multilingual picks (falling back only when a primary
 is refused). ``--panel PATH`` admits exactly a panel's external members. Both
 forms fetch uncached rows first and exit nonzero when a required family has no
 admitted instance.
+
+The tampered check grades the gold patch minus one hunk at a time, largest hunk
+first, up to ``$TILTH_BENCH_TAMPER_MAX_HUNKS`` hunks (default 8); an instance
+passes it when any one removal fails the held-out tests.
 """
 
 import sys
@@ -19,6 +23,7 @@ if __name__ == "__main__" and not __package__:
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
@@ -41,6 +46,14 @@ _DEPENDENCY_FILES = (
     "requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock",
 )
 _EXTERNAL_FAMILIES = (data.FEATUREBENCH, data.SWEBENCH_ML)
+# Bump when admission or grading changes, so cached verdicts are recomputed.
+VERDICT_VERSION = 2
+DEFAULT_TAMPER_MAX_HUNKS = 8
+
+
+def tamper_max_hunks() -> int:
+    """How many single-hunk removals the tampered check tries: ``$TILTH_BENCH_TAMPER_MAX_HUNKS``, else 8."""
+    return int(os.environ.get("TILTH_BENCH_TAMPER_MAX_HUNKS") or DEFAULT_TAMPER_MAX_HUNKS)
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,9 @@ class PreflightVerdict:
     empty: tuple[int, int] | None = None
     tampered: tuple[int, int] | None = None
     detail: str = ""
+    tampered_hunk: int | None = None
+    tamper_max_hunks: int | None = None
+    version: int = VERDICT_VERSION
 
     def counts(self) -> str:
         return " ".join(f"{name}={pair[0]}/{pair[1]}" if pair else f"{name}=-"
@@ -72,7 +88,9 @@ def _read_verdict(path: Path) -> PreflightVerdict | None:
         stored = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(stored, dict):
+    if not isinstance(stored, dict) or stored.get("version") != VERDICT_VERSION:
+        return None
+    if stored.get("tamper_max_hunks") != tamper_max_hunks():
         return None
     for name in ("gold", "empty", "tampered"):
         if stored.get(name) is not None:
@@ -120,12 +138,36 @@ def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[i
     return resolved, (details["f2p_passed"] + details["p2p_passed"], total)
 
 
+def _tamper(task: ExternalTask, workdir: Path, max_hunks: int) -> tuple[bool, dict]:
+    """Grade single-hunk removals of the gold patch until one fails the held-out tests.
+
+    Returns whether every applying removal still resolved, and the verdict fields
+    that record the counts, the failing hunk index, and the hunks tried.
+    """
+    tried: list[str] = []
+    counts = None
+    for index, path, patch in patches.hunk_removals(task.gold_patch, max_hunks):
+        _reset(workdir)
+        if patch and not apply_patch(workdir, patch):
+            tried.append(f"{index} (does not apply)")
+            continue
+        resolved, counts = _grade(task, workdir, patch)
+        if not resolved:
+            return False, {"tampered": counts, "tampered_hunk": index,
+                           "detail": f"tampered: removing gold hunk {index} ({path}) fails the held-out tests"}
+        tried.append(str(index))
+    return True, {"tampered": counts,
+                  "detail": f"tampered: every single-hunk removal tried still resolves (hunks {', '.join(tried)})"}
+
+
 def round_trip(task: ExternalTask, fingerprint: str) -> PreflightVerdict:
-    """Prepare the task on this host and grade its gold, empty, and tampered patches."""
+    """Prepare the task on this host and grade its gold, empty, and single-hunk tampered patches."""
+    max_hunks = tamper_max_hunks()
+
     def verdict(reason: Reason, **fields) -> PreflightVerdict:
         return PreflightVerdict(instance_id=task.name, dataset=task.dataset, data_rev=task.data_rev,
                                 env_fingerprint=fingerprint, admitted=reason.startswith("admitted"),
-                                reason=reason, **fields)
+                                reason=reason, tamper_max_hunks=max_hunks, **fields)
 
     with tempfile.TemporaryDirectory(prefix="tilth-preflight-") as temp:
         workdir = Path(temp) / "repo"
@@ -135,23 +177,26 @@ def round_trip(task: ExternalTask, fingerprint: str) -> PreflightVerdict:
             return verdict("prepare_failed", detail=str(error))
         try:
             task.build_env(workdir)
+            if task.language == "python":
+                task.grade_venv()
         except EnvBuildError as error:
             return verdict("env_build_failed", detail=str(error))
+        except PrepareError as error:
+            return verdict("prepare_failed", detail=str(error))
         try:
             gold_ok, gold = _grade(task, workdir, task.gold_patch)
             empty_ok, empty = _grade(task, workdir, "")
-            tampered_ok, tampered = _grade(task, workdir, patches.tampered(task.gold_patch))
+            if not gold_ok:
+                return verdict("gold_unresolved", gold=gold, empty=empty)
+            if empty_ok:
+                return verdict("empty_resolved", gold=gold, empty=empty)
+            tampered_ok, tampered = _tamper(task, workdir, max_hunks)
         except PrepareError as error:
             return verdict("prepare_failed", detail=str(error))
-    counts = {"gold": gold, "empty": empty, "tampered": tampered}
-    if not gold_ok:
-        return verdict("gold_unresolved", **counts)
-    if empty_ok:
-        return verdict("empty_resolved", **counts)
     if tampered_ok:
-        return verdict("tampered_resolved", **counts)
+        return verdict("tampered_resolved", gold=gold, empty=empty, **tampered)
     admitted: Reason = "admitted" if task.transformation == "none" else f"admitted:{task.transformation}"
-    return verdict(admitted, **counts)
+    return verdict(admitted, gold=gold, empty=empty, **tampered)
 
 
 def admit(instance_id: str) -> PreflightVerdict:
