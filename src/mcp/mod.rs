@@ -903,7 +903,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1976,
+            1978,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -1368,6 +1368,14 @@ mod tests {
             AGENTS_MD.trim_end(),
             expected.trim_end(),
             "AGENTS.md is out of sync with prompts/ — run ./scripts/regen-agents-md.sh"
+        );
+    }
+
+    #[test]
+    fn server_instructions_fit_character_cap() {
+        assert!(
+            SERVER_INSTRUCTIONS.trim_end().chars().count() <= 2048,
+            "instructions exceed 2048 characters"
         );
     }
 

@@ -7,7 +7,7 @@ pub mod glob;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
-mod structural;
+pub(crate) mod structural;
 pub mod symbol;
 pub mod target;
 pub mod truncate;

@@ -54,7 +54,7 @@ class StructuralSearch(unittest.TestCase):
         group = json.loads(harness.tool_result_text(response))["results"][0]["items"][0]
         self.assertNotEqual(group["tag"], "0000")
         edit = {"cwd": str(self.root), "edits": [{"path": "source.py", "tag": group["tag"], "ops": [
-            {"op": "replace_text", "old": "wrap(value)", "new": "wrapped(value)"}]}]}
+            {"op": "rewrite", "pattern": "wrap($A)", "rewrite": "wrapped($A)"}]}]}
         written = harness.run_mcp([], [
             harness.initialize_request(),
             harness.tools_call_request(2, "tilth_search", {

@@ -8,6 +8,7 @@ pub mod json;
 pub mod mismatch;
 pub mod parser;
 pub mod recovery;
+mod rewrite;
 pub mod snapshots;
 pub mod tag;
 

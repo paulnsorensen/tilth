@@ -22,7 +22,9 @@ use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
-use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
+use crate::edit::recovery::{
+    check_seen_lines, current_match_ranges, gated_apply, try_recover, EditError,
+};
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header, render_numbered_slice};
 use crate::error::TilthError;
@@ -293,19 +295,21 @@ fn resolve_edit(
     match section.tag {
         // Tagless [path]: seed a new file or edit live with no source-line provenance.
         None => {
-            if section
-                .ops
-                .iter()
-                .any(|op| matches!(op, Op::TextSwap { .. }))
-            {
+            if section.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
+                )
+            }) {
                 // Naming only the requirement sent agents into a full re-read.
                 // A section read carries the whole-file tag, so the cheap route
                 // has to be part of the rejection.
                 return Err(TilthError::EditRejected(
-                    "replace_text requires a tag from a tilth_read; a section read \
-                     (path#12-40) carries the whole-file tag without reading the file in \
-                     full, but `old` must occur in the lines it displayed. Files over the \
-                     tag cap mint no tag — use line ops there."
+                    "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search \
+                     result; a search match header or a section read (path#12-40) carries the \
+                     whole-file tag without reading the file in full, but the matched text must \
+                     occur in the lines it displayed. Files over the tag cap mint no tag — use \
+                     line ops there."
                         .into(),
                 ));
             }
@@ -361,7 +365,23 @@ fn recover_edit(
     // cross-session replay, or LRU-evicted) — it earns no short-circuit below.
     let snapshot = store.by_tag(key, tag);
     if let Some(snapshot) = &snapshot {
-        check_seen_lines(snapshot, path, &section.ops).map_err(EditError::from)?;
+        if let Err(error) = check_seen_lines(snapshot, path, &section.ops) {
+            if matches!(&error, MismatchError::UnseenAnchor { reads, .. } if !reads.is_empty()) {
+                let ranges = current_match_ranges(path, live, &section.ops);
+                if !ranges.is_empty() {
+                    let p = crate::format::display_path(path);
+                    let paths: Vec<String> = ranges
+                        .iter()
+                        .map(|(lo, hi)| format!("{p}#{lo}-{hi}"))
+                        .collect();
+                    let paths = serde_json::Value::from(paths);
+                    return Err(TilthError::EditRejected(format!(
+                        "Edit rejected for {p}: file changed since the read. tilth_read paths {paths} shows every match range in the current file; use the tag returned by that read when retrying."
+                    )));
+                }
+            }
+            return Err(EditError::from(error).into());
+        }
     }
     let file_op = FileOp::from_ops(&section.ops).map_err(EditError::Apply)?;
     let has_content = section
@@ -587,7 +607,11 @@ fn render_changed_window(
         let Some(row) = row else {
             continue;
         };
-        let mut numbered = render_numbered_slice(row, line);
+        // The slice ends in '\n' and rows are joined with '\n' below; drop it
+        // here so consecutive receipt rows have no blank line between them.
+        let mut numbered = render_numbered_slice(row, line)
+            .trim_end_matches('\n')
+            .to_string();
         if numbered.is_empty() {
             numbered = format!("{line}:");
         }
@@ -672,6 +696,184 @@ mod tests {
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
     use serde_json::json;
+
+    #[test]
+    fn receipt_rows_have_no_blank_line_between_them() {
+        let text = "one\ntwo\nthree\nfour\nfive\n";
+        let (rendered, seen, _) = render_changed_window(text, Some(3), Path::new("a.txt"), 1_000);
+        assert_eq!(seen.len(), 5);
+        assert!(
+            !rendered.contains("\n\n"),
+            "blank row in receipt: {rendered:?}"
+        );
+        assert_eq!(rendered.lines().count(), 5, "{rendered:?}");
+    }
+
+    #[test]
+    fn tool_write_replace_text_all_with_count_mismatch_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.txt");
+        let source = "foo\nfoo\nfoo\n";
+        std::fs::write(&path, source).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let read = json!({"cwd": dir.path(), "paths": [path.to_str().unwrap()]});
+        let read_out = crate::mcp::tools::read::tool_read(&read, &cache, &session).unwrap();
+        let tag = read_out
+            .split("m.txt#")
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .expect("tag in read output")
+            .to_string();
+        let edit = |count: u64| {
+            json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+                "ops": [{"op": "replace_text", "old": "foo", "new": "bar", "count": count}]}]})
+        };
+        let bad = super::tool_write(&edit(5), &session, &bloom, &cache);
+        let msg = match bad {
+            Ok(out) => out,
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("expected 5 matches") && msg.contains("found 3"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        super::tool_write(&edit(3), &session, &bloom, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bar\nbar\nbar\n");
+    }
+
+    const GO_SRC: &str = "package main\n\nfunc a() {\n\tx := w.Render(p)\n}\n\nfunc b() {\n\ty := t.inner.Render(q.Z())\n}\n";
+
+    fn read_tag(
+        dir: &Path,
+        spec: &str,
+        needle: &str,
+        session: &Session,
+        cache: &OutlineCache,
+    ) -> String {
+        let read = json!({"cwd": dir, "paths": [spec]});
+        let out = crate::mcp::tools::read::tool_read(&read, cache, session).unwrap();
+        out.split(needle)
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .expect("tag in read output")
+            .to_string()
+    }
+
+    #[test]
+    fn tool_write_rewrite_replaces_every_match_and_reports_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let tag = read_tag(
+            dir.path(),
+            path.to_str().unwrap(),
+            "r.go#",
+            &session,
+            &cache,
+        );
+        let edit = |count: u64| {
+            json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+                "ops": [{"op": "rewrite", "pattern": "$R.Render($W)",
+                         "rewrite": "$R.Render(context.Background(), $W)", "count": count}]}]})
+        };
+        let msg = match super::tool_write(&edit(5), &session, &bloom, &cache) {
+            Ok(out) => out,
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("rewrite expected 5 matches of pattern") && msg.contains("found 2"),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), GO_SRC);
+        let out = super::tool_write(&edit(2), &session, &bloom, &cache).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            GO_SRC
+                .replace("w.Render(p)", "w.Render(context.Background(), p)")
+                .replace(
+                    "t.inner.Render(q.Z())",
+                    "t.inner.Render(context.Background(), q.Z())"
+                )
+        );
+        assert!(out.contains("context.Background(), p"), "{out}");
+    }
+
+    #[test]
+    fn tool_write_rewrite_without_tag_or_on_unseen_match_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.go");
+        std::fs::write(&path, GO_SRC).unwrap();
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "w.Render(p)\n").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let op = json!([{"op": "rewrite", "pattern": "$R.Render($W)", "rewrite": "$R.Draw($W)"}]);
+        let run = |edits: Value| {
+            let args = json!({"cwd": dir.path(), "edits": edits});
+            match super::tool_write(&args, &session, &bloom, &cache) {
+                Ok(out) => out,
+                Err(e) => e,
+            }
+        };
+        let tagless = run(json!([{"path": path.to_str().unwrap(), "ops": op}]));
+        assert!(
+            tagless.contains("requires the [path#TAG] from a tilth_read or tilth_search"),
+            "{tagless}"
+        );
+
+        // Only the first function was displayed, so the second match is unseen.
+        let spec = format!("{}#1-5", path.to_str().unwrap());
+        let tag = read_tag(dir.path(), &spec, "r.go#", &session, &cache);
+        let unseen = run(json!([{"path": path.to_str().unwrap(), "tag": tag, "ops": op}]));
+        assert!(
+            unseen.contains("never displayed") && unseen.contains('8'),
+            "{unseen}"
+        );
+        // The fix is one batched read of each unseen match span, not a whole-file re-read.
+        let Some((reads, _)) = unseen
+            .split_once("tilth_read paths ")
+            .and_then(|(_, rest)| rest.split_once(" shows"))
+        else {
+            panic!("no batched read hint: {unseen}");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(reads).unwrap(),
+            json!(["r.go#8-8"]),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), GO_SRC);
+
+        let txt_tag = read_tag(
+            dir.path(),
+            txt.to_str().unwrap(),
+            "notes.txt#",
+            &session,
+            &cache,
+        );
+        let unsupported = run(json!([{"path": txt.to_str().unwrap(), "tag": txt_tag, "ops": op}]));
+        assert!(unsupported.contains("notes.txt"), "{unsupported}");
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), "w.Render(p)\n");
+    }
+
+    #[test]
+    fn tool_write_rewrite_rejects_capture_that_spans_unseen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.rs");
+        let source = "fn a() {\n    x();\n    y();\n    z();\n}\n";
+        std::fs::write(&path, source).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let spec = format!("{}#2-2", path.to_str().unwrap());
+        let tag = read_tag(dir.path(), &spec, "m.rs#", &session, &cache);
+        let args = json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+            "ops": [{"op": "rewrite", "pattern": "fn a() { $$$B }", "rewrite": "fn a() {}"}]}]});
+        let msg = super::tool_write(&args, &session, &bloom, &cache).unwrap_err();
+        assert!(msg.contains("never displayed"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
 
     #[test]
     fn incremental_write_create_evicts_parsed_entry() {
@@ -1757,7 +1959,9 @@ mod tests {
             // when a section read would have supplied the same whole-file tag.
             TilthError::EditRejected(message) => {
                 assert!(
-                    message.starts_with("replace_text requires a tag from a tilth_read"),
+                    message.starts_with(
+                        "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search"
+                    ),
                     "unexpected rejection: {message}"
                 );
                 assert!(

@@ -552,6 +552,15 @@ impl Language for PatternLanguage {
     }
 }
 
+/// Compile a structural pattern for `lang`, shared with the edit rewrite op.
+pub(crate) fn compile_pattern(
+    lang: Lang,
+    support: SupportLang,
+    source: &str,
+) -> Result<Pattern, String> {
+    PatternLanguage::new(lang, support).compile(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,5 +821,87 @@ mod tests {
             assert_eq!(result.retained, 1);
         }
         assert_eq!(witness.count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod go_pattern_tests {
+    use super::*;
+
+    fn matches(lang: Lang, support: SupportLang, pattern: &str, source: &str) -> Vec<String> {
+        let grammar =
+            tree_sitter::Language::new(crate::lang::spec::spec(lang).grammar.expect("grammar"));
+        let compiled = compile_pattern(lang, support, pattern).unwrap();
+        let document = crate::lang::treesitter::parse_document(source, &grammar).unwrap();
+        document
+            .root()
+            .find_all(&compiled)
+            .map(|node| node.text().into_owned())
+            .collect()
+    }
+
+    const GO: &str =
+        "package main\n\nfunc a() {\n\tw.Render(p)\n\ts.tpl.Render(q.Z())\n\tRender(r)\n}\n";
+
+    #[test]
+    fn go_selector_call_pattern_matches_varied_receivers() {
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "$R.Render($W)", GO),
+            ["w.Render(p)", "s.tpl.Render(q.Z())"]
+        );
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "w.Render($$$A)", GO),
+            ["w.Render(p)"]
+        );
+        assert_eq!(
+            matches(Lang::Go, SupportLang::Go, "Render($W)", GO),
+            ["Render(r)"]
+        );
+    }
+
+    #[test]
+    fn go_declaration_pattern_still_matches() {
+        let source = "package main\n\nfunc a(x int) int {\n\treturn x\n}\n";
+        assert_eq!(
+            matches(
+                Lang::Go,
+                SupportLang::Go,
+                "func $F($$$) $$$ { $$$ }",
+                source
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn other_languages_match_member_calls() {
+        assert_eq!(
+            matches(
+                Lang::Rust,
+                SupportLang::Rust,
+                "$X.foo($Y)",
+                "fn f() { a.foo(1); }\n"
+            ),
+            ["a.foo(1)"]
+        );
+        assert_eq!(
+            matches(
+                Lang::JavaScript,
+                SupportLang::JavaScript,
+                "$X.foo($Y)",
+                "a.foo(1);\n"
+            ),
+            ["a.foo(1)"]
+        );
+        assert_eq!(
+            matches(
+                Lang::Python,
+                SupportLang::Python,
+                "$X.foo($Y)",
+                "a.foo(1)\n"
+            ),
+            ["a.foo(1)"]
+        );
     }
 }

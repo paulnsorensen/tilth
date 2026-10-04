@@ -20,10 +20,12 @@ use std::path::Path;
 use thiserror::Error;
 
 use super::apply::{
-    anchor_lines, apply_ops, content_line_span, lower_ops, match_text_span, ApplyError, ApplyResult,
+    anchor_lines, apply_ops, content_line_span, find_all_text_spans, lower_ops, match_text_span,
+    ApplyError, ApplyResult,
 };
 use super::mismatch::MismatchError;
 use super::parser::Op;
+use super::rewrite::rewrite_match_spans;
 use super::snapshots::{Snapshot, SnapshotStore};
 use super::tag::compute_file_hash;
 
@@ -81,7 +83,7 @@ pub fn try_recover(
     // Re-lower against live purely to recover that diagnosis — but only when a
     // text swap is present, since lowering a block op re-parses the outline
     // uncached (~86ms on 735KB of Rust) for a diagnosis it cannot produce.
-    if ops.iter().any(|o| matches!(o, Op::TextSwap { .. })) {
+    if ops.iter().any(is_text_swap) {
         if let Err(err) = lower_ops(path, live, ops) {
             if err.is_text_match_failure() {
                 return Err(MismatchError::TextMatch {
@@ -157,7 +159,7 @@ fn replay_session_chain(
 /// by one line (the model saw part of the text it is replacing). Line, insert,
 /// and block ops stay strict — every anchored line must have been displayed.
 pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    check_text_swap_overlap(snapshot, ops)?;
+    check_text_swap_overlap(snapshot, path, ops)?;
     check_strict_anchors(snapshot, path, ops)
 }
 
@@ -165,13 +167,52 @@ pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<
 // line inside it. An `old` that does not resolve (unmatched/ambiguous/empty)
 // skips the gate here — apply_ops re-resolves the same text and reports the
 // real match failure, exactly as the strict path defers to it below.
-fn check_text_swap_overlap(snapshot: &Snapshot, ops: &[Op]) -> Result<(), MismatchError> {
+fn check_text_swap_overlap(
+    snapshot: &Snapshot,
+    path: &Path,
+    ops: &[Op],
+) -> Result<(), MismatchError> {
     for op in ops {
         if let Op::TextSwap { old, .. } = op {
             if let Ok((start, end, _)) = match_text_span(&snapshot.text, old) {
-                let (lo, hi) = content_line_span(&snapshot.text, start, end);
-                if !(lo..=hi).any(|l| snapshot.seen_lines.contains(&l)) {
-                    return Err(unseen_anchor(snapshot, lo, (lo, hi)));
+                check_span_seen(snapshot, start, end)?;
+            }
+        }
+        // all/count: every occurrence must overlap a seen line, not just one.
+        if let Op::TextSwapAll { old, count, .. } = op {
+            if let Ok(spans) = find_all_text_spans(&snapshot.text, old, *count) {
+                let unseen: Vec<(u32, u32)> = spans
+                    .iter()
+                    .map(|&(start, end)| content_line_span(&snapshot.text, start, end))
+                    .filter(|&(lo, hi)| !span_overlaps_seen(snapshot, lo, hi))
+                    .collect();
+                if let Some(&(lo, hi)) = unseen.first() {
+                    // One displayed line per occurrence passes the overlap gate.
+                    let reads = unseen.iter().map(|&(lo, _)| (lo, lo)).collect();
+                    return Err(with_reads(
+                        unseen_anchor(snapshot, lo, (lo, hi)),
+                        merge_ranges(reads),
+                    ));
+                }
+            }
+        }
+        // rewrite: `$$$` captures can span lines the agent never typed, so
+        // every line of every ast-grep match must have been displayed.
+        if let Op::Rewrite { pattern, count, .. } = op {
+            if let Ok(spans) = rewrite_match_spans(path, &snapshot.text, pattern, *count) {
+                let unseen: Vec<(u32, u32)> = spans
+                    .iter()
+                    .map(|&(start, end)| content_line_span(&snapshot.text, start, end))
+                    .filter(|&(lo, hi)| (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l)))
+                    .collect();
+                if let Some(&(lo, hi)) = unseen.first() {
+                    let line = (lo..=hi)
+                        .find(|l| !snapshot.seen_lines.contains(l))
+                        .unwrap_or(lo);
+                    return Err(with_reads(
+                        unseen_anchor(snapshot, line, (lo, hi)),
+                        merge_ranges(unseen),
+                    ));
                 }
             }
         }
@@ -179,16 +220,95 @@ fn check_text_swap_overlap(snapshot: &Snapshot, ops: &[Op]) -> Result<(), Mismat
     Ok(())
 }
 
+fn span_overlaps_seen(snapshot: &Snapshot, lo: u32, hi: u32) -> bool {
+    (lo..=hi).any(|l| snapshot.seen_lines.contains(&l))
+}
+
+fn check_span_seen(snapshot: &Snapshot, start: usize, end: usize) -> Result<(), MismatchError> {
+    let (lo, hi) = content_line_span(&snapshot.text, start, end);
+    if span_overlaps_seen(snapshot, lo, hi) {
+        Ok(())
+    } else {
+        Err(unseen_anchor(snapshot, lo, (lo, hi)))
+    }
+}
+
+fn with_reads(mut error: MismatchError, ranges: Vec<(u32, u32)>) -> MismatchError {
+    if let MismatchError::UnseenAnchor { reads, .. } = &mut error {
+        *reads = ranges;
+    }
+    error
+}
+
+/// `tilth_read` accepts at most this many paths in one call
+/// (`maxItems` in `crate::mcp::tools::definitions`; a test there pins it).
+pub(crate) const MAX_READ_RANGES: usize = 20;
+/// Ranges this close together read as one range.
+const MERGE_GAP: u32 = 3;
+
+/// Sort and merge line ranges for one batched `tilth_read`: join ranges within
+/// `MERGE_GAP` lines, then join the closest neighbours until at most
+/// `MAX_READ_RANGES` remain. Small ranges keep the read under its budget, so
+/// the read displays every line that it marks as seen.
+fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(MERGE_GAP + 1) => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    while merged.len() > MAX_READ_RANGES {
+        let Some(i) = (0..merged.len() - 1).min_by_key(|&i| merged[i + 1].0 - merged[i].1) else {
+            break;
+        };
+        merged[i].1 = merged[i].1.max(merged[i + 1].1);
+        merged.remove(i + 1);
+    }
+    merged
+}
+
+pub(crate) fn current_match_ranges(path: &Path, text: &str, ops: &[Op]) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    for op in ops {
+        match op {
+            Op::TextSwapAll { old, .. } => {
+                if let Ok(spans) = find_all_text_spans(text, old, None) {
+                    ranges.extend(spans.into_iter().map(|(start, end)| {
+                        let (lo, _) = content_line_span(text, start, end);
+                        (lo, lo)
+                    }));
+                }
+            }
+            Op::Rewrite { pattern, .. } => {
+                if let Ok(spans) = rewrite_match_spans(path, text, pattern, None) {
+                    ranges.extend(
+                        spans
+                            .into_iter()
+                            .map(|(start, end)| content_line_span(text, start, end)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    merge_ranges(ranges)
+}
+
+fn is_text_swap(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
+    )
+}
+
 // Line/insert/block ops stay strict. Lower only the non-text-swap ops (text
 // swaps handled above); a lowering failure skips the gate — apply_ops
 // re-lowers this same text and reports the real ApplyError. Live-lowering
 // paths re-check provenance themselves — see replay_session_chain.
 fn check_strict_anchors(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    let non_text: Vec<Op> = ops
-        .iter()
-        .filter(|o| !matches!(o, Op::TextSwap { .. }))
-        .cloned()
-        .collect();
+    let non_text: Vec<Op> = ops.iter().filter(|o| !is_text_swap(o)).cloned().collect();
     let Ok(lowered) = lower_ops(path, &snapshot.text, &non_text) else {
         return Ok(());
     };
@@ -212,6 +332,7 @@ fn unseen_anchor(snapshot: &Snapshot, line: u32, region: (u32, u32)) -> Mismatch
         displayed: ranges,
         reread_lo,
         reread_hi,
+        reads: Vec::new(),
     }
 }
 
@@ -653,6 +774,7 @@ mod tests {
                 displayed: vec![(1, 2)],
                 reread_lo: 1,
                 reread_hi: 3,
+                reads: Vec::new(),
             })
         );
 
@@ -820,5 +942,200 @@ mod tests {
         assert!(check_seen_lines(&snap, &p(), &ops).is_ok());
         let err = gated_apply(&snap, &p(), &ops).unwrap_err();
         assert_eq!(err, EditError::Apply(ApplyError::FileOpConflict));
+    }
+
+    fn snap_with_seen(text: &str, seen: &[u32]) -> Snapshot {
+        Snapshot {
+            path: "g.rs".into(),
+            text: text.into(),
+            tag: 0,
+            recorded_at: 1,
+            seen_lines: seen.iter().copied().collect(),
+        }
+    }
+
+    fn all_foo(count: Option<usize>) -> Vec<Op> {
+        vec![Op::TextSwapAll {
+            old: "foo".into(),
+            new: "bar".into(),
+            count,
+        }]
+    }
+
+    #[test]
+    fn all_gate_rejects_when_any_occurrence_is_unseen() {
+        let snap = snap_with_seen("foo\nmid\nfoo\n", &[1, 2]);
+        let err = gated_apply(&snap, &p(), &all_foo(None)).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { line, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert_eq!(line, 3, "must name the unseen occurrence's line");
+    }
+
+    #[test]
+    fn all_gate_names_one_read_line_per_unseen_occurrence() {
+        // Occurrences 70 lines apart sit past the old 60-line re-read window.
+        let text = format!(
+            "foo\n{}foo\n{}foo\n",
+            "mid\n".repeat(69),
+            "mid\n".repeat(69)
+        );
+        let snap = snap_with_seen(&text, &[1]);
+        let err = gated_apply(&snap, &p(), &all_foo(None)).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { line, reads, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert_eq!(line, 71);
+        assert_eq!(reads, vec![(71, 71), (141, 141)]);
+    }
+
+    #[test]
+    fn merge_ranges_joins_near_ranges_and_caps_the_batch() {
+        assert_eq!(
+            merge_ranges(vec![(12, 12), (1, 2), (5, 6), (30, 31)]),
+            vec![(1, 6), (12, 12), (30, 31)]
+        );
+        let spread: Vec<(u32, u32)> = (0..25).map(|i| (i * 100, i * 100)).collect();
+        let merged = merge_ranges(spread);
+        assert_eq!(merged.len(), MAX_READ_RANGES);
+        assert_eq!((merged[0].0, merged[MAX_READ_RANGES - 1].1), (0, 2400));
+    }
+
+    #[test]
+    fn all_gate_accepts_when_every_occurrence_is_seen() {
+        let snap = snap_with_seen("foo\nmid\nfoo\n", &[1, 3]);
+        let r = gated_apply(&snap, &p(), &all_foo(Some(2))).expect("apply");
+        assert_eq!(r.text, "bar\nmid\nbar\n");
+    }
+
+    #[test]
+    fn all_replay_on_live_never_applies_unseen_anchor() {
+        // Snapshot is not head; live has equal line count and identical anchor
+        // lines, but line 3 was never displayed under the snapshot.
+        let mut store = SnapshotStore::new();
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, "foo\nmid\nfoo\n", [1]).unwrap();
+        store.record(&key, "foo\nmid2\nfoo\n", [1, 3]).unwrap();
+        let live = "foo\nmid2\nfoo\n";
+        let err = try_recover(&store, &p(), tag, &all_foo(None), live).unwrap_err();
+        assert!(
+            matches!(err, MismatchError::Drift { .. }),
+            "unseen occurrence must reject as drift: {err:?}"
+        );
+    }
+    const RW_SRC: &str = "fn a() {\n    foo(1);\n}\nfn b() {\n    foo(2);\n}\n";
+
+    fn rewrite_foo(count: Option<usize>) -> Vec<Op> {
+        vec![Op::Rewrite {
+            pattern: "foo($A)".into(),
+            rewrite: "bar($A)".into(),
+            count,
+        }]
+    }
+
+    #[test]
+    fn rewrite_gate_rejects_when_any_match_is_unseen() {
+        let snap = snap_with_seen(RW_SRC, &[1, 2, 3]);
+        let err = gated_apply(&snap, &p(), &rewrite_foo(None)).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { line, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert_eq!(line, 5, "must name the first unseen match's line");
+    }
+
+    #[test]
+    fn rewrite_gate_rejection_names_full_span_reads() {
+        let src = "fn a() {\n    foo(1);\n}\nfn b() {\n    foo(\n        2,\n    );\n}\n";
+        let snap = snap_with_seen(src, &[1, 2, 3]);
+        let err = gated_apply(&snap, &p(), &rewrite_foo(None)).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { line, reads, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        // A rewrite must see every line of each match, so each read is a full span.
+        assert_eq!((line, reads), (5, vec![(5, 7)]));
+    }
+
+    #[test]
+    fn rewrite_with_many_matches_names_merged_reads() {
+        let text = "fn a() { foo(1); }\n".repeat(1001);
+        let snap = snap_with_seen(&text, &[1]);
+        let err = gated_apply(&snap, &p(), &rewrite_foo(None)).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { reads, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert_eq!(reads, vec![(2, 1001)]);
+    }
+
+    #[test]
+    fn single_text_swap_rejection_keeps_the_reread() {
+        let snap = snap_with_seen("foo\nmid\nbar\n", &[1]);
+        let ops = vec![Op::TextSwap {
+            old: "bar".into(),
+            new: "baz".into(),
+        }];
+        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { reads, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert!(
+            reads.is_empty(),
+            "a single swap keeps the bounded re-read hint"
+        );
+    }
+
+    #[test]
+    fn rewrite_gate_accepts_when_every_match_is_seen() {
+        let snap = snap_with_seen(RW_SRC, &[2, 5]);
+        let r = gated_apply(&snap, &p(), &rewrite_foo(Some(2))).expect("apply");
+        assert_eq!(
+            r.text,
+            "fn a() {\n    bar(1);\n}\nfn b() {\n    bar(2);\n}\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_replay_on_live_never_applies_unseen_match() {
+        // The snapshot displayed only the first match; live differs on a line
+        // next to it, so the merge conflicts and only the chain replay could
+        // apply the rewrite. It must refuse the unseen second match.
+        let mut store = SnapshotStore::new();
+        let key = p().to_string_lossy().into_owned();
+        let tag = store.record(&key, RW_SRC, [1, 2]).unwrap();
+        let live = "fn a() {\n    foo(1);\n} // z\nfn b() {\n    foo(2);\n}\n";
+        store.record(&key, live, [1, 2, 3]).unwrap();
+        let err = try_recover(&store, &p(), tag, &rewrite_foo(None), live).unwrap_err();
+        assert!(
+            matches!(err, MismatchError::Drift { .. }),
+            "unseen match must reject as drift: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_gate_rejects_multiline_capture_with_unseen_interior() {
+        let src = "fn a() {\n    x();\n    y();\n    z();\n}\n";
+        let snap = snap_with_seen(src, &[1]);
+        let ops = vec![Op::Rewrite {
+            pattern: "fn a() { $$$B }".into(),
+            rewrite: "fn a() {}".into(),
+            count: None,
+        }];
+        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
+        let EditError::Mismatch(MismatchError::UnseenAnchor { line, .. }) = err else {
+            panic!("expected UnseenAnchor, got {err:?}");
+        };
+        assert_eq!(line, 2, "must name the first unseen line of the match");
+    }
+
+    #[test]
+    fn rewrite_gate_accepts_multiline_match_when_every_line_is_seen() {
+        let src = "fn a() {\n    x();\n    y();\n}\n";
+        let snap = snap_with_seen(src, &[1, 2, 3, 4]);
+        let ops = vec![Op::Rewrite {
+            pattern: "fn a() { $$$B }".into(),
+            rewrite: "fn a() {}".into(),
+            count: None,
+        }];
+        let r = gated_apply(&snap, &p(), &ops).expect("apply");
+        assert_eq!(r.text, "fn a() {}\n");
     }
 }
