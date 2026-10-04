@@ -606,3 +606,32 @@ def test_rejected_rate_limit_event_before_a_successful_result_is_not_quota():
     ]
 
     assert detect_quota_rejection("\n".join(map(json.dumps, events))) is None
+
+
+def test_rejected_overage_event_on_a_budget_failure_is_not_quota():
+    """Only a terminal usage-limit result is quota; a budget stop is an ordinary failure."""
+    from parse import detect_quota_rejection
+
+    events = [
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "overage"}},
+        {"type": "result", "subtype": "error_max_budget_usd", "is_error": True, "total_cost_usd": 1.0},
+    ]
+
+    assert detect_quota_rejection("\n".join(map(json.dumps, events))) is None
+
+
+def test_rate_limit_result_subtype_is_quota():
+    from parse import detect_quota_rejection
+
+    event = {"type": "result", "subtype": "error_rate_limit", "is_error": True}
+
+    assert detect_quota_rejection(json.dumps(event))
+
+
+def test_missing_native_cost_and_init_model_prices_with_the_configured_model():
+    events = [_assistant_event("ok"), {"type": "result", "num_turns": 1}]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events), model="claude-sonnet-5")
+
+    assert result.cost_source == "pricing"
+    assert result.total_cost_usd > 0.0

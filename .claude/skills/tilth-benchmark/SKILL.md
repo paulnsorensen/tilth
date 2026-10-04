@@ -19,6 +19,7 @@ Collect or derive these before running:
 - explicit comma-separated model aliases from `benchmark/config.py`
 - repetitions, at least 1
 - maximum permitted benchmark cells
+- run-wide spend ceiling in USD (`--max-usd`)
 
 Never default a routine to `--tasks all` or `--models all`. A routine must make its paid workload visible in its configuration.
 
@@ -63,8 +64,11 @@ python benchmark/run.py \
   --tasks <task-a,task-b> \
   --models <model-a,model-b> \
   --reps <repetitions> \
-  --max-cells <maximum-cells>
+  --max-cells <maximum-cells> \
+  --max-usd <spend-ceiling-usd>
 ```
+
+   `--max-usd` is required whenever any cell is not answered from the result store; without it `run.py` exits before any model call. It caps the whole run's spend, including failed cells. The runner stops before the cell whose estimate would cross the ceiling and exits nonzero; re-running the same command resumes and reuses completed cells.
 
 9. Capture the result path printed by the runner. The runner records cell failures and finishes the schedule, so a zero exit code is not evidence of a valid run.
 10. Validate the result before analysis:

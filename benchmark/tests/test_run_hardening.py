@@ -59,15 +59,18 @@ def test_build_runner_env_allowlists_ambient_environment(
     bare: bool,
 ) -> None:
     """Each lane gets runtime/auth values but no unrelated host secret."""
-    # A Claude cell refuses ANTHROPIC_API_KEY outright (test_build_runner_env_refuses_api_key_for_claude).
-    auth_keys = _AUTH_KEYS - {"ANTHROPIC_API_KEY"} if runner == "claude" else _AUTH_KEYS
+    # A Claude cell refuses API-billing credentials outright
+    # (test_claude_auth_guard_refuses_api_billing_credentials); no runner receives them.
+    billing = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+    auth_keys = _AUTH_KEYS - billing if runner == "claude" else _AUTH_KEYS
     values = {key: f"value-for-{key}" for key in _RUNTIME_KEYS | auth_keys}
     values["PATH"] = "/usr/bin"
     values["LC_CUSTOM"] = "custom-locale"
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     if runner == "claude":
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        for key in billing:
+            monkeypatch.delenv(key, raising=False)
 
     monkeypatch.setenv("SENTINEL_SECRET", "do-not-forward")
     monkeypatch.setenv("CLAUDECODE", "nested-session")
@@ -83,9 +86,10 @@ def test_build_runner_env_allowlists_ambient_environment(
     expected = {
         key: value
         for key, value in ambient.items()
-        if key in _RUNTIME_KEYS
-        or key == "CODEX_API_KEY"
-        or key.startswith(("ANTHROPIC_", "OPENAI_", "OPENROUTER_", "LC_"))
+        if (key in _RUNTIME_KEYS
+            or key == "CODEX_API_KEY"
+            or key.startswith(("ANTHROPIC_", "OPENAI_", "OPENROUTER_", "LC_")))
+        and key not in billing
     }
     expected["PATH"] = f"/opt/tilth/bin{os.pathsep}{ambient['PATH']}"
     expected["DISABLE_AUTOUPDATER"] = "1"
@@ -319,7 +323,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
             "arguments": {"paths": ["a.py", "b.py"]},
         }}), model_id)]
     elif runner == "claude":
-        assert parser_calls == [(json.dumps({"type": "result", "subtype": "success", "is_error": False}),)]
+        assert parser_calls == [(json.dumps({"type": "result", "subtype": "success", "is_error": False}), model_id)]
     else:
         assert parser_calls == [("{}",)]
 
@@ -707,7 +711,7 @@ def test_claude_streaming_run_does_not_inherit_stdin(
         ),
     )
     monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
-    monkeypatch.setattr(run, "parse_stream_json", lambda _: RunResult(
+    monkeypatch.setattr(run, "parse_stream_json", lambda *_: RunResult(
         session_id="session",
         turns=[Turn(index=0, input_tokens=1, output_tokens=2, cache_creation_tokens=0, cache_read_tokens=0)],
         num_turns=1,
@@ -781,7 +785,7 @@ def test_mcp_armed_claude_cell_without_tilth_tools_raises(
         ),
     )
     monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
-    monkeypatch.setattr(run, "parse_stream_json", lambda _: RunResult(
+    monkeypatch.setattr(run, "parse_stream_json", lambda *_: RunResult(
         session_id="session",
         turns=[],
         num_turns=1,
@@ -1401,7 +1405,7 @@ def test_build_runner_env_refuses_api_key_for_claude() -> None:
 
     with pytest.raises(run.ClaudeAuthError, match="ANTHROPIC_API_KEY"):
         run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
-    assert run.build_runner_env("codex", ambient=ambient, tilth_bin=None)["ANTHROPIC_API_KEY"] == "sk-ant-api"
+    assert "ANTHROPIC_API_KEY" not in run.build_runner_env("codex", ambient=ambient, tilth_bin=None)
 
 
 def test_paid_run_requires_max_usd(bench, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1461,7 +1465,8 @@ def test_failed_cells_count_toward_ceiling(bench) -> None:
     assert code != 0
     assert len(bench.calls) == 2
     rows = bench.output_rows()
-    assert [row["total_cost_usd"] for row in rows] == [0.4, 0.4]
+    assert [row["charged_usd"] for row in rows] == [0.4, 0.4]
+    assert not any("total_cost_usd" in row for row in rows)
     assert {row["cost_source"] for row in rows} == {"estimate"}
 
 
@@ -1532,3 +1537,60 @@ def test_rejected_rate_limit_on_a_successful_cell_is_not_quota(
 def test_quota_stream_raises_quota_error_in_the_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with pytest.raises(run.QuotaExhaustedError, match="usage limit"):
         _replay_claude_cell(monkeypatch, tmp_path, "claude_quota_rejected.jsonl")
+
+
+def test_claude_stream_without_init_model_is_priced_with_the_cell_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    events = [json.loads(line) for line in (_STREAMS / "claude_no_native_cost.jsonl").read_text().splitlines()]
+    del events[0]["model"]
+    stream = tmp_path / "no_init_model.jsonl"
+    stream.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    row, _ = _replay_claude_cell(monkeypatch, tmp_path, str(stream))
+
+    assert row["cost_source"] == "pricing"
+    assert row["total_cost_usd"] > 0
+
+
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_claude_auth_guard_refuses_api_billing_credentials(key: str) -> None:
+    with pytest.raises(run.ClaudeAuthError, match=key):
+        run.guard_claude_auth({key: "sk-ant-secret"})
+    with pytest.raises(run.ClaudeAuthError, match=key):
+        run.build_runner_env("claude", ambient={"PATH": "/usr/bin", key: "sk-ant-secret"}, tilth_bin=None)
+
+
+@pytest.mark.parametrize("runner", ["codex", "opencode"])
+def test_anthropic_api_credentials_never_reach_a_runner(runner: str) -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-ant-api", "ANTHROPIC_AUTH_TOKEN": "bearer",
+               "ANTHROPIC_BASE_URL": "https://proxy.example"}
+
+    env = run.build_runner_env(runner, ambient=ambient, tilth_bin=None,
+                               opencode_config="/controlled/opencode.json" if runner == "opencode" else None)
+
+    assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
+    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example"
+
+
+def test_empty_anthropic_values_are_dropped_not_refused() -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
+               "ANTHROPIC_BASE_URL": "", "ANTHROPIC_MODEL": "claude-sonnet-5"}
+
+    env = run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
+
+    assert not any(key.startswith("ANTHROPIC_") and key != "ANTHROPIC_MODEL" for key in env)
+    assert env["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+
+
+def test_auth_token_refuses_claude_cell(bench, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "bearer")
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1",
+                      "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == []
+    assert "ANTHROPIC_AUTH_TOKEN" in capsys.readouterr().err

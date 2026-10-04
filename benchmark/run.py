@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 # Add parent directory to path for imports
@@ -106,6 +107,10 @@ def _variant_metadata(
         "tilth_version": reported_version or mode.tilth_version,
         "rustc_version": mode.rustc_version,
     }
+
+
+def _reported_tilth_version(mode: ModeConfig) -> Optional[str]:
+    return mode.tilth_version or (_tilth_version(mode.binary_path) if mode.binary_path else None)
 
 
 def wozcode_mode(plugin_dir: Path) -> ModeConfig:
@@ -192,17 +197,22 @@ class ClaudeAuthError(RuntimeError):
     """A Claude subprocess would bill an API key instead of the subscription."""
 
 
-def guard_claude_auth(env: Mapping[str, str]) -> None:
-    """Refuse a Claude call whose environment carries ``ANTHROPIC_API_KEY``.
+# API-billing credentials: under ``claude -p`` either overrides
+# ``CLAUDE_CODE_OAUTH_TOKEN`` and bills the API instead of the subscription.
+_API_BILLING_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
-    Under ``claude -p`` the API key silently overrides ``CLAUDE_CODE_OAUTH_TOKEN``,
-    switching billing off the subscription. Judge and proposer callers reuse this.
+
+def guard_claude_auth(env: Mapping[str, str]) -> None:
+    """Refuse a Claude call whose environment carries an API-billing credential.
+
+    Judge and proposer callers reuse this.
     """
-    if env.get("ANTHROPIC_API_KEY"):
-        raise ClaudeAuthError(
-            "ANTHROPIC_API_KEY is set; it overrides CLAUDE_CODE_OAUTH_TOKEN and bills "
-            "the API instead of the subscription. Unset it before running Claude cells."
-        )
+    for key in _API_BILLING_KEYS:
+        if env.get(key):
+            raise ClaudeAuthError(
+                f"{key} is set; it overrides CLAUDE_CODE_OAUTH_TOKEN and bills "
+                "the API instead of the subscription. Unset it before running Claude cells."
+            )
 
 
 def build_runner_env(
@@ -226,6 +236,11 @@ def build_runner_env(
         or key.startswith(_PROVIDER_AUTH_PREFIXES)
         or key.startswith("LC_")
     }
+    # No runner bills Anthropic through the API, and an empty ANTHROPIC_* value
+    # can still switch a client's auth path, so neither is forwarded.
+    for key in [key for key, value in env.items()
+                if key in _API_BILLING_KEYS or (key.startswith("ANTHROPIC_") and not value)]:
+        del env[key]
     # Pin the agent CLI for the whole run: a mid-run update changes the run key.
     env["DISABLE_AUTOUPDATER"] = "1"
 
@@ -456,8 +471,11 @@ _STRICT_SYSTEM_GUIDANCE = (
 )
 
 
+_BASH_GUARD = Path(__file__).with_name("claude_bash_guard.py")
+
+
 def _strict_bash_settings() -> str:
-    guard = Path(__file__).with_name("claude_bash_guard.py").resolve()
+    guard = _BASH_GUARD.resolve()
     command = f"{shlex.quote(str(Path(sys.executable).resolve()))} {shlex.quote(str(guard))}"
     return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
         {"type": "command", "command": command},
@@ -501,16 +519,28 @@ _TOOLCHAIN_PROBES = {
     "go": ("go", "version"),
     "node": ("node", "--version"),
     "python3": ("python3", "--version"),
+    "uv": ("uv", "--version"),
 }
+# The toolchains a repo's language builds and tests with; a rustc bump must not
+# re-key a Go, JavaScript, or Python task.
+_LANGUAGE_TOOLCHAINS = {
+    "rust": ("rustc", "cargo"),
+    "go": ("go",),
+    "javascript": ("node",),
+    "python": ("python3", "uv"),
+}
+# The synthetic fixture repo is a Python project (fixtures/template/pyproject.toml).
+_SYNTHETIC_LANGUAGE = "python"
+# A repo without a lockfile (express) pins its dependencies through these instead.
+_UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
 _LOCKFILES = (
     "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
 )
 
 
-@functools.lru_cache(maxsize=None)
-def _probe_version(argv: tuple[str, ...]) -> str | None:
-    """Return a tool's version line once per run, or None when it is unavailable."""
+def _run_probe(argv: tuple[str, ...]) -> str | None:
+    """Return a tool's version line, or None when it is unavailable."""
     try:
         probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
@@ -519,9 +549,17 @@ def _probe_version(argv: tuple[str, ...]) -> str | None:
     return lines[0] if probe.returncode == 0 and lines else None
 
 
-def cli_version(runner: str) -> str | None:
-    """Return the agent CLI version that a runner subprocess will use."""
-    return _probe_version((runner, "--version"))
+# Probed once per run when planning cell identities.
+_probe_version = functools.lru_cache(maxsize=None)(_run_probe)
+
+
+def cli_version(runner: str, *, fresh: bool = False) -> str | None:
+    """Return the agent CLI version that a runner subprocess will use.
+
+    ``fresh`` bypasses the per-run cache; the scheduler re-probes before each paid
+    cell so a mid-run CLI update cannot mix versions under one planned key.
+    """
+    return (_run_probe if fresh else _probe_version)((runner, "--version"))
 
 
 def _file_sha256(path: Path) -> str:
@@ -530,20 +568,33 @@ def _file_sha256(path: Path) -> str:
 
 
 def env_fingerprint(repo_name: str) -> str:
-    """Fingerprint the toolchains and the task repo's dependency lockfiles."""
+    """Fingerprint the task repo language's toolchains and its dependency lockfiles."""
     repo_path = get_repo_path(repo_name)
+    language = _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
     lockfiles = {
         name: _file_sha256(repo_path / name)
         for name in _LOCKFILES if (repo_path / name).is_file()
+    } or {
+        name: _file_sha256(repo_path / name)
+        for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
     }
     return baselines.env_fingerprint(
-        toolchains={name: _probe_version(argv) for name, argv in _TOOLCHAIN_PROBES.items()},
+        toolchains={name: _probe_version(_TOOLCHAIN_PROBES[name])
+                    for name in _LANGUAGE_TOOLCHAINS.get(language, ())},
         lockfile_hash=hashlib.sha256(json.dumps(lockfiles, sort_keys=True).encode()).hexdigest(),
     )
 
 
 def _is_tilth_arm(mode: ModeConfig) -> bool:
     return mode.mcp_config_path is not None and mode.plugin_dir is None
+
+
+def is_stock_arm(mode: ModeConfig) -> bool:
+    """A stock (baseline) arm attaches no MCP server or plugin, whatever its name.
+
+    Legacy runs call it ``baseline``; experiment manifests call it ``no_tilth``.
+    """
+    return mode.mcp_config_path is None and mode.plugin_dir is None
 
 
 def _mcp_shape(mode: ModeConfig, runner: str, mode_name: str) -> dict:
@@ -633,6 +684,43 @@ def _cell_task_digest(task: object) -> str:
     )
 
 
+_REPO_PLACEHOLDER = Path("<repo>")
+_TILTH_BIN_PLACEHOLDER = "<tilth-bin>"
+
+
+def _command_template(
+    task: object,
+    mode: ModeConfig,
+    mode_name: str,
+    model_name: str,
+    *,
+    bare: bool,
+    reasoning_effort: str | None,
+    max_budget_usd: float,
+    strict_file_tools: bool,
+) -> list[str]:
+    """Return the runner argv a cell will run, with its per-cell paths normalized.
+
+    The disposable workspace path, the host skill paths codex disables, the
+    tilth binary path (keyed by its SHA-256), and the task prompt (keyed by the
+    task digest) become placeholders, so the template changes only when the
+    runner configuration does.
+    """
+    if _is_tilth_arm(mode):
+        mode = replace(mode, binary_path=_TILTH_BIN_PLACEHOLDER)
+    template_task = SimpleNamespace(prompt="<prompt>", hide_git=bool(getattr(task, "hide_git", False)))
+    try:
+        cmd, _ = _runner_command(
+            template_task, mode, mode_name, model_name, _REPO_PLACEHOLDER,
+            bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
+            strict_file_tools=strict_file_tools, skill_paths=[],
+        )
+    except (ValueError, RuntimeError) as error:
+        # The cell fails when it runs; key it by the reason it cannot be built.
+        return [f"unbuildable: {error}"]
+    return cmd
+
+
 def cell_identity(
     task_name: str,
     mode_name: str,
@@ -660,6 +748,11 @@ def cell_identity(
             bare=bare,
             max_budget_usd=max_budget_usd if runner == "claude" else None,
             mcp_shape=_mcp_shape(mode, runner, mode_name),
+            command=_command_template(
+                task, mode, mode_name, model_name, bare=bare, reasoning_effort=reasoning_effort,
+                max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+            ),
+            bash_guard_sha256=_file_sha256(_BASH_GUARD) if strict_file_tools else None,
         ),
         "task_digest": _cell_task_digest(task),
         "env_fingerprint": env_fingerprint(task.repo),
@@ -725,35 +818,34 @@ def run_single(
         )
 
 
-def _run_single_in_repo(
-    task_name: str,
+_CODEX_GUIDANCE = (
+    "Do not discover, read, or invoke host skills or external agent guidance. "
+    "Batch independent source reads in one call when the tool supports it."
+)
+_CODEX_TILTH_GUIDANCE = (
+    " Use tilth MCP first for source discovery, reads, and writes. "
+    "Batch independent files into one tilth call. "
+    "Use shell only for tests and builds. Native tools remain available."
+)
+
+
+def _runner_command(
+    task: object,
+    mode: ModeConfig,
     mode_name: str,
     model_name: str,
-    repetition: int,
     repo_path: Path,
-    verbose: bool = False,
-    stream_log_path: Optional[Path] = None,
-    bare: bool = False,
-    reasoning_effort: str | None = None,
-    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
-    strict_file_tools: bool = False,
-    claude_config_dir: Path | None = None,
-) -> dict:
-    """Execute and grade one benchmark cell."""
-    task = TASKS[task_name]
-    mode = MODES[mode_name]
+    *,
+    bare: bool,
+    reasoning_effort: str | None,
+    max_budget_usd: float,
+    strict_file_tools: bool,
+    skill_paths: list[str],
+) -> tuple[list[str], Optional[str]]:
+    """Build one cell's runner argv and, for opencode, the config it selects."""
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
     opencode_config: Optional[str] = None
-    skill_paths: list[str] = []
-    skill_roots: list[str] = []
-    identity = cell_identity(
-        task_name, mode_name, model_name, repetition,
-        bare=bare, reasoning_effort=reasoning_effort,
-        max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
-    )
-
-    # Build command based on runner
     if runner == "codex":
         if mode_name == "tilth_forced":
             raise ValueError("Codex cannot enforce tilth_forced tool restrictions")
@@ -770,23 +862,13 @@ def _run_single_in_repo(
             "-c", "project_doc_max_bytes=0",
             "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
         ]
-        skill_paths = _codex_skill_paths(repo_path, os.environ)
-        skill_roots = [str(path) for path in _codex_skill_roots(repo_path, os.environ)]
         skills_config = ",".join(
             f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
         )
         cmd += ["-c", f"skills.config=[{skills_config}]"]
-        instructions = (
-            f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n"
-            "Do not discover, read, or invoke host skills or external agent guidance. "
-            "Batch independent source reads in one call when the tool supports it."
-        )
+        instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
         if mode.mcp_config_path:
-            instructions += (
-                " Use tilth MCP first for source discovery, reads, and writes. "
-                "Batch independent files into one tilth call. "
-                "Use shell only for tests and builds. Native tools remain available."
-            )
+            instructions += _CODEX_TILTH_GUIDANCE
         cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
         if reasoning_effort is not None:
             cmd += ["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"]
@@ -867,6 +949,45 @@ def _run_single_in_repo(
             cmd += ["--mcp-config", json.dumps(claude_mcp_config(mode))]
 
         cmd += ["--", task.prompt]
+
+    return cmd, opencode_config
+
+
+def _run_single_in_repo(
+    task_name: str,
+    mode_name: str,
+    model_name: str,
+    repetition: int,
+    repo_path: Path,
+    verbose: bool = False,
+    stream_log_path: Optional[Path] = None,
+    bare: bool = False,
+    reasoning_effort: str | None = None,
+    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+    strict_file_tools: bool = False,
+    claude_config_dir: Path | None = None,
+) -> dict:
+    """Execute and grade one benchmark cell."""
+    task = TASKS[task_name]
+    mode = MODES[mode_name]
+    model_id = MODELS[model_name]
+    runner = RUNNERS[model_name]
+    skill_paths: list[str] = []
+    skill_roots: list[str] = []
+    identity = cell_identity(
+        task_name, mode_name, model_name, repetition,
+        bare=bare, reasoning_effort=reasoning_effort,
+        max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+    )
+
+    if runner == "codex":
+        skill_paths = _codex_skill_paths(repo_path, os.environ)
+        skill_roots = [str(path) for path in _codex_skill_roots(repo_path, os.environ)]
+    cmd, opencode_config = _runner_command(
+        task, mode, mode_name, model_name, repo_path,
+        bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
+        strict_file_tools=strict_file_tools, skill_paths=skill_paths,
+    )
 
     if verbose:
         print(f"    Running: {' '.join(cmd)}")
@@ -980,7 +1101,7 @@ def _run_single_in_repo(
     elif runner == "opencode":
         run_result = parse_opencode_json(result.stdout)
     else:
-        run_result = parse_stream_json(result.stdout)
+        run_result = parse_stream_json(result.stdout, model_id)
     codex_tilth_calls = 0
     if runner == "codex":
         codex_tilth_calls = _validate_codex_stream(
@@ -1030,9 +1151,7 @@ def _run_single_in_repo(
     per_turn_output = [turn.output_tokens for turn in run_result.turns]
     total_context = sum(per_turn_context)
     task_source = asdict(task.source)
-    reported_version = mode.tilth_version or (
-        _tilth_version(mode.binary_path) if mode.binary_path else None
-    )
+    reported_version = _reported_tilth_version(mode)
 
     # Return JSON-serializable dict
     return {
@@ -1488,7 +1607,7 @@ Examples:
                 parser.error(str(error))
         drift = {}
         for cell in pending:
-            if cell.mode_name != "baseline":
+            if not is_stock_arm(MODES[cell.mode_name]):
                 continue
             planned = {
                 **cell.identity, "task": cell.task_name, "model": MODELS[cell.model_name],
@@ -1541,22 +1660,30 @@ Examples:
             output.write(json.dumps(row) + "\n")
             output.flush()
 
-        def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
-            """Store a failed cell, charging its native cost or else its pre-run estimate."""
+        def settle(row: dict, amount: float) -> None:
+            """Charge, store, and record one paid cell; called exactly once per cell."""
             nonlocal run_max_cost
+            row["charged_usd"] = amount
+            ledger.charge(amount, source=row.get("cost_source") or "native")
+            run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
+            baselines.store(row, path=store_path)
+            history.append(row)
+            record(row)
+
+        def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
+            """Store a failed cell, charging its native cost or else its pre-run estimate.
+
+            Only a native cost is reported as ``total_cost_usd``; an estimate is
+            charged to the ledger as ``charged_usd`` but is not a measured cost.
+            """
             native = stream_native_cost(_read_stream(stream_log_path))
-            amount = native if native is not None else estimate
             failed = {
                 **row,
-                "total_cost_usd": amount,
+                **({"total_cost_usd": native} if native is not None else {}),
                 "cost_source": "native" if native is not None else "estimate",
                 "trajectory_path": write_trajectory(stream_log_path, runner),
             }
-            ledger.charge(amount, source=failed["cost_source"])
-            run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
-            baselines.store(failed, path=store_path)
-            history.append(failed)
-            record(failed)
+            settle(failed, native if native is not None else estimate)
             return failed
 
         for current_run, cell in enumerate(cells, start=1):
@@ -1576,8 +1703,14 @@ Examples:
 
             stored = reusable.get(cell.run_key)
             if stored is not None:
-                # Written like a fresh row: this run's schedule metadata, the stored outcome.
-                record({**stored, **experiment_metadata, "reused": True})
+                # Written like a fresh row: this run's schedule and variant metadata,
+                # the stored outcome. The run key already pins what the variant runs.
+                reported_version = _reported_tilth_version(MODES[mode_name])
+                record({
+                    **stored, **experiment_metadata, "tilth_version": reported_version,
+                    "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
+                    "reused": True,
+                })
                 print(f"  ↺ reused stored row ({'✓' if stored.get('correct') else '✗'})")
                 continue
 
@@ -1589,6 +1722,13 @@ Examples:
                 stop_reason = (
                     f"spend ceiling: ${ledger.spent:.4f} spent + ${estimate:.4f} estimated for "
                     f"{run_id} exceeds --max-usd {args.max_usd}"
+                )
+                break
+            current_cli = cli_version(runner, fresh=True)
+            if current_cli != cell.identity["cli_version"]:
+                stop_reason = (
+                    f"agent CLI version changed mid-run: {runner} was "
+                    f"{cell.identity['cli_version']!r} when planned, now {current_cli!r}"
                 )
                 break
 
@@ -1636,26 +1776,6 @@ Examples:
                 result.update(cell.identity)
                 result["reused"] = False
                 result.setdefault("trajectory_path", None)
-                ledger.charge(result["total_cost_usd"], source=result.get("cost_source") or "native")
-                run_max_cost = (
-                    result["total_cost_usd"] if run_max_cost is None
-                    else max(run_max_cost, result["total_cost_usd"])
-                )
-                baselines.store(result, path=store_path)
-                history.append(result)
-                record(result)
-
-                status = "✓" if result["correct"] else "✗"
-                print(
-                    f"  {status} "
-                    f"{result['num_turns']}t "
-                    f"{result['context_tokens']:,}ctx "
-                    f"{result['output_tokens']:,}out "
-                    f"${result['total_cost_usd']:.4f} "
-                    f"{result['duration_ms']:,}ms"
-                )
-                if not result["correct"]:
-                    print(f"  → {result['correctness_reason']}")
 
             except InvalidCodexCellError as error:
                 print(f"  ✗ INVALID CODEX CELL: {error}")
@@ -1721,6 +1841,21 @@ Examples:
                     "correct": False,
                     "correctness_reason": f"Exception: {error}",
                 }, stream_log_path, runner, estimate)
+
+            else:
+                # Outside the try: an error from here on must not settle the cell twice.
+                settle(result, result["total_cost_usd"])
+                status = "✓" if result["correct"] else "✗"
+                print(
+                    f"  {status} "
+                    f"{result['num_turns']}t "
+                    f"{result['context_tokens']:,}ctx "
+                    f"{result['output_tokens']:,}out "
+                    f"${result['total_cost_usd']:.4f} "
+                    f"{result['duration_ms']:,}ms"
+                )
+                if not result["correct"]:
+                    print(f"  → {result['correctness_reason']}")
 
     # Clean real-world repos after run (remove junk files written by Claude sessions)
     for repo_name in selected_repos:

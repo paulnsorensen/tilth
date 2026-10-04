@@ -129,8 +129,12 @@ def _priced_stream_cost(turns: list[Turn], model: str | None) -> float:
     }).values())
 
 
-def parse_stream_json(raw_output: str) -> RunResult:
-    """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose."""
+def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
+    """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose.
+
+    ``model`` is the cell's configured model, used to price a stream that reports
+    neither a native cost nor an init-event model.
+    """
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
     events = [json.loads(line) for line in lines]
 
@@ -213,7 +217,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
         num_turns=final_summary.get("num_turns", len(turns)),
         total_cost_usd=(
             native_cost if native_cost is not None
-            else _priced_stream_cost(turns, stream_model)
+            else _priced_stream_cost(turns, stream_model or model)
         ),
         cost_source="native" if native_cost is not None else "pricing",
         duration_ms=final_summary.get("duration_ms", 0),
@@ -627,7 +631,7 @@ def extract_stream_error(stdout: str) -> Optional[str]:
     return found
 
 
-def _tolerant_events(raw: str) -> list[dict]:
+def tolerant_jsonl(raw: str) -> list[dict]:
     """Decode a teed JSONL stream, skipping a line a killed runner left torn."""
     events = []
     for line in raw.splitlines():
@@ -643,16 +647,10 @@ def _tolerant_events(raw: str) -> list[dict]:
 def stream_native_cost(raw: str) -> Optional[float]:
     """Return the last result event's reported ``total_cost_usd``, or None when absent."""
     costs = [
-        cost for event in _tolerant_events(raw)
+        cost for event in tolerant_jsonl(raw)
         if event.get("type") == "result" and (cost := _native_cost(event)) is not None
     ]
     return costs[-1] if costs else None
-
-
-def _stream_succeeded(events: list[dict]) -> bool:
-    """Whether the last result event reports a successful run."""
-    results = [event for event in events if event.get("type") == "result"]
-    return bool(results) and results[-1].get("is_error") is False and results[-1].get("subtype") == "success"
 
 
 # Documented usage-limit result text, e.g. "You've hit your session limit · resets 3am".
@@ -662,21 +660,20 @@ _USAGE_LIMIT_TEXT = re.compile(r"(?:you['’]ve hit your|usage limit reached)", 
 def detect_quota_rejection(raw: str) -> Optional[str]:
     """Return why a claude stream was rejected by a subscription usage limit, or None.
 
-    A stream whose last result event reports success was not rejected, even when it
-    carries a rejected rate_limit_event (for example an overage tier).
+    Only the terminal result decides: it must carry usage-limit text or a rate-limit
+    subtype. A rejected rate_limit_event (for example an overage tier) on a stream
+    that ended for another reason, such as ``error_max_budget_usd``, is not quota.
     """
-    events = _tolerant_events(raw)
-    if _stream_succeeded(events):
+    results = [event for event in tolerant_jsonl(raw) if event.get("type") == "result"]
+    if not results:
         return None
-    for event in events:
-        info = event.get("rate_limit_info")
-        if (event.get("type") == "rate_limit_event" and isinstance(info, dict)
-                and info.get("status") == "rejected"):
-            return f"rate_limit_event rejected ({info.get('rateLimitType', 'unknown limit')})"
-        result_text = event.get("result")
-        if (event.get("type") == "result" and isinstance(result_text, str)
-                and _USAGE_LIMIT_TEXT.search(result_text)):
-            return result_text
+    final = results[-1]
+    result_text = final.get("result")
+    if isinstance(result_text, str) and _USAGE_LIMIT_TEXT.search(result_text):
+        return result_text
+    subtype = final.get("subtype")
+    if isinstance(subtype, str) and "rate_limit" in subtype:
+        return f"result subtype {subtype}"
     return None
 
 
@@ -737,7 +734,7 @@ def _codex_trajectory(events: list[dict]) -> list[dict]:
 
 def extract_trajectory(raw: str, runner: Literal["claude", "codex"]) -> list[dict]:
     """Return every tool call in a teed stream with its full input and output."""
-    events = _tolerant_events(raw)
+    events = tolerant_jsonl(raw)
     if runner == "claude":
         return _claude_trajectory(events)
     return _codex_trajectory(events)

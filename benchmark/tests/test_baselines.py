@@ -131,7 +131,8 @@ def test_completed_row_reused_error_row_rerun(bench) -> None:
     assert bench.calls == [("cell_b", "plain", 0), ("cell_c", "plain", 0)]
     rows = {row["task"]: row for row in bench.output_rows()}
     schedule = {"experiment_manifest": None, "arm_order_seed": None, "arm_order": ["plain"], "arm_order_index": 0}
-    assert rows["cell_a"] == {**completed, **schedule, "reused": True}
+    variant = {"tilth_version": None, "variant": run._variant_metadata(run.MODES["plain"])}
+    assert rows["cell_a"] == {**completed, **schedule, **variant, "reused": True}
     assert rows["cell_b"]["reused"] is False and "error" not in rows["cell_b"]
     assert rows["cell_c"]["reused"] is False and "infra" not in rows["cell_c"]
     assert rows["cell_b"]["run_key"] == bench.identity("cell_b", "plain", 0)["run_key"]
@@ -268,3 +269,59 @@ def test_task_sources_cover_task_class_and_bases() -> None:
 
     assert {"tasks/gin_render_context_tasks.py", "tasks/base.py"} <= set(sources)
     assert all(not Path(path).is_absolute() for path in sources)
+
+
+def _stock_arm(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    from config import ModeConfig
+
+    monkeypatch.setitem(run.MODES, name, ModeConfig(name=name, tools=["Read"], mcp_config_path=None,
+                                                    description="stock arm"))
+
+
+def test_no_tilth_arm_is_drift_checked_as_a_baseline(bench, monkeypatch: pytest.MonkeyPatch,
+                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    """Experiment manifests name the stock arm `no_tilth`; it is frozen like `baseline`."""
+    _stock_arm(monkeypatch, "no_tilth")
+    bench.cli = "2.0.0"
+    bench.seed(bench.row("cell_a", "no_tilth", 0))
+    bench.cli = "2.1.0"
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "no_tilth",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == []
+    assert "cli_version" in capsys.readouterr().err
+
+
+def test_tilth_arm_is_not_a_stock_arm() -> None:
+    assert run.is_stock_arm(run.MODES["baseline"])
+    assert not run.is_stock_arm(run.MODES["tilth"])
+    assert not run.is_stock_arm(run.MODES["tilth_forced"])
+
+
+def test_harness_variant_of_a_baseline_is_not_drift(bench) -> None:
+    """A --bare baseline is a different harness, not a drifted copy of the default one."""
+    bench.seed(bench.row("cell_a", "baseline", 0))
+    bench.runner(lambda _stream: 0.1)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline",
+                      "--reps", "1", "--max-usd", "5", "--bare")
+
+    assert code == 0
+    assert bench.calls == [("cell_a", "baseline", 0)]
+
+
+def test_load_rows_skips_a_torn_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "store.jsonl"
+    baselines.store({"run_key": "k1", "correct": True}, path=path)
+    baselines.store({"run_key": "k2", "correct": True}, path=path)
+    with path.open("a") as store_file:
+        store_file.write('{"run_key": "k3", "corr')
+
+    assert [row["run_key"] for row in baselines.load_rows(path)] == ["k1", "k2"]
+    assert "skipped 1 malformed" in capsys.readouterr().err
+
+    baselines.store({"run_key": "k4", "correct": True}, path=path)
+    assert [row["run_key"] for row in baselines.load_rows(path)] == ["k1", "k2", "k4"]

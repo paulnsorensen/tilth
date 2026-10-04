@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -59,7 +60,8 @@ def test_timeout_row_records_estimate_and_is_rerun_next_run(bench) -> None:
     assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5", "--cell-estimate-usd", "0.25") == 0
     [row] = bench.output_rows()
     assert row["error"] == "timeout" and row["timed_out"] is True
-    assert (row["total_cost_usd"], row["cost_source"]) == (0.25, "estimate")
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.25, "estimate")
     assert all(field in row for field in _ROW_FIELDS)
     assert row["reused"] is False
 
@@ -121,7 +123,9 @@ def test_task_content_change_invalidates_reuse(bench, monkeypatch: pytest.Monkey
     monkeypatch.setitem(run.TASKS, "cell_a", StoreTask(prompt="A different question."))
     bench.runner(lambda _stream: 0.1)
 
-    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5") == 0
+    # `plain` attaches no MCP, so it is a stock arm: the changed task is baseline drift.
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5") != 0
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5", "--refreeze-baselines") == 0
     assert bench.calls == [("cell_a", "plain", 0)]
 
 
@@ -187,3 +191,92 @@ def test_quota_classifier_ignores_a_rejected_event_when_the_stream_succeeded(ben
     assert bench.main("--tasks", "cell_a,cell_b", *_ARGS, "--max-usd", "5") == 0
     assert len(bench.calls) == 2
     assert all("infra" not in row for row in bench.output_rows())
+
+
+def _fail_without_native_cost(_stream: Path) -> float:
+    raise RuntimeError("claude -p failed with code 1")
+
+
+def test_estimated_failure_cost_is_charged_not_reported_as_cost(bench) -> None:
+    bench.runner(_fail_without_native_cost)
+
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5", "--cell-estimate-usd", "0.3") == 0
+    [row] = bench.output_rows()
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.3, "estimate")
+    assert bench.stored_rows() == [row]
+
+
+def test_native_failure_cost_is_both_cost_and_charge(bench) -> None:
+    def capped(stream: Path) -> float:
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                      "total_cost_usd": 0.7}) + "\n")
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    bench.runner(capped)
+
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5") == 0
+    [row] = bench.output_rows()
+    assert (row["total_cost_usd"], row["charged_usd"], row["cost_source"]) == (0.7, 0.7, "native")
+
+
+def test_estimated_failure_rows_carry_no_cost_into_paired_analysis(bench) -> None:
+    import paired
+
+    bench.runner(_fail_without_native_cost)
+    assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5", "--cell-estimate-usd", "0.3") == 0
+    [row] = bench.output_rows()
+
+    assert paired._cost(row) is None
+    assert paired._cost({**row, "total_cost_usd": 0.3}) is None  # a pre-fix row tagged as an estimate
+
+
+def test_reused_row_carries_the_current_variant_metadata(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    stale = {"label": "plain", "git_ref": "old-ref", "binary_path": "/old/tilth", "tilth_version": "0.8.3"}
+    stored = bench.row("cell_a", "plain", 0, variant=stale, tilth_version="0.8.3")
+    bench.seed(stored)
+    current = replace(run.MODES["plain"], git_ref="new-ref", binary_path="/new/tilth", tilth_version="0.8.4")
+    monkeypatch.setitem(run.MODES, "plain", current)
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    assert bench.main("--tasks", "cell_a", *_ARGS) == 0
+    [row] = bench.output_rows()
+    assert row["variant"] == run._variant_metadata(current)
+    assert row["tilth_version"] == "0.8.4"
+    assert (row["correct"], row["correctness_reason"], row["total_cost_usd"]) == (True, "stored", 0.1)
+    assert bench.stored_rows() == [stored]
+
+
+def test_cli_version_change_mid_run_stops_before_the_next_paid_cell(
+    bench, capsys: pytest.CaptureFixture[str],
+) -> None:
+    def updates_cli(_stream: Path) -> float:
+        bench.cli = "2.2.0"
+        return 0.1
+
+    bench.runner(updates_cli)
+
+    assert bench.main("--tasks", "cell_a,cell_b", *_ARGS, "--max-usd", "5") != 0
+    assert bench.calls == [("cell_a", "plain", 0)]
+    assert {row["cli_version"] for row in bench.stored_rows()} == {"2.1.0"}
+    out = capsys.readouterr().out
+    assert "CLI version changed" in out and "2.1.0" in out and "2.2.0" in out
+
+
+def test_a_cell_is_stored_and_charged_once_when_reporting_fails(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    def run_single_missing_report_fields(task_name, mode_name, model_name, repetition, **_kwargs):
+        bench.calls.append((task_name, mode_name, repetition))
+        return {"task": task_name, "mode": mode_name, "model": run.MODELS[model_name],
+                "repetition": repetition, "correct": True, "correctness_reason": "fresh",
+                "total_cost_usd": 0.2, "cost_source": "native"}
+
+    monkeypatch.setattr(run, "run_single", run_single_missing_report_fields)
+
+    try:
+        bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5")
+    except KeyError:
+        pass
+    assert len(bench.stored_rows()) == 1
+    assert bench.stored_rows()[0]["charged_usd"] == 0.2
+    assert len(bench.output_rows()) == 1

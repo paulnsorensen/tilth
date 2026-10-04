@@ -101,6 +101,7 @@ class Bench:
 def hermetic_version_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host toolchain and agent CLI probes out of every test's subprocess stubs."""
     monkeypatch.setattr(run, "_probe_version", lambda argv: f"{argv[0]} test-version")
+    monkeypatch.setattr(run, "_run_probe", lambda argv: f"{argv[0]} test-version")
 
 
 @pytest.fixture
@@ -112,7 +113,7 @@ def bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Bench:
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
     monkeypatch.setattr(run, "RESULTS_DIR", harness.results_dir)
     monkeypatch.setattr(run, "reset_repo", lambda: None)
-    monkeypatch.setattr(run, "cli_version", lambda _runner: harness.cli)
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: harness.cli)
     monkeypatch.setattr(run, "env_fingerprint", lambda _repo: harness.env)
     for name in ("cell_a", "cell_b", "cell_c"):
         monkeypatch.setitem(run.TASKS, name, StoreTask())

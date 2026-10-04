@@ -9,9 +9,12 @@ row it is given, keyed by run key, but only a completed row is reusable.
 
 import hashlib
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from parse import tolerant_jsonl
 
 STORE_FILENAME = "result_store.jsonl"
 
@@ -22,8 +25,12 @@ CELL_KEY_FIELDS = (
 )
 DIGEST_FIELDS = ("harness_digest", "task_digest", "env_fingerprint")
 
-# Coordinates under which two baseline rows describe the same frozen cell.
-BASELINE_SLOT_FIELDS = ("task", "model", "reasoning_effort", "timeout_s", "repetition")
+# Coordinates under which two stock-arm rows describe the same frozen cell. The
+# harness digest is part of the slot: a --bare or strict-file-tools baseline is a
+# different harness, not a drifted copy of the default one.
+BASELINE_SLOT_FIELDS = (
+    "task", "model", "mode", "reasoning_effort", "timeout_s", "repetition", "harness_digest",
+)
 
 
 def _digest(payload: object) -> str:
@@ -39,11 +46,20 @@ def harness_digest(
     bare: bool,
     max_budget_usd: float | None,
     mcp_shape: Mapping[str, Any],
+    command: list[str] = (),
+    bash_guard_sha256: str | None = None,
 ) -> str:
-    """Hash the runner configuration a cell's agent sees."""
+    """Hash the runner configuration a cell's agent sees.
+
+    ``command`` is the runner argv template with per-cell paths normalized; it
+    carries codex developer instructions, ``--disallowedTools``, the strict Bash
+    hook settings, and ``--setting-sources``. ``bash_guard_sha256`` hashes the
+    strict-mode Bash allowlist source, which the settings only name by path.
+    """
     return _digest({
         "system_prompt": system_prompt, "tools": tools, "strict_file_tools": strict_file_tools,
         "bare": bare, "max_budget_usd": max_budget_usd, "mcp_shape": mcp_shape,
+        "command": list(command), "bash_guard_sha256": bash_guard_sha256,
     })
 
 
@@ -88,12 +104,16 @@ def is_completed(row: Mapping[str, Any]) -> bool:
 
 
 def load_rows(path: Path) -> list[dict]:
-    """Return every stored row, oldest first."""
+    """Return every stored row, oldest first, skipping a line a killed run left torn."""
     try:
         text = path.read_text()
     except FileNotFoundError:
         return []
-    return [json.loads(line) for line in text.splitlines() if line.strip()]
+    rows = tolerant_jsonl(text)
+    skipped = sum(1 for line in text.splitlines() if line.strip()) - len(rows)
+    if skipped:
+        print(f"warning: skipped {skipped} malformed line(s) in {path}", file=sys.stderr)
+    return rows
 
 
 def completed_by_key(rows: list[dict]) -> dict[str, dict]:
@@ -109,8 +129,14 @@ def lookup(key: str, *, path: Path) -> dict | None:
 def store(row: Mapping[str, Any], *, path: Path) -> None:
     """Append one row to the store."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as store_file:
-        store_file.write(json.dumps(row) + "\n")
+    line = json.dumps(row) + "\n"
+    with path.open("a+b") as store_file:
+        # Start a fresh line after a torn tail so the new row is not glued onto it.
+        if store_file.seek(0, 2):
+            store_file.seek(-1, 2)
+            if store_file.read(1) != b"\n":
+                line = "\n" + line
+        store_file.write(line.encode())
 
 
 def drifted_inputs(planned: Mapping[str, Any], stored: Mapping[str, Any]) -> list[str]:
@@ -122,15 +148,15 @@ def drifted_inputs(planned: Mapping[str, Any], stored: Mapping[str, Any]) -> lis
 
 
 def baseline_drift(planned: Mapping[str, Any], rows: list[dict]) -> list[str]:
-    """Name the inputs that changed since a completed baseline row for the same slot.
+    """Name the inputs that changed since a completed stock-arm row for the same slot.
 
-    ``planned`` is a baseline cell with no completed row under its own key. A
-    stored completed baseline row for the same task, model, effort, timeout, and
-    repetition under another key means the frozen baseline drifted.
+    ``planned`` is a stock-arm cell (no tilth MCP) with no completed row under its
+    own key. A stored completed row for the same slot (``BASELINE_SLOT_FIELDS``)
+    under another key means the frozen baseline drifted.
     """
     changed: set[str] = set()
     for row in rows:
-        if (row.get("mode") == "baseline" and is_completed(row)
+        if (is_completed(row)
                 and row.get("run_key") != planned.get("run_key")
                 and all(row.get(field) == planned.get(field) for field in BASELINE_SLOT_FIELDS)):
             changed.update(drifted_inputs(planned, row) or ["run_key"])
