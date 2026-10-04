@@ -31,7 +31,9 @@ class GitHubPRClient:
         self.run = run
 
     def push(self, sha: str, branch: str) -> None:
-        git("push", self.remote, f"{sha}:refs/heads/{branch}", cwd=self.repo)
+        """Create ``branch`` on the remote at ``sha``; a branch that already exists there is refused."""
+        git("push", f"--force-with-lease=refs/heads/{branch}:", self.remote, f"{sha}:refs/heads/{branch}",
+            cwd=self.repo)
 
     def create_draft(self, *, base: str, head: str, title: str, body: str) -> dict:
         completed = self.run(["gh", "pr", "create", "--draft", "--base", base, "--head", head, "--title", title,

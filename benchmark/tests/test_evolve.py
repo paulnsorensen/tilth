@@ -964,6 +964,64 @@ def test_finish_stops_before_crossing_full_ceiling(world) -> None:
     assert evo.ledger.spent <= 2.0 + 1e-9
 
 
+def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    use_engine(monkeypatch)
+    assert main(world) == 0
+    monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-test-b" if "test_a" in str(task) else world.env)
+    labelled, calls, spawned = len(world.judge.labelled), len(world.calls), len(world.spawned)
+
+    assert main(world, "--run-id", "run2") == 2
+    assert (len(world.judge.labelled), len(world.calls), len(world.spawned)) == (labelled, calls, spawned)
+    assert "test_a" in capsys.readouterr().err
+
+    assert main(world, "--run-id", "run3", "--refreeze-baselines") == 0
+    assert [call for call in world.calls[calls:] if call[:2] == ("test_a", "baseline")]
+
+
+def test_finish_baseline_drift_is_incomplete_not_traceback(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    use_engine(monkeypatch)
+    assert main(world) == 0
+    world.pr.calls.clear()
+
+    def drifting(seed_candidate, **kwargs):
+        world.env = "env-fingerprint-b"
+
+    monkeypatch.setattr(engine, "optimize_anything", drifting)
+    assert main(world, "--run-id", "run2") == 1
+    assert world.pr.calls == []
+    assert "finish: incomplete (baseline drift" in log_text(world, "run2")
+
+
+def test_finish_ceiling_after_plateau_logs_ceiling(world) -> None:
+    evo = ready(world, max_usd="2.0")
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+    evo.ledger.charge(1.95 - evo.ledger.spent, source="search")
+    evo.stop.set("plateau")
+
+    assert evo.finish() is None
+    assert world.pr.calls == []
+    assert "finish: incomplete (ceiling)" in log_text(world)
+
+
+def test_existing_winner_branch_is_a_logged_refusal(world) -> None:
+    remote = _remote(world)
+    gh: list[list[str]] = []
+    run_gh = lambda argv, **kwargs: gh.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "url\n", "")
+    evo = ready(world, pr_client=GitHubPRClient(world.repo, remote="origin", run=run_gh))
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1", tag="winner"), {"dev_a": 0.9, "dev_b": 0.9})
+    git("push", "-q", "origin", f"{world.seed_sha}:refs/heads/evolve/run1-winner", cwd=world.repo)
+    evo.search = lambda: None
+
+    assert evo.run() == 1
+    assert gh == []
+    assert "finish: refused" in log_text(world) and "evolve/run1-winner" in log_text(world)
+    heads = git("ls-remote", "--heads", str(remote), "evolve/run1-winner", cwd=world.tmp)
+    assert heads.split()[0] == world.seed_sha
+
+
 # --- AC-11: one ceiling, one ledger, one stop state ---
 
 

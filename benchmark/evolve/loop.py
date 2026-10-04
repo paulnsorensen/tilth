@@ -26,7 +26,7 @@ from . import engine
 from .calls import PaidCalls, StopState
 from .candidate import content_id
 from .finish import PRClient, outside_allowlist
-from .gitops import git
+from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
 from .proposer import Proposer
 
@@ -159,6 +159,7 @@ class Evolution:
         self.best: float | None = None
         self.unimproved = 0
         self.gepa_result = None
+        self.finish_failure: str | None = None
 
     # --- plumbing ---
 
@@ -236,7 +237,16 @@ class Evolution:
         return 2
 
     def preflight(self) -> int | None:
-        """Hold the finish reserve, label every panel task, and calibrate; an exit code when the run is refused."""
+        """Hold the finish reserve, label every panel task, and calibrate; an exit code when the run is refused.
+
+        A drifted test-split baseline cell refuses the run here, before any paid call, unless
+        ``--refreeze-baselines`` lets finish buy it again.
+        """
+        if not self.settings.refreeze_baselines:
+            try:
+                run.check_baseline_drift(self._cells(self.panel.test, BASELINE_MODE, self._reps()), panel=self.panel)
+            except run.BaselineDrift as error:
+                return self.refuse(f"test split: {error}")
         per_finalist = self.finalist_test_cost()
         if self.settings.max_usd < per_finalist:
             return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} cannot cover one finalist's test-split cost "
@@ -461,6 +471,11 @@ class Evolution:
 
     # --- finish ---
 
+    def _finish_failed(self, line: str) -> None:
+        """Log why finish opened no PR when it should have tried; the run then exits nonzero."""
+        self.finish_failure = line
+        self.log(line)
+
     def finish(self):
         """Score the finalists once on the test split and open a draft PR for a non-seed winner."""
         self.ledger.reserve = 0.0
@@ -479,28 +494,30 @@ class Evolution:
             test_rows = {member.cid: self._plan(self._cells(self.panel.test, CANDIDATE_MODE, reps), member.sha,
                                                 store_only=quota)
                          for member in finalists}
-        except _Stopped:
-            self.log(f"finish: incomplete ({self.stop.reason})")
-            return None
+        except _Stopped as stopped:
+            # The reason this finish stopped, which may be a ceiling or quota after an earlier plateau.
+            return self._finish_failed(f"finish: incomplete ({stopped})")
+        except run.BaselineDrift as error:
+            return self._finish_failed(f"finish: incomplete (baseline drift: {error})")
+        except run.CandidateBuildFailed as error:
+            return self._finish_failed(f"finish: incomplete (build failed)\n{tail(str(error))}")
         test_means = {cid: mean(correct(row) for row in rows) if rows else 0.0 for cid, rows in test_rows.items()}
         scores = ", ".join(f"{member.cid[:12]}={test_means[member.cid]:.3f}" for member in finalists)
         expected = len(self.panel.test) * len(reps)
         if quota and any(len(test_rows[member.cid]) < expected for member in finalists):
-            self.log(f"finish: incomplete (quota); stored test-split scores: {scores}")
-            return None
+            return self._finish_failed(f"finish: incomplete (quota); stored test-split scores: {scores}")
         self.log(f"finish: test-split means {scores}")
         winner = max(finalists, key=lambda member: (test_means[member.cid], member.dev_mean, -member.seq))
         if winner is seed:
             self.log("finish: no improvement (the seed has the best test-split mean)")
             return None
         if not winner.just_check_ok:
-            self.log(f"finish: refused; winner {winner.cid[:12]} has no just check pass in its cascade record")
-            return None
+            return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "
+                                       "in its cascade record")
         changed = git("diff", "--name-only", "--no-renames", self.settings.seed_sha, winner.sha,
                       cwd=self.settings.repo).split()
         if outside := outside_allowlist(changed):
-            self.log(f"finish: refused; winner {winner.cid[:12]} changes {', '.join(outside)}")
-            return None
+            return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} changes {', '.join(outside)}")
         dev_delta = winner.delta or self._dev_delta(winner)
         test_delta = self._delta_report(winner, "test", test_rows[winner.cid], baseline_rows)
         branch = f"evolve/{self.settings.run_id}-winner"
@@ -510,7 +527,10 @@ class Evolution:
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",
         ])
-        self.pr_client.push(winner.sha, branch)
+        try:
+            self.pr_client.push(winner.sha, branch)
+        except GitError as error:
+            return self._finish_failed(f"finish: refused; pushing {branch} failed (it may already exist): {error}")
         pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
                                          title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
                                          body=body)
@@ -532,4 +552,4 @@ class Evolution:
         totals = {**self.spend, "reflection": self.paid.total("reflection"), "proposer": self.paid.total("proposer")}
         self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
                  + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
-        return 0
+        return 1 if self.finish_failure else 0

@@ -1503,6 +1503,32 @@ def planned_identity(cell: CellSpec) -> dict:
                          max_budget_usd=DEFAULT_MAX_BUDGET_USD, strict_file_tools=False)
 
 
+def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[dict]) -> None:
+    drift = {}
+    for cell, identity in pending:
+        if is_stock_arm(MODES[cell.mode]):
+            changed = baselines.baseline_drift({
+                **identity, "task": cell.task, "model": MODELS[cell.model], "mode": cell.mode,
+                "repetition": cell.repetition, "reasoning_effort": None,
+            }, history)
+            if changed:
+                drift[f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"] = changed
+    if drift:
+        details = "; ".join(f"{slot}: {', '.join(fields)}" for slot, fields in drift.items())
+        raise BaselineDrift(f"stored baseline rows were recorded under different key inputs ({details}); "
+                            "pass --refreeze-baselines to re-run them")
+
+
+def check_baseline_drift(cells, *, panel: panels.Panel) -> None:
+    """Raise ``BaselineDrift`` when a stock-arm cell of ``cells`` that the store cannot answer drifted; runs nothing."""
+    panel.register(TASKS)
+    planned = [(cell, planned_identity(cell)) for cell in (CellSpec(*cell) for cell in cells)]
+    history = baselines.load_rows(RESULTS_DIR / baselines.STORE_FILENAME)
+    reusable = baselines.completed_by_key(history)
+    _refuse_baseline_drift([(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable],
+                           history)
+
+
 def run_plan(
     cells,
     *,
@@ -1555,19 +1581,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
     if pending and not store_only:
         if any(RUNNERS[cell.model] == "claude" for cell, _ in pending):
             guard_claude_auth(os.environ)
-        drift = {}
-        for cell, identity in pending:
-            if is_stock_arm(MODES[cell.mode]):
-                changed = baselines.baseline_drift({
-                    **identity, "task": cell.task, "model": MODELS[cell.model], "mode": cell.mode,
-                    "repetition": cell.repetition, "reasoning_effort": None,
-                }, history)
-                if changed:
-                    drift[f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"] = changed
-        if drift and not refreeze_baselines:
-            details = "; ".join(f"{slot}: {', '.join(fields)}" for slot, fields in drift.items())
-            raise BaselineDrift(f"stored baseline rows were recorded under different key inputs ({details}); "
-                                "pass --refreeze-baselines to re-run them")
+        if not refreeze_baselines:
+            _refuse_baseline_drift(pending, history)
 
     rows: list[dict] = []
     run_max_cost: float | None = None
