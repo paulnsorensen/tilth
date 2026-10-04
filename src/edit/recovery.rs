@@ -25,7 +25,7 @@ use super::apply::{
 };
 use super::mismatch::MismatchError;
 use super::parser::Op;
-use super::rewrite::rewrite_spans;
+use super::rewrite::rewrite_match_spans;
 use super::snapshots::{Snapshot, SnapshotStore};
 use super::tag::compute_file_hash;
 
@@ -198,16 +198,11 @@ fn check_text_swap_overlap(
         }
         // rewrite: `$$$` captures can span lines the agent never typed, so
         // every line of every ast-grep match must have been displayed.
-        if let Op::Rewrite {
-            pattern,
-            rewrite,
-            count,
-        } = op
-        {
-            if let Ok(spans) = rewrite_spans(path, &snapshot.text, pattern, rewrite, *count) {
+        if let Op::Rewrite { pattern, count, .. } = op {
+            if let Ok(spans) = rewrite_match_spans(path, &snapshot.text, pattern, *count) {
                 let unseen: Vec<(u32, u32)> = spans
                     .iter()
-                    .map(|&(start, end, _)| content_line_span(&snapshot.text, start, end))
+                    .map(|&(start, end)| content_line_span(&snapshot.text, start, end))
                     .filter(|&(lo, hi)| (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l)))
                     .collect();
                 if let Some(&(lo, hi)) = unseen.first() {
@@ -272,6 +267,33 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
         merged.remove(i + 1);
     }
     merged
+}
+
+pub(crate) fn current_match_ranges(path: &Path, text: &str, ops: &[Op]) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    for op in ops {
+        match op {
+            Op::TextSwapAll { old, .. } => {
+                if let Ok(spans) = find_all_text_spans(text, old, None) {
+                    ranges.extend(spans.into_iter().map(|(start, end)| {
+                        let (lo, _) = content_line_span(text, start, end);
+                        (lo, lo)
+                    }));
+                }
+            }
+            Op::Rewrite { pattern, .. } => {
+                if let Ok(spans) = rewrite_match_spans(path, text, pattern, None) {
+                    ranges.extend(
+                        spans
+                            .into_iter()
+                            .map(|(start, end)| content_line_span(text, start, end)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    merge_ranges(ranges)
 }
 
 fn is_text_swap(op: &Op) -> bool {

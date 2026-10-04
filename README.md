@@ -292,7 +292,7 @@ The MCP server always registers `tilth_write`. `tilth_read` prints a `[path#TAG]
 ]}
 ```
 
-`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces every ast-grep pattern match in the file's language.
+`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces outermost, non-overlapping ast-grep matches in the file's language. Nested matches inside a selected match are not rewritten, and `count: N` counts only selected matches.
 
 Large files still outline first — read a `path#n-m` section to get numbered content for the part you need.
 

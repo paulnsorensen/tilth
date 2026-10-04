@@ -132,6 +132,8 @@ pub enum ApplyError {
         expected: usize,
         found: usize,
     },
+    #[error("rewrite replacement output exceeds 16 MiB; no change written")]
+    RewriteOutputTooLarge,
 }
 
 impl ApplyError {
@@ -150,6 +152,7 @@ impl ApplyError {
                 | ApplyError::RewritePattern { .. }
                 | ApplyError::RewriteUnmatched { .. }
                 | ApplyError::RewriteCountMismatch { .. }
+                | ApplyError::RewriteOutputTooLarge
         )
     }
 }
@@ -472,6 +475,9 @@ fn lower_text_swaps(
         line_span: (u32, u32),
     }
 
+    let newlines: Vec<usize> = memchr::memchr_iter(b'\n', text.as_bytes()).collect();
+    let line_at =
+        |byte| u32::try_from(newlines.partition_point(|&at| at < byte)).unwrap_or(u32::MAX) + 1;
     let mut resolved: Vec<Resolved> = Vec::new();
     let mut normalized = false;
     for (op_idx, op) in ops.iter().enumerate() {
@@ -504,7 +510,7 @@ fn lower_text_swaps(
                 // Covering span (may include a line past the match's real
                 // content) — correct for run-coalescing/reject_overlaps below,
                 // but not for the seen-lines gate; use content_line_span there.
-                line_span: (line_number(text, start), line_number(text, end)),
+                line_span: (line_at(start), line_at(end)),
             });
         }
     }
@@ -805,36 +811,22 @@ fn check_bounds(line: u32, total: usize) -> Result<(), ApplyError> {
 /// Reject any two ranged splices that overlap, and any insert landing inside a
 /// ranged splice.
 fn reject_overlaps(splices: &[Splice]) -> Result<(), ApplyError> {
-    let ranged: Vec<(usize, (u32, u32))> = splices
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.range.map(|r| (i, r)))
-        .collect();
-
-    // Ranged vs ranged.
-    for i in 0..ranged.len() {
-        for j in (i + 1)..ranged.len() {
-            let (_, a) = ranged[i];
-            let (_, b) = ranged[j];
-            if a.0 <= b.1 && b.0 <= a.1 {
-                return Err(ApplyError::Overlap { a, b });
-            }
+    let mut ranged: Vec<(u32, u32)> = splices.iter().filter_map(|s| s.range).collect();
+    ranged.sort_unstable();
+    for pair in ranged.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b.0 <= a.1 {
+            return Err(ApplyError::Overlap { a, b });
         }
     }
 
-    // Insert landing inside a ranged op.
-    for s in splices {
-        if s.range.is_some() {
-            continue;
-        }
-        // Insert idx is 0-based; the 1-based "anchor line" it targets is idx or
-        // idx+1 depending on Pre/Post, but either way it must not fall strictly
-        // inside a ranged [start,end].
-        for (_, r) in &ranged {
-            let anchor = s.idx as u32; // Pre(n)→n-1, Post(n)→n, Head→0, Tail→total
+    for s in splices.iter().filter(|s| s.range.is_none()) {
+        let anchor = s.idx as u32;
+        let before = ranged.partition_point(|r| r.0 <= anchor);
+        if let Some(&r) = ranged.get(before.saturating_sub(1)) {
             if anchor + 1 > r.0 && anchor < r.1 {
                 return Err(ApplyError::Overlap {
-                    a: *r,
+                    a: r,
                     b: (anchor, anchor),
                 });
             }

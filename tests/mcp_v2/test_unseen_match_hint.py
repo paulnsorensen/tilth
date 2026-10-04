@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 
 import harness
@@ -20,7 +21,7 @@ def setUpModule():
     harness.build_if_needed()
 
 
-READS = re.compile(r"tilth_read paths (\[.*\]) shows every unseen match")
+READS = re.compile(r"tilth_read paths (\[.*\]) shows every match range in the current file")
 REPLACE_ALL = {"op": "replace_text", "old": "token", "new": "marker", "all": True}
 WRAP = {"op": "rewrite", "pattern": "wrap($A)", "rewrite": "wrapped($A)"}
 BODY = "".join(f"x{i} = {i}\n" for i in range(80))
@@ -106,6 +107,39 @@ class UnseenMatchHint(unittest.TestCase):
         op = {"op": "replace_text", "old": "oldName", "new": "newName", "all": True}
         _, text = self.attack("p.go", source, op)
         self.assertEqual(text, source.replace("oldName", "newName"))
+
+    def test_drifted_read_hint_retry_uses_current_tag(self):
+        source = f"a = token\n{BODY}b = token\n"
+        target = self.write("drift.py", source)
+        with subprocess.Popen([str(harness.BIN), "--mcp"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, bufsize=1) as proc:
+            def call(request):
+                proc.stdin.write(json.dumps(request) + "\n")
+                proc.stdin.flush()
+                return json.loads(proc.stdout.readline())
+
+            call(harness.initialize_request())
+            read = harness.tools_call_request(
+                2, "tilth_read", {"cwd": self.cwd, "paths": ["drift.py#1-2"]})
+            tag = re.search(r"#([0-9A-F]{4})\]",
+                            harness.tool_result_text(call(read))).group(1)
+            target.write_text("# drift\n" + source)
+            edit = {"cwd": self.cwd, "edits": [{"path": "drift.py", "tag": tag,
+                                                  "ops": [REPLACE_ALL]}]}
+            rejected = harness.tool_result_text(call(
+                harness.tools_call_request(3, "tilth_write", edit)))
+            paths = json.loads(READS.search(rejected).group(1))
+            self.assertEqual(paths, ["drift.py#2-2", "drift.py#83-83"])
+            shown = harness.tool_result_text(call(harness.tools_call_request(
+                4, "tilth_read", {"cwd": self.cwd, "paths": paths})))
+            current_tag = re.search(r"#([0-9A-F]{4})\]", shown).group(1)
+            self.assertNotEqual(current_tag, tag)
+            edit["edits"][0]["tag"] = current_tag
+            written = call(harness.tools_call_request(5, "tilth_write", edit))
+            self.assertFalse(harness.tool_is_error(written),
+                             harness.tool_result_text(written))
+            proc.stdin.close()
+        self.assertEqual(target.read_text(), "# drift\n" + source.replace("token", "marker"))
 
     def test_replace_all_regex_metacharacters(self):
         source = f"a = render(w)\n{BODY}b = render(w)\n{BODY}c = m[k] + render(w)\n"
