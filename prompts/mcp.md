@@ -9,9 +9,9 @@ BATCH related work; array parameters never accept singular values:
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
 - `edits: [{path: "src/a.rs", tag: "1A2B", ops: [...]}, {path: "src/b.rs", tag: "3C4D", ops: [...]}]`
 
-SEE BEFORE WRITE: `tilth_read` prints `[path#TAG]` above 1-based numbered lines; `tilth_search` shows `path#TAG` too. Copy TAG and integer line numbers; NEVER invent either. Edit only lines a read or search showed. DO NOT use `mode: full` to edit; read the section you change. `tilth_write` accepts `{path, tag?, ops}` sections. `replace_text` swaps one exact `old` (`all: true` for every match); `rewrite` swaps every ast-grep `pattern` match; `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for a new file or one too large to tag. Conflicts reject that section—re-read and retry it.
+SEE BEFORE WRITE: Only source text carries `[path#TAG]` and line numbers. Read structural ranges before `rewrite`. Copy shown TAGs and line numbers; never invent them. Section reads carry file TAGs. Edit only shown lines. DO NOT use `mode: full` to edit; read the section you change. `tilth_write` takes `{path, tag?, ops}`: `replace_text` swaps exact `old` (`all: true` replaces all; `count: N` requires N); `rewrite` swaps outermost non-overlapping ast-grep matches (`count: N` requires N); `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for new/untaggable files. Drift merges or rejects per section; re-read conflicts.
 
-Pair `tilth_write` with `tilth_read` of the next files in one turn.
+Pair `tilth_write` with the next `tilth_read`.
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 

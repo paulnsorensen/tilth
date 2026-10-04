@@ -66,14 +66,9 @@ impl Target {
 
     /// Anchor a relative scope under `cwd`; refuse `..`; trust an absolute scope.
     fn resolve_scope(&self, cwd: &Path) -> Result<std::path::PathBuf, String> {
-        let scope = Path::new(&self.scope);
-        if scope.is_absolute() {
-            return Ok(normalized(scope));
-        }
-        if scope.components().any(|c| c == Component::ParentDir) {
-            return Err("follow target scope requires a normalized path".into());
-        }
-        Ok(normalized(&cwd.join(scope)))
+        super::super::resolve_anchored(Path::new(&self.scope), cwd)
+            .map(|scope| normalized(&scope))
+            .map_err(|_| "follow target scope requires a normalized path".into())
     }
 
     fn validate(&self, cwd: &Path, cache: &OutlineCache) -> Result<(), String> {
@@ -173,7 +168,14 @@ pub(super) struct Follow {
 }
 
 impl Follow {
+    #[cfg(test)]
     pub fn parse(value: &Value, cwd: &Path, cache: &OutlineCache) -> Result<Self, String> {
+        let follow = Self::parse_shape(value)?;
+        follow.target.validate(cwd, cache)?;
+        Ok(follow)
+    }
+
+    pub fn parse_shape(value: &Value) -> Result<Self, String> {
         let kind = value
             .get("kind")
             .and_then(Value::as_str)
@@ -192,11 +194,14 @@ impl Follow {
         }
         let follow: Self = serde_json::from_value(value.clone())
             .map_err(|e| format!("invalid follow hint: {e}"))?;
-        follow.target.validate(cwd, cache)?;
         if follow.target.line.is_none() {
             return Err("this continuation requires a symbol target".into());
         }
         Ok(follow)
+    }
+
+    pub fn query(&self) -> &str {
+        self.target.name.as_deref().unwrap_or(&self.target.path)
     }
 
     pub fn execute(
@@ -205,7 +210,8 @@ impl Follow {
         bloom: &BloomFilterCache,
         cache: &OutlineCache,
     ) -> Result<Value, String> {
-        let query = self.target.name.as_deref().unwrap_or(&self.target.path);
+        self.target.validate(cwd, cache)?;
+        let query = self.query();
         let mut result = super::base_result(query, &self.kind, "ok");
         result["target"] = json!(self.target);
         let full = cwd.join(&self.target.path);
@@ -471,7 +477,13 @@ mod tests {
         for scope in ["..", "sub/..", "sub", "/tmp"] {
             let mut hint = follow_hint(cwd, "fetch_callees", &Value::Null);
             hint["target"]["scope"] = json!(scope);
-            assert!(Follow::parse(&hint, cwd, &cache).is_err(), "{scope}");
+            let error = Follow::parse(&hint, cwd, &cache).unwrap_err();
+            let expected = if scope.contains("..") {
+                "follow target scope requires a normalized path"
+            } else {
+                "follow target scope does not match cwd"
+            };
+            assert_eq!(error, expected, "{scope}");
         }
     }
 

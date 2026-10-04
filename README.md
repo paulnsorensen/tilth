@@ -125,6 +125,8 @@ Byte offsets are zero-based and half-open. Line numbers are one-based.
 The end line identifies the exclusive end position, including the next line when the range ends after a newline.
 Multi-captures retain matched punctuation, such as commas, in source order.
 Results contain owned ranges, not source text or borrowed syntax nodes.
+Structural coordinates do not include edit tags because they do not include source text.
+Read the matched ranges before using `rewrite`.
 
 When the response exceeds the budget, a structural result steps down the first of these tiers that fits.
 Every step sets `completeness: "partial"` and `budget_limited: true`, and adds a `note`.
@@ -292,7 +294,7 @@ The MCP server always registers `tilth_write`. `tilth_read` prints a `[path#TAG]
 ]}
 ```
 
-`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces every ast-grep pattern match in the file's language.
+`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces outermost, non-overlapping ast-grep matches in the file's language. Nested matches inside a selected match are not rewritten, and `count: N` counts only selected matches.
 
 Large files still outline first — read a `path#n-m` section to get numbered content for the part you need.
 

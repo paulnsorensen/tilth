@@ -5,18 +5,45 @@
 
 use std::path::Path;
 
+use ast_grep_core::replacer::Replacer;
+
 use super::apply::ApplyError;
 use crate::types;
 
-/// Resolve every match of `pattern` in `text` to `(start, end, replacement)`
-/// byte spans, in document order and non-overlapping. The language comes from
-/// `path`. A `count` that differs from the match count is an error.
+const MAX_REWRITE_OUTPUT: usize = 16 * 1024 * 1024;
+
+pub(super) fn rewrite_match_spans(
+    path: &Path,
+    text: &str,
+    pattern: &str,
+    count: Option<usize>,
+) -> Result<Vec<(usize, usize)>, ApplyError> {
+    resolve_rewrite(path, text, pattern, "", count, false).map(|spans| {
+        spans
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect()
+    })
+}
+
+/// Resolve outermost, non-overlapping matches before rendering replacements.
 pub(super) fn rewrite_spans(
     path: &Path,
     text: &str,
     pattern: &str,
     rewrite: &str,
     count: Option<usize>,
+) -> Result<Vec<(usize, usize, String)>, ApplyError> {
+    resolve_rewrite(path, text, pattern, rewrite, count, true)
+}
+
+fn resolve_rewrite(
+    path: &Path,
+    text: &str,
+    pattern: &str,
+    rewrite: &str,
+    count: Option<usize>,
+    render: bool,
 ) -> Result<Vec<(usize, usize, String)>, ApplyError> {
     let unsupported = || ApplyError::RewriteLanguage {
         path: path.display().to_string(),
@@ -33,31 +60,109 @@ pub(super) fn rewrite_spans(
     let grammar = tree_sitter::Language::new(grammar);
     let document =
         crate::lang::treesitter::parse_document(text, &grammar).ok_or_else(unsupported)?;
-    let spans: Vec<(usize, usize, String)> = document
+    let mut last_end = 0;
+    let matches: Vec<_> = document
         .root()
-        .replace_all(&compiled, rewrite)
-        .into_iter()
-        .map(|edit| {
-            (
-                edit.position,
-                edit.position + edit.deleted_length,
-                String::from_utf8_lossy(&edit.inserted_text).into_owned(),
-            )
+        .find_all(&compiled)
+        .filter(|matched| {
+            let range = rewrite.get_replaced_range(matched, &compiled);
+            if range.start < last_end {
+                false
+            } else {
+                last_end = range.end;
+                true
+            }
         })
         .collect();
-    if spans.is_empty() {
+    if matches.is_empty() {
         return Err(ApplyError::RewriteUnmatched {
             pattern: pattern.to_string(),
         });
     }
     if let Some(expected) = count {
-        if spans.len() != expected {
+        if matches.len() != expected {
             return Err(ApplyError::RewriteCountMismatch {
                 pattern: pattern.to_string(),
                 expected,
-                found: spans.len(),
+                found: matches.len(),
             });
         }
+    }
+    if !render {
+        return Ok(matches
+            .iter()
+            .map(|matched| {
+                let range = rewrite.get_replaced_range(matched, &compiled);
+                (range.start, range.end, String::new())
+            })
+            .collect());
+    }
+    if !rewrite.contains('$') && rewrite.len().saturating_mul(matches.len()) > MAX_REWRITE_OUTPUT {
+        return Err(ApplyError::RewriteOutputTooLarge);
+    }
+    let mut total = 0usize;
+    let mut spans = Vec::with_capacity(matches.len());
+    for matched in matches {
+        if rewrite.contains('$') {
+            let env = matched.get_env();
+            let mut upper = rewrite.len();
+            let mut newlines = memchr::memchr_iter(b'\n', rewrite.as_bytes()).count();
+            let mut from = 0;
+            while let Some(relative) = rewrite[from..].find('$') {
+                let start = from + relative;
+                let bytes = rewrite.as_bytes();
+                let marks = bytes[start..]
+                    .iter()
+                    .take(3)
+                    .take_while(|&&b| b == b'$')
+                    .count();
+                let name_start = start + marks;
+                let mut name_end = name_start;
+                while bytes
+                    .get(name_end)
+                    .is_some_and(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+                {
+                    name_end += 1;
+                }
+                if name_end > name_start {
+                    let name = &rewrite[name_start..name_end];
+                    let capture = if marks == 3 {
+                        let nodes = env.get_multiple_matches(name);
+                        nodes.first().zip(nodes.last()).map(|(first, last)| {
+                            &text.as_bytes()[first.range().start..last.range().end]
+                        })
+                    } else {
+                        env.get_match(name)
+                            .map(|node| &text.as_bytes()[node.range()])
+                            .or_else(|| env.get_transformed(name).map(Vec::as_slice))
+                    };
+                    if let Some(capture) = capture {
+                        upper = upper.saturating_add(capture.len());
+                        let capture_newlines = memchr::memchr_iter(b'\n', capture).count();
+                        newlines = newlines.saturating_add(capture_newlines);
+                        upper =
+                            upper.saturating_add(capture_newlines.saturating_mul(rewrite.len()));
+                    }
+                    from = name_end;
+                } else {
+                    from = start + 1;
+                }
+            }
+            upper = upper.saturating_add(newlines.saturating_mul(512));
+            if total.saturating_add(upper) > MAX_REWRITE_OUTPUT {
+                return Err(ApplyError::RewriteOutputTooLarge);
+            }
+        }
+        let edit = matched.make_edit(&compiled, &rewrite);
+        total = total.saturating_add(edit.inserted_text.len());
+        if total > MAX_REWRITE_OUTPUT {
+            return Err(ApplyError::RewriteOutputTooLarge);
+        }
+        spans.push((
+            edit.position,
+            edit.position + edit.deleted_length,
+            String::from_utf8_lossy(&edit.inserted_text).into_owned(),
+        ));
     }
     Ok(spans)
 }
@@ -222,5 +327,74 @@ mod tests {
         ];
         let out = run("a.rs", text, &ops).unwrap();
         assert_eq!(out, "fn m() {\n    g(1); g(2); end();\n}\n");
+    }
+    #[test]
+    fn count_rejection_precedes_large_replacement_guard() {
+        let text = "fn m() { f(1); f(2); }";
+        let huge = "x".repeat(MAX_REWRITE_OUTPUT + 1);
+        let err = rewrite_spans(Path::new("a.rs"), text, "f($A)", &huge, Some(3)).unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::RewriteCountMismatch { found: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn aggregate_rewrite_output_is_bounded_before_rendering() {
+        let text = "fn m() { f(1); f(2); }";
+        let huge = "x".repeat(MAX_REWRITE_OUTPUT / 2 + 1);
+        let err = rewrite_spans(Path::new("a.rs"), text, "f($A)", &huge, Some(2)).unwrap_err();
+        assert!(matches!(err, ApplyError::RewriteOutputTooLarge));
+        assert_eq!(
+            rewrite_match_spans(Path::new("a.rs"), text, "f($A)", Some(2))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn large_single_line_rewrite_under_limit_survives_indentation() {
+        let text = format!("fn m() {{\n{}f(1);\n}}\n", " ".repeat(32));
+        let replacement = "x".repeat(1024 * 1024);
+        let spans = rewrite_spans(Path::new("a.rs"), &text, "f($A)", &replacement, Some(1))
+            .expect("output below limit");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, replacement);
+    }
+
+    #[test]
+    fn large_capture_under_limit_is_not_rejected_by_preflight() {
+        let capture = format!("\"{}\"", "x".repeat(6 * 1024 * 1024));
+        let text = format!("f({capture})");
+        let spans = rewrite_spans(Path::new("a.rs"), &text, "f($A)", "g($A)", Some(1))
+            .expect("rendered output below limit");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, format!("g({capture})"));
+    }
+    #[test]
+    fn large_match_with_tiny_capture_remains_allowed() {
+        let text = format!(
+            "fn tiny() {{ let data = \"{}\"; }}",
+            "x".repeat(17 * 1024 * 1024)
+        );
+        let spans = rewrite_spans(
+            Path::new("a.rs"),
+            &text,
+            "fn $NAME() { $$$BODY }",
+            "$NAME",
+            Some(1),
+        )
+        .expect("small captured output stays below the limit");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].2, "tiny");
+    }
+
+    #[test]
+    fn repeated_large_capture_rejects_before_rendering() {
+        let capture = format!("\"{}\"", "x".repeat(6 * 1024 * 1024));
+        let text = format!("f({capture})");
+        let err = rewrite_spans(Path::new("a.rs"), &text, "f($A)", "$A$A$A", Some(1)).unwrap_err();
+        assert!(matches!(err, ApplyError::RewriteOutputTooLarge));
     }
 }

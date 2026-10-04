@@ -65,8 +65,8 @@ fn unseen_message(
         .collect();
     let paths = serde_json::Value::from(paths);
     format!(
-        "{head} DO NOT re-read the file: tilth_read paths {paths} shows every unseen match; \
-         retry with the same tag."
+        "{head} tilth_read paths {paths} shows every match range in the current file; \
+         use the tag returned by that read when retrying."
     )
 }
 
@@ -174,9 +174,9 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "Edit rejected for src/a.go: line 39 was never displayed under this tag \
-             (displayed: 1-36). DO NOT re-read the file: tilth_read paths \
-             [\"src/a.go#39-39\",\"src/a.go#120-122\"] shows every unseen match; retry with \
-             the same tag."
+             (displayed: 1-36). tilth_read paths \
+             [\"src/a.go#39-39\",\"src/a.go#120-122\"] shows every match range in the current \
+             file; use the tag returned by that read when retrying."
         );
     }
 

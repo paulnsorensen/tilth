@@ -75,8 +75,8 @@ class EditReadySearch(unittest.TestCase):
             harness.tools_call_request(3, "tilth_write", edit),
         ]).response_by_id(3)
         self.assertFalse(harness.tool_is_error(written), harness.tool_result_text(written))
-        self.assertIn(b"return done", target.read_bytes())
-        self.assertNotIn(b"last_line", target.read_bytes())
+        expected = source.replace("    return last_line", "    return done").encode()
+        self.assertEqual(target.read_bytes(), expected)
 
     def test_press_top_level_glob_is_rejected_with_a_hint_and_other_keys_stay_generic(self):
         glob = harness.tools_call_request(

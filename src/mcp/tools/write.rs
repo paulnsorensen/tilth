@@ -22,7 +22,9 @@ use crate::edit::apply::{ApplyError, FileOp};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
-use crate::edit::recovery::{check_seen_lines, gated_apply, try_recover, EditError};
+use crate::edit::recovery::{
+    check_seen_lines, current_match_ranges, gated_apply, try_recover, EditError,
+};
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header, render_numbered_slice};
 use crate::error::TilthError;
@@ -363,7 +365,23 @@ fn recover_edit(
     // cross-session replay, or LRU-evicted) — it earns no short-circuit below.
     let snapshot = store.by_tag(key, tag);
     if let Some(snapshot) = &snapshot {
-        check_seen_lines(snapshot, path, &section.ops).map_err(EditError::from)?;
+        if let Err(error) = check_seen_lines(snapshot, path, &section.ops) {
+            if matches!(&error, MismatchError::UnseenAnchor { reads, .. } if !reads.is_empty()) {
+                let ranges = current_match_ranges(path, live, &section.ops);
+                if !ranges.is_empty() {
+                    let p = crate::format::display_path(path);
+                    let paths: Vec<String> = ranges
+                        .iter()
+                        .map(|(lo, hi)| format!("{p}#{lo}-{hi}"))
+                        .collect();
+                    let paths = serde_json::Value::from(paths);
+                    return Err(TilthError::EditRejected(format!(
+                        "Edit rejected for {p}: file changed since the read. tilth_read paths {paths} shows every match range in the current file; use the tag returned by that read when retrying."
+                    )));
+                }
+            }
+            return Err(EditError::from(error).into());
+        }
     }
     let file_op = FileOp::from_ops(&section.ops).map_err(EditError::Apply)?;
     let has_content = section

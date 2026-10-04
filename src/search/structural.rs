@@ -73,21 +73,11 @@ impl Serialize for Match {
     }
 }
 
-/// Sorted matches of one file. Wire fields: `path`, `matches`, and optional
-/// `tag`, the whole-file edit tag when the caller minted one. Key order is not
-/// part of the contract.
+/// Sorted matches of one file. Coordinates require a tagged read before editing.
 #[derive(Serialize)]
 pub(crate) struct FileMatches {
     path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tag: Option<String>,
     matches: Vec<Match>,
-}
-
-impl FileMatches {
-    pub(crate) fn set_tag(&mut self, tag: String) {
-        self.tag = Some(tag);
-    }
 }
 
 #[derive(Default)]
@@ -234,7 +224,6 @@ impl StructuralPatterns {
                 Some(group) if group.path == path => group.matches.push(hit),
                 _ => scan.groups.push(FileMatches {
                     path,
-                    tag: None,
                     matches: vec![hit],
                 }),
             }

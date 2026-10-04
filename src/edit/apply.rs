@@ -132,6 +132,8 @@ pub enum ApplyError {
         expected: usize,
         found: usize,
     },
+    #[error("rewrite replacement output exceeds 16 MiB; no change written")]
+    RewriteOutputTooLarge,
 }
 
 impl ApplyError {
@@ -150,6 +152,7 @@ impl ApplyError {
                 | ApplyError::RewritePattern { .. }
                 | ApplyError::RewriteUnmatched { .. }
                 | ApplyError::RewriteCountMismatch { .. }
+                | ApplyError::RewriteOutputTooLarge
         )
     }
 }
@@ -393,20 +396,37 @@ fn line_number(text: &str, byte_pos: usize) -> u32 {
         + 1
 }
 
-/// The line span COVERING a byte range, i.e. the 1-based line numbers of the
-/// range's start byte and of its last actual character — never a phantom line
-/// past the range's exclusive end (which would misattribute a swap ending in a
-/// multibyte character or right before a newline). Distinct from the covering
-/// span computed in [`lower_text_swaps`] for run-coalescing and
-/// [`reject_overlaps`], which intentionally may include an adjacent line.
-pub(super) fn content_line_span(text: &str, start: usize, end: usize) -> (u32, u32) {
-    let lo = line_number(text, start);
-    let last_char_start = text[start..end]
-        .char_indices()
-        .last()
-        .map_or(start, |(i, _)| start + i);
-    let hi = line_number(text, last_char_start);
-    (lo, hi)
+/// Reuse newline offsets when mapping many byte spans to source lines.
+pub(super) struct NewlineIndex {
+    offsets: Vec<usize>,
+}
+
+impl NewlineIndex {
+    pub(super) fn new(text: &str) -> Self {
+        Self {
+            offsets: memchr::memchr_iter(b'\n', text.as_bytes()).collect(),
+        }
+    }
+
+    fn line(&self, byte_pos: usize) -> u32 {
+        u32::try_from(self.offsets.partition_point(|&at| at < byte_pos)).unwrap_or(u32::MAX - 1) + 1
+    }
+
+    /// Include the last byte before the exclusive end, not a phantom next line.
+    pub(super) fn content_line_span(&self, start: usize, end: usize) -> (u32, u32) {
+        (
+            self.line(start),
+            self.line(if end > start { end - 1 } else { start }),
+        )
+    }
+}
+
+fn line_separator(text: &str) -> &'static str {
+    if text.contains("\r\n") && text.split("\r\n").all(|row| !row.contains('\n')) {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Render the covering lines of `edits` with each substitution applied.
@@ -415,7 +435,7 @@ pub(super) fn content_line_span(text: &str, start: usize, end: usize) -> (u32, u
 /// byte ranges — [`lower_text_swaps`] is the only producer and establishes all
 /// three. The caller already knows the line span, so this returns only the
 /// replacement lines rather than rescanning the prefix to recompute it.
-fn render_swapped_lines(text: &str, edits: &[(usize, usize, &str)]) -> Vec<String> {
+fn render_swapped_lines(text: &str, edits: &[(usize, usize, &str)], strip_cr: bool) -> Vec<String> {
     let first_start = edits[0].0;
     let last_end = edits[edits.len() - 1].1;
     let line_start = text[..first_start].rfind('\n').map_or(0, |i| i + 1);
@@ -430,7 +450,16 @@ fn render_swapped_lines(text: &str, edits: &[(usize, usize, &str)]) -> Vec<Strin
         cursor = e;
     }
     out.push_str(&text[cursor..line_end]);
-    out.split('\n').map(str::to_string).collect()
+    out.split('\n')
+        .map(|line| {
+            if strip_cr {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                line
+            }
+            .to_string()
+        })
+        .collect()
 }
 
 /// Resolve a unique literal text occurrence to a whole-line replacement span.
@@ -449,7 +478,7 @@ fn resolve_text_swap(
     Ok((
         line_number(text, start),
         line_number(text, end),
-        render_swapped_lines(text, &[(start, end, new)]),
+        render_swapped_lines(text, &[(start, end, new)], line_separator(text) == "\r\n"),
     ))
 }
 
@@ -472,6 +501,10 @@ fn lower_text_swaps(
         line_span: (u32, u32),
     }
 
+    let newlines: Vec<usize> = memchr::memchr_iter(b'\n', text.as_bytes()).collect();
+    let strip_cr = line_separator(text) == "\r\n";
+    let line_at =
+        |byte| u32::try_from(newlines.partition_point(|&at| at < byte)).unwrap_or(u32::MAX) + 1;
     let mut resolved: Vec<Resolved> = Vec::new();
     let mut normalized = false;
     for (op_idx, op) in ops.iter().enumerate() {
@@ -504,7 +537,7 @@ fn lower_text_swaps(
                 // Covering span (may include a line past the match's real
                 // content) — correct for run-coalescing/reject_overlaps below,
                 // but not for the seen-lines gate; use content_line_span there.
-                line_span: (line_number(text, start), line_number(text, end)),
+                line_span: (line_at(start), line_at(end)),
             });
         }
     }
@@ -539,7 +572,7 @@ fn lower_text_swaps(
             .iter()
             .map(|r| (r.start, r.end, r.new.as_ref()))
             .collect();
-        let payload = render_swapped_lines(text, &edits);
+        let payload = render_swapped_lines(text, &edits, strip_cr);
         let primary = run.iter().map(|r| r.op_idx).min().unwrap_or(0);
         out[primary].push(LineOp::Swap {
             start: run[0].line_span.0,
@@ -689,7 +722,8 @@ struct Splice {
 /// Splice `line_ops` into `text`, treating it as `split('\n')` rows with 1-based
 /// line numbers (self-consistent with the whole-file-tag numbered-line render).
 pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyResult, ApplyError> {
-    let rows: Vec<Cow<str>> = text.split('\n').map(Cow::Borrowed).collect();
+    let separator = line_separator(text);
+    let rows: Vec<Cow<str>> = text.split(separator).map(Cow::Borrowed).collect();
     let total = rows.len();
 
     let mut splices: Vec<Splice> = Vec::with_capacity(line_ops.len());
@@ -731,7 +765,7 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
                     }
                     Cursor::Head => 0,
                     Cursor::Tail => {
-                        if text.ends_with('\n') {
+                        if text.ends_with(separator) {
                             total - 1
                         } else {
                             total
@@ -781,7 +815,7 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
         owned.splice(s.idx..end, s.new.iter().map(|l| Cow::Owned(l.clone())));
     }
 
-    let out = owned.join("\n");
+    let out = owned.join(separator);
     let first_changed_line = if out == text {
         None
     } else {
@@ -805,36 +839,22 @@ fn check_bounds(line: u32, total: usize) -> Result<(), ApplyError> {
 /// Reject any two ranged splices that overlap, and any insert landing inside a
 /// ranged splice.
 fn reject_overlaps(splices: &[Splice]) -> Result<(), ApplyError> {
-    let ranged: Vec<(usize, (u32, u32))> = splices
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.range.map(|r| (i, r)))
-        .collect();
-
-    // Ranged vs ranged.
-    for i in 0..ranged.len() {
-        for j in (i + 1)..ranged.len() {
-            let (_, a) = ranged[i];
-            let (_, b) = ranged[j];
-            if a.0 <= b.1 && b.0 <= a.1 {
-                return Err(ApplyError::Overlap { a, b });
-            }
+    let mut ranged: Vec<(u32, u32)> = splices.iter().filter_map(|s| s.range).collect();
+    ranged.sort_unstable();
+    for pair in ranged.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b.0 <= a.1 {
+            return Err(ApplyError::Overlap { a, b });
         }
     }
 
-    // Insert landing inside a ranged op.
-    for s in splices {
-        if s.range.is_some() {
-            continue;
-        }
-        // Insert idx is 0-based; the 1-based "anchor line" it targets is idx or
-        // idx+1 depending on Pre/Post, but either way it must not fall strictly
-        // inside a ranged [start,end].
-        for (_, r) in &ranged {
-            let anchor = s.idx as u32; // Pre(n)→n-1, Post(n)→n, Head→0, Tail→total
+    for s in splices.iter().filter(|s| s.range.is_none()) {
+        let anchor = s.idx as u32;
+        let before = ranged.partition_point(|r| r.0 <= anchor);
+        if let Some(&r) = ranged.get(before.saturating_sub(1)) {
             if anchor + 1 > r.0 && anchor < r.1 {
                 return Err(ApplyError::Overlap {
-                    a: *r,
+                    a: r,
                     b: (anchor, anchor),
                 });
             }
@@ -869,6 +889,21 @@ mod tests {
         .unwrap();
         assert_eq!(r.text, "a\nX\nY\nd\n");
         assert_eq!(r.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn swap_preserves_crlf_lines() {
+        let text = "a\r\nb\r\nc\r\n";
+        let result = apply(
+            text,
+            &[Op::Swap {
+                start: 2,
+                end: 2,
+                payload: vec!["B".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.text, "a\r\nB\r\nc\r\n");
     }
 
     #[test]
@@ -1200,9 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn crlf_line_endings_survive_untouched_rows() {
-        // apply operates on raw text; a swap rewrites its own row while other
-        // rows keep their CRLF verbatim.
+    fn crlf_line_endings_survive_line_replacement() {
         let r = apply(
             "a\r\nb\r\nc\r\n",
             &[Op::Swap {
@@ -1212,7 +1245,34 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(r.text, "a\r\nB\nc\r\n");
+        assert_eq!(r.text, "a\r\nB\r\nc\r\n");
+    }
+
+    #[test]
+    fn crlf_text_swap_preserves_exact_bytes() {
+        let result = apply(
+            "a = 1\r\nb = 2\r\n",
+            &[Op::TextSwap {
+                old: "a = 1".into(),
+                new: "a = 3".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.text.as_bytes(), b"a = 3\r\nb = 2\r\n");
+    }
+
+    #[test]
+    fn crlf_rewrite_preserves_exact_bytes() {
+        let result = apply(
+            "fn main() {\r\n    f(1);\r\n}\r\n",
+            &[Op::Rewrite {
+                pattern: "f($A)".into(),
+                rewrite: "g($A)".into(),
+                count: Some(1),
+            }],
+        )
+        .unwrap();
+        assert_eq!(result.text.as_bytes(), b"fn main() {\r\n    g(1);\r\n}\r\n");
     }
 
     #[test]
@@ -1667,6 +1727,13 @@ mod tests {
         let text = "foo a\nb foo foo\nc\nfoo\n";
         let out = apply_all(text, &[all_op("foo", "bar", None)]).expect("apply");
         assert_eq!(out, "bar a\nb bar bar\nc\nbar\n");
+    }
+
+    #[test]
+    fn crlf_text_swap_all_preserves_exact_bytes() {
+        let text = "foo\r\nfoo\r\n";
+        let out = apply_all(text, &[all_op("foo", "bar", None)]).expect("apply");
+        assert_eq!(out.as_bytes(), b"bar\r\nbar\r\n");
     }
 
     #[test]

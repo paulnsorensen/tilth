@@ -40,20 +40,19 @@ class StructuralSearch(unittest.TestCase):
         return self.untagged(json.loads(harness.tool_result_text(response)))
 
     def untagged(self, payload):
-        """Check each file entry's edit tag, then drop it so span assertions stay exact."""
+        """Structural coordinates do not authorize source edits."""
         for result in payload["results"]:
             for group in result.get("items", []):
-                tag = group.pop("tag", None)
-                self.assertRegex(tag or "", r"^[0-9A-F]{4}$", group)
+                self.assertNotIn("tag", group)
         return payload
 
-    def test_file_entries_carry_a_tag_that_tilth_write_accepts(self):
+    def test_file_entries_do_not_authorize_rewrite(self):
         source = "wrap(value)\nother(value)\n"
         target = self.write("source.py", source)
         response = self.call([{"pattern": "wrap($A)", "language": "python"}])
         group = json.loads(harness.tool_result_text(response))["results"][0]["items"][0]
-        self.assertNotEqual(group["tag"], "0000")
-        edit = {"cwd": str(self.root), "edits": [{"path": "source.py", "tag": group["tag"], "ops": [
+        self.assertNotIn("tag", group)
+        edit = {"cwd": str(self.root), "edits": [{"path": "source.py", "ops": [
             {"op": "rewrite", "pattern": "wrap($A)", "rewrite": "wrapped($A)"}]}]}
         written = harness.run_mcp([], [
             harness.initialize_request(),
@@ -61,8 +60,8 @@ class StructuralSearch(unittest.TestCase):
                 "cwd": str(self.root), "queries": [{"pattern": "wrap($A)", "language": "python"}]}),
             harness.tools_call_request(3, "tilth_write", edit),
         ]).response_by_id(3)
-        self.assertFalse(harness.tool_is_error(written), harness.tool_result_text(written))
-        self.assertEqual(target.read_text(), "wrapped(value)\nother(value)\n")
+        self.assertTrue(harness.tool_is_error(written), harness.tool_result_text(written))
+        self.assertEqual(target.read_text(), source)
 
     @staticmethod
     def location(source, text):

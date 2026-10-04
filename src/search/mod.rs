@@ -696,7 +696,6 @@ pub fn format_raw_result_deferred(
         Some(budget),
     )
 }
-
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
@@ -842,7 +841,11 @@ fn group_matches<'a>(matches: &'a [Match], cache: &OutlineCache) -> Vec<Vec<&'a 
 /// The whole file of a hit in a small file as `N:content` lines, with its last
 /// line number. `None` when the file is too large, unreadable, or the block
 /// would take more than half the response budget on top of what `out` holds.
-fn whole_file_block(m: &Match, out_len: usize, budget_tokens: u64) -> Option<(String, u32)> {
+fn whole_file_block(
+    m: &Match,
+    out_len: usize,
+    budget_tokens: u64,
+) -> Option<(String, u32, String)> {
     // `file_lines` is a bytes/40 estimate, so bound the read by size and count
     // the real lines below.
     if fs::metadata(&m.path).ok()?.len() > u64::from(WHOLE_FILE_MAX_LINES) * 400 {
@@ -858,7 +861,7 @@ fn whole_file_block(m: &Match, out_len: usize, budget_tokens: u64) -> Option<(St
     if estimate_tokens((out_len + block.len()) as u64) > budget_tokens / 2 {
         return None;
     }
-    Some((block, last))
+    Some((block, last, content))
 }
 
 /// True when an earlier entry already printed `path` whole.
@@ -908,6 +911,12 @@ fn format_grouped_usages(
     for m in group {
         let _ = write!(out, "\n{}:{}", m.line, m.text);
     }
+    let content = fs::read_to_string(&first.path).ok();
+    let source = content.as_deref().filter(|source| {
+        group
+            .iter()
+            .all(|m| source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str()))
+    });
     insert_tag(
         out,
         tag_at,
@@ -915,6 +924,7 @@ fn format_grouped_usages(
         seen,
         &first.path,
         &lines_as_ranges(&lines),
+        source,
     );
 }
 
@@ -962,8 +972,9 @@ fn insert_tag(
     seen: &mut Vec<(usize, SeenEntry)>,
     path: &Path,
     lines: &[(u32, u32)],
+    source: Option<&str>,
 ) {
-    insert_entry_tag(out, at, session, seen, path, lines, false);
+    insert_entry_tag(out, at, session, seen, path, lines, false, source);
 }
 
 /// `insert_tag` for an entry that may print its file whole.
@@ -975,10 +986,12 @@ fn insert_entry_tag(
     path: &Path,
     lines: &[(u32, u32)],
     whole_file: bool,
+    source: Option<&str>,
 ) {
-    let Some(session) = session else { return };
-    let spec = crate::read::SeenSpec::Ranges(Vec::new());
-    if let Some(tag) = crate::read::record_edit_snapshot(session, path, &spec) {
+    let (Some(session), Some(source)) = (session, source) else {
+        return;
+    };
+    if let Some(tag) = session.record_snapshot(path, source, Vec::new()) {
         out.insert_str(at, &format!("#{}", crate::edit::tag::format_tag(tag)));
         seen.push((
             at,
@@ -991,7 +1004,6 @@ fn insert_entry_tag(
         ));
     }
 }
-
 /// The symbol to feed query-aware truncation when expanding a match's body.
 ///
 /// For `impl`/`implements` matches the user searched for the trait or interface,
@@ -1081,7 +1093,15 @@ fn format_single_match(
                     let take_n = total_body_lines.min(MARKDOWN_PREVIEW_MAX_LINES);
                     let first = u32::try_from(body_start + 1).unwrap_or(u32::MAX);
                     let last = u32::try_from(body_start + take_n).unwrap_or(u32::MAX);
-                    insert_tag(out, tag_at, session, seen, &m.path, &[(first, last)]);
+                    insert_tag(
+                        out,
+                        tag_at,
+                        session,
+                        seen,
+                        &m.path,
+                        &[(first, last)],
+                        Some(&content),
+                    );
                     out.push('\n');
                     for line in &lines[body_start..body_start + take_n] {
                         out.push_str(line);
@@ -1138,23 +1158,63 @@ fn format_single_match(
             None
         };
 
-    if let Some((block, last_line)) = whole_file {
-        insert_entry_tag(out, tag_at, session, seen, &m.path, &[(1, last_line)], true);
+    let preview_content = if !fence_will_follow && whole_file.is_none() {
+        fs::read_to_string(&m.path).ok().filter(|source| {
+            source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str())
+        })
+    } else {
+        None
+    };
+    if let Some((block, last_line, content)) = whole_file {
+        insert_entry_tag(
+            out,
+            tag_at,
+            session,
+            seen,
+            &m.path,
+            &[(1, last_line)],
+            true,
+            Some(&content),
+        );
         out.push_str(&block);
     } else if m.file_lines < 50 {
         // Skip outline for small files — the expanded code speaks for itself
         if !fence_will_follow {
-            insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
+            insert_tag(
+                out,
+                tag_at,
+                session,
+                seen,
+                &m.path,
+                &[(m.line, m.line)],
+                preview_content.as_deref(),
+            );
             let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
         if !fence_will_follow {
-            insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
+            insert_tag(
+                out,
+                tag_at,
+                session,
+                seen,
+                &m.path,
+                &[(m.line, m.line)],
+                preview_content.as_deref(),
+            );
             let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if !fence_will_follow {
-        insert_tag(out, tag_at, session, seen, &m.path, &[(m.line, m.line)]);
+        insert_tag(
+            out,
+            tag_at,
+            session,
+            seen,
+            &m.path,
+            &[(m.line, m.line)],
+            preview_content.as_deref(),
+        );
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
@@ -1254,6 +1314,7 @@ fn format_single_match(
                         seen,
                         &m.path,
                         &lines_as_ranges(&shown),
+                        Some(&content),
                     );
                     out.push('\n');
                     out.push_str(&stripped_code);
@@ -4276,5 +4337,32 @@ mod tests {
             !out.contains("regex matched zero content"),
             "escaped-literal fallback with zero matches must not blame a regex: {out}"
         );
+    }
+    #[test]
+    fn tag_uses_displayed_source_after_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let shown = "fn before() {}\n";
+        std::fs::write(&path, shown).unwrap();
+        let captured = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "fn after() {}\n").unwrap();
+        let session = Session::new();
+        let mut out = "### a.rs:1".to_string();
+        let mut seen = Vec::new();
+        insert_tag(
+            &mut out,
+            "### a.rs".len(),
+            Some(&session),
+            &mut seen,
+            &path,
+            &[(1, 1)],
+            Some(&captured),
+        );
+        assert!(out.contains(&crate::edit::tag::format_tag(
+            crate::edit::tag::compute_file_hash(shown)
+        )));
+        let snapshot = session.snapshots().head(&path).unwrap();
+        assert_eq!(snapshot.text, shown);
+        assert_eq!(seen[0].1.tag, snapshot.tag);
     }
 }
