@@ -7,7 +7,6 @@ with context efficiency metrics and comparisons.
 """
 
 import argparse
-import json
 import math
 import sys
 from collections import Counter, defaultdict
@@ -21,6 +20,7 @@ import stats
 from flags import detect_flags
 from paired import (
     is_contaminated_panel_row,
+    load_runs,
     pair_modes,
     paired_accuracy_delta,
     paired_cpc_delta as paired_cpc_delta_impl,
@@ -64,16 +64,7 @@ def load_results(path: Path) -> list[dict]:
     A contaminated panel row counts as incorrect whatever its grader verdict; it
     stays in its task and arm denominators. Rows without ``panel_name`` are unchanged.
     """
-    results = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                result = json.loads(line)
-                if is_contaminated_panel_row(result):
-                    result["correct"] = False
-                results.append(result)
-    return results
+    return load_runs(path)
 
 
 def _contaminated_section(results: list[dict], modes: list[str]) -> list[str]:

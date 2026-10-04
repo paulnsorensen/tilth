@@ -196,7 +196,8 @@ class Evolution:
             with self._spending("cells"):
                 rows = run.run_plan(cells, panel=self.panel, ledger=self.ledger, candidate_sha=sha,
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
-                                    cell_estimate_usd=self.settings.cell_estimate_usd, store_only=store_only)
+                                    cell_estimate_usd=self.settings.cell_estimate_usd, store_only=store_only,
+                                    repo=self.settings.repo)
         except run.PlanStopped as stopped:
             self.log(f"cells: stopped ({stopped})")
             self.stop.set(stopped.reason)
@@ -514,9 +515,12 @@ class Evolution:
         code = self.preflight() or self.buy_baselines()
         if code:
             return code
-        if not self.stop.is_set:
-            self.search()
-        self.finish()
+        try:
+            if not self.stop.is_set:
+                self.search()
+            self.finish()
+        finally:
+            self.materializer.cleanup()
         totals = {**self.spend, "reflection": self.paid.total("reflection"), "proposer": self.paid.total("proposer")}
         self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
                  + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")

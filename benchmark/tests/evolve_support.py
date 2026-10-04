@@ -267,7 +267,7 @@ class World:
             row["contamination_hits"] = [{"reason": "benchmark_tree", "tool": "Read", "input": {}}]
         return row
 
-    def fake_build(self, sha: str) -> run.CandidateBuild:
+    def fake_build(self, sha: str, repo: Path | None = None) -> run.CandidateBuild:
         self.builds.append(sha)
         return run.CandidateBuild(git_sha=sha, binary_path=f"/fixture/bin/{sha[:12]}/tilth",
                                   binary_sha256=f"sha256-of-{sha}")

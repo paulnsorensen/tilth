@@ -173,14 +173,15 @@ def test_run_plan_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> Non
 # --- c5 AC-7: candidate cells are served from the candidate commit's binary ---
 
 
-def test_candidate_build_runs_at_candidate_commit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.fixture
+def candidate_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A repo whose HEAD is the seed, with one candidate commit the checkout is not on, and a cargo recorder."""
     repo = tmp_path / "tilth"
     seed = make_repo(repo)
     (repo / "src" / "lib.rs").write_text("pub fn changed() {}\n")
     git("commit", "-qam", "candidate", cwd=repo)
     candidate = git("rev-parse", "HEAD", cwd=repo).strip()
     git("checkout", "-q", seed, cwd=repo)
-    monkeypatch.setattr(run, "REPO_ROOT", repo)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run, "_CANDIDATE_BUILDS", {})
     builds: list[tuple[str, list[str]]] = []
@@ -193,6 +194,12 @@ def test_candidate_build_runs_at_candidate_commit(monkeypatch: pytest.MonkeyPatc
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(run, "_run_cargo", fake_cargo)
+    return repo, candidate, builds
+
+
+def test_candidate_build_runs_at_candidate_commit(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, candidate, builds = candidate_repo
+    monkeypatch.setattr(run, "REPO_ROOT", repo)
     first = run.build_candidate(candidate)
     second = run.build_candidate(candidate)
 
@@ -201,6 +208,16 @@ def test_candidate_build_runs_at_candidate_commit(monkeypatch: pytest.MonkeyPatc
     assert first.git_sha == candidate
     assert first.binary_sha256 == hashlib.sha256(b"binary for " + candidate.encode()).hexdigest()
     assert Path(first.binary_path).read_bytes() == b"binary for " + candidate.encode()
+
+
+def test_candidate_build_is_cached_on_disk_across_processes(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, candidate, builds = candidate_repo
+    first = run.build_candidate(candidate, repo=repo)
+    monkeypatch.setattr(run, "_CANDIDATE_BUILDS", {})
+
+    assert run.build_candidate(candidate, repo=repo) == first
+    assert len(builds) == 1
+    assert "candidates" not in git("worktree", "list", cwd=repo)
 
 
 def test_candidate_cells_record_candidate_identity(world) -> None:
@@ -231,3 +248,14 @@ def test_run_py_candidate_sha_flag(bench, monkeypatch: pytest.MonkeyPatch) -> No
     assert built == ["abc123"]
     row = bench.output_rows()[0]
     assert row["git_sha"] == "abc123" and row["binary_sha256"] == "sha256-candidate"
+
+
+def test_retried_cell_keeps_each_attempts_sidecar(world) -> None:
+    world.baseline["dev_a"] = "E"
+    plan(world, cells("dev_a"))
+    plan(world, cells("dev_a"))
+
+    failed = [row for row in world.stored() if row["task"] == "dev_a"]
+    assert len(failed) == 2 and all(row.get("error") for row in failed)
+    paths = [row["trajectory_path"] for row in failed]
+    assert len(set(paths)) == 2 and all(Path(path).is_file() for path in paths)

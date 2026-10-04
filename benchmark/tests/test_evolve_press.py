@@ -150,3 +150,32 @@ def test_content_id_hashes_utf8_not_ascii_escapes() -> None:
     assert candidates.content_id(candidate) != escaped
     assert candidates.content_id(candidate) == hashlib.sha256(
         json.dumps(candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def test_dispatcher_sends_each_record_once() -> None:
+    from evolve import engine
+    seen: list[list[dict]] = []
+    dispatcher = engine.Dispatcher(StopState(), reflect=lambda name, text, records: seen.append(records) or text,
+                                   propose=lambda candidate, records: seen.append(records) or "")
+    first, second = {"row": {"task": "dev_a", "repetition": 1}}, {"row": {"task": "dev_b", "repetition": 1}}
+    entry_a, entry_b = {"records": [first]}, {"records": [second]}
+    dispatcher(seed_candidate(), {"prompts/mcp.md": [entry_a, entry_b, entry_a],
+                                  "src_patch": [entry_b, entry_b]}, ["prompts/mcp.md", "src_patch"])
+    assert seen == [[first, second], [second]]
+
+
+def test_run_removes_its_candidate_worktrees(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from evolve import engine
+    from evolve_support import build, child, scripted_engine
+    world = make_world(monkeypatch, tmp_path)
+    fake, _seen = scripted_engine([child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", tag="c")])
+    monkeypatch.setattr(engine, "optimize_anything", fake)
+    other = tmp_path / "unrelated-worktree"
+    git("worktree", "add", "-q", "--detach", str(other), world.seed_sha, cwd=world.repo)
+    evo = build(world)
+
+    assert evo.run() == 0
+    listed = git("worktree", "list", "--porcelain", cwd=world.repo)
+    assert "evolve" not in listed and str(other) in listed
+    refs = git("for-each-ref", "--format=%(objectname)", "refs/evolve/run1", cwd=world.repo).split()
+    assert len(refs) == 2 and all(git("cat-file", "-t", sha, cwd=world.repo).strip() == "commit" for sha in refs)

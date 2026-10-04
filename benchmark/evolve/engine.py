@@ -85,7 +85,10 @@ class Dispatcher:
                  components_to_update: list[str]) -> dict[str, str]:
         proposal = {}
         for name in components_to_update:
-            records = [record for entry in reflective_dataset.get(name, ()) for record in entry.get("records", ())]
+            # gepa pads a minibatch with repeated examples; each distinct record goes into a prompt once.
+            unique = {json.dumps(record, sort_keys=True): record
+                      for entry in reflective_dataset.get(name, ()) for record in entry.get("records", ())}
+            records = list(unique.values())
             if self.stop.is_set:
                 proposal[name] = candidate[name]
             elif name == SRC_PATCH:

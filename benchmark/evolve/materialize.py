@@ -81,6 +81,14 @@ class Materializer:
             self._worktrees[sha] = self._add_worktree(self.work_dir / sha[:12], sha)
         return self._worktrees[sha]
 
+    def cleanup(self) -> None:
+        """Remove every worktree this materializer created; the ``refs/evolve`` refs keep the commits."""
+        for path in self._worktrees.values():
+            subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=self.repo, capture_output=True)
+            shutil.rmtree(path, ignore_errors=True)
+        self._worktrees.clear()
+        subprocess.run(["git", "worktree", "prune"], cwd=self.repo, capture_output=True)
+
     def _add_worktree(self, path: Path, sha: str) -> Path:
         if path.exists():
             subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=self.repo, capture_output=True)

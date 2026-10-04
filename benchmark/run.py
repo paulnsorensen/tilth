@@ -1447,41 +1447,43 @@ def _git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-def _candidate_worktree(sha: str) -> Path:
-    """A worktree of the tilth repo already at ``sha``, else a new detached one under the results dir."""
-    porcelain = _git("worktree", "list", "--porcelain", cwd=REPO_ROOT)
-    for entry in porcelain.split("\n\n"):
-        fields = dict(line.split(" ", 1) for line in entry.splitlines() if " " in line)
-        if fields.get("HEAD") == sha and Path(fields["worktree"]).is_dir():
-            if not _git("status", "--porcelain", "--untracked-files=no", cwd=Path(fields["worktree"])).strip():
-                return Path(fields["worktree"])
-    worktree = RESULTS_DIR / "candidates" / sha / "src"
-    if not worktree.is_dir():
-        _git("worktree", "add", "--detach", str(worktree), sha, cwd=REPO_ROOT)
-    return worktree
+def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
+    """Build ``sha`` once per results dir: the binary and its digest are kept beside the sha and reused."""
+    directory = RESULTS_DIR / "candidates" / sha
+    binary, record = directory / "tilth", directory / "build.json"
+    if binary.is_file() and record.is_file():
+        built = json.loads(record.read_text())
+        if built.get("binary_sha256") == _file_sha256(binary):
+            return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=built["binary_sha256"])
+    # A stable checkout path per sha; the target dir is shared so dependencies build once.
+    worktree = directory / "src"
+    if worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
+        shutil.rmtree(worktree, ignore_errors=True)
+    _git("worktree", "add", "--detach", str(worktree), sha, cwd=repo)
+    try:
+        head = _git("rev-parse", "HEAD", cwd=worktree).strip()
+        if head != sha:
+            raise RuntimeError(f"candidate worktree {worktree} is at {head}, not {sha}")
+        target_dir = RESULTS_DIR / "candidates" / "target"
+        build = _run_cargo(["cargo", "build", "--release", "--locked"], cwd=worktree,
+                           env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
+        if build.returncode != 0:
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\n{(build.stderr or '')[-2000:]}")
+        # The shared target dir is overwritten by the next build: keep this binary beside its sha.
+        shutil.copy2(target_dir / "release" / "tilth", binary)
+    finally:
+        _git("worktree", "remove", "--force", str(worktree), cwd=repo)
+    digest = _file_sha256(binary)
+    record.write_text(json.dumps({"git_sha": sha, "binary_sha256": digest}) + "\n")
+    return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=digest)
 
 
-def _build_candidate(sha: str) -> CandidateBuild:
-    worktree = _candidate_worktree(sha)
-    head = _git("rev-parse", "HEAD", cwd=worktree).strip()
-    if head != sha:
-        raise RuntimeError(f"candidate worktree {worktree} is at {head}, not {sha}")
-    target_dir = RESULTS_DIR / "candidates" / "target"
-    build = _run_cargo(["cargo", "build", "--release", "--locked"], cwd=worktree,
-                       env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
-    if build.returncode != 0:
-        raise RuntimeError(f"cargo build --release --locked failed at {sha}:\n{(build.stderr or '')[-2000:]}")
-    # The shared target dir is overwritten by the next build: keep this binary beside its sha.
-    binary = RESULTS_DIR / "candidates" / sha / "tilth"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(target_dir / "release" / "tilth", binary)
-    return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=_file_sha256(binary))
-
-
-def build_candidate(sha: str) -> CandidateBuild:
-    """Build tilth at the local commit ``sha`` with ``cargo build --release --locked``, once per sha."""
+def build_candidate(sha: str, *, repo: Path | None = None) -> CandidateBuild:
+    """Build tilth at the local commit ``sha`` of ``repo`` (default: this checkout) with
+    ``cargo build --release --locked``, once per sha."""
     if sha not in _CANDIDATE_BUILDS:
-        _CANDIDATE_BUILDS[sha] = _build_candidate(sha)
+        _CANDIDATE_BUILDS[sha] = _build_candidate(sha, Path(repo or REPO_ROOT))
     return _CANDIDATE_BUILDS[sha]
 
 
@@ -1506,6 +1508,7 @@ def run_plan(
     output: Path | None = None,
     cell_estimate_usd: float = DEFAULT_MAX_BUDGET_USD,
     store_only: bool = False,
+    repo: Path | None = None,
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
@@ -1513,7 +1516,7 @@ def run_plan(
     ``panel.stamp(task)`` into every row before ``baselines.store``. Tilth arms are
     served from the binary built at ``candidate_sha``. ``store_only`` returns only
     stored rows and never starts a runner. Every row returned is also appended to
-    ``output``. Raises ``BaselineDrift`` before any cell when a stock-arm cell
+    ``output``. ``repo`` holds ``candidate_sha`` (default: this checkout). Raises ``BaselineDrift`` before any cell when a stock-arm cell
     drifted without ``refreeze_baselines``, and ``PlanStopped`` when the ledger or
     a usage limit stops it before a cell.
     """
@@ -1521,7 +1524,7 @@ def run_plan(
     cells = [CellSpec(*cell) for cell in cells]
     saved: dict[str, ModeConfig] = {}
     if candidate_sha is not None:
-        build = build_candidate(candidate_sha)
+        build = build_candidate(candidate_sha, repo=repo)
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)
@@ -1598,7 +1601,10 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${estimate:.4f} estimated for {cell_id} "
                                          f"+ ${ledger.reserve:.4f} reserved exceeds ${ledger.max_usd}", rows)
         runner = RUNNERS[cell.model]
-        stream_log_path = stream_dir / f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}.jsonl"
+        # A per-attempt suffix: a retried cell has the same key and must not overwrite its earlier sidecar.
+        attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
+                                        f"_{attempt}.jsonl")
         metadata = {
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
             **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
