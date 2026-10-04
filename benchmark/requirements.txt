@@ -5,3 +5,5 @@ scipy>=1.11
 numpy>=1.24
 # External-task fetch (benchmark/external/preflight.py) decodes dataset parquet.
 pyarrow>=14
+# Evolution loop (benchmark/evolve/engine.py): pinned; the engine tests run this exact release.
+gepa==0.1.4

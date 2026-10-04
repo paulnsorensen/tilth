@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import stats
 from flags import detect_flags
 from paired import (
+    is_contaminated_panel_row,
     pair_modes,
     paired_accuracy_delta,
     paired_cpc_delta as paired_cpc_delta_impl,
@@ -55,11 +56,6 @@ def format_cost_delta(baseline_costs: dict[str, float], tilth_costs: dict[str, f
         f"Δinput={'+' if deltas['input'] >= 0 else ''}${deltas['input']:.3f}",
     ]
     return f"{indent}{' '.join(parts)}"
-
-
-def is_contaminated_panel_row(result: dict) -> bool:
-    """A panel row whose agent saw benchmark or upstream grader material."""
-    return bool(result.get("panel_name")) and result.get("contaminated") is True
 
 
 def load_results(path: Path) -> list[dict]:

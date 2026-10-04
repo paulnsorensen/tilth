@@ -409,3 +409,22 @@ def test_per_task_tools_used_totals_and_native_cost_reconciliation():
     assert "native=$1.0000" in report
     assert "Δnative=" in report
     assert "native per-model: claude-haiku-4-5-20251001=$0.1000, claude-sonnet-5=$0.9000" in report
+
+def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) -> None:
+    import json
+
+    rows = [
+        {**_run(task="t1", mode="baseline", cost=1.0, correct=True), "panel_name": "p", "contaminated": False},
+        {**_run(task="t1", mode="tilth", cost=1.0, correct=True), "panel_name": "p", "contaminated": True},
+        {**_run(task="t2", mode="baseline", cost=1.0, correct=True), "contaminated": True},
+        {**_run(task="t2", mode="tilth", cost=1.0, correct=True), "panel_name": "p", "contaminated": False},
+    ]
+    path = tmp_path / "results.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    loaded = paired.load_runs(path)
+
+    assert [row["correct"] for row in loaded] == [True, False, True, True]
+    assert len(loaded) == 4
+    assert paired.paired_accuracy_delta(loaded, "tilth")[0] == pytest.approx(-0.5)
+    assert analyze.is_contaminated_panel_row is paired.is_contaminated_panel_row
