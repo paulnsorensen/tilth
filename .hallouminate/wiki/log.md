@@ -69,3 +69,5 @@
 2026-10-01 · 92ae5213050bd1fd · merged · upstream-library-reuse.md · Record the merge onto main and the zero-copy move of the owned read String into cold parsed documents.
 
 2026-10-02 · 5cd6b764a7b36652 · merged · local-gate-gotchas.md · Record that the default macOS TMPDIR breaks `!contains("l1")` assertions, that `/tmp` overrides still hit the symlink, and that a shared CARGO_TARGET_DIR across worktrees can skip new tests.
+
+2026-10-04 · 0f156690e9e51193 · merged · adr/tilth-write-teaching-errors.md · Align ADR-009 retry guidance with the emitted current-tag hint after PR #308 review. Frozen probes rank the target page first, second, and first.

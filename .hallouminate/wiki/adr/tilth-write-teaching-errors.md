@@ -167,7 +167,7 @@ Session 2026-08-02; spec at the durable corpus
 
 - **Context:** `rewrite` and `replace_text all` touch many matches that can sit far apart. The ADR-005 re-read caps at 60 lines, so agents re-read in steps or read the whole file. Sonnet 5.5 benchmark runs showed this on `render/render_test.go` (`count: 43`).
 - **Decision:**
-  1. `replace_text all` and `rewrite` name one batched read: `DO NOT re-read the file: tilth_read paths ["{path}#{lo}-{hi}", ...] shows every unseen match; retry with the same tag`.
+  1. `replace_text all` and `rewrite` name one batched read: `tilth_read paths {paths} shows every match range in the current file; use the tag returned by that read when retrying.`
   2. For `replace_text all`, each range is the first line of one unseen occurrence. One displayed line passes the overlap gate.
   3. For `rewrite`, each range is one full match span. The full-span gate needs every line of each match.
   4. Ranges within 3 lines merge. The closest neighbours then merge until at most 20 ranges remain, because `tilth_read` takes at most 20 paths. A test in `src/mcp/tools/definitions.rs` pins the two caps together.
