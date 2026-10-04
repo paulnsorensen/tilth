@@ -123,6 +123,26 @@ def test_run_plan_reuses_stored_cells(world, tmp_path: Path) -> None:
     assert all(row["panel_name"] == world.panel.name for row in rows)
 
 
+def test_reused_row_is_restamped_for_this_panel(world, tmp_path: Path) -> None:
+    plan(world, cells(*DEV))
+    restored = []
+    for row in world.stored():
+        if row["task"] == "dev_a":
+            row = {key: value for key, value in row.items() if not key.startswith("panel_")}
+        else:
+            row.update(panel_name="another-panel", panel_split="test", panel_split_digest="another-digest")
+        restored.append(json.dumps(row))
+    world.store_path.write_text("\n".join(restored) + "\n")
+    output = tmp_path / "out.jsonl"
+
+    rows = plan(world, cells(*DEV), output=output)
+
+    assert len(world.runner_calls()) == len(DEV)
+    assert [row["reused"] for row in rows] == [True, True]
+    for row in [*rows, *(json.loads(line) for line in output.read_text().splitlines())]:
+        assert {key: row[key] for key in world.panel.stamp(row["task"])} == world.panel.stamp(row["task"])
+
+
 def test_run_plan_refuses_drift_without_refreeze(world) -> None:
     plan(world, cells(*DEV))
     world.env = "env-fingerprint-b"

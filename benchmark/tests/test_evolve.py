@@ -687,6 +687,30 @@ def test_dominated_candidate_not_rerun(world) -> None:
     assert result not in evo.frontier
 
 
+def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    evo = ready(world)
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 0.5})
+    # One rollout scores (1, 1), which the member does not dominate; the re-run brings the means to (0.5, 0.5).
+    candidate = child(evo.seed, dev_a="10", dev_b="10", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
+        ("dev_a", 1), ("dev_a", 2), ("dev_b", 1), ("dev_b", 2)]
+    assert result.means == {} and not result.accepted
+    assert evo.frontier == [member]
+    assert "dominated after 2 rollouts" in log_text(world)
+
+
+def test_dev_delta_never_buys_baseline_cells(world) -> None:
+    evo = build(world)
+    assert evo.preflight() is None
+    evo.evaluate(child(evo.seed, dev_a="1", dev_b="1", cheap_a="1"), "dev_a")
+
+    assert evo.deltas and world.runner_calls("baseline") == []
+
+
 def test_single_rollout_never_finalist_on_tie(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     dev3 = ("dev_a", "dev_b", "dev_c")
     files = seed_files(mcp(dev_a="0", dev_b="0", dev_c="1", cheap_a="1", test_a="1"))
