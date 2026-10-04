@@ -42,7 +42,9 @@ _PREPARED_COMMIT_ENV = {
 }
 _ENV_STEP_TIMEOUT_S = 1800
 _CONTAINER_TOOLS = {"docker", "podman"}
-_SHELL_WORD_SEPARATORS = re.compile(r"[\s;&|()`'\"]+")
+_SHELL_SEGMENTS = re.compile(r"\n|;|&&|\|\||\||\(|\)|`|\$\(")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_COMMAND_PREFIXES = {"sudo", "exec", "command", "env", "nohup", "time"}
 _PYTHON_TIMEOUT_S = 1200
 _COMPILED_TIMEOUT_S = 1800
 
@@ -314,8 +316,7 @@ class ExternalTask(Task):
             steps = [["uv", "venv", *version, str(venv)]]
             steps += [_install_argv(step, venv) for step in self.install_steps()]
         for argv in steps:
-            words = [word for part in argv for word in _SHELL_WORD_SEPARATORS.split(part)]
-            if any(Path(word).name in _CONTAINER_TOOLS for word in words if word):
+            if _command_names(argv) & _CONTAINER_TOOLS:
                 raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
             try:
                 result = proc.run(argv, cwd=workdir, env=env, timeout=_ENV_STEP_TIMEOUT_S)
@@ -390,8 +391,41 @@ class ExternalTask(Task):
         return dict(self._details)
 
 
+def _command_names(argv: list[str]) -> set[str]:
+    """The programs ``argv`` starts: its first word, or each command of a ``bash -c`` script."""
+    segments = _SHELL_SEGMENTS.split(argv[2]) if argv[:2] == ["bash", "-c"] else [shlex.join(argv)]
+    names = set()
+    for segment in segments:
+        words = segment.split()
+        while words and (_ASSIGNMENT.match(words[0]) or words[0] in _COMMAND_PREFIXES):
+            words.pop(0)
+        if words:
+            names.add(Path(words[0].strip("'\"")).name)
+    return names
+
+
+def _needs_shell(step: str) -> bool:
+    """True when ``step`` uses an unquoted shell operator, an expansion, or several lines."""
+    if any(character in step for character in "$`\n"):
+        return True
+    lexer = shlex.shlex(step, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return any(set(token) <= set("();<>|&") for token in lexer)
+    except ValueError:
+        return True
+
+
 def _install_argv(step: str, venv: Path) -> list[str]:
-    """Run a row's install step against the workdir venv, with pip through uv."""
+    """Run a row's install step against the workdir venv, with pip through uv.
+
+    A line with shell operators runs as one script line under ``set -e``, as the
+    dataset's own setup script runs it: a command that fails inside an ``&&``
+    chain stops the chain without failing the build.
+    """
+    if _needs_shell(step):
+        script = "\n".join(["set -e", 'pip() { uv pip "$@"; }', 'pip3() { uv pip "$@"; }', step, ":"])
+        return ["bash", "-c", script]
     tokens = shlex.split(step)
     if tokens[:1] in (["pip"], ["pip3"]):
         return ["uv", "pip", *tokens[1:]]

@@ -339,3 +339,21 @@ def test_preflight_panel_form(external_bench, monkeypatch: pytest.MonkeyPatch, t
     cli.refused = {FB_LV1}
     assert external.preflight.main(["--panel", str(panel)]) != 0
     assert "featurebench" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stored", [{"instance_id": SWE_PY, "admitted": True}, ["admitted"],
+                                    {"instance_id": SWE_PY, "admitted": True, "reason": "admitted",
+                                     "dataset": "swebench_ml", "data_rev": "x", "env_fingerprint": "y",
+                                     "schema": 2}])
+def test_stale_schema_verdict_is_recomputed(external_bench, monkeypatch: pytest.MonkeyPatch, stored) -> None:
+    external_bench.seed(SWE_PY)
+    task = external.swebench_ml.load(SWE_PY, external.SWEBENCH_ML_REVISION)
+    fingerprint = external.preflight.env_fingerprint(task)
+    path = external.preflight.verdict_path(SWE_PY, external.SWEBENCH_ML_REVISION, fingerprint)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(stored))
+    monkeypatch.setattr(external.preflight, "round_trip", lambda task, fingerprint: verdict(SWE_PY, False))
+
+    result = external.preflight.admit(SWE_PY)
+
+    assert (result.admitted, result.reason) == (False, "gold_unresolved")

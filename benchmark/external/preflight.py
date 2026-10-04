@@ -71,10 +71,16 @@ def _read_verdict(path: Path) -> PreflightVerdict | None:
         stored = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(stored, dict):
+        return None
     for name in ("gold", "empty", "tampered"):
         if stored.get(name) is not None:
             stored[name] = tuple(stored[name])
-    return PreflightVerdict(**stored)
+    try:
+        return PreflightVerdict(**stored)
+    except TypeError:
+        # Written by another verdict schema: recompute rather than trust it.
+        return None
 
 
 def _probe(argv: tuple[str, ...]) -> str | None:

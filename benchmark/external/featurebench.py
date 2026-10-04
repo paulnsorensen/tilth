@@ -108,12 +108,13 @@ class FeatureBenchTask(ExternalTask):
             raise PrepareError("test_patch does not apply after the mask")
 
     def install_steps(self) -> list[str]:
-        steps = [str(step) for step in self.settings.get("pre_install") or []]
-        steps += [step.strip() for step in str(self.settings.get("install") or "").split("&&") if step.strip()]
-        packages = [str(package) for package in self.settings.get("pip_packages") or []]
-        if packages:
-            steps.append(shlex.join(["pip", "install", *packages]))
-        return steps
+        # FeatureBench's own setup script order: pytest-timeout and each pip package,
+        # then pre_install, then the project install line (featurebench/docker/image_manager.py).
+        packages = ["pytest-timeout", *(str(package) for package in self.settings.get("pip_packages") or [])]
+        steps = [shlex.join(["pip", "install", package]) for package in packages]
+        steps += [str(step) for step in self.settings.get("pre_install") or []]
+        install = str(self.settings.get("install") or "").strip()
+        return [*steps, install] if install else steps
 
     def restore_heldout(self, checkout: Path) -> None:
         for relative in (*self.fail_to_pass, *self.pass_to_pass):
@@ -130,6 +131,8 @@ class FeatureBenchTask(ExternalTask):
     def test_output(self, checkout: Path, workdir: Path) -> str:
         argv = [str(workdir / ".venv" / "bin" / "python"), "-m", "pytest", *self._pytest_options(),
                 "--continue-on-collection-errors", "-p", "no:cacheprovider",
+                # pytest-pretty replaces the -rA summary these results are parsed from.
+                "-p", "no:pretty",
                 *self.fail_to_pass, *self.pass_to_pass]
         result = proc.run(argv, cwd=checkout, env=self.venv_env(workdir), timeout=self.timeout_s)
         return result.stdout + result.stderr

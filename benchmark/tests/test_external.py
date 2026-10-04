@@ -1,5 +1,7 @@
 """External task loading, prepared workspaces, native grading, and dataset fetch (bench-external-tasks)."""
 
+import json
+import os
 import subprocess
 import sys
 import urllib.request
@@ -17,6 +19,7 @@ import external.patches
 import external.preflight
 import external.proc
 import external.swebench_ml
+import external.task
 from external_support import (
     FB_F2P_EDIT, FB_LV1, OUTPUTS, SWE_GO, SWE_PY, SWE_RS, git, parquet_bytes, projects, rows,
 )
@@ -439,3 +442,95 @@ def test_patch_helpers_split_reverse_and_tamper() -> None:
     assert "+    return left // right\n" not in tampered
     single = external.patches.tampered(external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1])
     assert not [line for line in single.splitlines() if line.startswith("+") and not line.startswith("+++")]
+
+
+def _featurebench_variant(bench, instance_id: str, **settings) -> external.ExternalTask:
+    row = bench.row(FB_LV1)
+    merged = {**json.loads(row["repo_settings"]), **settings}
+    bench.seed_row({**row, "instance_id": instance_id, "repo_settings": json.dumps(merged)})
+    return external.featurebench.load(instance_id, external.FEATUREBENCH_REVISION)
+
+
+def test_featurebench_env_follows_dataset_setup_order(external_bench, tmp_path: Path) -> None:
+    task = _featurebench_variant(
+        external_bench, "fixture__shapes.0a1b2c3d.test_area.0rder000.lv1",
+        pip_packages=["pytest", "rich>=13"], pre_install=["python -c pass"],
+        install="python -c pass && false && touch never-installed",
+    )
+    workdir = tmp_path / "workdir"
+
+    task.prepare(workdir)
+
+    steps = [argv for argv in external_bench.commands
+             if argv[:2] in (["uv", "pip"], ["bash", "-c"]) or argv[0].endswith("/.venv/bin/python")]
+    assert steps[:3] == [["uv", "pip", "install", "pytest-timeout"], ["uv", "pip", "install", "pytest"],
+                         ["uv", "pip", "install", "rich>=13"]]
+    assert steps[3] == [str(workdir / ".venv" / "bin" / "python"), "-c", "pass"]
+    assert steps[4][:2] == ["bash", "-c"] and "python -c pass && false" in steps[4][2]
+    assert not (workdir / "never-installed").exists()
+
+
+def test_failing_install_command_fails_the_env_build(external_bench, tmp_path: Path) -> None:
+    task = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.fa11ed00.lv1",
+                                 install="python -c 'raise SystemExit(3)'")
+
+    with pytest.raises(external.task.EnvBuildError):
+        task.prepare(tmp_path / "workdir")
+
+
+def test_grader_disables_summary_replacing_reporter(external_bench, tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    task, workdir = prepared(external_bench, FB_LV1, tmp_path)
+    apply_patch(workdir, task.gold_patch)
+    grading: list[list[str]] = []
+    recording = external.proc.run
+
+    def record(argv, **kwargs):
+        if "pytest" in argv:
+            grading.append(list(argv))
+        return recording(argv, **kwargs)
+
+    monkeypatch.setattr(external.proc, "run", record)
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct, reason
+    [argv] = grading
+    # pytest-pretty registers as "pretty" and replaces the -rA summary the grader parses.
+    assert argv[argv.index("no:pretty") - 1] == "-p"
+
+
+def test_container_named_packages_are_not_container_steps(external_bench, tmp_path: Path) -> None:
+    task = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.d0c4e5d4.lv1",
+                                 pip_packages=["docker", "podman-compose"],
+                                 install="python -c pass && GOFLAGS=x sudo docker info")
+
+    with pytest.raises(external.task.EnvBuildError, match="container steps"):
+        task.prepare(tmp_path / "workdir")
+    assert ["uv", "pip", "install", "docker"] in external_bench.commands
+    assert ["uv", "pip", "install", "podman-compose"] in external_bench.commands
+
+
+def test_interrupted_fetch_leaves_no_truncated_row(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(external.featurebench, "PARETO12_IDS", ())
+    replaced: list[str] = []
+    real_replace = os.replace
+
+    def crash_on_second(source, target):
+        replaced.append(str(target))
+        if len(replaced) == 2:
+            raise KeyboardInterrupt
+        real_replace(source, target)
+
+    def client(url: str) -> bytes:
+        return parquet_bytes(list(rows("featurebench").values()))
+
+    monkeypatch.setattr(os, "replace", crash_on_second)
+    with pytest.raises(KeyboardInterrupt):
+        external.download.fetch("featurebench", client=client)
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    for path in (external_bench.data / "rows").rglob("*.json"):
+        json.loads(path.read_text())
+    assert len(list((external_bench.data / "rows").rglob("*.json"))) == 1
+    external.download.fetch("featurebench", client=client)
+    assert all(external.cached_row(instance_id) == row for instance_id, row in rows("featurebench").items())
