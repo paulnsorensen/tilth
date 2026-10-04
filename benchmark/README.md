@@ -76,6 +76,27 @@ A paid run that would re-run a stock-arm cell (an arm with no MCP server or plug
 Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives them, and empty `ANTHROPIC_*` values are dropped.
 A usage-limit rejection (a terminal result with usage-limit text or a rate-limit subtype) records the cell as `infra: quota` and stops the run with exit status 1, as does the spend ceiling.
 
+## External tasks: FeatureBench and SWE-bench Multilingual
+
+`benchmark/external/` runs FeatureBench Lite Level 1 (HF `LiberCoders/FeatureBench`, tag `v1.1`) and SWE-bench Multilingual (HF `SWE-bench/SWE-bench_Multilingual`, revision `846e647b9f33c0b51b739d005d13d85493c9af09`) instances natively, with no Docker.
+Dataset rows, bare upstream mirrors, gold patches, held-out tests, and admission verdicts live only in `$TILTH_BENCH_DATA` (default `~/.local/share/tilth-bench/external`), outside this checkout and every agent workdir.
+
+```bash
+pip install pyarrow   # the preflight fetch decodes the dataset parquet
+# Fetch uncached rows, then admit the FeatureBench candidates and the Go and Rust picks
+python3 benchmark/external/preflight.py
+# Admit exactly a panel's FeatureBench and SWE-bench Multilingual members
+python3 benchmark/external/preflight.py --panel path/to/panel.json
+```
+
+Admission prepares each instance on this host and grades its gold, empty, and tampered patches; only an instance whose gold resolves and whose empty and tampered patches do not is admitted.
+Verdicts are cached by instance ID, data revision, and environment fingerprint; delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
+`run.py --tasks <instance_id>` runs an admitted instance: its workdir is the `base_commit` tree (FeatureBench: with the mask applied and the FAIL_TO_PASS tests deleted) as the single commit of a fresh repository, with a `uv` venv for Python or the host Go or Rust toolchain.
+Grading copies the agent's changes onto a clean prepared tree, restores the held-out tests, and runs FAIL_TO_PASS and PASS_TO_PASS natively; rows add `pass_rate`, `f2p_passed`, `f2p_total`, `p2p_passed`, and `p2p_total`.
+`--tasks all` stays the local registry.
+
+Every row records `contaminated` and `contamination_hits`: a tool input that reads the `benchmark/` tree or the harness data directory, fetches the task's upstream repository or package, or, in an external cell, reads a clone under `/tmp/tilth_bench/repos/` is a hit. A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
+
 ## Larger Luna edit task
 
 `gin_edit_render_context` migrates Gin's renderer API to accept request context.

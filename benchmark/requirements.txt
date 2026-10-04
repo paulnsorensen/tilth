@@ -3,3 +3,5 @@
 # results. Manual install: pip install -r benchmark/requirements.txt
 scipy>=1.11
 numpy>=1.24
+# External-task fetch (benchmark/external/preflight.py) decodes dataset parquet.
+pyarrow>=14

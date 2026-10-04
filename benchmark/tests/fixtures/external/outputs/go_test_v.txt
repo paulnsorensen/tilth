@@ -1,0 +1,17 @@
+=== RUN   TestAdd
+--- PASS: TestAdd (0.00s)
+=== RUN   TestMul
+    calc_test.go:12: mul
+--- FAIL: TestMul (0.00s)
+=== RUN   TestSub
+=== RUN   TestSub/neg
+=== RUN   TestSub/pos
+    --- PASS: TestSub/neg (0.00s)
+    --- FAIL: TestSub/pos (0.00s)
+--- FAIL: TestSub (0.00s)
+=== RUN   TestSkip
+    calc_test.go:30: skipped
+--- SKIP: TestSkip (0.00s)
+FAIL
+FAIL	example.com/calcgo	0.002s
+FAIL

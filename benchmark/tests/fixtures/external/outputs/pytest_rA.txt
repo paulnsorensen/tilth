@@ -1,0 +1,29 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-8.3.5, pluggy-1.5.0
+rootdir: /testbed
+collected 6 items / 1 error
+
+tests/test_a.py ..                                                       [ 33%]
+tests/test_ab.py F                                                       [ 50%]
+tests/test_b.py .F                                                       [ 83%]
+tests/test_skip.py s                                                     [100%]
+
+==================================== ERRORS ====================================
+_______________________ ERROR collecting tests/test_c.py _______________________
+ImportError while importing test module '/testbed/tests/test_c.py'.
+E   ImportError: cannot import name 'circle_area' from 'shapes.area'
+=================================== FAILURES ===================================
+_________________________________ test_z ________________________________________
+    def test_z():
+>       assert False
+E       assert False
+=========================== short test summary info ============================
+PASSED tests/test_a.py::test_x
+PASSED tests/test_a.py::test_y[a b]
+PASSED tests/test_b.py::test_one
+SKIPPED [1] tests/test_skip.py:4: not on this platform
+FAILED tests/test_ab.py::test_z - assert False
+FAILED tests/test_b.py::test_two - assert 1 == 2
+ERROR tests/test_c.py - ImportError: cannot import name 'circle_area' from 'shapes.area'
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=================== 2 failed, 3 passed, 1 skipped, 1 error in 0.12s ===================

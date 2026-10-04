@@ -33,6 +33,9 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import baselines
+import external
+import external.contamination
+import external.preflight
 from spend import SpendLedger
 from claude_bash_guard import allowed_command
 from config import (
@@ -415,6 +418,15 @@ def _agent_repo(repo_path: Path, hide_git: bool):
         yield workspace
 
 
+@contextmanager
+def _prepared_repo(task: object):
+    """Yield a fresh workdir that the task's ``prepare`` hook builds."""
+    with tempfile.TemporaryDirectory(prefix="tilth-benchmark-") as temp_dir:
+        workspace = Path(temp_dir) / "repo"
+        task.prepare(workspace)
+        yield workspace
+
+
 class McpUnavailableError(RuntimeError):
     """A mode expected an MCP server that the session did not expose."""
 
@@ -567,17 +579,39 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def env_fingerprint(repo_name: str) -> str:
-    """Fingerprint the task repo language's toolchains and its dependency lockfiles."""
-    repo_path = get_repo_path(repo_name)
-    language = _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
-    lockfiles = {
-        name: _file_sha256(repo_path / name)
-        for name in _LOCKFILES if (repo_path / name).is_file()
-    } or {
-        name: _file_sha256(repo_path / name)
-        for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
-    }
+def _is_prepared(task: object) -> bool:
+    """A task with a ``prepare`` hook builds its own workdir instead of copying a REPOS fixture."""
+    return callable(getattr(task, "prepare", None))
+
+
+def _task_timeout(task: object) -> int:
+    return getattr(task, "timeout_s", CELL_TIMEOUT_S)
+
+
+def env_fingerprint(task_or_repo: object) -> str:
+    """Fingerprint the task language's toolchains and its dependency lockfiles.
+
+    A task exposing ``language`` supplies the language; a prepared task supplies
+    the lockfiles of its base tree, so neither indexes ``REPOS``. A bare repo
+    name resolves both through ``REPOS``.
+    """
+    task = None if isinstance(task_or_repo, str) else task_or_repo
+    repo_name = task_or_repo if task is None else task.repo
+    language = getattr(task, "language", None) or (
+        _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
+    )
+    if _is_prepared(task):
+        base_file_hashes = getattr(task, "base_file_hashes", lambda _names: {})
+        lockfiles = base_file_hashes(_LOCKFILES) or base_file_hashes(_UNLOCKED_DEPENDENCY_FILES)
+    else:
+        repo_path = get_repo_path(repo_name)
+        lockfiles = {
+            name: _file_sha256(repo_path / name)
+            for name in _LOCKFILES if (repo_path / name).is_file()
+        } or {
+            name: _file_sha256(repo_path / name)
+            for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
+        }
     return baselines.env_fingerprint(
         toolchains={name: _probe_version(_TOOLCHAIN_PROBES[name])
                     for name in _LANGUAGE_TOOLCHAINS.get(language, ())},
@@ -672,6 +706,7 @@ def _task_source_files(task: object) -> dict[str, str]:
 def _cell_task_digest(task: object) -> str:
     ground_truth = getattr(task, "ground_truth", None)
     mutations = getattr(task, "mutations", ()) or ()
+    identity_inputs = getattr(task, "identity_inputs", None)
     return baselines.task_digest(
         prompt=task.prompt,
         ground_truth=asdict(ground_truth) if is_dataclass(ground_truth) else ground_truth,
@@ -681,6 +716,7 @@ def _cell_task_digest(task: object) -> str:
         mutations=[asdict(mutation) if is_dataclass(mutation) else mutation for mutation in mutations],
         hide_git=bool(getattr(task, "hide_git", False)),
         task_sources=_task_source_files(task),
+        identity_inputs=identity_inputs() if callable(identity_inputs) else None,
     )
 
 
@@ -755,9 +791,9 @@ def cell_identity(
             bash_guard_sha256=_file_sha256(_BASH_GUARD) if strict_file_tools else None,
         ),
         "task_digest": _cell_task_digest(task),
-        "env_fingerprint": env_fingerprint(task.repo),
+        "env_fingerprint": env_fingerprint(task),
         "cli_version": cli_version(runner),
-        "timeout_s": CELL_TIMEOUT_S,
+        "timeout_s": _task_timeout(task),
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
     }
     key_inputs = {
@@ -775,6 +811,12 @@ def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     sidecar = stream_log_path.with_name(f"{stream_log_path.stem}.trajectory.jsonl")
     sidecar.write_text("".join(json.dumps(call) + "\n" for call in calls))
     return str(sidecar)
+
+
+def contamination_fields(trajectory_path: str | None, task: object) -> dict:
+    """The ``contaminated`` flag and its hits for a row's trajectory sidecar."""
+    hits = external.contamination.find_hits(trajectory_path, task)
+    return {"contaminated": bool(hits), "contamination_hits": hits}
 
 
 class QuotaExhaustedError(RuntimeError):
@@ -795,12 +837,13 @@ def run_single(
 ) -> dict:
     """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
-    with _agent_repo(
-        get_repo_path(task.repo),
-        getattr(task, "hide_git", False),
-    ) as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
+    workspace = (
+        _prepared_repo(task) if _is_prepared(task)
+        else _agent_repo(get_repo_path(task.repo), getattr(task, "hide_git", False))
+    )
+    with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
         mutations = getattr(task, "mutations", ())
-        if mutations:
+        if mutations and not _is_prepared(task):
             task.apply_mutations(str(repo_path))
         return _run_single_in_repo(
             task_name,
@@ -972,6 +1015,7 @@ def _run_single_in_repo(
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
+    timeout_s = _task_timeout(task)
     skill_paths: list[str] = []
     skill_roots: list[str] = []
     identity = cell_identity(
@@ -1033,7 +1077,7 @@ def _run_single_in_repo(
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
-        timer = threading.Timer(CELL_TIMEOUT_S, _kill_on_timeout)
+        timer = threading.Timer(timeout_s, _kill_on_timeout)
         timer.start()
         try:
             with open(stream_log_path, "w") as logf:
@@ -1052,7 +1096,7 @@ def _run_single_in_repo(
         if runner == "codex":
             stream_log_path.with_suffix(".stderr").write_text(stderr_text)
         if timed_out:
-            raise subprocess.TimeoutExpired(cmd, CELL_TIMEOUT_S)
+            raise subprocess.TimeoutExpired(cmd, timeout_s)
 
         result = subprocess.CompletedProcess(
             args=cmd,
@@ -1067,7 +1111,7 @@ def _run_single_in_repo(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=CELL_TIMEOUT_S,
+            timeout=timeout_s,
             env=env,
         )
     elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1142,6 +1186,8 @@ def _run_single_in_repo(
     )
     run_result.correct = correct
     run_result.correctness_reason = reason
+    grade_details = getattr(task, "grade_details", None)
+    details = grade_details() if callable(grade_details) else {}
 
     # Build tool call breakdown
     tool_breakdown = tool_call_counts(run_result)
@@ -1210,6 +1256,8 @@ def _run_single_in_repo(
         "op_kinds": tool_op_kinds(run_result),
         "cost_source": run_result.cost_source,
         "trajectory_path": trajectory_path,
+        **contamination_fields(trajectory_path, task),
+        **details,
         "reused": False,
         **identity,
     }
@@ -1249,6 +1297,25 @@ def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
             f"Valid options: {', '.join(valid_options.keys())}"
         )
     return items
+
+def select_tasks(value: str) -> list[str]:
+    """Resolve ``--tasks``: ``all`` is the local registry; another name may be an admitted external instance.
+
+    A name outside ``TASKS`` is resolved through ``external.resolve_task`` and
+    registered in ``TASKS`` so planning, identity, and the runners find it.
+    """
+    if value.lower() == "all":
+        return [name for name, task in TASKS.items() if not isinstance(task, external.ExternalTask)]
+    for name in (item.strip() for item in value.split(",")):
+        if not name or name in TASKS:
+            continue
+        resolved = external.resolve_task(name)
+        if resolved is not None:
+            TASKS[name] = resolved
+        elif external.cached_row(name) is not None:
+            raise ValueError(f"external task {name} is not admitted: {external.preflight.admit(name).reason}")
+    return parse_comma_list(value, TASKS, "tasks")
+
 
 def planned_cell_count(
     *,
@@ -1457,7 +1524,7 @@ Examples:
             if any(RUNNERS[model] != "claude" for model in models):
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
-        tasks_list = parse_comma_list(args.tasks, TASKS, "tasks")
+        tasks_list = select_tasks(args.tasks)
         if args.experiment:
             experiment = load_experiment(args.experiment)
             configured_modes = experiment_modes(
@@ -1530,9 +1597,20 @@ Examples:
     except ValueError as error:
         parser.error(str(error))
 
+    # Guard external cells before any model call: each must be admitted on this host.
+    for task_name in tasks_list:
+        if isinstance(TASKS[task_name], external.ExternalTask):
+            verdict = external.preflight.admit(task_name)
+            if not verdict.admitted:
+                print(f"ERROR: external task {task_name} is not admitted: {verdict.reason}", file=sys.stderr)
+                sys.exit(1)
+
+    # Prepared tasks build their own workdirs; only the rest copy REPOS fixtures.
+    fixture_tasks = [name for name in tasks_list if not _is_prepared(TASKS[name])]
+
     # Validate and restore the synthetic source once. Every cell runs from a
     # disposable copy, so the scheduler never mutates this source again.
-    if "synthetic" in {TASKS[name].repo for name in tasks_list}:
+    if "synthetic" in {TASKS[name].repo for name in fixture_tasks}:
         if not SYNTHETIC_REPO.exists():
             parser.error(
                 f"Synthetic repo not found at {SYNTHETIC_REPO}; "
@@ -1541,7 +1619,7 @@ Examples:
         reset_repo()
 
     # Validate real-world repos exist (for selected tasks)
-    selected_repos = set(TASKS[t].repo for t in tasks_list) - {"synthetic"}
+    selected_repos = set(TASKS[t].repo for t in fixture_tasks) - {"synthetic"}
     for repo_name in selected_repos:
         repo_path = REPOS[repo_name].path
         if not repo_path.exists():
@@ -1663,6 +1741,8 @@ Examples:
         def settle(row: dict, amount: float) -> None:
             """Charge, store, and record one paid cell; called exactly once per cell."""
             nonlocal run_max_cost
+            if not isinstance(row.get("contaminated"), bool):
+                row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
             row["charged_usd"] = amount
             ledger.charge(amount, source=row.get("cost_source") or "native")
             run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
@@ -1706,8 +1786,12 @@ Examples:
                 # Written like a fresh row: this run's schedule and variant metadata,
                 # the stored outcome. The run key already pins what the variant runs.
                 reported_version = _reported_tilth_version(MODES[mode_name])
+                scanned = (
+                    {} if isinstance(stored.get("contaminated"), bool)
+                    else contamination_fields(stored.get("trajectory_path"), task)
+                )
                 record({
-                    **stored, **experiment_metadata, "tilth_version": reported_version,
+                    **stored, **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "reused": True,
                 })
@@ -1804,7 +1888,7 @@ Examples:
                 sys.exit(1)
 
             except subprocess.TimeoutExpired:
-                print(f"  ✗ TIMEOUT (>{CELL_TIMEOUT_S}s)")
+                print(f"  ✗ TIMEOUT (>{_task_timeout(task)}s)")
                 record_failure({
                     **record_metadata,
                     "error": "timeout",

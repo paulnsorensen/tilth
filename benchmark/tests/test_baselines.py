@@ -132,7 +132,9 @@ def test_completed_row_reused_error_row_rerun(bench) -> None:
     rows = {row["task"]: row for row in bench.output_rows()}
     schedule = {"experiment_manifest": None, "arm_order_seed": None, "arm_order": ["plain"], "arm_order_index": 0}
     variant = {"tilth_version": None, "variant": run._variant_metadata(run.MODES["plain"])}
-    assert rows["cell_a"] == {**completed, **schedule, **variant, "reused": True}
+    # A stored row without the field is scanned before it is written; it has no sidecar to scan.
+    unscanned = {"contaminated": True, "contamination_hits": [{"reason": "unscanned", "tool": None, "input": None}]}
+    assert rows["cell_a"] == {**completed, **unscanned, **schedule, **variant, "reused": True}
     assert rows["cell_b"]["reused"] is False and "error" not in rows["cell_b"]
     assert rows["cell_c"]["reused"] is False and "infra" not in rows["cell_c"]
     assert rows["cell_b"]["run_key"] == bench.identity("cell_b", "plain", 0)["run_key"]
