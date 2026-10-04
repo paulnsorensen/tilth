@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -31,8 +32,10 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import baselines
+from spend import SpendLedger
 from claude_bash_guard import allowed_command
 from config import (
+    BENCHMARK_DIR,
     DEFAULT_MAX_BUDGET_USD,
     DEFAULT_REPS,
     FIXTURES_DIR,
@@ -565,12 +568,17 @@ def _mcp_shape(mode: ModeConfig, runner: str, mode_name: str) -> dict:
 
 
 def _task_fixture_files(task: object) -> dict[str, str]:
-    """Hash the fixture files a task grades or runs against."""
+    """Hash the fixture files a task grades or runs against.
+
+    A task module's fixtures sit beside it as `<stem>_fixtures` or, for a
+    `*_tasks` module, `<name>_fixtures` (as `gin_render_context_fixtures` does).
+    """
     roots = []
     module_file = inspect.getsourcefile(type(task))
     if module_file:
         module_path = Path(module_file)
-        roots.append(module_path.with_name(f"{module_path.stem}_fixtures"))
+        stems = {module_path.stem, module_path.stem.removesuffix("_tasks")}
+        roots.extend(module_path.with_name(f"{stem}_fixtures") for stem in sorted(stems))
     if getattr(task, "repo", None) == "synthetic":
         roots.append(FIXTURES_DIR / "template")
     return {
@@ -579,6 +587,35 @@ def _task_fixture_files(task: object) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file() and "__pycache__" not in path.parts
     }
+
+
+_LIBRARY_PATHS = tuple(
+    Path(path).resolve() for key in ("stdlib", "platstdlib", "purelib", "platlib")
+    if (path := sysconfig.get_paths().get(key))
+)
+
+
+def _task_source_files(task: object) -> dict[str, str]:
+    """Hash the source files that define the task class and its bases.
+
+    These hold the grader (`check_correctness`, `required_matches`, module
+    helpers), so a grading edit changes the task digest. Keys are relative to the
+    benchmark directory, or a bare file name outside it, so they match across hosts.
+    """
+    sources = {}
+    for cls in type(task).__mro__:
+        try:
+            source_file = inspect.getsourcefile(cls)
+        except TypeError:
+            continue
+        if not source_file:
+            continue
+        path = Path(source_file).resolve()
+        if any(path.is_relative_to(library) for library in _LIBRARY_PATHS):
+            continue
+        key = str(path.relative_to(BENCHMARK_DIR)) if path.is_relative_to(BENCHMARK_DIR) else path.name
+        sources[key] = _file_sha256(path)
+    return sources
 
 
 def _cell_task_digest(task: object) -> str:
@@ -592,6 +629,7 @@ def _cell_task_digest(task: object) -> str:
         repo_commit=REPOS[task.repo].commit_sha if task.repo in REPOS else None,
         mutations=[asdict(mutation) if is_dataclass(mutation) else mutation for mutation in mutations],
         hide_git=bool(getattr(task, "hide_git", False)),
+        task_sources=_task_source_files(task),
     )
 
 
@@ -1492,7 +1530,7 @@ Examples:
     print("=" * 70)
     print()
 
-    spent = 0.0
+    ledger = SpendLedger(max_usd=args.max_usd)
     run_max_cost: float | None = None
     stop_reason: str | None = None
     fallback_estimate = args.cell_estimate_usd or args.max_budget_usd
@@ -1505,7 +1543,7 @@ Examples:
 
         def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
             """Store a failed cell, charging its native cost or else its pre-run estimate."""
-            nonlocal spent, run_max_cost
+            nonlocal run_max_cost
             native = stream_native_cost(_read_stream(stream_log_path))
             amount = native if native is not None else estimate
             failed = {
@@ -1514,7 +1552,7 @@ Examples:
                 "cost_source": "native" if native is not None else "estimate",
                 "trajectory_path": write_trajectory(stream_log_path, runner),
             }
-            spent += amount
+            ledger.charge(amount, source=failed["cost_source"])
             run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
             baselines.store(failed, path=store_path)
             history.append(failed)
@@ -1547,9 +1585,9 @@ Examples:
                 history, task=task_name, mode=mode_name, model=MODELS[model_name],
                 run_max_cost=run_max_cost, fallback=fallback_estimate,
             )
-            if spent + estimate > args.max_usd:
+            if ledger.would_cross(estimate):
                 stop_reason = (
-                    f"spend ceiling: ${spent:.4f} spent + ${estimate:.4f} estimated for "
+                    f"spend ceiling: ${ledger.spent:.4f} spent + ${estimate:.4f} estimated for "
                     f"{run_id} exceeds --max-usd {args.max_usd}"
                 )
                 break
@@ -1598,7 +1636,7 @@ Examples:
                 result.update(cell.identity)
                 result["reused"] = False
                 result.setdefault("trajectory_path", None)
-                spent += result["total_cost_usd"]
+                ledger.charge(result["total_cost_usd"], source=result.get("cost_source") or "native")
                 run_max_cost = (
                     result["total_cost_usd"] if run_max_cost is None
                     else max(run_max_cost, result["total_cost_usd"])
@@ -1696,7 +1734,7 @@ Examples:
     if stop_reason:
         print(f"Stop reason: {stop_reason}")
         print("Re-run the same command to resume; completed cells are reused from the store.")
-    print(f"Spend: ${spent:.4f}" + (f" of ${args.max_usd:.2f}" if args.max_usd is not None else ""))
+    print(f"Spend: ${ledger.spent:.4f}" + (f" of ${args.max_usd:.2f}" if args.max_usd is not None else ""))
     print(f"Results saved to: {output_file}")
     print("=" * 70)
     print()

@@ -56,12 +56,19 @@ def task_digest(
     repo_commit: str | None,
     mutations: list[object] = (),
     hide_git: bool = False,
+    task_sources: Mapping[str, str] | None = None,
 ) -> str:
-    """Hash what the task asks, how it is graded, and the code it runs against."""
+    """Hash what the task asks, how it is graded, and the code it runs against.
+
+    ``task_sources`` maps each source file defining the task class or its bases to
+    its hash, so an edit to grading code such as a ``check_correctness`` override
+    yields a new digest.
+    """
     return _digest({
         "prompt": prompt, "ground_truth": ground_truth, "test_command": test_command,
         "fixture_files": fixture_files, "repo_commit": repo_commit,
         "mutations": list(mutations), "hide_git": hide_git,
+        "task_sources": dict(task_sources or {}),
     })
 
 

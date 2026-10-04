@@ -1,6 +1,8 @@
 """Result-store reuse, run-key identity, and baseline drift (spec bench-result-substrate)."""
 
+import importlib.util
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import run
+from tasks import TASKS
 
 _HARNESS = {
     "system_prompt": "You are a code assistant.",
@@ -52,6 +56,7 @@ _CHANGED_INPUTS = [
         "test_command": ["go", "test", "./render"],
         "fixture_files": {"render_test.go": "f" * 64},
         "repo_commit": "0a88cccd",
+        "task_sources": {"tasks/gin_render_context_tasks.py": "e" * 64},
     }.items()),
     *(("env", key, value) for key, value in {
         "toolchains": {"go": "go1.27", "rustc": "rustc 1.99"},
@@ -211,3 +216,55 @@ def test_drift_check_ignores_other_repetitions_and_arms(bench) -> None:
 
     assert code == 0
     assert bench.calls == [("cell_a", "baseline", 0)]
+
+
+_DEMO_TASK = '''
+class DemoTask:
+    repo = "not-a-repo"
+    prompt = "Name the dispatcher."
+    ground_truth = {"required_strings": ["handler_3"]}
+    test_command = ["go", "test", "./..."]
+
+    def check_correctness(self, result_text, repo_path):
+        return "{answer}" in result_text, "graded"
+'''
+
+
+def _demo_task_digest(tmp_path: Path, *, answer: str = "handler_3") -> str:
+    module_path = tmp_path / "demo_tasks.py"
+    module_path.write_text(textwrap.dedent(_DEMO_TASK).replace("{answer}", answer))
+    name = f"demo_tasks_{abs(hash((str(tmp_path), answer, module_path.read_text())))}"
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return run._cell_task_digest(module.DemoTask())
+
+
+def test_task_digest_tracks_grading_code(tmp_path: Path) -> None:
+    """A check_correctness edit must invalidate stored rows graded by the old code."""
+    assert _demo_task_digest(tmp_path) != _demo_task_digest(tmp_path, answer="handler_4")
+
+
+def test_task_digest_tracks_held_out_fixtures(tmp_path: Path) -> None:
+    """Fixtures may sit in `<stem>_fixtures` or, for `*_tasks` modules, `<name>_fixtures`."""
+    held_out = tmp_path / "demo_fixtures" / "held_out_test.go"
+    held_out.parent.mkdir()
+    held_out.write_text("package demo\n")
+    before = _demo_task_digest(tmp_path)
+    held_out.write_text("package demo\n\nfunc TestHeldOut() {}\n")
+
+    assert _demo_task_digest(tmp_path) != before
+
+
+def test_gin_render_context_digest_covers_held_out_tests() -> None:
+    fixtures = run._task_fixture_files(TASKS["gin_edit_render_context"])
+
+    assert any(path.startswith("gin_render_context_fixtures/") for path in fixtures)
+
+
+def test_task_sources_cover_task_class_and_bases() -> None:
+    sources = run._task_source_files(TASKS["gin_edit_render_context"])
+
+    assert {"tasks/gin_render_context_tasks.py", "tasks/base.py"} <= set(sources)
+    assert all(not Path(path).is_absolute() for path in sources)
