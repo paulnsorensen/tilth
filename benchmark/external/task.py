@@ -396,11 +396,14 @@ def _command_names(argv: list[str]) -> set[str]:
     segments = _SHELL_SEGMENTS.split(argv[2]) if argv[:2] == ["bash", "-c"] else [shlex.join(argv)]
     names = set()
     for segment in segments:
-        words = segment.split()
-        while words and (_ASSIGNMENT.match(words[0]) or words[0] in _COMMAND_PREFIXES):
+        words = [word.strip("'\"") for word in segment.split()]
+        while words and _ASSIGNMENT.match(words[0]):
             words.pop(0)
-        if words:
-            names.add(Path(words[0].strip("'\"")).name)
+        if words and words[0] in _COMMAND_PREFIXES:
+            # A prefix (env, sudo, ...) runs one of its arguments, after options that may take values.
+            names.update(Path(word).name for word in words)
+        elif words:
+            names.add(Path(words[0]).name)
     return names
 
 

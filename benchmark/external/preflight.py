@@ -19,6 +19,7 @@ if __name__ == "__main__" and not __package__:
 import argparse
 import hashlib
 import json
+import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -86,7 +87,7 @@ def _read_verdict(path: Path) -> PreflightVerdict | None:
 def _probe(argv: tuple[str, ...]) -> str | None:
     try:
         result = proc.run(argv, timeout=30)
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     lines = (result.stdout or result.stderr).strip().splitlines()
     return lines[0] if result.returncode == 0 and lines else None

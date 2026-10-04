@@ -357,3 +357,18 @@ def test_stale_schema_verdict_is_recomputed(external_bench, monkeypatch: pytest.
     result = external.preflight.admit(SWE_PY)
 
     assert (result.admitted, result.reason) == (False, "gold_unresolved")
+
+
+def test_hung_toolchain_probe_does_not_crash_admit(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_PY)
+    recording = external.proc.run
+
+    def hung_uv(argv, **kwargs):
+        if list(argv) == ["uv", "--version"]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return recording(argv, **kwargs)
+
+    monkeypatch.setattr(external.proc, "run", hung_uv)
+    monkeypatch.setattr(external.preflight, "round_trip", lambda task, fingerprint: verdict(SWE_PY, True))
+
+    assert external.preflight.admit(SWE_PY).admitted is True

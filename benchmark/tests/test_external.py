@@ -534,3 +534,12 @@ def test_interrupted_fetch_leaves_no_truncated_row(external_bench, monkeypatch: 
     assert len(list((external_bench.data / "rows").rglob("*.json"))) == 1
     external.download.fetch("featurebench", client=client)
     assert all(external.cached_row(instance_id) == row for instance_id, row in rows("featurebench").items())
+
+
+@pytest.mark.parametrize("step", ["env -i docker info", "sudo -E podman info", "A=1 env -u B docker ps"])
+def test_container_after_prefix_options_is_refused(external_bench, tmp_path: Path, step: str) -> None:
+    task = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.0e0e0e0e.lv1",
+                                 install=f"python -c pass && {step}")
+
+    with pytest.raises(external.task.EnvBuildError, match="container steps"):
+        task.prepare(tmp_path / "workdir")
