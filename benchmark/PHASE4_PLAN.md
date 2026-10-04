@@ -1,5 +1,10 @@
 # Phase 4 — Data adequacy & contamination (execution power-gated)
 
+> **Superseded (2026-10-04)** by the `benchmark-gepa-overhaul` spec. The power
+> readout in `analyze.py` is now informational and no longer emits the
+> "grow TASK pool" verdict that opened this gate; task growth is driven by that
+> spec's goals instead. Kept for history.
+
 **Status: design accepted, execution gated.** Do not author or run new tasks
 until the trigger below fires. This plan exists so that when the gate opens the
 work is already scoped.

@@ -1,8 +1,9 @@
 import json
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pricing import compute_cost_breakdown
 
@@ -57,6 +58,8 @@ class RunResult:
     available_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict] = field(default_factory=list)
     model_usage: dict[str, dict] = field(default_factory=dict)
+    # "native" when the runner reported the cost, "pricing" when pricing.yaml computed it.
+    cost_source: Literal["native", "pricing"] = "native"
 
 
 _MODEL_USAGE_FIELDS = (
@@ -91,6 +94,41 @@ def _cache_creation_ttl_tokens(usage: dict) -> tuple[int, int]:
     )
 
 
+def _native_cost(result_event: dict) -> float | None:
+    """Return the result event's reported cost; an absent field is not 0.0."""
+    cost = result_event.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        return float(cost)
+    return None
+
+
+def _priced_stream_cost(turns: list[Turn], model: str | None) -> float:
+    """Price a claude stream that reported no native cost from pricing.yaml."""
+    per_turn = [
+        {
+            "input_tokens": turn.input_tokens,
+            "cache_creation_tokens": turn.cache_creation_tokens,
+            "cache_creation_5m_tokens": turn.cache_creation_5m_tokens,
+            "cache_creation_1h_tokens": turn.cache_creation_1h_tokens,
+            "cache_read_tokens": turn.cache_read_tokens,
+            "output_tokens": turn.output_tokens,
+        }
+        for turn in turns
+    ]
+    totals = {
+        key: sum(usage[key] for usage in per_turn)
+        for key in ("input_tokens", "cache_creation_tokens", "cache_creation_5m_tokens",
+                    "cache_creation_1h_tokens", "cache_read_tokens", "output_tokens")
+    }
+    if not any(totals.values()):
+        return 0.0
+    if model is None:
+        raise ValueError("claude stream reports no total_cost_usd and no model to price it")
+    return sum(compute_cost_breakdown({
+        "model": model, "per_turn_token_usage": per_turn, **totals,
+    }).values())
+
+
 def parse_stream_json(raw_output: str) -> RunResult:
     """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose."""
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
@@ -103,6 +141,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
     final_summary = {}
     available_tools: list[str] = []
     mcp_servers: list[dict] = []
+    stream_model: str | None = None
 
     for event in events:
         event_type = event.get("type")
@@ -112,6 +151,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
             if event.get("subtype") == "init":
                 available_tools = event.get("tools", [])
                 mcp_servers = event.get("mcp_servers", [])
+                stream_model = event.get("model") or stream_model
 
         elif event_type == "assistant":
             message = event.get("message", {})
@@ -166,11 +206,16 @@ def parse_stream_json(raw_output: str) -> RunResult:
         elif event_type == "result":
             final_summary = event
 
+    native_cost = _native_cost(final_summary)
     return RunResult(
         session_id=session_id,
         turns=turns,
         num_turns=final_summary.get("num_turns", len(turns)),
-        total_cost_usd=final_summary.get("total_cost_usd", 0.0),
+        total_cost_usd=(
+            native_cost if native_cost is not None
+            else _priced_stream_cost(turns, stream_model)
+        ),
+        cost_source="native" if native_cost is not None else "pricing",
         duration_ms=final_summary.get("duration_ms", 0),
         duration_api_ms=final_summary.get("duration_api_ms", 0),
         total_input_tokens=final_summary.get("usage", {}).get("input_tokens", 0),
@@ -346,6 +391,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
         turns=turns,
         num_turns=len(turn_usages),
         total_cost_usd=cost_usd,
+        cost_source="pricing",
         duration_ms=0,  # set by caller from subprocess timing
         duration_api_ms=0,
         total_input_tokens=total_input,
@@ -579,3 +625,119 @@ def extract_stream_error(stdout: str) -> Optional[str]:
         msg = (err.get("data") or {}).get("message") or err.get("message") or ""
         found = f"{name}: {msg}".rstrip(": ").strip()
     return found
+
+
+def _tolerant_events(raw: str) -> list[dict]:
+    """Decode a teed JSONL stream, skipping a line a killed runner left torn."""
+    events = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def stream_native_cost(raw: str) -> Optional[float]:
+    """Return the last result event's reported ``total_cost_usd``, or None when absent."""
+    costs = [
+        cost for event in _tolerant_events(raw)
+        if event.get("type") == "result" and (cost := _native_cost(event)) is not None
+    ]
+    return costs[-1] if costs else None
+
+
+def _stream_succeeded(events: list[dict]) -> bool:
+    """Whether the last result event reports a successful run."""
+    results = [event for event in events if event.get("type") == "result"]
+    return bool(results) and results[-1].get("is_error") is False and results[-1].get("subtype") == "success"
+
+
+# Documented usage-limit result text, e.g. "You've hit your session limit · resets 3am".
+_USAGE_LIMIT_TEXT = re.compile(r"(?:you['’]ve hit your|usage limit reached)", re.IGNORECASE)
+
+
+def detect_quota_rejection(raw: str) -> Optional[str]:
+    """Return why a claude stream was rejected by a subscription usage limit, or None.
+
+    A stream whose last result event reports success was not rejected, even when it
+    carries a rejected rate_limit_event (for example an overage tier).
+    """
+    events = _tolerant_events(raw)
+    if _stream_succeeded(events):
+        return None
+    for event in events:
+        info = event.get("rate_limit_info")
+        if (event.get("type") == "rate_limit_event" and isinstance(info, dict)
+                and info.get("status") == "rejected"):
+            return f"rate_limit_event rejected ({info.get('rateLimitType', 'unknown limit')})"
+        result_text = event.get("result")
+        if (event.get("type") == "result" and isinstance(result_text, str)
+                and _USAGE_LIMIT_TEXT.search(result_text)):
+            return result_text
+    return None
+
+
+def _claude_trajectory(events: list[dict]) -> list[dict]:
+    calls: dict[str, dict] = {}
+    for event in events:
+        message = event.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id") not in calls:
+                calls[block.get("id")] = {
+                    "tool_use_id": block.get("id"), "name": block.get("name"),
+                    "input": block.get("input"), "output": None, "is_error": None,
+                }
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                call = calls[block["tool_use_id"]]
+                call["output"] = block.get("content")
+                call["is_error"] = block.get("is_error") is True
+    return list(calls.values())
+
+
+def _codex_trajectory(events: list[dict]) -> list[dict]:
+    records = []
+    for event in events:
+        item = event.get("item")
+        if event.get("type") != "item.completed" or not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"agent_message", "reasoning"}:
+            continue
+        if item_type == "command_execution":
+            name = item_type
+            tool_input: object = {"command": item.get("command")}
+            output = item.get("aggregated_output")
+            is_error = item.get("exit_code") not in (0, None)
+        elif item_type == "mcp_tool_call":
+            name = f"mcp__{item.get('server')}__{item.get('tool')}"
+            tool_input = item.get("arguments")
+            output = item.get("result") if item.get("error") is None else item.get("error")
+            result = item.get("result")
+            is_error = item.get("error") is not None or (
+                isinstance(result, dict) and (result.get("isError") is True or result.get("is_error") is True)
+            )
+        else:
+            name = str(item_type)
+            tool_input = {key: value for key, value in item.items() if key not in {"id", "type", "status"}}
+            output = item.get("status")
+            is_error = item.get("status") == "failed"
+        records.append({
+            "tool_use_id": item.get("id"), "name": name,
+            "input": tool_input, "output": output, "is_error": is_error,
+        })
+    return records
+
+
+def extract_trajectory(raw: str, runner: Literal["claude", "codex"]) -> list[dict]:
+    """Return every tool call in a teed stream with its full input and output."""
+    events = _tolerant_events(raw)
+    if runner == "claude":
+        return _claude_trajectory(events)
+    return _codex_trajectory(events)

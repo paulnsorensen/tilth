@@ -467,3 +467,142 @@ def test_opencode_result_text_single_turn_unchanged():
     result = parse_opencode_json(raw_output)
 
     assert result.result_text == "The answer is 42."
+
+
+# --- cost source and stream fixtures ------------------------------------------
+
+_STREAMS = Path(__file__).parent / "fixtures" / "streams"
+
+
+def test_present_native_cost_is_used():
+    result = parse_stream_json((_STREAMS / "claude_native_cost.jsonl").read_text())
+
+    assert result.total_cost_usd == 0.0421
+    assert result.cost_source == "native"
+
+
+def test_reported_zero_native_cost_is_not_repriced():
+    events = [_assistant_event("ok"), {"type": "result", "num_turns": 1, "total_cost_usd": 0.0}]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.total_cost_usd == 0.0
+    assert result.cost_source == "native"
+
+
+def test_missing_native_cost_uses_pricing():
+    from pricing import compute_cost_breakdown
+
+    result = parse_stream_json((_STREAMS / "claude_no_native_cost.jsonl").read_text())
+    expected = sum(compute_cost_breakdown({
+        "model": "claude-sonnet-5",
+        "per_turn_token_usage": [
+            {"input_tokens": 1200, "cache_creation_tokens": 4000, "cache_creation_5m_tokens": 4000,
+             "cache_creation_1h_tokens": 0, "cache_read_tokens": 0, "output_tokens": 300},
+            {"input_tokens": 50, "cache_creation_tokens": 0, "cache_creation_5m_tokens": 0,
+             "cache_creation_1h_tokens": 0, "cache_read_tokens": 5200, "output_tokens": 120},
+        ],
+        "input_tokens": 1250, "cache_creation_tokens": 4000, "cache_creation_5m_tokens": 4000,
+        "cache_creation_1h_tokens": 0, "cache_read_tokens": 5200, "output_tokens": 420,
+    }).values())
+
+    assert result.cost_source == "pricing"
+    assert result.total_cost_usd > 0.0
+    assert result.total_cost_usd == pytest.approx(expected)
+
+
+def test_missing_native_cost_without_a_model_cannot_be_priced():
+    events = [_assistant_event("ok"), {"type": "result", "num_turns": 1}]
+
+    with pytest.raises(ValueError, match="model"):
+        parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+
+def test_missing_native_cost_with_no_usage_prices_to_zero():
+    events = [{"type": "system", "subtype": "init", "tools": []}, {"type": "result", "num_turns": 0}]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.total_cost_usd == 0.0
+    assert result.cost_source == "pricing"
+
+
+def test_stream_native_cost_distinguishes_absent_from_zero():
+    from parse import stream_native_cost
+
+    assert stream_native_cost((_STREAMS / "claude_native_cost.jsonl").read_text()) == 0.0421
+    assert stream_native_cost((_STREAMS / "claude_no_native_cost.jsonl").read_text()) is None
+    assert stream_native_cost(json.dumps({"type": "result", "total_cost_usd": 0}) + "\n{truncated") == 0.0
+
+
+def test_quota_rejection_is_detected_from_rate_limit_event():
+    from parse import detect_quota_rejection
+
+    assert detect_quota_rejection((_STREAMS / "claude_quota_rejected.jsonl").read_text())
+    assert detect_quota_rejection((_STREAMS / "claude_native_cost.jsonl").read_text()) is None
+    allowed = {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed_warning"}}
+    assert detect_quota_rejection(json.dumps(allowed)) is None
+
+
+def test_quota_rejection_is_detected_from_limit_result_text():
+    from parse import detect_quota_rejection
+
+    event = {"type": "result", "is_error": True, "result": "You've hit your weekly limit · resets Mon"}
+    assert detect_quota_rejection(json.dumps(event))
+
+
+def test_claude_trajectory_pairs_untruncated_inputs_and_outputs():
+    from parse import extract_trajectory
+
+    raw = (_STREAMS / "claude_native_cost.jsonl").read_text()
+    events = [json.loads(line) for line in raw.splitlines()]
+    tool_use = events[1]["message"]["content"][0]
+    tool_result = events[2]["message"]["content"][0]
+
+    trajectory = extract_trajectory(raw, "claude")
+
+    assert trajectory == [{
+        "tool_use_id": "toolu_fixture_1",
+        "name": "Bash",
+        "input": tool_use["input"],
+        "output": tool_result["content"],
+        "is_error": False,
+    }]
+
+
+def test_codex_trajectory_records_commands_and_mcp_calls():
+    from parse import extract_trajectory
+
+    long_output = "x" * 500
+    events = [
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "item_1", "type": "command_execution",
+                                             "command": "go test ./...", "aggregated_output": long_output,
+                                             "exit_code": 1, "status": "failed"}},
+        {"type": "item.completed", "item": {"id": "item_2", "type": "mcp_tool_call", "server": "tilth",
+                                             "tool": "tilth_read", "arguments": {"paths": ["a.go"]},
+                                             "result": {"content": [{"type": "text", "text": long_output}]},
+                                             "error": None, "status": "completed"}},
+        {"type": "item.completed", "item": {"id": "item_3", "type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+
+    trajectory = extract_trajectory("\n".join(map(json.dumps, events)), "codex")
+
+    assert trajectory == [
+        {"tool_use_id": "item_1", "name": "command_execution", "input": {"command": "go test ./..."},
+         "output": long_output, "is_error": True},
+        {"tool_use_id": "item_2", "name": "mcp__tilth__tilth_read", "input": {"paths": ["a.go"]},
+         "output": {"content": [{"type": "text", "text": long_output}]}, "is_error": False},
+    ]
+
+
+def test_rejected_rate_limit_event_before_a_successful_result_is_not_quota():
+    from parse import detect_quota_rejection
+
+    events = [
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day_opus"}},
+        {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.1},
+    ]
+
+    assert detect_quota_rejection("\n".join(map(json.dumps, events))) is None
