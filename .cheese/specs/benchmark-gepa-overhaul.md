@@ -17,7 +17,7 @@ gate_applicability:
   ui_surface: non-browser
 landing:
   shape: diamond_stack
-  layers: [["c1-result-substrate"], ["c2-external-task-adapter", "c4-model-judge"], ["c3-panel-manifest"], ["c5-evolution-loop"]]
+  layers: [["c1-result-substrate", "c0-prompt-files"], ["c2-external-task-adapter", "c4-model-judge"], ["c3-panel-manifest"], ["c5-evolution-loop"]]
   per_layer_green: required
   review_fixes: fold
 ---
@@ -93,7 +93,7 @@ Build a result substrate first, then two independent adapters, then the panel, t
 **Cross-curd invariants.** These are the parent contract, verified in `benchmark/tests/test_invariants.py` by the curd that closes each one:
 
 - The only score is grader correctness. Labels and critiques never move it, and a contaminated rollout counts as incorrect (F-5, F-1).
-- No optimizer-side model reads grader inputs. Reflective records and GEPA side info carry the grader verdict and counts (`correct`, `pass_rate`, F2P/P2P counts) and never grader-side material: `correctness_reason`, the task's ground-truth definition (`required_strings`, `forbidden_strings`), gold patches, or held-out test source or output. Text the agent itself produced in its trajectory or final answer stays in the record even when it matches a ground-truth string, since a correct answer to a local task must name those identifiers (`benchmark/tasks/ripgrep_tasks.py:26`); today `correctness_reason` names missing ground-truth strings (`benchmark/tasks/base.py:178-180`) and holds held-out test output (`benchmark/tasks/gin_render_context_tasks.py:152-153`). The proposer sees no `benchmark/` file, no panel file, and no harness data path. Critique inputs are that same stripped record. Contaminated rollouts contribute no reflective record or critique. Test-split tasks contribute no reflective record before finish (F-5, F-2).
+- No optimizer-side model reads grader inputs. Reflective records and GEPA side info carry the grader verdict and counts (`correct`, `pass_rate`, F2P/P2P counts) and never grader-side material: `correctness_reason`, the task's ground-truth definition (`required_strings`, `forbidden_strings`), gold patches, or held-out test source or output. Text the agent itself produced in its trajectory or final answer stays in the record even when it matches a ground-truth string, since a correct answer to a local task must name those identifiers (`benchmark/tasks/ripgrep_tasks.py:26`); today `correctness_reason` names missing ground-truth strings (`benchmark/tasks/base.py:178-180`) and holds held-out test output (`benchmark/tasks/gin_render_context_tasks.py:155-156`). The proposer sees no `benchmark/` file, no panel file, and no harness data path. Critique inputs are that same stripped record. Contaminated rollouts contribute no reflective record or critique. Test-split tasks contribute no reflective record before finish (F-5, F-2).
 - Every paid model call shares one `--max-usd` ceiling and one OAuth auth guard: agent cells, judge calls, reflection calls, and proposer calls (F-6).
 - Baselines are reused, not re-bought, across runs and candidates. A baseline key that drifted (agent CLI version or env fingerprint) refuses the run until an explicit `--refreeze-baselines` buys them once under the new key (G-5, F-3).
 - Nothing runs in a container (F-1).
@@ -141,7 +141,7 @@ Each child spec carries the detailed per-slice rows; these rows test only the in
 slice:            benchmark (existing harness) + NEW SLICE benchmark/external/, benchmark/judge/, benchmark/evolve/
 spine step:       workflow (run.py cell loop) + infra (native checkout and env builder, result store)
 public interface: baselines.run_key(cell) -> str; baselines.lookup(key) -> Row | None; baselines.store(row)  (c1, F-3)
-public interface: run.py --panel PATH --max-usd FLOAT --cell-estimate-usd FLOAT --refreeze-baselines --candidate-sha SHA  (c1/c3, F-6, F-2)
+public interface: run.py --max-usd FLOAT --cell-estimate-usd FLOAT --refreeze-baselines (c1, F-6); run.py --panel PATH --panel-split {cheap,dev,test,all} (c3, F-1); run.py --candidate-sha SHA and run.run_plan(cells, *, ledger, candidate_sha, refreeze_baselines) (c5, F-2)
 public interface: Task.prepare(workdir) and Task.grade_details() optional hooks, called by run.py when present  (c2, F-1)
 public interface: external.ExternalTask(Task); external.featurebench.load / external.swebench_ml.load -> ExternalTask; external.preflight.admit(instance_id) -> PreflightVerdict; external.contamination.scan(sidecar_path, task) -> bool  (c2, F-1)
 public interface: panels.load_panel(path) -> Panel(cheap, dev, test)  (c3, F-1)
@@ -180,11 +180,12 @@ arrows:           run.py -> external, baselines, panels; evolve -> run.py, basel
 
 ## Curds
 
+- **c0-prompt-files** — one-time byte-identical move of the `tilth_search` and `tilth_write` tool descriptions into `prompts/tools/search.md` and `prompts/tools/write.md` via `include_str!`, refactor-only, gated by `just check`. Covers G-4 as an enabler for c5. Parent ACs: none directly; c5 AC-12 depends on it. Depends on: none. Child: `bench-prompt-files` (split out of c5 by user choice on 2026-10-04). State: proposed.
 - **c1-result-substrate** — run key, trajectory sidecar, result store, `--max-usd` spend ledger, auth guard, quota stop, CLI pin, power gate retired. Covers G-4, G-5. Parent ACs: AC-2, AC-3, AC-7, AC-8 (substrate half). Depends on: none. Child: `bench-result-substrate` (`/root/.local/share/cheese/paulnsorensen-tilth/specs/bench-result-substrate.md`); route: Cook here in isolation, pending its coherence verdict. State: draft.
-- **c2-external-task-adapter** — `prepare` and `grade_details` hooks, native checkout, masked-state reconstruction, `uv` and Go/Rust environments, native F2P/P2P grading, contamination flag, preflight. Covers G-1, G-3. Parent ACs: AC-1 (admission half). Depends on: c1. Child: `bench-external-tasks` (to mint from r3-pre-umbrella AC-1, AC-2, AC-3, AC-17). State: proposed.
-- **c4-model-judge** — applicability labels and analysis slicing, per-rollout critiques, calibration gate. Covers G-6. Parent ACs: AC-4 (label half), AC-7 (judge calls). Depends on: c1. Child: `bench-model-judge` (to mint from r3-pre-umbrella AC-10, AC-11). State: proposed.
-- **c3-panel-manifest** — pre-registered panel, task families, split lock. Covers G-1, G-2, G-3. Parent ACs: AC-1. Depends on: c2. Child: `bench-panel-manifest` (to mint from r3-pre-umbrella AC-4). State: proposed.
-- **c5-evolution-loop** — tool-description move to prompt files, multi-component candidate with isolated `src_patch` proposer, applier, cascade, GEPA engine, delta reports, frontier re-runs, held-out scoring, draft PR. Covers G-4, G-5. Parent ACs: AC-2 to AC-8 (loop half). Depends on: c1, c3, c4. Child: `bench-evolution-loop` (to mint from r3-pre-umbrella AC-12 to AC-16, AC-18, AC-19). State: proposed.
+- **c2-external-task-adapter** — `prepare` and `grade_details` hooks, native checkout, masked-state reconstruction, `uv` and Go/Rust environments, native F2P/P2P grading, contamination flag, preflight. Covers G-1, G-3. Parent ACs: AC-1 (admission half). Depends on: c1. Child: `bench-external-tasks`. State: draft.
+- **c4-model-judge** — applicability labels and analysis slicing, per-rollout critiques, calibration gate. Covers G-6. Parent ACs: AC-4 (label half), AC-7 (judge calls). Depends on: c1. Child: `bench-model-judge`. State: draft.
+- **c3-panel-manifest** — pre-registered panel, task families, split lock. Covers G-1, G-2, G-3. Parent ACs: AC-1. Depends on: c2. Child: `bench-panel-manifest`. State: draft.
+- **c5-evolution-loop** — multi-component candidate with isolated `src_patch` proposer, applier, cascade, GEPA engine, delta reports, frontier re-runs, held-out scoring, draft PR. Covers G-4, G-5. Parent ACs: AC-2 to AC-8 (loop half). Depends on: c0, c1, c3, c4. Child: `bench-evolution-loop`. State: draft.
 
 ## References
 

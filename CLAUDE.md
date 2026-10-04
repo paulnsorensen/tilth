@@ -122,14 +122,15 @@ python benchmark/fixtures/setup.py
 
 ```bash
 # Full suite: all tasks, baseline + tilth, 3 reps per task
-python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all
+python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all --max-usd 40
 
 # Specific tasks
-python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth
+python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth --max-usd 5
 
 # Models: sonnet, opus, haiku, gpt5, o3
 # Modes: baseline (built-in tools), tilth (built-in + tilth MCP), tilth_forced (tilth MCP only)
 # Tasks: all, or comma-separated names from benchmark/tasks/*.py
+# --max-usd is required whenever any cell is not already in the result store; matching completed cells are reused, not re-run
 ```
 
 Hard tasks take 2-5 min each. Run in background for multi-task suites. Do NOT pipe output through `head` or similar — it breaks the pipe and causes timeouts.
