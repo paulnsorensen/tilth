@@ -1159,7 +1159,7 @@ def test_stop_state_neutralizes_calls(world) -> None:
     calls, spawned = len(world.calls), len(world.spawned)
 
     proposal = evo.dispatcher(evo.seed, {name: [{"records": []}] for name in evo.seed}, list(evo.seed))
-    assert proposal == evo.seed
+    assert proposal == {}
     assert evo.evaluate(child(evo.seed, dev_a="1"), "dev_a") == (0.0, {"stopped": "ceiling"})
     assert (len(world.calls), len(world.spawned)) == (calls, spawned)
     assert refs(world) == []
@@ -1175,15 +1175,29 @@ def test_run_log_has_no_gate_verdict(world, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def _ceiling_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn):
-    """max 1.2, a 0.3 finish reserve, free search cells, and 0.1 test cells."""
+    """max 1.2, a 0.3 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
     world = weak_world(monkeypatch, tmp_path)
     world.costs.update(dev_a=0.0, dev_b=0.0, cheap_a=0.0, test_a=0.1)
-    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="200", spawn=spawn)
+    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="2000", spawn=spawn)
     monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
     assert evo.preflight() is None
     assert evo.ledger.reserve == pytest.approx(0.3)
     assert evo.buy_baselines() is None
     return world, evo
+
+
+def count_evaluations_after_stop(evo) -> list[str]:
+    """Record each evaluator call gepa makes once the stop state is set; gepa reads ``evo.evaluate`` at search."""
+    after_stop: list[str] = []
+    evaluate = evo.evaluate
+
+    def counting(candidate, example):
+        if evo.stop.is_set:
+            after_stop.append(example)
+        return evaluate(candidate, example)
+
+    evo.evaluate = counting
+    return after_stop
 
 
 def test_real_gepa_ceiling_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1200,10 +1214,12 @@ def test_real_gepa_ceiling_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     evo.paid.costs.setdefault("reflection", []).append(0.2)
     evo.paid.costs.setdefault("proposer", []).append(0.2)
     evo.ledger.charge(0.8 - evo.ledger.spent, source="search")
+    after_stop = count_evaluations_after_stop(evo)
 
     evo.search()
     assert paid == []
     assert evo.stop.reason == "ceiling"
+    assert after_stop == []
     search_calls = len(world.calls)
     pr = evo.finish()
 
@@ -1225,9 +1241,11 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
 
     world, evo = _ceiling_world(monkeypatch, tmp_path, spawn)
     evo.ledger.max_usd = 100.0
+    after_stop = count_evaluations_after_stop(evo)
     evo.search()
     assert paid == ["reflection"] * 4 + ["proposer"]
     assert evo.stop.reason == "quota"
+    assert after_stop == []
     calls = len(world.calls)
 
     assert evo.finish() is None

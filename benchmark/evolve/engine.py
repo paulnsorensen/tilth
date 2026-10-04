@@ -72,7 +72,8 @@ class ReflectionClient:
 class Dispatcher:
     """gepa ``custom_candidate_proposer``: text components to reflection, ``src_patch`` to the proposer.
 
-    While the stop state is set it returns the parent's components without a call.
+    While the stop state is set it makes no call, and once the stop state is set it returns no
+    components, so gepa evaluates no child and the stop callback ends the search at the next check.
     """
 
     def __init__(self, stop: StopState, *, reflect: Callable[[str, str, list[dict]], str],
@@ -90,12 +91,12 @@ class Dispatcher:
                       for entry in reflective_dataset.get(name, ()) for record in entry.get("records", ())}
             records = list(unique.values())
             if self.stop.is_set:
-                proposal[name] = candidate[name]
-            elif name == SRC_PATCH:
+                break
+            if name == SRC_PATCH:
                 proposal[name] = self.propose(candidate, records)
             else:
                 proposal[name] = self.reflect(name, candidate[name], records)
-        return proposal
+        return {} if self.stop.is_set else proposal
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,

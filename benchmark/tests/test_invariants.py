@@ -410,7 +410,7 @@ def test_one_ceiling_spans_all_paid_calls(world, monkeypatch: pytest.MonkeyPatch
     evo.ledger.charge(evo.ledger.max_usd - evo.ledger.reserve - evo.ledger.spent - 0.05, source="search")
     spawned = len(world.spawned)
 
-    assert evo.dispatcher(evo.seed, {name: [{"records": []}] for name in evo.seed}, list(evo.seed)) == evo.seed
+    assert evo.dispatcher(evo.seed, {name: [{"records": []}] for name in evo.seed}, list(evo.seed)) == {}
     assert len(world.spawned) == spawned
     assert evo.stop.reason == "ceiling"
     evo.stop.reason = None
