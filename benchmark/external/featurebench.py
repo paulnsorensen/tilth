@@ -118,7 +118,7 @@ class FeatureBenchTask(ExternalTask):
 
     def restore_heldout(self, checkout: Path) -> None:
         for relative in (*self.fail_to_pass, *self.pass_to_pass):
-            write_or_remove(checkout / relative, self.base_file(relative))
+            write_or_remove(checkout, relative, self.base_file(relative))
 
     def _pytest_options(self) -> list[str]:
         tokens = shlex.split(str(self.settings.get("test_cmd") or "pytest -rA"))

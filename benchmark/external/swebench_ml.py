@@ -7,7 +7,6 @@ test command natively, and matches each FAIL_TO_PASS and PASS_TO_PASS test ID
 against exactly one parsed verdict.
 """
 
-import os
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -79,15 +78,15 @@ class SweBenchTask(ExternalTask):
     def restore_heldout(self, checkout: Path) -> None:
         test_patch = self.row["test_patch"]
         for relative in sorted(patches.touched_paths(test_patch)):
-            write_or_remove(checkout / relative, self.base_file(relative))
+            write_or_remove(checkout, relative, self.base_file(relative))
         if not apply_patch(checkout, test_patch):
             raise PrepareError("test_patch does not apply to the restored test files")
 
     def test_output(self, checkout: Path) -> str:
-        env = self.grading_env(checkout) if self.language == "python" else dict(os.environ)
-        # Cargo builds in the fresh checkout's own target/: a shared target directory would
-        # reuse an earlier grade's build, because exported sources keep the commit's mtime.
-        env.pop("CARGO_TARGET_DIR", None)
+        env = self.grading_env(checkout) if self.language == "python" else self.grade_env(checkout)
+        # The grade env never carries CARGO_TARGET_DIR, so Cargo builds in the fresh checkout's own target/:
+        # a shared target directory would reuse an earlier grade's build, because exported sources keep the
+        # commit's mtime.
         result = proc.run(["bash", "-c", test_command(self.row["eval_script"])], cwd=checkout, env=env,
                           timeout=self.timeout_s)
         return result.stdout + result.stderr

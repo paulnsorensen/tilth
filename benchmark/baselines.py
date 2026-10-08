@@ -21,7 +21,7 @@ STORE_FILENAME = "result_store.jsonl"
 # Row fields that make up a run key besides the three digests.
 CELL_KEY_FIELDS = (
     "task", "model", "cli_version", "reasoning_effort", "timeout_s", "mode",
-    "repetition", "git_sha", "binary_sha256",
+    "repetition", "git_sha", "binary_sha256", "plugin_sha256",
 )
 DIGEST_FIELDS = ("harness_digest", "task_digest", "env_fingerprint")
 

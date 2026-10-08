@@ -20,7 +20,7 @@ import run
 from panel_support import (
     CHEAP, COMMITTED_PANEL, COMPLETE, EXPECTED_DEV, EXPECTED_TEST, FALLBACKS, FB_ALGORITHMS, FB_IDS, FB_NULLSPACE,
     FB_REGRESSION, GEPA_ROWS, GO_FALLBACK, GO_SLOT, RENDER, RUST_FALLBACK, RUST_SLOT, load, member, panel_run, read,
-    refusing, restratify, row_source, stamp_digest, stub_loaders, stub_task, without, write,
+    RUN_ARGS, refusing, restratify, row_source, stamp_digest, stub_loaders, stub_task, without, write,
 )
 
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
@@ -292,6 +292,18 @@ def test_reused_row_output_carries_stamp(prun, bench) -> None:
         assert row["panel_split"] == "cheap"
 
 
+def test_non_panel_reuse_drops_stored_stamp(prun, bench) -> None:
+    assert prun.main(prun.panel(read(COMPLETE)), "--panel-split", "cheap") == 0
+    bench.calls.clear()
+
+    assert bench.main("--tasks", ",".join(CHEAP), *RUN_ARGS) == 0
+
+    assert bench.calls == []
+    reused = bench.output_rows()
+    assert len(reused) == 3 and all(row["reused"] for row in reused)
+    assert not any(field in row for row in reused for field in STAMP_FIELDS)
+
+
 def test_baselines_rows_is_read_only_filter(tmp_path: Path, store: Path) -> None:
     assert list(baselines.rows(tmp_path / "missing.jsonl")) == []
     stored = [{"run_key": "a", "panel_name": "p"}, {"run_key": "b", "panel_name": "q"},
@@ -348,7 +360,7 @@ def test_error_rows_do_not_lock(prun, bench) -> None:
 def test_direct_loader_refuses_changed_split(store: Path) -> None:
     baselines.store({"run_key": "k", "panel_name": "fixture-primaries", "panel_split_digest": "0" * 64}, path=store)
     with pytest.raises(panels.PanelError, match="split"):
-        load(COMPLETE, store)
+        load(COMPLETE, store, admit=lambda _id: pytest.fail("admission ran before the split lock"))
     assert load(FALLBACKS, store).name == "fixture-fallbacks"
 
 
@@ -417,6 +429,25 @@ def test_external_language_refused(tmp_path: Path, store: Path, member_id: str, 
 def test_panel_excludes_task_and_repo_filters(prun, flags: tuple[str, str]) -> None:
     assert prun.main(prun.panel(read(COMPLETE)), *flags) != 0
     assert prun.called == []
+
+
+def test_panel_split_requires_panel(bench, capsys: pytest.CaptureFixture[str]) -> None:
+    assert bench.main("--panel-split", "dev", *RUN_ARGS) == 2
+
+    assert bench.calls == []
+    assert "--panel-split requires --panel" in capsys.readouterr().err
+
+
+def test_panel_refuses_runner_without_trajectory_sidecar(
+    bench, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(panels, "load_panel", lambda *_args, **_kwargs: pytest.fail("panel loaded"))
+    path = write(tmp_path, read(COMPLETE))
+
+    assert bench.main("--panel", str(path), "--models", "sonnet5,gpt5mini", "--modes", "plain") == 2
+
+    assert bench.calls == []
+    assert "--panel requires claude or codex models" in capsys.readouterr().err
 
 
 # --- AC-7: the committed panel ---

@@ -377,6 +377,10 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "tilth_search")
             .expect("search tool");
+        // prompts/tools/search.md must keep the edit-ready search guidance from #309.
+        let desc = search["description"].as_str().expect("search description");
+        assert!(desc.contains("Match headers carry `path#TAG`"), "{desc}");
+        assert!(desc.contains("then use a `rewrite` op"), "{desc}");
         let schema = &search["inputSchema"];
         assert!(schema["properties"]["kind"].is_null());
         for dropped in ["scope", "expand", "context", "if_modified_since"] {
