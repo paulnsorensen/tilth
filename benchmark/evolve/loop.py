@@ -7,6 +7,7 @@ the proposer see only c4 stripped records; test-split rollouts appear only in
 """
 
 import json
+import subprocess
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -72,7 +73,6 @@ class Cascade:
     stage: str | None = None
     tail: str = ""
     just_check_ok: bool | None = None
-    check_tail: str = ""
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
     cheap_records: list[dict] = field(default_factory=list)
@@ -80,7 +80,6 @@ class Cascade:
     means: dict[str, float] = field(default_factory=dict)
     rows: list[dict] = field(default_factory=list)
     records: dict[str, list[dict]] = field(default_factory=dict)
-    reached_paid: bool = False
     admitted: bool = False
     accepted: bool = False
     counted: bool = False
@@ -158,7 +157,6 @@ class Evolution:
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
-        self.gepa_result = None
         self.finish_failure: str | None = None
 
     # --- plumbing ---
@@ -239,14 +237,16 @@ class Evolution:
     def preflight(self) -> int | None:
         """Hold the finish reserve, label every panel task, and calibrate; an exit code when the run is refused.
 
-        A drifted test-split baseline cell refuses the run here, before any paid call, unless
+        A drifted cheap, dev, or test-split baseline cell refuses the run here, before any paid call, unless
         ``--refreeze-baselines`` lets finish buy it again.
         """
         if not self.settings.refreeze_baselines:
+            baseline_cells = self._cells((*self.panel.cheap, *self.panel.dev, *self.panel.test), BASELINE_MODE,
+                                         self._reps())
             try:
-                run.check_baseline_drift(self._cells(self.panel.test, BASELINE_MODE, self._reps()), panel=self.panel)
+                run.check_baseline_drift(baseline_cells, panel=self.panel)
             except run.BaselineDrift as error:
-                return self.refuse(f"test split: {error}")
+                return self.refuse(f"baselines: {error}")
         per_finalist = self.finalist_test_cost()
         reserve = 3 * per_finalist
         if self.settings.max_usd <= reserve:
@@ -304,11 +304,11 @@ class Evolution:
     # --- search ---
 
     def search(self):
-        self.gepa_result = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
-                                           max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
-                                           proposer=self.dispatcher)
+        found = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
+                                max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
+                                proposer=self.dispatcher)
         self.log(f"search: ended ({self.stop.reason or 'metric-call budget'})")
-        return self.gepa_result
+        return found
 
     def evaluate(self, candidate: dict[str, str], example: str) -> tuple[float, dict]:
         """GEPA's evaluator: the candidate's score on one dev task, with grader-free side info."""
@@ -334,10 +334,10 @@ class Evolution:
                 return result.fail("apply", tail(rejected.tail))
         if result.just_check_ok is None:
             ok, output = self.just_check(self.materializer.worktree(result.sha))
-            result.just_check_ok, result.check_tail = ok, tail(output)
+            result.just_check_ok = ok
             self.materializer.release(result.sha)
-        if not result.just_check_ok:
-            return result.fail("just check", result.check_tail)
+            if not ok:
+                return result.fail("just check", tail(output))
         try:
             return self._tiers(result)
         except run.CandidateBuildFailed as failed:
@@ -361,7 +361,6 @@ class Evolution:
             result.rows = rows
             result.records = {task: records.get(task, []) for task in self.panel.dev}
             result.scores = {task: self._task_mean(rows, task) for task in self.panel.dev}
-        result.reached_paid = True
         self._admit(result)
         if result.delta is None:
             result.delta = self._dev_delta(result)
@@ -486,6 +485,9 @@ class Evolution:
             seed.sha = self.settings.seed_sha
         nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
                          key=lambda member: (-member.dev_mean, member.seq))[:2]
+        if not nonseed:
+            self.log("finish: no improvement (no non-seed candidate on the frontier)")
+            return None
         finalists = [*nonseed, seed]
         self.log("finish: finalists " + ", ".join(f"{member.cid[:12]} (dev mean {member.dev_mean:.3f})"
                                                   for member in finalists))
@@ -532,25 +534,35 @@ class Evolution:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:
             return self._finish_failed(f"finish: refused; pushing {branch} failed (it may already exist): {error}")
-        pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
-                                         title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
-                                         body=body)
+        try:
+            pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
+                                             title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
+                                             body=body)
+        except (subprocess.CalledProcessError, OSError) as error:
+            detail = getattr(error, "stderr", None) or str(error)
+            return self._finish_failed(f"finish: pushed {branch} but opening the draft PR failed: "
+                                       f"{tail(str(detail))}")
         self.log(f"finish: draft PR opened from {branch}: {pr}")
         return pr
 
     # --- the whole run ---
 
     def run(self) -> int:
-        code = self.preflight() or self.buy_baselines()
+        code = self.preflight()
+        if code is None and not self.stop.is_set:
+            code = self.buy_baselines()
         if code:
             return code
         try:
             if not self.stop.is_set:
                 self.search()
             self.finish()
+        except (GitError, OSError, EvolveError) as error:
+            self._finish_failed(f"finish: run failed ({type(error).__name__}): {error}")
         finally:
             self.materializer.cleanup()
-        totals = {**self.spend, "reflection": self.paid.total("reflection"), "proposer": self.paid.total("proposer")}
-        self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
-                 + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
+            totals = {**self.spend, "reflection": self.paid.total("reflection"),
+                      "proposer": self.paid.total("proposer")}
+            self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
+                     + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
         return 1 if self.finish_failure else 0

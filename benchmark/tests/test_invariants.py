@@ -316,7 +316,7 @@ def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatc
 
 
 def test_baselines_bought_once_then_reused(world, monkeypatch: pytest.MonkeyPatch) -> None:
-    _engine(monkeypatch)
+    _engine(monkeypatch, [es.child(es.seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert es.main(world) == 0
     planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (0, 1)}
     assert sorted((task, rep) for task, _mode, rep, _sha in world.runner_calls("baseline")) == sorted(planned)

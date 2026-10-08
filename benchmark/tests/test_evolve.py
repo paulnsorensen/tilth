@@ -22,7 +22,8 @@ import run
 from evolve import candidate as candidates
 from evolve import engine
 from evolve.finish import GitHubPRClient
-from evolve.loop import Cascade
+from evolve.gitops import GitError
+from evolve.loop import Cascade, EvolveError
 from evolve.materialize import ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
@@ -90,7 +91,6 @@ def accept(evo, candidate: dict, means: dict[str, float], *, just_check: bool = 
     result = evo.results.get(candidates.content_id(candidate)) or evo.new_cascade(candidate)
     result.sha = evo.materializer.materialize(candidate)
     result.just_check_ok = just_check
-    result.reached_paid = True
     result.scores = dict(means)
     result.means = dict(means)
     result.accepted = True
@@ -133,7 +133,8 @@ def test_test_split_never_reflected(world, monkeypatch: pytest.MonkeyPatch) -> N
         prompts.append(kwargs["input"])
         return subprocess.CompletedProcess(argv, 0, result_stream("no change"), "")
 
-    seen = use_engine(monkeypatch, propose=[["prompts/mcp.md"], ["src_patch"]])
+    seen = use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")],
+                      propose=[["prompts/mcp.md"], ["src_patch"]])
     assert main(world, spawn=spawn) == 0
 
     assert len(prompts) == 2
@@ -510,7 +511,7 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
     assert score == 0
     assert info["stage"] == stage
     result = evo.results[candidates.content_id(failing)]
-    assert result.stage == stage and not result.reached_paid
+    assert result.stage == stage and not result.scores
     non_seed = [call for call in world.calls if call[1] == "tilth" and call[3] != world.seed_sha]
     if stage in {"apply", "just check"}:
         assert non_seed == []
@@ -561,7 +562,7 @@ def test_build_failure_side_info_names_stage(world, monkeypatch: pytest.MonkeyPa
     assert score == 0
     assert info["stage"] == "build" and "error[E0308]: mismatched types" in info["tail"]
     result = evo.results[candidates.content_id(failing)]
-    assert result.stage == "build" and not result.reached_paid
+    assert result.stage == "build" and not result.scores
     assert evo.evaluate(failing, "dev_b")[1]["stage"] == "build"
 
 
@@ -1059,7 +1060,7 @@ def test_finish_stops_before_crossing_full_ceiling(world) -> None:
 
 def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
                                                              capsys: pytest.CaptureFixture[str]) -> None:
-    use_engine(monkeypatch)
+    use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-test-b" if "test_a" in str(task) else world.env)
     labelled, calls, spawned = len(world.judge.labelled), len(world.calls), len(world.spawned)
@@ -1073,11 +1074,13 @@ def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch:
 
 
 def test_finish_baseline_drift_is_incomplete_not_traceback(world, monkeypatch: pytest.MonkeyPatch) -> None:
-    use_engine(monkeypatch)
+    use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     world.pr.calls.clear()
 
-    def drifting(seed_candidate, **kwargs):
+    def drifting(seed, *, evaluator, dataset, **kwargs):
+        for example in dataset:
+            evaluator(child(seed, dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="drift"), example=example)
         world.env = "env-fingerprint-b"
 
     monkeypatch.setattr(engine, "optimize_anything", drifting)
@@ -1114,6 +1117,75 @@ def test_existing_winner_branch_is_a_logged_refusal(world) -> None:
     heads = git("ls-remote", "--heads", str(remote), "evolve/run1-winner", cwd=world.tmp)
     assert heads.split()[0] == world.seed_sha
 
+
+
+def test_stopped_preflight_buys_no_baselines(world) -> None:
+    evo = build(world)
+    evo.preflight = lambda: evo.stop.set("quota")
+    evo.search = lambda: None
+    evo.finish = lambda: None
+
+    assert evo.run() == 0
+    assert world.calls == []
+
+
+@pytest.mark.parametrize("error", [subprocess.CalledProcessError(1, ["gh"], stderr="gh: boom"), OSError("gh: boom")])
+def test_failed_draft_pr_is_a_logged_failure(world, error: Exception) -> None:
+    class FailingDraft:
+        pushes: list[tuple[str, str]] = []
+
+        def push(self, sha: str, branch: str) -> None:
+            self.pushes.append((sha, branch))
+
+        def create_draft(self, *, base: str, head: str, title: str, body: str) -> dict:
+            raise error
+
+    client = FailingDraft()
+    evo = ready(world, pr_client=client)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1", tag="winner"), {"dev_a": 0.9, "dev_b": 0.9})
+    evo.search = lambda: None
+
+    assert evo.run() == 1
+    assert len(client.pushes) == 1
+    assert "pushed evolve/run1-winner but opening the draft PR failed: gh: boom" in log_text(world)
+
+
+@pytest.mark.parametrize("error", [GitError(["status"], "boom"), OSError("boom"), EvolveError("boom")])
+def test_search_error_is_a_recorded_failure_with_a_spend_summary(world, error: Exception) -> None:
+    evo = ready(world)
+
+    def failing_search():
+        raise error
+
+    evo.search = failing_search
+    assert evo.run() == 1
+    text = log_text(world)
+    assert f"finish: run failed ({type(error).__name__}): " in text and "boom" in text
+    assert "spend: " in text
+
+
+def test_finish_without_a_nonseed_candidate_buys_nothing(world) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls and not [call for call in world.calls if call[0] == "test_a"]
+    assert world.pr.calls == [] and evo.finish_failure is None
+    assert "finish: no improvement (no non-seed candidate on the frontier)" in log_text(world)
+
+
+def test_dev_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    use_engine(monkeypatch)
+    assert main(world) == 0
+    monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-dev-b" if "dev_a" in str(task) else world.env)
+    labelled, calls, spawned = len(world.judge.labelled), len(world.calls), len(world.spawned)
+
+    assert main(world, "--run-id", "run2") == 2
+    assert (len(world.judge.labelled), len(world.calls), len(world.spawned)) == (labelled, calls, spawned)
+    assert "dev_a" in capsys.readouterr().err
 
 # --- AC-11: one ceiling, one ledger, one stop state ---
 
@@ -1234,6 +1306,7 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
         return real_plan(*args, **kwargs)
 
     monkeypatch.setattr(run, "run_plan", recording_plan)
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     evo.finish()
     assert set(reserve_at_finish) == {0.0}
     assert [call for call in world.calls if call[0] == "test_a"]
@@ -1270,6 +1343,8 @@ def test_stop_state_neutralizes_calls(world) -> None:
 
 def test_cli_change_mid_search_stops_the_run(world, monkeypatch: pytest.MonkeyPatch) -> None:
     evo = ready(world)
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     calls = len(world.calls)
     monkeypatch.setattr(run, "cli_version", lambda runner, *, fresh=False: "9.9.9" if fresh else "2.1.0")
 
@@ -1360,6 +1435,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
     assert paid == ["reflection"] * 4 + ["proposer"]
     assert evo.stop.reason == "quota"
     assert after_stop == []
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     calls = len(world.calls)
 
     assert evo.finish() is None
