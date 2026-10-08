@@ -655,6 +655,15 @@ def test_materializer_release_removes_one_worktree(world) -> None:
     materializer.cleanup()
     assert not other.exists()
 
+
+def test_same_candidate_gets_the_same_sha_across_runs(world) -> None:
+    first = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work1")
+    second = Materializer(world.repo, world.seed_sha, "run2", world.tmp / "work2")
+    candidate = child(first.seed, dev_a="1")
+
+    assert first.materialize(candidate) == second.materialize(candidate)
+
+
 def test_candidate_cells_use_candidate_binary(world) -> None:
     evo = ready(world)
     candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1")
@@ -1117,6 +1126,34 @@ def test_existing_winner_branch_is_a_logged_refusal(world) -> None:
     heads = git("ls-remote", "--heads", str(remote), "evolve/run1-winner", cwd=world.tmp)
     assert heads.split()[0] == world.seed_sha
 
+
+@pytest.mark.parametrize(("url", "expected"), [
+    ("https://github.com/acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("https://github.com/acme/tilth", ["--repo", "acme/tilth"]),
+    ("git@github.com:acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("ssh://git@github.com/acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("/srv/git/tilth.git", []),
+    ("https://example.com/acme/tilth.git", []),
+], ids=["https-git", "https", "scp", "ssh", "local-path", "other-host"])
+def test_create_draft_targets_the_remote_repo(world, url: str, expected: list[str]) -> None:
+    _remote(world)
+    git("remote", "set-url", "origin", url, cwd=world.repo)
+    gh: list[list[str]] = []
+    run_gh = lambda argv, **kwargs: gh.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "url\n", "")
+
+    GitHubPRClient(world.repo, remote="origin", run=run_gh).create_draft(base="main", head="h", title="t", body="b")
+
+    [argv] = gh
+    assert [argv[i:i + 2] for i in range(len(argv)) if argv[i] == "--repo"] == ([expected] if expected else [])
+
+
+def test_create_draft_omits_repo_when_the_remote_is_missing(world) -> None:
+    gh: list[list[str]] = []
+    run_gh = lambda argv, **kwargs: gh.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "url\n", "")
+
+    GitHubPRClient(world.repo, remote="nowhere", run=run_gh).create_draft(base="main", head="h", title="t", body="b")
+
+    assert "--repo" not in gh[0]
 
 
 def test_stopped_preflight_buys_no_baselines(world) -> None:
