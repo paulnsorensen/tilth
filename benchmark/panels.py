@@ -31,6 +31,8 @@ LOCAL = (*CHEAP, "gin_edit_render_context")
 # Per-language SWE-bench Multilingual slots: (primary, fallback).
 SLOTS: Mapping[str, tuple[str, str]] = external.swebench_ml.PICKS
 _SLOT_LANGUAGE = {instance_id: language for language, pair in SLOTS.items() for instance_id in pair}
+# Row fields that Panel.stamp writes; a reused row drops stored ones before the current stamp applies.
+STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 
 _PANEL_KEYS = {"name", "split_seed", "members"}
 _MEMBER_KEYS = {"id", "family", "language", "split"}
@@ -303,9 +305,9 @@ def load_panel(
     _check_complete(members)
     _check_languages(members, row_source or _cached_row)
     _check_split(members, split_seed)
-    _check_admitted(members, admit or external.preflight.admit)
     digest = split_digest(members)
     _check_lock(name, digest, store_path)
+    _check_admitted(members, admit or external.preflight.admit)
     by_split = {split: tuple(member.id for member in members if member.split == split) for split in SPLITS}
     return Panel(name=name, split_seed=split_seed, cheap=by_split["cheap"], dev=by_split["dev"],
                  test=by_split["test"], split_digest=digest, members=tuple(members))

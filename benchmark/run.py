@@ -817,9 +817,12 @@ def cell_identity(
     return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags}
 
 
+TRAJECTORY_RUNNERS = frozenset({"claude", "codex"})
+
+
 def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     """Write the tool-call sidecar beside a teed claude or codex stream."""
-    if runner not in {"claude", "codex"} or stream_log_path is None or not stream_log_path.is_file():
+    if runner not in TRAJECTORY_RUNNERS or stream_log_path is None or not stream_log_path.is_file():
         return None
     calls = extract_trajectory(stream_log_path.read_text(), runner)
     sidecar = stream_log_path.with_name(f"{stream_log_path.stem}.trajectory.jsonl")
@@ -1538,6 +1541,8 @@ Examples:
         parser.error("--arm-order-seed applies only to legacy modes")
     if args.panel and (args.tasks != "all" or args.repos.lower() != "all"):
         parser.error("--panel selects its own tasks; it cannot be combined with --tasks or --repos")
+    if args.panel_split != "all" and not args.panel:
+        parser.error("--panel-split requires --panel")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1554,6 +1559,9 @@ Examples:
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
         if args.panel:
+            if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
+                raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
+                                 "sidecar, so every panel row would count as contaminated")
             panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
             panel.register(TASKS)
             tasks_list = panel.select(args.panel_split)
@@ -1845,8 +1853,9 @@ Examples:
                     {} if isinstance(stored.get("contaminated"), bool)
                     else contamination_fields(stored.get("trajectory_path"), task)
                 )
+                unstamped = {key: value for key, value in stored.items() if key not in panels.STAMP_FIELDS}
                 record({
-                    **stored, **scanned, **experiment_metadata, "tilth_version": reported_version,
+                    **unstamped, **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "charged_usd": 0.0, "reused": True,
                 })

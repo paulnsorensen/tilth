@@ -111,6 +111,7 @@ python3 benchmark/run.py --panel benchmark/panels/gepa-v1.json --panel-split dev
 ```
 
 `panels.load_panel` is the only loader. It refuses an unknown key or family, a missing required member, a declared language that differs from the repo language or `external.language_of` on the dataset row, a hand-picked split, and any external member `external.preflight.admit` does not admit on this host.
+`--panel` accepts only Claude and Codex models: other runners write no trajectory sidecar, so every panel row would be `contaminated`.
 Every row of a panel run carries `panel_name`, `panel_split_digest`, and `panel_split` (not run-key inputs).
 The first completed stored row for a panel name locks its split: a later split change is refused; register it under a new panel name.
 `analyze.py` counts a `contaminated` panel row as incorrect, keeps it in its denominators, and tallies it per task and arm.
