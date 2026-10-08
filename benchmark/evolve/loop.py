@@ -155,7 +155,6 @@ class Evolution:
         self.deltas: list[dict] = []
         self.labels: dict[str, str] = {}
         self.calibrated = False
-        self.reserve = 0.0
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
@@ -249,12 +248,12 @@ class Evolution:
             except run.BaselineDrift as error:
                 return self.refuse(f"test split: {error}")
         per_finalist = self.finalist_test_cost()
-        if self.settings.max_usd < per_finalist:
-            return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} cannot cover one finalist's test-split cost "
-                               f"${per_finalist:.2f}; short by ${per_finalist - self.settings.max_usd:.2f}")
-        self.reserve = min(3 * per_finalist, self.settings.max_usd)
-        self.ledger.reserve = self.reserve
-        self.log(f"reserve: ${self.reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
+        reserve = 3 * per_finalist
+        if self.settings.max_usd <= reserve:
+            return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} must exceed the finish reserve ${reserve:.2f} "
+                               f"(3 x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
+        self.ledger.reserve = reserve
+        self.log(f"reserve: ${reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
 
         unlabeled = []
         for name in self.panel.select("all"):

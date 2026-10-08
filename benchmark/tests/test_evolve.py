@@ -1189,14 +1189,14 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
     warm.evaluate(warm.seed, "dev_a")
     client_calls.clear()
 
-    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.2", "--run-id", "run2", max_usd="1.0",
+    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.2", "--run-id", "run2", max_usd="1.3",
                 judge_factory=factory)
     judge_store.write_agreement(Agreement(calibrated=True, **judge_store.current_stamp()))
     monkeypatch.setattr(evo.judge, "calibrate",
                         lambda labels: Agreement(calibrated=True, label_kappa=0.9, verdict_kappa=0.9))
     assert evo.preflight() is None and evo.buy_baselines() is None
     evo.ledger.reserve = 0.4
-    evo.ledger.charge(0.5, source="search")
+    evo.ledger.charge(0.8, source="search")
 
     _score, info = evo.evaluate(evo.seed, "dev_a")
 
@@ -1214,13 +1214,23 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
     evo.finish()
     assert set(reserve_at_finish) == {0.0}
     assert [call for call in world.calls if call[0] == "test_a"]
-    assert evo.ledger.spent <= 1.0 + 1e-9
+    assert evo.ledger.spent <= 1.3 + 1e-9
 
 
 def test_insufficient_reserve_refuses_at_start(world, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(world, max_usd="0.15") != 0
     assert world.calls == [] and world.judge.labelled == [] and world.spawned == []
-    assert "$0.25" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "$0.15" in error and "$1.20" in error and "$0.40" in error
+
+
+def test_max_usd_equal_to_the_reserve_is_refused(world, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(world, max_usd="1.2") == 2
+    error = capsys.readouterr().err
+    assert "$1.20" in error and "$0.40" in error
+    assert world.calls == [] and world.judge.labelled == []
+
+    assert build(world, max_usd="1.25").preflight() is None
 
 
 def test_stop_state_neutralizes_calls(world) -> None:
