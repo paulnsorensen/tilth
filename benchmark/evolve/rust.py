@@ -5,7 +5,8 @@ from pathlib import PurePosixPath
 
 _CFG_ATTR = re.compile(r"#(!?)\[\s*(?:cfg|cfg_attr)\s*\(")
 _TEST_TOKEN = re.compile(r"\btest\b")
-_INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)!\s*([(\[{])")
+_INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)\s*!\s*([(\[{])")
+_PATH_ATTR = re.compile(r"#\s*!?\s*\[\s*path\s*=")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
 _STRING = r'("(?:[^"\\]|\\.)*")'
@@ -133,6 +134,12 @@ def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
         close = _match_brace(mask, match.end() - 1, {"(": "()", "[": "[]", "{": "{}"}[match[2]])
         found.append((_line(text, match.start()), _line(text, close), match[1], text[match.end():close].strip()))
     return found
+
+
+def path_attributes(text: str) -> list[int]:
+    """The first line of each ``#[path = ..]`` or ``#![path = ..]`` attribute, which can point a module outside the tree."""
+    mask = code_mask(text)
+    return [_line(text, match.start()) for match in _PATH_ATTR.finditer(mask)]
 
 
 def string_literal(source: str) -> str | None:
