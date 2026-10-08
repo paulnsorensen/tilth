@@ -57,8 +57,8 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-prompts/               MCP server instruction source (mcp.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
-AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
+prompts/               MCP server instruction source (mcp.md) and tool descriptions (tools/*.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
+AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/mcp.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
 ## Languages supported
@@ -163,6 +163,7 @@ Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed
 Server instructions sent via MCP protocol live in `prompts/`:
 
 - `prompts/mcp.md` — the one instruction file (wired in as `SERVER_INSTRUCTIONS`)
+- `prompts/tools/read.md`, `prompts/tools/search.md`, `prompts/tools/write.md` — the `tilth_read`, `tilth_search`, and `tilth_write` descriptions, loaded via `include_str!` in `src/mcp/tools/definitions.rs`. Each file holds the exact served bytes with no trailing newline. `tests/mcp_v2/test_tool_descriptions_stable.py` checks that `tools/list` serves each file byte for byte. `regen-agents-md.sh` does not read them.
 
 The server has one mode: it always registers `tilth_write` and serves tagged `tilth_read` output. `--edit` and `tilth install <host> --edit` are accepted for backwards compatibility and ignored.
 
