@@ -214,6 +214,13 @@ def test_calibrated_label_is_cached() -> None:
     assert len(client.prompts) == 1
 
 
+def test_analyze_import_leaves_judge_runner_unloaded() -> None:
+    probe = ("import sys, analyze, judge; assert 'judge.core' not in sys.modules; "
+             "assert judge.Judge is sys.modules['judge.core'].Judge; print('ok')")
+    result = subprocess.run([sys.executable, "-c", probe], cwd=BENCHMARK_DIR, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok\n"
+
 @pytest.mark.parametrize("torn_file", ["labels.jsonl", "agreements.jsonl"])
 def test_append_after_torn_tail_keeps_new_entry(torn_file: str) -> None:
     judge_config.JUDGE_DIR.mkdir(parents=True)
