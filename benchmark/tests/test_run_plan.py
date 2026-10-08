@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -395,3 +396,27 @@ def test_run_plan_native_failure_cost_is_both_cost_and_charge(world, monkeypatch
 
     assert (row["total_cost_usd"], row["charged_usd"], row["cost_source"]) == (0.7, 0.7, "native")
     assert ledger.spent == pytest.approx(0.7)
+
+
+def test_candidate_build_env_is_allowlisted(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, candidate, _builds = candidate_repo
+    for key, value in {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+                       "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_BASE_URL": "https://example.invalid",
+                       "MISE_GITHUB_TOKEN": "mise", "SCCACHE_DIR": "/tmp/sccache"}.items():
+        monkeypatch.setenv(key, value)
+    seen: list[dict] = []
+    inner = run._run_cargo
+
+    def spy(argv, *, cwd, env, **kwargs):
+        seen.append(dict(env))
+        return inner(argv, cwd=cwd, env=env, **kwargs)
+
+    monkeypatch.setattr(run, "_run_cargo", spy)
+    run.build_candidate(candidate, repo=repo)
+
+    [env] = seen
+    assert not {"CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY",
+                "ANTHROPIC_BASE_URL", "MISE_GITHUB_TOKEN"} & set(env)
+    assert env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
+    assert env["SCCACHE_DIR"] == "/tmp/sccache"
+    assert env["CARGO_TARGET_DIR"] == str(run.candidate_target_dir())

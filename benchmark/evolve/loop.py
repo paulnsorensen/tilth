@@ -336,6 +336,7 @@ class Evolution:
         if result.just_check_ok is None:
             ok, output = self.just_check(self.materializer.worktree(result.sha))
             result.just_check_ok, result.check_tail = ok, tail(output)
+            self.materializer.release(result.sha)
         if not result.just_check_ok:
             return result.fail("just check", result.check_tail)
         try:

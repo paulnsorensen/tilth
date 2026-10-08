@@ -1445,6 +1445,27 @@ class CandidateBuildFailed(RuntimeError):
 _CANDIDATE_BUILDS: dict[str, CandidateBuild] = {}
 
 
+_TOOL_ENV_KEYS = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "SHELL", "CARGO_HOME",
+                            "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "CARGO_INCREMENTAL"})
+_TOOL_ENV_PREFIXES = ("LC_", "XDG_", "MISE_", "SCCACHE_")
+_SECRET_MARKS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "AUTH")
+
+
+def build_tool_env() -> dict[str, str]:
+    """The allowlisted env for a candidate's build and checks: no token, key, or credential reaches proposer code.
+
+    The real HOME stays: cargo is a mise shim that resolves toolchains through HOME, and the caches live there.
+    Files under HOME stay readable to candidate code; a sandbox is a follow-up.
+    """
+    return {key: value for key, value in os.environ.items()
+            if (key in _TOOL_ENV_KEYS or key.startswith(_TOOL_ENV_PREFIXES))
+            and not any(mark in key.upper() for mark in _SECRET_MARKS)}
+
+
+def candidate_target_dir() -> Path:
+    return RESULTS_DIR / "candidates" / "target"
+
+
 def _run_cargo(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
 
@@ -1471,9 +1492,9 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
         head = _git("rev-parse", "HEAD", cwd=worktree).strip()
         if head != sha:
             raise RuntimeError(f"candidate worktree {worktree} is at {head}, not {sha}")
-        target_dir = RESULTS_DIR / "candidates" / "target"
+        target_dir = candidate_target_dir()
         build = _run_cargo(["cargo", "build", "--release", "--locked"], cwd=worktree,
-                           env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
+                           env={**build_tool_env(), "CARGO_TARGET_DIR": str(target_dir)})
         if build.returncode != 0:
             raise RuntimeError(f"cargo build --release --locked failed at {sha}:\n{(build.stderr or '')[-2000:]}")
         # The shared target dir is overwritten by the next build: keep this binary beside its sha.

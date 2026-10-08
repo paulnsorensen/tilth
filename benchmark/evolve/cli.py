@@ -36,7 +36,18 @@ from spend import SpendLedger  # noqa: E402
 
 
 def default_just_check(worktree: Path) -> tuple[bool, str]:
-    completed = subprocess.run(["just", "check"], cwd=worktree, capture_output=True, text=True)
+    """Run ``just check`` in an allowlisted env, with ``<worktree>/target`` linked to the shared candidate target dir.
+
+    A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
+    ``/target`` matches a symlink.
+    """
+    target = Path(worktree) / "target"
+    if not target.is_symlink() and not target.exists():
+        shared = run.candidate_target_dir()
+        shared.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(shared, target_is_directory=True)
+    completed = subprocess.run(["just", "check"], cwd=worktree, capture_output=True, text=True,
+                               env=run.build_tool_env())
     return completed.returncode == 0, completed.stdout + completed.stderr
 
 

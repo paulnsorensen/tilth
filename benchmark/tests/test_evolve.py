@@ -599,11 +599,37 @@ def test_same_candidate_materializes_once(world) -> None:
 
     sha = evo.results[candidates.content_id(candidate)].sha
     assert len([ref for ref in refs(world) if ref.endswith(candidates.content_id(candidate)[:12])]) == 1
-    assert sum(1 for path in world.checks if path == evo.materializer.worktree(sha)) == 1
+    cid = candidates.content_id(candidate)
+    assert sum(1 for path in world.checks if path.name == f"candidate-{cid[:12]}") == 1
     assert world.builds.count(sha) == 1
     rows = [row for row in world.stored() if row.get("git_sha") == sha]
     assert rows and {row["binary_sha256"] for row in rows} == {f"sha256-of-{sha}"}
 
+
+def test_cascade_releases_the_worktree_after_just_check(world) -> None:
+    evo = ready(world)
+    candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+
+    [checked] = [path for path in world.checks if path.name.startswith("candidate-")]
+    assert not checked.exists()
+    assert str(checked) not in git("worktree", "list", cwd=world.repo)
+    assert evo.results[candidates.content_id(candidate)].sha not in evo.materializer._worktrees
+
+
+def test_materializer_release_removes_one_worktree(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    sha = materializer.materialize(child(materializer.seed, dev_a="1"))
+    other = materializer.worktree(world.seed_sha)
+    kept = materializer.worktree(sha)
+
+    materializer.release(sha)
+
+    assert not kept.exists() and other.exists()
+    assert str(kept) not in git("worktree", "list", cwd=world.repo)
+    materializer.release(sha)
+    materializer.cleanup()
+    assert not other.exists()
 
 def test_candidate_cells_use_candidate_binary(world) -> None:
     evo = ready(world)
@@ -1455,3 +1481,35 @@ def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(run.ClaudeAuthError):
         evo.proposer.propose_src_patch(evo.seed, [])
     assert world.spawned == []
+
+
+_SECRET_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+               "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_BASE_URL": "https://example.invalid",
+               "MISE_GITHUB_TOKEN": "mise"}
+
+
+def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypatch: pytest.MonkeyPatch,
+                                                                      tmp_path: Path) -> None:
+    from evolve import cli
+    for key, value in _SECRET_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MISE_DATA_DIR", "/tmp/mise")
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert cli.default_just_check(worktree) == (True, "ok")
+
+    assert seen["argv"] == ["just", "check"]
+    assert not set(_SECRET_ENV) & set(seen["env"])
+    assert seen["env"]["PATH"] == os.environ["PATH"] and seen["env"]["HOME"] == os.environ["HOME"]
+    assert seen["env"]["MISE_DATA_DIR"] == "/tmp/mise" and "CARGO_TARGET_DIR" not in seen["env"]
+    link = worktree / "target"
+    assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
