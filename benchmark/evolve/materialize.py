@@ -108,6 +108,13 @@ class Materializer:
         self._worktrees.clear()
         subprocess.run(["git", "worktree", "prune"], cwd=self.repo, capture_output=True)
 
+    def release(self, sha: str) -> None:
+        """Remove the worktree of one candidate commit, as ``cleanup`` does for all of them."""
+        path = self._worktrees.pop(sha, None)
+        if path is not None:
+            subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=self.repo, capture_output=True)
+            shutil.rmtree(path, ignore_errors=True)
+
     def _add_worktree(self, path: Path, sha: str) -> Path:
         if path.exists():
             subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=self.repo, capture_output=True)
