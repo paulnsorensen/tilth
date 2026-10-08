@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -48,6 +48,7 @@ from config import (
     MODES,
     OPENCODE_CONFIG_HOME,
     OPENCODE_CONFIGS,
+    REPO_ROOT,
     REPOS,
     RESULTS_DIR,
     RUNNERS,
@@ -1411,6 +1412,307 @@ def _read_stream(stream_log_path: Path) -> str:
         return ""
 
 
+# --- The evolve loop's cell path (benchmark/evolve) ---
+
+
+class CellSpec(NamedTuple):
+    """One cell ``run_plan`` schedules; ``repetition`` is the row's 0-based repetition number."""
+
+    task: str
+    mode: str
+    model: str
+    repetition: int
+
+
+@dataclass(frozen=True)
+class CandidateBuild:
+    """A tilth binary built from one local commit."""
+
+    git_sha: str
+    binary_path: str
+    binary_sha256: str
+
+
+class PlanStopped(RuntimeError):
+    """``run_plan`` stopped: ``ceiling`` (spend), ``quota`` (usage limit), ``cli-version`` (the agent CLI changed
+    or stopped answering ``--version`` since the cell was planned) before a cell, or ``mcp-unavailable`` and
+    ``invalid-cell`` (a config-level failure that main aborts on) after the failed cell is stored.
+
+    ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
+    """
+
+    def __init__(self, reason: str, detail: str, rows: list[dict]) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.rows = rows
+
+
+class BaselineDrift(ValueError):
+    """A planned stock-arm cell has a completed stored row only under different key inputs."""
+
+
+class CandidateBuildFailed(RuntimeError):
+    """``run_plan`` could not build ``candidate_sha``; the message ends with the failing build output."""
+
+
+_CANDIDATE_BUILDS: dict[str, CandidateBuild] = {}
+
+
+_TOOL_ENV_KEYS = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "SHELL", "CARGO_HOME",
+                            "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "CARGO_INCREMENTAL"})
+_TOOL_ENV_PREFIXES = ("LC_", "XDG_", "MISE_", "SCCACHE_")
+_SECRET_MARKS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "AUTH")
+
+
+def build_tool_env() -> dict[str, str]:
+    """The allowlisted env for a candidate's build and checks: no token, key, or credential reaches proposer code.
+
+    The real HOME stays: cargo is a mise shim that resolves toolchains through HOME, and the caches live there.
+    Files under HOME stay readable to candidate code; a sandbox is a follow-up.
+    """
+    return {key: value for key, value in os.environ.items()
+            if (key in _TOOL_ENV_KEYS or key.startswith(_TOOL_ENV_PREFIXES))
+            and not any(mark in key.upper() for mark in _SECRET_MARKS)}
+
+
+def candidate_target_dir() -> Path:
+    return RESULTS_DIR / "candidates" / "target"
+
+
+def _run_cargo(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+def _git(*args: str, cwd: Path) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
+    """Build ``sha`` once per results dir: the binary and its digest are kept beside the sha and reused."""
+    directory = RESULTS_DIR / "candidates" / sha
+    binary, record = directory / "tilth", directory / "build.json"
+    if binary.is_file() and record.is_file():
+        built = json.loads(record.read_text())
+        if built.get("binary_sha256") == _file_sha256(binary):
+            return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=built["binary_sha256"])
+    # A stable checkout path per sha; the target dir is shared so dependencies build once.
+    worktree = directory / "src"
+    if worktree.exists():
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
+        shutil.rmtree(worktree, ignore_errors=True)
+    _git("worktree", "add", "--detach", str(worktree), sha, cwd=repo)
+    try:
+        head = _git("rev-parse", "HEAD", cwd=worktree).strip()
+        if head != sha:
+            raise RuntimeError(f"candidate worktree {worktree} is at {head}, not {sha}")
+        target_dir = candidate_target_dir()
+        build = _run_cargo(["cargo", "build", "--release", "--locked"], cwd=worktree,
+                           env={**build_tool_env(), "CARGO_TARGET_DIR": str(target_dir)})
+        if build.returncode != 0:
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\n{(build.stderr or '')[-2000:]}")
+        # The shared target dir is overwritten by the next build: keep this binary beside its sha.
+        shutil.copy2(target_dir / "release" / "tilth", binary)
+    finally:
+        # Never raise here: a cleanup failure must not hide the build error already propagating.
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
+    digest = _file_sha256(binary)
+    record.write_text(json.dumps({"git_sha": sha, "binary_sha256": digest}) + "\n")
+    return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=digest)
+
+
+def build_candidate(sha: str, *, repo: Path | None = None) -> CandidateBuild:
+    """Build tilth at the local commit ``sha`` of ``repo`` (default: this checkout) with
+    ``cargo build --release --locked``, once per full sha; a short or symbolic ref resolves to it first."""
+    repo = Path(repo or REPO_ROOT)
+    full = _git("rev-parse", "--verify", f"{sha}^{{commit}}", cwd=repo).strip()
+    if full not in _CANDIDATE_BUILDS:
+        _CANDIDATE_BUILDS[full] = _build_candidate(full, repo)
+    return _CANDIDATE_BUILDS[full]
+
+
+def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
+    return replace(mode, binary_path=build.binary_path, git_ref=build.git_sha, git_sha=build.git_sha,
+                   binary_sha256=build.binary_sha256)
+
+
+def planned_identity(cell: CellSpec) -> dict:
+    """The run key and key inputs of one ``run_plan`` cell: a bare, non-strict harness at the default budget."""
+    return cell_identity(cell.task, cell.mode, cell.model, cell.repetition, bare=True, reasoning_effort=None,
+                         max_budget_usd=DEFAULT_MAX_BUDGET_USD, strict_file_tools=False)
+
+
+def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[dict]) -> None:
+    drift = {}
+    for cell, identity in pending:
+        if is_stock_arm(MODES[cell.mode]):
+            changed = baselines.baseline_drift({
+                **identity, "task": cell.task, "model": MODELS[cell.model], "mode": cell.mode,
+                "repetition": cell.repetition, "reasoning_effort": None,
+            }, history)
+            if changed:
+                drift[f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"] = changed
+    if drift:
+        details = "; ".join(f"{slot}: {', '.join(fields)}" for slot, fields in drift.items())
+        raise BaselineDrift(f"stored baseline rows were recorded under different key inputs ({details}); "
+                            "pass --refreeze-baselines to re-run them")
+
+
+def check_baseline_drift(cells, *, panel: panels.Panel) -> None:
+    """Raise ``BaselineDrift`` when a stock-arm cell of ``cells`` that the store cannot answer drifted; runs nothing."""
+    panel.register(TASKS)
+    planned = [(cell, planned_identity(cell)) for cell in (CellSpec(*cell) for cell in cells)]
+    history = baselines.load_rows(RESULTS_DIR / baselines.STORE_FILENAME)
+    reusable = baselines.completed_by_key(history)
+    _refuse_baseline_drift([(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable],
+                           history)
+
+
+def run_plan(
+    cells,
+    *,
+    panel: panels.Panel,
+    ledger: SpendLedger,
+    candidate_sha: str | None,
+    refreeze_baselines: bool,
+    output: Path | None = None,
+    cell_estimate_usd: float = DEFAULT_MAX_BUDGET_USD,
+    store_only: bool = False,
+    repo: Path | None = None,
+) -> list[dict]:
+    """Run ``cells`` for one panel, answering each from the result store when it can.
+
+    Registers the panel's members in ``TASKS`` before planning any cell, and merges
+    ``panel.stamp(task)`` into every row before ``baselines.store``. Tilth arms are
+    served from the binary built at ``candidate_sha``. ``store_only`` returns only
+    stored rows and never starts a runner. Every row returned is also appended to
+    ``output``. ``repo`` holds ``candidate_sha`` (default: this checkout). Raises ``CandidateBuildFailed``
+    when ``candidate_sha`` does not build, ``BaselineDrift`` before any cell when a stock-arm cell
+    drifted without ``refreeze_baselines``, and ``PlanStopped`` when the ledger or
+    a usage limit stops it before a cell.
+    """
+    panel.register(TASKS)
+    cells = [CellSpec(*cell) for cell in cells]
+    saved: dict[str, ModeConfig] = {}
+    if candidate_sha is not None:
+        try:
+            build = build_candidate(candidate_sha, repo=repo)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            output = getattr(error, "stderr", None) or ""
+            raise CandidateBuildFailed(f"{error}\n{output}".strip()) from error
+        for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
+            saved[name] = MODES[name]
+            MODES[name] = candidate_mode(MODES[name], build)
+    try:
+        return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
+                         cell_estimate_usd=cell_estimate_usd, store_only=store_only)
+    finally:
+        MODES.update(saved)
+
+
+def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_baselines: bool,
+              output: Path | None, cell_estimate_usd: float, store_only: bool) -> list[dict]:
+    planned = [(cell, planned_identity(cell)) for cell in cells]
+    store_path = RESULTS_DIR / baselines.STORE_FILENAME
+    history = baselines.load_rows(store_path)
+    reusable = baselines.completed_by_key(history)
+    pending = [(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable]
+    if pending and not store_only:
+        if any(RUNNERS[cell.model] == "claude" for cell, _ in pending):
+            guard_claude_auth(os.environ)
+        if not refreeze_baselines:
+            _refuse_baseline_drift(pending, history)
+
+    rows: list[dict] = []
+    run_max_cost: float | None = None
+    stream_dir = RESULTS_DIR / "streams" / "plan"
+
+    def emit(row: dict) -> None:
+        rows.append(row)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("a") as out:
+                out.write(json.dumps(row) + "\n")
+
+    def settle(row: dict, amount: float) -> None:
+        nonlocal run_max_cost
+        if not isinstance(row.get("contaminated"), bool):
+            row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
+        row["charged_usd"] = amount
+        ledger.charge(amount, source=row.get("cost_source") or "native")
+        run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
+        baselines.store(row, path=store_path)
+        history.append(row)
+        emit(row)
+
+    for cell, identity in planned:
+        task = TASKS[cell.task]
+        mode = MODES[cell.mode]
+        stamp = panel.stamp(cell.task)
+        stored = reusable.get(identity["run_key"])
+        if stored is not None:
+            scanned = {} if isinstance(stored.get("contaminated"), bool) else contamination_fields(
+                stored.get("trajectory_path"), task)
+            emit({**stored, **scanned, **stamp, "variant": _variant_metadata(mode), "charged_usd": 0.0,
+                  "reused": True})
+            continue
+        if store_only:
+            continue
+        cell_id = f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"
+        estimate = estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=MODELS[cell.model],
+                                      run_max_cost=run_max_cost, fallback=cell_estimate_usd)
+        if ledger.would_cross(estimate):
+            raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${estimate:.4f} estimated for {cell_id} "
+                                         f"+ ${ledger.reserve:.4f} reserved exceeds ${ledger.max_usd}", rows)
+        runner = RUNNERS[cell.model]
+        # As in main: a mid-run CLI update must not run a cell under a key planned for the old version.
+        current_cli = cli_version(runner, fresh=True)
+        if current_cli != identity["cli_version"]:
+            raise PlanStopped("cli-version", f"{runner} --version probe failed before {cell_id}" if current_cli is None
+                              else f"{runner} was {identity['cli_version']!r} when planned, now {current_cli!r}", rows)
+        # A per-attempt suffix: a retried cell has the same key and must not overwrite its earlier sidecar.
+        attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
+                                        f"_{attempt}.jsonl")
+        metadata = {
+            "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
+            **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
+            "capability": getattr(task, "capability", None), "repetition": cell.repetition,
+            "variant": _variant_metadata(mode), **stamp, **identity, "reused": False,
+        }
+
+        def fail(fields: dict) -> None:
+            native = stream_native_cost(_read_stream(stream_log_path))
+            settle({**metadata, **fields, "correct": False,
+                    **({"total_cost_usd": native} if native is not None else {}),
+                    "cost_source": "native" if native is not None else "estimate",
+                    "trajectory_path": write_trajectory(stream_log_path, runner)},
+                   native if native is not None else estimate)
+
+        try:
+            result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
+                                bare=True, max_budget_usd=DEFAULT_MAX_BUDGET_USD)
+        except InvalidCodexCellError as error:
+            fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
+            raise PlanStopped("invalid-cell", str(error), rows) from error
+        except McpUnavailableError as error:
+            fail({"error": f"mcp_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
+            raise PlanStopped("mcp-unavailable", str(error), rows) from error
+        except subprocess.TimeoutExpired:
+            fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
+        except Exception as error:
+            quota = str(error) if isinstance(error, QuotaExhaustedError) else detect_quota_rejection(
+                _read_stream(stream_log_path))
+            if quota:
+                fail({"infra": "quota", "error": f"infra:quota: {quota}", "correctness_reason": f"Usage limit: {quota}"})
+                raise PlanStopped("quota", quota, rows) from error
+            fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
+        else:
+            result.update({**stamp, **identity, "variant": _variant_metadata(mode), "reused": False})
+            result.setdefault("trajectory_path", None)
+            settle(result, result["total_cost_usd"])
+    return rows
+
+
 def mcp_server_commands(mode_name: str, runner: str | None) -> dict[str, str]:
     """Return the server commands that the selected runner will launch."""
     mode = MODES[mode_name]
@@ -1503,6 +1805,10 @@ Examples:
         choices=["cheap", "dev", "test", "all"],
         default="all",
         help="Panel members to run (default: all)",
+    )
+    parser.add_argument(
+        "--candidate-sha",
+        help="Serve tilth arms from a binary built with cargo build --release --locked at this local commit",
     )
     arm_group = parser.add_mutually_exclusive_group()
     arm_group.add_argument(
@@ -1599,6 +1905,16 @@ Examples:
                 raise ValueError("wozcode mode requires --wozcode-plugin-dir")
     except ValueError as error:
         parser.error(str(error))
+    if args.candidate_sha:
+        if experiment is not None:
+            parser.error("--candidate-sha builds the tilth arm itself; it cannot be combined with --experiment")
+        try:
+            build = build_candidate(args.candidate_sha)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            parser.error(f"cannot build --candidate-sha {args.candidate_sha}: {error}")
+        for mode_name in modes:
+            if _is_tilth_arm(MODES[mode_name]):
+                MODES[mode_name] = candidate_mode(MODES[mode_name], build)
 
     # Verify the exact MCP command that each selected runner will launch.
     for mode_name in modes:

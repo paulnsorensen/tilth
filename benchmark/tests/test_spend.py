@@ -37,3 +37,16 @@ def test_unbounded_ledger_never_crosses() -> None:
 def test_negative_charge_refused() -> None:
     with pytest.raises(ValueError):
         SpendLedger(max_usd=1.0).charge(-0.1, source="native")
+
+
+def test_would_cross_counts_reserve() -> None:
+    ledger = SpendLedger(max_usd=1.0, reserve=0.3)
+    ledger.charge(0.5, source="native")
+
+    assert not ledger.would_cross(0.2)
+    assert ledger.would_cross(0.3)
+    ledger.reserve = 0.5
+    assert ledger.would_cross(0.1)
+    ledger.reserve = 0.0
+    assert not ledger.would_cross(0.5)
+    assert not SpendLedger(max_usd=None, reserve=10.0).would_cross(1_000.0)

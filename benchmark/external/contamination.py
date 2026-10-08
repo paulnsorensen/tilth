@@ -30,6 +30,7 @@ class _Rules:
     """What counts as a hit for one task's cell."""
 
     benchmark_roots: tuple[str, ...]
+    notes_roots: tuple[str, ...]
     data_roots: tuple[str, ...]
     foreign_roots: tuple[str, ...]
     upstream: re.Pattern | None
@@ -66,6 +67,7 @@ def _rules(task: object) -> _Rules:
         upstream = re.compile(hosts + re.escape(slug) + r"(?:\.git)?(?=$|[/\s'\"#?@:])", re.IGNORECASE)
     return _Rules(
         benchmark_roots=_roots(config.BENCHMARK_DIR),
+        notes_roots=_roots(config.REPO_ROOT / ".cheese"),
         data_roots=_roots(data.data_dir()),
         foreign_roots=_roots(config.REPOS_DIR) if isinstance(task, ExternalTask) else (),
         upstream=upstream,
@@ -139,6 +141,8 @@ def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
         for path in _paths(text):
             if _under(path, rules.benchmark_roots):
                 reasons.append("benchmark_tree")
+            elif _under(path, rules.notes_roots):
+                reasons.append("harness_notes")
             elif _under(path, rules.data_roots):
                 reasons.append("harness_data")
             elif _under(path, rules.foreign_roots):

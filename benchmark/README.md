@@ -132,6 +132,22 @@ Both spend flags are required whenever a call is uncached; judge calls share the
 The maintainer hand-labels `benchmark/judge/calibration.json` (`{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, verdict `apt`, `missed`, or `misapplied`): every task an analyzed run holds plus at least 20 clean, completed rollouts with trajectories.
 The judge is calibrated when unweighted Cohen's kappa reaches 0.6 on both labels and verdicts; until then critiques are withheld and `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
 
+## Evolution loop
+
+`benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits: the four `prompts/` instruction files plus a cumulative `src/**` patch on `--seed-sha`.
+Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`), passes `just check`, then a cheap tier and the panel's dev split; its score is grader correctness only, with contaminated rollouts counted incorrect.
+Reflection and the `src/` proposer are isolated `claude -p` calls that see only the judge's stripped records, never grader text or test-split rollouts.
+Baseline cells are bought once and answered from the result store afterwards; a candidate is accepted only after `--reruns` more rollouts, and finish scores the two best accepted candidates plus the seed once on the test split.
+
+```bash
+python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha "$(git rev-parse HEAD)" \
+  --base-branch main --max-usd 200 --max-metric-calls 60 --cell-estimate-usd 0.5
+```
+
+`--max-usd` is required and bounds every cell, judge, reflection, and proposer call; three finalists' test-split cost is held back for finish.
+A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
+Run logs, delta reports, and candidate worktrees live under the gitignored `benchmark/results/evolve/<run-id>/`.
+
 ## Larger Luna edit task
 
 `gin_edit_render_context` migrates Gin's renderer API to accept request context.
