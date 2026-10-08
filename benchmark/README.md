@@ -100,6 +100,22 @@ Python tests run in a grading venv built once per instance and environment finge
 
 Every row records `contaminated` and `contamination_hits`: a tool input that reads the `benchmark/` tree or the harness data directory, fetches the task's upstream repository or package, or, in an external cell, reads a clone under `/tmp/tilth_bench/repos/` is a hit. A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
 
+## Pre-registered panels
+
+A panel (`benchmark/panels/<name>.json`) is a fixed task set: the three local hard tasks as the cheap tier (`rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, dev-only), `gin_edit_render_context`, at least one FeatureBench Lite Level 1 instance, and one Go and one Rust SWE-bench Multilingual slot member (`gin-gonic__gin-3741` or its fallback `prometheus__prometheus-14861`; `sharkdp__bat-2650` or its fallback `tokio-rs__tokio-6724`, a fallback naming `fallback_for` and `fallback_reason`).
+The other members are split into dev and test by `panels.stratify`: within each source family, members sort by language and `sha256("<split_seed>:<id>")` and alternate dev, test.
+
+```bash
+python3 benchmark/run.py --panel benchmark/panels/gepa-v1.json --panel-split dev \
+  --models sonnet5 --modes baseline,tilth --reps 1 --max-usd 20
+```
+
+`panels.load_panel` is the only loader. It refuses an unknown key or family, a missing required member, a declared language that differs from the repo language or `external.language_of` on the dataset row, a hand-picked split, and any external member `external.preflight.admit` does not admit on this host.
+Every row of a panel run carries `panel_name`, `panel_split_digest`, and `panel_split` (not run-key inputs).
+The first completed stored row for a panel name locks its split: a later split change is refused; register it under a new panel name.
+`analyze.py` counts a `contaminated` panel row as incorrect, keeps it in its denominators, and tallies it per task and arm.
+`benchmark/tests/fixtures/panels/gepa-v1-rows/` holds redacted rows (`instance_id`, `repo`, `base_commit`) for the committed panel's language check; full rows stay in `$TILTH_BENCH_DATA`.
+
 ## Larger Luna edit task
 
 `gin_edit_render_context` migrates Gin's renderer API to accept request context.
