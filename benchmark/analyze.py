@@ -1056,7 +1056,11 @@ def statistical_analysis_section(valid_results: list[dict], all_results: list[di
 
 
 def _power_readout(all_results: list[dict]) -> list[str]:
-    """Report task-clustered paired accuracy and task-level power by model."""
+    """Report task-clustered paired accuracy and an informational power readout by model.
+
+    The readout no longer gates task-pool growth (PHASE4_PLAN.md is superseded by
+    the benchmark-gepa-overhaul spec); it only describes the observed power.
+    """
     modes = ordered_modes({
         run.get("mode")
         for run in all_results
@@ -1091,7 +1095,7 @@ def _power_readout(all_results: list[dict]) -> list[str]:
         lines.append("| — | — | — | — |")
     lines.extend([
         "",
-        "**Power readout by model:**",
+        "**Power readout by model (informational; not a task-growth gate):**",
         "_MDE@N is an optimistic single-proportion bound; the paired bootstrap "
         "interval is the inferential decision rule._",
         "",
@@ -1131,7 +1135,7 @@ def _power_readout(all_results: list[dict]) -> list[str]:
             if lo > 0 or hi < 0:
                 verdict = "effect SIGNIFICANT"
             elif abs(delta) < mde:
-                verdict = "N INSUFFICIENT for observed effect — grow TASK pool"
+                verdict = "N INSUFFICIENT for observed effect"
             else:
                 verdict = "CI includes zero — more data advised"
             lines.append(

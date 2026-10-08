@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+# The benchmark.* imports below resolve from the repository root.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from benchmark.tasks import TASKS
 from benchmark.tasks.gin_render_context_tasks import FIXTURE, SOURCE_FILES, ROOT_TEST_PATTERN, _grade_commands
