@@ -145,6 +145,21 @@ def test_task_ground_truth_feeds_the_key(monkeypatch: pytest.MonkeyPatch) -> Non
     assert _key() != before
 
 
+def test_wozcode_plugin_content_feeds_the_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Same version and path, new server code: only the plugin tree hash can move the key."""
+    plugin = tmp_path / "woz"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"version": "1.0.0"}))
+    (plugin / "servers").mkdir()
+    (plugin / "servers" / "code-server.cjs").write_text("console.log('a')\n")
+    monkeypatch.setitem(run.MODES, "wozcode", run.wozcode_mode(plugin))
+    before = _key(mode="wozcode")
+    (plugin / "servers" / "code-server.cjs").write_text("console.log('b')\n")
+    monkeypatch.setitem(run.MODES, "wozcode", run.wozcode_mode(plugin))
+
+    assert _key(mode="wozcode") != before
+
+
 # --- environment fingerprint (finding 6) ---
 
 

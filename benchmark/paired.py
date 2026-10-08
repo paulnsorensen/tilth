@@ -51,12 +51,14 @@ def load_runs(path: Path) -> list[dict]:
     return runs
 
 
-def _cost(run: dict):
-    """Run cost, or None for error records (which carry no cost).
+def measured_cost(run: dict):
+    """Run cost for cost-per-correct, or None when the row has no measured cost.
 
-    A pre-run spend estimate is a ledger charge, not a measured cost.
+    One rule for paired.py and analyze.py: an error row's spend never enters
+    cost-per-correct, even when it carries a native cost; the run's spend ledger
+    (``charged_usd``) bills it. A pre-run spend estimate is not a measured cost.
     """
-    if run.get("cost_source") == "estimate":
+    if "error" in run or run.get("cost_source") == "estimate":
         return None
     cost = run.get("total_cost_usd")
     return float(cost) if isinstance(cost, (int, float)) else None
@@ -90,8 +92,8 @@ def pair_modes(
             rep,
             bool(baseline.get("correct", False)),
             bool(experiment.get("correct", False)),
-            _cost(baseline),
-            _cost(experiment),
+            measured_cost(baseline),
+            measured_cost(experiment),
         ))
     return dict(pairs)
 
@@ -103,11 +105,11 @@ def pair_ab(runs: list[dict]) -> dict[tuple[str, str], list[tuple]]:
 
 def _cpc(runs: list[dict]) -> float:
     """Return total reported cost per correct result, or infinity."""
-    costed = [run for run in runs if _cost(run) is not None]
+    costed = [run for run in runs if measured_cost(run) is not None]
     correct = sum(1 for run in costed if run.get("correct", False))
     if not costed or correct == 0:
         return float("inf")
-    return sum(_cost(run) or 0.0 for run in costed) / correct
+    return sum(measured_cost(run) or 0.0 for run in costed) / correct
 
 
 def _matched_runs_by_task(

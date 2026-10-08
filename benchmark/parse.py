@@ -648,8 +648,10 @@ _USAGE_LIMIT_TEXT = re.compile(r"(?:you['’]ve hit your|usage limit reached)", 
 def detect_quota_rejection(raw: str) -> Optional[str]:
     """Return why a claude stream was rejected by a subscription usage limit, or None.
 
-    When the stream has a result, only the terminal result decides: it must carry
-    usage-limit text or a rate-limit subtype. A rejected rate_limit_event (for
+    When the stream has a result, only the terminal result decides: it must be an
+    error result (``is_error``) that carries usage-limit text or a rate-limit
+    subtype, so a successful answer that quotes a limit message is not quota. A
+    rejected rate_limit_event (for
     example an overage tier) on a stream that ended for another reason, such as
     ``error_max_budget_usd``, is not quota. A stream with no result event has only
     its rate_limit_events to decide by, so a rejected one there is quota.
@@ -664,6 +666,8 @@ def detect_quota_rejection(raw: str) -> Optional[str]:
                 return f"rejected {info.get('rateLimitType') or 'unknown'} rate limit"
         return None
     final = results[-1]
+    if final.get("is_error") is not True:
+        return None
     result_text = final.get("result")
     if isinstance(result_text, str) and _USAGE_LIMIT_TEXT.search(result_text):
         return result_text

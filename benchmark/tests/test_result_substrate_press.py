@@ -228,8 +228,21 @@ def test_estimated_failure_rows_carry_no_cost_into_paired_analysis(bench) -> Non
     assert bench.main("--tasks", "cell_a", *_ARGS, "--max-usd", "5", "--cell-estimate-usd", "0.3") == 0
     [row] = bench.output_rows()
 
-    assert paired._cost(row) is None
-    assert paired._cost({**row, "total_cost_usd": 0.3}) is None  # a pre-fix row tagged as an estimate
+    assert paired.measured_cost(row) is None
+    assert paired.measured_cost({**row, "total_cost_usd": 0.3}) is None  # a pre-fix row tagged as an estimate
+
+
+def test_failed_native_cost_row_never_counts_toward_cost_per_correct() -> None:
+    import analyze
+    import paired
+
+    ok = {"correct": True, "total_cost_usd": 0.2, "cost_source": "native"}
+    failed = {"correct": False, "total_cost_usd": 0.7, "cost_source": "native", "error": "error_max_budget_usd"}
+
+    assert paired.measured_cost(ok) == 0.2
+    assert paired.measured_cost(failed) is None
+    assert paired._cpc([ok, failed]) == pytest.approx(0.2)
+    assert analyze.cost_per_correct([ok, failed])[0] == pytest.approx(0.2)
 
 
 def test_reused_row_carries_the_current_variant_metadata(bench, monkeypatch: pytest.MonkeyPatch) -> None:
