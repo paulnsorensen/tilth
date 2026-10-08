@@ -25,6 +25,7 @@ from paired import (
     paired_cpc_delta as paired_cpc_delta_impl,
 )
 from pricing import PRICING_DATA, compute_cost_breakdown, pricing_staleness_warning
+from judge import config as judge_config, store as judge_store
 from tasks import TASKS
 
 
@@ -365,6 +366,62 @@ def _capability_section(results: list[dict], modes: list[str]) -> list[str]:
                 f"| {capability} | {mode_label(mode)} | {correctness_pct(runs):.0f}% | "
                 f"{_fmt_usd(cost_per_correct(runs)[0])} |"
             )
+    lines.append("")
+    return lines
+
+
+def _agreement_line(agreement: judge_store.Agreement | None) -> str:
+    if agreement is None:
+        return f"Judge agreement: uncalibrated, {judge_store.NO_RECORD_REASON}."
+    kappas = ", ".join(
+        f"{name} kappa {kappa:.2f} over {count} {unit}"
+        for name, kappa, count, unit in (
+            ("label", agreement.label_kappa, agreement.label_count, "tasks"),
+            ("verdict", agreement.verdict_kappa, agreement.verdict_count, "trajectories"),
+        )
+        if kappa is not None
+    )
+    measured = f" ({kappas}, threshold {agreement.threshold})" if kappas else f" (threshold {agreement.threshold})"
+    if agreement.calibrated:
+        return f"Judge agreement ({agreement.model}): calibrated{measured}."
+    return f"Judge agreement ({agreement.model}): uncalibrated, {agreement.reason}{measured}."
+
+
+def _applicability_section(results: list[dict], modes: list[str]) -> list[str]:
+    """Correctness and cost per correct by judge label, only when the judge is calibrated.
+
+    Reads the agreement record and label cache; never calls the judge.
+    """
+    agreement = judge_store.current_agreement()
+    summary = _agreement_line(agreement)
+    if agreement is None or not agreement.calibrated:
+        return ["## Applicability (uncalibrated)", "", summary, ""]
+    labels = judge_store.cached_labels(
+        run["task_digest"] for run in results if isinstance(run.get("task_digest"), str)
+    )
+    labelled = [
+        (run, labels.get(run.get("task_digest")) if run.get("task") in agreement.tasks else None)
+        for run in results
+    ]
+    unlabelled = sorted({str(run.get("task")) for run, label in labelled if label is None})
+    if unlabelled:
+        return [f"## Applicability (unlabelled: {', '.join(unlabelled)})", "", summary, ""]
+    lines = [
+        "## Applicability",
+        "",
+        summary,
+        "",
+        "| Label | Mode | Correctness | Cost/correct |",
+        "|---|---|---:|---:|",
+    ]
+    for label in judge_config.LABELS:
+        for mode in modes:
+            runs = [run for run, run_label in labelled if run.get("mode") == mode and run_label == label]
+            if runs:
+                lines.append(
+                    f"| {label} | {mode_label(mode)} | {correctness_pct(runs):.0f}% | "
+                    f"{_fmt_usd(cost_per_correct(runs)[0])} |"
+                )
     lines.append("")
     return lines
 
@@ -779,6 +836,7 @@ def generate_report(results: list[dict]) -> str:
         lines.extend([warning, ""])
     lines.extend(_headline_section(valid_results, modes))
     lines.extend(_capability_section(valid_results, modes))
+    lines.extend(_applicability_section(valid_results, modes))
     lines.extend(_control_section(valid_results, modes))
     lines.extend(_flags_section(results))
     lines.extend(_tool_usage_section(valid_results))

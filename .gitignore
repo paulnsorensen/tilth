@@ -38,6 +38,7 @@ benchmark/results/*.jsonl
 benchmark/results/*.md
 benchmark/results/*.log
 benchmark/results/streams/
+benchmark/results/judge/
 benchmark/results/configs/
 !benchmark/results/.gitkeep
 
