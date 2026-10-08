@@ -122,4 +122,16 @@ Retarget report links to the rebased archive commit, which remains in the PR his
 [^sept-large]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-results.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/luna56-render-context-invalid-attempt.md
 [^sept-strict]: https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-plan.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-strict-auth-failure.md; https://github.com/paulnsorensen/tilth/blob/2b17c3755589a4e89eccaf89c3309ea9591aaa82/benchmark/reports/2026-09-28-tilth-vs-wozcode/sonnet5-hybrid-stopped-results.md
 
-_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-09-29 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+## October 2026 GEPA overhaul gotchas
+
+The benchmark GEPA overhaul (PR #312) found these silent-failure modes. The guards that fix them are on [Benchmark GEPA loop invariants and guards](benchmark-gepa-invariants.md).
+
+- The `bare` variant flag means `--setting-sources ""`, not `claude --bare`. The real `--bare` ignores `CLAUDE_CODE_OAUTH_TOKEN`, so it breaks subscription runs (`benchmark/run.py:989-990`).
+- A quota rejection can arrive with no `result` event. Without a result event, a rejected `rate_limit_event` must classify as quota, or the run treats it as an ordinary error (`benchmark/parse.py:648`).
+- pytest-pretty hides the pytest summary line, so a gold patch scored 0 until the grader passed `-p no:pretty`.
+- FeatureBench environment builds fail unless install order and `set -e` match the upstream setup script.
+- Stored rows written before the `bare` field existed never fill a baseline slot. Their stock arms re-run instead of raising drift.
+- A benchmark cell that reads the checkout's `.cheese/` tree is contaminated (`harness_notes`): review notes and specs quote local-task ground-truth identifiers.
+- Phase-agent self-reviews missed blockers that independent mutation-tested reviews found; see [Multi-agent workflow notes](multi-agent-workflow-notes.md).
+
+_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82; PR #312 session archive verified at `e77a567` · Updated: 2026-10-08 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
