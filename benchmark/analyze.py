@@ -57,15 +57,53 @@ def format_cost_delta(baseline_costs: dict[str, float], tilth_costs: dict[str, f
     return f"{indent}{' '.join(parts)}"
 
 
+def is_contaminated_panel_row(result: dict) -> bool:
+    """A panel row whose agent saw benchmark or upstream grader material."""
+    return bool(result.get("panel_name")) and result.get("contaminated") is True
+
+
 def load_results(path: Path) -> list[dict]:
-    """Load JSONL results file."""
+    """Load JSONL results file.
+
+    A contaminated panel row counts as incorrect whatever its grader verdict; it
+    stays in its task and arm denominators. Rows without ``panel_name`` are unchanged.
+    """
     results = []
     with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
-                results.append(json.loads(line))
+                result = json.loads(line)
+                if is_contaminated_panel_row(result):
+                    result["correct"] = False
+                results.append(result)
     return results
+
+
+def _contaminated_section(results: list[dict], modes: list[str]) -> list[str]:
+    """Per-task and per-arm tally of contaminated panel rows (counted as incorrect)."""
+    panel_rows = [r for r in results if r.get("panel_name")]
+    if not panel_rows:
+        return []
+    lines = [
+        "## Contaminated panel rows",
+        "",
+        "Panel rows marked `contaminated` count as incorrect and stay in their denominators.",
+        "",
+        "| Task | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "---|" * len(modes),
+    ]
+
+    def tally(rows: list[dict], mode: str) -> str:
+        arm = [r for r in rows if r.get("mode") == mode]
+        return f"{sum(is_contaminated_panel_row(r) for r in arm)} / {len(arm)}"
+
+    for task in sorted({r.get("task", "unknown") for r in panel_rows}):
+        rows = [r for r in panel_rows if r.get("task", "unknown") == task]
+        lines.append(f"| {task} | " + " | ".join(tally(rows, mode) for mode in modes) + " |")
+    lines.append("| **All tasks** | " + " | ".join(tally(panel_rows, mode) for mode in modes) + " |")
+    lines.append("")
+    return lines
 
 
 def group_by(results: list[dict], *keys: str) -> dict:
@@ -746,6 +784,7 @@ def generate_report(results: list[dict]) -> str:
     lines.extend(_flags_section(results))
     lines.extend(_tool_usage_section(valid_results))
     lines.extend(_failure_taxonomy_section(results))
+    lines.extend(_contaminated_section(valid_results, modes))
     lines.extend([
         "## Context Efficiency",
         "",

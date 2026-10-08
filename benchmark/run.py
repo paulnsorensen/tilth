@@ -36,6 +36,7 @@ import baselines
 import external
 import external.contamination
 import external.preflight
+import panels
 from spend import SpendLedger
 from claude_bash_guard import allowed_command
 from config import (
@@ -826,9 +827,12 @@ def cell_identity(
     return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags}
 
 
+TRAJECTORY_RUNNERS = frozenset({"claude", "codex"})
+
+
 def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     """Write the tool-call sidecar beside a teed claude or codex stream."""
-    if runner not in {"claude", "codex"} or stream_log_path is None or not stream_log_path.is_file():
+    if runner not in TRAJECTORY_RUNNERS or stream_log_path is None or not stream_log_path.is_file():
         return None
     calls = extract_trajectory(stream_log_path.read_text(), runner)
     sidecar = stream_log_path.with_name(f"{stream_log_path.stem}.trajectory.jsonl")
@@ -1489,6 +1493,17 @@ Examples:
         default="all",
         help="Comma-separated task names or 'all' (default: all)",
     )
+    parser.add_argument(
+        "--panel",
+        type=Path,
+        help="Run a pre-registered panel (benchmark/panels/<name>.json); excludes --tasks and --repos",
+    )
+    parser.add_argument(
+        "--panel-split",
+        choices=["cheap", "dev", "test", "all"],
+        default="all",
+        help="Panel members to run (default: all)",
+    )
     arm_group = parser.add_mutually_exclusive_group()
     arm_group.add_argument(
         "--modes",
@@ -1534,10 +1549,15 @@ Examples:
             parser.error(f"{flag} must be a positive finite number")
     if args.experiment and args.arm_order_seed is not None:
         parser.error("--arm-order-seed applies only to legacy modes")
+    if args.panel and (args.tasks != "all" or args.repos.lower() != "all"):
+        parser.error("--panel selects its own tasks; it cannot be combined with --tasks or --repos")
+    if args.panel_split != "all" and not args.panel:
+        parser.error("--panel-split requires --panel")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment = None
+    panel = None
     try:
         models = select_models(args.models, args.runner)
         if args.strict_file_tools and any(RUNNERS[model] != "claude" for model in models):
@@ -1548,7 +1568,15 @@ Examples:
             if any(RUNNERS[model] != "claude" for model in models):
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
-        tasks_list = select_tasks(args.tasks)
+        if args.panel:
+            if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
+                raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
+                                 "sidecar, so every panel row would count as contaminated")
+            panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
+            panel.register(TASKS)
+            tasks_list = panel.select(args.panel_split)
+        else:
+            tasks_list = select_tasks(args.tasks)
         if args.experiment:
             experiment = load_experiment(args.experiment)
             configured_modes = experiment_modes(
@@ -1738,6 +1766,8 @@ Examples:
     print("tilth Benchmark Runner")
     print("=" * 70)
     print(f"Models:      {', '.join(models)}")
+    if panel:
+        print(f"Panel:       {panel.name} ({args.panel_split}, split {panel.split_digest[:12]})")
     print(f"Tasks:       {', '.join(tasks_list)}")
     print(f"Modes:       {', '.join(modes)}")
     repos_used = sorted(set(TASKS[t].repo for t in tasks_list))
@@ -1818,6 +1848,7 @@ Examples:
                 "arm_order_seed": experiment.arm_order_seed if experiment else args.arm_order_seed,
                 "arm_order": list(cell.arm_order),
                 "arm_order_index": cell.arm_index,
+                **(panel.stamp(task_name) if panel else {}),
             }
 
             stored = reusable.get(cell.run_key)
@@ -1832,8 +1863,9 @@ Examples:
                     {} if isinstance(stored.get("contaminated"), bool)
                     else contamination_fields(stored.get("trajectory_path"), task)
                 )
+                unstamped = {key: value for key, value in stored.items() if key not in panels.STAMP_FIELDS}
                 record({
-                    **stored, **scanned, **experiment_metadata, "tilth_version": reported_version,
+                    **unstamped, **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "charged_usd": 0.0, "reused": True,
                 })

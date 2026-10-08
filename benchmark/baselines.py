@@ -10,7 +10,7 @@ row it is given, keyed by run key, but only a completed row is reusable.
 import hashlib
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -122,6 +122,13 @@ def load_rows(path: Path) -> list[dict]:
     if skipped:
         print(f"warning: skipped {skipped} malformed line(s) in {path}", file=sys.stderr)
     return rows
+
+
+def rows(path: Path, *, panel_name: str | None = None) -> Iterator[dict]:
+    """Yield stored rows oldest first, only those stamped ``panel_name`` when given; never writes."""
+    for row in load_rows(path):
+        if panel_name is None or row.get("panel_name") == panel_name:
+            yield row
 
 
 def completed_by_key(rows: list[dict]) -> dict[str, dict]:
