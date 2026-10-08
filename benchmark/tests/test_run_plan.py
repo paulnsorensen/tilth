@@ -29,7 +29,7 @@ def cells(*tasks: str, mode: str = "baseline", reps: tuple[int, ...] = (0,)) -> 
 
 def plan(world, specs, *, ledger=None, sha=None, refreeze=False, **kwargs) -> list[dict]:
     return run.run_plan(specs, panel=world.panel, ledger=ledger or SpendLedger(100.0), candidate_sha=sha,
-                        refreeze_baselines=refreeze, **kwargs)
+                        refreeze_baselines=refreeze, **{"repo": world.repo, **kwargs})
 
 
 # --- c5 AC-8: rows stored through run_plan carry the panel stamp ---
@@ -259,6 +259,18 @@ def test_candidate_build_is_cached_on_disk_across_processes(candidate_repo, monk
     assert run.build_candidate(candidate, repo=repo) == first
     assert len(builds) == 1
     assert "candidates" not in git("worktree", "list", cwd=repo)
+
+
+def test_candidate_build_keys_on_the_full_sha(candidate_repo) -> None:
+    repo, candidate, builds = candidate_repo
+    git("branch", "cand", candidate, cwd=repo)
+    builds_by_ref = [run.build_candidate(ref, repo=repo) for ref in (candidate[:10], "cand", candidate)]
+
+    assert len(builds) == 1
+    assert all(build == builds_by_ref[0] for build in builds_by_ref)
+    assert builds_by_ref[0].git_sha == candidate
+    assert (run.RESULTS_DIR / "candidates" / candidate / "tilth").is_file()
+    assert [path.name for path in (run.RESULTS_DIR / "candidates").iterdir() if path.name != "target"] == [candidate]
 
 
 def test_candidate_cells_record_candidate_identity(world) -> None:
