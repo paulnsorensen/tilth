@@ -10,7 +10,7 @@ from statistics import mean
 
 import run
 from jsonl import tolerant_jsonl
-from parse import detect_quota_rejection, stream_native_cost
+from parse import detect_quota_rejection, parse_stream_json, stream_native_cost
 from spend import SpendLedger
 
 STOP_REASONS = ("ceiling", "quota", "plateau", "cli-version", "mcp-unavailable", "invalid-cell")
@@ -76,6 +76,18 @@ class PaidCalls:
     def total(self, kind: str) -> float:
         return sum(self.costs.get(kind, ()))
 
+    @staticmethod
+    def _cost(stdout: str, argv: list[str], estimate: float) -> tuple[float, str]:
+        """The native cost, else the priced stream, else the estimate; the second value names the source."""
+        native = stream_native_cost(stdout)
+        if native is not None:
+            return native, "native"
+        model = argv[argv.index("--model") + 1] if "--model" in argv[:-1] else None
+        try:
+            priced = parse_stream_json(stdout, model).total_cost_usd
+        except ValueError:
+            priced = 0.0
+        return (priced, "pricing") if priced else (estimate, "estimate")
     def call(self, kind: str, argv: list[str], prompt: str, cwd: Path) -> CallOutcome | None:
         """Run one isolated ``claude -p`` with ``prompt`` on stdin; None when it did not start or failed."""
         run.guard_claude_auth(os.environ)
@@ -87,6 +99,10 @@ class PaidCalls:
                      f"${self.ledger.reserve:.4f} reserved exceeds ${self.ledger.max_usd}")
             self.stop.set("ceiling")
             return None
+        if self.ledger.max_usd is not None:
+            # The CLI itself stops a call before it spends past what the run has left.
+            headroom = self.ledger.max_usd - self.ledger.spent - self.ledger.reserve
+            argv = [*argv, "--max-budget-usd", f"{headroom:.4f}"]
         env = run.build_runner_env("claude", tilth_bin=None)
         with tempfile.TemporaryDirectory(prefix=f"tilth-{kind}-config-") as config_dir:
             env["CLAUDE_CONFIG_DIR"] = config_dir
@@ -98,9 +114,8 @@ class PaidCalls:
                 output = error.stdout
                 stdout = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
                 returncode = None
-        native = stream_native_cost(stdout)
-        cost = native if native is not None else estimate
-        self.ledger.charge(cost, source=f"{kind}:{'native' if native is not None else 'estimate'}")
+        cost, source = self._cost(stdout, argv, estimate)
+        self.ledger.charge(cost, source=f"{kind}:{source}")
         self.costs.setdefault(kind, []).append(cost)
         quota = detect_quota_rejection(stdout)
         if quota:

@@ -1523,3 +1523,55 @@ def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypa
     assert seen["env"]["MISE_DATA_DIR"] == "/tmp/mise" and "CARGO_TARGET_DIR" not in seen["env"]
     link = worktree / "target"
     assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
+
+
+# --- paid calls: the CLI budget flag and the cost sources ---
+
+_HAIKU = "claude-haiku-4-5-20251001"
+
+
+def _paid(spawn, ledger):
+    from evolve.calls import PaidCalls, StopState
+    return PaidCalls(ledger, StopState(), 0.3, spawn=spawn, log=lambda _line: None)
+
+
+def _usage_stream(*, input_tokens: int = 1_000_000, output_tokens: int = 100_000) -> str:
+    events = [{"type": "assistant", "message": {"id": "m1", "content": [], "usage": {
+        "input_tokens": input_tokens, "output_tokens": output_tokens}}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def test_paid_call_passes_the_remaining_headroom_to_the_cli(world, tmp_path: Path) -> None:
+    from spend import SpendLedger
+    seen: list[list[str]] = []
+
+    def spawn(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, result_stream("ok", cost=0.01), "")
+
+    ledger = SpendLedger(2.0, reserve=0.5)
+    ledger.charge(0.25, source="cells")
+    assert _paid(spawn, ledger).call("reflection", ["claude", "-p"], "prompt", tmp_path) is not None
+    assert seen[0][-2:] == ["--max-budget-usd", "1.2500"]
+
+    unbounded = []
+    _paid(lambda argv, **kw: unbounded.append(list(argv)) or subprocess.CompletedProcess(
+        argv, 0, result_stream("ok"), ""), SpendLedger(None)).call("reflection", ["claude", "-p"], "p", tmp_path)
+    assert "--max-budget-usd" not in unbounded[0]
+
+
+@pytest.mark.parametrize(("stream", "cost", "source"), [
+    (result_stream("ok", cost=0.07), 0.07, "reflection:native"),
+    (_usage_stream(), 1.5, "reflection:pricing"),
+    (_usage_stream(input_tokens=0, output_tokens=0), 0.3, "reflection:estimate"),
+    ("not json\n", 0.3, "reflection:estimate"),
+], ids=["native", "pricing", "zero-priced", "unparseable"])
+def test_paid_call_cost_source(world, tmp_path: Path, stream: str, cost: float, source: str) -> None:
+    from spend import SpendLedger
+    ledger = SpendLedger(100.0)
+    paid = _paid(lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stream, ""), ledger)
+
+    paid.call("reflection", ["claude", "-p", "--model", _HAIKU], "prompt", tmp_path)
+
+    assert ledger.charges == [(pytest.approx(cost), source)]
