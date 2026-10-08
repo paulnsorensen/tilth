@@ -88,7 +88,7 @@ def test_build_runner_env_allowlists_ambient_environment(
         for key, value in ambient.items()
         if (key in _RUNTIME_KEYS
             or key == "CODEX_API_KEY"
-            or key.startswith(("ANTHROPIC_", "OPENAI_", "OPENROUTER_", "LC_")))
+            or key.startswith(("OPENAI_", "OPENROUTER_", "LC_")))
         and key not in billing
     }
     expected["PATH"] = f"/opt/tilth/bin{os.pathsep}{ambient['PATH']}"
@@ -392,6 +392,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         "plugin_dir": None,
         "plugin_version": None,
         "plugin_git_sha": None,
+        "plugin_sha256": None,
         "repository": "https://github.com/example/tilth",
         "git_ref": "feature/candidate",
         "git_sha": "a" * 40,
@@ -545,6 +546,12 @@ def test_codex_invalid_cell_aborts_schedule(monkeypatch: pytest.MonkeyPatch, tmp
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run, "reset_repo", lambda: None)
+    fake_tilth = tmp_path / "bin" / "tilth"
+    fake_tilth.parent.mkdir()
+    fake_tilth.write_text("#!/bin/sh\necho 'tilth 0.0.0'\n")
+    fake_tilth.chmod(0o755)
+    monkeypatch.setattr(run, "TILTH_BIN", str(fake_tilth))
+    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], binary_path=str(fake_tilth)))
     calls = []
     def invalid(*_args, **_kwargs):
         calls.append(1)
@@ -1580,26 +1587,26 @@ def test_claude_auth_guard_refuses_api_billing_credentials(key: str) -> None:
         run.build_runner_env("claude", ambient={"PATH": "/usr/bin", key: "sk-ant-secret"}, tilth_bin=None)
 
 
-@pytest.mark.parametrize("runner", ["codex", "opencode"])
-def test_anthropic_api_credentials_never_reach_a_runner(runner: str) -> None:
-    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-ant-api", "ANTHROPIC_AUTH_TOKEN": "bearer",
-               "ANTHROPIC_BASE_URL": "https://proxy.example"}
+@pytest.mark.parametrize("runner", ["claude", "codex", "opencode"])
+def test_no_anthropic_variable_reaches_a_runner(runner: str) -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_BASE_URL": "https://proxy.example",
+               "ANTHROPIC_MODEL": "claude-sonnet-5", "ANTHROPIC_CUSTOM_HEADERS": "x-key: 1",
+               "ANTHROPIC_EMPTY": ""}
+    if runner != "claude":
+        ambient.update({"ANTHROPIC_API_KEY": "sk-ant-api", "ANTHROPIC_AUTH_TOKEN": "bearer"})
 
     env = run.build_runner_env(runner, ambient=ambient, tilth_bin=None,
                                opencode_config="/controlled/opencode.json" if runner == "opencode" else None)
 
-    assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
-    assert env["ANTHROPIC_BASE_URL"] == "https://proxy.example"
+    assert not any(key.startswith("ANTHROPIC_") for key in env)
 
 
-def test_empty_anthropic_values_are_dropped_not_refused() -> None:
-    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "",
-               "ANTHROPIC_BASE_URL": "", "ANTHROPIC_MODEL": "claude-sonnet-5"}
+def test_empty_anthropic_api_keys_do_not_refuse_a_claude_cell() -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
 
     env = run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
 
-    assert not any(key.startswith("ANTHROPIC_") and key != "ANTHROPIC_MODEL" for key in env)
-    assert env["ANTHROPIC_MODEL"] == "claude-sonnet-5"
+    assert not any(key.startswith("ANTHROPIC_") for key in env)
 
 
 def test_auth_token_refuses_claude_cell(bench, monkeypatch: pytest.MonkeyPatch,

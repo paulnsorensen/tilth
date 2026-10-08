@@ -551,6 +551,15 @@ def test_quota_rejection_is_detected_from_limit_result_text():
     assert detect_quota_rejection(json.dumps(event))
 
 
+def test_successful_result_quoting_a_limit_message_is_not_quota():
+    from parse import detect_quota_rejection
+
+    event = {"type": "result", "is_error": False, "result": "The log said: usage limit reached"}
+    assert detect_quota_rejection(json.dumps(event)) is None
+    del event["is_error"]
+    assert detect_quota_rejection(json.dumps(event)) is None
+
+
 def test_claude_trajectory_pairs_untruncated_inputs_and_outputs():
     from parse import extract_trajectory
 
