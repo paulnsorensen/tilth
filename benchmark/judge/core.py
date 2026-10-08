@@ -425,8 +425,10 @@ class Judge:
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f})")
         reply = self.client(prompt)
         if reply.quota is not None or reply.error is not None:
-            native = reply.cost if reply.cost is not None and reply.cost_source == "native" else None
-            self._charge(native if native is not None else estimate, "estimate")
+            if reply.cost is not None and reply.cost_source == "native":
+                self._charge(reply.cost, "native")
+            else:
+                self._charge(estimate, "estimate")
             if reply.quota is not None:
                 _quota_reason = reply.quota
                 raise JudgeQuota(reply.quota)
