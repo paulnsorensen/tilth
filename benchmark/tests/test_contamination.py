@@ -70,6 +70,19 @@ def test_benchmark_tree_read_marks_local_task(tmp_path: Path, monkeypatch: pytes
         assert reasons(path, task) == ["benchmark_tree"], tool_input
 
 
+def test_harness_notes_read_marks_contaminated(tmp_path: Path) -> None:
+    """Review notes under the checkout's .cheese/ can quote ground truth, so reading them is contamination."""
+    notes = config.REPO_ROOT / ".cheese" / "archive" / "notes.md"
+    inputs = [
+        ("Read", {"file_path": str(notes)}),
+        ("Bash", {"command": f"grep -r required_strings {config.REPO_ROOT / '.cheese'}"}),
+    ]
+    for task in (TASKS["rg_search_dispatch"], TASKS["gin_edit_render_context"]):
+        for tool_input in inputs:
+            path = sidecar(tmp_path, tool_input)
+            assert reasons(path, task) == ["harness_notes"], tool_input
+
+
 def test_harness_data_read_marks_contaminated(external_bench, tmp_path: Path) -> None:
     rows = external.data.data_dir() / "rows"
     path = sidecar(tmp_path, ("Bash", {"command": f"grep -r FAIL_TO_PASS {rows}"}))
