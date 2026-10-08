@@ -1509,10 +1509,12 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
 
 def build_candidate(sha: str, *, repo: Path | None = None) -> CandidateBuild:
     """Build tilth at the local commit ``sha`` of ``repo`` (default: this checkout) with
-    ``cargo build --release --locked``, once per sha."""
-    if sha not in _CANDIDATE_BUILDS:
-        _CANDIDATE_BUILDS[sha] = _build_candidate(sha, Path(repo or REPO_ROOT))
-    return _CANDIDATE_BUILDS[sha]
+    ``cargo build --release --locked``, once per full sha; a short or symbolic ref resolves to it first."""
+    repo = Path(repo or REPO_ROOT)
+    full = _git("rev-parse", "--verify", f"{sha}^{{commit}}", cwd=repo).strip()
+    if full not in _CANDIDATE_BUILDS:
+        _CANDIDATE_BUILDS[full] = _build_candidate(full, repo)
+    return _CANDIDATE_BUILDS[full]
 
 
 def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
@@ -1890,7 +1892,7 @@ Examples:
             parser.error("--candidate-sha builds the tilth arm itself; it cannot be combined with --experiment")
         try:
             build = build_candidate(args.candidate_sha)
-        except (RuntimeError, subprocess.CalledProcessError) as error:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             parser.error(f"cannot build --candidate-sha {args.candidate_sha}: {error}")
         for mode_name in modes:
             if _is_tilth_arm(MODES[mode_name]):
