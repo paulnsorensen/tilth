@@ -163,8 +163,9 @@ class Materializer:
             except ValueError as error:
                 raise ApplyRejected(f"{BYTE_LOCK_FILE}: {error}") from error
         git("add", "-A", cwd=worktree)
-        git("commit", "-q", "--allow-empty", "--no-verify", "-m", f"evolve {self.run_id}: candidate {cid[:12]}",
-            cwd=worktree)
+        stamp = f"@{git('log', '-1', '--format=%ct', self.seed_sha, cwd=worktree).strip()} +0000"
+        git("commit", "-q", "--allow-empty", "--no-verify", "-m", f"evolve: candidate {cid[:12]}", cwd=worktree,
+            env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
         return git("rev-parse", "HEAD", cwd=worktree).strip()
 
     def _seed_text(self, path: str) -> str | None:
