@@ -119,8 +119,27 @@ def _copy_changes(workdir: Path, checkout: Path) -> None:
         (checkout / relative).unlink()
 
 
-def write_or_remove(target: Path, content: bytes | None) -> None:
-    """Set ``target`` to ``content``, or remove it when ``content`` is None."""
+def checkout_path(root: Path, relative: str) -> Path:
+    """``root / relative`` for a row-supplied path, never outside ``root``.
+
+    Raises PrepareError for an absolute path or a ``..`` component. A symlink at
+    a directory component (one the agent left) is removed, so a write through
+    the returned path cannot follow it out of ``root``.
+    """
+    parts = PurePosixPath(relative).parts
+    if not parts or relative.startswith("/") or ".." in parts:
+        raise PrepareError(f"unsafe path in the row: {relative!r}")
+    current = root
+    for part in parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            current.unlink()
+    return root.joinpath(*parts)
+
+
+def write_or_remove(root: Path, relative: str, content: bytes | None) -> None:
+    """Set ``root / relative`` to ``content``, or remove it when ``content`` is None."""
+    target = checkout_path(root, relative)
     if target.is_symlink() or target.is_file():
         target.unlink()
     if content is not None:
@@ -316,7 +335,10 @@ class ExternalTask(Task):
             raise PrepareError(f"git archive {self.base_commit} failed: {archive.stderr.decode()[-500:]}")
         dest.mkdir(parents=True, exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tree:
-            tree.extractall(dest, filter="tar")
+            try:
+                tree.extractall(dest, filter="data")
+            except tarfile.TarError as error:
+                raise PrepareError(f"git archive {self.base_commit} does not extract safely: {error}") from error
         self.apply_mask(dest)
 
     def prepare_tree(self, workdir: Path) -> None:
@@ -334,9 +356,8 @@ class ExternalTask(Task):
 
     def build_env(self, workdir: Path, venv: Path | None = None) -> None:
         """Build the native environment: a uv venv (``<workdir>/.venv`` by default), or the host Go or Rust
-        toolchain's dependencies."""
+        toolchain's dependencies. Steps run under ``proc.toolchain_env`` with a throwaway HOME."""
         venv = venv or workdir / ".venv"
-        env = {**os.environ, "VIRTUAL_ENV": str(venv), "PATH": f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"}
         if self.language == "go":
             steps = [["go", "mod", "download"]]
         elif self.language == "rust":
@@ -345,16 +366,19 @@ class ExternalTask(Task):
             version = ["--python", self.python_version] if self.python_version else []
             steps = [["uv", "venv", *version, str(venv)]]
             steps += [_install_argv(step, venv) for step in self.install_steps()]
-        for argv in steps:
-            if _command_names(argv) & _CONTAINER_TOOLS:
-                raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
-            try:
-                result = proc.run(argv, cwd=workdir, env=env, timeout=_ENV_STEP_TIMEOUT_S)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                raise EnvBuildError(f"{shlex.join(argv)}: {error}") from error
-            if result.returncode:
-                raise EnvBuildError(f"{shlex.join(argv)} exited {result.returncode}: "
-                                    f"{(result.stderr or result.stdout).strip()[-800:]}")
+        with tempfile.TemporaryDirectory(prefix="tilth-external-home-") as home:
+            env = proc.toolchain_env(Path(home))
+            env.update(VIRTUAL_ENV=str(venv), PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
+            for argv in steps:
+                if _command_names(argv) & _CONTAINER_TOOLS:
+                    raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
+                try:
+                    result = proc.run(argv, cwd=workdir, env=env, timeout=_ENV_STEP_TIMEOUT_S)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    raise EnvBuildError(f"{shlex.join(argv)}: {error}") from error
+                if result.returncode:
+                    raise EnvBuildError(f"{shlex.join(argv)} exited {result.returncode}: "
+                                        f"{(result.stderr or result.stdout).strip()[-800:]}")
 
     def prepare(self, workdir: Path) -> None:
         """The run.py hook: build the agent's workdir and its native environment."""
@@ -398,12 +422,13 @@ class ExternalTask(Task):
             name = PurePosixPath(relative).name
             if name not in _PYTEST_CONFIG_NAMES and name != "pyproject.toml":
                 continue
-            base, target = self.base_file(relative), checkout / relative
+            base = self.base_file(relative)
             if name == "pyproject.toml":
+                target = checkout_path(checkout, relative)
                 current = target.read_bytes() if target.is_file() else b""
                 if b"[tool.pytest" not in current + (base or b""):
                     continue
-            write_or_remove(target, base)
+            write_or_remove(checkout, relative, base)
 
     @abstractmethod
     def test_output(self, checkout: Path) -> str:
@@ -413,13 +438,20 @@ class ExternalTask(Task):
     def entry_results(self, output: str) -> dict[str, bool]:
         """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether it passed."""
 
+    def grade_env(self, checkout: Path) -> dict[str, str]:
+        """``proc.toolchain_env`` with a fresh HOME beside ``checkout``, for running the held-out tests."""
+        home = checkout.with_name(f"{checkout.name}-home")
+        home.mkdir(exist_ok=True)
+        return proc.toolchain_env(home)
+
     def grading_env(self, checkout: Path) -> dict[str, str]:
         """The grading venv's environment, importing the project from ``checkout`` before the venv's install."""
         venv = self.grade_venv()
+        env = self.grade_env(checkout)
         sources = [str(path) for path in (checkout, checkout / "src") if path.is_dir()]
-        python_path = os.pathsep.join([*sources, *filter(None, [os.environ.get("PYTHONPATH")])])
-        return {**os.environ, "VIRTUAL_ENV": str(venv), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": python_path,
-                "PATH": f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"}
+        env.update(VIRTUAL_ENV=str(venv), PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=os.pathsep.join(sources),
+                   PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
+        return env
 
     def _count(self, results: Mapping[str, bool]) -> dict[str, float | int]:
         f2p = sum(bool(results.get(entry)) for entry in self.fail_to_pass)

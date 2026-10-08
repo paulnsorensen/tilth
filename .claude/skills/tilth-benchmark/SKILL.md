@@ -70,7 +70,7 @@ python benchmark/run.py \
 
    `--max-usd` is required whenever any cell is not answered from the result store; without it `run.py` exits before any model call. It caps the whole run's spend, including failed cells. The runner stops before the cell whose estimate would cross the ceiling and exits nonzero; re-running the same command resumes and reuses completed cells.
 
-9. Capture the result path printed by the runner. The runner records cell failures and finishes the schedule, so a zero exit code is not evidence of a valid run.
+9. Capture the result path printed by the runner. The runner records cell failures and finishes the schedule, so a zero exit code is not evidence of a valid run. The runner stops early with a nonzero exit when the spend ceiling is reached, a usage limit rejects a cell (`infra: quota`), or the agent CLI version changes after planning; it aborts on an invalid Codex cell or an unavailable MCP server. After an early stop, re-run the same command: completed cells are reused and the run resumes, with a fresh `--max-usd` ceiling.
 10. Validate the result before analysis:
 
 ```bash
