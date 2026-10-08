@@ -311,7 +311,8 @@ LIB = "pub mod mcp;\npub mod edit;\n\npub fn lib_marker() -> u8 {\n    1\n}\n"
     'pub const P: &str = include_str!(env!("HOME"));',
     "pub const P: &str = include_str!(PATH);",
     'pub const P: &str = include_str!["../Cargo.toml"];',
-], ids=["parent", "multiline-bytes", "absolute", "concat-env", "env", "not-a-literal", "brackets"])
+    'pub const P: &str = include_str ! ("../Cargo.toml");',
+], ids=["parent", "multiline-bytes", "absolute", "concat-env", "env", "not-a-literal", "brackets", "spaced-bang"])
 def test_rejects_include_outside_src_and_prompts(world, line: str) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     patch = patch_for(world, {"src/lib.rs": LIB + line + "\n"})
@@ -321,6 +322,28 @@ def test_rejects_include_outside_src_and_prompts(world, line: str) -> None:
     assert refs(world) == []
 
 
+@pytest.mark.parametrize("attribute", [
+    '#[path = "../../outside.rs"]',
+    '#[ path="../../outside.rs" ]',
+    '#\n[\npath = "../../outside.rs"]',
+    '#![path = "../../outside.rs"]',
+], ids=["outer", "spaced", "split", "inner"])
+def test_rejects_path_attribute_without_naming_the_harness(world, attribute: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\nmod outside;\n"})
+
+    with pytest.raises(ApplyRejected, match=r"#\[path\] attribute") as rejected:
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert "benchmark" not in rejected.value.tail.lower()
+    assert refs(world) == []
+
+
+def test_path_word_in_a_comment_or_string_is_kept(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    lines = '// #[path = "x.rs"] is not used here\npub const P: &str = "#[path = \\"x.rs\\"]";\n'
+    sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
+    assert sha != world.seed_sha
+
 def test_includes_inside_src_and_prompts_are_kept(world) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     lines = 'pub const A: &str = include_str!("main.rs");\npub const B: &str = include_str!("../prompts/mcp.md");\n'
@@ -328,7 +351,7 @@ def test_includes_inside_src_and_prompts_are_kept(world) -> None:
     assert "include_str!(\"main.rs\")" in git("show", f"{sha}:src/lib.rs", cwd=world.repo)
 
 
-@pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "TILTH_BENCH_DATA",
+@pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA",
                                   "panel-path", "panel-name", "data-dir"])
 def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, term: str) -> None:
     data = world.tmp / "harness-data"

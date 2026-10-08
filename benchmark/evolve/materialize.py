@@ -14,7 +14,7 @@ from .gitops import GitError, git
 
 ALLOWED_PREFIXES = ("src/", "prompts/")
 # Names that point a candidate's code at the harness; the loop adds the panel file and the data directory.
-HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "TILTH_BENCH_DATA")
+HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA")
 BYTE_LOCK_FILE = "src/mcp/mod.rs"
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -174,7 +174,8 @@ class Materializer:
             return None
 
     def _refuse_harness_reach(self, worktree: Path, diff: str) -> None:
-        """Refuse added ``src/**`` lines that name the harness or include a file outside ``src/`` and ``prompts/``."""
+        """Refuse added ``src/**`` lines that name the harness, include a file outside ``src/`` and ``prompts/``,
+        or carry a ``#[path]`` attribute."""
         root = Path(worktree).resolve()
         allowed = [root / prefix.rstrip("/") for prefix in ALLOWED_PREFIXES]
         for path, (_removed, added) in changed_lines(diff).items():
@@ -190,6 +191,10 @@ class Materializer:
                     raise ApplyRejected(f"{path}:{number} names the benchmark harness")
             if not path.endswith(".rs"):
                 continue
+            for number in rust.path_attributes(text):
+                if number in added:
+                    raise ApplyRejected(f"{path}:{number} uses a #[path] attribute, which can point a module outside "
+                                        "src/** and prompts/**")
             for first, last, macro, argument in rust.include_invocations(text):
                 if not any(first <= number <= last for number in added):
                     continue
