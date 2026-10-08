@@ -217,7 +217,8 @@ def test_calibrated_label_is_cached() -> None:
 def test_analyze_import_leaves_judge_runner_unloaded() -> None:
     probe = ("import sys, analyze, judge; assert 'judge.core' not in sys.modules; "
              "assert judge.Judge is sys.modules['judge.core'].Judge; print('ok')")
-    result = subprocess.run([sys.executable, "-c", probe], cwd=BENCHMARK_DIR, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-c", probe], cwd=BENCHMARK_DIR, capture_output=True, text=True,
+                            check=False)
     assert result.returncode == 0, result.stderr
     assert result.stdout == "ok\n"
 
