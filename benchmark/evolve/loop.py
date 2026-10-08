@@ -187,7 +187,7 @@ class Evolution:
             self.spend[kind] += self.ledger.spent - before
 
     def _reps(self) -> range:
-        return range(1, self.settings.reruns + 2)
+        return range(self.settings.reruns + 1)
 
     def _cells(self, tasks: Iterable[str], mode: str, reps: Iterable[int]) -> list[run.CellSpec]:
         reps = list(reps)
@@ -346,7 +346,7 @@ class Evolution:
     def _tiers(self, result: Cascade) -> Cascade:
         """The cheap and paid tiers; the first cell of either builds the candidate binary."""
         if result.cheap_score is None:
-            rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [1]), result.sha)
+            rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)
             result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
             result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
@@ -356,7 +356,7 @@ class Evolution:
             if result.cheap_score < (seed.cheap_score or 0.0):
                 return result.fail("cheap tier")
         if not result.scores:
-            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [1]), result.sha)
+            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)
             result.rows = rows
             result.records = {task: records.get(task, []) for task in self.panel.dev}
@@ -408,7 +408,7 @@ class Evolution:
             return
         dev = self.panel.dev
         members = [member for member in self.frontier if member is not result]
-        first = [row for row in result.rows if row["repetition"] == 1]
+        first = [row for row in result.rows if row["repetition"] == 0]
         if not all(baselines.is_completed(row) for row in first) or len(first) < len(dev):
             result.admitted = True
             self.log(f"candidate {result.cid[:12]}: a first rollout did not complete; not re-run")
@@ -417,7 +417,7 @@ class Evolution:
             result.admitted = True
             self.log(f"candidate {result.cid[:12]}: dominated after one rollout; not re-run")
             return
-        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(2, self.settings.reruns + 2)), result.sha)
+        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(1, self.settings.reruns + 1)), result.sha)
         records = self._records(reruns)
         for task in dev:
             result.records[task] = result.records.get(task, []) + records.get(task, [])

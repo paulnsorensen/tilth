@@ -318,7 +318,7 @@ def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatc
 def test_baselines_bought_once_then_reused(world, monkeypatch: pytest.MonkeyPatch) -> None:
     _engine(monkeypatch)
     assert es.main(world) == 0
-    planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (1, 2)}
+    planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (0, 1)}
     assert sorted((task, rep) for task, _mode, rep, _sha in world.runner_calls("baseline")) == sorted(planned)
 
     assert es.main(world, "--run-id", "run2") == 0
@@ -353,7 +353,7 @@ def test_frontier_needs_reruns_and_frozen_delta(world) -> None:
     accepted = evo.results[evolve_candidate.content_id(steady)]
     assert accepted.accepted and accepted in evo.frontier
     assert sorted(rep for task, rep in [(call[0], call[2]) for call in world.calls
-                                        if call[3] == accepted.sha and call[0] == "dev_a"]) == [1, 2]
+                                        if call[3] == accepted.sha and call[0] == "dev_a"]) == [0, 1]
     assert len(world.runner_calls("baseline")) == baseline_calls
 
 

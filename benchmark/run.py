@@ -1403,7 +1403,7 @@ def _read_stream(stream_log_path: Path) -> str:
 
 
 class CellSpec(NamedTuple):
-    """One cell ``run_plan`` schedules; ``repetition`` is the row's repetition number."""
+    """One cell ``run_plan`` schedules; ``repetition`` is the row's 0-based repetition number."""
 
     task: str
     mode: str

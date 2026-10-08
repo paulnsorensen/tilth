@@ -703,7 +703,7 @@ def test_evolve_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch) -
     assert [call["store_path"] for call in calls] == [run.RESULTS_DIR / baselines.STORE_FILENAME]
     rows = world.stored()
     assert {row["mode"] for row in rows} == {"baseline", "tilth"}
-    assert {row["repetition"] for row in rows} == {1, 2}
+    assert {row["repetition"] for row in rows} == {0, 1}
     for row in rows:
         stamp = world.panel.stamp(row["task"])
         assert {key: row[key] for key in stamp} == stamp
@@ -719,7 +719,7 @@ def test_reruns_use_fresh_repetitions(world) -> None:
     sha = evo.results[candidates.content_id(candidate)].sha
 
     dev_calls = sorted(call for call in tilth_calls(world, sha) if call[0] in DEV)
-    assert dev_calls == sorted((task, rep) for task in DEV for rep in (1, 2, 3))
+    assert dev_calls == sorted((task, rep) for task in DEV for rep in (0, 1, 2))
     assert evo.results[candidates.content_id(candidate)].accepted
 
 
@@ -731,7 +731,7 @@ def test_dominated_candidate_not_rerun(world) -> None:
     result = evo.results[candidates.content_id(dominated)]
 
     assert score == 0
-    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 1), ("dev_b", 1)]
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 0), ("dev_b", 0)]
     assert not result.accepted
     assert result not in evo.frontier
 
@@ -746,7 +746,7 @@ def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch,
     result = evo.results[candidates.content_id(candidate)]
 
     assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
-        ("dev_a", 1), ("dev_a", 2), ("dev_b", 1), ("dev_b", 2)]
+        ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
     assert result.means == {} and not result.accepted
     assert evo.frontier == [member]
     assert "dominated after 2 rollouts" in log_text(world)
@@ -863,7 +863,7 @@ def test_finalists_are_top_two_nonseed_plus_seed(world) -> None:
                for mean in (0.5, 0.7, 0.6, 0.4)]
     evo.finish()
 
-    reps = [("test_a", rep) for rep in (1, 2)]
+    reps = [("test_a", rep) for rep in (0, 1)]
     runs = _finalist_runs(world, evo, seed_result, *members)
     assert runs[members[1].cid[:12]] == reps and runs[members[2].cid[:12]] == reps
     assert runs[seed_result.cid[:12]] == reps
@@ -1039,8 +1039,8 @@ def test_finish_spends_reserve_after_ceiling(world, monkeypatch: pytest.MonkeyPa
     assert evo.finish() is not None
 
     assert finish_reserve and set(finish_reserve) == {0.0}
-    assert sorted(tilth_calls(world, winner.sha)) == [("test_a", 1), ("test_a", 2)]
-    assert sorted(tilth_calls(world, world.seed_sha)) == [("test_a", 1), ("test_a", 2)]
+    assert sorted(tilth_calls(world, winner.sha)) == [("test_a", 0), ("test_a", 1)]
+    assert sorted(tilth_calls(world, world.seed_sha)) == [("test_a", 0), ("test_a", 1)]
     assert evo.ledger.spent <= 2.05 + 1e-9
 
 

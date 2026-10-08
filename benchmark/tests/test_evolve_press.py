@@ -157,7 +157,7 @@ def test_dispatcher_sends_each_record_once() -> None:
     seen: list[list[dict]] = []
     dispatcher = engine.Dispatcher(StopState(), reflect=lambda name, text, records: seen.append(records) or text,
                                    propose=lambda candidate, records: seen.append(records) or "")
-    first, second = {"row": {"task": "dev_a", "repetition": 1}}, {"row": {"task": "dev_b", "repetition": 1}}
+    first, second = {"row": {"task": "dev_a", "repetition": 0}}, {"row": {"task": "dev_b", "repetition": 0}}
     entry_a, entry_b = {"records": [first]}, {"records": [second]}
     dispatcher(seed_candidate(), {"prompts/mcp.md": [entry_a, entry_b, entry_a],
                                   "src_patch": [entry_b, entry_b]}, ["prompts/mcp.md", "src_patch"])
