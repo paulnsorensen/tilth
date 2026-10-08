@@ -5,7 +5,6 @@ records its reason and the verbatim tool input. A missing sidecar is itself a
 hit (``unscanned``), so no consumer treats an unverifiable rollout as clean.
 """
 
-import json
 import os
 import re
 from collections.abc import Iterator
@@ -13,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
+from jsonl import tolerant_jsonl
 
 from . import data
 from .task import ExternalTask
@@ -160,13 +160,7 @@ def find_hits(sidecar_path: str | Path | None, task: object) -> list[dict]:
         return [{"reason": "unscanned", "tool": None, "input": None}]
     rules = _rules(task)
     hits = []
-    for line in Path(sidecar_path).read_text().splitlines():
-        try:
-            call = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(call, dict):
-            continue
+    for call in tolerant_jsonl(Path(sidecar_path).read_text()):
         for reason in _call_reasons(call.get("input"), rules):
             hits.append({"reason": reason, "tool": call.get("name"), "input": call.get("input")})
     return hits

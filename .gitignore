@@ -40,6 +40,8 @@ benchmark/results/*.log
 benchmark/results/streams/
 benchmark/results/judge/
 benchmark/results/configs/
+benchmark/results/evolve/
+benchmark/results/candidates/
 !benchmark/results/.gitkeep
 
 # Local env (API keys, secrets)

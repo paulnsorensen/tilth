@@ -104,6 +104,7 @@ def _variant_metadata(
         "plugin_dir": mode.plugin_dir,
         "plugin_version": mode.plugin_version,
         "plugin_git_sha": mode.plugin_git_sha,
+        "plugin_sha256": mode.plugin_sha256,
         "repository": mode.repository,
         "git_ref": mode.git_ref,
         "git_sha": mode.git_sha,
@@ -144,7 +145,7 @@ def wozcode_mode(plugin_dir: Path) -> ModeConfig:
         name="wozcode", tools=list(MODES["baseline"].tools),
         mcp_config_path=str(manifest_path), description="Built-ins + Woz Code plugin",
         plugin_dir=str(plugin_dir), plugin_version=version,
-        plugin_git_sha=plugin_git_sha,
+        plugin_git_sha=plugin_git_sha, plugin_sha256=_tree_sha256(plugin_dir),
     )
 
 
@@ -191,7 +192,10 @@ _RUNTIME_ENV_KEYS = frozenset(
         "GOCACHE",
     }
 )
-_PROVIDER_AUTH_PREFIXES = ("ANTHROPIC_", "OPENAI_", "OPENROUTER_")
+# No runner bills Anthropic through the API or needs an ANTHROPIC_* setting:
+# Claude cells use CLAUDE_CODE_OAUTH_TOKEN, and a variable such as
+# ANTHROPIC_BASE_URL or ANTHROPIC_MODEL would redirect a cell outside its run key.
+_PROVIDER_AUTH_PREFIXES = ("OPENAI_", "OPENROUTER_")
 _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
 
 
@@ -241,11 +245,6 @@ def build_runner_env(
         or key.startswith(_PROVIDER_AUTH_PREFIXES)
         or key.startswith("LC_")
     }
-    # No runner bills Anthropic through the API, and an empty ANTHROPIC_* value
-    # can still switch a client's auth path, so neither is forwarded.
-    for key in [key for key, value in env.items()
-                if key in _API_BILLING_KEYS or (key.startswith("ANTHROPIC_") and not value)]:
-        del env[key]
     # Pin the agent CLI for the whole run: a mid-run update changes the run key.
     env["DISABLE_AUTOUPDATER"] = "1"
 
@@ -586,6 +585,16 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def _tree_sha256(root: Path) -> str:
+    """Hash every file under a directory by relative path and content, skipping `.git`."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if path.is_file() and ".git" not in relative.parts:
+            digest.update(f"{relative.as_posix()}\0{_file_sha256(path)}\n".encode())
+    return digest.hexdigest()
+
+
 def _is_prepared(task: object) -> bool:
     """A task with a ``prepare`` hook builds its own workdir instead of copying a REPOS fixture."""
     return callable(getattr(task, "prepare", None))
@@ -804,6 +813,7 @@ def cell_identity(
         "cli_version": cli_version(runner),
         "timeout_s": _task_timeout(task),
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
+        **({"plugin_sha256": mode.plugin_sha256} if mode.plugin_dir else {}),
     }
     key_inputs = {
         **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
@@ -818,9 +828,12 @@ def cell_identity(
     return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags}
 
 
+TRAJECTORY_RUNNERS = frozenset({"claude", "codex"})
+
+
 def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     """Write the tool-call sidecar beside a teed claude or codex stream."""
-    if runner not in {"claude", "codex"} or stream_log_path is None or not stream_log_path.is_file():
+    if runner not in TRAJECTORY_RUNNERS or stream_log_path is None or not stream_log_path.is_file():
         return None
     calls = extract_trajectory(stream_log_path.read_text(), runner)
     sidecar = stream_log_path.with_name(f"{stream_log_path.stem}.trajectory.jsonl")
@@ -1403,7 +1416,7 @@ def _read_stream(stream_log_path: Path) -> str:
 
 
 class CellSpec(NamedTuple):
-    """One cell ``run_plan`` schedules; ``repetition`` is the row's repetition number."""
+    """One cell ``run_plan`` schedules; ``repetition`` is the row's 0-based repetition number."""
 
     task: str
     mode: str
@@ -1421,8 +1434,9 @@ class CandidateBuild:
 
 
 class PlanStopped(RuntimeError):
-    """``run_plan`` stopped before a cell: ``ceiling`` (spend), ``quota`` (usage limit), or ``cli-version``
-    (the agent CLI changed or stopped answering ``--version`` since the cell was planned).
+    """``run_plan`` stopped: ``ceiling`` (spend), ``quota`` (usage limit), ``cli-version`` (the agent CLI changed
+    or stopped answering ``--version`` since the cell was planned) before a cell, or ``mcp-unavailable`` and
+    ``invalid-cell`` (a config-level failure that main aborts on) after the failed cell is stored.
 
     ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
     """
@@ -1442,6 +1456,27 @@ class CandidateBuildFailed(RuntimeError):
 
 
 _CANDIDATE_BUILDS: dict[str, CandidateBuild] = {}
+
+
+_TOOL_ENV_KEYS = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "SHELL", "CARGO_HOME",
+                            "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER", "CARGO_INCREMENTAL"})
+_TOOL_ENV_PREFIXES = ("LC_", "XDG_", "MISE_", "SCCACHE_")
+_SECRET_MARKS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "AUTH")
+
+
+def build_tool_env() -> dict[str, str]:
+    """The allowlisted env for a candidate's build and checks: no token, key, or credential reaches proposer code.
+
+    The real HOME stays: cargo is a mise shim that resolves toolchains through HOME, and the caches live there.
+    Files under HOME stay readable to candidate code; a sandbox is a follow-up.
+    """
+    return {key: value for key, value in os.environ.items()
+            if (key in _TOOL_ENV_KEYS or key.startswith(_TOOL_ENV_PREFIXES))
+            and not any(mark in key.upper() for mark in _SECRET_MARKS)}
+
+
+def candidate_target_dir() -> Path:
+    return RESULTS_DIR / "candidates" / "target"
 
 
 def _run_cargo(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -1470,9 +1505,9 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
         head = _git("rev-parse", "HEAD", cwd=worktree).strip()
         if head != sha:
             raise RuntimeError(f"candidate worktree {worktree} is at {head}, not {sha}")
-        target_dir = RESULTS_DIR / "candidates" / "target"
+        target_dir = candidate_target_dir()
         build = _run_cargo(["cargo", "build", "--release", "--locked"], cwd=worktree,
-                           env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
+                           env={**build_tool_env(), "CARGO_TARGET_DIR": str(target_dir)})
         if build.returncode != 0:
             raise RuntimeError(f"cargo build --release --locked failed at {sha}:\n{(build.stderr or '')[-2000:]}")
         # The shared target dir is overwritten by the next build: keep this binary beside its sha.
@@ -1487,10 +1522,12 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
 
 def build_candidate(sha: str, *, repo: Path | None = None) -> CandidateBuild:
     """Build tilth at the local commit ``sha`` of ``repo`` (default: this checkout) with
-    ``cargo build --release --locked``, once per sha."""
-    if sha not in _CANDIDATE_BUILDS:
-        _CANDIDATE_BUILDS[sha] = _build_candidate(sha, Path(repo or REPO_ROOT))
-    return _CANDIDATE_BUILDS[sha]
+    ``cargo build --release --locked``, once per full sha; a short or symbolic ref resolves to it first."""
+    repo = Path(repo or REPO_ROOT)
+    full = _git("rev-parse", "--verify", f"{sha}^{{commit}}", cwd=repo).strip()
+    if full not in _CANDIDATE_BUILDS:
+        _CANDIDATE_BUILDS[full] = _build_candidate(full, repo)
+    return _CANDIDATE_BUILDS[full]
 
 
 def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
@@ -1654,6 +1691,12 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
                                 bare=True, max_budget_usd=DEFAULT_MAX_BUDGET_USD)
+        except InvalidCodexCellError as error:
+            fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
+            raise PlanStopped("invalid-cell", str(error), rows) from error
+        except McpUnavailableError as error:
+            fail({"error": f"mcp_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
+            raise PlanStopped("mcp-unavailable", str(error), rows) from error
         except subprocess.TimeoutExpired:
             fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
         except Exception as error:
@@ -1690,8 +1733,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run.py --experiment benchmark/experiments/upstream-fork.json --models sonnet --reps 5
-  python run.py --models haiku --reps 1 --tasks find_definition --modes baseline,tilth
+  python run.py --experiment benchmark/experiments/upstream-fork.json --models sonnet --reps 5 --max-usd 40
+  python run.py --models haiku --reps 1 --tasks find_definition --modes baseline,tilth --max-usd 1
         """,
     )
 
@@ -1814,6 +1857,8 @@ Examples:
         parser.error("--arm-order-seed applies only to legacy modes")
     if args.panel and (args.tasks != "all" or args.repos.lower() != "all"):
         parser.error("--panel selects its own tasks; it cannot be combined with --tasks or --repos")
+    if args.panel_split != "all" and not args.panel:
+        parser.error("--panel-split requires --panel")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1830,6 +1875,9 @@ Examples:
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
         if args.panel:
+            if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
+                raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
+                                 "sidecar, so every panel row would count as contaminated")
             panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
             panel.register(TASKS)
             tasks_list = panel.select(args.panel_split)
@@ -1862,7 +1910,7 @@ Examples:
             parser.error("--candidate-sha builds the tilth arm itself; it cannot be combined with --experiment")
         try:
             build = build_candidate(args.candidate_sha)
-        except (RuntimeError, subprocess.CalledProcessError) as error:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             parser.error(f"cannot build --candidate-sha {args.candidate_sha}: {error}")
         for mode_name in modes:
             if _is_tilth_arm(MODES[mode_name]):
@@ -2131,8 +2179,9 @@ Examples:
                     {} if isinstance(stored.get("contaminated"), bool)
                     else contamination_fields(stored.get("trajectory_path"), task)
                 )
+                unstamped = {key: value for key, value in stored.items() if key not in panels.STAMP_FIELDS}
                 record({
-                    **stored, **scanned, **experiment_metadata, "tilth_version": reported_version,
+                    **unstamped, **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "charged_usd": 0.0, "reused": True,
                 })
@@ -2290,6 +2339,7 @@ Examples:
     if stop_reason:
         print(f"Stop reason: {stop_reason}")
         print("Re-run the same command to resume; completed cells are reused from the store.")
+        print("Each run has its own --max-usd ceiling, so a resumed run can spend up to it again.")
     print(f"Spend: ${ledger.spent:.4f}" + (f" of ${args.max_usd:.2f}" if args.max_usd is not None else ""))
     print(f"Results saved to: {output_file}")
     print("=" * 70)

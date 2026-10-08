@@ -226,7 +226,7 @@ def admit(instance_id: str) -> PreflightVerdict:
         return cached
     verdict = round_trip(task, fingerprint)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(verdict)))
+    download.write_atomically(path, json.dumps(asdict(verdict)))
     return verdict
 
 

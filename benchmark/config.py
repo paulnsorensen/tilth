@@ -68,6 +68,7 @@ class ModeConfig:
     plugin_dir: Optional[str] = None
     plugin_version: Optional[str] = None
     plugin_git_sha: Optional[str] = None
+    plugin_sha256: Optional[str] = None
 
 
 REPO_ROOT = Path(__file__).parent.parent

@@ -1,6 +1,6 @@
 ---
 slug: bench-prompt-files
-status: draft
+status: implemented
 source: mold-curd-mini-spec
 created: 2026-10-04
 confidence: high
@@ -69,9 +69,9 @@ arrows:           src/mcp/tools/definitions.rs -> prompts/tools/*.md (compile ti
 
 ## Acceptance
 - AC-1: WHEN the MCP server answers `tools/list` THE SYSTEM SHALL serve the `tilth_search` description from `prompts/tools/search.md` and the `tilth_write` description from `prompts/tools/write.md`, each loaded through `include_str!` in `src/mcp/tools/definitions.rs` as `prompts/tools/read.md` is, and `definitions.rs` SHALL hold no inline literal for either description, so the four text components that `bench-evolution-loop` reads exist as files.  (F-2, G-4)
-- AC-2: WHEN the post-move binary and a HEAD `da84a41` binary each answer the same `initialize` plus `tools/list` requests THE SYSTEM SHALL produce byte-identical `tools/list` responses, and `prompts/tools/search.md` and `prompts/tools/write.md` SHALL each equal the corresponding pre-move served description bytes with no trailing newline.  (F-2)
+- AC-2: WHEN the post-move binary and a main `81e39d3` binary each answer the same `initialize` plus `tools/list` requests THE SYSTEM SHALL produce byte-identical `tools/list` responses, and `prompts/tools/search.md` and `prompts/tools/write.md` SHALL each equal the corresponding pre-move served description bytes with no trailing newline. The draft named `da84a41`; main `81e39d3` (after #307-#311) changed both descriptions, so the files carry the bytes that main serves.  (F-2)
 - AC-3: WHEN `python3 -m unittest discover -s tests/mcp_v2 -t tests/mcp_v2` runs THE SYSTEM SHALL pass `tests/mcp_v2/test_tool_descriptions_stable.py::ToolDescriptionsStable::test_descriptions_match_prompt_files`, which asserts that the served descriptions of `tilth_read`, `tilth_search`, and `tilth_write` each equal the bytes of `prompts/tools/read.md`, `prompts/tools/search.md`, and `prompts/tools/write.md`.  (F-2)
-- AC-4: WHEN the change lands THE SYSTEM SHALL touch only `src/mcp/tools/definitions.rs`, `prompts/tools/search.md`, `prompts/tools/write.md`, and `tests/mcp_v2/test_tool_descriptions_stable.py`; `bash scripts/regen-agents-md.sh && git diff --exit-code AGENTS.md` SHALL exit 0; and `prompts/mcp.md`, `prompts/tools/read.md`, `server_instructions_byte_lock`, and the `version` fields in `Cargo.toml` and `npm/package.json` SHALL be unchanged.  (F-2)
+- AC-4: WHEN the change lands THE SYSTEM SHALL touch only `src/mcp/tools/definitions.rs`, `prompts/tools/search.md`, `prompts/tools/write.md`, `tests/mcp_v2/test_tool_descriptions_stable.py`, and the `CLAUDE.md` prompt-file docs; `bash scripts/regen-agents-md.sh && git diff --exit-code AGENTS.md` SHALL exit 0; and `prompts/mcp.md`, `prompts/tools/read.md`, `server_instructions_byte_lock`, and the `version` fields in `Cargo.toml` and `npm/package.json` SHALL be unchanged.  (F-2)
 - AC-5: WHEN `just check` runs THE SYSTEM SHALL exit 0 with the existing `definitions.rs` tests (`tilth_write_surface_teaches_replace_text_first`, `tool_descriptions_fit_2kb`, `tilth_write_schema_includes_replace_text_branch`) and `mcp_surface_stays_within_cap` unmodified, and markdownlint over `prompts/` with `.markdownlint.json` (the CI markdown job) SHALL report no finding.  (F-2)
 
 ## Non-goals

@@ -1,8 +1,10 @@
 """Shared scaffolding for tests that drive ``run.main`` against a result store."""
 
 import json
+import site
 import subprocess
 import sys
+import sysconfig
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -183,8 +185,16 @@ def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalB
         harness.commands.append(list(argv))
         harness.cwds.append(None if kwargs.get("cwd") is None else str(kwargs["cwd"]))
         if list(argv[:2]) == ["uv", "venv"]:
-            argv = [sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]]
-        elif list(argv[:2]) == ["uv", "pip"]:
+            result = real_run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
+                              **kwargs)
+            # --system-site-packages exposes the base interpreter only. A suite run from a venv keeps pytest
+            # in that venv, so a .pth file adds this interpreter's site directories to the stub venv.
+            purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
+            if purelib.is_dir():
+                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])]
+                (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
+            return result
+        if list(argv[:2]) == ["uv", "pip"]:
             return subprocess.CompletedProcess(argv, 0, "" if kwargs.get("text", True) else b"",
                                                "" if kwargs.get("text", True) else b"")
         return real_run(argv, **kwargs)

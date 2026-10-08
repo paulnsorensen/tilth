@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Literal
 
+import baselines
 from jsonl import tolerant_jsonl
 
 from . import config
@@ -92,10 +93,8 @@ def _read(name: str) -> list[dict]:
 
 
 def _append(name: str, entry: dict) -> None:
-    path = config.JUDGE_DIR / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as cache:
-        cache.write(json.dumps(entry) + "\n")
+    # The result-store append starts a fresh line after a torn tail that a killed run left.
+    baselines.store(entry, path=config.JUDGE_DIR / name)
 
 
 def entries(kind: Kind) -> list[dict]:

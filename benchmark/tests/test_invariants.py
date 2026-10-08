@@ -316,9 +316,9 @@ def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatc
 
 
 def test_baselines_bought_once_then_reused(world, monkeypatch: pytest.MonkeyPatch) -> None:
-    _engine(monkeypatch)
+    _engine(monkeypatch, [es.child(es.seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert es.main(world) == 0
-    planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (1, 2)}
+    planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (0, 1)}
     assert sorted((task, rep) for task, _mode, rep, _sha in world.runner_calls("baseline")) == sorted(planned)
 
     assert es.main(world, "--run-id", "run2") == 0
@@ -353,7 +353,7 @@ def test_frontier_needs_reruns_and_frozen_delta(world) -> None:
     accepted = evo.results[evolve_candidate.content_id(steady)]
     assert accepted.accepted and accepted in evo.frontier
     assert sorted(rep for task, rep in [(call[0], call[2]) for call in world.calls
-                                        if call[3] == accepted.sha and call[0] == "dev_a"]) == [1, 2]
+                                        if call[3] == accepted.sha and call[0] == "dev_a"]) == [0, 1]
     assert len(world.runner_calls("baseline")) == baseline_calls
 
 
@@ -390,9 +390,12 @@ def test_winner_is_unmerged_allowlisted_draft(world) -> None:
     es.git("commit", "-qam", "bump", cwd=world.repo)
     winner.sha = es.git("rev-parse", "HEAD", cwd=world.repo).strip()
     gh.clear()
+    es.git("-C", str(remote), "update-ref", "-d", "refs/heads/evolve/run1-winner", cwd=world.tmp)
+    assert "evolve/run1-winner" not in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
     assert evo.finish() is None
     assert gh == []
-    assert "evolve/run1-winner" in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
+    assert "changes Cargo.toml" in evo.finish_failure
+    assert "evolve/run1-winner" not in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
 
 
 def test_one_ceiling_spans_all_paid_calls(world, monkeypatch: pytest.MonkeyPatch) -> None:

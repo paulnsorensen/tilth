@@ -22,7 +22,8 @@ import run
 from evolve import candidate as candidates
 from evolve import engine
 from evolve.finish import GitHubPRClient
-from evolve.loop import Cascade
+from evolve.gitops import GitError
+from evolve.loop import Cascade, EvolveError
 from evolve.materialize import ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
@@ -90,7 +91,6 @@ def accept(evo, candidate: dict, means: dict[str, float], *, just_check: bool = 
     result = evo.results.get(candidates.content_id(candidate)) or evo.new_cascade(candidate)
     result.sha = evo.materializer.materialize(candidate)
     result.just_check_ok = just_check
-    result.reached_paid = True
     result.scores = dict(means)
     result.means = dict(means)
     result.accepted = True
@@ -133,7 +133,8 @@ def test_test_split_never_reflected(world, monkeypatch: pytest.MonkeyPatch) -> N
         prompts.append(kwargs["input"])
         return subprocess.CompletedProcess(argv, 0, result_stream("no change"), "")
 
-    seen = use_engine(monkeypatch, propose=[["prompts/mcp.md"], ["src_patch"]])
+    seen = use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")],
+                      propose=[["prompts/mcp.md"], ["src_patch"]])
     assert main(world, spawn=spawn) == 0
 
     assert len(prompts) == 2
@@ -311,7 +312,8 @@ LIB = "pub mod mcp;\npub mod edit;\n\npub fn lib_marker() -> u8 {\n    1\n}\n"
     'pub const P: &str = include_str!(env!("HOME"));',
     "pub const P: &str = include_str!(PATH);",
     'pub const P: &str = include_str!["../Cargo.toml"];',
-], ids=["parent", "multiline-bytes", "absolute", "concat-env", "env", "not-a-literal", "brackets"])
+    'pub const P: &str = include_str ! ("../Cargo.toml");',
+], ids=["parent", "multiline-bytes", "absolute", "concat-env", "env", "not-a-literal", "brackets", "spaced-bang"])
 def test_rejects_include_outside_src_and_prompts(world, line: str) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     patch = patch_for(world, {"src/lib.rs": LIB + line + "\n"})
@@ -321,6 +323,28 @@ def test_rejects_include_outside_src_and_prompts(world, line: str) -> None:
     assert refs(world) == []
 
 
+@pytest.mark.parametrize("attribute", [
+    '#[path = "../../outside.rs"]',
+    '#[ path="../../outside.rs" ]',
+    '#\n[\npath = "../../outside.rs"]',
+    '#![path = "../../outside.rs"]',
+], ids=["outer", "spaced", "split", "inner"])
+def test_rejects_path_attribute_without_naming_the_harness(world, attribute: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\nmod outside;\n"})
+
+    with pytest.raises(ApplyRejected, match=r"#\[path\] attribute") as rejected:
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert "benchmark" not in rejected.value.tail.lower()
+    assert refs(world) == []
+
+
+def test_path_word_in_a_comment_or_string_is_kept(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    lines = '// #[path = "x.rs"] is not used here\npub const P: &str = "#[path = \\"x.rs\\"]";\n'
+    sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
+    assert sha != world.seed_sha
+
 def test_includes_inside_src_and_prompts_are_kept(world) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     lines = 'pub const A: &str = include_str!("main.rs");\npub const B: &str = include_str!("../prompts/mcp.md");\n'
@@ -328,7 +352,7 @@ def test_includes_inside_src_and_prompts_are_kept(world) -> None:
     assert "include_str!(\"main.rs\")" in git("show", f"{sha}:src/lib.rs", cwd=world.repo)
 
 
-@pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "TILTH_BENCH_DATA",
+@pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA",
                                   "panel-path", "panel-name", "data-dir"])
 def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, term: str) -> None:
     data = world.tmp / "harness-data"
@@ -487,7 +511,7 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
     assert score == 0
     assert info["stage"] == stage
     result = evo.results[candidates.content_id(failing)]
-    assert result.stage == stage and not result.reached_paid
+    assert result.stage == stage and not result.scores
     non_seed = [call for call in world.calls if call[1] == "tilth" and call[3] != world.seed_sha]
     if stage in {"apply", "just check"}:
         assert non_seed == []
@@ -538,7 +562,7 @@ def test_build_failure_side_info_names_stage(world, monkeypatch: pytest.MonkeyPa
     assert score == 0
     assert info["stage"] == "build" and "error[E0308]: mismatched types" in info["tail"]
     result = evo.results[candidates.content_id(failing)]
-    assert result.stage == "build" and not result.reached_paid
+    assert result.stage == "build" and not result.scores
     assert evo.evaluate(failing, "dev_b")[1]["stage"] == "build"
 
 
@@ -599,10 +623,45 @@ def test_same_candidate_materializes_once(world) -> None:
 
     sha = evo.results[candidates.content_id(candidate)].sha
     assert len([ref for ref in refs(world) if ref.endswith(candidates.content_id(candidate)[:12])]) == 1
-    assert sum(1 for path in world.checks if path == evo.materializer.worktree(sha)) == 1
+    cid = candidates.content_id(candidate)
+    assert sum(1 for path in world.checks if path.name == f"candidate-{cid[:12]}") == 1
     assert world.builds.count(sha) == 1
     rows = [row for row in world.stored() if row.get("git_sha") == sha]
     assert rows and {row["binary_sha256"] for row in rows} == {f"sha256-of-{sha}"}
+
+
+def test_cascade_releases_the_worktree_after_just_check(world) -> None:
+    evo = ready(world)
+    candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+
+    [checked] = [path for path in world.checks if path.name.startswith("candidate-")]
+    assert not checked.exists()
+    assert str(checked) not in git("worktree", "list", cwd=world.repo)
+    assert evo.results[candidates.content_id(candidate)].sha not in evo.materializer._worktrees
+
+
+def test_materializer_release_removes_one_worktree(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    sha = materializer.materialize(child(materializer.seed, dev_a="1"))
+    other = materializer.worktree(world.seed_sha)
+    kept = materializer.worktree(sha)
+
+    materializer.release(sha)
+
+    assert not kept.exists() and other.exists()
+    assert str(kept) not in git("worktree", "list", cwd=world.repo)
+    materializer.release(sha)
+    materializer.cleanup()
+    assert not other.exists()
+
+
+def test_same_candidate_gets_the_same_sha_across_runs(world) -> None:
+    first = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work1")
+    second = Materializer(world.repo, world.seed_sha, "run2", world.tmp / "work2")
+    candidate = child(first.seed, dev_a="1")
+
+    assert first.materialize(candidate) == second.materialize(candidate)
 
 
 def test_candidate_cells_use_candidate_binary(world) -> None:
@@ -654,7 +713,7 @@ def test_evolve_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch) -
     assert [call["store_path"] for call in calls] == [run.RESULTS_DIR / baselines.STORE_FILENAME]
     rows = world.stored()
     assert {row["mode"] for row in rows} == {"baseline", "tilth"}
-    assert {row["repetition"] for row in rows} == {1, 2}
+    assert {row["repetition"] for row in rows} == {0, 1}
     for row in rows:
         stamp = world.panel.stamp(row["task"])
         assert {key: row[key] for key in stamp} == stamp
@@ -670,7 +729,7 @@ def test_reruns_use_fresh_repetitions(world) -> None:
     sha = evo.results[candidates.content_id(candidate)].sha
 
     dev_calls = sorted(call for call in tilth_calls(world, sha) if call[0] in DEV)
-    assert dev_calls == sorted((task, rep) for task in DEV for rep in (1, 2, 3))
+    assert dev_calls == sorted((task, rep) for task in DEV for rep in (0, 1, 2))
     assert evo.results[candidates.content_id(candidate)].accepted
 
 
@@ -682,7 +741,7 @@ def test_dominated_candidate_not_rerun(world) -> None:
     result = evo.results[candidates.content_id(dominated)]
 
     assert score == 0
-    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 1), ("dev_b", 1)]
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 0), ("dev_b", 0)]
     assert not result.accepted
     assert result not in evo.frontier
 
@@ -697,7 +756,7 @@ def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch,
     result = evo.results[candidates.content_id(candidate)]
 
     assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
-        ("dev_a", 1), ("dev_a", 2), ("dev_b", 1), ("dev_b", 2)]
+        ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
     assert result.means == {} and not result.accepted
     assert evo.frontier == [member]
     assert "dominated after 2 rollouts" in log_text(world)
@@ -814,7 +873,7 @@ def test_finalists_are_top_two_nonseed_plus_seed(world) -> None:
                for mean in (0.5, 0.7, 0.6, 0.4)]
     evo.finish()
 
-    reps = [("test_a", rep) for rep in (1, 2)]
+    reps = [("test_a", rep) for rep in (0, 1)]
     runs = _finalist_runs(world, evo, seed_result, *members)
     assert runs[members[1].cid[:12]] == reps and runs[members[2].cid[:12]] == reps
     assert runs[seed_result.cid[:12]] == reps
@@ -937,6 +996,26 @@ def test_quota_stop_finish_buys_nothing(world) -> None:
     assert "finish: incomplete (quota)" in log_text(world)
 
 
+def test_mcp_unavailable_stop_in_search_makes_finish_buy_nothing(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    def unavailable(*args, **kwargs):
+        raise run.McpUnavailableError("tilth MCP did not start")
+
+    monkeypatch.setattr(run, "run_single", unavailable)
+    evo.evaluate(child(evo.seed, dev_a="1", cheap_a="1"), "dev_a")
+    assert evo.stop.reason == "mcp-unavailable"
+    monkeypatch.setattr(run, "run_single", world.fake_run_single)
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls
+    assert world.pr.calls == []
+    assert "finish: incomplete (mcp-unavailable)" in log_text(world)
+
+
 def test_quota_stop_finish_scores_stored_rows(world) -> None:
     evo = ready(world)
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
@@ -970,8 +1049,8 @@ def test_finish_spends_reserve_after_ceiling(world, monkeypatch: pytest.MonkeyPa
     assert evo.finish() is not None
 
     assert finish_reserve and set(finish_reserve) == {0.0}
-    assert sorted(tilth_calls(world, winner.sha)) == [("test_a", 1), ("test_a", 2)]
-    assert sorted(tilth_calls(world, world.seed_sha)) == [("test_a", 1), ("test_a", 2)]
+    assert sorted(tilth_calls(world, winner.sha)) == [("test_a", 0), ("test_a", 1)]
+    assert sorted(tilth_calls(world, world.seed_sha)) == [("test_a", 0), ("test_a", 1)]
     assert evo.ledger.spent <= 2.05 + 1e-9
 
 
@@ -990,7 +1069,7 @@ def test_finish_stops_before_crossing_full_ceiling(world) -> None:
 
 def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
                                                              capsys: pytest.CaptureFixture[str]) -> None:
-    use_engine(monkeypatch)
+    use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-test-b" if "test_a" in str(task) else world.env)
     labelled, calls, spawned = len(world.judge.labelled), len(world.calls), len(world.spawned)
@@ -1004,11 +1083,13 @@ def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch:
 
 
 def test_finish_baseline_drift_is_incomplete_not_traceback(world, monkeypatch: pytest.MonkeyPatch) -> None:
-    use_engine(monkeypatch)
+    use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     world.pr.calls.clear()
 
-    def drifting(seed_candidate, **kwargs):
+    def drifting(seed, *, evaluator, dataset, **kwargs):
+        for example in dataset:
+            evaluator(child(seed, dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="drift"), example=example)
         world.env = "env-fingerprint-b"
 
     monkeypatch.setattr(engine, "optimize_anything", drifting)
@@ -1045,6 +1126,103 @@ def test_existing_winner_branch_is_a_logged_refusal(world) -> None:
     heads = git("ls-remote", "--heads", str(remote), "evolve/run1-winner", cwd=world.tmp)
     assert heads.split()[0] == world.seed_sha
 
+
+@pytest.mark.parametrize(("url", "expected"), [
+    ("https://github.com/acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("https://github.com/acme/tilth", ["--repo", "acme/tilth"]),
+    ("git@github.com:acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("ssh://git@github.com/acme/tilth.git", ["--repo", "acme/tilth"]),
+    ("/srv/git/tilth.git", []),
+    ("https://example.com/acme/tilth.git", []),
+], ids=["https-git", "https", "scp", "ssh", "local-path", "other-host"])
+def test_create_draft_targets_the_remote_repo(world, url: str, expected: list[str]) -> None:
+    _remote(world)
+    git("remote", "set-url", "origin", url, cwd=world.repo)
+    gh: list[list[str]] = []
+    run_gh = lambda argv, **kwargs: gh.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "url\n", "")
+
+    GitHubPRClient(world.repo, remote="origin", run=run_gh).create_draft(base="main", head="h", title="t", body="b")
+
+    [argv] = gh
+    assert [argv[i:i + 2] for i in range(len(argv)) if argv[i] == "--repo"] == ([expected] if expected else [])
+
+
+def test_create_draft_omits_repo_when_the_remote_is_missing(world) -> None:
+    gh: list[list[str]] = []
+    run_gh = lambda argv, **kwargs: gh.append(list(argv)) or subprocess.CompletedProcess(argv, 0, "url\n", "")
+
+    GitHubPRClient(world.repo, remote="nowhere", run=run_gh).create_draft(base="main", head="h", title="t", body="b")
+
+    assert "--repo" not in gh[0]
+
+
+def test_stopped_preflight_buys_no_baselines(world) -> None:
+    evo = build(world)
+    evo.preflight = lambda: evo.stop.set("quota")
+    evo.search = lambda: None
+    evo.finish = lambda: None
+
+    assert evo.run() == 0
+    assert world.calls == []
+
+
+@pytest.mark.parametrize("error", [subprocess.CalledProcessError(1, ["gh"], stderr="gh: boom"), OSError("gh: boom")])
+def test_failed_draft_pr_is_a_logged_failure(world, error: Exception) -> None:
+    class FailingDraft:
+        pushes: list[tuple[str, str]] = []
+
+        def push(self, sha: str, branch: str) -> None:
+            self.pushes.append((sha, branch))
+
+        def create_draft(self, *, base: str, head: str, title: str, body: str) -> dict:
+            raise error
+
+    client = FailingDraft()
+    evo = ready(world, pr_client=client)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1", tag="winner"), {"dev_a": 0.9, "dev_b": 0.9})
+    evo.search = lambda: None
+
+    assert evo.run() == 1
+    assert len(client.pushes) == 1
+    assert "pushed evolve/run1-winner but opening the draft PR failed: gh: boom" in log_text(world)
+
+
+@pytest.mark.parametrize("error", [GitError(["status"], "boom"), OSError("boom"), EvolveError("boom")])
+def test_search_error_is_a_recorded_failure_with_a_spend_summary(world, error: Exception) -> None:
+    evo = ready(world)
+
+    def failing_search():
+        raise error
+
+    evo.search = failing_search
+    assert evo.run() == 1
+    text = log_text(world)
+    assert f"finish: run failed ({type(error).__name__}): " in text and "boom" in text
+    assert "spend: " in text
+
+
+def test_finish_without_a_nonseed_candidate_buys_nothing(world) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls and not [call for call in world.calls if call[0] == "test_a"]
+    assert world.pr.calls == [] and evo.finish_failure is None
+    assert "finish: no improvement (no non-seed candidate on the frontier)" in log_text(world)
+
+
+def test_dev_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
+                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    use_engine(monkeypatch)
+    assert main(world) == 0
+    monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-dev-b" if "dev_a" in str(task) else world.env)
+    labelled, calls, spawned = len(world.judge.labelled), len(world.calls), len(world.spawned)
+
+    assert main(world, "--run-id", "run2") == 2
+    assert (len(world.judge.labelled), len(world.calls), len(world.spawned)) == (labelled, calls, spawned)
+    assert "dev_a" in capsys.readouterr().err
 
 # --- AC-11: one ceiling, one ledger, one stop state ---
 
@@ -1143,14 +1321,14 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
     warm.evaluate(warm.seed, "dev_a")
     client_calls.clear()
 
-    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.2", "--run-id", "run2", max_usd="1.0",
+    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.2", "--run-id", "run2", max_usd="1.3",
                 judge_factory=factory)
     judge_store.write_agreement(Agreement(calibrated=True, **judge_store.current_stamp()))
     monkeypatch.setattr(evo.judge, "calibrate",
                         lambda labels: Agreement(calibrated=True, label_kappa=0.9, verdict_kappa=0.9))
     assert evo.preflight() is None and evo.buy_baselines() is None
     evo.ledger.reserve = 0.4
-    evo.ledger.charge(0.5, source="search")
+    evo.ledger.charge(0.8, source="search")
 
     _score, info = evo.evaluate(evo.seed, "dev_a")
 
@@ -1165,16 +1343,27 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
         return real_plan(*args, **kwargs)
 
     monkeypatch.setattr(run, "run_plan", recording_plan)
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     evo.finish()
     assert set(reserve_at_finish) == {0.0}
     assert [call for call in world.calls if call[0] == "test_a"]
-    assert evo.ledger.spent <= 1.0 + 1e-9
+    assert evo.ledger.spent <= 1.3 + 1e-9
 
 
 def test_insufficient_reserve_refuses_at_start(world, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(world, max_usd="0.15") != 0
     assert world.calls == [] and world.judge.labelled == [] and world.spawned == []
-    assert "$0.25" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "$0.15" in error and "$1.20" in error and "$0.40" in error
+
+
+def test_max_usd_equal_to_the_reserve_is_refused(world, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(world, max_usd="1.2") == 2
+    error = capsys.readouterr().err
+    assert "$1.20" in error and "$0.40" in error
+    assert world.calls == [] and world.judge.labelled == []
+
+    assert build(world, max_usd="1.25").preflight() is None
 
 
 def test_stop_state_neutralizes_calls(world) -> None:
@@ -1191,6 +1380,8 @@ def test_stop_state_neutralizes_calls(world) -> None:
 
 def test_cli_change_mid_search_stops_the_run(world, monkeypatch: pytest.MonkeyPatch) -> None:
     evo = ready(world)
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     calls = len(world.calls)
     monkeypatch.setattr(run, "cli_version", lambda runner, *, fresh=False: "9.9.9" if fresh else "2.1.0")
 
@@ -1281,6 +1472,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
     assert paid == ["reflection"] * 4 + ["proposer"]
     assert evo.stop.reason == "quota"
     assert after_stop == []
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
     calls = len(world.calls)
 
     assert evo.finish() is None
@@ -1435,3 +1627,87 @@ def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(run.ClaudeAuthError):
         evo.proposer.propose_src_patch(evo.seed, [])
     assert world.spawned == []
+
+
+_SECRET_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+               "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_BASE_URL": "https://example.invalid",
+               "MISE_GITHUB_TOKEN": "mise"}
+
+
+def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypatch: pytest.MonkeyPatch,
+                                                                      tmp_path: Path) -> None:
+    from evolve import cli
+    for key, value in _SECRET_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MISE_DATA_DIR", "/tmp/mise")
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert cli.default_just_check(worktree) == (True, "ok")
+
+    assert seen["argv"] == ["just", "check"]
+    assert not set(_SECRET_ENV) & set(seen["env"])
+    assert seen["env"]["PATH"] == os.environ["PATH"] and seen["env"]["HOME"] == os.environ["HOME"]
+    assert seen["env"]["MISE_DATA_DIR"] == "/tmp/mise" and "CARGO_TARGET_DIR" not in seen["env"]
+    link = worktree / "target"
+    assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
+
+
+# --- paid calls: the CLI budget flag and the cost sources ---
+
+_HAIKU = "claude-haiku-4-5-20251001"
+
+
+def _paid(spawn, ledger):
+    from evolve.calls import PaidCalls, StopState
+    return PaidCalls(ledger, StopState(), 0.3, spawn=spawn, log=lambda _line: None)
+
+
+def _usage_stream(*, input_tokens: int = 1_000_000, output_tokens: int = 100_000) -> str:
+    events = [{"type": "assistant", "message": {"id": "m1", "content": [], "usage": {
+        "input_tokens": input_tokens, "output_tokens": output_tokens}}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def test_paid_call_passes_the_remaining_headroom_to_the_cli(world, tmp_path: Path) -> None:
+    from spend import SpendLedger
+    seen: list[list[str]] = []
+
+    def spawn(argv, **kwargs):
+        seen.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, result_stream("ok", cost=0.01), "")
+
+    ledger = SpendLedger(2.0, reserve=0.5)
+    ledger.charge(0.25, source="cells")
+    assert _paid(spawn, ledger).call("reflection", ["claude", "-p"], "prompt", tmp_path) is not None
+    assert seen[0][-2:] == ["--max-budget-usd", "1.2500"]
+
+    unbounded = []
+    _paid(lambda argv, **kw: unbounded.append(list(argv)) or subprocess.CompletedProcess(
+        argv, 0, result_stream("ok"), ""), SpendLedger(None)).call("reflection", ["claude", "-p"], "p", tmp_path)
+    assert "--max-budget-usd" not in unbounded[0]
+
+
+@pytest.mark.parametrize(("stream", "cost", "source"), [
+    (result_stream("ok", cost=0.07), 0.07, "reflection:native"),
+    (_usage_stream(), 1.5, "reflection:pricing"),
+    (_usage_stream(input_tokens=0, output_tokens=0), 0.3, "reflection:estimate"),
+    ("not json\n", 0.3, "reflection:estimate"),
+], ids=["native", "pricing", "zero-priced", "unparseable"])
+def test_paid_call_cost_source(world, tmp_path: Path, stream: str, cost: float, source: str) -> None:
+    from spend import SpendLedger
+    ledger = SpendLedger(100.0)
+    paid = _paid(lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stream, ""), ledger)
+
+    paid.call("reflection", ["claude", "-p", "--model", _HAIKU], "prompt", tmp_path)
+
+    assert ledger.charges == [(pytest.approx(cost), source)]

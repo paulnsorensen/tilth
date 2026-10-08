@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,13 +23,13 @@ def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return make_world(monkeypatch, tmp_path)
 
 
-def cells(*tasks: str, mode: str = "baseline", reps: tuple[int, ...] = (1,)) -> list[run.CellSpec]:
+def cells(*tasks: str, mode: str = "baseline", reps: tuple[int, ...] = (0,)) -> list[run.CellSpec]:
     return [run.CellSpec(task, mode, MODEL, rep) for task in tasks for rep in reps]
 
 
 def plan(world, specs, *, ledger=None, sha=None, refreeze=False, **kwargs) -> list[dict]:
     return run.run_plan(specs, panel=world.panel, ledger=ledger or SpendLedger(100.0), candidate_sha=sha,
-                        refreeze_baselines=refreeze, **kwargs)
+                        refreeze_baselines=refreeze, **{"repo": world.repo, **kwargs})
 
 
 # --- c5 AC-8: rows stored through run_plan carry the panel stamp ---
@@ -102,7 +103,7 @@ def test_run_plan_plans_external_member_only_after_registration(bench, monkeypat
         return real_identity(cell)
 
     monkeypatch.setattr(run, "planned_identity", recording_identity)
-    run.run_plan([run.CellSpec(FB_ALGORITHMS, "plain", "sonnet5", 1)], panel=panel, ledger=SpendLedger(10.0),
+    run.run_plan([run.CellSpec(FB_ALGORITHMS, "plain", "sonnet5", 0)], panel=panel, ledger=SpendLedger(10.0),
                  candidate_sha=None, refreeze_baselines=False)
 
     assert planned == [(FB_ALGORITHMS, True)]
@@ -260,6 +261,18 @@ def test_candidate_build_is_cached_on_disk_across_processes(candidate_repo, monk
     assert "candidates" not in git("worktree", "list", cwd=repo)
 
 
+def test_candidate_build_keys_on_the_full_sha(candidate_repo) -> None:
+    repo, candidate, builds = candidate_repo
+    git("branch", "cand", candidate, cwd=repo)
+    builds_by_ref = [run.build_candidate(ref, repo=repo) for ref in (candidate[:10], "cand", candidate)]
+
+    assert len(builds) == 1
+    assert all(build == builds_by_ref[0] for build in builds_by_ref)
+    assert builds_by_ref[0].git_sha == candidate
+    assert (run.RESULTS_DIR / "candidates" / candidate / "tilth").is_file()
+    assert [path.name for path in (run.RESULTS_DIR / "candidates").iterdir() if path.name != "target"] == [candidate]
+
+
 def test_candidate_cells_record_candidate_identity(world) -> None:
     rows = plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
 
@@ -322,3 +335,100 @@ def test_run_plan_reports_any_build_failure_as_candidate_build_failed(world, mon
         plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
     assert world.runner_calls() == []
     assert run.MODES["tilth"].git_sha is None
+
+
+# --- config-level failures stop the plan as main aborts the run ---
+
+
+@pytest.mark.parametrize(("error", "reason", "marker"), [
+    (run.McpUnavailableError("tilth MCP did not start"), "mcp-unavailable", "mcp_unavailable: tilth MCP did not start"),
+    (run.InvalidCodexCellError("no codex stream"), "invalid-cell", "invalid_codex_cell: no codex stream"),
+], ids=["mcp-unavailable", "invalid-cell"])
+def test_run_plan_stops_on_config_level_failure(world, monkeypatch: pytest.MonkeyPatch, error, reason, marker) -> None:
+    def failing(*args, **kwargs):
+        world.calls.append(args)
+        raise error
+
+    monkeypatch.setattr(run, "run_single", failing)
+    ledger = SpendLedger(100.0)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells(*DEV), ledger=ledger, cell_estimate_usd=0.2)
+
+    assert stopped.value.reason == reason
+    assert len(world.calls) == 1
+    [row] = world.stored()
+    assert row["error"] == marker and row["correct"] is False
+    assert stopped.value.rows == [row]
+    assert ledger.spent == pytest.approx(0.2)
+
+
+# --- run_plan charges failed cells as main does ---
+
+
+def test_run_plan_timeout_row_records_estimate_and_is_rerun(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["claude"], run.CELL_TIMEOUT_S)
+
+    monkeypatch.setattr(run, "run_single", timeout)
+    ledger = SpendLedger(100.0)
+    [row] = plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.25)
+
+    assert row["error"] == "timeout" and row["timed_out"] is True
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.25, "estimate")
+    assert row["reused"] is False and ledger.spent == pytest.approx(0.25)
+
+    monkeypatch.setattr(run, "run_single", world.fake_run_single)
+    plan(world, cells("dev_a"))
+    assert len(world.runner_calls()) == 1
+
+
+def test_run_plan_estimated_failure_cost_is_charged_not_reported_as_cost(world, monkeypatch) -> None:
+    def failing(*args, **kwargs):
+        raise RuntimeError("claude -p failed with code 1")
+
+    monkeypatch.setattr(run, "run_single", failing)
+    [row] = plan(world, cells("dev_a"), cell_estimate_usd=0.3)
+
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.3, "estimate")
+    assert world.stored() == [row]
+
+
+def test_run_plan_native_failure_cost_is_both_cost_and_charge(world, monkeypatch) -> None:
+    def capped(*args, stream_log_path, **kwargs):
+        stream_log_path.parent.mkdir(parents=True, exist_ok=True)
+        stream_log_path.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                               "total_cost_usd": 0.7}) + "\n")
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    monkeypatch.setattr(run, "run_single", capped)
+    ledger = SpendLedger(100.0)
+    [row] = plan(world, cells("dev_a"), ledger=ledger)
+
+    assert (row["total_cost_usd"], row["charged_usd"], row["cost_source"]) == (0.7, 0.7, "native")
+    assert ledger.spent == pytest.approx(0.7)
+
+
+def test_candidate_build_env_is_allowlisted(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, candidate, _builds = candidate_repo
+    for key, value in {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
+                       "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_BASE_URL": "https://example.invalid",
+                       "MISE_GITHUB_TOKEN": "mise", "SCCACHE_DIR": "/tmp/sccache"}.items():
+        monkeypatch.setenv(key, value)
+    seen: list[dict] = []
+    inner = run._run_cargo
+
+    def spy(argv, *, cwd, env, **kwargs):
+        seen.append(dict(env))
+        return inner(argv, cwd=cwd, env=env, **kwargs)
+
+    monkeypatch.setattr(run, "_run_cargo", spy)
+    run.build_candidate(candidate, repo=repo)
+
+    [env] = seen
+    assert not {"CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY",
+                "ANTHROPIC_BASE_URL", "MISE_GITHUB_TOKEN"} & set(env)
+    assert env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
+    assert env["SCCACHE_DIR"] == "/tmp/sccache"
+    assert env["CARGO_TARGET_DIR"] == str(run.candidate_target_dir())

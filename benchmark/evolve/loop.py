@@ -7,6 +7,7 @@ the proposer see only c4 stripped records; test-split rollouts appear only in
 """
 
 import json
+import subprocess
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -33,6 +34,7 @@ from .proposer import Proposer
 CANDIDATE_MODE = "tilth"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
+NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell"})
 
 
 class EvolveError(RuntimeError):
@@ -71,7 +73,6 @@ class Cascade:
     stage: str | None = None
     tail: str = ""
     just_check_ok: bool | None = None
-    check_tail: str = ""
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
     cheap_records: list[dict] = field(default_factory=list)
@@ -79,7 +80,6 @@ class Cascade:
     means: dict[str, float] = field(default_factory=dict)
     rows: list[dict] = field(default_factory=list)
     records: dict[str, list[dict]] = field(default_factory=dict)
-    reached_paid: bool = False
     admitted: bool = False
     accepted: bool = False
     counted: bool = False
@@ -154,11 +154,9 @@ class Evolution:
         self.deltas: list[dict] = []
         self.labels: dict[str, str] = {}
         self.calibrated = False
-        self.reserve = 0.0
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
-        self.gepa_result = None
         self.finish_failure: str | None = None
 
     # --- plumbing ---
@@ -187,7 +185,7 @@ class Evolution:
             self.spend[kind] += self.ledger.spent - before
 
     def _reps(self) -> range:
-        return range(1, self.settings.reruns + 2)
+        return range(self.settings.reruns + 1)
 
     def _cells(self, tasks: Iterable[str], mode: str, reps: Iterable[int]) -> list[run.CellSpec]:
         reps = list(reps)
@@ -239,21 +237,23 @@ class Evolution:
     def preflight(self) -> int | None:
         """Hold the finish reserve, label every panel task, and calibrate; an exit code when the run is refused.
 
-        A drifted test-split baseline cell refuses the run here, before any paid call, unless
+        A drifted cheap, dev, or test-split baseline cell refuses the run here, before any paid call, unless
         ``--refreeze-baselines`` lets finish buy it again.
         """
         if not self.settings.refreeze_baselines:
+            baseline_cells = self._cells((*self.panel.cheap, *self.panel.dev, *self.panel.test), BASELINE_MODE,
+                                         self._reps())
             try:
-                run.check_baseline_drift(self._cells(self.panel.test, BASELINE_MODE, self._reps()), panel=self.panel)
+                run.check_baseline_drift(baseline_cells, panel=self.panel)
             except run.BaselineDrift as error:
-                return self.refuse(f"test split: {error}")
+                return self.refuse(f"baselines: {error}")
         per_finalist = self.finalist_test_cost()
-        if self.settings.max_usd < per_finalist:
-            return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} cannot cover one finalist's test-split cost "
-                               f"${per_finalist:.2f}; short by ${per_finalist - self.settings.max_usd:.2f}")
-        self.reserve = min(3 * per_finalist, self.settings.max_usd)
-        self.ledger.reserve = self.reserve
-        self.log(f"reserve: ${self.reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
+        reserve = 3 * per_finalist
+        if self.settings.max_usd <= reserve:
+            return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} must exceed the finish reserve ${reserve:.2f} "
+                               f"(3 x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
+        self.ledger.reserve = reserve
+        self.log(f"reserve: ${reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
 
         unlabeled = []
         for name in self.panel.select("all"):
@@ -304,11 +304,11 @@ class Evolution:
     # --- search ---
 
     def search(self):
-        self.gepa_result = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
-                                           max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
-                                           proposer=self.dispatcher)
+        found = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
+                                max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
+                                proposer=self.dispatcher)
         self.log(f"search: ended ({self.stop.reason or 'metric-call budget'})")
-        return self.gepa_result
+        return found
 
     def evaluate(self, candidate: dict[str, str], example: str) -> tuple[float, dict]:
         """GEPA's evaluator: the candidate's score on one dev task, with grader-free side info."""
@@ -334,9 +334,10 @@ class Evolution:
                 return result.fail("apply", tail(rejected.tail))
         if result.just_check_ok is None:
             ok, output = self.just_check(self.materializer.worktree(result.sha))
-            result.just_check_ok, result.check_tail = ok, tail(output)
-        if not result.just_check_ok:
-            return result.fail("just check", result.check_tail)
+            result.just_check_ok = ok
+            self.materializer.release(result.sha)
+            if not ok:
+                return result.fail("just check", tail(output))
         try:
             return self._tiers(result)
         except run.CandidateBuildFailed as failed:
@@ -345,7 +346,7 @@ class Evolution:
     def _tiers(self, result: Cascade) -> Cascade:
         """The cheap and paid tiers; the first cell of either builds the candidate binary."""
         if result.cheap_score is None:
-            rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [1]), result.sha)
+            rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)
             result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
             result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
@@ -355,12 +356,11 @@ class Evolution:
             if result.cheap_score < (seed.cheap_score or 0.0):
                 return result.fail("cheap tier")
         if not result.scores:
-            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [1]), result.sha)
+            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)
             result.rows = rows
             result.records = {task: records.get(task, []) for task in self.panel.dev}
             result.scores = {task: self._task_mean(rows, task) for task in self.panel.dev}
-        result.reached_paid = True
         self._admit(result)
         if result.delta is None:
             result.delta = self._dev_delta(result)
@@ -407,7 +407,7 @@ class Evolution:
             return
         dev = self.panel.dev
         members = [member for member in self.frontier if member is not result]
-        first = [row for row in result.rows if row["repetition"] == 1]
+        first = [row for row in result.rows if row["repetition"] == 0]
         if not all(baselines.is_completed(row) for row in first) or len(first) < len(dev):
             result.admitted = True
             self.log(f"candidate {result.cid[:12]}: a first rollout did not complete; not re-run")
@@ -416,7 +416,7 @@ class Evolution:
             result.admitted = True
             self.log(f"candidate {result.cid[:12]}: dominated after one rollout; not re-run")
             return
-        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(2, self.settings.reruns + 2)), result.sha)
+        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(1, self.settings.reruns + 1)), result.sha)
         records = self._records(reruns)
         for task in dev:
             result.records[task] = result.records.get(task, []) + records.get(task, [])
@@ -479,20 +479,23 @@ class Evolution:
     def finish(self):
         """Score the finalists once on the test split and open a draft PR for a non-seed winner."""
         self.ledger.reserve = 0.0
-        quota = self.stop.reason == "quota"
+        no_spend = self.stop.reason in NO_SPEND_REASONS
         seed = self.new_cascade(self.seed)
         if seed.sha is None:
             seed.sha = self.settings.seed_sha
         nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
                          key=lambda member: (-member.dev_mean, member.seq))[:2]
+        if not nonseed:
+            self.log("finish: no improvement (no non-seed candidate on the frontier)")
+            return None
         finalists = [*nonseed, seed]
         self.log("finish: finalists " + ", ".join(f"{member.cid[:12]} (dev mean {member.dev_mean:.3f})"
                                                   for member in finalists))
         reps = self._reps()
         try:
-            baseline_rows = self._plan(self._cells(self.panel.test, BASELINE_MODE, reps), None, store_only=quota)
+            baseline_rows = self._plan(self._cells(self.panel.test, BASELINE_MODE, reps), None, store_only=no_spend)
             test_rows = {member.cid: self._plan(self._cells(self.panel.test, CANDIDATE_MODE, reps), member.sha,
-                                                store_only=quota)
+                                                store_only=no_spend)
                          for member in finalists}
         except _Stopped as stopped:
             # The reason this finish stopped, which may be a ceiling or quota after an earlier plateau.
@@ -504,8 +507,8 @@ class Evolution:
         test_means = {cid: mean(correct(row) for row in rows) if rows else 0.0 for cid, rows in test_rows.items()}
         scores = ", ".join(f"{member.cid[:12]}={test_means[member.cid]:.3f}" for member in finalists)
         expected = len(self.panel.test) * len(reps)
-        if quota and any(len(test_rows[member.cid]) < expected for member in finalists):
-            return self._finish_failed(f"finish: incomplete (quota); stored test-split scores: {scores}")
+        if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
+            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
         self.log(f"finish: test-split means {scores}")
         winner = max(finalists, key=lambda member: (test_means[member.cid], member.dev_mean, -member.seq))
         if winner is seed:
@@ -531,25 +534,35 @@ class Evolution:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:
             return self._finish_failed(f"finish: refused; pushing {branch} failed (it may already exist): {error}")
-        pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
-                                         title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
-                                         body=body)
+        try:
+            pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
+                                             title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
+                                             body=body)
+        except (subprocess.CalledProcessError, OSError) as error:
+            detail = getattr(error, "stderr", None) or str(error)
+            return self._finish_failed(f"finish: pushed {branch} but opening the draft PR failed: "
+                                       f"{tail(str(detail))}")
         self.log(f"finish: draft PR opened from {branch}: {pr}")
         return pr
 
     # --- the whole run ---
 
     def run(self) -> int:
-        code = self.preflight() or self.buy_baselines()
+        code = self.preflight()
+        if code is None and not self.stop.is_set:
+            code = self.buy_baselines()
         if code:
             return code
         try:
             if not self.stop.is_set:
                 self.search()
             self.finish()
+        except (GitError, OSError, EvolveError) as error:
+            self._finish_failed(f"finish: run failed ({type(error).__name__}): {error}")
         finally:
             self.materializer.cleanup()
-        totals = {**self.spend, "reflection": self.paid.total("reflection"), "proposer": self.paid.total("proposer")}
-        self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
-                 + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
+            totals = {**self.spend, "reflection": self.paid.total("reflection"),
+                      "proposer": self.paid.total("proposer")}
+            self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
+                     + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
         return 1 if self.finish_failure else 0
