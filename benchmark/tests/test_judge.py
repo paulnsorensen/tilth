@@ -214,6 +214,15 @@ def test_calibrated_label_is_cached() -> None:
     assert len(client.prompts) == 1
 
 
+@pytest.mark.parametrize("torn_file", ["labels.jsonl", "agreements.jsonl"])
+def test_append_after_torn_tail_keeps_new_entry(torn_file: str) -> None:
+    judge_config.JUDGE_DIR.mkdir(parents=True)
+    (judge_config.JUDGE_DIR / torn_file).write_text('{"key": "killed-mid-write", "lab')
+    store.put_label(task="alpha", task_digest="digest-alpha", label="weak", cost=0.1)
+    seed_agreement()
+    assert store.cached_label("digest-alpha") == "weak"
+    assert store.current_agreement() is not None
+
 def test_label_cache_key_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     client = StubClient()
     task = TASKS["rg_search_dispatch"]
