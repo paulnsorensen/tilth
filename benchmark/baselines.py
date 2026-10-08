@@ -75,19 +75,25 @@ def task_digest(
     mutations: list[object] = (),
     hide_git: bool = False,
     task_sources: Mapping[str, str] | None = None,
+    identity_inputs: Mapping[str, object] | None = None,
 ) -> str:
     """Hash what the task asks, how it is graded, and the code it runs against.
 
     ``task_sources`` maps each source file defining the task class or its bases to
     its hash, so an edit to grading code such as a ``check_correctness`` override
-    yields a new digest.
+    yields a new digest. ``identity_inputs`` carries what a task's own hook adds,
+    such as an external instance's patches, test lists, base commit, and data
+    revision; it is hashed only when given, so other tasks keep their digests.
     """
-    return _digest({
+    payload = {
         "prompt": prompt, "ground_truth": ground_truth, "test_command": test_command,
         "fixture_files": fixture_files, "repo_commit": repo_commit,
         "mutations": list(mutations), "hide_git": hide_git,
         "task_sources": dict(task_sources or {}),
-    })
+    }
+    if identity_inputs is not None:
+        payload["identity_inputs"] = dict(identity_inputs)
+    return _digest(payload)
 
 
 def env_fingerprint(*, toolchains: Mapping[str, str | None], lockfile_hash: str) -> str:

@@ -1,7 +1,10 @@
 """Shared scaffolding for tests that drive ``run.main`` against a result store."""
 
 import json
+import site
+import subprocess
 import sys
+import sysconfig
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,11 +14,18 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import external
+import external.data
+import external.proc
+import external_support
 import run
 from config import DEFAULT_MAX_BUDGET_USD, ModeConfig
 from tasks.base import GroundTruth, TaskSource
 
 STREAMS = Path(__file__).parent / "fixtures" / "streams"
+
+# Fixture projects hold their own test files; they are data, not this suite's tests.
+collect_ignore_glob = ["fixtures/*"]
 
 # A runner behavior receives the cell's tee path and returns the cell cost, or raises.
 Behavior = Callable[[Path], float]
@@ -118,4 +128,76 @@ def bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Bench:
     for name in ("cell_a", "cell_b", "cell_c"):
         monkeypatch.setitem(run.TASKS, name, StoreTask())
     monkeypatch.setitem(run.MODES, "plain", ModeConfig(name="plain", tools=["Read"], mcp_config_path=None, description="test arm"))
+    return harness
+
+
+@dataclass
+class ExternalBench:
+    """A temporary harness data directory with fixture upstreams and a subprocess recorder.
+
+    ``uv`` is the only command that would reach the network: ``uv venv`` builds a
+    stdlib venv that sees the host pytest, and ``uv pip`` is recorded but skipped.
+    """
+
+    data: Path
+    upstream: Path
+    commands: list[list[str]] = field(default_factory=list)
+    cwds: list[str | None] = field(default_factory=list)
+
+    def row(self, instance_id: str) -> dict:
+        for dataset in (external.data.FEATUREBENCH, external.data.SWEBENCH_ML):
+            rows = external_support.rows(dataset)
+            if instance_id in rows:
+                return dict(rows[instance_id])
+        raise KeyError(instance_id)
+
+    def seed(self, *instance_ids: str) -> None:
+        for instance_id in instance_ids:
+            self.seed_row(self.row(instance_id))
+
+    def seed_row(self, row: dict) -> None:
+        """Cache ``row`` under its dataset's pinned revision and mirror its upstream."""
+        dataset = external.data.FEATUREBENCH if "repo_settings" in row else external.data.SWEBENCH_ML
+        path = external.data.row_path(dataset, external.data.REVISIONS[dataset], row["instance_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(row))
+        mirror = external.data.mirror_path(row["repo"])
+        if not mirror.exists():
+            subprocess.run(["git", "clone", "-q", "--bare", str(self.upstream / f"{row['repo']}.git"), str(mirror)],
+                           check=True, capture_output=True)
+
+    def argv_containing(self, word: str) -> list[list[str]]:
+        return [argv for argv in self.commands if any(word in part for part in argv)]
+
+
+@pytest.fixture
+def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalBench:
+    harness = ExternalBench(data=tmp_path / "bench-data", upstream=tmp_path / "upstream")
+    monkeypatch.setenv("TILTH_BENCH_DATA", str(harness.data))
+    for repo, language in external_support.REPO_LANGUAGES.items():
+        monkeypatch.setitem(external.data.REPO_LANGUAGES, repo, language)
+    monkeypatch.setattr(external.data, "UPSTREAM_URL", f"file://{harness.upstream}/{{repo}}.git")
+    for repo, files in external_support.projects().items():
+        external_support.build_upstream(repo, files, harness.upstream)
+    real_run = external.proc.run
+
+    def recording_run(argv, **kwargs):
+        harness.commands.append(list(argv))
+        harness.cwds.append(None if kwargs.get("cwd") is None else str(kwargs["cwd"]))
+        if list(argv[:2]) == ["uv", "venv"]:
+            result = real_run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
+                              **kwargs)
+            # --system-site-packages exposes the base interpreter only. A suite run from a venv keeps pytest
+            # in that venv, so a .pth file adds this interpreter's site directories to the stub venv.
+            purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
+            if purelib.is_dir():
+                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])]
+                (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
+            return result
+        if list(argv[:2]) == ["uv", "pip"]:
+            return subprocess.CompletedProcess(argv, 0, "" if kwargs.get("text", True) else b"",
+                                               "" if kwargs.get("text", True) else b"")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(external.proc, "run", recording_run)
     return harness
