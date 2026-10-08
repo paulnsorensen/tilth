@@ -1,0 +1,4 @@
+# Benchmark test suite (CI `benchmark-tests` job, `just check-benchmark`).
+# Manual install: pip install -r benchmark/requirements-dev.txt
+-r requirements.txt
+pytest>=8

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import stats
 from flags import detect_flags
 from paired import (
+    measured_cost,
     pair_modes,
     paired_accuracy_delta,
     paired_cpc_delta as paired_cpc_delta_impl,
@@ -205,7 +206,7 @@ def cost_per_correct(runs: list[dict]) -> tuple[float, float, float]:
     """
     if not runs:
         return (float("inf"), float("inf"), float("inf"))
-    costs = [float(r.get("total_cost_usd", 0.0)) for r in runs]
+    costs = [measured_cost(r) or 0.0 for r in runs]
     correct = [1.0 if r.get("correct") else 0.0 for r in runs]
     total_correct = sum(correct)
     if total_correct == 0:
@@ -1056,7 +1057,11 @@ def statistical_analysis_section(valid_results: list[dict], all_results: list[di
 
 
 def _power_readout(all_results: list[dict]) -> list[str]:
-    """Report task-clustered paired accuracy and task-level power by model."""
+    """Report task-clustered paired accuracy and an informational power readout by model.
+
+    The readout no longer gates task-pool growth (the old phase-4 plan is superseded by
+    .cheese/specs/benchmark-gepa-overhaul.md); it only describes the observed power.
+    """
     modes = ordered_modes({
         run.get("mode")
         for run in all_results
@@ -1091,7 +1096,7 @@ def _power_readout(all_results: list[dict]) -> list[str]:
         lines.append("| — | — | — | — |")
     lines.extend([
         "",
-        "**Power readout by model:**",
+        "**Power readout by model (informational; not a task-growth gate):**",
         "_MDE@N is an optimistic single-proportion bound; the paired bootstrap "
         "interval is the inferential decision rule._",
         "",
@@ -1131,7 +1136,7 @@ def _power_readout(all_results: list[dict]) -> list[str]:
             if lo > 0 or hi < 0:
                 verdict = "effect SIGNIFICANT"
             elif abs(delta) < mde:
-                verdict = "N INSUFFICIENT for observed effect — grow TASK pool"
+                verdict = "N INSUFFICIENT for observed effect"
             else:
                 verdict = "CI includes zero — more data advised"
             lines.append(
