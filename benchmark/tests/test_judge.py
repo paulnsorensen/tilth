@@ -817,9 +817,18 @@ def test_judge_cost_enters_shared_ledger() -> None:
     with pytest.raises(core.JudgeCallFailed):
         make_judge(core.ClaudeJudgeClient(spawn=failing), ledger=ledger, floor=0.25).applicability(
             TASKS["rg_trait_implementors"])
-    cost, source = ledger.charges[-1]
-    assert source == "estimate" and cost > 0
-    assert ledger.spent == pytest.approx(0.3 + cost)
+    # The cached-mean tier: the one cached label cost 0.3.
+    assert ledger.charges[-1] == (pytest.approx(0.3), "estimate")
+    assert ledger.spent == pytest.approx(0.6)
+
+
+def test_failed_call_with_native_cost_is_charged_as_native() -> None:
+    ledger = SpendLedger(10.0)
+    failing = Recorder(claude_stream("", 0.42), returncode=1)
+    with pytest.raises(core.JudgeCallFailed):
+        make_judge(core.ClaudeJudgeClient(spawn=failing), ledger=ledger, floor=0.25).applicability(
+            TASKS["rg_search_dispatch"])
+    assert ledger.charges == [(pytest.approx(0.42), "native")]
 
 
 def test_judge_cost_falls_back_to_pricing() -> None:
