@@ -71,3 +71,13 @@
 2026-10-02 · 5cd6b764a7b36652 · merged · local-gate-gotchas.md · Record that the default macOS TMPDIR breaks `!contains("l1")` assertions, that `/tmp` overrides still hit the symlink, and that a shared CARGO_TARGET_DIR across worktrees can skip new tests.
 
 2026-10-04 · 0f156690e9e51193 · merged · adr/tilth-write-teaching-errors.md · Align ADR-009 retry guidance with the emitted current-tag hint after PR #308 review. Frozen probes rank the target page first, second, and first.
+
+
+2026-10-08 · 5d588557962c2ca8 · new-page · sources/benchmark-subscription-auth-2026-10.md · Preserve the PR #312 subscription-auth research note (setup-token, key precedence, --bare, quota, Codex auth.json, Consumer Terms question). Exact-title probe ranks first.
+
+2026-10-08 · 5d588557962c2ca8 · new-page · adr/benchmark-gepa-overhaul.md · Record F-1 to F-6, OAuth-only auth, frozen baselines with drift refusal, and the single-hunk tampered rule. Exact and native-grading probes rank first.
+
+2026-10-08 · 5d588557962c2ca8 · new-page · benchmark-gepa-invariants.md · Record run keys, spend ledger and finish reserve, admission and grading venvs, contamination scan, split lock, kappa gate, candidate guards, paid-run checklist, and open risks, verified at e77a567. Exact and natural probes rank first.
+
+2026-10-08 · 5d588557962c2ca8 · merged · benchmark-harness-gotchas.md; mcp-instructions-limits-and-format.md; multi-agent-workflow-notes.md; index.md · Add GEPA overhaul gotchas, prompts/tools description files, the self-review lesson, and index links. Correct the stale mcp-base/mcp-edit byte-lock note. Tool-description probe ranks second.
+

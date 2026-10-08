@@ -17,6 +17,8 @@ _Source: PR #278 benchmark ingestion · Updated: 2026-09-29_
 
 - [Benchmark harness gotchas (Sonnet 5 investigation)](benchmark-harness-gotchas.md) — `--safe-mode` silently strips all MCP servers including `--mcp-config` ones (invalidated a full sonnet5 run); the PR #168 guards (available_tools/mcp_servers/model_usage recording, McpUnavailableError abort); pricing.yaml drift vs native billing; the stale `~/.local/bin/tilth` binary that made byte-size, not `--version`, the only trustworthy staleness check.
 
+- [Benchmark GEPA loop invariants and guards](benchmark-gepa-invariants.md) — run keys and `--refreeze-baselines` drift refusal, the spend ledger and finish reserve, native admission and grading venvs, the contamination scan, the panel split lock, the judge's Cohen's-kappa gate, GEPA candidate guards, the before-first-paid-run checklist, and open risks. Decisions in [ADR: benchmark GEPA overhaul](adr/benchmark-gepa-overhaul.md); research in [subscription-auth source](sources/benchmark-subscription-auth-2026-10.md).
+
 - [Diff: git ref resolution and exit-code handling](diff-git-ref-resolution.md) — why the root commit needs git's empty-tree hash rather than `{hash}^..{hash}`, why `^!` looks right and is not (it degrades to a working-tree diff and breaks `overlay.rs`'s `..`-splitting), git diff's 0-or-1 success convention, and the three constraints on default-branch teaching hints.
 - [Diff: symbol output order is not deterministic](diff-symbol-order-nondeterminism.md) — open bug: `match_symbols` iterates a `HashMap`, so formatted symbol line order varies between `diff()` calls; how to write tests around it and what the workaround costs.
 

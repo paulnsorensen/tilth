@@ -69,3 +69,11 @@ transcripts (anthropic.com/engineering/writing-tools-for-agents).
 - A truncation-guard test asserts the first 2,048 chars of the served
   instructions contain every critical span, so "below the
   fold" fails CI instead of silently shipping.
+- Tool descriptions for `tilth_read`, `tilth_search`, and `tilth_write` live in
+  `prompts/tools/{read,search,write}.md`, loaded with `include_str!`
+  (`src/mcp/tools/definitions.rs:4-6`), with no trailing newline.
+  `tests/mcp_v2/test_tool_descriptions_stable.py::test_descriptions_match_prompt_files`
+  compares served bytes with the files, not frozen bytes, so GEPA candidates can
+  evolve them. `tool_descriptions_fit_2kb` caps each at 2,048 bytes.
+
+_Source: PR #312 (bench-prompt-files) verified at `e77a567` · Updated: 2026-10-08_
