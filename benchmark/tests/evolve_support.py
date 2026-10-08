@@ -237,7 +237,7 @@ class World:
             line = next((line for line in text.splitlines() if line.startswith("score:")), "score:")
             scores = dict(part.split("=", 1) for part in line.removeprefix("score:").split())
             marks = scores.get(task, "0")
-        return marks[min(repetition, len(marks)) - 1]
+        return marks[min(repetition, len(marks) - 1)]
 
     def fake_run_single(self, task_name, mode_name, model_name, repetition, **kwargs):
         sha = run.MODES[mode_name].git_sha

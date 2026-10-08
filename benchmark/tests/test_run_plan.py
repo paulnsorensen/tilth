@@ -23,7 +23,7 @@ def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return make_world(monkeypatch, tmp_path)
 
 
-def cells(*tasks: str, mode: str = "baseline", reps: tuple[int, ...] = (1,)) -> list[run.CellSpec]:
+def cells(*tasks: str, mode: str = "baseline", reps: tuple[int, ...] = (0,)) -> list[run.CellSpec]:
     return [run.CellSpec(task, mode, MODEL, rep) for task in tasks for rep in reps]
 
 
@@ -103,7 +103,7 @@ def test_run_plan_plans_external_member_only_after_registration(bench, monkeypat
         return real_identity(cell)
 
     monkeypatch.setattr(run, "planned_identity", recording_identity)
-    run.run_plan([run.CellSpec(FB_ALGORITHMS, "plain", "sonnet5", 1)], panel=panel, ledger=SpendLedger(10.0),
+    run.run_plan([run.CellSpec(FB_ALGORITHMS, "plain", "sonnet5", 0)], panel=panel, ledger=SpendLedger(10.0),
                  candidate_sha=None, refreeze_baselines=False)
 
     assert planned == [(FB_ALGORITHMS, True)]
