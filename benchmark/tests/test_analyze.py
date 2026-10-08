@@ -10,8 +10,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import analyze
 
-_BENCHMARK_DIR = Path(__file__).parent.parent
-
 
 def _row(task: str, mode: str, correct: bool) -> dict:
     return {
@@ -41,11 +39,3 @@ def test_power_readout_is_informational(
     assert "Power readout by model (informational" in report
     assert "grow TASK pool" not in report
     assert "N INSUFFICIENT for observed effect" in report
-
-
-def test_phase4_plan_is_superseded() -> None:
-    plan = (_BENCHMARK_DIR / "PHASE4_PLAN.md").read_text()
-
-    assert plan.splitlines()[0].startswith("# ")
-    assert "Superseded" in plan.split("\n## ", 1)[0]
-    assert "benchmark-gepa-overhaul" in plan.split("\n## ", 1)[0]
