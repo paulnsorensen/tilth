@@ -9,6 +9,7 @@ the judge caches only; they never enter result rows or the result store.
 import hashlib
 import json
 import math
+import re
 import shlex
 import subprocess
 import tempfile
@@ -119,8 +120,15 @@ def stripped_record(
     return {"prompt": task.prompt, "row": fields, "trajectory": sidecar}
 
 
+def _fenced(text: str) -> str:
+    """Fence text as data; the fence is longer than any backtick run in the text, so the text cannot close it."""
+    longest = max((len(ticks) for ticks in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
+
+
 def _prompt(kind: Kind, sections: list[tuple[str, str]]) -> str:
-    body = "\n\n".join(f"## {heading}\n\n{text}" for heading, text in sections)
+    body = "\n\n".join(f"## {heading}\n\n{_fenced(text)}" for heading, text in sections)
     return f"{store.prompt_template(kind)}\n{body}\n"
 
 
