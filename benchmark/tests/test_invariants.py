@@ -390,9 +390,12 @@ def test_winner_is_unmerged_allowlisted_draft(world) -> None:
     es.git("commit", "-qam", "bump", cwd=world.repo)
     winner.sha = es.git("rev-parse", "HEAD", cwd=world.repo).strip()
     gh.clear()
+    es.git("-C", str(remote), "update-ref", "-d", "refs/heads/evolve/run1-winner", cwd=world.tmp)
+    assert "evolve/run1-winner" not in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
     assert evo.finish() is None
     assert gh == []
-    assert "evolve/run1-winner" in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
+    assert "changes Cargo.toml" in evo.finish_failure
+    assert "evolve/run1-winner" not in es.git("ls-remote", "--heads", str(remote), cwd=world.tmp)
 
 
 def test_one_ceiling_spans_all_paid_calls(world, monkeypatch: pytest.MonkeyPatch) -> None:
