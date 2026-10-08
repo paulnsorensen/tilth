@@ -191,7 +191,8 @@ def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalB
             # in that venv, so a .pth file adds this interpreter's site directories to the stub venv.
             purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
             if purelib.is_dir():
-                (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site.getsitepackages()))
+                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])]
+                (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
             return result
         if list(argv[:2]) == ["uv", "pip"]:
             return subprocess.CompletedProcess(argv, 0, "" if kwargs.get("text", True) else b"",
