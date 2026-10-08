@@ -52,7 +52,12 @@ def load_runs(path: Path) -> list[dict]:
 
 
 def _cost(run: dict):
-    """Run cost, or None for error records (which carry no cost)."""
+    """Run cost, or None for error records (which carry no cost).
+
+    A pre-run spend estimate is a ledger charge, not a measured cost.
+    """
+    if run.get("cost_source") == "estimate":
+        return None
     cost = run.get("total_cost_usd")
     return float(cost) if isinstance(cost, (int, float)) else None
 

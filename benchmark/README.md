@@ -34,7 +34,7 @@ Run a bounded synthetic check without Claude calls:
 
 ```bash
 python benchmark/run.py --runner codex --tasks find_definition \
-  --models gpt5 --modes baseline,tilth --reps 1 --max-cells 2
+  --models gpt5 --modes baseline,tilth --reps 1 --max-cells 2 --max-usd 2
 ```
 
 Run the curated, edit-only Luna 5.6 comparison at xhigh after setup and authentication:
@@ -43,7 +43,7 @@ Run the curated, edit-only Luna 5.6 comparison at xhigh after setup and authenti
 python benchmark/run.py --runner codex --models luna56 \
   --reasoning-effort xhigh \
   --tasks gin_edit_render_cascade,gin_edit_render_runtime \
-  --modes baseline,tilth --reps 3 --max-cells 12
+  --modes baseline,tilth --reps 3 --max-cells 12 --max-usd 40
 ```
 
 This schedule has two tasks and 12 cells. Both tasks require cross-file repairs and use test-based grading.
@@ -51,9 +51,30 @@ The selection targets batched file access: a shared-helper contract repair and t
 It excludes read-only tasks, single-file repairs, and the invalid Express multi-mutation task.
 Select tasks before inspecting results. This small Gin-only suite does not measure general coding performance.
 Check raw tool calls and `batch_sizes` for actual batching; one successful MCP call does not demonstrate batching.
-The cell cap limits calls, not spending. The runner records the selected effort in each result row.
+The cell cap limits calls; `--max-usd` limits spending. The runner records the selected effort in each result row.
 
-The output path appears in the run summary under `benchmark/results/`. Raw Codex JSONL and adjacent `.stderr` files appear in the matching `benchmark/results/streams/` directory, including failed cells. `--max-cells` and the per-cell 600-second timeout bound the run size. Codex has no dollar-budget cap in this harness. The result's cost is an estimate from token usage, not a spending limit.
+The output path appears in the run summary under `benchmark/results/`. Raw Codex JSONL and adjacent `.stderr` files appear in the matching `benchmark/results/streams/` directory, including failed cells. `--max-cells` and the per-cell 600-second timeout bound the run size. Codex has no per-cell dollar cap; its cost is an estimate from token usage, which the run-wide `--max-usd` ledger counts.
+
+## Result store, spend ceiling, and subscription guards
+
+Every row carries a `run_key` that hashes the model, agent CLI version, effort, timeout, arm, repetition, task, a harness digest (system prompt, tool allowlist, strict-file-tools, bare, per-cell `--max-budget-usd`, MCP config shape, the runner command template with workspace, binary, and prompt paths normalized, and in strict mode the Bash guard source), a task digest (prompt, ground truth, test command, mutations, fixture files, repo commit), an environment fingerprint (the versions of the task repo language's toolchains, with `uv` for Python, plus the repo's lockfiles, or `package.json` and `node_modules/.package-lock.json` when it has none), and, for tilth arms, the candidate `git_sha` and `binary_sha256`.
+Rows also record `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, `cost_source`, `charged_usd`, `reused`, and `trajectory_path`.
+For Claude and Codex cells, `trajectory_path` names a sidecar beside the raw stream with every tool call's full input and output; OpenCode cells record `null`.
+
+`run.py` appends every row to `benchmark/results/result_store.jsonl`.
+A cell whose key matches a completed row (no `error`, no `infra`, no timeout) is answered from the store without a model call and written to the run's output with `reused: true`, this run's schedule and variant metadata, and the stored outcome.
+A torn store line is skipped with a warning.
+Error, timeout, and `infra: quota` rows are re-run. Re-running an interrupted command resumes it.
+
+A run with any cell the store cannot answer is paid and requires `--max-usd`.
+Spend sums native `total_cost_usd` when the stream reports it, else the `pricing.yaml` cost (`cost_source: native | pricing`).
+Failed cells add their native cost, else their pre-run estimate (`cost_source: estimate`). Every paid row records the ledger amount as `charged_usd`; an estimate is never written as `total_cost_usd`, so analysis does not count it as cost.
+The run stops before a cell whose estimate would cross the ceiling.
+The estimate is the mean stored cost for that task, arm, and model, else this run's largest cell cost, else `--cell-estimate-usd` (default: `--max-budget-usd`).
+
+A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
+Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives them, and empty `ANTHROPIC_*` values are dropped.
+A usage-limit rejection (a terminal result with usage-limit text or a rate-limit subtype) records the cell as `infra: quota` and stops the run with exit status 1, as does the spend ceiling.
 
 ## Larger Luna edit task
 
@@ -79,7 +100,7 @@ Run three repetitions per arm, with no Claude calls:
 TILTH_BIN="$PWD/target/release/tilth" mise exec go@1.24.7 -- \
   python benchmark/run.py --runner codex --models luna56 \
   --reasoning-effort xhigh --tasks gin_edit_render_context \
-  --modes baseline,tilth --reps 3 --max-cells 6
+  --modes baseline,tilth --reps 3 --max-cells 6 --max-usd 20
 ```
 
 This forward task retains Git metadata. Reference tests and solution files stay outside the candidate workspace.
@@ -322,23 +343,23 @@ pip install -r benchmark/requirements.txt
 python benchmark/run.py \
   --experiment /tmp/tilth-benchmark/experiment.json \
   --tasks all --repos ripgrep,fastapi,gin,express \
-  --models sonnet --reps 3
+  --models sonnet --reps 3 --max-usd 150
 
 # Multiple model lanes use the same pinned variants and arm-order seed
 python benchmark/run.py \
   --experiment /tmp/tilth-benchmark/experiment.json \
-  --tasks all --models sonnet,opus --reps 3
+  --tasks all --models sonnet,opus --reps 3 --max-usd 400
 
 # Routine-safe bounded run: 2 tasks × 1 model × 1 repetition × 3 arms
 python benchmark/run.py \
   --experiment /tmp/tilth-benchmark/experiment.json \
   --tasks find_definition,markdown_section \
-  --models haiku --reps 1 --max-cells 6
+  --models haiku --reps 1 --max-cells 6 --max-usd 3
 
 # Legacy local A/B remains available for development checks
 python benchmark/run.py \
   --tasks fastapi_depends_processing,gin_middleware_chain \
-  --models sonnet --reps 1 --modes baseline,tilth
+  --models sonnet --reps 1 --modes baseline,tilth --max-usd 5
 
 # Local three-way Sonnet 5 comparison: one Gin renderer task, five matched repetitions.
 # Set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
@@ -348,11 +369,11 @@ CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \
 python benchmark/run.py \
   --tasks gin_edit_render_context --models sonnet5 --reasoning-effort high \
   --modes baseline,tilth,wozcode --wozcode-plugin-dir /absolute/path/to/wozcode \
-  --reps 5 --max-cells 15 --max-budget-usd 10 --arm-order-seed 20260929 \
+  --reps 5 --max-cells 15 --max-budget-usd 10 --max-usd 150 --arm-order-seed 20260929 \
   --strict-file-tools
 
 # Diagnostic only: remove built-in search tools and force the local tilth MCP
-python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced
+python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced --max-usd 20
 ```
 
 `--strict-file-tools` gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms use the same invocation-only Bash hook. It permits only `go test`, `go build`, `go vet`, and `gofmt -w` with checked local arguments. It denies shell composition, file inspection, and delegation. This controls tool use, not code run by Go tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools` and denied Bash counts.
