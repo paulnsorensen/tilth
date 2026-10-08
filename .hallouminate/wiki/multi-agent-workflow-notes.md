@@ -48,10 +48,9 @@ gate is plain `cargo clippy -- -D warnings`, which stays clean.
 
 ## Byte-lock tests constrain prompt file formatting
 
-`<certain>` `src/mcp/mod.rs` embeds `prompts/mcp-base.md` and
-`prompts/mcp-edit.md` via `include_str!`, and byte-lock tests
-(`server_instructions_byte_lock`, `edit_mode_instructions_byte_lock`) assert
-their exact byte length. Prompt files must not carry a trailing newline (or
+`<certain>` `src/mcp/mod.rs` embeds `prompts/mcp.md` via `include_str!`
+(the August split into `mcp-base.md` and `mcp-edit.md` is gone), and the
+byte-lock test `server_instructions_byte_lock` asserts its exact byte length. Prompt files must not carry a trailing newline (or
 any other stray byte) that the byte-lock test doesn't expect — every fan-out
 worker touching these files had to update the byte-lock constants alongside
 the content change, not just the content.
@@ -65,6 +64,23 @@ unsquashed commits. Rebasing the child cleanly onto the new squashed base
 requires `git rebase --onto <new-base> <old-base> <child-branch>`, not a
 plain rebase — a plain rebase replays the now-duplicate base commits and
 produces spurious conflicts.
+
+## Self-review is not independent review (benchmark overhaul, 2026-10)
+
+`<certain>` In the PR #312 benchmark overhaul, phase agents could not dispatch
+fresh-context reviewers, so their own review passes were self-reviews. The
+orchestrator's independent reviews still found blockers: two rounds on the
+result substrate (a task digest that skipped grader source; quota without a
+result event), and a mutation-tested review of the panel, judge, and evolve
+slices (44 mutants, 38 caught) that found a byte-lock exemption a candidate
+could bypass. Budget one independent, mutation-tested review per slice.
+
+Every spec in that effort exhausted three fork-coherence rounds on narrowing
+findings. The maintainer then accepted each with a recorded override
+(`gates_overridden`) once every finding was folded in and none reopened a fork.
+The Mold tool gap behind this is paulnsorensen/easy-cheese#745.
+
+_Source: PR #312 session archive · Updated: 2026-10-08 · Supersedes: the mcp-base/mcp-edit byte-lock description_
 
 ## Related
 

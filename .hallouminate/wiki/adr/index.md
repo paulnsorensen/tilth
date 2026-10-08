@@ -1,6 +1,7 @@
 # adr
 
 <!-- HALLOUMINATE:INDEX-START -->
+- [benchmark-gepa-overhaul](./benchmark-gepa-overhaul.md) — ADR: benchmark GEPA overhaul
 - [python-scoped-import-deps](./python-scoped-import-deps.md) — ADR: scoped Python import dependencies (#197 part A)
 - [semantic-declaration-spans](./semantic-declaration-spans.md) — ADR: Semantic declaration spans
 - [tilth-diff-scope-ergonomics](./tilth-diff-scope-ergonomics.md) — ADRs — tilth_diff scope ergonomics (slug: tilth-diff-scope-ergonomics)
