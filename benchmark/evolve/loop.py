@@ -33,6 +33,7 @@ from .proposer import Proposer
 CANDIDATE_MODE = "tilth"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
+NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell"})
 
 
 class EvolveError(RuntimeError):
@@ -479,7 +480,7 @@ class Evolution:
     def finish(self):
         """Score the finalists once on the test split and open a draft PR for a non-seed winner."""
         self.ledger.reserve = 0.0
-        quota = self.stop.reason == "quota"
+        no_spend = self.stop.reason in NO_SPEND_REASONS
         seed = self.new_cascade(self.seed)
         if seed.sha is None:
             seed.sha = self.settings.seed_sha
@@ -490,9 +491,9 @@ class Evolution:
                                                   for member in finalists))
         reps = self._reps()
         try:
-            baseline_rows = self._plan(self._cells(self.panel.test, BASELINE_MODE, reps), None, store_only=quota)
+            baseline_rows = self._plan(self._cells(self.panel.test, BASELINE_MODE, reps), None, store_only=no_spend)
             test_rows = {member.cid: self._plan(self._cells(self.panel.test, CANDIDATE_MODE, reps), member.sha,
-                                                store_only=quota)
+                                                store_only=no_spend)
                          for member in finalists}
         except _Stopped as stopped:
             # The reason this finish stopped, which may be a ceiling or quota after an earlier plateau.
@@ -504,8 +505,8 @@ class Evolution:
         test_means = {cid: mean(correct(row) for row in rows) if rows else 0.0 for cid, rows in test_rows.items()}
         scores = ", ".join(f"{member.cid[:12]}={test_means[member.cid]:.3f}" for member in finalists)
         expected = len(self.panel.test) * len(reps)
-        if quota and any(len(test_rows[member.cid]) < expected for member in finalists):
-            return self._finish_failed(f"finish: incomplete (quota); stored test-split scores: {scores}")
+        if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
+            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
         self.log(f"finish: test-split means {scores}")
         winner = max(finalists, key=lambda member: (test_means[member.cid], member.dev_mean, -member.seq))
         if winner is seed:

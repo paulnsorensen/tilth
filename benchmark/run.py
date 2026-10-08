@@ -1421,8 +1421,9 @@ class CandidateBuild:
 
 
 class PlanStopped(RuntimeError):
-    """``run_plan`` stopped before a cell: ``ceiling`` (spend), ``quota`` (usage limit), or ``cli-version``
-    (the agent CLI changed or stopped answering ``--version`` since the cell was planned).
+    """``run_plan`` stopped: ``ceiling`` (spend), ``quota`` (usage limit), ``cli-version`` (the agent CLI changed
+    or stopped answering ``--version`` since the cell was planned) before a cell, or ``mcp-unavailable`` and
+    ``invalid-cell`` (a config-level failure that main aborts on) after the failed cell is stored.
 
     ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
     """
@@ -1654,6 +1655,12 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
                                 bare=True, max_budget_usd=DEFAULT_MAX_BUDGET_USD)
+        except InvalidCodexCellError as error:
+            fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
+            raise PlanStopped("invalid-cell", str(error), rows) from error
+        except McpUnavailableError as error:
+            fail({"error": f"mcp_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
+            raise PlanStopped("mcp-unavailable", str(error), rows) from error
         except subprocess.TimeoutExpired:
             fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
         except Exception as error:

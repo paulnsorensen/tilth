@@ -322,3 +322,76 @@ def test_run_plan_reports_any_build_failure_as_candidate_build_failed(world, mon
         plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
     assert world.runner_calls() == []
     assert run.MODES["tilth"].git_sha is None
+
+
+# --- config-level failures stop the plan as main aborts the run ---
+
+
+@pytest.mark.parametrize(("error", "reason", "marker"), [
+    (run.McpUnavailableError("tilth MCP did not start"), "mcp-unavailable", "mcp_unavailable: tilth MCP did not start"),
+    (run.InvalidCodexCellError("no codex stream"), "invalid-cell", "invalid_codex_cell: no codex stream"),
+], ids=["mcp-unavailable", "invalid-cell"])
+def test_run_plan_stops_on_config_level_failure(world, monkeypatch: pytest.MonkeyPatch, error, reason, marker) -> None:
+    def failing(*args, **kwargs):
+        world.calls.append(args)
+        raise error
+
+    monkeypatch.setattr(run, "run_single", failing)
+    ledger = SpendLedger(100.0)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells(*DEV), ledger=ledger, cell_estimate_usd=0.2)
+
+    assert stopped.value.reason == reason
+    assert len(world.calls) == 1
+    [row] = world.stored()
+    assert row["error"] == marker and row["correct"] is False
+    assert stopped.value.rows == [row]
+    assert ledger.spent == pytest.approx(0.2)
+
+
+# --- run_plan charges failed cells as main does ---
+
+
+def test_run_plan_timeout_row_records_estimate_and_is_rerun(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["claude"], run.CELL_TIMEOUT_S)
+
+    monkeypatch.setattr(run, "run_single", timeout)
+    ledger = SpendLedger(100.0)
+    [row] = plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.25)
+
+    assert row["error"] == "timeout" and row["timed_out"] is True
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.25, "estimate")
+    assert row["reused"] is False and ledger.spent == pytest.approx(0.25)
+
+    monkeypatch.setattr(run, "run_single", world.fake_run_single)
+    plan(world, cells("dev_a"))
+    assert len(world.runner_calls()) == 1
+
+
+def test_run_plan_estimated_failure_cost_is_charged_not_reported_as_cost(world, monkeypatch) -> None:
+    def failing(*args, **kwargs):
+        raise RuntimeError("claude -p failed with code 1")
+
+    monkeypatch.setattr(run, "run_single", failing)
+    [row] = plan(world, cells("dev_a"), cell_estimate_usd=0.3)
+
+    assert "total_cost_usd" not in row
+    assert (row["charged_usd"], row["cost_source"]) == (0.3, "estimate")
+    assert world.stored() == [row]
+
+
+def test_run_plan_native_failure_cost_is_both_cost_and_charge(world, monkeypatch) -> None:
+    def capped(*args, stream_log_path, **kwargs):
+        stream_log_path.parent.mkdir(parents=True, exist_ok=True)
+        stream_log_path.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                               "total_cost_usd": 0.7}) + "\n")
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    monkeypatch.setattr(run, "run_single", capped)
+    ledger = SpendLedger(100.0)
+    [row] = plan(world, cells("dev_a"), ledger=ledger)
+
+    assert (row["total_cost_usd"], row["charged_usd"], row["cost_source"]) == (0.7, 0.7, "native")
+    assert ledger.spent == pytest.approx(0.7)

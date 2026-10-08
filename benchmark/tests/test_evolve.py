@@ -937,6 +937,26 @@ def test_quota_stop_finish_buys_nothing(world) -> None:
     assert "finish: incomplete (quota)" in log_text(world)
 
 
+def test_mcp_unavailable_stop_in_search_makes_finish_buy_nothing(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    def unavailable(*args, **kwargs):
+        raise run.McpUnavailableError("tilth MCP did not start")
+
+    monkeypatch.setattr(run, "run_single", unavailable)
+    evo.evaluate(child(evo.seed, dev_a="1", cheap_a="1"), "dev_a")
+    assert evo.stop.reason == "mcp-unavailable"
+    monkeypatch.setattr(run, "run_single", world.fake_run_single)
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls
+    assert world.pr.calls == []
+    assert "finish: incomplete (mcp-unavailable)" in log_text(world)
+
+
 def test_quota_stop_finish_scores_stored_rows(world) -> None:
     evo = ready(world)
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
