@@ -127,7 +127,7 @@ python3 benchmark/judge/cli.py label --tasks rg_search_dispatch,gin_edit_render_
 python3 benchmark/judge/cli.py calibrate --max-usd 5 --cell-estimate-usd 0.05
 ```
 
-Both spend flags are required whenever a call is uncached; judge calls share the `--max-usd` ceiling and stop at the first usage-limit rejection.
+Both spend flags are required whenever a call is uncached; judge calls share the `--max-usd` ceiling, pass its remaining headroom as `--max-budget-usd`, and stop at the first usage-limit rejection.
 The maintainer hand-labels `benchmark/judge/calibration.json` (`{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, verdict `apt`, `missed`, or `misapplied`): every task an analyzed run holds plus at least 20 clean, completed rollouts with trajectories.
 The judge is calibrated when unweighted Cohen's kappa reaches 0.6 on both labels and verdicts; until then critiques are withheld and `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
 

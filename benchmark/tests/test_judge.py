@@ -973,6 +973,39 @@ def test_press_full_judge_argv() -> None:
     ]
 
 
+def budget_flags(argv: list[str]) -> list[str]:
+    return [argv[i + 1] for i, part in enumerate(argv) if part == "--max-budget-usd"]
+
+
+def test_judge_call_budget_is_ledger_headroom() -> None:
+    ledger = SpendLedger(1.0)
+    ledger.charge(0.25, source="native")
+    recorder = Recorder(claude_stream("strong", 0.1))
+    judge = core.Judge(ledger, cell_estimate_usd=0.05)
+    assert judge.client.ledger is ledger
+    judge.client.spawn = recorder
+    judge.applicability(TASKS["rg_search_dispatch"])
+    judge.applicability(TASKS["rg_trait_implementors"])
+    assert [budget_flags(call["argv"]) for call in recorder.calls] == [["0.75"], [str(1.0 - (0.25 + 0.1))]]
+
+
+def test_unbounded_judge_call_passes_no_budget() -> None:
+    recorder = Recorder(claude_stream("strong", 0.1))
+    judge = core.Judge(SpendLedger(None), cell_estimate_usd=0.05)
+    judge.client.spawn = recorder
+    judge.applicability(TASKS["rg_search_dispatch"])
+    (call,) = recorder.calls
+    assert budget_flags(call["argv"]) == []
+
+
+def test_exhausted_ledger_refuses_zero_estimate_call() -> None:
+    ledger = SpendLedger(1.0)
+    ledger.charge(1.0, source="native")
+    client = StubClient()
+    with pytest.raises(core.JudgeSpendCeiling):
+        make_judge(client, ledger=ledger, floor=0.0).applicability(TASKS["rg_search_dispatch"])
+    assert client.prompts == []
+
 @pytest.mark.parametrize("value", ["false", 0, None])
 def test_press_contamination_must_be_exactly_false(judge_home: Path, value: object) -> None:
     seed_agreement()

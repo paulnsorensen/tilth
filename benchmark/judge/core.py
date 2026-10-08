@@ -278,21 +278,34 @@ def pending_calls(
 
 
 class ClaudeJudgeClient:
-    """One isolated, tool-less ``claude -p`` call per prompt, the prompt on stdin."""
+    """One isolated, tool-less ``claude -p`` call per prompt, the prompt on stdin.
+
+    With a bounded ``ledger``, each call passes the ledger's headroom as ``--max-budget-usd``,
+    so one call cannot spend past the run's ceiling.
+    """
 
     def __init__(self, *, spawn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-                 timeout_s: int = 600) -> None:
+                 timeout_s: int = 600, ledger: SpendLedger | None = None) -> None:
         self.spawn = spawn
         self.timeout_s = timeout_s
+        self.ledger = ledger
 
     @staticmethod
-    def argv() -> list[str]:
+    def argv(max_budget_usd: float | None = None) -> list[str]:
         # No --bare (it refuses OAuth) and no --mcp-config: --strict-mcp-config then loads no server.
-        return [
+        argv = [
             "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", config.JUDGE_MODEL,
             "--tools", "", "--strict-mcp-config", "--setting-sources", "",
             "--no-session-persistence", "--disable-slash-commands",
         ]
+        if max_budget_usd is not None:
+            argv += ["--max-budget-usd", str(max_budget_usd)]
+        return argv
+
+    def _headroom(self) -> float | None:
+        if self.ledger is None or self.ledger.max_usd is None:
+            return None
+        return self.ledger.max_usd - self.ledger.spent
 
     def __call__(self, prompt: str) -> JudgeReply:
         env = run.build_runner_env("claude", tilth_bin=None)
@@ -300,7 +313,7 @@ class ClaudeJudgeClient:
               tempfile.TemporaryDirectory(prefix="tilth-judge-config-") as config_dir):
             env["CLAUDE_CONFIG_DIR"] = config_dir
             try:
-                completed = self.spawn(self.argv(), input=prompt, capture_output=True, text=True,
+                completed = self.spawn(self.argv(self._headroom()), input=prompt, capture_output=True, text=True,
                                        cwd=cwd, env=env, timeout=self.timeout_s)
             except subprocess.TimeoutExpired as error:
                 output = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout
@@ -335,7 +348,7 @@ class Judge:
         cell_estimate_usd: float,
     ) -> None:
         self.ledger = ledger
-        self.client = client if client is not None else ClaudeJudgeClient()
+        self.client = client if client is not None else ClaudeJudgeClient(ledger=ledger)
         self.resolve_task = resolve_task
         self.cell_estimate_usd = cell_estimate_usd
         self._largest_cost: float | None = None
@@ -428,7 +441,8 @@ class Judge:
         if _quota_reason is not None:
             raise JudgeQuota(f"judge calls stopped after a usage-limit rejection: {_quota_reason}")
         estimate = self._estimate(kind)
-        if self.ledger.would_cross(estimate):
+        exhausted = self.ledger.max_usd is not None and self.ledger.spent >= self.ledger.max_usd
+        if exhausted or self.ledger.would_cross(estimate):
             raise JudgeSpendCeiling(f"{kind} judge call estimated at ${estimate:.4f} would cross the "
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f})")
         reply = self.client(prompt)
