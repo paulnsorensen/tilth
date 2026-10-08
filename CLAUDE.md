@@ -57,8 +57,8 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-prompts/               MCP server instruction source (mcp.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
-AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
+prompts/               MCP server instruction source (mcp.md) and tool descriptions (tools/*.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
+AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/mcp.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
 ## Languages supported
@@ -80,7 +80,7 @@ cargo fmt --check            # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
 ```
 
-CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, the `tests/mcp_v2` and `tests/scripts` unittest suites, and the bash-guard self-test on every push/PR, with sccache. `just check` runs the same list; keep `GATE_COMMANDS` in `scripts/verify.py` in step with `.github/workflows/ci.yml`.
+CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, the `tests/mcp_v2` and `tests/scripts` unittest suites, and the bash-guard self-test on every push/PR, with sccache. `just check` runs the same list. A separate `benchmark-tests` job runs the benchmark pytest suite (`pip install -r benchmark/requirements-dev.txt`; locally `just check-benchmark`). Keep `GATE_COMMANDS` in `scripts/verify.py` in step with the jobs in `.github/workflows/ci.yml`.
 
 ## Fork law
 
@@ -110,7 +110,7 @@ Releases publish **two npm names** from the same `npm/` wrapper: the canonical u
 
 ## Benchmarks
 
-51 tasks across a synthetic repo and 4 real repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust), spanning code navigation, multi-file edits, diff comprehension, and symbol "grok" understanding. Navigation/grok tasks run headless `claude -p` and check the answer against ground-truth strings; edit/diff tasks inject mutations and pass only when the task's `test_command` goes green.
+58 tasks across a synthetic repo and 4 real repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust), spanning code navigation, multi-file edits, diff comprehension, and symbol "grok" understanding. Navigation/grok tasks run headless `claude -p` and check the answer against ground-truth strings; edit/diff tasks inject mutations and pass only when the task's `test_command` goes green.
 
 **Setup** (one-time — clones repos at pinned commits):
 
@@ -122,7 +122,7 @@ python benchmark/fixtures/setup.py
 
 ```bash
 # Full suite: all tasks, baseline + tilth, 3 reps per task
-python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all --max-usd 40
+python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all --max-usd 150
 
 # Specific tasks
 python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth --max-usd 5
@@ -145,7 +145,7 @@ python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 jq -r '[.task, (.correct|tostring), (.total_cost_usd|tostring), (.tool_calls.tilth_search // 0 | tostring)] | join("\t")' benchmark/results/<file>.jsonl
 ```
 
-Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line is JSON with: `task`, `mode`, `model`, `correct`, `total_cost_usd`, `num_turns`, `tool_calls` (map of tool name → count), `tool_sequence`, `batch_sizes` (map of batchable tool → per-call item counts), `op_kinds` (map of tilth_write op kind → count), `tilth_version`, `duration_ms`, token counts.
+Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line is JSON with: `task`, `mode`, `model`, `correct`, `total_cost_usd`, `run_key`, `cost_source`, `charged_usd`, `reused`, `num_turns`, `tool_calls` (map of tool name → count), `tool_sequence`, `batch_sizes` (map of batchable tool → per-call item counts), `op_kinds` (map of tilth_write op kind → count), `tilth_version`, `duration_ms`, token counts; `benchmark/README.md` lists the full set.
 
 Key metric: **cost per correct answer** = total_spend / correct_count. This is the expected cost under retry (geometric model: `avg_cost / accuracy`).
 
@@ -163,6 +163,7 @@ Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed
 Server instructions sent via MCP protocol live in `prompts/`:
 
 - `prompts/mcp.md` — the one instruction file (wired in as `SERVER_INSTRUCTIONS`)
+- `prompts/tools/read.md`, `prompts/tools/search.md`, `prompts/tools/write.md` — the `tilth_read`, `tilth_search`, and `tilth_write` descriptions, loaded via `include_str!` in `src/mcp/tools/definitions.rs`. Each file holds the exact served bytes with no trailing newline. `tests/mcp_v2/test_tool_descriptions_stable.py` checks that `tools/list` serves each file byte for byte. `regen-agents-md.sh` does not read them.
 
 The server has one mode: it always registers `tilth_write` and serves tagged `tilth_read` output. `--edit` and `tilth install <host> --edit` are accepted for backwards compatibility and ignored.
 

@@ -26,8 +26,8 @@ def _parquet_rows(payload: bytes) -> list[dict]:
     return parquet.read_table(io.BytesIO(payload)).to_pylist()
 
 
-def _write_atomically(path: Path, text: str) -> None:
-    """Replace ``path`` with ``text`` so an interrupted fetch never leaves a truncated row."""
+def write_atomically(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` so an interrupted write never leaves a truncated file."""
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(text)
     os.replace(temporary, path)
@@ -74,7 +74,7 @@ def fetch(dataset: str, *, client: Callable[[str], bytes] | None = None, extra_i
         target.mkdir(parents=True, exist_ok=True)
         for row in rows:
             if data.is_safe_id(str(row.get("instance_id", ""))):
-                _write_atomically(data.row_path(dataset, revision, row["instance_id"]), json.dumps(row, default=str))
+                write_atomically(data.row_path(dataset, revision, row["instance_id"]), json.dumps(row, default=str))
         (target / _COMPLETE_MARKER).write_text(url + "\n")
     for instance_id in dict.fromkeys([*registry.candidates(dataset), *extra_ids]):
         if data.cached_dataset(instance_id) == dataset:

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import stats
 from flags import detect_flags
 from paired import (
+    measured_cost,
     pair_modes,
     paired_accuracy_delta,
     paired_cpc_delta as paired_cpc_delta_impl,
@@ -243,7 +244,7 @@ def cost_per_correct(runs: list[dict]) -> tuple[float, float, float]:
     """
     if not runs:
         return (float("inf"), float("inf"), float("inf"))
-    costs = [float(r.get("total_cost_usd", 0.0)) for r in runs]
+    costs = [measured_cost(r) or 0.0 for r in runs]
     correct = [1.0 if r.get("correct") else 0.0 for r in runs]
     total_correct = sum(correct)
     if total_correct == 0:
@@ -1097,8 +1098,8 @@ def statistical_analysis_section(valid_results: list[dict], all_results: list[di
 def _power_readout(all_results: list[dict]) -> list[str]:
     """Report task-clustered paired accuracy and an informational power readout by model.
 
-    The readout no longer gates task-pool growth (PHASE4_PLAN.md is superseded by
-    the benchmark-gepa-overhaul spec); it only describes the observed power.
+    The readout no longer gates task-pool growth (the old phase-4 plan is superseded by
+    .cheese/specs/benchmark-gepa-overhaul.md); it only describes the observed power.
     """
     modes = ordered_modes({
         run.get("mode")

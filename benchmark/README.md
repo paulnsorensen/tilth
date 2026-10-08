@@ -53,12 +53,12 @@ Select tasks before inspecting results. This small Gin-only suite does not measu
 Check raw tool calls and `batch_sizes` for actual batching; one successful MCP call does not demonstrate batching.
 The cell cap limits calls; `--max-usd` limits spending. The runner records the selected effort in each result row.
 
-The output path appears in the run summary under `benchmark/results/`. Raw Codex JSONL and adjacent `.stderr` files appear in the matching `benchmark/results/streams/` directory, including failed cells. `--max-cells` and the per-cell 600-second timeout bound the run size. Codex has no per-cell dollar cap; its cost is an estimate from token usage, which the run-wide `--max-usd` ledger counts.
+The output path appears in the run summary under `benchmark/results/`. Raw Codex JSONL and adjacent `.stderr` files appear in the matching `benchmark/results/streams/` directory, including failed cells. `--max-cells`, `--max-usd`, and the per-cell 600-second timeout bound the run size. Codex has no per-cell dollar cap; its cost is an estimate from token usage, which the run-wide `--max-usd` ledger counts.
 
 ## Result store, spend ceiling, and subscription guards
 
 Every row carries a `run_key` that hashes the model, agent CLI version, effort, timeout, arm, repetition, task, a harness digest (system prompt, tool allowlist, strict-file-tools, bare, per-cell `--max-budget-usd`, MCP config shape, the runner command template with workspace, binary, and prompt paths normalized, and in strict mode the Bash guard source), a task digest (prompt, ground truth, test command, mutations, fixture files, repo commit), an environment fingerprint (the versions of the task repo language's toolchains, with `uv` for Python, plus the repo's lockfiles, or `package.json` and `node_modules/.package-lock.json` when it has none), and, for tilth arms, the candidate `git_sha` and `binary_sha256`.
-Rows also record `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, `cost_source`, `charged_usd`, `reused`, and `trajectory_path`.
+Rows also record `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, `cost_source`, `charged_usd`, `reused`, and `trajectory_path`; a Woz Code cell also records `plugin_sha256`, a hash of the plugin tree that joins the run key.
 For Claude and Codex cells, `trajectory_path` names a sidecar beside the raw stream with every tool call's full input and output; OpenCode cells record `null`.
 
 `run.py` appends every row to `benchmark/results/result_store.jsonl`.
@@ -73,7 +73,7 @@ The run stops before a cell whose estimate would cross the ceiling.
 The estimate is the mean stored cost for that task, arm, and model, else this run's largest cell cost, else `--cell-estimate-usd` (default: `--max-budget-usd`).
 
 A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
-Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives them, and empty `ANTHROPIC_*` values are dropped.
+Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives any `ANTHROPIC_*` variable.
 A usage-limit rejection (a terminal result with usage-limit text or a rate-limit subtype) records the cell as `infra: quota` and stops the run with exit status 1, as does the spend ceiling.
 
 ## External tasks: FeatureBench and SWE-bench Multilingual
@@ -354,7 +354,7 @@ All selected modes use the same system prompt, model, and per-cell budget cap (d
 - Python 3.12+
 - At least one supported agent CLI (`claude`, `codex`, or `opencode`) installed and authenticated
 - Rust/Cargo and Git (for building exact tilth revisions and cloning benchmark repos)
-- Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy + numpy)
+- Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy and numpy). Running the tests also needs pytest: `pip install -r benchmark/requirements-dev.txt`.
 
 **Setup:**
 
