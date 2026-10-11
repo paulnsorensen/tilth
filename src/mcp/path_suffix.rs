@@ -6,6 +6,11 @@
 //!   * `n`         → from line n to end of file
 //!   * `# heading` → markdown heading anchor
 //!   * `name`      → code symbol resolved via outline
+//!
+//! When the spec has no `#`, a trailing colon line address is also accepted so
+//! a path copied with an editor/grep-style line reference still resolves:
+//!   * `path:n-m`  → same as `#n-m` (1-indexed inclusive line range)
+//!   * `path:n`    → same as `#n` (from line n to end of file)
 
 use std::path::PathBuf;
 
@@ -29,6 +34,11 @@ pub enum PathSuffix {
 /// disambiguation is left to the caller (depends on file type).
 pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
     let Some(hash_idx) = spec.find('#') else {
+        // No `#`: accept a trailing colon line address (`path:n` / `path:n-m`),
+        // the editor/grep-style reference an agent commonly carries into a read.
+        if let Some(parsed) = split_trailing_line_suffix(spec) {
+            return parsed;
+        }
         return (PathBuf::from(spec), PathSuffix::None);
     };
     let path = PathBuf::from(&spec[..hash_idx]);
@@ -67,6 +77,38 @@ pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
         return (path, PathSuffix::Heading(format!("# {suffix_raw}")));
     }
     (path, PathSuffix::Symbol(suffix_raw.to_string()))
+}
+
+/// Try to split a trailing colon line address off `spec`: `path:n-m` →
+/// [`PathSuffix::LineRange`], `path:n` → [`PathSuffix::FromLine`]. Anchors on
+/// the last `:` and matches only when the tail is a bare 1-indexed line address,
+/// so a colon elsewhere in the path (or a non-numeric tail) leaves the spec
+/// untouched. Mirrors the `#n-m` / `#n` grammar exactly (same 1-indexed,
+/// inclusive, `start <= end`, `n >= 1` rules).
+fn split_trailing_line_suffix(spec: &str) -> Option<(PathBuf, PathSuffix)> {
+    let colon = spec.rfind(':')?;
+    let head = &spec[..colon];
+    let tail = &spec[colon + 1..];
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+
+    if let Some((a, b)) = tail.split_once('-') {
+        let (Ok(start), Ok(end)) = (a.parse::<usize>(), b.parse::<usize>()) else {
+            return None;
+        };
+        if start >= 1 && end >= start {
+            return Some((PathBuf::from(head), PathSuffix::LineRange(start, end)));
+        }
+        return None;
+    }
+
+    if let Ok(n) = tail.parse::<usize>() {
+        if n >= 1 {
+            return Some((PathBuf::from(head), PathSuffix::FromLine(n)));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -137,6 +179,73 @@ mod tests {
         assert!(
             !matches!(s, PathSuffix::FromLine(_)),
             "line 0 must not be FromLine, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_colon_line_range() {
+        // `path:n-m` resolves the same as `path#n-m` (issue #84).
+        let (p, s) = parse_path_with_suffix("src/read/mod.rs:255-275");
+        assert_eq!(p, PathBuf::from("src/read/mod.rs"));
+        assert!(
+            matches!(s, PathSuffix::LineRange(255, 275)),
+            "colon range must parse as LineRange, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_colon_from_line() {
+        // `path:n` resolves the same as `path#n` (from line n to end).
+        let (p, s) = parse_path_with_suffix("a.rs:42");
+        assert_eq!(p, PathBuf::from("a.rs"));
+        assert!(
+            matches!(s, PathSuffix::FromLine(42)),
+            "colon single line must parse as FromLine, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_colon_non_numeric_tail_is_plain_path() {
+        // A colon not followed by a bare line address is left in the path.
+        let (p, s) = parse_path_with_suffix("weird:name.rs");
+        assert_eq!(p, PathBuf::from("weird:name.rs"));
+        assert!(
+            matches!(s, PathSuffix::None),
+            "non-numeric colon tail must stay a plain path, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_colon_invalid_range_is_plain_path() {
+        // `:10-5` (end < start) is not a valid range; the whole spec stays path.
+        let (p, s) = parse_path_with_suffix("a.rs:10-5");
+        assert_eq!(p, PathBuf::from("a.rs:10-5"));
+        assert!(
+            matches!(s, PathSuffix::None),
+            "invalid colon range must stay a plain path, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_colon_line_zero_rejected() {
+        // Line 0 is not a valid 1-indexed line; the whole spec stays path.
+        let (p, s) = parse_path_with_suffix("a.rs:0");
+        assert_eq!(p, PathBuf::from("a.rs:0"));
+        assert!(
+            matches!(s, PathSuffix::None),
+            "colon line 0 must stay a plain path, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn parse_hash_wins_over_colon() {
+        // When both are present the `#` grammar is primary; the colon stays in
+        // the path portion, untouched.
+        let (p, s) = parse_path_with_suffix("a.rs:1#10-20");
+        assert_eq!(p, PathBuf::from("a.rs:1"));
+        assert!(
+            matches!(s, PathSuffix::LineRange(10, 20)),
+            "hash suffix must win over a colon, got {s:?}"
         );
     }
 }
