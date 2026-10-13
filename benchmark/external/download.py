@@ -1,5 +1,6 @@
 """``fetch``: the only code path that downloads dataset rows or upstream source."""
 
+import hashlib
 import io
 import json
 import os
@@ -24,6 +25,15 @@ def _parquet_rows(payload: bytes) -> list[dict]:
     except ImportError as error:
         raise RuntimeError("fetching dataset rows needs pyarrow: pip install pyarrow") from error
     return parquet.read_table(io.BytesIO(payload)).to_pylist()
+
+
+def _verified(dataset: str, payload: bytes) -> bytes:
+    """``payload`` when its sha256 matches the pin for ``dataset``; otherwise raise."""
+    expected = data.PARQUET_SHA256.get(dataset)
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"{dataset} parquet sha256 {actual} does not match the pinned {expected}")
+    return payload
 
 
 def write_atomically(path: Path, text: str) -> None:
@@ -70,7 +80,7 @@ def fetch(dataset: str, *, client: Callable[[str], bytes] | None = None, extra_i
     target = data.rows_dir(dataset, revision)
     if not (target / _COMPLETE_MARKER).is_file():
         url = dataset_url(dataset)
-        rows = _parquet_rows((client or _http_get)(url))
+        rows = _parquet_rows(_verified(dataset, (client or _http_get)(url)))
         target.mkdir(parents=True, exist_ok=True)
         for row in rows:
             if data.is_safe_id(str(row.get("instance_id", ""))):

@@ -1,7 +1,9 @@
 """External task loading, prepared workspaces, native grading, and dataset fetch (bench-external-tasks)."""
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -25,7 +27,7 @@ from external_support import (
     FB_F2P_EDIT, FB_LV1, OUTPUTS, SWE_GO, SWE_PY, SWE_RS, git, parquet_bytes, projects, rows,
 )
 
-FEATUREBENCH_URL = ("https://huggingface.co/datasets/LiberCoders/FeatureBench/resolve/v1.1/"
+FEATUREBENCH_URL = ("https://huggingface.co/datasets/LiberCoders/FeatureBench/resolve/76b4a4566e04f4bcc13c35125d4f301791efa736/"
                     "data/lite-00000-of-00001.parquet")
 SWEBENCH_ML_URL = ("https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/"
                    "846e647b9f33c0b51b739d005d13d85493c9af09/data/test-00000-of-00001.parquet")
@@ -386,7 +388,14 @@ def test_loaders_build_tasks_from_pinned_rows(external_bench, tmp_path: Path, in
         loader(instance_id, external.data.REVISIONS[dataset])
 
 
+def _pin_fixture_parquet(monkeypatch: pytest.MonkeyPatch) -> None:
+    pins = {dataset: hashlib.sha256(parquet_bytes(list(rows(dataset).values()))).hexdigest()
+            for dataset in ("featurebench", "swebench_ml")}
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", pins)
+
+
 def test_fetch_pins_revisions(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_fixture_parquet(monkeypatch)
     monkeypatch.setattr(external.featurebench, "PARETO12_IDS", (FB_LV1,))
     monkeypatch.setattr(external.swebench_ml, "PICKS", {"go": (SWE_GO,), "rust": (SWE_RS,)})
     requested: list[str] = []
@@ -403,7 +412,7 @@ def test_fetch_pins_revisions(external_bench, monkeypatch: pytest.MonkeyPatch) -
     stored = sorted(str(path.relative_to(external_bench.data / "rows"))
                     for path in (external_bench.data / "rows").rglob("*.json"))
     assert stored == sorted(
-        [f"featurebench/v1.1/{instance_id}.json" for instance_id in rows("featurebench")]
+        [f"featurebench/76b4a4566e04f4bcc13c35125d4f301791efa736/{instance_id}.json" for instance_id in rows("featurebench")]
         + [f"swebench_ml/846e647b9f33c0b51b739d005d13d85493c9af09/{instance_id}.json"
            for instance_id in rows("swebench_ml")]
     )
@@ -632,7 +641,28 @@ def test_container_named_packages_are_not_container_steps(external_bench, tmp_pa
     assert ["uv", "pip", "install", "podman-compose"] in external_bench.commands
 
 
+def test_fetch_refuses_a_parquet_that_does_not_match_its_pin(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(external.featurebench, "PARETO12_IDS", ())
+    payload = parquet_bytes(list(rows("featurebench").values()))
+
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": "0" * 64})
+    with pytest.raises(RuntimeError, match="does not match the pinned"):
+        external.download.fetch("featurebench", client=lambda url: payload)
+    assert not list((external_bench.data / "rows").rglob("_complete"))
+
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": hashlib.sha256(payload).hexdigest()})
+    external.download.fetch("featurebench", client=lambda url: payload)
+    assert list((external_bench.data / "rows").rglob("_complete"))
+
+
+def test_pinned_revisions_are_commit_shas() -> None:
+    for dataset, revision in external.data.REVISIONS.items():
+        assert re.fullmatch(r"[0-9a-f]{40}", revision), dataset
+        assert re.fullmatch(r"[0-9a-f]{64}", external.data.PARQUET_SHA256[dataset]), dataset
+
+
 def test_interrupted_fetch_leaves_no_truncated_row(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_fixture_parquet(monkeypatch)
     monkeypatch.setattr(external.featurebench, "PARETO12_IDS", ())
     replaced: list[str] = []
     real_replace = os.replace
