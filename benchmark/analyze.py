@@ -388,7 +388,7 @@ def _applicability_section(results: list[dict], modes: list[str]) -> list[str]:
         run["task_digest"] for run in results if isinstance(run.get("task_digest"), str)
     )
     labelled = [
-        (run, labels.get(run.get("task_digest")) if run.get("task") in agreement.tasks else None)
+        (run, judge_store.released_label(agreement, run.get("task"), run.get("task_digest"), labels))
         for run in results
     ]
     unlabelled = sorted({str(run.get("task")) for run, label in labelled if label is None})

@@ -8,13 +8,11 @@ here touches result rows or the result store.
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
-from pathlib import Path
 from typing import Literal
 
 import baselines
-from jsonl import tolerant_jsonl
 
 from . import config
 
@@ -36,6 +34,7 @@ class Agreement:
     label_count: int = 0
     verdict_count: int = 0
     threshold: float = config.KAPPA_THRESHOLD
+    min_trajectories: int = config.MIN_CALIBRATION_TRAJECTORIES
     model: str = ""
     applicability_prompt_hash: str = ""
     critique_prompt_hash: str = ""
@@ -43,7 +42,7 @@ class Agreement:
     tasks: tuple[str, ...] = ()
 
 
-def _sha256(data: bytes) -> str:
+def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
@@ -52,29 +51,31 @@ def prompt_template(kind: Kind) -> str:
 
 
 def prompt_hash(kind: Kind) -> str:
-    return _sha256(prompt_template(kind).encode())
+    return sha256(prompt_template(kind).encode())
 
 
-def calibration_digest(path: Path | None = None) -> str:
-    return _sha256((path or config.CALIBRATION_FILE).read_bytes())
+def calibration_digest() -> str:
+    return sha256(config.CALIBRATION_FILE.read_bytes())
 
 
-def judge_stamp() -> dict[str, str]:
-    """The judge model and prompt hashes an agreement record carries."""
+def judge_stamp() -> dict[str, object]:
+    """The judge model, prompt hashes, and calibration policy an agreement record carries."""
     return {
         "model": config.JUDGE_MODEL,
+        "threshold": config.KAPPA_THRESHOLD,
+        "min_trajectories": config.MIN_CALIBRATION_TRAJECTORIES,
         "applicability_prompt_hash": prompt_hash("applicability"),
         "critique_prompt_hash": prompt_hash("critique"),
     }
 
 
-def current_stamp() -> dict[str, str]:
+def current_stamp() -> dict[str, object]:
     """The identity a stored agreement must match to count as current."""
     return {**judge_stamp(), "calibration_digest": calibration_digest()}
 
 
 def _key(kind: Kind, subject: str, kind_prompt_hash: str | None = None) -> str:
-    return _sha256(json.dumps([subject, config.JUDGE_MODEL, kind_prompt_hash or prompt_hash(kind)]).encode())
+    return sha256(json.dumps([subject, config.JUDGE_MODEL, kind_prompt_hash or prompt_hash(kind)]).encode())
 
 
 def label_key(task_digest: str) -> str:
@@ -86,10 +87,7 @@ def critique_key(run_key: str) -> str:
 
 
 def _read(name: str) -> list[dict]:
-    try:
-        return tolerant_jsonl((config.JUDGE_DIR / name).read_text())
-    except FileNotFoundError:
-        return []
+    return baselines.load_rows(config.JUDGE_DIR / name)
 
 
 def _append(name: str, entry: dict) -> None:
@@ -157,3 +155,17 @@ def current_agreement() -> Agreement | None:
             known = {key: value for key, value in record.items() if key in names}
             return Agreement(**{**known, "tasks": tuple(known.get("tasks", ()))})
     return None
+
+
+def released_label(
+    agreement: Agreement | None, task_name: str, task_digest: str, labels: Mapping[str, str] | None = None,
+) -> str | None:
+    """The cached label for a task digest, only when ``agreement`` releases it.
+
+    ``agreement`` comes from ``current_agreement()``. It releases a label when it is calibrated
+    and its hand-labelled tasks cover ``task_name``. A caller that checks many digests passes
+    ``labels`` from one ``cached_labels`` read.
+    """
+    if agreement is None or not agreement.calibrated or task_name not in agreement.tasks:
+        return None
+    return (labels if labels is not None else cached_labels([task_digest])).get(task_digest)

@@ -6,12 +6,12 @@ rejection stops every later judge call in the process. Labels and critiques live
 the judge caches only; they never enter result rows or the result store.
 """
 
-import hashlib
 import json
 import math
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -65,8 +65,7 @@ class CritiqueWithheld(JudgeError):
 
 class UnresolvableTask(JudgeError):
     def __init__(self, task: object) -> None:
-        super().__init__(f"task {task} does not resolve to a local task or an admitted external instance")
-        self.task = task
+        super().__init__(f"task {task} does not resolve to a local task or a cached external instance")
 
 
 class JudgeQuota(JudgeError):
@@ -98,10 +97,35 @@ class JudgeClient(Protocol):
     def __call__(self, prompt: str) -> JudgeReply: ...
 
 
+_external_tasks: dict[str, object] = {}
+
+
+def _load_external(name: str) -> object | None:
+    """The ExternalTask for a cached instance row, else None; never admits, downloads, or builds."""
+    if name not in _external_tasks:
+        if external.cached_row(name) is None:
+            return None
+        _external_tasks[name] = external.registry.load(name)
+    return _external_tasks[name]
+
+
 def default_resolve_task(name: str) -> object | None:
-    """A local task from the registry, else an admitted external instance, else None."""
+    """A local task from the registry, else a cached external instance, else None.
+
+    An external instance skips admission: the judge reads the task statement and gold patch only,
+    so it needs no environment build and no paid admission round trip.
+    """
     task = TASKS.get(name)
-    return task if task is not None else external.resolve_task(name)
+    return task if task is not None else _load_external(name)
+
+
+def trusted_reference(task: object) -> str | None:
+    """The held-out tests that sit in the task module's ``HELD_OUT`` directory, else None."""
+    held_out = getattr(sys.modules.get(type(task).__module__), "HELD_OUT", None)
+    if held_out is None:
+        return None
+    files = sorted(Path(held_out).glob("*_heldout_test.go"))
+    return "\n".join(f"// {path.name}\n{path.read_text()}" for path in files) or None
 
 
 def stripped_record(
@@ -145,9 +169,9 @@ def label_prompt(task: object) -> str:
     test_command = list(getattr(task, "test_command", ()) or ())
     if test_command:
         sections.append(("Test command", shlex.join(test_command)))
-    trusted_reference = getattr(task, "trusted_reference", None)
-    if trusted_reference:
-        sections.append(("Trusted reference", trusted_reference))
+    reference = trusted_reference(task)
+    if reference:
+        sections.append(("Trusted reference", reference))
     return _prompt("applicability", sections)
 
 
@@ -251,7 +275,7 @@ def load_calibration(
         trajectories.append(CalibrationTrajectory(run_key, verdict, row, Path(sidecar).read_text()))
     if problems:
         raise CalibrationInvalid(f"{path} refused:\n" + "\n".join(f"  {problem}" for problem in problems))
-    return CalibrationSet(dict(data["tasks"]), tuple(trajectories), hashlib.sha256(raw).hexdigest())
+    return CalibrationSet(dict(data["tasks"]), tuple(trajectories), store.sha256(raw))
 
 
 def calibration_shortfall(labels: CalibrationSet) -> str | None:
@@ -265,6 +289,11 @@ def calibration_shortfall(labels: CalibrationSet) -> str | None:
     return "; ".join(shortfalls) or None
 
 
+def uncached_labels(tasks: Mapping[str, object]) -> list[str]:
+    """The names of the tasks whose label is not cached."""
+    return [name for name, task in tasks.items() if store.cached_label(run._cell_task_digest(task)) is None]
+
+
 def pending_calls(
     labels: CalibrationSet, resolve_task: Callable[[str], object | None] = default_resolve_task,
 ) -> list[str]:
@@ -272,7 +301,7 @@ def pending_calls(
     if calibration_shortfall(labels) is not None:
         return []
     return [
-        *(name for name in labels.tasks if store.cached_label(run._cell_task_digest(resolve_task(name))) is None),
+        *uncached_labels({name: resolve_task(name) for name in labels.tasks}),
         *(entry.run_key for entry in labels.trajectories if store.cached_critique(entry.run_key) is None),
     ]
 
@@ -380,7 +409,7 @@ class Judge:
         """Measure agreement with the hand labels and record it, calibrated or not."""
         stamp = {**store.judge_stamp(), "calibration_digest": labels.digest}
         counts = {"label_count": len(labels.tasks), "verdict_count": len(labels.trajectories),
-                  "threshold": config.KAPPA_THRESHOLD, "tasks": tuple(sorted(labels.tasks))}
+                  "tasks": tuple(sorted(labels.tasks))}
         shortfall = calibration_shortfall(labels)
         if shortfall is not None:
             agreement = Agreement(calibrated=False, reason=shortfall, **counts, **stamp)
@@ -446,15 +475,14 @@ class Judge:
             raise JudgeSpendCeiling(f"{kind} judge call estimated at ${estimate:.4f} would cross the "
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f})")
         reply = self.client(prompt)
-        if reply.quota is not None or reply.error is not None:
-            if reply.cost is not None and reply.cost_source == "native":
-                self._charge(reply.cost, "native")
-            else:
-                self._charge(estimate, "estimate")
-            if reply.quota is not None:
-                _quota_reason = reply.quota
-                raise JudgeQuota(reply.quota)
-            raise JudgeCallFailed(reply.error)
-        cost, source = (reply.cost, reply.cost_source) if reply.cost is not None else (estimate, "estimate")
+        failed = reply.quota is not None or reply.error is not None
+        # A failed call charges only a native cost; a pricing-derived cost is not trusted.
+        trusted = reply.cost is not None and (reply.cost_source == "native" or not failed)
+        cost, source = (reply.cost, reply.cost_source) if trusted else (estimate, "estimate")
         self._charge(cost, source)
+        if reply.quota is not None:
+            _quota_reason = reply.quota
+            raise JudgeQuota(reply.quota)
+        if reply.error is not None:
+            raise JudgeCallFailed(reply.error)
         return reply.text, cost

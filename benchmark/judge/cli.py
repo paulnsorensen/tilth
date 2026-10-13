@@ -9,6 +9,7 @@ Both spend flags are required whenever a requested judge call is uncached.
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -21,7 +22,7 @@ if not __package__:
     sys.path.insert(0, str(_PACKAGE_DIR.parent))
 
 import run  # noqa: E402
-from judge import core, store  # noqa: E402
+from judge import core  # noqa: E402
 from spend import SpendLedger  # noqa: E402
 
 _SPEND_FLAGS = (("--max-usd", "max_usd"), ("--cell-estimate-usd", "cell_estimate_usd"))
@@ -44,8 +45,7 @@ def _label(args: argparse.Namespace, client: core.JudgeClient | None) -> int:
     if unknown:
         print(f"error: unknown task(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
-    pending = [name for name, task in tasks.items() if store.cached_label(run._cell_task_digest(task)) is None]
-    judge = _judge(args, client, pending)
+    judge = _judge(args, client, core.uncached_labels(tasks))
     if judge is None:
         return 2
     for name, task in tasks.items():
@@ -65,7 +65,7 @@ def _calibrate(args: argparse.Namespace, client: core.JudgeClient | None) -> int
 
 def _positive(value: str) -> float:
     number = float(value)
-    if number <= 0:
+    if not (math.isfinite(number) and number > 0):
         raise argparse.ArgumentTypeError(f"{value} is not a positive amount")
     return number
 
