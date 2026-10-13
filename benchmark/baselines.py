@@ -11,7 +11,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from collections.abc import Iterator, Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 

@@ -31,7 +31,7 @@ LOCAL = (*CHEAP, "gin_edit_render_context")
 # Per-language SWE-bench Multilingual slots: (primary, fallback).
 SLOTS: Mapping[str, tuple[str, str]] = external.swebench_ml.PICKS
 _SLOT_LANGUAGE = {instance_id: language for language, pair in SLOTS.items() for instance_id in pair}
-# Row fields that Panel.stamp writes; a reused row drops stored ones before the current stamp applies.
+# Row fields that Panel.stamp writes, in order; unstamp drops them from a reused row.
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 
 _PANEL_KEYS = {"name", "split_seed", "members"}
@@ -56,7 +56,6 @@ class Member:
 @dataclass(frozen=True)
 class Panel:
     name: str
-    split_seed: int
     cheap: tuple[str, ...]
     dev: tuple[str, ...]
     test: tuple[str, ...]
@@ -75,8 +74,7 @@ class Panel:
 
     def stamp(self, task_name: str) -> dict[str, str]:
         """The row fields that tie a stored row to this panel and the member's tier."""
-        return {"panel_name": self.name, "panel_split_digest": self.split_digest,
-                "panel_split": self.member(task_name).split}
+        return dict(zip(STAMP_FIELDS, (self.name, self.split_digest, self.member(task_name).split)))
 
     def register(self, tasks_by_name: dict) -> None:
         """Insert each external member into ``tasks_by_name`` through the c2 loaders.
@@ -96,6 +94,8 @@ class Panel:
                 task = loader(member.id, external.data.REVISIONS[dataset])
             except (LookupError, ValueError, OSError) as error:
                 raise PanelError(f"{member.id}: cannot load the external task: {error}") from error
+            if task.name != member.id:
+                raise PanelError(f"{member.id}: the loader returned task {task.name}")
             existing = tasks_by_name.get(task.name)
             if existing is not None:
                 if not isinstance(existing, external.ExternalTask):
@@ -103,13 +103,12 @@ class Panel:
                 if _cell_task_digest(existing) != _cell_task_digest(task):
                     raise PanelError(f"{task.name}: already registered with a different task digest")
                 continue
-            if task.name != member.id:
-                raise PanelError(f"{member.id}: the loader returned task {task.name}")
             tasks_by_name[task.name] = task
 
 
-def _digest(payload: object) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def unstamp(row: Mapping[str, Any]) -> dict[str, Any]:
+    """A copy of a stored row without the panel stamp, so a reused row takes the current stamp."""
+    return {key: value for key, value in row.items() if key not in STAMP_FIELDS}
 
 
 def stratify(members: Iterable[Mapping[str, Any]], split_seed: int) -> dict[str, str]:
@@ -134,11 +133,7 @@ def split_digest(members: Iterable[Member]) -> str:
     lists: dict[str, list[str]] = {split: [] for split in SPLITS}
     for member in members:
         lists[member.split].append(member.id)
-    return _digest({split: sorted(ids) for split, ids in lists.items()})
-
-
-def _cached_row(instance_id: str) -> Mapping[str, Any] | None:
-    return external.data.cached_row(instance_id)
+    return baselines._digest({split: sorted(ids) for split, ids in lists.items()})
 
 
 def _parse(path: Path) -> tuple[str, int, list[Member]]:
@@ -303,11 +298,11 @@ def load_panel(
     name, split_seed, members = _parse(path)
     _check_members(members)
     _check_complete(members)
-    _check_languages(members, row_source or _cached_row)
+    _check_languages(members, row_source or external.data.cached_row)
     _check_split(members, split_seed)
     digest = split_digest(members)
     _check_lock(name, digest, store_path)
     _check_admitted(members, admit or external.preflight.admit)
     by_split = {split: tuple(member.id for member in members if member.split == split) for split in SPLITS}
-    return Panel(name=name, split_seed=split_seed, cheap=by_split["cheap"], dev=by_split["dev"],
+    return Panel(name=name, cheap=by_split["cheap"], dev=by_split["dev"],
                  test=by_split["test"], split_digest=digest, members=tuple(members))

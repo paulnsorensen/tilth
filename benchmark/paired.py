@@ -40,14 +40,26 @@ def _model_key(run: dict) -> object:
     return MODEL_ALIASES.get(model, model)
 
 
+def is_contaminated_panel_row(result: dict) -> bool:
+    """A panel row whose agent saw benchmark or upstream grader material."""
+    return bool(result.get("panel_name")) and result.get("contaminated") is True
+
+
 def load_runs(path: Path) -> list[dict]:
-    """Load JSONL results, keeping error records (they pair as incorrect)."""
+    """Load JSONL results, keeping error records (they pair as incorrect).
+
+    A contaminated panel row counts as incorrect whatever its grader verdict and
+    stays in its pairing; rows without ``panel_name`` are unchanged.
+    """
     runs = []
     with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
-                runs.append(json.loads(line))
+                run = json.loads(line)
+                if is_contaminated_panel_row(run):
+                    run["correct"] = False
+                runs.append(run)
     return runs
 
 

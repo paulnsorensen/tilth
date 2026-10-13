@@ -1361,6 +1361,21 @@ def mcp_server_commands(mode_name: str, runner: str | None) -> dict[str, str]:
     }
 
 
+def _store_reused_panel_row(stored: dict, stamp: dict, *, store_path: Path) -> None:
+    """Record a panel's stamp for a reused row, so the panel's split lock sees it.
+
+    The copy costs nothing and keeps the stored run key and outcome, so reuse lookup is unchanged.
+    No row for the run key that already carries this panel's name and split digest is stored again.
+    """
+    if not stamp:
+        return
+    fields = ("panel_name", "panel_split_digest")
+    if any(row.get("run_key") == stored.get("run_key") and all(row.get(key) == stamp.get(key) for key in fields)
+           for row in [stored, *baselines.load_rows(store_path)]):
+        return
+    baselines.store({**stored, **stamp, "charged_usd": 0.0, "reused": True}, path=store_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
@@ -1791,9 +1806,10 @@ Examples:
                     {} if isinstance(stored.get("contaminated"), bool)
                     else contamination_fields(stored.get("trajectory_path"), task)
                 )
-                unstamped = {key: value for key, value in stored.items() if key not in panels.STAMP_FIELDS}
+                if panel:
+                    _store_reused_panel_row({**stored, **scanned}, panel.stamp(task_name), store_path=store_path)
                 record({
-                    **unstamped, **scanned, **experiment_metadata, "tilth_version": reported_version,
+                    **panels.unstamp(stored), **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "charged_usd": 0.0, "reused": True,
                 })
