@@ -11,6 +11,9 @@ phase's budget unspent, then sets it to 0 for finish.
 import math
 from dataclasses import dataclass, field
 
+# Unreserved headroom below this floor counts as exhausted, so float leftovers never become a budget cap.
+MIN_HEADROOM_USD = 0.01
+
 
 @dataclass
 class SpendLedger:
@@ -28,6 +31,11 @@ class SpendLedger:
     def headroom(self) -> float | None:
         """Unreserved spend left under the ceiling; ``None`` when unbounded."""
         return None if self.max_usd is None else self.max_usd - self.spent - self.reserve
+
+    def exhausted(self) -> bool:
+        """True when the unreserved headroom is below ``MIN_HEADROOM_USD``."""
+        headroom = self.headroom()
+        return headroom is not None and headroom < MIN_HEADROOM_USD
 
     def charge(self, cost: float, *, source: str) -> None:
         if cost < 0:

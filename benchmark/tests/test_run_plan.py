@@ -471,6 +471,88 @@ def test_run_plan_spawns_no_cell_without_unreserved_headroom(world) -> None:
     assert world.runner_calls() == []
 
 
+def test_run_plan_stops_when_a_capped_cell_hits_its_cap(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def capped(*args, stream_log_path, **kwargs):
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    monkeypatch.setattr(run, "run_single", capped)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells("dev_a", "dev_b"), ledger=SpendLedger(1.0, reserve=0.7), cell_estimate_usd=0.05)
+
+    assert stopped.value.reason == "ceiling"
+    [row] = world.stored()
+    assert row["task"] == "dev_a" and row["correct"] is False and "error_max_budget_usd" in row["error"]
+    assert row["applied_max_budget_usd"] == pytest.approx(0.3)
+
+
+def test_run_plan_default_cap_failure_stays_a_cell_failure(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def capped(*args, stream_log_path, **kwargs):
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    monkeypatch.setattr(run, "run_single", capped)
+    [row] = plan(world, cells("dev_a"), ledger=SpendLedger(100.0))
+
+    assert row["correct"] is False and "error_max_budget_usd" in row["error"]
+
+
+def test_run_plan_float_leftover_headroom_spawns_no_cell(world) -> None:
+    ledger = SpendLedger(1.0, spent=0.7, reserve=0.3)
+    assert 0 < ledger.headroom() < 1e-9
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.0)
+
+    assert stopped.value.reason == "ceiling"
+    assert world.runner_calls() == []
+
+
+def test_run_plan_stops_a_codex_cell_without_unreserved_headroom(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(run.RUNNERS, MODEL, "codex")
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "codex-test")
+    monkeypatch.setattr(run, "planned_identity", lambda cell: {"run_key": "k" * 64, "cli_version": "codex-test"})
+    monkeypatch.setattr(run, "_refuse_baseline_drift", lambda *_args: None)
+    ledger = SpendLedger(1.0, spent=0.5, reserve=0.5)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.0)
+
+    assert stopped.value.reason == "ceiling"
+    assert world.runner_calls() == []
+
+
+class OtherPanel:
+    def __init__(self, inner, name: str) -> None:
+        self.inner, self.name = inner, name
+
+    def stamp(self, task: str) -> dict:
+        return {**self.inner.stamp(task), "panel_name": self.name, "panel_split_digest": self.name * 4}
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def test_run_plan_reuse_across_panels_does_not_grow_the_store(world) -> None:
+    plan(world, cells("dev_a"))
+    other = OtherPanel(world.panel, "b")
+
+    def reuse(panel) -> None:
+        run.run_plan(cells("dev_a"), panel=panel, ledger=SpendLedger(100.0), candidate_sha=None,
+                     refreeze_baselines=False, repo=world.repo)
+
+    reuse(other)
+    grown = len(world.stored())
+    reuse(world.panel)
+    reuse(other)
+    reuse(world.panel)
+
+    assert grown == 2 and len(world.stored()) == 2
+
+
+def test_estimate_ignores_reused_copies() -> None:
+    fresh = {"task": "t", "mode": "m", "model": "x", "total_cost_usd": 0.4}
+    rows = [fresh, {**fresh, "reused": True}, {**fresh, "reused": True, "total_cost_usd": 0.4}]
+    assert run.estimate_cell_cost(rows + [{**fresh, "total_cost_usd": 0.2}], task="t", mode="m", model="x",
+                                  run_max_cost=None, fallback=9.0) == pytest.approx(0.3)
+
+
 def test_candidate_build_env_is_allowlisted(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
     repo, candidate, _builds = candidate_repo
     for key, value in {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",

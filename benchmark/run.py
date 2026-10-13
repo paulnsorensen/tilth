@@ -923,7 +923,7 @@ def _runner_command(
             "--output-format", "stream-json",
             "--verbose",
             "--model", model_id,
-            "--max-budget-usd", str(max_budget_usd),
+            "--max-budget-usd", f"{max_budget_usd:.4f}",
             "--disable-slash-commands",
             "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and mode.mcp_config_path else "Agent,Task",
             "--no-session-persistence",
@@ -1610,13 +1610,15 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
                                         f"_{attempt}.jsonl")
-        # The run key pins the default budget. The cap passed to the runner shrinks to the unreserved headroom,
-        # so a cell that overruns its estimate cannot spend the evolve finish reserve.
-        headroom = ledger.headroom() if runner == "claude" else None
-        cell_cap = DEFAULT_MAX_BUDGET_USD if headroom is None else min(DEFAULT_MAX_BUDGET_USD, headroom)
-        if cell_cap <= 0:
+        # Any runner stops without unreserved headroom. The run key pins the default budget; a claude cell's
+        # --max-budget-usd cap shrinks to the headroom, so an overrunning cell cannot spend the finish reserve.
+        headroom = ledger.headroom()
+        if ledger.exhausted():
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${ledger.reserve:.4f} reserved leaves no "
                                          f"budget for {cell_id} under ${ledger.max_usd}", rows)
+        cell_cap = DEFAULT_MAX_BUDGET_USD
+        if runner == "claude" and headroom is not None:
+            cell_cap = min(DEFAULT_MAX_BUDGET_USD, headroom)
         applied_cap = {"applied_max_budget_usd": cell_cap} if runner == "claude" else {}
         metadata = {
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
@@ -1651,6 +1653,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                 fail({"infra": "quota", "error": f"infra:quota: {quota}", "correctness_reason": f"Usage limit: {quota}"})
                 raise PlanStopped("quota", quota, rows) from error
             fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
+            if cell_cap < DEFAULT_MAX_BUDGET_USD and "error_max_budget_usd" in str(error):
+                raise PlanStopped("ceiling", f"{cell_id} hit its ${cell_cap:.4f} cap at the unreserved headroom",
+                                  rows) from error
         else:
             result.update({**stamp, **identity, **applied_cap, "variant": _variant_metadata(mode), "reused": False})
             result.setdefault("trajectory_path", None)

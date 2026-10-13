@@ -1112,7 +1112,7 @@ def test_judge_call_budget_is_ledger_headroom() -> None:
     judge.client.spawn = recorder
     judge.applicability(TASKS["rg_search_dispatch"])
     judge.applicability(TASKS["rg_trait_implementors"])
-    assert [budget_flags(call["argv"]) for call in recorder.calls] == [["0.75"], [str(1.0 - (0.25 + 0.1))]]
+    assert [budget_flags(call["argv"]) for call in recorder.calls] == [["0.7500"], ["0.6500"]]
 
 
 def test_judge_call_budget_excludes_the_finish_reserve() -> None:
@@ -1123,7 +1123,7 @@ def test_judge_call_budget_excludes_the_finish_reserve() -> None:
     judge.client.spawn = recorder
     judge.applicability(TASKS["rg_search_dispatch"])
     (call,) = recorder.calls
-    assert budget_flags(call["argv"]) == ["0.25"]
+    assert budget_flags(call["argv"]) == ["0.2500"]
 
 
 def test_reserve_only_headroom_refuses_judge_call() -> None:
@@ -1133,6 +1133,17 @@ def test_reserve_only_headroom_refuses_judge_call() -> None:
     judge = core.Judge(ledger, cell_estimate_usd=0.0)
     judge.client.spawn = recorder
     with pytest.raises(core.JudgeSpendCeiling):
+        judge.applicability(TASKS["rg_search_dispatch"])
+    assert recorder.calls == []
+
+
+def test_judge_call_with_float_leftover_headroom_is_refused() -> None:
+    ledger = SpendLedger(1.0, spent=0.7, reserve=0.3)
+    assert 0 < ledger.headroom() < 1e-9
+    recorder = Recorder(claude_stream("strong", 0.1))
+    judge = core.Judge(ledger, cell_estimate_usd=0.0)
+    judge.client.spawn = recorder
+    with pytest.raises(core.JudgeSpendCeiling, match=r"\$0\.3000 reserved"):
         judge.applicability(TASKS["rg_search_dispatch"])
     assert recorder.calls == []
 
