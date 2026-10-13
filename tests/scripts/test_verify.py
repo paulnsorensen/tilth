@@ -1,8 +1,10 @@
 """Tests for scripts/verify.py sccache setup and command dispatch."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -88,6 +90,20 @@ class VerifyTest(unittest.TestCase):
     def test_propagates_command_failure(self):
         result = self.run_verify({}, command=[sys.executable, "-c", "raise SystemExit(7)"])
         self.assertEqual(result.returncode, 7)
+
+    def test_unknown_job_is_refused(self):
+        result = self.run_verify({}, command=["--job", "no-such-job"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("benchmark-tests", result.stderr)
+
+    def test_gate_jobs_are_ci_jobs(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        ci_jobs = set(re.findall(r"^  ([\w-]+):$", workflow, flags=re.MULTILINE))
+        spec = importlib.util.spec_from_file_location("verify", VERIFY)
+        verify = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verify)
+        self.assertEqual(set(verify.GATE_COMMANDS) - ci_jobs, set())
+        self.assertIn("benchmark-tests", verify.GATE_COMMANDS)
 
 
 if __name__ == "__main__":

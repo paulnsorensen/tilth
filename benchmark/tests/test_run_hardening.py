@@ -59,11 +59,18 @@ def test_build_runner_env_allowlists_ambient_environment(
     bare: bool,
 ) -> None:
     """Each lane gets runtime/auth values but no unrelated host secret."""
-    values = {key: f"value-for-{key}" for key in _RUNTIME_KEYS | _AUTH_KEYS}
+    # A Claude cell refuses API-billing credentials outright
+    # (test_claude_auth_guard_refuses_api_billing_credentials); no runner receives them.
+    billing = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+    auth_keys = _AUTH_KEYS - billing if runner == "claude" else _AUTH_KEYS
+    values = {key: f"value-for-{key}" for key in _RUNTIME_KEYS | auth_keys}
     values["PATH"] = "/usr/bin"
     values["LC_CUSTOM"] = "custom-locale"
     for key, value in values.items():
         monkeypatch.setenv(key, value)
+    if runner == "claude":
+        for key in billing:
+            monkeypatch.delenv(key, raising=False)
 
     monkeypatch.setenv("SENTINEL_SECRET", "do-not-forward")
     monkeypatch.setenv("CLAUDECODE", "nested-session")
@@ -79,11 +86,13 @@ def test_build_runner_env_allowlists_ambient_environment(
     expected = {
         key: value
         for key, value in ambient.items()
-        if key in _RUNTIME_KEYS
-        or key == "CODEX_API_KEY"
-        or key.startswith(("ANTHROPIC_", "OPENAI_", "OPENROUTER_", "LC_"))
+        if (key in _RUNTIME_KEYS
+            or key == "CODEX_API_KEY"
+            or key.startswith(("OPENAI_", "OPENROUTER_", "LC_")))
+        and key not in billing
     }
     expected["PATH"] = f"/opt/tilth/bin{os.pathsep}{ambient['PATH']}"
+    expected["DISABLE_AUTOUPDATER"] = "1"
     if runner == "claude":
         expected["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-only-token"
         expected["CLAUDE_CONFIG_DIR"] = "/controlled/claude-config"
@@ -314,7 +323,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
             "arguments": {"paths": ["a.py", "b.py"]},
         }}), model_id)]
     elif runner == "claude":
-        assert parser_calls == [(json.dumps({"type": "result", "subtype": "success", "is_error": False}),)]
+        assert parser_calls == [(json.dumps({"type": "result", "subtype": "success", "is_error": False}), model_id)]
     else:
         assert parser_calls == [("{}",)]
 
@@ -383,6 +392,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         "plugin_dir": None,
         "plugin_version": None,
         "plugin_git_sha": None,
+        "plugin_sha256": None,
         "repository": "https://github.com/example/tilth",
         "git_ref": "feature/candidate",
         "git_sha": "a" * 40,
@@ -536,13 +546,19 @@ def test_codex_invalid_cell_aborts_schedule(monkeypatch: pytest.MonkeyPatch, tmp
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run, "reset_repo", lambda: None)
+    fake_tilth = tmp_path / "bin" / "tilth"
+    fake_tilth.parent.mkdir()
+    fake_tilth.write_text("#!/bin/sh\necho 'tilth 0.0.0'\n")
+    fake_tilth.chmod(0o755)
+    monkeypatch.setattr(run, "TILTH_BIN", str(fake_tilth))
+    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], binary_path=str(fake_tilth)))
     calls = []
     def invalid(*_args, **_kwargs):
         calls.append(1)
         raise run.InvalidCodexCellError("no successful tilth call")
     monkeypatch.setattr(run, "run_single", invalid)
     monkeypatch.setattr(sys, "argv", ["run.py", "--runner", "codex", "--models", "luna56",
-        "--tasks", "invalid_task", "--modes", "tilth", "--reps", "2", "--max-cells", "2"])
+        "--tasks", "invalid_task", "--modes", "tilth", "--reps", "2", "--max-cells", "2", "--max-usd", "100"])
     with pytest.raises(SystemExit) as error:
         run.main()
     assert error.value.code == 1
@@ -626,7 +642,7 @@ def test_luna_reasoning_effort_is_recorded_for_each_cell(
     monkeypatch.setattr(sys, "argv", [
         "run.py", "--runner", "codex", "--models", "luna56",
         "--tasks", "luna_task", "--modes", "baseline", "--reps", "1",
-        "--max-cells", "1", "--reasoning-effort", "xhigh",
+        "--max-cells", "1", "--reasoning-effort", "xhigh", "--max-usd", "100",
     ])
     run.main()
     row = json.loads(next(output_dir.glob("benchmark_*.jsonl")).read_text())
@@ -674,7 +690,7 @@ def test_luna_xhigh_cli_reaches_codex_argv(
     monkeypatch.setattr(sys, "argv", [
         "run.py", "--runner", "codex", "--models", "luna56",
         "--tasks", "luna_task", "--modes", "baseline", "--reps", "1",
-        "--max-cells", "1", "--reasoning-effort", "xhigh",
+        "--max-cells", "1", "--reasoning-effort", "xhigh", "--max-usd", "100",
     ])
     run.main()
     row = json.loads(next(output_dir.glob("benchmark_*.jsonl")).read_text())
@@ -702,7 +718,7 @@ def test_claude_streaming_run_does_not_inherit_stdin(
         ),
     )
     monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
-    monkeypatch.setattr(run, "parse_stream_json", lambda _: RunResult(
+    monkeypatch.setattr(run, "parse_stream_json", lambda *_: RunResult(
         session_id="session",
         turns=[Turn(index=0, input_tokens=1, output_tokens=2, cache_creation_tokens=0, cache_read_tokens=0)],
         num_turns=1,
@@ -776,7 +792,7 @@ def test_mcp_armed_claude_cell_without_tilth_tools_raises(
         ),
     )
     monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
-    monkeypatch.setattr(run, "parse_stream_json", lambda _: RunResult(
+    monkeypatch.setattr(run, "parse_stream_json", lambda *_: RunResult(
         session_id="session",
         turns=[],
         num_turns=1,
@@ -913,6 +929,8 @@ def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
             "2",
             "--max-cells",
             "6",
+            "--max-usd",
+            "100",
         ],
     )
 
@@ -1185,7 +1203,7 @@ def test_legacy_arm_seed_and_local_binary_identity(
     monkeypatch.setattr(run, "run_single", fake_run_single)
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "seed_task", "--models", "sonnet5",
                         "--modes", "baseline,tilth", "--reps", "2", "--max-cells", "4",
-                        "--arm-order-seed", "42", "--max-budget-usd", "2.5"])
+                        "--arm-order-seed", "42", "--max-budget-usd", "2.5", "--max-usd", "100"])
     run.main()
     rows = [json.loads(line) for line in next((tmp_path / "results").glob("benchmark_*.jsonl")).read_text().splitlines()]
     for repetition in range(2):
@@ -1283,9 +1301,322 @@ def test_strict_timeout_row_retains_mode_metadata(
     monkeypatch.setattr(run, "run_single", timeout)
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_timeout_task",
                         "--models", "sonnet5", "--modes", "baseline", "--reps", "1",
-                        "--max-cells", "1", "--strict-file-tools"])
+                        "--max-cells", "1", "--strict-file-tools", "--max-usd", "100"])
     run.main()
     row = json.loads(next((tmp_path / "results").glob("benchmark_*.jsonl")).read_text())
     assert seen == [True]
     assert row["strict_file_tools"] is True
     assert row["error"] == "timeout"
+
+
+# --- result substrate: run keys, sidecars, spend, auth, quota -----------------
+
+_STREAMS = Path(__file__).parent / "fixtures" / "streams"
+
+
+class _ReplayProcess:
+    """A Popen stand-in that replays a canned stream-json transcript."""
+
+    def __init__(self, stream: str) -> None:
+        self.stdout = io.StringIO(stream)
+        self.stderr = io.StringIO("")
+        self.returncode = 0
+
+    def wait(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def _replay_claude_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fixture: str) -> tuple[dict, Path]:
+    monkeypatch.setitem(run.TASKS, "sidecar_task", _RunnerTask())
+    monkeypatch.setattr(run, "cli_version", lambda _runner: "2.1.0")
+    monkeypatch.setattr(run, "env_fingerprint", lambda _repo: "env-fingerprint-a")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stream = (_STREAMS / fixture).read_text()
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *_args, **_kwargs: _ReplayProcess(stream))
+    stream_path = tmp_path / "streams" / "01_sidecar_task.jsonl"
+    row = run._run_single_in_repo("sidecar_task", "baseline", "sonnet5", 0, tmp_path, stream_log_path=stream_path)
+    return row, stream_path
+
+
+def test_row_has_run_key_and_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    row, stream_path = _replay_claude_cell(monkeypatch, tmp_path, "claude_native_cost.jsonl")
+
+    for field in ("run_key", "harness_digest", "task_digest", "env_fingerprint", "cli_version",
+                  "timeout_s", "trajectory_path", "cost_source", "reused"):
+        assert field in row, field
+    assert row["run_key"] == run.cell_identity(
+        "sidecar_task", "baseline", "sonnet5", 0, bare=False, reasoning_effort=None,
+        max_budget_usd=run.DEFAULT_MAX_BUDGET_USD, strict_file_tools=False,
+    )["run_key"]
+    assert row["cli_version"] == "2.1.0"
+    assert row["env_fingerprint"] == "env-fingerprint-a"
+    assert row["timeout_s"] == 600
+    assert row["reused"] is False
+    assert row["cost_source"] == "native"
+    assert row["total_cost_usd"] == 0.0421
+    assert Path(row["trajectory_path"]).is_file()
+    assert Path(row["trajectory_path"]).parent == stream_path.parent
+
+
+def test_row_records_pricing_cost_source_when_stream_has_no_native_cost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    row, _ = _replay_claude_cell(monkeypatch, tmp_path, "claude_no_native_cost.jsonl")
+
+    assert row["cost_source"] == "pricing"
+    assert row["total_cost_usd"] > 0
+
+
+def test_sidecar_is_untruncated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    row, _ = _replay_claude_cell(monkeypatch, tmp_path, "claude_native_cost.jsonl")
+    events = [json.loads(line) for line in (_STREAMS / "claude_native_cost.jsonl").read_text().splitlines()]
+    tool_input = events[1]["message"]["content"][0]["input"]["command"]
+    tool_output = events[2]["message"]["content"][0]["content"]
+    assert len(tool_input) > 200 and len(tool_output) > 200
+
+    records = [json.loads(line) for line in Path(row["trajectory_path"]).read_text().splitlines()]
+
+    assert [record["name"] for record in records] == ["Bash"]
+    assert records[0]["input"]["command"] == tool_input
+    assert records[0]["output"] == tool_output
+
+
+def test_tilth_arm_key_includes_candidate_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(run.TASKS, "identity_task", _RunnerTask())
+    monkeypatch.setattr(run, "cli_version", lambda _runner: "2.1.0")
+    monkeypatch.setattr(run, "env_fingerprint", lambda _repo: "env-fingerprint-a")
+    candidate = replace(run.MODES["tilth"], git_sha="a" * 40, binary_sha256="b" * 64)
+    monkeypatch.setitem(run.MODES, "tilth", candidate)
+    first = run.cell_identity("identity_task", "tilth", "sonnet5", 0, bare=False, reasoning_effort=None,
+                              max_budget_usd=1.0, strict_file_tools=False)
+    monkeypatch.setitem(run.MODES, "tilth", replace(candidate, binary_sha256="c" * 64))
+    second = run.cell_identity("identity_task", "tilth", "sonnet5", 0, bare=False, reasoning_effort=None,
+                               max_budget_usd=1.0, strict_file_tools=False)
+
+    assert first["run_key"] != second["run_key"]
+
+
+@pytest.mark.parametrize("runner", ["claude", "codex", "opencode"])
+def test_runner_env_disables_autoupdater(runner: str) -> None:
+    env = run.build_runner_env(runner, ambient={"PATH": "/usr/bin"}, tilth_bin=None,
+                               opencode_config="/controlled/opencode.json" if runner == "opencode" else None)
+
+    assert env["DISABLE_AUTOUPDATER"] == "1"
+
+
+def test_build_runner_env_refuses_api_key_for_claude() -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-ant-api", "CLAUDE_CODE_OAUTH_TOKEN": "oauth"}
+
+    with pytest.raises(run.ClaudeAuthError, match="ANTHROPIC_API_KEY"):
+        run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
+    assert "ANTHROPIC_API_KEY" not in run.build_runner_env("codex", ambient=ambient, tilth_bin=None)
+
+
+def test_paid_run_requires_max_usd(bench, capsys: pytest.CaptureFixture[str]) -> None:
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1")
+
+    assert code != 0
+    assert bench.calls == []
+    assert "--max-usd" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_max_usd_must_be_positive_finite(bench, value: str) -> None:
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    assert bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1",
+                      "--max-usd", value) != 0
+
+
+def test_ceiling_stops_before_crossing_cell(bench) -> None:
+    bench.seed(bench.row("cell_b", "plain", 1, cost=0.6))
+    bench.runner(lambda _stream: 0.5)
+
+    code = bench.main("--tasks", "cell_a,cell_b", "--models", "sonnet5", "--modes", "plain",
+                      "--reps", "1", "--max-usd", "1.0")
+
+    assert code != 0
+    assert bench.calls == [("cell_a", "plain", 0)]
+    assert [row["task"] for row in bench.output_rows()] == ["cell_a"]
+
+
+def test_cell_estimate_tiers() -> None:
+    stored = [
+        {"task": "t", "mode": "m", "model": "x", "total_cost_usd": 0.2, "correct": True},
+        {"task": "t", "mode": "m", "model": "x", "total_cost_usd": 0.4, "correct": False},
+        {"task": "t", "mode": "m", "model": "x", "total_cost_usd": 9.0, "error": "boom"},
+        {"task": "t", "mode": "other", "model": "x", "total_cost_usd": 5.0},
+    ]
+
+    assert run.estimate_cell_cost(stored, task="t", mode="m", model="x", run_max_cost=0.9, fallback=1.5) == pytest.approx(0.3)
+    assert run.estimate_cell_cost(stored, task="u", mode="m", model="x", run_max_cost=0.9, fallback=1.5) == 0.9
+    assert run.estimate_cell_cost(stored, task="u", mode="m", model="x", run_max_cost=None, fallback=1.5) == 1.5
+
+
+def test_failed_cells_count_toward_ceiling(bench) -> None:
+    def budget_capped(stream: Path) -> float:
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True}) + "\n")
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    bench.runner(budget_capped)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "4",
+                      "--max-usd", "1.0", "--cell-estimate-usd", "0.4")
+
+    assert code != 0
+    assert len(bench.calls) == 2
+    rows = bench.output_rows()
+    assert [row["charged_usd"] for row in rows] == [0.4, 0.4]
+    assert not any("total_cost_usd" in row for row in rows)
+    assert {row["cost_source"] for row in rows} == {"estimate"}
+
+
+def test_failed_cell_with_native_cost_counts_native_amount(bench) -> None:
+    def capped_with_cost(stream: Path) -> float:
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                      "total_cost_usd": 0.7}) + "\n")
+        raise RuntimeError("claude -p did not complete successfully: error_max_budget_usd")
+
+    bench.runner(capped_with_cost)
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "3",
+                      "--max-usd", "1.0", "--cell-estimate-usd", "0.1")
+
+    assert code != 0
+    assert len(bench.calls) == 1
+    assert [(row["total_cost_usd"], row["cost_source"]) for row in bench.output_rows()] == [(0.7, "native")]
+
+
+def test_quota_rejection_stops_run(bench) -> None:
+    def first_completes_then_quota(stream: Path) -> float:
+        if len(bench.calls) == 1:
+            return 0.1
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text((_STREAMS / "claude_quota_rejected.jsonl").read_text())
+        raise RuntimeError("claude -p failed with code 1")
+
+    bench.runner(first_completes_then_quota)
+
+    code = bench.main("--tasks", "cell_a,cell_b,cell_c", "--models", "sonnet5", "--modes", "plain",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == [("cell_a", "plain", 0), ("cell_b", "plain", 0)]
+    stored = {row["task"]: row for row in bench.stored_rows()}
+    assert stored["cell_b"]["infra"] == "quota"
+    assert "cell_c" not in stored
+    completed_key = bench.identity("cell_a", "plain", 0)["run_key"]
+    assert run.baselines.lookup(completed_key, path=bench.store_path)["task"] == "cell_a"
+    assert run.baselines.lookup(stored["cell_b"]["run_key"], path=bench.store_path) is None
+
+
+def test_rejected_rate_limit_event_without_a_result_stops_run(bench, capsys: pytest.CaptureFixture[str]) -> None:
+    def rejected_before_any_result(stream: Path) -> float:
+        stream.parent.mkdir(parents=True, exist_ok=True)
+        stream.write_text(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour"}}) + "\n")
+        raise RuntimeError("claude -p failed with code 1")
+
+    bench.runner(rejected_before_any_result)
+
+    code = bench.main("--tasks", "cell_a,cell_b", "--models", "sonnet5", "--modes", "plain",
+                      "--reps", "1", "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == [("cell_a", "plain", 0)]
+    [row] = bench.stored_rows()
+    assert row["infra"] == "quota"
+    assert "Stop reason: usage limit" in capsys.readouterr().out
+
+
+def test_api_key_refuses_claude_cell(bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api")
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1",
+                      "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == []
+
+
+def test_rejected_rate_limit_on_a_successful_cell_is_not_quota(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    events = [json.loads(line) for line in (_STREAMS / "claude_native_cost.jsonl").read_text().splitlines()]
+    events.insert(1, {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "seven_day_opus"}})
+    stream = tmp_path / "with_rejected_overage.jsonl"
+    stream.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    row, _ = _replay_claude_cell(monkeypatch, tmp_path, str(stream))
+
+    assert row["cost_source"] == "native"
+
+
+def test_quota_stream_raises_quota_error_in_the_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with pytest.raises(run.QuotaExhaustedError, match="usage limit"):
+        _replay_claude_cell(monkeypatch, tmp_path, "claude_quota_rejected.jsonl")
+
+
+def test_claude_stream_without_init_model_is_priced_with_the_cell_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    events = [json.loads(line) for line in (_STREAMS / "claude_no_native_cost.jsonl").read_text().splitlines()]
+    del events[0]["model"]
+    stream = tmp_path / "no_init_model.jsonl"
+    stream.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    row, _ = _replay_claude_cell(monkeypatch, tmp_path, str(stream))
+
+    assert row["cost_source"] == "pricing"
+    assert row["total_cost_usd"] > 0
+
+
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_claude_auth_guard_refuses_api_billing_credentials(key: str) -> None:
+    with pytest.raises(run.ClaudeAuthError, match=key):
+        run.guard_claude_auth({key: "sk-ant-secret"})
+    with pytest.raises(run.ClaudeAuthError, match=key):
+        run.build_runner_env("claude", ambient={"PATH": "/usr/bin", key: "sk-ant-secret"}, tilth_bin=None)
+
+
+@pytest.mark.parametrize("runner", ["claude", "codex", "opencode"])
+def test_no_anthropic_variable_reaches_a_runner(runner: str) -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_BASE_URL": "https://proxy.example",
+               "ANTHROPIC_MODEL": "claude-sonnet-5", "ANTHROPIC_CUSTOM_HEADERS": "x-key: 1",
+               "ANTHROPIC_EMPTY": ""}
+    if runner != "claude":
+        ambient.update({"ANTHROPIC_API_KEY": "sk-ant-api", "ANTHROPIC_AUTH_TOKEN": "bearer"})
+
+    env = run.build_runner_env(runner, ambient=ambient, tilth_bin=None,
+                               opencode_config="/controlled/opencode.json" if runner == "opencode" else None)
+
+    assert not any(key.startswith("ANTHROPIC_") for key in env)
+
+
+def test_empty_anthropic_api_keys_do_not_refuse_a_claude_cell() -> None:
+    ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
+
+    env = run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
+
+    assert not any(key.startswith("ANTHROPIC_") for key in env)
+
+
+def test_auth_token_refuses_claude_cell(bench, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "bearer")
+    bench.runner(lambda _stream: pytest.fail("model call started"))
+
+    code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1",
+                      "--max-usd", "5")
+
+    assert code != 0
+    assert bench.calls == []
+    assert "ANTHROPIC_AUTH_TOKEN" in capsys.readouterr().err
