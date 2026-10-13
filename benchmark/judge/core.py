@@ -309,8 +309,9 @@ def pending_calls(
 class ClaudeJudgeClient:
     """One isolated, tool-less ``claude -p`` call per prompt, the prompt on stdin.
 
-    With a bounded ``ledger``, each call passes the ledger's headroom as ``--max-budget-usd``,
-    so one call cannot spend past the run's ceiling.
+    With a bounded ``ledger``, each call passes the ledger's unreserved headroom (ceiling minus spend
+    minus the finish reserve) as ``--max-budget-usd``, so one call cannot spend past the run's ceiling
+    or into the reserve.
     """
 
     def __init__(self, *, spawn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -332,9 +333,7 @@ class ClaudeJudgeClient:
         return argv
 
     def _headroom(self) -> float | None:
-        if self.ledger is None or self.ledger.max_usd is None:
-            return None
-        return self.ledger.max_usd - self.ledger.spent
+        return None if self.ledger is None else self.ledger.headroom()
 
     def __call__(self, prompt: str) -> JudgeReply:
         env = run.build_runner_env("claude", tilth_bin=None)
@@ -470,7 +469,8 @@ class Judge:
         if _quota_reason is not None:
             raise JudgeQuota(f"judge calls stopped after a usage-limit rejection: {_quota_reason}")
         estimate = self._estimate(kind)
-        exhausted = self.ledger.max_usd is not None and self.ledger.spent >= self.ledger.max_usd
+        headroom = self.ledger.headroom()
+        exhausted = headroom is not None and headroom <= 0
         if exhausted or self.ledger.would_cross(estimate):
             raise JudgeSpendCeiling(f"{kind} judge call estimated at ${estimate:.4f} would cross the "
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f})")

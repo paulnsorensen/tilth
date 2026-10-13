@@ -1115,6 +1115,28 @@ def test_judge_call_budget_is_ledger_headroom() -> None:
     assert [budget_flags(call["argv"]) for call in recorder.calls] == [["0.75"], [str(1.0 - (0.25 + 0.1))]]
 
 
+def test_judge_call_budget_excludes_the_finish_reserve() -> None:
+    ledger = SpendLedger(1.0, reserve=0.5)
+    ledger.charge(0.25, source="native")
+    recorder = Recorder(claude_stream("strong", 0.1))
+    judge = core.Judge(ledger, cell_estimate_usd=0.05)
+    judge.client.spawn = recorder
+    judge.applicability(TASKS["rg_search_dispatch"])
+    (call,) = recorder.calls
+    assert budget_flags(call["argv"]) == ["0.25"]
+
+
+def test_reserve_only_headroom_refuses_judge_call() -> None:
+    ledger = SpendLedger(1.0, reserve=0.5)
+    ledger.charge(0.5, source="native")
+    recorder = Recorder(claude_stream("strong", 0.1))
+    judge = core.Judge(ledger, cell_estimate_usd=0.0)
+    judge.client.spawn = recorder
+    with pytest.raises(core.JudgeSpendCeiling):
+        judge.applicability(TASKS["rg_search_dispatch"])
+    assert recorder.calls == []
+
+
 def test_unbounded_judge_call_passes_no_budget() -> None:
     recorder = Recorder(claude_stream("strong", 0.1))
     judge = core.Judge(SpendLedger(None), cell_estimate_usd=0.05)
