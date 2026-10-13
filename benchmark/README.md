@@ -78,27 +78,47 @@ A usage-limit rejection (a terminal result with usage-limit text or a rate-limit
 
 ## External tasks: FeatureBench and SWE-bench Multilingual
 
-`benchmark/external/` runs FeatureBench Lite Level 1 (HF `LiberCoders/FeatureBench`, tag `v1.1`) and SWE-bench Multilingual (HF `SWE-bench/SWE-bench_Multilingual`, revision `846e647b9f33c0b51b739d005d13d85493c9af09`) instances natively, with no Docker.
-Dataset rows, bare upstream mirrors, gold patches, held-out tests, and admission verdicts live only in `$TILTH_BENCH_DATA` (default `~/.local/share/tilth-bench/external`), outside this checkout and every agent workdir.
+`benchmark/external/` runs FeatureBench Lite Level 1 and SWE-bench Multilingual instances natively, with no Docker.
+FeatureBench comes from HF `LiberCoders/FeatureBench` (tag `v1.1`).
+SWE-bench Multilingual comes from HF `SWE-bench/SWE-bench_Multilingual` (revision `846e647b9f33c0b51b739d005d13d85493c9af09`).
+The harness keeps dataset rows, bare upstream mirrors, gold patches, held-out tests, and admission verdicts only in `$TILTH_BENCH_DATA`.
+The default is `~/.local/share/tilth-bench/external`, outside this checkout and every agent workdir.
 
 ```bash
-pip install pyarrow   # the preflight fetch decodes the dataset parquet
+pip install -r benchmark/requirements.txt   # includes pyarrow, which the preflight fetch needs
 # Fetch uncached rows, then admit the FeatureBench candidates and the Go and Rust picks
 python3 benchmark/external/preflight.py
 # Admit exactly a panel's FeatureBench and SWE-bench Multilingual members
 python3 benchmark/external/preflight.py --panel path/to/panel.json
 ```
 
-Admission prepares each instance on this host and grades its gold, empty, and tampered patches; only an instance whose gold resolves, whose empty patch does not, and whose tampered check fails is admitted.
-The tampered check removes one gold hunk at a time, largest first, up to `$TILTH_BENCH_TAMPER_MAX_HUNKS` hunks (default 8), and passes when any single removal fails the held-out tests; the verdict names that hunk.
-Verdicts are cached by instance ID, data revision, and environment fingerprint; delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
-A verdict from an older admission version or another tamper bound is recomputed.
-`run.py --tasks <instance_id>` runs an admitted instance: its workdir is the `base_commit` tree (FeatureBench: with the mask applied and the FAIL_TO_PASS tests deleted) as the single commit of a fresh repository, with a `uv` venv for Python or the host Go or Rust toolchain.
-Grading copies the agent's changes onto a clean prepared tree, restores the held-out tests and every pytest configuration file (`conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg`, a `pyproject.toml` with `[tool.pytest`) from `base_commit`, and runs FAIL_TO_PASS and PASS_TO_PASS natively.
-Python tests run in a grading venv built once per instance and environment fingerprint under `$TILTH_BENCH_DATA/envs/`, never in the agent's `.venv`; rows add `pass_rate`, `f2p_passed`, `f2p_total`, `p2p_passed`, and `p2p_total`.
+Admission prepares each instance on this host and grades its gold, empty, and tampered patches.
+An instance is admitted only when its gold resolves, its empty patch does not, and its tampered check fails.
+The tampered check removes one gold hunk at a time, largest first.
+It stops at `$TILTH_BENCH_TAMPER_MAX_HUNKS` hunks (default 8).
+The check passes when any single removal fails the held-out tests, and the verdict names that hunk.
+The harness caches verdicts by instance ID, data revision, and environment fingerprint.
+Delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
+The harness recomputes a verdict from an older admission version or another tamper bound.
+`run.py --tasks <instance_id>` runs an admitted instance.
+Its workdir is the `base_commit` tree as the single commit of a fresh repository.
+FeatureBench workdirs also apply the mask and delete the FAIL_TO_PASS tests.
+The instance gets a `uv` venv for Python, or the host Go or Rust toolchain.
+Grading copies the agent's changes onto a clean prepared tree.
+It restores the held-out tests and every pytest configuration file from `base_commit`: `conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg`, and a `pyproject.toml` with `[tool.pytest`.
+Then it runs FAIL_TO_PASS and PASS_TO_PASS natively.
+Python tests run in a grading venv, never in the agent's `.venv`.
+The harness builds that venv once per instance and environment fingerprint under `$TILTH_BENCH_DATA/envs/`.
+Rows add `pass_rate`, `f2p_passed`, `f2p_total`, `p2p_passed`, and `p2p_total`.
 `--tasks all` stays the local registry.
 
-Every row records `contaminated` and `contamination_hits`: a tool input that reads the `benchmark/` tree or the harness data directory, fetches the task's upstream repository or package, or, in an external cell, reads a clone under `/tmp/tilth_bench/repos/` is a hit. A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
+Every row records `contaminated` and `contamination_hits`. These inputs count as a hit:
+
+- A tool input that reads the `benchmark/` tree or the harness data directory.
+- A tool input that fetches the task's upstream repository or package. A `git clone`, `curl`, or `go get` command counts. A bare `github.com` import path or issue link does not.
+- In an external cell, a tool input that reads a clone under `/tmp/tilth_bench/repos/`.
+
+A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
 
 ## Larger Luna edit task
 
@@ -337,7 +357,7 @@ All selected modes use the same system prompt, model, and per-cell budget cap (d
 - Python 3.12+
 - At least one supported agent CLI (`claude`, `codex`, or `opencode`) installed and authenticated
 - Rust/Cargo and Git (for building exact tilth revisions and cloning benchmark repos)
-- Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy and numpy). Running the tests also needs pytest: `pip install -r benchmark/requirements-dev.txt`.
+- Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy, numpy, and pyarrow). Running the tests also needs pytest: `pip install -r benchmark/requirements-dev.txt`.
 
 **Setup:**
 
