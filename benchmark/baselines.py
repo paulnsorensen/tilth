@@ -9,8 +9,9 @@ row it is given, keyed by run key, but only a completed row is reusable.
 
 import hashlib
 import json
+import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -75,24 +76,105 @@ def task_digest(
     mutations: list[object] = (),
     hide_git: bool = False,
     task_sources: Mapping[str, str] | None = None,
+    identity_inputs: Mapping[str, object] | None = None,
 ) -> str:
     """Hash what the task asks, how it is graded, and the code it runs against.
 
     ``task_sources`` maps each source file defining the task class or its bases to
     its hash, so an edit to grading code such as a ``check_correctness`` override
-    yields a new digest.
+    yields a new digest. ``identity_inputs`` carries what a task's own hook adds,
+    such as an external instance's patches, test lists, base commit, and data
+    revision; it is hashed only when given, so other tasks keep their digests.
     """
-    return _digest({
+    payload = {
         "prompt": prompt, "ground_truth": ground_truth, "test_command": test_command,
         "fixture_files": fixture_files, "repo_commit": repo_commit,
         "mutations": list(mutations), "hide_git": hide_git,
         "task_sources": dict(task_sources or {}),
-    })
+    }
+    if identity_inputs is not None:
+        payload["identity_inputs"] = dict(identity_inputs)
+    return _digest(payload)
 
 
 def env_fingerprint(*, toolchains: Mapping[str, str | None], lockfile_hash: str) -> str:
     """Hash toolchain versions and the dependency lockfiles a cell builds against."""
     return _digest({"toolchains": toolchains, "lockfile_hash": lockfile_hash})
+
+
+TOOLCHAIN_PROBES = {
+    "rustc": ("rustc", "--version"),
+    "cargo": ("cargo", "--version"),
+    "go": ("go", "version"),
+    "node": ("node", "--version"),
+    "python3": ("python3", "--version"),
+    "uv": ("uv", "--version"),
+}
+# The toolchains a repo's language builds and tests with; a rustc bump must not
+# re-key a Go, JavaScript, or Python task.
+LANGUAGE_TOOLCHAINS = {
+    "rust": ("rustc", "cargo"),
+    "go": ("go",),
+    "javascript": ("node",),
+    "python": ("python3", "uv"),
+}
+# A repo without a lockfile (express) pins its dependencies through these instead.
+UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
+LOCKFILES = (
+    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
+)
+# What an external instance's base tree contributes to its environment key.
+EXTERNAL_DEPENDENCY_FILES = (
+    "Cargo.toml", "go.mod", "pyproject.toml", "setup.py", "setup.cfg", *LOCKFILES,
+)
+
+
+def run_probe(argv: tuple[str, ...]) -> str | None:
+    """Return a tool's version line, or None when it is unavailable."""
+    try:
+        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (probe.stdout or probe.stderr).strip().splitlines()
+    return lines[0] if probe.returncode == 0 and lines else None
+
+
+def local_dependency_hashes(read: Callable[[Sequence[str]], Mapping[str, str]]) -> Mapping[str, str]:
+    """Lockfile hashes of a tree, else the hashes of its unlocked dependency files."""
+    return read(LOCKFILES) or read(UNLOCKED_DEPENDENCY_FILES)
+
+
+def host_env_fingerprint(
+    language: str,
+    dependency_hashes: Mapping[str, str],
+    *,
+    probe: Callable[[tuple[str, ...]], str | None] | None = None,
+) -> str:
+    """Fingerprint the language's toolchains and a tree's dependency file hashes."""
+    probe = probe or run_probe
+    return env_fingerprint(
+        toolchains={name: probe(TOOLCHAIN_PROBES[name]) for name in LANGUAGE_TOOLCHAINS.get(language, ())},
+        lockfile_hash=hashlib.sha256(json.dumps(dependency_hashes, sort_keys=True).encode()).hexdigest(),
+    )
+
+
+def file_sha256(path: Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def tree_sha256(root: Path, pattern: str = "*", *, exclude: Collection[str] = ()) -> str:
+    """Hash the files under ``root`` that match ``pattern`` by relative path and content.
+
+    ``.git`` is skipped. ``exclude`` names relative paths to leave out.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob(pattern)):
+        relative = path.relative_to(root)
+        if path.is_file() and ".git" not in relative.parts and relative.as_posix() not in exclude:
+            digest.update(f"{relative.as_posix()}\0{file_sha256(path)}\n".encode())
+    return digest.hexdigest()
 
 
 def run_key(cell: Mapping[str, Any]) -> str:

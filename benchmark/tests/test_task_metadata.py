@@ -91,3 +91,27 @@ def test_failed_task_reports_full_test_command(tmp_path) -> None:
 
     assert correct is False
     assert message == f"Test failed: {shlex.join(task.test_command)}"
+
+
+def test_default_prepare_applies_mutations_and_skips_when_none(tmp_path) -> None:
+    target = tmp_path / "broken.py"
+    target.write_text("before")
+
+    FixTask().prepare(tmp_path)
+    assert target.read_text() == "after"
+
+    class Plain(TraceTask):
+        mutations = []
+
+    target.write_text("before")
+    Plain().prepare(tmp_path)
+    assert target.read_text() == "before"
+
+
+def test_task_hook_defaults() -> None:
+    task = FixTask()
+    assert task.timeout_s is None
+    assert task.language == "python"
+    assert task.identity_inputs() is None
+    assert task.grade_details() == {}
+    assert task.fixture_path is not None

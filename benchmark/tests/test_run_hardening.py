@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import run
 from config import ModeConfig
 from parse import RunResult, Turn
-from tasks.base import TaskSource
+from tasks.base import GroundTruth, Task, TaskSource
 
 _RUNTIME_KEYS = {
     "PATH",
@@ -192,7 +192,9 @@ def test_agent_repo_uses_disposable_git_worktree(tmp_path: Path) -> None:
     assert tracked.read_text() == "clean"
 
 @dataclass
-class _RunnerTask:
+class _RunnerTask(Task):
+    name: str = "runner_task"
+    ground_truth: GroundTruth | None = None
     repo: str = "synthetic"
     prompt: str = "Answer the task."
     capability: str = "trace"

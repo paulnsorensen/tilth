@@ -1,0 +1,20 @@
+{"Action":"start","Package":"example.com/calcgo"}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestAdd"}
+{"Action":"output","Package":"example.com/calcgo","Test":"TestAdd","Output":"=== RUN   TestAdd\n"}
+{"Action":"output","Package":"example.com/calcgo","Test":"TestAdd","Output":"--- PASS: TestAdd (0.00s)\n"}
+{"Action":"pass","Package":"example.com/calcgo","Test":"TestAdd","Elapsed":0}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestMul"}
+{"Action":"output","Package":"example.com/calcgo","Test":"TestMul","Output":"    calc_test.go:12: mul\n"}
+{"Action":"output","Package":"example.com/calcgo","Test":"TestMul","Output":"--- FAIL: TestMul (0.00s)\n"}
+{"Action":"fail","Package":"example.com/calcgo","Test":"TestMul","Elapsed":0}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestSub"}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestSub/neg"}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestSub/pos"}
+{"Action":"pass","Package":"example.com/calcgo","Test":"TestSub/neg","Elapsed":0}
+{"Action":"fail","Package":"example.com/calcgo","Test":"TestSub/pos","Elapsed":0}
+{"Action":"fail","Package":"example.com/calcgo","Test":"TestSub","Elapsed":0}
+{"Action":"run","Package":"example.com/calcgo","Test":"TestSkip"}
+{"Action":"output","Package":"example.com/calcgo","Test":"TestSkip","Output":"    calc_test.go:30: skipped\n"}
+{"Action":"skip","Package":"example.com/calcgo","Test":"TestSkip","Elapsed":0}
+{"Action":"output","Package":"example.com/calcgo","Output":"FAIL\n"}
+{"Action":"fail","Package":"example.com/calcgo","Elapsed":0.002}

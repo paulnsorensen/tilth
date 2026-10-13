@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 
-from config import REPOS
+import baselines
+from config import REPOS, SYNTHETIC_REPO
 
 
 @dataclass
@@ -39,6 +40,9 @@ class TaskSource:
 
 
 DEFAULT_TASK_SOURCE = TaskSource()
+
+# The synthetic fixture repo is a Python project (fixtures/template/pyproject.toml).
+SYNTHETIC_LANGUAGE = "python"
 
 
 def required_matches(required: str, text_lower: str) -> bool:
@@ -80,6 +84,41 @@ class Task(ABC):
     @property
     def capability(self) -> str:
         return ""
+
+    @property
+    def language(self) -> str:
+        """Language of the task's repository."""
+        return SYNTHETIC_LANGUAGE if self.repo == "synthetic" else REPOS[self.repo].language
+
+    @property
+    def timeout_s(self) -> int | None:
+        """Per-task cell timeout in seconds; None selects the run's default."""
+        return None
+
+    @property
+    def fixture_path(self) -> Path | None:
+        """Local fixture repo that cells copy; None for a task that builds its own workdir."""
+        return SYNTHETIC_REPO if self.repo == "synthetic" else REPOS[self.repo].path
+
+    def prepare(self, workdir: Path) -> None:
+        """Make the cell workdir ready for the agent; a local task applies its mutations."""
+        if self.mutations:
+            self.apply_mutations(str(workdir))
+
+    def dependency_hashes(self) -> dict[str, str]:
+        """SHA-256 of the dependency files in the task's fixture repo."""
+        root = self.fixture_path
+        return dict(baselines.local_dependency_hashes(lambda names: {
+            name: baselines.file_sha256(root / name) for name in names if (root / name).is_file()
+        }))
+
+    def identity_inputs(self) -> dict[str, object] | None:
+        """Extra inputs that join the task digest; None for a task with none."""
+        return None
+
+    def grade_details(self) -> dict[str, float | int]:
+        """Grading detail counts from the last ``check_correctness``."""
+        return {}
 
     @cached_property
     def source(self) -> TaskSource:

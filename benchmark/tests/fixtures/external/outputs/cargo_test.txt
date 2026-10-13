@@ -1,0 +1,23 @@
+   Compiling calcrs v0.1.0 (/testbed)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running tests/calc.rs (target/debug/deps/calc-0123456789abcdef)
+
+running 5 tests
+test add_works ... ok
+test mul_works ... FAILED
+test nested::div_works ... ok
+test slow_works ... ignored
+test tests::bench_like ... ok
+
+failures:
+
+---- mul_works stdout ----
+thread 'mul_works' panicked at tests/calc.rs:10:5:
+assertion `left == right` failed
+  left: 5
+ right: 6
+
+failures:
+    mul_works
+
+test result: FAILED. 3 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -33,6 +33,9 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import baselines
+import external
+import external.contamination
+import external.preflight
 from spend import SpendLedger
 from claude_bash_guard import allowed_command
 from config import (
@@ -66,6 +69,7 @@ from parse import (
     tool_op_kinds,
 )
 from tasks import TASKS
+from tasks.base import SYNTHETIC_LANGUAGE, Task
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -414,6 +418,13 @@ def _agent_repo(repo_path: Path, hide_git: bool):
         yield workspace
 
 
+@contextmanager
+def _built_workdir():
+    """Yield a path for a workdir that a task with no fixture builds in ``prepare``."""
+    with tempfile.TemporaryDirectory(prefix="tilth-benchmark-") as temp_dir:
+        yield Path(temp_dir) / "repo"
+
+
 class McpUnavailableError(RuntimeError):
     """A mode expected an MCP server that the session did not expose."""
 
@@ -517,40 +528,9 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
 
 
 CELL_TIMEOUT_S = 600
-_TOOLCHAIN_PROBES = {
-    "rustc": ("rustc", "--version"),
-    "cargo": ("cargo", "--version"),
-    "go": ("go", "version"),
-    "node": ("node", "--version"),
-    "python3": ("python3", "--version"),
-    "uv": ("uv", "--version"),
-}
-# The toolchains a repo's language builds and tests with; a rustc bump must not
-# re-key a Go, JavaScript, or Python task.
-_LANGUAGE_TOOLCHAINS = {
-    "rust": ("rustc", "cargo"),
-    "go": ("go",),
-    "javascript": ("node",),
-    "python": ("python3", "uv"),
-}
-# The synthetic fixture repo is a Python project (fixtures/template/pyproject.toml).
-_SYNTHETIC_LANGUAGE = "python"
-# A repo without a lockfile (express) pins its dependencies through these instead.
-_UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
-_LOCKFILES = (
-    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
-)
+_SYNTHETIC_LANGUAGE = SYNTHETIC_LANGUAGE
 
-
-def _run_probe(argv: tuple[str, ...]) -> str | None:
-    """Return a tool's version line, or None when it is unavailable."""
-    try:
-        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = (probe.stdout or probe.stderr).strip().splitlines()
-    return lines[0] if probe.returncode == 0 and lines else None
+_run_probe = baselines.run_probe
 
 
 # Probed once per run when planning cell identities.
@@ -566,37 +546,31 @@ def cli_version(runner: str, *, fresh: bool = False) -> str | None:
     return (_run_probe if fresh else _probe_version)((runner, "--version"))
 
 
-def _file_sha256(path: Path) -> str:
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+_file_sha256 = baselines.file_sha256
+_tree_sha256 = baselines.tree_sha256
 
 
-def _tree_sha256(root: Path) -> str:
-    """Hash every file under a directory by relative path and content, skipping `.git`."""
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if path.is_file() and ".git" not in relative.parts:
-            digest.update(f"{relative.as_posix()}\0{_file_sha256(path)}\n".encode())
-    return digest.hexdigest()
+def _task_timeout(task: Task) -> int:
+    return task.timeout_s or CELL_TIMEOUT_S
 
 
-def env_fingerprint(repo_name: str) -> str:
-    """Fingerprint the task repo language's toolchains and its dependency lockfiles."""
-    repo_path = get_repo_path(repo_name)
-    language = _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
-    lockfiles = {
-        name: _file_sha256(repo_path / name)
-        for name in _LOCKFILES if (repo_path / name).is_file()
-    } or {
-        name: _file_sha256(repo_path / name)
-        for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
-    }
-    return baselines.env_fingerprint(
-        toolchains={name: _probe_version(_TOOLCHAIN_PROBES[name])
-                    for name in _LANGUAGE_TOOLCHAINS.get(language, ())},
-        lockfile_hash=hashlib.sha256(json.dumps(lockfiles, sort_keys=True).encode()).hexdigest(),
-    )
+def env_fingerprint(task_or_repo: object) -> str:
+    """Fingerprint the task language's toolchains and its dependency lockfiles.
+
+    A task supplies its own language and dependency hashes. A bare repo name
+    resolves both through ``REPOS``.
+    """
+    if isinstance(task_or_repo, str):
+        repo_name = task_or_repo
+        language = _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
+        repo_path = get_repo_path(repo_name)
+        hashes = baselines.local_dependency_hashes(lambda names: {
+            name: _file_sha256(repo_path / name) for name in names if (repo_path / name).is_file()
+        })
+    else:
+        language = task_or_repo.language
+        hashes = task_or_repo.dependency_hashes()
+    return baselines.host_env_fingerprint(language, hashes, probe=_probe_version)
 
 
 def _is_tilth_arm(mode: ModeConfig) -> bool:
@@ -695,6 +669,7 @@ def _cell_task_digest(task: object) -> str:
         mutations=[asdict(mutation) if is_dataclass(mutation) else mutation for mutation in mutations],
         hide_git=bool(getattr(task, "hide_git", False)),
         task_sources=_task_source_files(task),
+        identity_inputs=task.identity_inputs(),
     )
 
 
@@ -771,9 +746,9 @@ def cell_identity(
             bash_guard_sha256=_file_sha256(_BASH_GUARD) if strict_file_tools else None,
         ),
         "task_digest": _cell_task_digest(task),
-        "env_fingerprint": env_fingerprint(task.repo),
+        "env_fingerprint": env_fingerprint(task),
         "cli_version": cli_version(runner),
-        "timeout_s": CELL_TIMEOUT_S,
+        "timeout_s": _task_timeout(task),
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
         **({"plugin_sha256": mode.plugin_sha256} if mode.plugin_dir else {}),
     }
@@ -800,6 +775,12 @@ def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     return str(sidecar)
 
 
+def contamination_fields(trajectory_path: str | None, task: object) -> dict:
+    """The ``contaminated`` flag and its hits for a row's trajectory sidecar."""
+    hits = external.contamination.find_hits(trajectory_path, task)
+    return {"contaminated": bool(hits), "contamination_hits": hits}
+
+
 class QuotaExhaustedError(RuntimeError):
     """A subscription usage limit rejected the cell; later cells would fail too."""
 
@@ -818,13 +799,12 @@ def run_single(
 ) -> dict:
     """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
-    with _agent_repo(
-        get_repo_path(task.repo),
-        getattr(task, "hide_git", False),
-    ) as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
-        mutations = getattr(task, "mutations", ())
-        if mutations:
-            task.apply_mutations(str(repo_path))
+    workspace = (
+        _built_workdir() if task.fixture_path is None
+        else _agent_repo(get_repo_path(task.repo), task.hide_git)
+    )
+    with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
+        task.prepare(repo_path)
         return _run_single_in_repo(
             task_name,
             mode_name,
@@ -996,6 +976,7 @@ def _run_single_in_repo(
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
+    timeout_s = _task_timeout(task)
     skill_paths: list[str] = []
     skill_roots: list[str] = []
     identity = cell_identity(
@@ -1057,7 +1038,7 @@ def _run_single_in_repo(
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
-        timer = threading.Timer(CELL_TIMEOUT_S, _kill_on_timeout)
+        timer = threading.Timer(timeout_s, _kill_on_timeout)
         timer.start()
         try:
             with open(stream_log_path, "w") as logf:
@@ -1076,7 +1057,7 @@ def _run_single_in_repo(
         if runner == "codex":
             stream_log_path.with_suffix(".stderr").write_text(stderr_text)
         if timed_out:
-            raise subprocess.TimeoutExpired(cmd, CELL_TIMEOUT_S)
+            raise subprocess.TimeoutExpired(cmd, timeout_s)
 
         result = subprocess.CompletedProcess(
             args=cmd,
@@ -1091,7 +1072,7 @@ def _run_single_in_repo(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=CELL_TIMEOUT_S,
+            timeout=timeout_s,
             env=env,
         )
     elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1166,6 +1147,7 @@ def _run_single_in_repo(
     )
     run_result.correct = correct
     run_result.correctness_reason = reason
+    details = task.grade_details()
 
     # Build tool call breakdown
     tool_breakdown = tool_call_counts(run_result)
@@ -1234,6 +1216,8 @@ def _run_single_in_repo(
         "op_kinds": tool_op_kinds(run_result),
         "cost_source": run_result.cost_source,
         "trajectory_path": trajectory_path,
+        **contamination_fields(trajectory_path, task),
+        **details,
         "reused": False,
         **identity,
     }
@@ -1273,6 +1257,25 @@ def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
             f"Valid options: {', '.join(valid_options.keys())}"
         )
     return items
+
+def select_tasks(value: str) -> list[str]:
+    """Resolve ``--tasks``: ``all`` is the local registry; another name may be an admitted external instance.
+
+    A name outside ``TASKS`` is resolved through ``external.resolve_task`` and
+    registered in ``TASKS`` so planning, identity, and the runners find it.
+    """
+    if value.lower() == "all":
+        return [name for name, task in TASKS.items() if not isinstance(task, external.ExternalTask)]
+    for name in (item.strip() for item in value.split(",")):
+        if not name or name in TASKS:
+            continue
+        resolved, verdict = external.resolve_task(name)
+        if resolved is not None:
+            TASKS[name] = resolved
+        elif verdict is not None:
+            raise ValueError(f"external task {name} is not admitted: {verdict.reason}")
+    return parse_comma_list(value, TASKS, "tasks")
+
 
 def planned_cell_count(
     *,
@@ -1481,7 +1484,7 @@ Examples:
             if any(RUNNERS[model] != "claude" for model in models):
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
-        tasks_list = parse_comma_list(args.tasks, TASKS, "tasks")
+        tasks_list = select_tasks(args.tasks)
         if args.experiment:
             experiment = load_experiment(args.experiment)
             configured_modes = experiment_modes(
@@ -1554,9 +1557,12 @@ Examples:
     except ValueError as error:
         parser.error(str(error))
 
+    # Tasks without a fixture build their own workdirs; only the rest copy fixtures.
+    fixture_tasks = [name for name in tasks_list if TASKS[name].fixture_path is not None]
+
     # Validate and restore the synthetic source once. Every cell runs from a
     # disposable copy, so the scheduler never mutates this source again.
-    if "synthetic" in {TASKS[name].repo for name in tasks_list}:
+    if "synthetic" in {TASKS[name].repo for name in fixture_tasks}:
         if not SYNTHETIC_REPO.exists():
             parser.error(
                 f"Synthetic repo not found at {SYNTHETIC_REPO}; "
@@ -1565,7 +1571,7 @@ Examples:
         reset_repo()
 
     # Validate real-world repos exist (for selected tasks)
-    selected_repos = set(TASKS[t].repo for t in tasks_list) - {"synthetic"}
+    selected_repos = set(TASKS[t].repo for t in fixture_tasks) - {"synthetic"}
     for repo_name in selected_repos:
         repo_path = REPOS[repo_name].path
         if not repo_path.exists():
@@ -1688,6 +1694,8 @@ Examples:
         def settle(row: dict, amount: float) -> None:
             """Charge and store one paid cell; called exactly once per cell."""
             nonlocal run_max_cost
+            if not isinstance(row.get("contaminated"), bool):
+                row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
             row["charged_usd"] = amount
             ledger.charge(amount, source=row.get("cost_source") or "native")
             run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
@@ -1748,8 +1756,12 @@ Examples:
                 if mode_name not in reported_versions:
                     reported_versions[mode_name] = _reported_tilth_version(MODES[mode_name])
                 reported_version = reported_versions[mode_name]
+                scanned = (
+                    {} if isinstance(stored.get("contaminated"), bool)
+                    else contamination_fields(stored.get("trajectory_path"), task)
+                )
                 record({
-                    **stored, **experiment_metadata, "tilth_version": reported_version,
+                    **stored, **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),
                     "charged_usd": 0.0, "reused": True,
                 })
@@ -1848,7 +1860,7 @@ Examples:
                 sys.exit(1)
 
             except subprocess.TimeoutExpired:
-                print(f"  ✗ TIMEOUT (>{CELL_TIMEOUT_S}s)")
+                print(f"  ✗ TIMEOUT (>{_task_timeout(task)}s)")
                 record_failure({
                     **record_metadata,
                     "error": "timeout",
@@ -1856,6 +1868,17 @@ Examples:
                     "correct": False,
                     "correctness_reason": "Subprocess timed out",
                 }, stream_log_path, runner, estimate)
+
+            except (external.task.EnvBuildError, external.task.PrepareError) as error:
+                # No model call ran, so the cell estimate must not be charged.
+                print(f"  ✗ PREPARE FAILED: {error}")
+                record_failure({
+                    **record_metadata,
+                    "infra": "prepare",
+                    "error": f"infra:prepare: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Prepare failed: {error}",
+                }, stream_log_path, runner, 0.0)
 
             except Exception as error:
                 quota = (

@@ -1,0 +1,68 @@
+[
+ {
+  "base_commit": "25af91287dac414ccac2ebde92631fff0d396a46",
+  "created_at": "2026-01-01 00:00:00",
+  "eval_type": "pass_and_fail",
+  "image": "swebench/sweb.eval.x86_64.fixture__calc-1:latest",
+  "instance_id": "fixture__calc-1",
+  "log_parser": "parse_log_pytest",
+  "repo": "fixture/calc",
+  "version": "1",
+  "patch": "diff --git a/calc/ops.py b/calc/ops.py\nindex 7fedd63..60feb6f 100644\n--- a/calc/ops.py\n+++ b/calc/ops.py\n@@ -7,7 +7,7 @@ def add(left, right):\n \n def mul(left, right):\n     # Multiply two integers.\n-    return left + right\n+    return left * right\n \n \n def negate(value):\n@@ -20,4 +20,4 @@ def double(value):\n \n def div(left, right):\n     # Integer division of non-negative operands.\n-    return left // right + 1\n+    return left // right\n",
+  "test_patch": "diff --git a/tests/test_ops.py b/tests/test_ops.py\nindex d509f32..5121e29 100644\n--- a/tests/test_ops.py\n+++ b/tests/test_ops.py\n@@ -1,5 +1,13 @@\n-from calc import add\n+from calc import add, div, mul\n \n \n def test_add():\n     assert add(2, 3) == 5\n+\n+\n+def test_mul():\n+    assert mul(2, 3) == 6\n+\n+\n+def test_div():\n+    assert div(7, 2) == 3\n",
+  "eval_script": "#!/bin/bash\nset -uxo pipefail\ncd /testbed\ngit config --global --add safe.directory /testbed\ngit status\ngit show\ngit -c core.fileMode=false diff 25af91287dac414ccac2ebde92631fff0d396a46\ngit checkout 25af91287dac414ccac2ebde92631fff0d396a46 tests/test_ops.py\ngit apply -v - <<'EOF_114329324912'\ndiff --git a/tests/test_ops.py b/tests/test_ops.py\nindex d509f32..5121e29 100644\n--- a/tests/test_ops.py\n+++ b/tests/test_ops.py\n@@ -1,5 +1,13 @@\n-from calc import add\n+from calc import add, div, mul\n \n \n def test_add():\n     assert add(2, 3) == 5\n+\n+\n+def test_mul():\n+    assert mul(2, 3) == 6\n+\n+\n+def test_div():\n+    assert div(7, 2) == 3\nEOF_114329324912\n: '>>>>> Start Test Output'\npython -m pytest -rA tests/test_ops.py\n: '>>>>> End Test Output'\ngit checkout 25af91287dac414ccac2ebde92631fff0d396a46 tests/test_ops.py\n",
+  "problem_statement": "fixture/calc: mul and div return wrong results.\n",
+  "hints_text": "",
+  "FAIL_TO_PASS": [
+   "tests/test_ops.py::test_mul",
+   "tests/test_ops.py::test_div"
+  ],
+  "PASS_TO_PASS": [
+   "tests/test_ops.py::test_add"
+  ]
+ },
+ {
+  "base_commit": "eb7093fc3ecc1a6272e14d7140225c06d445f814",
+  "created_at": "2026-01-01 00:00:00",
+  "eval_type": "pass_and_fail",
+  "image": "swebench/sweb.eval.x86_64.fixture__calcgo-2:latest",
+  "instance_id": "fixture__calcgo-2",
+  "log_parser": "parse_log_gotest",
+  "repo": "fixture/calcgo",
+  "version": "2",
+  "patch": "diff --git a/calc.go b/calc.go\nindex 4c019a3..b71d320 100644\n--- a/calc.go\n+++ b/calc.go\n@@ -5,7 +5,7 @@ func Add(a, b int) int { return a + b }\n \n // Mul returns the product.\n func Mul(a, b int) int {\n-\treturn a + b\n+\treturn a * b\n }\n \n // Negate flips the sign.\n@@ -16,5 +16,5 @@ func Double(a int) int { return a * 2 }\n \n // Div returns the truncated quotient.\n func Div(a, b int) int {\n-\treturn a/b + 1\n+\treturn a / b\n }\n",
+  "test_patch": "diff --git a/calc_test.go b/calc_test.go\nindex 010e1bf..4cd3352 100644\n--- a/calc_test.go\n+++ b/calc_test.go\n@@ -7,3 +7,15 @@ func TestAdd(t *testing.T) {\n \t\tt.Fatal(\"add\")\n \t}\n }\n+\n+func TestMul(t *testing.T) {\n+\tif Mul(2, 3) != 6 {\n+\t\tt.Fatal(\"mul\")\n+\t}\n+}\n+\n+func TestDiv(t *testing.T) {\n+\tif Div(7, 2) != 3 {\n+\t\tt.Fatal(\"div\")\n+\t}\n+}\n",
+  "eval_script": "#!/bin/bash\nset -uxo pipefail\ncd /testbed\ngit config --global --add safe.directory /testbed\ngit status\ngit show\ngit -c core.fileMode=false diff eb7093fc3ecc1a6272e14d7140225c06d445f814\ngit checkout eb7093fc3ecc1a6272e14d7140225c06d445f814 calc_test.go\ngit apply -v - <<'EOF_114329324912'\ndiff --git a/calc_test.go b/calc_test.go\nindex 010e1bf..4cd3352 100644\n--- a/calc_test.go\n+++ b/calc_test.go\n@@ -7,3 +7,15 @@ func TestAdd(t *testing.T) {\n \t\tt.Fatal(\"add\")\n \t}\n }\n+\n+func TestMul(t *testing.T) {\n+\tif Mul(2, 3) != 6 {\n+\t\tt.Fatal(\"mul\")\n+\t}\n+}\n+\n+func TestDiv(t *testing.T) {\n+\tif Div(7, 2) != 3 {\n+\t\tt.Fatal(\"div\")\n+\t}\n+}\nEOF_114329324912\n: '>>>>> Start Test Output'\n(go test -v . -run \"^Test\") | cat\n: '>>>>> End Test Output'\ngit checkout eb7093fc3ecc1a6272e14d7140225c06d445f814 calc_test.go\n",
+  "problem_statement": "fixture/calcgo: mul and div return wrong results.\n",
+  "hints_text": "",
+  "FAIL_TO_PASS": [
+   "TestMul",
+   "TestDiv"
+  ],
+  "PASS_TO_PASS": [
+   "TestAdd"
+  ]
+ },
+ {
+  "base_commit": "42245e8f487505f66b502fd6b10711bac8649c71",
+  "created_at": "2026-01-01 00:00:00",
+  "eval_type": "pass_and_fail",
+  "image": "swebench/sweb.eval.x86_64.fixture__calcrs-3:latest",
+  "instance_id": "fixture__calcrs-3",
+  "log_parser": "parse_log_cargo",
+  "repo": "fixture/calcrs",
+  "version": "3",
+  "patch": "diff --git a/src/lib.rs b/src/lib.rs\nindex 18392c0..6f4c6c8 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -3,7 +3,7 @@ pub fn add(a: i64, b: i64) -> i64 {\n }\n \n pub fn mul(a: i64, b: i64) -> i64 {\n-    a + b\n+    a * b\n }\n \n pub fn negate(a: i64) -> i64 {\n@@ -15,5 +15,5 @@ pub fn double(a: i64) -> i64 {\n }\n \n pub fn div(a: i64, b: i64) -> i64 {\n-    a / b + 1\n+    a / b\n }\n",
+  "test_patch": "diff --git a/tests/calc.rs b/tests/calc.rs\nindex 55c5b74..4ef2f18 100644\n--- a/tests/calc.rs\n+++ b/tests/calc.rs\n@@ -1,6 +1,16 @@\n-use calcrs::add;\n+use calcrs::{add, div, mul};\n \n #[test]\n fn add_works() {\n     assert_eq!(add(2, 3), 5);\n }\n+\n+#[test]\n+fn mul_works() {\n+    assert_eq!(mul(2, 3), 6);\n+}\n+\n+#[test]\n+fn div_works() {\n+    assert_eq!(div(7, 2), 3);\n+}\n",
+  "eval_script": "#!/bin/bash\nset -uxo pipefail\ncd /testbed\ngit config --global --add safe.directory /testbed\ngit status\ngit show\ngit -c core.fileMode=false diff 42245e8f487505f66b502fd6b10711bac8649c71\ngit checkout 42245e8f487505f66b502fd6b10711bac8649c71 tests/calc.rs\ngit apply -v - <<'EOF_114329324912'\ndiff --git a/tests/calc.rs b/tests/calc.rs\nindex 55c5b74..4ef2f18 100644\n--- a/tests/calc.rs\n+++ b/tests/calc.rs\n@@ -1,6 +1,16 @@\n-use calcrs::add;\n+use calcrs::{add, div, mul};\n \n #[test]\n fn add_works() {\n     assert_eq!(add(2, 3), 5);\n }\n+\n+#[test]\n+fn mul_works() {\n+    assert_eq!(mul(2, 3), 6);\n+}\n+\n+#[test]\n+fn div_works() {\n+    assert_eq!(div(7, 2), 3);\n+}\nEOF_114329324912\n: '>>>>> Start Test Output'\n(RUSTFLAGS=-Awarnings cargo test --test calc) | cat\n: '>>>>> End Test Output'\ngit checkout 42245e8f487505f66b502fd6b10711bac8649c71 tests/calc.rs\n",
+  "problem_statement": "fixture/calcrs: mul and div return wrong results.\n",
+  "hints_text": "",
+  "FAIL_TO_PASS": [
+   "mul_works",
+   "div_works"
+  ],
+  "PASS_TO_PASS": [
+   "add_works"
+  ]
+ }
+]
