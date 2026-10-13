@@ -35,6 +35,28 @@ It reported only the `ERROR` and `MISSING` nodes that the edit introduced.
 Issue #221 ("Add an advisory post-write parse check to tilth_write") is OPEN.
 The design above is a good start for #221. The hook point must move to the `tilth_write` apply path.
 
+## Acceptance (for #221)
+
+The seven cases below carry over to the `tilth_write` check:
+
+1. Clean edit, clean file: no `── parse ──` block.
+2. Clean edit, pre-broken file: no block. Pre-existing errors stay silent.
+3. Edit introduces a syntax error: a block with the new error, anchored to its line.
+4. Edit introduces 15 errors: list the top 10, then `... and 5 more (15 new, 15 total)`.
+5. File with no grammar (Dockerfile, Make): no block, no crash.
+6. Multi-file batch where one file breaks: only that file's section shows a block.
+7. Edit fixes a pre-existing error: no block. Version 1 does not report fixes.
+
+Overflow format: `... and N more (X new, Y total)`. `X` is the new-error count. `Y` is the total post-edit error count.
+Sort rule: sort errors by `(line, col)`. `col` is a 0-indexed sort key and never appears in the output.
+
+Version 2 candidates:
+
+- Per-edit attribution: map each error to the edit range that contains it.
+- Report fixed errors next to regressions.
+- Structured parse for JSON, YAML, and TOML.
+- Opt-out flag, only if benchmarks justify it.
+
 ## Successor
 
 Issue #221.

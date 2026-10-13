@@ -21,9 +21,9 @@ Agents went around the tilth API where it fought their trained shapes or lacked 
 
 ## Decisions
 
-- Substring match over whole-line match, for trained-shape alignment. Both fail closed (ADR-001).
-- No op pruning. Production use showed block ops in 11 projects and 1,662 insert uses (ADR-002).
-- The character cap never yields (ADR-003).
+- Substring match over whole-line match, for trained-shape alignment. Both fail closed: an `old` that matches zero or many times is rejected.
+- No op pruning. Production use showed block ops in 11 projects and 1,662 insert uses. This reverses the benchmark-census recommendation.
+- The character cap never yields. The live check is `server_instructions_fit_character_cap` (`src/mcp/mod.rs:1379`), which now caps at 2,048 characters. The 13,779 figure is superseded; `tool_descriptions_fit_2kb` (`src/mcp/tools/definitions.rs:542`) caps each tool description at 2,048 bytes.
 - No scratch-file affordance. Answer inline.
 
 ## What shipped

@@ -36,6 +36,11 @@ A comparison with woz found better session economics there: caching, range slici
 - Shipped, then retired: `tilth_list` (#282, `d88bdf0`).
 - Dropped: top-level `expand` and `context`, and per-entry `kind`. The same test lists `expand` and `context` as dropped.
 - Replaced: hash prefixes in search. Match headers now carry `path#TAG` (#309).
+- AC 2, merged default: replaced. Search-v2 routes each query automatically, and entries have no `kind` (`src/mcp/tools/definitions.rs:386-431`).
+- AC 6, hash-prefixed signature lines: replaced. #99 removed per-line hashes. Read output now carries one `[path#TAG]` header over numbered lines.
+- AC 9, strict auto-fix on hash mismatch: replaced by 3-way-merge recovery under #116 (`src/edit/recovery.rs`).
+- AC 12-13, thin instructions plus per-tool examples: lasted. One `prompts/mcp.md` (`src/mcp/mod.rs:76`) plus `prompts/tools/{read,search,write}.md` (`src/mcp/tools/definitions.rs:4-6`).
+- Open questions: moot or resolved. `LARGE_FILE_TOKENS` has no constant in `src/`. The per-tool description budget is 2,048 bytes (`src/mcp/tools/definitions.rs:542`). The write-mode alias is moot because the modes are gone.
 
 ## Lessons
 
@@ -45,6 +50,6 @@ A comparison with woz found better session economics there: caching, range slici
 
 ## Successor
 
-#116 (JSON `edits` array on whole-file tags) and `adr/tilth-search-v2-roadmap-001`.
+PR #116 (JSON `edits` array on whole-file tags) and `adr/tilth-search-v2-roadmap-001`.
 
 _Source: former `.cheese/specs/tilth-mcp-overhaul.md`; commits `da4c58e` (#23), `32940ef` (#37), `d88bdf0` (#282); PR #116 · Updated: 2026-10-13_
