@@ -79,7 +79,7 @@ A usage-limit rejection (a terminal result with usage-limit text or a rate-limit
 ## External tasks: FeatureBench and SWE-bench Multilingual
 
 `benchmark/external/` runs FeatureBench Lite Level 1 and SWE-bench Multilingual instances natively, with no Docker.
-FeatureBench comes from HF `LiberCoders/FeatureBench` (tag `v1.1`).
+FeatureBench comes from HF `LiberCoders/FeatureBench` (the commit that tag `v1.1` names, pinned in `external/data.py` with a parquet sha256).
 SWE-bench Multilingual comes from HF `SWE-bench/SWE-bench_Multilingual` (revision `846e647b9f33c0b51b739d005d13d85493c9af09`).
 The harness keeps dataset rows, bare upstream mirrors, gold patches, held-out tests, and admission verdicts only in `$TILTH_BENCH_DATA`.
 The default is `~/.local/share/tilth-bench/external`, outside this checkout and every agent workdir.
