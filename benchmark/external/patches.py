@@ -164,7 +164,8 @@ def hunk_removals(patch: str, max_hunks: int) -> list[tuple[int, str, str]]:
     The index counts hunks in patch order. Source hunks are tried (documentation
     hunks only when there is no other), largest first, at most ``max_hunks`` of
     them. A patch with one such hunk yields it minus its added lines instead,
-    since removing it would only repeat the empty patch.
+    since removing it would only repeat the empty patch. When that hunk only
+    adds lines, no variant exists and the result is empty.
     """
     sections = _sections(patch)
     hunks = [(index, position) for index, section in enumerate(sections)
@@ -174,6 +175,8 @@ def hunk_removals(patch: str, max_hunks: int) -> list[tuple[int, str, str]]:
     if len(source) == 1:
         [(index, position)] = source
         stripped = _without_added_lines(sections[index].hunks[position])
+        if stripped is None:
+            return []
         return [(number[source[0]], sections[index].path, _replace_hunk(sections, index, position, stripped))]
     ranked = sorted(source, key=lambda hunk: (-_changed_lines(sections[hunk[0]].hunks[hunk[1]]), number[hunk]))
     return [(number[(index, position)], sections[index].path, _replace_hunk(sections, index, position, None))

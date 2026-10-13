@@ -108,12 +108,15 @@ def _reset(workdir: Path) -> None:
         raise PrepareError(f"{' '.join(error.cmd)} failed in {workdir}") from error
 
 
-def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[int, int]]:
-    """Resolve ``patch`` on the prepared tree; a patch that does not apply does not resolve."""
+def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[int, int] | None]:
+    """Reset the tree, apply ``patch``, and grade it.
+
+    A patch that does not apply does not resolve and has no counts.
+    """
     _reset(workdir)
     total = len(task.fail_to_pass) + len(task.pass_to_pass)
     if patch and not apply_patch(workdir, patch):
-        return False, (0, total)
+        return False, None
     resolved, _ = task.check_correctness("", str(workdir))
     details = task.grade_details()
     return resolved, (details["f2p_passed"] + details["p2p_passed"], total)
@@ -124,19 +127,25 @@ def _tamper(task: ExternalTask, workdir: Path, max_hunks: int) -> tuple[bool, di
 
     Returns whether every applying removal still resolved, and the verdict fields
     that record the counts, the failing hunk index, and the hunks tried.
+    The check is n/a when the gold patch has no hunk to remove.
     """
+    variants = patches.hunk_removals(task.gold_patch, max_hunks)
+    if not variants:
+        return False, {"detail": "tampered: n/a (the gold patch has no hunk whose removal differs from the empty patch)"}
     tried: list[str] = []
     counts = None
-    for index, path, patch in patches.hunk_removals(task.gold_patch, max_hunks):
-        _reset(workdir)
-        if patch and not apply_patch(workdir, patch):
+    for index, path, patch in variants:
+        resolved, graded = _grade(task, workdir, patch)
+        if graded is None:
             tried.append(f"{index} (does not apply)")
             continue
-        resolved, counts = _grade(task, workdir, patch)
+        counts = graded
         if not resolved:
             return False, {"tampered": counts, "tampered_hunk": index,
                            "detail": f"tampered: removing gold hunk {index} ({path}) fails the held-out tests"}
         tried.append(str(index))
+    if counts is None:
+        return True, {"detail": f"tampered_unapplicable: no single-hunk removal applies (hunks {', '.join(tried)})"}
     return True, {"tampered": counts,
                   "detail": f"tampered: every single-hunk removal tried still resolves (hunks {', '.join(tried)})"}
 
@@ -157,9 +166,10 @@ def round_trip(task: ExternalTask, fingerprint: str) -> PreflightVerdict:
         except PrepareError as error:
             return verdict("prepare_failed", detail=str(error))
         try:
-            task.build_env(workdir)
             if task.language == "python":
                 task.grade_venv()
+            else:
+                task.build_env(workdir)
         except EnvBuildError as error:
             return verdict("env_build_failed", detail=str(error))
         except PrepareError as error:

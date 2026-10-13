@@ -218,6 +218,37 @@ def test_tampered_check_is_bounded_by_max_hunks(external_bench, monkeypatch: pyt
     assert "hunks 2" in result.detail
 
 
+def _tamper_task(gold: str):
+    class Task:
+        gold_patch = gold
+        fail_to_pass: list[str] = []
+        pass_to_pass: list[str] = []
+    return Task()
+
+
+def test_tamper_check_is_not_applicable_when_gold_only_adds_lines(tmp_path: Path) -> None:
+    added = "".join(f"+NOTE_{n} = {n}\n" for n in range(3))
+    gold = ("diff --git a/calc/ops.py b/calc/ops.py\n--- a/calc/ops.py\n+++ b/calc/ops.py\n"
+            f"@@ -1,1 +1,4 @@\n x = 1\n{added}")
+
+    resolved, fields = external.preflight._tamper(_tamper_task(gold), tmp_path, 8)
+
+    assert resolved is False
+    assert "n/a" in fields["detail"] and "tampered" not in fields
+
+
+def test_tamper_check_reports_when_no_removal_applies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(external.preflight, "reset_repo", lambda workdir: None)
+    monkeypatch.setattr(external.preflight, "apply_patch", lambda workdir, patch: False)
+    gold = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n-one\n+uno\n two\n"
+            "@@ -9,2 +9,2 @@\n nine\n-ten\n+diez\n")
+
+    resolved, fields = external.preflight._tamper(_tamper_task(gold), tmp_path, 8)
+
+    assert resolved is True and fields["detail"].startswith("tampered_unapplicable:")
+    assert "0 (does not apply)" in fields["detail"] and "tampered" not in fields
+
+
 def test_preflight_refuses_by_reason(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
     external_bench.seed(FB_LV2)
     assert (external.preflight.admit(FB_LV2).admitted, external.preflight.admit(FB_LV2).reason) == (False, "level2")

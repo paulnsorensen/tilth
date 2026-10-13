@@ -539,6 +539,10 @@ def _notes_hunk(lines: int) -> str:
             f"--- /dev/null\n+++ b/calc/notes.py\n@@ -0,0 +1,{lines} @@\n{body}")
 
 
+def _edit_and_add_hunk() -> str:
+    return ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,3 @@\n-one\n two\n+three\n+four\n")
+
+
 def test_patch_helpers_split_reverse_and_remove_hunks() -> None:
     row = rows("featurebench")[FB_F2P_EDIT]
     gold = rows("swebench_ml")[SWE_PY]["patch"] + _notes_hunk(3)
@@ -554,8 +558,10 @@ def test_patch_helpers_split_reverse_and_remove_hunks() -> None:
     assert "+    return left * right" not in without[0] and "+    return left // right\n" in without[0]
     assert "+    return left // right\n" not in without[1] and "NOTE_0" in without[1]
     assert [index for index, _, _ in external.patches.hunk_removals(gold, max_hunks=1)] == [2]
-    [(index, _, single)] = external.patches.hunk_removals(
-        external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1], max_hunks=8)
+    # A lone hunk that only adds lines has no variant: removing it would repeat the empty patch.
+    assert external.patches.hunk_removals(
+        external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1], max_hunks=8) == []
+    [(index, _, single)] = external.patches.hunk_removals(_edit_and_add_hunk(), max_hunks=8)
     assert index == 0
     assert not [line for line in single.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
