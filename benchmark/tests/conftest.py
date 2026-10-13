@@ -192,11 +192,13 @@ def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalB
         if list(argv[:2]) == ["uv", "venv"]:
             result = real_run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
                               **kwargs)
-            # --system-site-packages exposes the base interpreter only. A suite run from a venv keeps pytest
-            # in that venv, so a .pth file adds this interpreter's site directories to the stub venv.
+            # --system-site-packages exposes the base interpreter only. A suite run from a venv or a layered env
+            # (uv run --with) keeps pytest outside it, so a .pth file adds this interpreter's site directories.
             purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
             if purelib.is_dir():
-                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])]
+                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else []),
+                             *(entry for entry in sys.path if Path(entry).name == "site-packages")]
+                site_dirs = list(dict.fromkeys(site_dirs))
                 (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
             return result
         if list(argv[:2]) == ["uv", "pip"]:
