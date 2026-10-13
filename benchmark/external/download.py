@@ -86,7 +86,12 @@ def fetch(dataset: str, *, client: Callable[[str], bytes] | None = None, extra_i
             if data.is_safe_id(str(row.get("instance_id", ""))):
                 write_atomically(data.row_path(dataset, revision, row["instance_id"]), json.dumps(row, default=str))
         (target / _COMPLETE_MARKER).write_text(url + "\n")
-    for instance_id in dict.fromkeys([*registry.candidates(dataset), *extra_ids]):
+    mirror_instances(dataset, dict.fromkeys([*registry.candidates(dataset), *extra_ids]))
+
+
+def mirror_instances(dataset: str, instance_ids: Iterable[str]) -> None:
+    """Mirror the ``base_commit`` of each cached instance of ``dataset``."""
+    for instance_id in instance_ids:
         if data.cached_dataset(instance_id) == dataset:
             row = data.cached_row(instance_id)
             ensure_mirror(row["repo"], row["base_commit"])

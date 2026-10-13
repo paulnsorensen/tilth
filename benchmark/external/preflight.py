@@ -228,6 +228,8 @@ def admit(instance_id: str) -> PreflightVerdict:
 def _ensure_rows(dataset: str, instance_ids: list[str]) -> None:
     if any(data.cached_row(instance_id) is None for instance_id in instance_ids):
         download.fetch(dataset, extra_ids=instance_ids)
+    else:
+        download.mirror_instances(dataset, instance_ids)
 
 
 def _admit_and_print(instance_id: str) -> PreflightVerdict | None:

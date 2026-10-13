@@ -326,6 +326,7 @@ class _Cli:
             "rust": (SWE_RS, "fixture__calcrs-9"),
         })
         monkeypatch.setattr(external.download, "fetch", self.fetch)
+        monkeypatch.setattr(external.download, "mirror_instances", lambda dataset, instance_ids: None)
         monkeypatch.setattr(external.preflight, "admit", self.admit)
 
     def fetch(self, dataset: str, **kwargs) -> None:
@@ -421,6 +422,23 @@ def test_preflight_panel_form(external_bench, monkeypatch: pytest.MonkeyPatch, t
     cli.refused = {FB_LV1}
     assert external.preflight.main(["--panel", str(panel)]) != 0
     assert "featurebench" in capsys.readouterr().err
+
+def test_cached_rows_with_a_missing_mirror_are_mirrored_for_the_panel(external_bench,
+                                                                     monkeypatch: pytest.MonkeyPatch,
+                                                                     tmp_path: Path) -> None:
+    external_bench.seed(SWE_GO)
+    row = external_bench.row(SWE_GO)
+    mirrored: list[tuple[str, str]] = []
+    monkeypatch.setattr(external.download, "fetch", lambda *args, **kwargs: pytest.fail("rows are cached"))
+    monkeypatch.setattr(external.download, "ensure_mirror", lambda repo, commit: mirrored.append((repo, commit)))
+    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: verdict(instance_id, True))
+    panel = tmp_path / "panel.json"
+    panel.write_text(json.dumps({"members": [{"id": SWE_GO, "family": "swebench_ml"}]}))
+
+    external.preflight._panel(panel)
+
+    assert mirrored == [(row["repo"], row["base_commit"])]
+
 
 
 _PRE_VERSION_VERDICT = {"instance_id": SWE_PY, "dataset": "swebench_ml", "data_rev": external.SWEBENCH_ML_REVISION,
