@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import urllib.request
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -90,8 +91,15 @@ def fetch(dataset: str, *, client: Callable[[str], bytes] | None = None, extra_i
 
 
 def mirror_instances(dataset: str, instance_ids: Iterable[str]) -> None:
-    """Mirror the ``base_commit`` of each cached instance of ``dataset``."""
+    """Mirror the ``base_commit`` of each cached instance of ``dataset``.
+
+    An instance whose commit cannot be mirrored is reported on stderr and skipped,
+    so one bad instance does not stop the others. ``admit`` then refuses it.
+    """
     for instance_id in instance_ids:
         if data.cached_dataset(instance_id) == dataset:
             row = data.cached_row(instance_id)
-            ensure_mirror(row["repo"], row["base_commit"])
+            try:
+                ensure_mirror(row["repo"], row["base_commit"])
+            except RuntimeError as error:
+                print(f"WARNING: cannot mirror {instance_id}: {error}", file=sys.stderr)

@@ -440,6 +440,24 @@ def test_cached_rows_with_a_missing_mirror_are_mirrored_for_the_panel(external_b
     assert mirrored == [(row["repo"], row["base_commit"])]
 
 
+def test_one_unmirrorable_commit_does_not_stop_the_others(external_bench, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    external_bench.seed(SWE_GO)
+    external_bench.seed(SWE_RS)
+    bad_commit = external_bench.row(SWE_GO)["base_commit"]
+    mirrored: list[str] = []
+
+    def ensure_mirror(repo: str, commit: str) -> None:
+        if commit == bad_commit:
+            raise RuntimeError(f"cannot fetch {commit}")
+        mirrored.append(commit)
+
+    monkeypatch.setattr(external.download, "ensure_mirror", ensure_mirror)
+
+    external.download.mirror_instances("swebench_ml", [SWE_GO, SWE_RS])
+
+    assert mirrored == [external_bench.row(SWE_RS)["base_commit"]]
+    assert SWE_GO in capsys.readouterr().err
 
 _PRE_VERSION_VERDICT = {"instance_id": SWE_PY, "dataset": "swebench_ml", "data_rev": external.SWEBENCH_ML_REVISION,
                         "env_fingerprint": "y", "admitted": True, "reason": "admitted", "gold": [3, 3],
