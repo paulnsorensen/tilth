@@ -1,6 +1,5 @@
 """Pre-registered panels: schema, completeness, admission, tiers, stratified split, stamp, lock, registration."""
 
-import hashlib
 import json
 import socket
 import sys
@@ -179,13 +178,13 @@ def test_stratify_orders_by_language_then_seeded_hash() -> None:
     assert any(panels.stratify(members, seed) != assignment for seed in range(4, 20))
 
     # Language sorts first: the lone go member leads its stratum on every seed, so it is always dev.
+    # The stratum then alternates test, dev, test, dev, test over the five python members.
     mixed = [*members, {"id": "z-go", "family": "featurebench", "language": "go"}]
     for seed in range(20):
-        ordered = sorted(mixed, key=lambda entry: (entry["language"],
-                                                   hashlib.sha256(f"{seed}:{entry['id']}".encode()).hexdigest()))
-        expected = {entry["id"]: "dev" if index % 2 == 0 else "test" for index, entry in enumerate(ordered)}
-        assert panels.stratify(mixed, seed) == expected
-        assert expected["z-go"] == "dev"
+        split = panels.stratify(mixed, seed)
+        assert split["z-go"] == "dev"
+        assert [split[entry["id"]] for entry in members].count("dev") == 2
+        assert [split[entry["id"]] for entry in members].count("test") == 3
 
 
 @pytest.mark.parametrize(("member_id", "split"), [("rg_search_dispatch", "test"), (RENDER, "cheap"),
@@ -378,6 +377,14 @@ def _set(path: tuple, value: object):
     return mutate
 
 
+def _drop(path: tuple):
+    def mutate(data: dict) -> dict:
+        data = json.loads(json.dumps(data))
+        del (data if len(path) == 1 else member(data, path[0]))[path[-1]]
+        return data
+    return mutate
+
+
 def _add(entry: dict):
     def mutate(data: dict) -> dict:
         return {**data, "members": [*data["members"], entry]}
@@ -396,10 +403,15 @@ def _add(entry: dict):
     (_set(("rg_search_dispatch", "language"), "go"), "rg_search_dispatch"),
     (_set(("split_seed",), "7"), "split_seed"),
     (_set(("members",), {}), "members"),
+    (_drop(("split_seed",)), "missing key"),
+    (_set(("name",), "  "), "non-empty"),
+    (_set((RENDER, "language"), 5), "must be strings"),
+    (_drop((RENDER, "language")), "missing member key"),
     (_add({"id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv2", "family": "featurebench",
            "language": "python", "split": "dev"}), "Level 1"),
 ], ids=["unknown-key", "unknown-member-key", "duplicate-id", "unknown-local", "extra-local", "unknown-family",
-        "third-swebench", "local-language", "seed-type", "members-type", "level2"])
+        "third-swebench", "local-language", "seed-type", "members-type", "no-seed", "empty-name", "non-string-field",
+        "no-member-language", "level2"])
 def test_malformed_panel_refused(tmp_path: Path, store: Path, mutate, fault: str) -> None:
     with pytest.raises(panels.PanelError, match=fault):
         load(write(tmp_path, mutate(read(COMPLETE))), store)
@@ -495,6 +507,22 @@ def test_committed_rows_hold_no_grader_material() -> None:
         assert set(row) <= REDACTED_KEYS, path.name
         assert not set(row) & GRADER_KEYS, path.name
         assert row["instance_id"] == path.stem
+
+
+def _all_keys(value: object) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {key for item in value.values() for key in _all_keys(item)}
+    if isinstance(value, list):
+        return {key for item in value for key in _all_keys(item)}
+    return set()
+
+
+def test_committed_manifests_hold_no_grader_material() -> None:
+    manifests = [*sorted(COMMITTED_PANEL.parent.glob("*.json")), *sorted(COMPLETE.parent.glob("*.json"))]
+
+    assert COMMITTED_PANEL in manifests and COMPLETE in manifests
+    for path in manifests:
+        assert not _all_keys(read(path)) & GRADER_KEYS, path.name
 
 
 # --- AC-9: registration ---

@@ -3,7 +3,6 @@
 import copy
 import hashlib
 import json
-import subprocess
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -19,6 +18,7 @@ import external.featurebench
 import external.preflight
 import external.swebench_ml
 import external_support
+from conftest import ExternalBench
 import panels
 import run
 import tasks.base
@@ -214,15 +214,9 @@ def seed_synthetic_data(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
         monkeypatch.setitem(external.data.REPO_LANGUAGES, repo, language)
     for repo, files in read(SYNTHETIC / "projects.json").items():
         external_support.build_upstream(repo, files, upstream)
+    harness = ExternalBench(data=data_dir, upstream=upstream)
     for row in synthetic_rows().values():
-        dataset = external.data.FEATUREBENCH if "repo_settings" in row else external.data.SWEBENCH_ML
-        path = external.data.row_path(dataset, external.data.REVISIONS[dataset], row["instance_id"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(row))
-        mirror = external.data.mirror_path(row["repo"])
-        if not mirror.exists():
-            subprocess.run(["git", "clone", "-q", "--bare", str(upstream / f"{row['repo']}.git"), str(mirror)],
-                           check=True, capture_output=True)
+        harness.seed_row(row)
 
 
 def synthetic_panel() -> dict:

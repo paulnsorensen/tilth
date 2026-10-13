@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import external.preflight
 import run
-from conftest import STREAMS
+from conftest import STREAMS, link_suite_site
 from panel_support import (
     CHEAP, COMPLETE, FB_IDS, GO_SLOT, RENDER, RUST_SLOT, SYNTHETIC_FB, admit_all, hermetic_repos, panel_run, read,
     restratify, seed_synthetic_data, synthetic_panel, without, write,
@@ -95,7 +95,11 @@ def test_external_cell_never_invokes_container(bench, monkeypatch: pytest.Monkey
             return _Replay(stream)
         if argv[:2] == ["uv", "venv"]:
             # A stdlib venv that sees the host pytest; uv itself would fetch an interpreter.
-            argv = [sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]]
+            venv = real_popen([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
+                              *args, **kwargs)
+            venv.wait()
+            link_suite_site(argv[-1])
+            return venv
         elif argv[:2] == ["uv", "pip"]:
             argv = ["true"]
         return real_popen(argv, *args, **kwargs)

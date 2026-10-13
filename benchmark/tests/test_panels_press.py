@@ -87,15 +87,63 @@ def test_lock_holds_when_a_newer_row_matches(store: Path) -> None:
     assert store.read_bytes() == before
 
 
-def test_panel_rows_flow_into_analysis_once(tmp_path: Path) -> None:
+def test_all_reused_panel_run_locks_the_split(bench, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    prun = panel_run(bench, monkeypatch, tmp_path)
+    data = read(COMPLETE)
+    cheap = [entry["id"] for entry in data["members"] if entry["split"] == "cheap"]
+    for task in cheap:
+        bench.seed(bench.row(task, "plain", 0))
+
+    assert prun.main(prun.panel(data), "--panel-split", "cheap") == 0
+    assert prun.called == []
+    stamped = [row for row in bench.stored_rows() if row.get("panel_name") == data["name"]]
+    assert sorted(row["task"] for row in stamped) == sorted(cheap)
+    assert {row["panel_split_digest"] for row in stamped} == {stamp_digest(data)}
+    assert all(row["charged_usd"] == 0.0 and row["reused"] is True for row in stamped)
+
+    assert prun.main(prun.panel(data), "--panel-split", "cheap") == 0
+    assert len(bench.stored_rows()) == 2 * len(cheap)
+
+    moved = next(candidate for seed in range(8, 80)
+                 if stamp_digest(candidate := restratify({**read(COMPLETE), "split_seed": seed})) != stamp_digest(data))
+    with pytest.raises(panels.PanelError, match="split changed"):
+        load(prun.panel(moved, "moved.json"), bench.store_path)
+
+
+def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) -> None:
+    import paired
+
+    rows = [{"task": "t", "mode": "baseline", "correct": True, "panel_name": "p", "contaminated": True},
+            {"task": "t", "mode": "tilth", "correct": True, "contaminated": True},
+            {"task": "t", "mode": "tilth", "correct": True, "panel_name": "p", "contaminated": False}]
+    path = tmp_path / "results.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    assert [run["correct"] for run in paired.load_runs(path)] == [False, True, True]
+
+
+def test_failure_taxonomy_names_contaminated_rows_first() -> None:
     import analyze
 
-    row = {"task": "t", "mode": "baseline", "correct": True, "panel_name": "p", "contaminated": True}
-    path = tmp_path / "results.jsonl"
-    path.write_text(json.dumps(row) + "\n")
+    row = {"task": "t", "mode": "baseline", "correct": False, "panel_name": "p", "contaminated": True,
+           "correctness_reason": "Missing: needle"}
 
-    [loaded] = analyze.load_results(path)
+    assert analyze._failure_type(row) == ("contaminated", "agent saw grader material")
+    assert analyze._failure_type({**row, "panel_name": ""}) == ("missing_required_literal", "needle")
 
-    assert loaded["correct"] is False
-    assert {key: value for key, value in loaded.items() if key != "correct"} == {
-        key: value for key, value in row.items() if key != "correct"}
+
+def test_register_checks_the_loader_name_before_collisions(monkeypatch: pytest.MonkeyPatch, store: Path) -> None:
+    renamed = FB_IDS[1]
+    monkeypatch.setattr(external.featurebench, "load", lambda _id, revision: stub_task(renamed, revision))
+    panel = load(COMPLETE, store)
+    registry = {**run.TASKS, renamed: run.TASKS[RENDER]}
+
+    with pytest.raises(panels.PanelError, match="the loader returned task"):
+        panel.register(registry)
+
+
+def test_unstamp_drops_only_the_panel_stamp() -> None:
+    row = {"run_key": "k", "correct": True, "panel_name": "p", "panel_split_digest": "d", "panel_split": "dev"}
+
+    assert panels.unstamp(row) == {"run_key": "k", "correct": True}
+    assert "panel_name" in row

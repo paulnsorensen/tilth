@@ -10,7 +10,6 @@ the host ``go``, ``cargo``, and Python. Nothing here comes from a real dataset r
 """
 
 import json
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -85,13 +84,7 @@ def total(values):
     return sum(values)
 '''
 
-PY_CORE_MASKED = '''"""Number helpers."""
-
-
-def biggest(values):
-    """Return the largest value."""
-    return max(values)
-'''
+PY_CORE_MASKED = PY_CORE[:PY_CORE.index("\n\ndef total")]
 
 PY_TOTAL_TEST = '''from panelpy.core import total
 
@@ -155,10 +148,12 @@ EOF_PANEL
 git checkout {base} {test_files}
 """
 
-REPO_SETTINGS = {
-    "repository": "fixture/panelpy", "commit": "", "base_image": "python311", "pre_install": [], "install": "",
-    "pip_packages": [], "test_cmd": "pytest -rA --tb=short --color=no", "library_name": "panelpy",
-}
+def repo_settings(base: str) -> str:
+    return json.dumps({
+        "repository": "fixture/panelpy", "commit": base[:7], "base_image": "python311", "pre_install": [],
+        "install": "", "pip_packages": [], "test_cmd": "pytest -rA --tb=short --color=no",
+        "library_name": "panelpy",
+    })
 
 
 def diff(work: Path, files: dict[str, str | None]) -> str:
@@ -202,9 +197,8 @@ def main() -> None:
                     "FAIL_TO_PASS": ["tests/test_total.py"], "PASS_TO_PASS": ["tests/test_biggest.py"],
                     "image_name": "synthetic", "repo": repo, "base_commit": base,
                     "problem_statement": "Implement ``total`` in ``panelpy.core``: return the sum of the values.\n",
-                    "repo_settings": json.dumps({**REPO_SETTINGS, "commit": base[:7]}),
+                    "repo_settings": repo_settings(base),
                 })
-            shutil.rmtree(work)
     (HERE / "projects.json").write_text(json.dumps(PROJECTS, indent=1) + "\n")
     (HERE / "rows.json").write_text(json.dumps(rows, indent=1) + "\n")
 

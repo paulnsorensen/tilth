@@ -175,6 +175,19 @@ class ExternalBench:
         return [argv for argv in self.commands if any(word in part for part in argv)]
 
 
+def link_suite_site(venv: str) -> None:
+    """Let a stdlib venv import this suite's packages.
+
+    ``--system-site-packages`` exposes the base interpreter only. A suite run from a venv or a layered env
+    (uv run --with) keeps pytest outside it, so a .pth file adds this interpreter's site directories.
+    """
+    purelib = Path(sysconfig.get_path("purelib", vars={"base": venv, "platbase": venv}))
+    if purelib.is_dir():
+        site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else []),
+                     *(entry for entry in sys.path if Path(entry).name == "site-packages")]
+        (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in dict.fromkeys(site_dirs)))
+
+
 @pytest.fixture
 def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalBench:
     harness = ExternalBench(data=tmp_path / "bench-data", upstream=tmp_path / "upstream")
@@ -192,14 +205,7 @@ def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalB
         if list(argv[:2]) == ["uv", "venv"]:
             result = real_run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
                               **kwargs)
-            # --system-site-packages exposes the base interpreter only. A suite run from a venv or a layered env
-            # (uv run --with) keeps pytest outside it, so a .pth file adds this interpreter's site directories.
-            purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
-            if purelib.is_dir():
-                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else []),
-                             *(entry for entry in sys.path if Path(entry).name == "site-packages")]
-                site_dirs = list(dict.fromkeys(site_dirs))
-                (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
+            link_suite_site(argv[-1])
             return result
         if list(argv[:2]) == ["uv", "pip"]:
             return subprocess.CompletedProcess(argv, 0, "" if kwargs.get("text", True) else b"",
