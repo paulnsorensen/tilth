@@ -76,8 +76,9 @@ def _failure(entry: Mapping) -> list[dict]:
 class Dispatcher:
     """gepa ``custom_candidate_proposer``: text components to reflection, ``src_patch`` to the proposer.
 
-    While the stop state is set it makes no call, and once the stop state is set it returns no
-    components, so gepa evaluates no child and the stop callback ends the search at the next check.
+    While the stop state is set, it makes no call.
+    Once the stop state is set, it returns no components, so gepa evaluates no child.
+    The stop callback then ends the search at the next check.
     """
 
     def __init__(self, stop: StopState, *, reflect: Callable[[str, str, list[dict]], str],

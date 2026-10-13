@@ -77,12 +77,15 @@ def _line_changes(old: str, new: str) -> tuple[set[int], set[int]]:
 class Materializer:
     """``materialize(candidate) -> sha``, memoized by content id.
 
-    The first call for a content id writes the text components into a worktree at
-    the seed, applies the cumulative ``src_patch``, refuses changes outside
-    ``src/**`` and ``prompts/**``, inside ``#[cfg(test)]`` code, or reaching for the
-    harness (a harness name, or an ``include*!`` outside ``src/`` and ``prompts/``), regenerates
-    ``AGENTS.md``, rewrites the byte-lock literals, commits with the seed as
-    parent, and points ``evolve/<run-id>/<content-id>`` at the commit.
+    The first call for a content id takes these steps:
+
+    1. Write the text components into a worktree at the seed.
+    2. Apply the cumulative ``src_patch``.
+    3. Refuse changes outside ``src/**`` and ``prompts/**``, and changes inside ``#[cfg(test)]`` code.
+    4. Refuse reach for the harness: a harness name, an ``include*!`` outside ``src/`` and ``prompts/``,
+       an alias of an include macro, or ``cfg!(test)``.
+    5. Regenerate ``AGENTS.md`` and rewrite the byte-lock literals.
+    6. Commit with the seed as parent, and point ``evolve/<run-id>/<content-id>`` at the commit.
     """
 
     def __init__(self, repo: Path, seed_sha: str, run_id: str, work_dir: Path, *,

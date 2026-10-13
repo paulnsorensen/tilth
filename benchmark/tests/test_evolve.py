@@ -102,7 +102,7 @@ def refs(world) -> list[str]:
     return git("for-each-ref", "--format=%(refname)", "refs/evolve", cwd=world.repo).split()
 
 
-# --- AC-1: records are c4 stripped records ---
+# --- records are stripped records ---
 
 
 def test_records_are_judge_stripped_records(world) -> None:
@@ -122,7 +122,7 @@ def test_records_are_judge_stripped_records(world) -> None:
     assert all(trajectory == Path(row["trajectory_path"]).read_text() for row, trajectory in world.judge.critiques)
 
 
-# --- AC-2: test-split rollouts never feed reflection ---
+# --- test-split rollouts never feed reflection ---
 
 
 def test_test_split_never_reflected(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -146,7 +146,7 @@ def test_test_split_never_reflected(world, monkeypatch: pytest.MonkeyPatch) -> N
         assert '"task": "test_a"' not in text
 
 
-# --- AC-3: the score is the paid-tier dev mean ---
+# --- the score is the paid-tier dev mean ---
 
 
 def weak_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -178,7 +178,7 @@ def test_missing_contamination_flag_stops(world, monkeypatch: pytest.MonkeyPatch
         evo.evaluate(evo.seed, "dev_a")
 
 
-# --- AC-4: judge gating ---
+# --- judge gating ---
 
 
 def test_unlabeled_task_refuses_run(world, capsys: pytest.CaptureFixture[str]) -> None:
@@ -210,7 +210,7 @@ def test_critique_error_recorded_not_raised(world, error: Exception) -> None:
     assert evo.stop.reason is None
 
 
-# --- AC-5: the proposer works in an isolated export of the candidate's own tree ---
+# --- the proposer works in an isolated export of the candidate's own tree ---
 
 
 def test_proposer_command_disables_tools(world, tmp_path: Path) -> None:
@@ -288,7 +288,7 @@ def test_rejected_proposal_returns_parent_patch(world) -> None:
     assert "rejected" in log_text(world)
 
 
-# --- AC-6: the applier ---
+# --- the applier ---
 
 
 @pytest.mark.parametrize("path", ["benchmark/run.py", "Cargo.toml"])
@@ -483,7 +483,7 @@ def test_candidate_id_is_content_hash(world) -> None:
     assert materializer.materialize(seed_candidate()) == world.seed_sha
 
 
-# --- AC-7: the cascade ---
+# --- the cascade ---
 
 
 def _broken_check(worktree: Path) -> tuple[bool, str]:
@@ -680,7 +680,7 @@ def test_candidate_cells_use_candidate_binary(world) -> None:
         assert row["variant"]["git_sha"] == sha and row["binary_sha256"] == f"sha256-of-{sha}"
 
 
-# --- AC-8: frozen baselines and panel stamps ---
+# --- frozen baselines and panel stamps ---
 
 
 def test_refreeze_buys_once_then_reuses(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -719,7 +719,7 @@ def test_evolve_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch) -
         assert {key: row[key] for key in stamp} == stamp
 
 
-# --- AC-9: accepted frontier, re-runs, deltas, plateau ---
+# --- accepted frontier, re-runs, deltas, plateau ---
 
 
 def test_reruns_use_fresh_repetitions(world) -> None:
@@ -859,7 +859,7 @@ def test_plateau_resets_on_improvement(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert evo.stop.reason == "plateau"
 
 
-# --- AC-10: finish ---
+# --- finish ---
 
 
 def _finalist_runs(world, evo, *results) -> dict[str, list[tuple[str, int]]]:
@@ -1225,7 +1225,7 @@ def test_dev_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest
     assert (len(world.judge.labelled), len(world.calls), len(world.spawned)) == (labelled, calls, spawned)
     assert "dev_a" in capsys.readouterr().err
 
-# --- AC-11: one ceiling, one ledger, one stop state ---
+# --- one ceiling, one ledger, one stop state ---
 
 
 def test_evolve_requires_max_usd(world, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1484,7 +1484,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "infra:quota" in text and "finish: incomplete (quota)" in text
 
 
-# --- AC-12: seed and engine wiring ---
+# --- seed and engine wiring ---
 
 
 def test_seed_requires_prompt_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -1580,7 +1580,7 @@ def test_real_gepa_drives_evaluate(world, monkeypatch: pytest.MonkeyPatch) -> No
     assert "litellm" not in sys.modules
 
 
-# --- AC-13: the reflection call is isolated ---
+# --- the reflection call is isolated ---
 
 
 def test_reflection_call_isolated(world, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

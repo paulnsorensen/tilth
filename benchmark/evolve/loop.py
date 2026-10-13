@@ -1,9 +1,9 @@
 """One evolve run: judge preflight, frozen baselines, the cascade, evolve's accepted frontier, and finish.
 
 A candidate's score is grader correctness only: the mean ``correct`` over its
-paid-tier dev rollouts, a contaminated rollout counted incorrect. Reflection and
-the proposer see only c4 stripped records; test-split rollouts appear only in
-``finish``.
+paid-tier dev rollouts. A contaminated rollout counts as incorrect.
+Reflection and the proposer see only stripped records.
+Test-split rollouts appear only in ``finish``.
 """
 
 import json
@@ -219,7 +219,7 @@ class Evolution:
     # --- preflight ---
 
     def finalist_test_cost(self) -> float:
-        """c1's estimate over one finalist's test-split cells plus the test-split baseline cells not stored."""
+        """The estimate for one finalist: its test-split cells plus the test-split baseline cells not yet stored."""
         history = baselines.load_rows(run.RESULTS_DIR / baselines.STORE_FILENAME)
         stored = baselines.completed_by_key(history)
         model = run.MODELS[self.settings.model]
@@ -385,7 +385,7 @@ class Evolution:
         return mean(scored) if scored else 0.0
 
     def _records(self, rows: list[dict]) -> dict[str, list[dict]]:
-        """One c4 stripped record per uncontaminated rollout, plus ``label`` and ``critique`` when calibrated."""
+        """One stripped record per uncontaminated rollout, plus ``label`` and ``critique`` when calibrated."""
         records: dict[str, list[dict]] = {}
         for row in rows:
             if row["contaminated"] is True:

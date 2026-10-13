@@ -169,17 +169,25 @@ An external instance needs only a cached dataset row: the judge does not run adm
 
 ## Evolution loop
 
-`benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits: the four `prompts/` instruction files plus a cumulative `src/**` patch on `--seed-sha`.
-Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`), passes `just check`, then a cheap tier and the panel's dev split; its score is grader correctness only, with contaminated rollouts counted incorrect.
-Reflection and the `src/` proposer are isolated `claude -p` calls that see only the judge's stripped records, never grader text or test-split rollouts.
-Baseline cells are bought once and answered from the result store afterwards; a candidate is accepted only after `--reruns` more rollouts, and finish scores the two best accepted candidates plus the seed once on the test split.
+`benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits.
+A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
+Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
+The commit passes `just check`, then a cheap tier, then the panel's dev split.
+The score is grader correctness only, and contaminated rollouts count as incorrect.
+Reflection and the `src/` proposer are isolated `claude -p` calls.
+They see only the judge's stripped records, never grader text or test-split rollouts.
+The loop buys baseline cells once and answers them from the result store afterwards.
+A candidate is accepted only after `--reruns` more rollouts.
+The finish step scores the two best accepted candidates and the seed once on the test split.
 
 ```bash
 python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha "$(git rev-parse HEAD)" \
   --base-branch main --max-usd 200 --max-metric-calls 60 --cell-estimate-usd 0.5
 ```
 
-`--max-usd` is required and bounds every cell, judge, reflection, and proposer call; three finalists' test-split cost is held back for finish.
+`--max-usd` is required.
+It bounds every cell, judge, reflection, and proposer call.
+The finish step holds back the test-split cost of three finalists.
 A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
 Run logs, delta reports, and candidate worktrees live under the gitignored `benchmark/results/evolve/<run-id>/`.
 

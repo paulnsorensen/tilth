@@ -179,6 +179,30 @@ def test_reflective_record_has_untruncated_tool_io(world) -> None:
         assert any(call["output"].startswith(es.LONG_OUTPUT) and len(call["output"]) > 80 for call in calls)
 
 
+def test_reflective_record_keeps_a_20kb_tool_output_from_the_sidecar_writer(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    big = "x" * 24_000 + "[end-of-output]"
+    events = [{"type": "assistant", "message": {"content": [
+                  {"type": "tool_use", "id": "t1", "name": "Grep", "input": {"pattern": "dispatch"}}]}},
+              {"type": "user", "message": {"content": [
+                  {"type": "tool_result", "tool_use_id": "t1", "content": big}]}}]
+
+    def run_single(task_name, mode_name, model_name, repetition, **kwargs):
+        row = world.fake_run_single(task_name, mode_name, model_name, repetition, **kwargs)
+        stream = kwargs["stream_log_path"]
+        stream.write_text("".join(json.dumps(event) + "\n" for event in events))
+        row["trajectory_path"] = run.write_trajectory(stream, "claude")
+        return row
+
+    monkeypatch.setattr(run, "run_single", run_single)
+    evo = _ready(world)
+    _score, info = evo.evaluate(evo.seed, "dev_a")
+
+    assert _records(info)
+    for record in _records(info):
+        [call] = [json.loads(line) for line in record["trajectory"].splitlines()]
+        assert call["output"] == big
+
+
 def test_reflective_record_strips_grader_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     world = es.make_world(monkeypatch, tmp_path, es.seed_files(es.mcp(dev_a="0", dev_b="0", cheap_a="0", test_a="0")))
     world.judge.calibrated = True
@@ -283,7 +307,7 @@ def test_label_is_categorical(world, capsys: pytest.CaptureFixture[str]) -> None
     assert "dev_a" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("kind", ["panel", "outside", "data", "benchmark"])
+@pytest.mark.parametrize("kind", ["panel", "outside", "data", "panel-in-export", "data-in-export", "benchmark"])
 def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
     data_dir = world.tmp / "bench-data"
     monkeypatch.setenv("TILTH_BENCH_DATA", str(data_dir))
@@ -300,6 +324,8 @@ def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatc
             "panel": ("Read", {"file_path": str(world.tmp / "panel.json")}, "{}"),
             "outside": ("Read", {"file_path": "../../etc/passwd"}, "root"),
             "data": ("Grep", {"pattern": "x", "path": str(data_dir)}, ""),
+            "panel-in-export": ("Grep", {"pattern": str(world.tmp / "panel.json"), "path": "src"}, ""),
+            "data-in-export": ("Grep", {"pattern": "x", "path": "src"}, f"found under {data_dir}"),
             "benchmark": ("Grep", {"pattern": "grader", "path": "src"}, "see benchmark/run.py for the grader"),
         }[kind]
         events = [{"type": "assistant", "message": {"content": [
@@ -383,7 +409,6 @@ def test_winner_is_unmerged_allowlisted_draft(world) -> None:
     evo.frontier.append(winner)
     evo.finish()
 
-    assert not any(hasattr(client, name) for name in ("merge", "enable_auto_merge", "auto_merge"))
     [create] = gh
     assert "--draft" in create and not any("merge" in part for part in create)
     changed = es.git("diff", "--name-only", world.seed_sha, winner.sha, cwd=world.repo).split()

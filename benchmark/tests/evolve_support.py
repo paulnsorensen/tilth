@@ -156,7 +156,7 @@ def fixture_panel(name: str = "evolve-fixture", dev: tuple[str, ...] = DEV) -> p
 
 @dataclass
 class StubJudge:
-    """A c4-shaped judge: labels, calibration, and critiques, each recorded."""
+    """A judge double: labels, calibration, and critiques, each recorded."""
 
     labels: dict[str, str] = field(default_factory=dict)
     calibrated: bool = False

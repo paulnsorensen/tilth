@@ -1,6 +1,6 @@
 """Candidate components and content identity.
 
-A candidate is five components: the four instruction texts that ``src/`` embeds
+A candidate is five components: the four prompt texts that ``src/`` embeds
 with ``include_str!`` and ``src_patch``, the cumulative unified diff of the
 candidate's ``src/**`` against the seed commit. Its identity is a hash of its
 content, never a GEPA pool index.
@@ -38,7 +38,7 @@ def ref_name(run_id: str, candidate: Mapping[str, str]) -> str:
 
 
 def read_seed(repo: Path, seed_sha: str) -> dict[str, str]:
-    """The seed candidate: the four instruction files' bytes at ``seed_sha`` and an empty ``src_patch``."""
+    """The seed candidate: the four prompt files' bytes at ``seed_sha`` and an empty ``src_patch``."""
     texts, missing = {}, []
     for name in TEXT_COMPONENTS:
         try:

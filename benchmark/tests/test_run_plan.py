@@ -33,7 +33,7 @@ def plan(world, specs, *, ledger=None, sha=None, refreeze=False, **kwargs) -> li
                         refreeze_baselines=refreeze, **{"repo": world.repo, **kwargs})
 
 
-# --- c5 AC-8: rows stored through run_plan carry the panel stamp ---
+# --- rows stored through run_plan carry the panel stamp ---
 
 
 def test_run_plan_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -530,8 +530,6 @@ def test_run_plan_float_leftover_headroom_spawns_no_cell(world) -> None:
 def test_run_plan_stops_a_codex_cell_without_unreserved_headroom(world, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(run.RUNNERS, MODEL, "codex")
     monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "codex-test")
-    monkeypatch.setattr(run, "planned_identity", lambda cell: {"run_key": "k" * 64, "cli_version": "codex-test"})
-    monkeypatch.setattr(run, "_refuse_baseline_drift", lambda *_args: None)
     ledger = SpendLedger(1.0, spent=0.5, reserve=0.5)
     with pytest.raises(run.PlanStopped) as stopped:
         plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.0)

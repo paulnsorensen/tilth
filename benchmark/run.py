@@ -1372,10 +1372,13 @@ class CandidateBuild:
 
 
 class PlanStopped(RuntimeError):
-    """``run_plan`` stopped: ``ceiling`` (spend), ``quota`` (usage limit), ``cli-version`` (the agent CLI changed
-    or stopped answering ``--version`` since the cell was planned) before a cell, or ``mcp-unavailable`` and
-    ``invalid-cell`` (a config-level failure that main aborts on) after the failed cell is stored.
+    """``run_plan`` stopped before a cell for one of these reasons.
 
+    ``ceiling``: the spend ceiling. ``quota``: a usage limit.
+    ``cli-version``: the agent CLI changed, or stopped answering ``--version``, since the cell was planned.
+
+    After the failed cell is stored, it stops for ``mcp-unavailable`` or ``invalid-cell``.
+    Those are config-level failures that main aborts on.
     ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
     """
 
@@ -1519,14 +1522,15 @@ def run_plan(
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
-    Registers the panel's members in ``TASKS`` before planning any cell, and merges
-    ``panel.stamp(task)`` into every row before ``baselines.store``. Tilth arms are
-    served from the binary built at ``candidate_sha``. ``store_only`` returns only
-    stored rows and never starts a runner. Every row returned is also appended to
-    ``output``. ``repo`` holds ``candidate_sha`` (default: this checkout). Raises ``CandidateBuildFailed``
-    when ``candidate_sha`` does not build, ``BaselineDrift`` before any cell when a stock-arm cell
-    drifted without ``refreeze_baselines``, and ``PlanStopped`` when the ledger or
-    a usage limit stops it before a cell.
+    Registers the panel's members in ``TASKS`` before planning any cell.
+    Merges ``panel.stamp(task)`` into every row before ``baselines.store``.
+    Tilth arms use the binary built at ``candidate_sha``, which ``repo`` holds (default: this checkout).
+    ``store_only`` returns only stored rows and never starts a runner.
+    Every row returned is also appended to ``output``.
+
+    Raises ``CandidateBuildFailed`` when ``candidate_sha`` does not build.
+    Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
+    Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
     panel.register(TASKS)
     cells = [CellSpec(*cell) for cell in cells]
