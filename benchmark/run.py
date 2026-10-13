@@ -1269,11 +1269,11 @@ def select_tasks(value: str) -> list[str]:
     for name in (item.strip() for item in value.split(",")):
         if not name or name in TASKS:
             continue
-        resolved = external.resolve_task(name)
+        resolved, verdict = external.resolve_task(name)
         if resolved is not None:
             TASKS[name] = resolved
-        elif external.cached_row(name) is not None:
-            raise ValueError(f"external task {name} is not admitted: {external.preflight.admit(name).reason}")
+        elif verdict is not None:
+            raise ValueError(f"external task {name} is not admitted: {verdict.reason}")
     return parse_comma_list(value, TASKS, "tasks")
 
 
@@ -1556,14 +1556,6 @@ Examples:
         enforce_cell_ceiling(total_runs, maximum=args.max_cells)
     except ValueError as error:
         parser.error(str(error))
-
-    # Guard external cells before any model call: each must be admitted on this host.
-    for task_name in tasks_list:
-        if isinstance(TASKS[task_name], external.ExternalTask):
-            verdict = external.preflight.admit(task_name)
-            if not verdict.admitted:
-                print(f"ERROR: external task {task_name} is not admitted: {verdict.reason}", file=sys.stderr)
-                sys.exit(1)
 
     # Tasks without a fixture build their own workdirs; only the rest copy fixtures.
     fixture_tasks = [name for name in tasks_list if TASKS[name].fixture_path is not None]
@@ -1876,6 +1868,17 @@ Examples:
                     "correct": False,
                     "correctness_reason": "Subprocess timed out",
                 }, stream_log_path, runner, estimate)
+
+            except (external.task.EnvBuildError, external.task.PrepareError) as error:
+                # No model call ran, so the cell estimate must not be charged.
+                print(f"  ✗ PREPARE FAILED: {error}")
+                record_failure({
+                    **record_metadata,
+                    "infra": "prepare",
+                    "error": f"infra:prepare: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Prepare failed: {error}",
+                }, stream_log_path, runner, 0.0)
 
             except Exception as error:
                 quota = (

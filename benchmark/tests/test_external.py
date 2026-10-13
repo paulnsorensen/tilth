@@ -499,13 +499,14 @@ def test_resolve_task(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(external.download, "fetch", no_download)
     monkeypatch.setattr(urllib.request, "urlopen", no_download)
 
-    task = external.resolve_task(SWE_PY)
-    assert isinstance(task, external.ExternalTask) and task.name == SWE_PY
+    task, verdict = external.resolve_task(SWE_PY)
+    assert isinstance(task, external.ExternalTask) and task.name == SWE_PY and verdict.admitted
 
     verdicts[SWE_PY] = _verdict(SWE_PY, False, "gold_unresolved")
-    assert external.resolve_task(SWE_PY) is None
+    task, verdict = external.resolve_task(SWE_PY)
+    assert task is None and verdict.reason == "gold_unresolved"
 
-    assert external.resolve_task("nobody__unknown-1") is None
+    assert external.resolve_task("nobody__unknown-1") == (None, None)
     assert admitted == [SWE_PY, SWE_PY]
     assert not external_bench.argv_containing("fetch")
 

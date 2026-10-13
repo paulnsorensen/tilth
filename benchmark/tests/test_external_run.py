@@ -370,21 +370,47 @@ def test_grader_material_only_in_reason(bench, external_bench, monkeypatch: pyte
 # --- AC-4 / AC-5: guard and --tasks resolution ---
 
 
-def test_guard_uses_admit(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
-                          capsys: pytest.CaptureFixture[str]) -> None:
+def test_admit_runs_once_per_task(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
+                                  capsys: pytest.CaptureFixture[str]) -> None:
     external_bench.seed(SWE_PY)
-    monkeypatch.setitem(run.TASKS, SWE_PY, load(SWE_PY))
+    monkeypatch.setattr(run, "TASKS", dict(run.TASKS))
     bench.runner(lambda _stream: 0.1)
-    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, False, "tampered_resolved"))
+    admits: list[str] = []
+    verdict = {"admitted": False, "reason": "tampered_resolved"}
+
+    def fake_admit(instance_id: str) -> external.preflight.PreflightVerdict:
+        admits.append(instance_id)
+        return _verdict(instance_id, verdict["admitted"], verdict["reason"])
+
+    monkeypatch.setattr(external.preflight, "admit", fake_admit)
 
     assert bench.main("--tasks", SWE_PY, *_ARGS) != 0
     assert bench.calls == []
     error = capsys.readouterr().err
     assert SWE_PY in error and "tampered_resolved" in error
+    assert admits == [SWE_PY]
 
-    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, True, "admitted"))
+    admits.clear()
+    verdict.update(admitted=True, reason="admitted")
     assert bench.main("--tasks", SWE_PY, *_ARGS) == 0
     assert bench.calls == [(SWE_PY, "plain", 0)]
+    assert admits == [SWE_PY]
+
+
+def test_prepare_failure_is_not_charged(bench, external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_PY)
+    monkeypatch.setattr(run, "TASKS", dict(run.TASKS))
+    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, True, "admitted"))
+
+    def broken_prepare(self, workdir: Path) -> None:
+        raise external.task.EnvBuildError("pip exited 1")
+
+    monkeypatch.setattr(external.ExternalTask, "prepare", broken_prepare)
+
+    assert bench.main("--tasks", SWE_PY, *_ARGS) == 0
+    [row] = bench.output_rows()
+    assert row["infra"] == "prepare" and "pip exited 1" in row["error"]
+    assert row["correct"] is False and row["charged_usd"] == 0.0
 
 
 def test_tasks_flag_registers_and_prepares_external(bench, external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
