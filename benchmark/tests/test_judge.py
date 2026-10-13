@@ -235,7 +235,7 @@ def test_calibrated_label_is_cached() -> None:
 
 
 def test_judge_config_and_store_import_leave_runner_unloaded() -> None:
-    probe = ("import sys; from judge import config, store; "
+    probe = ("import sys; from judge import config, store; import analyze; "
              "assert 'run' not in sys.modules and 'judge.core' not in sys.modules; print('ok')")
     result = subprocess.run([sys.executable, "-c", probe], cwd=BENCHMARK_DIR, capture_output=True, text=True,
                             check=False)
@@ -597,17 +597,20 @@ def test_label_kappa_below_threshold_blocks_calibration(judge_home: Path, calibr
     assert "label kappa" in agreement.reason and "verdict kappa" not in agreement.reason
 
 
-def test_kappa_exactly_at_threshold_is_calibrated(judge_home: Path, calibration_tasks: list[str]) -> None:
+def test_kappa_exactly_at_threshold_is_calibrated(judge_home: Path, calibration_tasks: list[str],
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
     rows = seed_rollouts(judge_home, 20)
     labels = calibration_set(calibration_tasks, rows)
     flipped = {0: "none", 5: "strong"}
     judge_labels = {name: flipped.get(index, "strong" if index < 5 else "none")
                     for index, name in enumerate(calibration_tasks)}
     judge_verdicts = {index: ("apt" if index < 10 else "missed") for index in range(20)}
+    exact = make_judge(StubClient(answer=scripted(judge_labels, judge_verdicts))).calibrate(labels).label_kappa
+    # The threshold is the computed kappa itself, so a `<=` gate would refuse this agreement.
+    monkeypatch.setattr(judge_config, "KAPPA_THRESHOLD", exact)
     agreement = make_judge(StubClient(answer=scripted(judge_labels, judge_verdicts))).calibrate(labels)
 
-    assert agreement.label_kappa == pytest.approx(judge_config.KAPPA_THRESHOLD)
-    assert agreement.label_kappa >= judge_config.KAPPA_THRESHOLD
+    assert agreement.label_kappa == judge_config.KAPPA_THRESHOLD
     assert agreement.calibrated is True
 
 
