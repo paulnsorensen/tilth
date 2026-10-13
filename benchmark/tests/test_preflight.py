@@ -81,6 +81,19 @@ def test_compiled_round_trip_rebuilds_each_grade(external_bench, monkeypatch: py
     assert (result.admitted, result.gold, result.empty, result.tampered) == (True, (3, 3), (1, 3), (2, 3))
 
 
+def test_rust_grades_seed_target_from_one_cached_build(external_bench) -> None:
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo is not installed")
+    external_bench.seed(SWE_RS)
+
+    result = external.preflight.admit(SWE_RS)
+
+    seed_builds = [argv for argv in external_bench.commands if argv[:3] == ["cargo", "test", "--no-run"]]
+    assert result.admitted is True and len(seed_builds) == 1
+    [seed] = (external.data.data_dir() / "envs").rglob("cargo/target")
+    assert seed.is_dir() and not (seed.parent.parent / "tree").exists()
+
+
 def test_patch_editing_f2p_file_is_admitted(external_bench, tmp_path: Path) -> None:
     external_bench.seed(FB_F2P_EDIT)
     task = external.featurebench.load(FB_F2P_EDIT, external.FEATUREBENCH_REVISION)

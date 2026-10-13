@@ -1,14 +1,15 @@
 """Admission of external instances: a native gold, empty, and tampered round trip on this host.
 
-``python3 benchmark/external/preflight.py`` admits the FeatureBench candidates and
-the per-language SWE-bench Multilingual picks (falling back only when a primary
-is refused). ``--panel PATH`` admits exactly a panel's external members. Both
-forms fetch uncached rows first and exit nonzero when a required family has no
-admitted instance.
+``python3 benchmark/external/preflight.py`` admits the FeatureBench candidates.
+It also admits the per-language SWE-bench Multilingual picks.
+It tries a fallback pick only when the primary is refused.
+``--panel PATH`` admits exactly the external members of a panel.
+Both forms fetch uncached rows first.
+Both forms exit nonzero when a required family has no admitted instance.
 
-The tampered check grades the gold patch minus one hunk at a time, largest hunk
-first, up to ``$TILTH_BENCH_TAMPER_MAX_HUNKS`` hunks (default 8); an instance
-passes it when any one removal fails the held-out tests.
+The tampered check grades the gold patch minus one hunk at a time.
+It tries the largest hunk first, up to ``$TILTH_BENCH_TAMPER_MAX_HUNKS`` hunks (default 8).
+An instance passes the check when any one removal fails the held-out tests.
 """
 
 import sys
@@ -125,8 +126,8 @@ def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[i
 def _tamper(task: ExternalTask, workdir: Path, max_hunks: int) -> tuple[bool, dict]:
     """Grade single-hunk removals of the gold patch until one fails the held-out tests.
 
-    Returns whether every applying removal still resolved, and the verdict fields
-    that record the counts, the failing hunk index, and the hunks tried.
+    Returns whether every applying removal still resolved.
+    Also returns the verdict fields: the counts, the failing hunk index, and the hunks tried.
     The check is n/a when the gold patch has no hunk to remove.
     """
     variants = patches.hunk_removals(task.gold_patch, max_hunks)

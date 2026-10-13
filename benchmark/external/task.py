@@ -1,12 +1,15 @@
 """ExternalTask: one pinned external benchmark instance, prepared and graded natively (no containers).
 
-A prepared workdir is the instance's ``base_commit`` tree, exported from the bare
-upstream mirror and transformed by the dataset (FeatureBench applies its mask),
-committed as the only commit of a fresh repository. Grading copies the agent's
-changes onto a freshly exported prepared tree, restores the held-out tests and
-(for Python) the pytest configuration from the mirror, and runs them. Python
-tests run in a grading venv cached under the harness data directory, never in
-the agent-writable ``<workdir>/.venv``.
+A prepared workdir is the ``base_commit`` tree of the instance.
+Prepare exports it from the bare upstream mirror and the dataset transforms it.
+FeatureBench applies its mask.
+The result is the only commit of a fresh repository.
+Grading copies the changes of the agent onto a freshly exported prepared tree.
+It restores the held-out tests from the mirror.
+For Python, it also restores the pytest configuration.
+Then it runs the tests.
+Python tests run in a grading venv cached under the harness data directory.
+They never run in the agent-writable ``<workdir>/.venv``.
 """
 
 import fcntl
@@ -414,8 +417,11 @@ class ExternalTask(Task):
         return []
 
     def build_env(self, workdir: Path, venv: Path | None = None) -> None:
-        """Build the native environment: a uv venv (``<workdir>/.venv`` by default), or the host Go or Rust
-        toolchain's dependencies. Steps run under ``proc.toolchain_env`` with a throwaway HOME."""
+        """Build the native environment.
+
+        Python gets a uv venv (``<workdir>/.venv`` by default). Go and Rust get the dependencies of the host toolchain.
+        Steps run under ``proc.toolchain_env`` with a throwaway HOME.
+        """
         venv = venv or workdir / ".venv"
         if self.language == "go":
             steps = [["go", "mod", "download"]]
@@ -447,8 +453,8 @@ class ExternalTask(Task):
     def grade_venv(self) -> Path:
         """The Python grading venv, built once per (instance, env fingerprint) under the harness data directory.
 
-        It is built from the prepared tree with the row's install steps, outside
-        every agent workdir, and grading only reads it.
+        Build uses the prepared tree and the install steps of the row.
+        The venv lives outside every agent workdir. Grading only reads it.
         """
         from .preflight import env_fingerprint  # preflight imports this module
 
@@ -474,9 +480,9 @@ class ExternalTask(Task):
     def prune_added_top_level(self, checkout: Path) -> None:
         """Remove each entry in ``checkout`` and ``checkout/src`` that the base tree lacks.
 
-        Both directories are on the import path. An added ``pytest.py``, ``_pytest/``, or
-        dist-info there could shadow pytest, a plugin, or the standard library.
-        A top-level name that the gold patch creates stays: the feature needs it.
+        Both directories are on the import path.
+        An added ``pytest.py``, ``_pytest/``, or dist-info there could shadow pytest, a plugin, or the standard library.
+        A top-level name that the gold patch creates stays, because the feature needs it.
         """
         for directory, prefix in ((checkout, ""), (checkout / "src", "src/")):
             if not directory.is_dir() or directory.is_symlink():
@@ -513,9 +519,10 @@ class ExternalTask(Task):
     def test_output(self, checkout: Path) -> tuple[str, str]:
         """Run the held-out tests natively in ``checkout``; return ``(log, report)``.
 
-        The log is the process output, for diagnosis only. The report is the
-        machine-readable result that ``entry_results`` reads. Code the agent wrote
-        runs in the tests, so a report must not be text the tests can print.
+        The log is the process output, for diagnosis only.
+        The report is the machine-readable result that ``entry_results`` reads.
+        Code that the agent wrote runs in the tests.
+        So a report must not be text that the tests can print.
         """
 
     @abstractmethod
@@ -533,8 +540,8 @@ class ExternalTask(Task):
     def grading_env(self, checkout: Path) -> dict[str, str]:
         """The environment of a private copy of the grading venv, importing the project from ``checkout`` first.
 
-        The copy lives beside ``checkout``, so code the agent runs during the grade cannot
-        change the shared venv that later grades use.
+        The copy lives beside ``checkout``.
+        So code that the agent runs during the grade cannot change the shared venv.
         """
         venv = checkout.with_name(f"{checkout.name}-venv")
         shutil.copytree(self.grade_venv(), venv, symlinks=True)

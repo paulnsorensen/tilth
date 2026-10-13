@@ -1,15 +1,19 @@
 """SWE-bench Multilingual instances at the pinned revision.
 
 The row ``patch`` is the gold fix and ``test_patch`` adds the held-out tests.
-Prepare applies neither. Grading resets the files ``test_patch`` touches to
-``base_commit``, applies it as the row's ``eval_script`` does, runs the script's
-test command natively, and matches each FAIL_TO_PASS and PASS_TO_PASS test ID
-against exactly one parsed verdict.
+Prepare applies neither.
+Grading resets the files that ``test_patch`` touches to ``base_commit``.
+It applies ``test_patch`` as the row's ``eval_script`` does.
+It runs the test command of the script natively.
+It matches each FAIL_TO_PASS and PASS_TO_PASS test ID against exactly one parsed verdict.
 """
 
+import fcntl
 import json
 import re
 import shlex
+import shutil
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -69,10 +73,12 @@ def go_log(output: str) -> str:
 def test_results(report: str, language: str) -> list[tuple[str, bool]]:
     """``(test ID, passed)`` for every verdict in a ``go test -json`` stream, ``cargo test`` output, or JUnit XML.
 
-    Go verdicts are ``pass``, ``fail``, and ``skip`` events. The test2json encoder wraps
-    everything a test prints in an ``output`` event, so test output cannot forge one.
-    Cargo verdicts are text lines. A test that writes straight to the process's stdout
-    and then aborts can forge one: libtest has no machine-readable format on stable Rust.
+    Go verdicts are ``pass``, ``fail``, and ``skip`` events.
+    The test2json encoder wraps everything a test prints in an ``output`` event.
+    So test output cannot forge a Go verdict.
+    Cargo verdicts are text lines.
+    A test that writes straight to stdout and then aborts can forge one.
+    Libtest has no machine-readable format on stable Rust.
     """
     if language == "go":
         return [(event["Test"], event["Action"] == "pass") for event in _go_events(report)
@@ -113,6 +119,32 @@ class SweBenchTask(ExternalTask):
         if not apply_patch(checkout, test_patch):
             raise PrepareError("test_patch does not apply to the restored test files")
 
+    def cargo_seed(self) -> Path | None:
+        """A ``target/`` built once from the prepared tree, per (instance, env fingerprint).
+
+        Each Rust grade copies it into its checkout, so dependencies build once.
+        The workspace crates still rebuild, because their path is part of the build hash.
+        Returns None when the seed build fails. The grade then builds cold.
+        """
+        from .preflight import env_fingerprint  # preflight imports this module
+
+        root = data.data_dir() / "envs" / self.data_rev / self.name / env_fingerprint(self) / "cargo"
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not (root / "ready").is_file():
+                with tempfile.TemporaryDirectory(prefix="tilth-external-seed-") as temp:
+                    tree = Path(temp) / "tree"
+                    self.export_prepared(tree)
+                    result = proc.run(["cargo", "test", "--no-run"], cwd=tree, env=self.grade_env(tree),
+                                      timeout=self.timeout_s)
+                    if result.returncode or not (tree / "target").is_dir():
+                        return None
+                    shutil.rmtree(root / "target", ignore_errors=True)
+                    shutil.move(tree / "target", root / "target")
+                (root / "ready").touch()
+        return root / "target"
+
     def test_output(self, checkout: Path) -> tuple[str, str]:
         env = self.grading_env(checkout) if self.language == "python" else self.grade_env(checkout)
         command = test_command(self.row["eval_script"])
@@ -121,9 +153,11 @@ class SweBenchTask(ExternalTask):
             env["PYTEST_ADDOPTS"] = shlex.join([*JUNIT_OPTIONS, f"--junitxml={report}"])
         elif self.language == "go":
             command = go_json_command(command)
-        # The grade env never carries CARGO_TARGET_DIR, so Cargo builds in the fresh checkout's own target/:
-        # a shared target directory would reuse an earlier grade's build, because exported sources keep the
-        # commit's mtime.
+        # The grade env never carries CARGO_TARGET_DIR. Cargo builds in the checkout's own target/, a private
+        # copy of the seed. A target directory shared by grades would reuse an earlier build,
+        # because exported sources keep the commit's mtime.
+        if self.language == "rust" and (seed := self.cargo_seed()):
+            shutil.copytree(seed, checkout / "target", symlinks=True)
         result = proc.run(["bash", "-c", command], cwd=checkout, env=env, timeout=self.timeout_s)
         if self.language == "python":
             return result.stdout + result.stderr, read_report(report)
