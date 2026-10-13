@@ -140,18 +140,32 @@ The first completed stored row for a panel name locks its split: a later split c
 
 ## Applicability judge
 
-`benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability and critiques stripped rollouts for reflection, with the pinned `claude-sonnet-5` through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN` (no tools, MCP servers, settings, or hooks; the prompt on stdin).
-A critique sees only the task prompt, allowlisted row fields, and the verbatim trajectory sidecar, never `correctness_reason`, ground truth, gold patches, or held-out tests.
-Labels and critiques are cached under the gitignored `benchmark/results/judge/` and never enter result rows or scores.
+`benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability.
+It also critiques stripped rollouts for reflection.
+It uses the pinned `claude-sonnet-5` through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN`.
+The call has no tools, MCP servers, settings, or hooks, and the prompt goes on stdin.
+A critique sees only the task prompt, allowlisted row fields, and the verbatim trajectory sidecar.
+It never sees `correctness_reason`, ground truth, gold patches, or held-out tests.
+Labels and critiques are cached under the gitignored `benchmark/results/judge/`.
+They never enter result rows or scores.
 
 ```bash
 python3 benchmark/judge/cli.py label --tasks rg_search_dispatch,gin_edit_render_context --max-usd 2 --cell-estimate-usd 0.05
 python3 benchmark/judge/cli.py calibrate --max-usd 5 --cell-estimate-usd 0.05
 ```
 
-Both spend flags are required whenever a call is uncached; judge calls share the `--max-usd` ceiling, pass its remaining headroom as `--max-budget-usd`, and stop at the first usage-limit rejection.
-The maintainer hand-labels `benchmark/judge/calibration.json` (`{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, verdict `apt`, `missed`, or `misapplied`): every task an analyzed run holds plus at least 20 clean, completed rollouts with trajectories.
-The judge is calibrated when unweighted Cohen's kappa reaches 0.6 on both labels and verdicts; until then critiques are withheld and `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
+Both spend flags are required whenever a call is uncached.
+Judge calls share the `--max-usd` ceiling and pass its remaining headroom as `--max-budget-usd`.
+The first usage-limit rejection stops every later judge call.
+The flags accept finite positive numbers only.
+The maintainer hand-labels `benchmark/judge/calibration.json`.
+Its shape is `{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, with verdict `apt`, `missed`, or `misapplied`.
+It lists every task an analyzed run holds, plus at least 20 clean, completed rollouts with trajectories.
+The judge is calibrated when unweighted Cohen's kappa reaches 0.6 on both labels and verdicts.
+A stored agreement goes stale when the model, a prompt, the calibration file, the threshold, or the minimum trajectory count changes.
+Until the judge is calibrated, critiques are withheld.
+Until then, `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
+An external instance needs only a cached dataset row: the judge does not run admission.
 
 ## Larger Luna edit task
 
