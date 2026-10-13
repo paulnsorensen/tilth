@@ -752,12 +752,13 @@ def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch,
     member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 0.5})
     # One rollout scores (1, 1), which the member does not dominate; the re-run brings the means to (0.5, 0.5).
     candidate = child(evo.seed, dev_a="10", dev_b="10", cheap_a="1")
-    evo.evaluate(candidate, "dev_a")
+    score, _info = evo.evaluate(candidate, "dev_a")
     result = evo.results[candidates.content_id(candidate)]
 
     assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
         ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
-    assert result.means == {} and not result.accepted
+    assert result.means == {"dev_a": 0.5, "dev_b": 0.5} and not result.accepted
+    assert score == 0.5  # GEPA sees the re-run mean, not the first rollout's 1.0
     assert evo.frontier == [member]
     assert "dominated after 2 rollouts" in log_text(world)
 
@@ -1711,3 +1712,66 @@ def test_paid_call_cost_source(world, tmp_path: Path, stream: str, cost: float, 
     paid.call("reflection", ["claude", "-p", "--model", _HAIKU], "prompt", tmp_path)
 
     assert ledger.charges == [(pytest.approx(cost), source)]
+
+
+# --- cure: ties, early stops, critiques only when read, released labels, headroom ---
+
+
+def test_tie_with_the_seed_opens_no_draft(world) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="0", tag="tied"), {"dev_a": 0.9, "dev_b": 0.9})
+    evo.finish()
+
+    assert world.pr.pushes == [] and evo.finish_failure is None
+    assert "no candidate beats the seed" in log_text(world)
+
+
+@pytest.mark.parametrize(("reason", "failed"), [("quota", True), ("ceiling", True), ("plateau", False)])
+def test_stop_before_any_accepted_candidate(world, reason: str, failed: bool) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    evo.stop.set(reason)
+    evo.finish()
+
+    assert (evo.finish_failure is not None) is failed
+    assert world.pr.pushes == []
+
+
+def test_cheap_tier_critiques_are_bought_only_for_a_cheap_failure(world) -> None:
+    world.judge.calibrated = True
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    evo.evaluate(child(evo.seed, dev_a="1", dev_b="1", cheap_a="1", tag="passes"), "dev_a")
+    assert not [row for row, _ in world.judge.critiques if row["task"] in CHEAP]
+
+    _score, info = evo.evaluate(child(evo.seed, dev_a="1", dev_b="1", cheap_a="0", tag="fails"), "dev_a")
+    assert info["stage"] == "cheap tier" and info["records"]
+    assert all("critique" in record for record in info["records"])
+    assert [row for row, _ in world.judge.critiques if row["task"] in CHEAP]
+
+
+def test_records_carry_only_labels_the_agreement_releases(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    world.judge.calibrated = True
+    world.judge.labels = {"dev_a": "weak", "dev_b": "strong"}
+    monkeypatch.setattr(world.judge, "calibrate", lambda labels: Agreement(
+        calibrated=True, label_kappa=0.9, verdict_kappa=0.9, tasks=("dev_b",)))
+    evo = ready(world)
+
+    assert evo.released == {"dev_b": "strong"}
+    _score, info = evo.evaluate(evo.seed, "dev_a")
+    assert {record["label"] for record in info["records"]} == {None}
+    _score, info = evo.evaluate(evo.seed, "dev_b")
+    assert {record["label"] for record in info["records"]} == {"strong"}
+
+
+def test_paid_call_refuses_below_the_minimum_headroom(world, tmp_path: Path) -> None:
+    from evolve.calls import PaidCalls, StopState
+    from spend import SpendLedger
+    started: list[list[str]] = []
+    ledger = SpendLedger(1.0, reserve=0.995)
+    stop = StopState()
+    paid = PaidCalls(ledger, stop, 0.0, spawn=lambda argv, **kw: started.append(argv), log=lambda _line: None)
+
+    assert paid.call("reflection", ["claude", "-p"], "prompt", tmp_path) is None
+    assert started == [] and stop.reason == "ceiling"

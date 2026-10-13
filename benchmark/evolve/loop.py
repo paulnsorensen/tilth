@@ -21,6 +21,7 @@ import paired
 import panels
 import run
 from judge import core as judge
+from judge import store as judge_store
 from spend import SpendLedger
 
 from . import engine
@@ -75,6 +76,7 @@ class Cascade:
     just_check_ok: bool | None = None
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
+    cheap_rows: list[dict] = field(default_factory=list)
     cheap_records: list[dict] = field(default_factory=list)
     scores: dict[str, float] = field(default_factory=dict)
     means: dict[str, float] = field(default_factory=dict)
@@ -92,7 +94,7 @@ class Cascade:
         return mean(values.values()) if values else 0.0
 
     def score(self, task: str) -> float:
-        return (self.means if self.accepted else self.scores).get(task, 0.0)
+        return (self.means or self.scores).get(task, 0.0)
 
     def fail(self, stage: str, tail: str = "") -> "Cascade":
         self.stage, self.tail, self.done = stage, tail, True
@@ -153,7 +155,9 @@ class Evolution:
         self.frontier: list[Cascade] = []
         self.deltas: list[dict] = []
         self.labels: dict[str, str] = {}
+        self.released: dict[str, str] = {}
         self.calibrated = False
+        self.dev_baseline_rows: list[dict] | None = None
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
@@ -281,6 +285,10 @@ class Evolution:
         except judge.JudgeError as error:
             reason = str(error)
         self.calibrated = bool(agreement is not None and agreement.calibrated)
+        for name, label in self.labels.items():
+            digest = run._cell_task_digest(run.TASKS[name])
+            if released := judge_store.released_label(agreement, name, digest, {digest: label}):
+                self.released[name] = released
         if agreement is not None:
             kappas = " ".join(f"{name}={value:.2f}" if value is not None else f"{name}=undefined"
                               for name, value in (("label_kappa", agreement.label_kappa),
@@ -347,13 +355,15 @@ class Evolution:
         """The cheap and paid tiers; the first cell of either builds the candidate binary."""
         if result.cheap_score is None:
             rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
-            records = self._records(rows)
-            result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
+            result.cheap_rows = rows
             result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
             result.cheap_score = mean(correct(row) for row in rows) if rows else 0.0
         if result.cid != self.seed_id:
             seed = self.cascade(self.seed)
             if result.cheap_score < (seed.cheap_score or 0.0):
+                # Only a failing candidate shows its cheap-tier records to reflection; critiques cost money.
+                records = self._records(result.cheap_rows)
+                result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
                 return result.fail("cheap tier")
         if not result.scores:
             rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
@@ -384,7 +394,7 @@ class Evolution:
             sidecar = Path(path).read_text() if path and Path(path).is_file() else None
             record = judge.stripped_record(row, sidecar or "")
             if self.calibrated:
-                record["label"] = self.labels.get(row["task"])
+                record["label"] = self.released.get(row["task"])
                 try:
                     with self._spending("judge"):
                         record["critique"] = self.judge.critique(row, sidecar)
@@ -426,10 +436,11 @@ class Evolution:
         if not all(baselines.is_completed(row) for row in reruns) or len(reruns) < len(dev) * self.settings.reruns:
             self.log(f"candidate {result.cid[:12]}: a re-run did not complete; not accepted")
             return
+        result.means = means
         if any(dominates(member.means, means, dev) for member in members):
             self.log(f"candidate {result.cid[:12]}: dominated after {self.settings.reruns + 1} rollouts; not accepted")
             return
-        result.means, result.accepted = means, True
+        result.accepted = True
         self.frontier = [member for member in members if not dominates(means, member.means, dev)] + [result]
         self.log(f"candidate {result.cid[:12]}: accepted (dev mean {result.dev_mean:.3f}, "
                  f"frontier {len(self.frontier)})")
@@ -457,8 +468,8 @@ class Evolution:
         report = {"candidate": result.cid[:12], "seq": result.seq, "split": split, **accuracy(rows),
                   "cpc_delta": cpc, "cpc_ci": [cpc_low, cpc_high]}
         if self.calibrated:
-            report["labels"] = {label: accuracy([row for row in rows if self.labels.get(row["task"]) == label])
-                                for label in sorted(set(self.labels.values()))}
+            report["labels"] = {label: accuracy([row for row in rows if self.released.get(row["task"]) == label])
+                                for label in sorted(set(self.released.values()))}
         else:
             report["labels"] = "uncalibrated"
         self.deltas.append(report)
@@ -466,8 +477,11 @@ class Evolution:
         return report
 
     def _dev_delta(self, result: Cascade) -> dict:
-        baseline_rows = self._plan(self._cells(self.panel.dev, BASELINE_MODE, self._reps()), None, store_only=True)
-        return self._delta_report(result, "dev", result.rows, baseline_rows)
+        if self.dev_baseline_rows is None:
+            # Read once: each store-only plan writes its reused rows to rows.jsonl again.
+            self.dev_baseline_rows = self._plan(self._cells(self.panel.dev, BASELINE_MODE, self._reps()), None,
+                                                store_only=True)
+        return self._delta_report(result, "dev", result.rows, self.dev_baseline_rows)
 
     # --- finish ---
 
@@ -486,6 +500,8 @@ class Evolution:
         nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
                          key=lambda member: (-member.dev_mean, member.seq))[:2]
         if not nonseed:
+            if self.stop.is_set and self.stop.reason != "plateau":
+                return self._finish_failed(f"finish: incomplete ({self.stop.reason}); the search accepted no candidate")
             self.log("finish: no improvement (no non-seed candidate on the frontier)")
             return None
         finalists = [*nonseed, seed]
@@ -511,8 +527,8 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
         self.log(f"finish: test-split means {scores}")
         winner = max(finalists, key=lambda member: (test_means[member.cid], member.dev_mean, -member.seq))
-        if winner is seed:
-            self.log("finish: no improvement (the seed has the best test-split mean)")
+        if winner is seed or test_means[winner.cid] <= test_means[seed.cid]:
+            self.log("finish: no improvement (no candidate beats the seed's test-split mean)")
             return None
         if not winner.just_check_ok:
             return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "

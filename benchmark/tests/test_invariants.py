@@ -390,6 +390,7 @@ def test_winner_is_unmerged_allowlisted_draft(world) -> None:
     assert changed and all(path.startswith(("src/", "prompts/")) or path == "AGENTS.md" for path in changed)
 
     # A winner commit that reaches outside the allowlist is never pushed.
+    es.git("checkout", "-q", "--detach", winner.sha, cwd=world.repo)  # keep the winner's instructions
     (world.repo / "Cargo.toml").write_text("[package]\nname = \"tilth\"\nversion = \"9.9.9\"\n")
     es.git("commit", "-qam", "bump", cwd=world.repo)
     winner.sha = es.git("rev-parse", "HEAD", cwd=world.repo).strip()

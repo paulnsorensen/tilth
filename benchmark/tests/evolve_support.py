@@ -78,7 +78,7 @@ def mod_rs(instructions: str) -> str:
     )
 
 
-SEED_MCP = mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="1")
+SEED_MCP = mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="0")
 
 
 def seed_files(instructions: str = SEED_MCP) -> dict[str, str]:
@@ -174,7 +174,8 @@ class StubJudge:
 
     def calibrate(self, labels: object) -> Agreement:
         return Agreement(calibrated=self.calibrated, reason="" if self.calibrated else "kappa 0.10 below 0.6",
-                         label_kappa=0.9 if self.calibrated else 0.1, verdict_kappa=0.8 if self.calibrated else 0.1)
+                         label_kappa=0.9 if self.calibrated else 0.1, verdict_kappa=0.8 if self.calibrated else 0.1,
+                         tasks=(*CHEAP, *DEV, *TEST))
 
     def critique(self, row: dict, trajectory: str | None) -> str:
         self.critiques.append((row, trajectory))
