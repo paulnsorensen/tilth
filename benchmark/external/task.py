@@ -433,7 +433,9 @@ class ExternalTask(Task):
             steps += [_install_argv(step, venv) for step in self.install_steps()]
         with tempfile.TemporaryDirectory(prefix="tilth-external-home-") as home:
             env = proc.toolchain_env(Path(home))
-            env.update(VIRTUAL_ENV=str(venv), PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
+            # uv hardlinks venv files to its cache by default, so an in-place edit of a venv would reach every venv.
+            env.update(UV_LINK_MODE="copy", VIRTUAL_ENV=str(venv),
+                       PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
             for argv in steps:
                 if _command_names(argv) & _CONTAINER_TOOLS:
                     raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
