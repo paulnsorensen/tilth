@@ -1,6 +1,7 @@
 """The one subprocess entry point for loading, preparing, admitting, and grading external tasks."""
 
 import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -60,8 +61,27 @@ def run(
     input: str | bytes | None = None,
     text: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Run ``argv`` to completion, capturing output; never raises on a nonzero exit."""
-    return subprocess.run(
-        list(argv), cwd=cwd, env=None if env is None else dict(env), timeout=timeout,
-        input=input, text=text, capture_output=True, check=False,
-    )
+    """Run ``argv`` to completion, capturing output; never raises on a nonzero exit.
+
+    The child leads its own process group. On a timeout or an interrupt, the whole
+    group is killed, so no background child outlives the call.
+    """
+    with subprocess.Popen(
+        list(argv), cwd=cwd, env=None if env is None else dict(env), text=text,
+        stdin=None if input is None else subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(input, timeout=timeout)
+        except BaseException:
+            _kill_group(process)
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+
+
+def _kill_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass

@@ -1,7 +1,10 @@
 """Grading and environment builds keep harness credentials and row paths contained."""
 
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -73,3 +76,21 @@ def test_grading_runs_without_harness_credentials(external_bench, monkeypatch: p
     graded = [env for env in envs if "VIRTUAL_ENV" in env]
     assert graded
     assert all("GH_TOKEN" not in env and env["HOME"] != os.environ["HOME"] for env in graded)
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
+    pidfile = tmp_path / "child.pid"
+    script = f"sleep 100 & echo $! > {pidfile}; sleep 100"
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        external.proc.run(["bash", "-c", script], timeout=1)
+
+    child = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    os.kill(child, signal.SIGKILL)
+    pytest.fail("the background child outlived the timeout")
