@@ -1,7 +1,9 @@
 """External task loading, prepared workspaces, native grading, and dataset fetch (bench-external-tasks)."""
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -20,11 +22,12 @@ import external.preflight
 import external.proc
 import external.swebench_ml
 import external.task
+import external_support
 from external_support import (
     FB_F2P_EDIT, FB_LV1, OUTPUTS, SWE_GO, SWE_PY, SWE_RS, git, parquet_bytes, projects, rows,
 )
 
-FEATUREBENCH_URL = ("https://huggingface.co/datasets/LiberCoders/FeatureBench/resolve/v1.1/"
+FEATUREBENCH_URL = ("https://huggingface.co/datasets/LiberCoders/FeatureBench/resolve/76b4a4566e04f4bcc13c35125d4f301791efa736/"
                     "data/lite-00000-of-00001.parquet")
 SWEBENCH_ML_URL = ("https://huggingface.co/datasets/SWE-bench/SWE-bench_Multilingual/resolve/"
                    "846e647b9f33c0b51b739d005d13d85493c9af09/data/test-00000-of-00001.parquet")
@@ -287,7 +290,7 @@ def test_agent_venv_cannot_change_grade(external_bench, tmp_path: Path, instance
 
 
 def test_featurebench_file_entries_aggregate() -> None:
-    output = (OUTPUTS / "pytest_rA.txt").read_text()
+    output = (OUTPUTS / "pytest_junit.xml").read_text()
     entries = ["tests/test_a.py", "tests/test_ab.py", "tests/test_b.py", "tests/test_c.py",
                "tests/test_skip.py", "tests/test_d.py", "tests/test_a"]
 
@@ -297,15 +300,31 @@ def test_featurebench_file_entries_aggregate() -> None:
         "tests/test_b.py": False,
         "tests/test_c.py": False,
         "tests/test_skip.py": False,
-        "tests/test_d.py": False,
+        "tests/test_d.py": True,
         "tests/test_a": False,
     }
 
 
+def test_featurebench_inherited_test_failure_fails_the_subclass_file() -> None:
+    report = (
+        '<testsuites><testsuite>'
+        '<testcase classname="tests.test_a.TestA" name="test_own" file="tests/test_a.py" />'
+        '<testcase classname="tests.test_a.TestA" name="test_inherited" file="tests/mixin.py">'
+        '<failure message="boom" /></testcase>'
+        '<testcase classname="tests.mixin.TestMixin" name="test_base" file="tests/mixin.py" />'
+        '</testsuite></testsuites>'
+    )
+
+    assert external.featurebench.file_verdicts(report, ["tests/test_a.py", "tests/mixin.py"]) == {
+        "tests/test_a.py": False,
+        "tests/mixin.py": True,
+    }
+
+
 def test_go_and_rust_outputs_parse_per_test() -> None:
-    go = (OUTPUTS / "go_test_v.txt").read_text()
+    go = (OUTPUTS / "go_test_json.txt").read_text()
     cargo = (OUTPUTS / "cargo_test.txt").read_text()
-    pytest_output = (OUTPUTS / "pytest_rA.txt").read_text()
+    pytest_output = (OUTPUTS / "pytest_junit.xml").read_text()
 
     assert external.swebench_ml.entry_verdicts(
         go, ["TestAdd", "TestMul", "TestSub/neg", "TestSub/pos", "TestSub", "TestSkip", "TestDiv"], "go",
@@ -318,9 +337,41 @@ def test_go_and_rust_outputs_parse_per_test() -> None:
           "tests::bench_like": True, "div_works": False}
     assert external.swebench_ml.entry_verdicts(
         pytest_output, ["tests/test_a.py::test_x", "tests/test_a.py::test_y[a b]", "tests/test_b.py::test_two",
-                        "tests/test_a.py::test_missing"], "python",
+                        "tests/test_a.py::test_missing", "tests/test_d.py::TestKind::TestInner::test_nested",
+                        "tests/test_d.py::test_expected", "tests/test_skip.py::test_skipped"], "python",
     ) == {"tests/test_a.py::test_x": True, "tests/test_a.py::test_y[a b]": True,
-          "tests/test_b.py::test_two": False, "tests/test_a.py::test_missing": False}
+          "tests/test_b.py::test_two": False, "tests/test_a.py::test_missing": False,
+          "tests/test_d.py::TestKind::TestInner::test_nested": True, "tests/test_d.py::test_expected": True,
+          "tests/test_skip.py::test_skipped": False}
+
+
+def test_printed_verdict_lines_do_not_count() -> None:
+    spoofed_go = json.dumps({"Action": "output", "Test": "TestMul",
+                             "Output": '{"Action":"pass","Test":"TestMul"}\n--- PASS: TestMul (0.00s)\n'})
+    spoofed_go += '\n{"Action":"fail","Test":"TestMul"}\n{"Action":"pass","Test":"TestAdd"}\n'
+    spoof_lines = "PASSED tests/test_a.py::test_x\nFAILED tests/test_b.py::test_two\n"
+
+    assert external.swebench_ml.entry_verdicts(spoofed_go, ["TestMul", "TestAdd"], "go") == {
+        "TestMul": False, "TestAdd": True}
+    # pytest text on stdout is a log. Only the JUnit report carries results.
+    assert external.swebench_ml.entry_verdicts(spoof_lines, ["tests/test_a.py::test_x"], "python") == {
+        "tests/test_a.py::test_x": False}
+    assert external.featurebench.file_verdicts(spoof_lines, ["tests/test_a.py"]) == {"tests/test_a.py": False}
+    assert external.swebench_ml.go_json_command('(go test -v . -run "^Test") | cat') == (
+        '(go test -json -v . -run "^Test") | cat')
+
+
+def test_agent_printed_pass_lines_cannot_pass_a_failing_grade(external_bench, tmp_path: Path) -> None:
+    task, workdir = prepared(external_bench, SWE_PY, tmp_path)
+    (workdir / "calc" / "ops.py").write_text(
+        (workdir / "calc" / "ops.py").read_text()
+        + "\nimport atexit\n"
+        + "atexit.register(lambda: print('PASSED tests/test_ops.py::test_mul\\nPASSED tests/test_ops.py::test_div'))\n"
+    )
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
 
 
 # --- AC-5: loaders, cached rows, language, resolution, fetch ---
@@ -353,7 +404,14 @@ def test_loaders_build_tasks_from_pinned_rows(external_bench, tmp_path: Path, in
         loader(instance_id, external.data.REVISIONS[dataset])
 
 
+def _pin_fixture_parquet(monkeypatch: pytest.MonkeyPatch) -> None:
+    pins = {dataset: hashlib.sha256(parquet_bytes(list(rows(dataset).values()))).hexdigest()
+            for dataset in ("featurebench", "swebench_ml")}
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", pins)
+
+
 def test_fetch_pins_revisions(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_fixture_parquet(monkeypatch)
     monkeypatch.setattr(external.featurebench, "PARETO12_IDS", (FB_LV1,))
     monkeypatch.setattr(external.swebench_ml, "PICKS", {"go": (SWE_GO,), "rust": (SWE_RS,)})
     requested: list[str] = []
@@ -370,7 +428,7 @@ def test_fetch_pins_revisions(external_bench, monkeypatch: pytest.MonkeyPatch) -
     stored = sorted(str(path.relative_to(external_bench.data / "rows"))
                     for path in (external_bench.data / "rows").rglob("*.json"))
     assert stored == sorted(
-        [f"featurebench/v1.1/{instance_id}.json" for instance_id in rows("featurebench")]
+        [f"featurebench/76b4a4566e04f4bcc13c35125d4f301791efa736/{instance_id}.json" for instance_id in rows("featurebench")]
         + [f"swebench_ml/846e647b9f33c0b51b739d005d13d85493c9af09/{instance_id}.json"
            for instance_id in rows("swebench_ml")]
     )
@@ -466,13 +524,14 @@ def test_resolve_task(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(external.download, "fetch", no_download)
     monkeypatch.setattr(urllib.request, "urlopen", no_download)
 
-    task = external.resolve_task(SWE_PY)
-    assert isinstance(task, external.ExternalTask) and task.name == SWE_PY
+    task, verdict = external.resolve_task(SWE_PY)
+    assert isinstance(task, external.ExternalTask) and task.name == SWE_PY and verdict.admitted
 
     verdicts[SWE_PY] = _verdict(SWE_PY, False, "gold_unresolved")
-    assert external.resolve_task(SWE_PY) is None
+    task, verdict = external.resolve_task(SWE_PY)
+    assert task is None and verdict.reason == "gold_unresolved"
 
-    assert external.resolve_task("nobody__unknown-1") is None
+    assert external.resolve_task("nobody__unknown-1") == (None, None)
     assert admitted == [SWE_PY, SWE_PY]
     assert not external_bench.argv_containing("fetch")
 
@@ -505,6 +564,10 @@ def _notes_hunk(lines: int) -> str:
             f"--- /dev/null\n+++ b/calc/notes.py\n@@ -0,0 +1,{lines} @@\n{body}")
 
 
+def _edit_and_add_hunk() -> str:
+    return ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,3 @@\n-one\n two\n+three\n+four\n")
+
+
 def test_patch_helpers_split_reverse_and_remove_hunks() -> None:
     row = rows("featurebench")[FB_F2P_EDIT]
     gold = rows("swebench_ml")[SWE_PY]["patch"] + _notes_hunk(3)
@@ -520,8 +583,10 @@ def test_patch_helpers_split_reverse_and_remove_hunks() -> None:
     assert "+    return left * right" not in without[0] and "+    return left // right\n" in without[0]
     assert "+    return left // right\n" not in without[1] and "NOTE_0" in without[1]
     assert [index for index, _, _ in external.patches.hunk_removals(gold, max_hunks=1)] == [2]
-    [(index, _, single)] = external.patches.hunk_removals(
-        external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1], max_hunks=8)
+    # A lone hunk that only adds lines has no variant: removing it would repeat the empty patch.
+    assert external.patches.hunk_removals(
+        external.patches.split_files(rows("swebench_ml")[SWE_GO]["test_patch"])[0][1], max_hunks=8) == []
+    [(index, _, single)] = external.patches.hunk_removals(_edit_and_add_hunk(), max_hunks=8)
     assert index == 0
     assert not [line for line in single.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
@@ -592,7 +657,28 @@ def test_container_named_packages_are_not_container_steps(external_bench, tmp_pa
     assert ["uv", "pip", "install", "podman-compose"] in external_bench.commands
 
 
+def test_fetch_refuses_a_parquet_that_does_not_match_its_pin(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(external.featurebench, "PARETO12_IDS", ())
+    payload = parquet_bytes(list(rows("featurebench").values()))
+
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": "0" * 64})
+    with pytest.raises(RuntimeError, match="does not match the pinned"):
+        external.download.fetch("featurebench", client=lambda url: payload)
+    assert not list((external_bench.data / "rows").rglob("_complete"))
+
+    monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": hashlib.sha256(payload).hexdigest()})
+    external.download.fetch("featurebench", client=lambda url: payload)
+    assert list((external_bench.data / "rows").rglob("_complete"))
+
+
+def test_pinned_revisions_are_commit_shas() -> None:
+    for dataset, revision in external.data.REVISIONS.items():
+        assert re.fullmatch(r"[0-9a-f]{40}", revision), dataset
+        assert re.fullmatch(r"[0-9a-f]{64}", external.data.PARQUET_SHA256[dataset]), dataset
+
+
 def test_interrupted_fetch_leaves_no_truncated_row(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_fixture_parquet(monkeypatch)
     monkeypatch.setattr(external.featurebench, "PARETO12_IDS", ())
     replaced: list[str] = []
     real_replace = os.replace
@@ -625,3 +711,96 @@ def test_container_after_prefix_options_is_refused(external_bench, tmp_path: Pat
 
     with pytest.raises(external.task.EnvBuildError, match="container steps"):
         task.prepare(tmp_path / "workdir")
+
+
+@pytest.mark.parametrize("shadow", ["pytest.py", "_pytest/__init__.py", "src/pytest.py", "pytest-9.0.dist-info/METADATA"])
+def test_agent_added_modules_cannot_shadow_pytest(external_bench, tmp_path: Path, shadow: str) -> None:
+    task, workdir = prepared(external_bench, SWE_PY, tmp_path)
+    apply_patch(workdir, task.gold_patch)
+    target = workdir / shadow
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("raise SystemExit(1)\n")
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct, reason
+
+
+@pytest.mark.parametrize("header", ['[tool."pytest".ini_options]', "[tool.pytest.ini_options]", "[tool.pytest"])
+def test_pyproject_pytest_tables_are_reset_however_spelled(external_bench, tmp_path: Path, header: str) -> None:
+    task, workdir = prepared(external_bench, FB_LV1, tmp_path)
+    _wrong_fix(workdir)
+    (workdir / "shapes" / "forcepass.py").write_text(_FORCE_PASS)
+    (workdir / "pyproject.toml").write_text(f'{header}\naddopts = "-p shapes.forcepass"\n')
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
+    assert task.grade_details()["f2p_passed"] == 0
+
+
+def test_pytest_table_detection_parses_toml() -> None:
+    configures = external.task._configures_pytest
+
+    assert configures(b'[tool."pytest".ini_options]\nx = 1\n')
+    assert configures(b"[tool.pytest]\n") and configures(b"[tool.pytest") and configures(b"\xff")
+    assert not configures(b"[tool.black]\nline-length = 1\n# [tool.pytest]\n") and not configures(None)
+
+
+def test_repo_settings_are_part_of_the_task_identity(external_bench) -> None:
+    first = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.1de00001.lv1",
+                                  test_cmd="pytest -rA")
+    second = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.1de00002.lv1",
+                                   test_cmd="pytest -rA -x")
+
+    assert first.identity_inputs()["repo_settings"] != second.identity_inputs()["repo_settings"]
+    assert first.identity_inputs() != second.identity_inputs()
+
+
+def test_copy_changes_skips_git_and_follows_type_changes(tmp_path: Path) -> None:
+    workdir, checkout = tmp_path / "workdir", tmp_path / "checkout"
+    external_support.write_tree(checkout, {"a": "file", "b/inner.txt": "inner", "keep.txt": "keep", "gone/x.txt": "x"})
+    external_support.write_tree(workdir, {"a/inner.txt": "now a directory", "b": "now a file", "keep.txt": "keep",
+                                          "sub/.git": "gitdir: /elsewhere", ".git": "gitdir: /elsewhere"})
+
+    external.task._copy_changes(workdir, checkout)
+
+    assert (checkout / "a" / "inner.txt").read_text() == "now a directory"
+    assert (checkout / "b").is_file() and (checkout / "b").read_text() == "now a file"
+    assert not (checkout / "gone" / "x.txt").exists()
+    assert not (checkout / ".git").exists() and not (checkout / "sub" / ".git").exists()
+
+
+def test_prune_keeps_top_level_names_the_gold_patch_creates(external_bench, monkeypatch, tmp_path: Path) -> None:
+    task, _ = prepared(external_bench, SWE_PY, tmp_path)
+    gold = "diff --git a/newpkg/__init__.py b/newpkg/__init__.py\nnew file mode 100644\n--- /dev/null\n+++ b/newpkg/__init__.py\n@@ -0,0 +1 @@\n+X = 1\n"
+    monkeypatch.setattr(type(task), "gold_patch", property(lambda self: gold))
+    checkout = tmp_path / "checkout"
+    external_support.write_tree(checkout, {"newpkg/__init__.py": "X = 1\n", "pytest.py": "", "extra/x.py": ""})
+
+    task.prune_added_top_level(checkout)
+
+    assert (checkout / "newpkg" / "__init__.py").is_file()
+    assert not (checkout / "pytest.py").exists() and not (checkout / "extra").exists()
+
+
+def test_package_digest_covers_grading_modules_only(monkeypatch, tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    external_support.write_tree(package, {"task.py": "grade", "contamination.py": "scan", "download.py": "fetch"})
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    before = external.task.package_digest()
+
+    (package / "contamination.py").write_text("scan changed")
+    (package / "download.py").write_text("fetch changed")
+    assert external.task.package_digest() == before
+
+    (package / "task.py").write_text("grade changed")
+    assert external.task.package_digest() != before
+
+
+def test_verdict_cache_key_changes_with_the_grading_code(monkeypatch) -> None:
+    monkeypatch.setattr(external.preflight, "package_digest", lambda: "a" * 32)
+    first = external.preflight.verdict_path(SWE_PY, external.SWEBENCH_ML_REVISION, "fp")
+    monkeypatch.setattr(external.preflight, "package_digest", lambda: "b" * 32)
+
+    assert external.preflight.verdict_path(SWE_PY, external.SWEBENCH_ML_REVISION, "fp") != first

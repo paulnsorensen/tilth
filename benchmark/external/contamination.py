@@ -22,7 +22,25 @@ _HOME_REFERENCE = re.compile(r"\$\{HOME\}|\$HOME")
 _PIP_COMMAND = re.compile(r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+(?:download|install)\b([^;&|\n]*)")
 _UV_ADD = re.compile(r"\buv\s+add\b([^;&|\n]*)")
 _GO_COMMAND = re.compile(r"\bgo\s+(?:get|install|mod\s+download)\b([^;&|\n]*)")
+_FETCH_COMMAND = re.compile(
+    r"\b(?:git\s+(?:clone|fetch|pull|remote\s+add)|curl|wget|go\s+(?:get|install)|gh\s+(?:repo\s+clone|api))\b"
+)
+_COMMAND_SEGMENTS = re.compile(r"[;&|\n]+")
 _GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+
+
+@dataclass(frozen=True)
+class _Upstream:
+    """Fetch hosts always count; a github.com URL counts inside a fetch command or a fetch tool's input."""
+
+    hosts: re.Pattern
+    repo_url: re.Pattern
+
+    def fetched_by(self, text: str) -> bool:
+        if self.hosts.search(text):
+            return True
+        return any(_FETCH_COMMAND.search(segment) and self.repo_url.search(segment)
+                   for segment in _COMMAND_SEGMENTS.split(text))
 
 
 @dataclass(frozen=True)
@@ -32,7 +50,7 @@ class _Rules:
     benchmark_roots: tuple[str, ...]
     data_roots: tuple[str, ...]
     foreign_roots: tuple[str, ...]
-    upstream: re.Pattern | None
+    upstream: "_Upstream | None"
     packages: tuple[str, ...]
     go_module: str | None
 
@@ -62,8 +80,11 @@ def _rules(task: object) -> _Rules:
             packages = (repo.name,)
     upstream = None
     if slug:
-        hosts = r"(?:github\.com[/:]|codeload\.github\.com/|raw\.githubusercontent\.com/|api\.github\.com/repos/)"
-        upstream = re.compile(hosts + re.escape(slug) + r"(?:\.git)?(?=$|[/\s'\"#?@:])", re.IGNORECASE)
+        tail = re.escape(slug) + r"(?:\.git)?(?=$|[/\s'\"#?@:])"
+        hosts = re.compile(r"(?:codeload\.github\.com/|raw\.githubusercontent\.com/|api\.github\.com/repos/)" + tail,
+                           re.IGNORECASE)
+        clone = r"(?:github\.com[/:]|\bgh\s+repo\s+clone\s+|\bgh\s+api\s+(?:-\S+\s+)*repos/)"
+        upstream = _Upstream(hosts, re.compile(clone + tail, re.IGNORECASE))
     return _Rules(
         benchmark_roots=_roots(config.BENCHMARK_DIR),
         data_roots=_roots(data.data_dir()),
@@ -133,8 +154,13 @@ def _fetches_package(text: str, rules: _Rules) -> bool:
     return False
 
 
-def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
+def _is_fetch_tool(name: object) -> bool:
+    return isinstance(name, str) and "fetch" in name.lower()
+
+
+def _call_reasons(tool_input: object, rules: _Rules, tool: object = None) -> list[str]:
     reasons: list[str] = []
+    fetching = _is_fetch_tool(tool)
     for text in _strings(tool_input):
         for path in _paths(text):
             if _under(path, rules.benchmark_roots):
@@ -143,7 +169,8 @@ def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
                 reasons.append("harness_data")
             elif _under(path, rules.foreign_roots):
                 reasons.append("foreign_repo_clone")
-        if rules.upstream is not None and rules.upstream.search(text):
+        if rules.upstream is not None and (rules.upstream.fetched_by(text)
+                                           or (fetching and rules.upstream.repo_url.search(text))):
             reasons.append("upstream_fetch")
         if _fetches_package(text, rules):
             reasons.append("package_source")
@@ -157,7 +184,7 @@ def find_hits(sidecar_path: str | Path | None, task: object) -> list[dict]:
     rules = _rules(task)
     hits = []
     for call in tolerant_jsonl(Path(sidecar_path).read_text()):
-        for reason in _call_reasons(call.get("input"), rules):
+        for reason in _call_reasons(call.get("input"), rules, call.get("name")):
             hits.append({"reason": reason, "tool": call.get("name"), "input": call.get("input")})
     return hits
 

@@ -6,9 +6,11 @@ from pathlib import Path
 
 REPO_PATH = Path(__file__).parent / "repo"
 
-def reset_repo():
-    subprocess.run(["git", "checkout", "--", "."], cwd=REPO_PATH, check=True, capture_output=True)
-    subprocess.run(["git", "clean", "-fd"], cwd=REPO_PATH, check=True, capture_output=True)
+def reset_repo(path: Path | None = None):
+    """Discard tracked changes and untracked files in ``path`` (default: the synthetic repo)."""
+    path = path or REPO_PATH
+    subprocess.run(["git", "checkout", "--", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "clean", "-fd"], cwd=path, check=True, capture_output=True)
 
 def restore_git(repo_path: Path) -> None:
     """Restore `.git` if a hide_git task moved it aside to `.git_hidden`.

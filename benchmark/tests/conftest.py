@@ -20,7 +20,7 @@ import external.proc
 import external_support
 import run
 from config import DEFAULT_MAX_BUDGET_USD, ModeConfig
-from tasks.base import GroundTruth, TaskSource
+from tasks.base import GroundTruth, Task, TaskSource
 
 STREAMS = Path(__file__).parent / "fixtures" / "streams"
 
@@ -32,13 +32,18 @@ Behavior = Callable[[Path], float]
 
 
 @dataclass
-class StoreTask:
+class StoreTask(Task):
+    name: str = "store_task"
     repo: str = "synthetic"
     prompt: str = "Name the dispatcher."
     capability: str = "trace"
     hide_git: bool = False
-    ground_truth: GroundTruth = field(default_factory=lambda: GroundTruth(required_strings=["handler_3"]))
+    ground_truth: GroundTruth | None = None
     source: TaskSource = TaskSource(origin="fixture", license="MIT", commit_or_tag="test-pin", transformation="test-only")
+
+    def __post_init__(self) -> None:
+        if self.ground_truth is None:
+            self.ground_truth = GroundTruth(required_strings=["handler_3"])
 
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
         return True, "expected answer"
@@ -187,11 +192,13 @@ def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalB
         if list(argv[:2]) == ["uv", "venv"]:
             result = real_run([sys.executable, "-m", "venv", "--without-pip", "--system-site-packages", argv[-1]],
                               **kwargs)
-            # --system-site-packages exposes the base interpreter only. A suite run from a venv keeps pytest
-            # in that venv, so a .pth file adds this interpreter's site directories to the stub venv.
+            # --system-site-packages exposes the base interpreter only. A suite run from a venv or a layered env
+            # (uv run --with) keeps pytest outside it, so a .pth file adds this interpreter's site directories.
             purelib = Path(sysconfig.get_path("purelib", vars={"base": argv[-1], "platbase": argv[-1]}))
             if purelib.is_dir():
-                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])]
+                site_dirs = [*site.getsitepackages(), *([site.getusersitepackages()] if site.ENABLE_USER_SITE else []),
+                             *(entry for entry in sys.path if Path(entry).name == "site-packages")]
+                site_dirs = list(dict.fromkeys(site_dirs))
                 (purelib / "_suite_site.pth").write_text("".join(f"{path}\n" for path in site_dirs))
             return result
         if list(argv[:2]) == ["uv", "pip"]:

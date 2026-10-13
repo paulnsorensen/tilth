@@ -1,8 +1,10 @@
 """``fetch``: the only code path that downloads dataset rows or upstream source."""
 
+import hashlib
 import io
 import json
 import os
+import sys
 import urllib.request
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -24,6 +26,15 @@ def _parquet_rows(payload: bytes) -> list[dict]:
     except ImportError as error:
         raise RuntimeError("fetching dataset rows needs pyarrow: pip install pyarrow") from error
     return parquet.read_table(io.BytesIO(payload)).to_pylist()
+
+
+def _verified(dataset: str, payload: bytes) -> bytes:
+    """``payload`` when its sha256 matches the pin for ``dataset``; otherwise raise."""
+    expected = data.PARQUET_SHA256.get(dataset)
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"{dataset} parquet sha256 {actual} does not match the pinned {expected}")
+    return payload
 
 
 def write_atomically(path: Path, text: str) -> None:
@@ -70,13 +81,25 @@ def fetch(dataset: str, *, client: Callable[[str], bytes] | None = None, extra_i
     target = data.rows_dir(dataset, revision)
     if not (target / _COMPLETE_MARKER).is_file():
         url = dataset_url(dataset)
-        rows = _parquet_rows((client or _http_get)(url))
+        rows = _parquet_rows(_verified(dataset, (client or _http_get)(url)))
         target.mkdir(parents=True, exist_ok=True)
         for row in rows:
             if data.is_safe_id(str(row.get("instance_id", ""))):
                 write_atomically(data.row_path(dataset, revision, row["instance_id"]), json.dumps(row, default=str))
         (target / _COMPLETE_MARKER).write_text(url + "\n")
-    for instance_id in dict.fromkeys([*registry.candidates(dataset), *extra_ids]):
+    mirror_instances(dataset, dict.fromkeys([*registry.candidates(dataset), *extra_ids]))
+
+
+def mirror_instances(dataset: str, instance_ids: Iterable[str]) -> None:
+    """Mirror the ``base_commit`` of each cached instance of ``dataset``.
+
+    An instance whose commit cannot be mirrored is reported on stderr and skipped,
+    so one bad instance does not stop the others. ``admit`` then refuses it.
+    """
+    for instance_id in instance_ids:
         if data.cached_dataset(instance_id) == dataset:
             row = data.cached_row(instance_id)
-            ensure_mirror(row["repo"], row["base_commit"])
+            try:
+                ensure_mirror(row["repo"], row["base_commit"])
+            except RuntimeError as error:
+                print(f"WARNING: cannot mirror {instance_id}: {error}", file=sys.stderr)

@@ -20,10 +20,14 @@ def fetch(dataset: str, **kwargs) -> None:
     download.fetch(dataset, **kwargs)
 
 
-def resolve_task(name: str) -> ExternalTask | None:
-    """The admitted ExternalTask for a cached instance ID, else None; never downloads."""
+def resolve_task(name: str) -> tuple[ExternalTask | None, preflight.PreflightVerdict | None]:
+    """The admitted ExternalTask for a cached instance ID, with the one admission verdict; never downloads.
+
+    An uncached name returns ``(None, None)``. A refused instance returns ``(None, verdict)``.
+    """
     if cached_row(name) is None:
-        return None
-    if not preflight.admit(name).admitted:
-        return None
-    return registry.load(name)
+        return None, None
+    verdict = preflight.admit(name)
+    if not verdict.admitted:
+        return None, verdict
+    return registry.load(name), verdict

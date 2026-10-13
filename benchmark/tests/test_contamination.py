@@ -53,6 +53,46 @@ def test_upstream_fetch_marks_contaminated(external_bench, tmp_path: Path, insta
     assert set(reasons(path, task)) & {"upstream_fetch", "package_source"}
 
 
+@pytest.mark.parametrize("tool_input", [
+    ("Edit", {"file_path": f"{WORKDIR}/render.go", "new_string": 'import "github.com/gin-gonic/gin/render"'}),
+    ("Bash", {"command": "go test github.com/gin-gonic/gin/render/..."}),
+    ("Bash", {"command": "echo '# see https://github.com/gin-gonic/gin/issues/12'"}),
+    ("Write", {"file_path": f"{WORKDIR}/notes.md", "content": "See https://github.com/gin-gonic/gin/issues/12"}),
+])
+def test_upstream_mention_without_fetch_is_clean(tmp_path: Path, tool_input: tuple[str, object]) -> None:
+    task = TASKS["gin_edit_render_context"]
+    path = sidecar(tmp_path, tool_input)
+
+    assert "upstream_fetch" not in reasons(path, task)
+    assert external.contamination.scan(path, task) is False
+
+
+def test_upstream_raw_and_gh_fetch_marks_contaminated(tmp_path: Path) -> None:
+    task = TASKS["gin_edit_render_context"]
+    for command in ("curl -s https://raw.githubusercontent.com/gin-gonic/gin/master/render/render.go",
+                    "gh repo clone gin-gonic/gin",
+                    "git fetch https://github.com/gin-gonic/gin.git"):
+        assert "upstream_fetch" in reasons(sidecar(tmp_path, ("Bash", {"command": command})), task), command
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/gin-gonic/gin/pull/3741",
+    "https://github.com/gin-gonic/gin/commit/abc123",
+    "https://github.com/gin-gonic/gin",
+])
+def test_web_fetch_of_upstream_url_marks_contaminated(tmp_path: Path, url: str) -> None:
+    task = TASKS["gin_edit_render_context"]
+    path = sidecar(tmp_path, ("WebFetch", {"url": url, "prompt": "summarize"}))
+
+    assert "upstream_fetch" in reasons(path, task)
+
+
+def test_web_fetch_of_other_repo_is_clean(tmp_path: Path) -> None:
+    task = TASKS["gin_edit_render_context"]
+    path = sidecar(tmp_path, ("WebFetch", {"url": "https://github.com/other/project/pull/1", "prompt": "x"}))
+
+    assert "upstream_fetch" not in reasons(path, task)
+
+
 def test_benchmark_tree_read_marks_local_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     task = TASKS["rg_search_dispatch"]
     home = config.BENCHMARK_DIR.parent.parent

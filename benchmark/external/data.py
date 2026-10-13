@@ -12,13 +12,19 @@ from pathlib import Path
 
 FEATUREBENCH = "featurebench"
 SWEBENCH_ML = "swebench_ml"
-FEATUREBENCH_REVISION = "v1.1"
+# Commit that the Hugging Face tag v1.1 pointed to on 2026-10-13.
+FEATUREBENCH_REVISION = "76b4a4566e04f4bcc13c35125d4f301791efa736"
 SWEBENCH_ML_REVISION = "846e647b9f33c0b51b739d005d13d85493c9af09"
 REVISIONS = {FEATUREBENCH: FEATUREBENCH_REVISION, SWEBENCH_ML: SWEBENCH_ML_REVISION}
 # Hugging Face dataset repository and parquet file per dataset.
 DATASET_FILES = {
     FEATUREBENCH: ("LiberCoders/FeatureBench", "data/lite-00000-of-00001.parquet"),
     SWEBENCH_ML: ("SWE-bench/SWE-bench_Multilingual", "data/test-00000-of-00001.parquet"),
+}
+# sha256 of each pinned parquet file. A download that does not match is refused.
+PARQUET_SHA256 = {
+    FEATUREBENCH: "8740f33eb89e443e8e32b46c98508be05a2db2cbf65f856ff38e4e7730b1cc99",
+    SWEBENCH_ML: "92abca7cb527b41a9f66d03a26ce441ff7319e3a49f985998fd56be4bb9b08b2",
 }
 UPSTREAM_URL = "https://github.com/{repo}.git"
 DEFAULT_DATA_DIR = "~/.local/share/tilth-bench/external"

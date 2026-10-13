@@ -70,6 +70,7 @@ from parse import (
     tool_op_kinds,
 )
 from tasks import TASKS
+from tasks.base import SYNTHETIC_LANGUAGE, Task
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -419,12 +420,10 @@ def _agent_repo(repo_path: Path, hide_git: bool):
 
 
 @contextmanager
-def _prepared_repo(task: object):
-    """Yield a fresh workdir that the task's ``prepare`` hook builds."""
+def _built_workdir():
+    """Yield a path for a workdir that a task with no fixture builds in ``prepare``."""
     with tempfile.TemporaryDirectory(prefix="tilth-benchmark-") as temp_dir:
-        workspace = Path(temp_dir) / "repo"
-        task.prepare(workspace)
-        yield workspace
+        yield Path(temp_dir) / "repo"
 
 
 class McpUnavailableError(RuntimeError):
@@ -530,40 +529,9 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
 
 
 CELL_TIMEOUT_S = 600
-_TOOLCHAIN_PROBES = {
-    "rustc": ("rustc", "--version"),
-    "cargo": ("cargo", "--version"),
-    "go": ("go", "version"),
-    "node": ("node", "--version"),
-    "python3": ("python3", "--version"),
-    "uv": ("uv", "--version"),
-}
-# The toolchains a repo's language builds and tests with; a rustc bump must not
-# re-key a Go, JavaScript, or Python task.
-_LANGUAGE_TOOLCHAINS = {
-    "rust": ("rustc", "cargo"),
-    "go": ("go",),
-    "javascript": ("node",),
-    "python": ("python3", "uv"),
-}
-# The synthetic fixture repo is a Python project (fixtures/template/pyproject.toml).
-_SYNTHETIC_LANGUAGE = "python"
-# A repo without a lockfile (express) pins its dependencies through these instead.
-_UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
-_LOCKFILES = (
-    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
-)
+_SYNTHETIC_LANGUAGE = SYNTHETIC_LANGUAGE
 
-
-def _run_probe(argv: tuple[str, ...]) -> str | None:
-    """Return a tool's version line, or None when it is unavailable."""
-    try:
-        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = (probe.stdout or probe.stderr).strip().splitlines()
-    return lines[0] if probe.returncode == 0 and lines else None
+_run_probe = baselines.run_probe
 
 
 # Probed once per run when planning cell identities.
@@ -579,59 +547,31 @@ def cli_version(runner: str, *, fresh: bool = False) -> str | None:
     return (_run_probe if fresh else _probe_version)((runner, "--version"))
 
 
-def _file_sha256(path: Path) -> str:
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+_file_sha256 = baselines.file_sha256
+_tree_sha256 = baselines.tree_sha256
 
 
-def _tree_sha256(root: Path) -> str:
-    """Hash every file under a directory by relative path and content, skipping `.git`."""
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if path.is_file() and ".git" not in relative.parts:
-            digest.update(f"{relative.as_posix()}\0{_file_sha256(path)}\n".encode())
-    return digest.hexdigest()
-
-
-def _is_prepared(task: object) -> bool:
-    """A task with a ``prepare`` hook builds its own workdir instead of copying a REPOS fixture."""
-    return callable(getattr(task, "prepare", None))
-
-
-def _task_timeout(task: object) -> int:
-    return getattr(task, "timeout_s", CELL_TIMEOUT_S)
+def _task_timeout(task: Task) -> int:
+    return task.timeout_s or CELL_TIMEOUT_S
 
 
 def env_fingerprint(task_or_repo: object) -> str:
     """Fingerprint the task language's toolchains and its dependency lockfiles.
 
-    A task exposing ``language`` supplies the language; a prepared task supplies
-    the lockfiles of its base tree, so neither indexes ``REPOS``. A bare repo
-    name resolves both through ``REPOS``.
+    A task supplies its own language and dependency hashes. A bare repo name
+    resolves both through ``REPOS``.
     """
-    task = None if isinstance(task_or_repo, str) else task_or_repo
-    repo_name = task_or_repo if task is None else task.repo
-    language = getattr(task, "language", None) or (
-        _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
-    )
-    if _is_prepared(task):
-        base_file_hashes = getattr(task, "base_file_hashes", lambda _names: {})
-        lockfiles = base_file_hashes(_LOCKFILES) or base_file_hashes(_UNLOCKED_DEPENDENCY_FILES)
-    else:
+    if isinstance(task_or_repo, str):
+        repo_name = task_or_repo
+        language = _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
         repo_path = get_repo_path(repo_name)
-        lockfiles = {
-            name: _file_sha256(repo_path / name)
-            for name in _LOCKFILES if (repo_path / name).is_file()
-        } or {
-            name: _file_sha256(repo_path / name)
-            for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
-        }
-    return baselines.env_fingerprint(
-        toolchains={name: _probe_version(_TOOLCHAIN_PROBES[name])
-                    for name in _LANGUAGE_TOOLCHAINS.get(language, ())},
-        lockfile_hash=hashlib.sha256(json.dumps(lockfiles, sort_keys=True).encode()).hexdigest(),
-    )
+        hashes = baselines.local_dependency_hashes(lambda names: {
+            name: _file_sha256(repo_path / name) for name in names if (repo_path / name).is_file()
+        })
+    else:
+        language = task_or_repo.language
+        hashes = task_or_repo.dependency_hashes()
+    return baselines.host_env_fingerprint(language, hashes, probe=_probe_version)
 
 
 def _is_tilth_arm(mode: ModeConfig) -> bool:
@@ -721,7 +661,6 @@ def _task_source_files(task: object) -> dict[str, str]:
 def _cell_task_digest(task: object) -> str:
     ground_truth = getattr(task, "ground_truth", None)
     mutations = getattr(task, "mutations", ()) or ()
-    identity_inputs = getattr(task, "identity_inputs", None)
     return baselines.task_digest(
         prompt=task.prompt,
         ground_truth=asdict(ground_truth) if is_dataclass(ground_truth) else ground_truth,
@@ -731,7 +670,7 @@ def _cell_task_digest(task: object) -> str:
         mutations=[asdict(mutation) if is_dataclass(mutation) else mutation for mutation in mutations],
         hide_git=bool(getattr(task, "hide_git", False)),
         task_sources=_task_source_files(task),
-        identity_inputs=identity_inputs() if callable(identity_inputs) else None,
+        identity_inputs=task.identity_inputs(),
     )
 
 
@@ -865,13 +804,11 @@ def run_single(
     """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
     workspace = (
-        _prepared_repo(task) if _is_prepared(task)
-        else _agent_repo(get_repo_path(task.repo), getattr(task, "hide_git", False))
+        _built_workdir() if task.fixture_path is None
+        else _agent_repo(get_repo_path(task.repo), task.hide_git)
     )
     with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
-        mutations = getattr(task, "mutations", ())
-        if mutations and not _is_prepared(task):
-            task.apply_mutations(str(repo_path))
+        task.prepare(repo_path)
         return _run_single_in_repo(
             task_name,
             mode_name,
@@ -1214,8 +1151,7 @@ def _run_single_in_repo(
     )
     run_result.correct = correct
     run_result.correctness_reason = reason
-    grade_details = getattr(task, "grade_details", None)
-    details = grade_details() if callable(grade_details) else {}
+    details = task.grade_details()
 
     # Build tool call breakdown
     tool_breakdown = tool_call_counts(run_result)
@@ -1337,11 +1273,11 @@ def select_tasks(value: str) -> list[str]:
     for name in (item.strip() for item in value.split(",")):
         if not name or name in TASKS:
             continue
-        resolved = external.resolve_task(name)
+        resolved, verdict = external.resolve_task(name)
         if resolved is not None:
             TASKS[name] = resolved
-        elif external.cached_row(name) is not None:
-            raise ValueError(f"external task {name} is not admitted: {external.preflight.admit(name).reason}")
+        elif verdict is not None:
+            raise ValueError(f"external task {name} is not admitted: {verdict.reason}")
     return parse_comma_list(value, TASKS, "tasks")
 
 
@@ -1649,16 +1585,8 @@ Examples:
     except ValueError as error:
         parser.error(str(error))
 
-    # Guard external cells before any model call: each must be admitted on this host.
-    for task_name in tasks_list:
-        if isinstance(TASKS[task_name], external.ExternalTask):
-            verdict = external.preflight.admit(task_name)
-            if not verdict.admitted:
-                print(f"ERROR: external task {task_name} is not admitted: {verdict.reason}", file=sys.stderr)
-                sys.exit(1)
-
-    # Prepared tasks build their own workdirs; only the rest copy REPOS fixtures.
-    fixture_tasks = [name for name in tasks_list if not _is_prepared(TASKS[name])]
+    # Tasks without a fixture build their own workdirs; only the rest copy fixtures.
+    fixture_tasks = [name for name in tasks_list if TASKS[name].fixture_path is not None]
 
     # Validate and restore the synthetic source once. Every cell runs from a
     # disposable copy, so the scheduler never mutates this source again.
@@ -1972,6 +1900,17 @@ Examples:
                     "correct": False,
                     "correctness_reason": "Subprocess timed out",
                 }, stream_log_path, runner, estimate)
+
+            except (external.task.EnvBuildError, external.task.PrepareError) as error:
+                # No model call ran, so the cell estimate must not be charged.
+                print(f"  ✗ PREPARE FAILED: {error}")
+                record_failure({
+                    **record_metadata,
+                    "infra": "prepare",
+                    "error": f"infra:prepare: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Prepare failed: {error}",
+                }, stream_log_path, runner, 0.0)
 
             except Exception as error:
                 quota = (

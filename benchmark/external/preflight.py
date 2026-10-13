@@ -1,14 +1,15 @@
 """Admission of external instances: a native gold, empty, and tampered round trip on this host.
 
-``python3 benchmark/external/preflight.py`` admits the FeatureBench candidates and
-the per-language SWE-bench Multilingual picks (falling back only when a primary
-is refused). ``--panel PATH`` admits exactly a panel's external members. Both
-forms fetch uncached rows first and exit nonzero when a required family has no
-admitted instance.
+``python3 benchmark/external/preflight.py`` admits the FeatureBench candidates.
+It also admits the per-language SWE-bench Multilingual picks.
+It tries a fallback pick only when the primary is refused.
+``--panel PATH`` admits exactly the external members of a panel.
+Both forms fetch uncached rows first.
+Both forms exit nonzero when a required family has no admitted instance.
 
-The tampered check grades the gold patch minus one hunk at a time, largest hunk
-first, up to ``$TILTH_BENCH_TAMPER_MAX_HUNKS`` hunks (default 8); an instance
-passes it when any one removal fails the held-out tests.
+The tampered check grades the gold patch minus one hunk at a time.
+It tries the largest hunk first, up to ``$TILTH_BENCH_TAMPER_MAX_HUNKS`` hunks (default 8).
+An instance passes the check when any one removal fails the held-out tests.
 """
 
 import sys
@@ -21,7 +22,6 @@ if __name__ == "__main__" and not __package__:
     raise SystemExit(_main())
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -29,22 +29,16 @@ import tempfile
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from . import data, download, featurebench, patches, proc, registry, swebench_ml
-from .task import EnvBuildError, ExternalTask, PrepareError, apply_patch
+import baselines
+from fixtures.reset import reset_repo
+
+from . import data, download, featurebench, patches, registry, swebench_ml
+from .task import EnvBuildError, ExternalTask, PrepareError, apply_patch, package_digest
 
 Reason = Literal[
     "admitted", "admitted:mask_patch_forward", "level2", "unclassified", "env_build_failed",
     "prepare_failed", "gold_unresolved", "empty_resolved", "tampered_resolved",
 ]
-_PROBES = {
-    "python": (("uv", "--version"), ("python3", "--version")),
-    "go": (("go", "version"),),
-    "rust": (("rustc", "--version"), ("cargo", "--version")),
-}
-_DEPENDENCY_FILES = (
-    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pyproject.toml", "setup.py", "setup.cfg",
-    "requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock",
-)
 _EXTERNAL_FAMILIES = (data.FEATUREBENCH, data.SWEBENCH_ML)
 # Bump when admission or grading changes, so cached verdicts are recomputed.
 VERDICT_VERSION = 2
@@ -80,7 +74,8 @@ class PreflightVerdict:
 
 
 def verdict_path(instance_id: str, data_rev: str, fingerprint: str) -> Path:
-    return data.data_dir() / "verdicts" / data_rev / instance_id / f"{fingerprint}.json"
+    """The cache file of one verdict, keyed by host environment and by the grading code that decided it."""
+    return data.data_dir() / "verdicts" / data_rev / instance_id / f"{fingerprint}-{package_digest()[:16]}.json"
 
 
 def _read_verdict(path: Path) -> PreflightVerdict | None:
@@ -102,37 +97,27 @@ def _read_verdict(path: Path) -> PreflightVerdict | None:
         return None
 
 
-def _probe(argv: tuple[str, ...]) -> str | None:
-    try:
-        result = proc.run(argv, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = (result.stdout or result.stderr).strip().splitlines()
-    return lines[0] if result.returncode == 0 and lines else None
-
-
-def env_fingerprint(task: ExternalTask) -> str:
+def env_fingerprint(task: ExternalTask, probe=None) -> str:
     """Hash this host's toolchain versions for the task's language and its base dependency files."""
-    payload = {
-        "toolchains": {" ".join(argv): _probe(argv) for argv in _PROBES[task.language]},
-        "python": task.python_version,
-        "dependency_files": task.base_file_hashes(_DEPENDENCY_FILES),
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return baselines.host_env_fingerprint(task.language, task.dependency_hashes(), probe=probe)
 
 
 def _reset(workdir: Path) -> None:
-    for argv in (["git", "reset", "-q", "--hard"], ["git", "clean", "-q", "-f", "-d"]):
-        if proc.run(argv, cwd=workdir).returncode:
-            raise PrepareError(f"{' '.join(argv)} failed in {workdir}")
+    try:
+        reset_repo(workdir)
+    except subprocess.CalledProcessError as error:
+        raise PrepareError(f"{' '.join(error.cmd)} failed in {workdir}") from error
 
 
-def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[int, int]]:
-    """Resolve ``patch`` on the prepared tree; a patch that does not apply does not resolve."""
+def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[int, int] | None]:
+    """Reset the tree, apply ``patch``, and grade it.
+
+    A patch that does not apply does not resolve and has no counts.
+    """
     _reset(workdir)
     total = len(task.fail_to_pass) + len(task.pass_to_pass)
     if patch and not apply_patch(workdir, patch):
-        return False, (0, total)
+        return False, None
     resolved, _ = task.check_correctness("", str(workdir))
     details = task.grade_details()
     return resolved, (details["f2p_passed"] + details["p2p_passed"], total)
@@ -141,21 +126,27 @@ def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[i
 def _tamper(task: ExternalTask, workdir: Path, max_hunks: int) -> tuple[bool, dict]:
     """Grade single-hunk removals of the gold patch until one fails the held-out tests.
 
-    Returns whether every applying removal still resolved, and the verdict fields
-    that record the counts, the failing hunk index, and the hunks tried.
+    Returns whether every applying removal still resolved.
+    Also returns the verdict fields: the counts, the failing hunk index, and the hunks tried.
+    The check is n/a when the gold patch has no hunk to remove.
     """
+    variants = patches.hunk_removals(task.gold_patch, max_hunks)
+    if not variants:
+        return False, {"detail": "tampered: n/a (the gold patch has no hunk whose removal differs from the empty patch)"}
     tried: list[str] = []
     counts = None
-    for index, path, patch in patches.hunk_removals(task.gold_patch, max_hunks):
-        _reset(workdir)
-        if patch and not apply_patch(workdir, patch):
+    for index, path, patch in variants:
+        resolved, graded = _grade(task, workdir, patch)
+        if graded is None:
             tried.append(f"{index} (does not apply)")
             continue
-        resolved, counts = _grade(task, workdir, patch)
+        counts = graded
         if not resolved:
             return False, {"tampered": counts, "tampered_hunk": index,
                            "detail": f"tampered: removing gold hunk {index} ({path}) fails the held-out tests"}
         tried.append(str(index))
+    if counts is None:
+        return True, {"detail": f"tampered_unapplicable: no single-hunk removal applies (hunks {', '.join(tried)})"}
     return True, {"tampered": counts,
                   "detail": f"tampered: every single-hunk removal tried still resolves (hunks {', '.join(tried)})"}
 
@@ -176,9 +167,10 @@ def round_trip(task: ExternalTask, fingerprint: str) -> PreflightVerdict:
         except PrepareError as error:
             return verdict("prepare_failed", detail=str(error))
         try:
-            task.build_env(workdir)
             if task.language == "python":
                 task.grade_venv()
+            else:
+                task.build_env(workdir)
         except EnvBuildError as error:
             return verdict("env_build_failed", detail=str(error))
         except PrepareError as error:
@@ -236,6 +228,8 @@ def admit(instance_id: str) -> PreflightVerdict:
 def _ensure_rows(dataset: str, instance_ids: list[str]) -> None:
     if any(data.cached_row(instance_id) is None for instance_id in instance_ids):
         download.fetch(dataset, extra_ids=instance_ids)
+    else:
+        download.mirror_instances(dataset, instance_ids)
 
 
 def _admit_and_print(instance_id: str) -> PreflightVerdict | None:

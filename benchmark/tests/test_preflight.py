@@ -81,6 +81,19 @@ def test_compiled_round_trip_rebuilds_each_grade(external_bench, monkeypatch: py
     assert (result.admitted, result.gold, result.empty, result.tampered) == (True, (3, 3), (1, 3), (2, 3))
 
 
+def test_rust_grades_seed_target_from_one_cached_build(external_bench) -> None:
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo is not installed")
+    external_bench.seed(SWE_RS)
+
+    result = external.preflight.admit(SWE_RS)
+
+    seed_builds = [argv for argv in external_bench.commands if argv[:3] == ["cargo", "test", "--no-run"]]
+    assert result.admitted is True and len(seed_builds) == 1
+    [seed] = (external.data.data_dir() / "envs").rglob("cargo/target")
+    assert seed.is_dir() and not (seed.parent.parent / "tree").exists()
+
+
 def test_patch_editing_f2p_file_is_admitted(external_bench, tmp_path: Path) -> None:
     external_bench.seed(FB_F2P_EDIT)
     task = external.featurebench.load(FB_F2P_EDIT, external.FEATUREBENCH_REVISION)
@@ -218,6 +231,37 @@ def test_tampered_check_is_bounded_by_max_hunks(external_bench, monkeypatch: pyt
     assert "hunks 2" in result.detail
 
 
+def _tamper_task(gold: str):
+    class Task:
+        gold_patch = gold
+        fail_to_pass: list[str] = []
+        pass_to_pass: list[str] = []
+    return Task()
+
+
+def test_tamper_check_is_not_applicable_when_gold_only_adds_lines(tmp_path: Path) -> None:
+    added = "".join(f"+NOTE_{n} = {n}\n" for n in range(3))
+    gold = ("diff --git a/calc/ops.py b/calc/ops.py\n--- a/calc/ops.py\n+++ b/calc/ops.py\n"
+            f"@@ -1,1 +1,4 @@\n x = 1\n{added}")
+
+    resolved, fields = external.preflight._tamper(_tamper_task(gold), tmp_path, 8)
+
+    assert resolved is False
+    assert "n/a" in fields["detail"] and "tampered" not in fields
+
+
+def test_tamper_check_reports_when_no_removal_applies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(external.preflight, "reset_repo", lambda workdir: None)
+    monkeypatch.setattr(external.preflight, "apply_patch", lambda workdir, patch: False)
+    gold = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n-one\n+uno\n two\n"
+            "@@ -9,2 +9,2 @@\n nine\n-ten\n+diez\n")
+
+    resolved, fields = external.preflight._tamper(_tamper_task(gold), tmp_path, 8)
+
+    assert resolved is True and fields["detail"].startswith("tampered_unapplicable:")
+    assert "0 (does not apply)" in fields["detail"] and "tampered" not in fields
+
+
 def test_preflight_refuses_by_reason(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
     external_bench.seed(FB_LV2)
     assert (external.preflight.admit(FB_LV2).admitted, external.preflight.admit(FB_LV2).reason) == (False, "level2")
@@ -282,6 +326,7 @@ class _Cli:
             "rust": (SWE_RS, "fixture__calcrs-9"),
         })
         monkeypatch.setattr(external.download, "fetch", self.fetch)
+        monkeypatch.setattr(external.download, "mirror_instances", lambda dataset, instance_ids: None)
         monkeypatch.setattr(external.preflight, "admit", self.admit)
 
     def fetch(self, dataset: str, **kwargs) -> None:
@@ -378,6 +423,41 @@ def test_preflight_panel_form(external_bench, monkeypatch: pytest.MonkeyPatch, t
     assert external.preflight.main(["--panel", str(panel)]) != 0
     assert "featurebench" in capsys.readouterr().err
 
+def test_cached_rows_with_a_missing_mirror_are_mirrored_for_the_panel(external_bench,
+                                                                     monkeypatch: pytest.MonkeyPatch,
+                                                                     tmp_path: Path) -> None:
+    external_bench.seed(SWE_GO)
+    row = external_bench.row(SWE_GO)
+    mirrored: list[tuple[str, str]] = []
+    monkeypatch.setattr(external.download, "fetch", lambda *args, **kwargs: pytest.fail("rows are cached"))
+    monkeypatch.setattr(external.download, "ensure_mirror", lambda repo, commit: mirrored.append((repo, commit)))
+    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: verdict(instance_id, True))
+    panel = tmp_path / "panel.json"
+    panel.write_text(json.dumps({"members": [{"id": SWE_GO, "family": "swebench_ml"}]}))
+
+    external.preflight._panel(panel)
+
+    assert mirrored == [(row["repo"], row["base_commit"])]
+
+
+def test_one_unmirrorable_commit_does_not_stop_the_others(external_bench, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    external_bench.seed(SWE_GO)
+    external_bench.seed(SWE_RS)
+    bad_commit = external_bench.row(SWE_GO)["base_commit"]
+    mirrored: list[str] = []
+
+    def ensure_mirror(repo: str, commit: str) -> None:
+        if commit == bad_commit:
+            raise RuntimeError(f"cannot fetch {commit}")
+        mirrored.append(commit)
+
+    monkeypatch.setattr(external.download, "ensure_mirror", ensure_mirror)
+
+    external.download.mirror_instances("swebench_ml", [SWE_GO, SWE_RS])
+
+    assert mirrored == [external_bench.row(SWE_RS)["base_commit"]]
+    assert SWE_GO in capsys.readouterr().err
 
 _PRE_VERSION_VERDICT = {"instance_id": SWE_PY, "dataset": "swebench_ml", "data_rev": external.SWEBENCH_ML_REVISION,
                         "env_fingerprint": "y", "admitted": True, "reason": "admitted", "gold": [3, 3],
@@ -407,14 +487,14 @@ def test_stale_schema_verdict_is_recomputed(external_bench, monkeypatch: pytest.
 
 def test_hung_toolchain_probe_does_not_crash_admit(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
     external_bench.seed(SWE_PY)
-    recording = external.proc.run
+    recording = subprocess.run
 
     def hung_uv(argv, **kwargs):
         if list(argv) == ["uv", "--version"]:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         return recording(argv, **kwargs)
 
-    monkeypatch.setattr(external.proc, "run", hung_uv)
+    monkeypatch.setattr(subprocess, "run", hung_uv)
     monkeypatch.setattr(external.preflight, "round_trip", lambda task, fingerprint: verdict(SWE_PY, True))
 
     assert external.preflight.admit(SWE_PY).admitted is True

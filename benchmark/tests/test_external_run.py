@@ -83,6 +83,7 @@ def _verdict(instance_id: str, admitted: bool, reason: str) -> external.prefligh
 @dataclass
 class PreparedTask(StoreTask):
     repo: str = "not_a_fixture_repo"
+    fixture_path = None
     prepared_into: Path | None = None
 
     def prepare(self, workdir: Path) -> None:
@@ -274,13 +275,41 @@ def test_identity_inputs_change_run_key(external_bench, monkeypatch: pytest.Monk
     if changed == "toolchain":
         monkeypatch.setattr(run, "_probe_version", lambda argv: f"{argv[0]} 9.9.9")
     elif changed == "lockfile":
-        monkeypatch.setattr(base, "base_file_hashes", lambda names: {"Cargo.lock": "f" * 64})
+        edited = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+        monkeypatch.setattr(edited, "base_file_hashes", lambda names: {"Cargo.lock": "f" * 64})
+        monkeypatch.setitem(run.TASKS, SWE_RS, edited)
     else:
         row, revision = _changed_rows(external_bench)[changed]
         monkeypatch.setitem(run.TASKS, SWE_RS, external.swebench_ml.SweBenchTask(row, revision))
 
     assert _identity(SWE_RS)["run_key"] != before
 
+
+def test_preflight_and_run_share_one_external_fingerprint(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+    probe = lambda argv: f"{argv[0]} 1.2.3"  # noqa: E731
+    monkeypatch.setattr(run, "_probe_version", probe)
+
+    assert run.env_fingerprint(task) == external.preflight.env_fingerprint(task, probe=probe)
+
+
+def test_external_dependency_hashes_are_computed_once_per_instance(
+    external_bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+    reads = []
+    original = task.base_file
+    monkeypatch.setattr(task, "base_file", lambda name: reads.append(name) or original(name))
+
+    run.env_fingerprint(task)
+    after_first = len(reads)
+    run.env_fingerprint(task)
+    external.preflight.env_fingerprint(task)
+
+    assert after_first > 0
+    assert len(reads) == after_first
 
 def test_external_helper_edit_changes_only_external_run_key(bench, external_bench,
                                                             monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -341,21 +370,47 @@ def test_grader_material_only_in_reason(bench, external_bench, monkeypatch: pyte
 # --- AC-4 / AC-5: guard and --tasks resolution ---
 
 
-def test_guard_uses_admit(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
-                          capsys: pytest.CaptureFixture[str]) -> None:
+def test_admit_runs_once_per_task(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
+                                  capsys: pytest.CaptureFixture[str]) -> None:
     external_bench.seed(SWE_PY)
-    monkeypatch.setitem(run.TASKS, SWE_PY, load(SWE_PY))
+    monkeypatch.setattr(run, "TASKS", dict(run.TASKS))
     bench.runner(lambda _stream: 0.1)
-    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, False, "tampered_resolved"))
+    admits: list[str] = []
+    verdict = {"admitted": False, "reason": "tampered_resolved"}
+
+    def fake_admit(instance_id: str) -> external.preflight.PreflightVerdict:
+        admits.append(instance_id)
+        return _verdict(instance_id, verdict["admitted"], verdict["reason"])
+
+    monkeypatch.setattr(external.preflight, "admit", fake_admit)
 
     assert bench.main("--tasks", SWE_PY, *_ARGS) != 0
     assert bench.calls == []
     error = capsys.readouterr().err
     assert SWE_PY in error and "tampered_resolved" in error
+    assert admits == [SWE_PY]
 
-    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, True, "admitted"))
+    admits.clear()
+    verdict.update(admitted=True, reason="admitted")
     assert bench.main("--tasks", SWE_PY, *_ARGS) == 0
     assert bench.calls == [(SWE_PY, "plain", 0)]
+    assert admits == [SWE_PY]
+
+
+def test_prepare_failure_is_not_charged(bench, external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_PY)
+    monkeypatch.setattr(run, "TASKS", dict(run.TASKS))
+    monkeypatch.setattr(external.preflight, "admit", lambda instance_id: _verdict(instance_id, True, "admitted"))
+
+    def broken_prepare(self, workdir: Path) -> None:
+        raise external.task.EnvBuildError("pip exited 1")
+
+    monkeypatch.setattr(external.ExternalTask, "prepare", broken_prepare)
+
+    assert bench.main("--tasks", SWE_PY, *_ARGS) == 0
+    [row] = bench.output_rows()
+    assert row["infra"] == "prepare" and "pip exited 1" in row["error"]
+    assert row["correct"] is False and row["charged_usd"] == 0.0
 
 
 def test_tasks_flag_registers_and_prepares_external(bench, external_bench, monkeypatch: pytest.MonkeyPatch) -> None:

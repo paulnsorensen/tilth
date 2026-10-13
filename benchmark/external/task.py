@@ -1,23 +1,26 @@
 """ExternalTask: one pinned external benchmark instance, prepared and graded natively (no containers).
 
-A prepared workdir is the instance's ``base_commit`` tree, exported from the bare
-upstream mirror and transformed by the dataset (FeatureBench applies its mask),
-committed as the only commit of a fresh repository. Grading copies the agent's
-changes onto a freshly exported prepared tree, restores the held-out tests and
-(for Python) the pytest configuration from the mirror, and runs them. Python
-tests run in a grading venv cached under the harness data directory, never in
-the agent-writable ``<workdir>/.venv``.
+A prepared workdir is the ``base_commit`` tree of the instance.
+Prepare exports it from the bare upstream mirror and the dataset transforms it.
+FeatureBench applies its mask.
+The result is the only commit of a fresh repository.
+Grading copies the changes of the agent onto a freshly exported prepared tree.
+It restores the held-out tests from the mirror.
+For Python, it also restores the pytest configuration.
+Then it runs the tests.
+Python tests run in a grading venv cached under the harness data directory.
+They never run in the agent-writable ``<workdir>/.venv``.
 """
 
 import fcntl
 import filecmp
 import hashlib
-import io
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -27,16 +30,18 @@ from collections.abc import Iterable, Mapping
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
+import baselines
 from tasks.base import GroundTruth, Task, TaskSource
 
-from . import data, proc
+from . import data, patches, proc
 
-# The external package; every .py file in it keys an external task's run.
+# The external package; its grading modules key an external task's run.
 PACKAGE_DIR = Path(__file__).resolve().parent
+_NON_GRADING_MODULES = frozenset({"contamination.py", "download.py", "preflight.py"})
 # Paths the prepared workdir excludes from git; grading never copies them.
 EXCLUDED_PATHS = (".venv/", "target/")
 _SKIPPED_TOP = {".git", ".venv", "target"}
-_SKIPPED_ANYWHERE = {"__pycache__", ".pytest_cache"}
+_SKIPPED_ANYWHERE = {".git", "__pycache__", ".pytest_cache"}
 _PREPARED_COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "tilth-bench",
     "GIT_AUTHOR_EMAIL": "tilth-bench@localhost",
@@ -98,13 +103,41 @@ def _tree_files(root: Path) -> set[str]:
                 directories.remove(directory)
                 if not skipped:
                     files.add((relative / directory).as_posix())
-        files.update((relative / name).as_posix() for name in names)
+        files.update((relative / name).as_posix() for name in names if name != ".git")
     return files
 
 
+def report_path(checkout: Path, name: str) -> Path:
+    """A path for a test report in a fresh directory beside ``checkout``, outside the agent's tree."""
+    directory = checkout.with_name(f"{checkout.name}-reports")
+    directory.mkdir(exist_ok=True)
+    return directory / name
+
+
+def read_report(path: Path) -> str:
+    """The report file's text, or an empty string when the run wrote none."""
+    return path.read_text(errors="replace") if path.is_file() else ""
+
+
+def _configures_pytest(pyproject: bytes | None) -> bool:
+    """True when a ``pyproject.toml`` has a ``tool.pytest`` table or cannot be parsed."""
+    if pyproject is None:
+        return False
+    try:
+        tool = tomllib.loads(pyproject.decode()).get("tool")
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+    return isinstance(tool, dict) and "pytest" in tool
+
+
 def _copy_changes(workdir: Path, checkout: Path) -> None:
-    """Make ``checkout`` hold the agent's tree: copy changed and new files, drop deleted ones."""
+    """Make ``checkout`` hold the agent's tree: copy changed and new files, drop deleted ones.
+
+    A path that is a file in one tree and a directory in the other gets the agent's type.
+    """
     agent, clean = _tree_files(workdir), _tree_files(checkout)
+    for relative in clean - agent:
+        (checkout / relative).unlink()
     for relative in sorted(agent):
         source, target = workdir / relative, checkout / relative
         unchanged = (relative in clean and not source.is_symlink() and not target.is_symlink()
@@ -112,11 +145,11 @@ def _copy_changes(workdir: Path, checkout: Path) -> None:
         if unchanged:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink() or target.exists():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.is_symlink() or target.exists():
             target.unlink()
         shutil.copy2(source, target, follow_symlinks=False)
-    for relative in clean - agent:
-        (checkout / relative).unlink()
 
 
 def checkout_path(root: Path, relative: str) -> Path:
@@ -148,11 +181,11 @@ def write_or_remove(root: Path, relative: str, content: bytes | None) -> None:
 
 
 def package_digest() -> str:
-    """SHA-256 over every .py file in the external package, keyed by sorted relative path."""
-    digest = hashlib.sha256()
-    for relative in sorted(path.relative_to(PACKAGE_DIR).as_posix() for path in PACKAGE_DIR.rglob("*.py")):
-        digest.update(f"{relative}\0{hashlib.sha256((PACKAGE_DIR / relative).read_bytes()).hexdigest()}\n".encode())
-    return digest.hexdigest()
+    """SHA-256 over the grading modules of the external package.
+
+    Contamination scanning, downloads, and admission do not grade a cell, so an edit to them keeps the digest.
+    """
+    return baselines.tree_sha256(PACKAGE_DIR, "*.py", exclude=_NON_GRADING_MODULES)
 
 
 def read_row(dataset: str, data_rev: str, instance_id: str) -> dict:
@@ -175,9 +208,9 @@ class ExternalTask(Task):
     def __init__(self, row: Mapping, data_rev: str) -> None:
         self.row = dict(row)
         self.data_rev = data_rev
-        self.language = data.language_of(row)
-        if self.language not in data.LANGUAGES:
-            raise ValueError(f"{self.name}: unsupported language {self.language!r}")
+        self._language = data.language_of(row)
+        if self._language not in data.LANGUAGES:
+            raise ValueError(f"{self.name}: unsupported language {self._language!r}")
         self._details = self._count({})
 
     # --- Task surface ---
@@ -214,6 +247,14 @@ class ExternalTask(Task):
     def source(self) -> TaskSource:
         return TaskSource(origin=data.upstream_url(self.upstream_repo), license="upstream",
                           commit_or_tag=self.base_commit, transformation=self.transformation)
+
+    @property
+    def language(self) -> str:
+        return self._language
+
+    @property
+    def fixture_path(self) -> None:
+        return None
 
     @property
     def timeout_s(self) -> int:
@@ -255,6 +296,7 @@ class ExternalTask(Task):
             "PASS_TO_PASS": list(self.pass_to_pass),
             "base_commit": self.base_commit,
             "data_revision": self.data_rev,
+            "repo_settings": self.row.get("repo_settings"),
             # Grading helpers outside the task's class files (patches, preflight, proc, ...).
             "external_package": package_digest(),
         }
@@ -296,6 +338,17 @@ class ExternalTask(Task):
                 hashes[name] = hashlib.sha256(content).hexdigest()
         return hashes
 
+    @cached_property
+    def _dependency_hashes(self) -> dict[str, str]:
+        hashes = self.base_file_hashes(baselines.EXTERNAL_DEPENDENCY_FILES)
+        if self.python_version:
+            hashes["python_version"] = self.python_version
+        return hashes
+
+    def dependency_hashes(self) -> dict[str, str]:
+        """The base tree's dependency file hashes and requested interpreter; computed once per instance."""
+        return self._dependency_hashes
+
     def declared_package(self) -> str | None:
         """A package name the row itself declares; datasets override."""
         return None
@@ -329,16 +382,25 @@ class ExternalTask(Task):
 
     def export_prepared(self, dest: Path) -> None:
         """Write the prepared tree (base tree plus mask) to ``dest`` without git metadata."""
-        archive = proc.run(["git", f"--git-dir={self.mirror}", "archive", "--format=tar", self.base_commit],
-                           text=False)
-        if archive.returncode:
-            raise PrepareError(f"git archive {self.base_commit} failed: {archive.stderr.decode()[-500:]}")
         dest.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tree:
+        with tempfile.TemporaryFile() as errors, subprocess.Popen(
+            ["git", f"--git-dir={self.mirror}", "archive", "--format=tar", self.base_commit],
+            stdout=subprocess.PIPE, stderr=errors, start_new_session=True,
+        ) as archive:
             try:
-                tree.extractall(dest, filter="data")
+                with tarfile.open(fileobj=archive.stdout, mode="r|") as tree:
+                    tree.extractall(dest, filter="data")
+                while archive.stdout.read(1 << 16):
+                    pass
             except tarfile.TarError as error:
+                os.killpg(archive.pid, signal.SIGKILL)
                 raise PrepareError(f"git archive {self.base_commit} does not extract safely: {error}") from error
+            except BaseException:
+                os.killpg(archive.pid, signal.SIGKILL)
+                raise
+            if archive.wait():
+                errors.seek(0)
+                raise PrepareError(f"git archive {self.base_commit} failed: {errors.read().decode()[-500:]}")
         self.apply_mask(dest)
 
     def prepare_tree(self, workdir: Path) -> None:
@@ -355,8 +417,11 @@ class ExternalTask(Task):
         return []
 
     def build_env(self, workdir: Path, venv: Path | None = None) -> None:
-        """Build the native environment: a uv venv (``<workdir>/.venv`` by default), or the host Go or Rust
-        toolchain's dependencies. Steps run under ``proc.toolchain_env`` with a throwaway HOME."""
+        """Build the native environment.
+
+        Python gets a uv venv (``<workdir>/.venv`` by default). Go and Rust get the dependencies of the host toolchain.
+        Steps run under ``proc.toolchain_env`` with a throwaway HOME.
+        """
         venv = venv or workdir / ".venv"
         if self.language == "go":
             steps = [["go", "mod", "download"]]
@@ -368,7 +433,9 @@ class ExternalTask(Task):
             steps += [_install_argv(step, venv) for step in self.install_steps()]
         with tempfile.TemporaryDirectory(prefix="tilth-external-home-") as home:
             env = proc.toolchain_env(Path(home))
-            env.update(VIRTUAL_ENV=str(venv), PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
+            # uv hardlinks venv files to its cache by default, so an in-place edit of a venv would reach every venv.
+            env.update(UV_LINK_MODE="copy", VIRTUAL_ENV=str(venv),
+                       PATH=f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}")
             for argv in steps:
                 if _command_names(argv) & _CONTAINER_TOOLS:
                     raise EnvBuildError(f"{shlex.join(argv)}: container steps are not run (native environments only)")
@@ -388,8 +455,8 @@ class ExternalTask(Task):
     def grade_venv(self) -> Path:
         """The Python grading venv, built once per (instance, env fingerprint) under the harness data directory.
 
-        It is built from the prepared tree with the row's install steps, outside
-        every agent workdir, and grading only reads it.
+        Build uses the prepared tree and the install steps of the row.
+        The venv lives outside every agent workdir. Grading only reads it.
         """
         from .preflight import env_fingerprint  # preflight imports this module
 
@@ -412,11 +479,31 @@ class ExternalTask(Task):
     def restore_heldout(self, checkout: Path) -> None:
         """Put the held-out tests into the grading checkout, overriding any agent edit."""
 
+    def prune_added_top_level(self, checkout: Path) -> None:
+        """Remove each entry in ``checkout`` and ``checkout/src`` that the base tree lacks.
+
+        Both directories are on the import path.
+        An added ``pytest.py``, ``_pytest/``, or dist-info there could shadow pytest, a plugin, or the standard library.
+        A top-level name that the gold patch creates stays, because the feature needs it.
+        """
+        for directory, prefix in ((checkout, ""), (checkout / "src", "src/")):
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            paths = self.base_paths | patches.touched_paths(self.gold_patch)
+            known = {path[len(prefix):].split("/", 1)[0] for path in paths if path.startswith(prefix)}
+            for entry in directory.iterdir():
+                if entry.name in known:
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+
     def restore_test_config(self, checkout: Path) -> None:
         """Reset every pytest configuration file to ``base_commit``, removing ones the agent added.
 
-        That is each ``conftest.py`` and pytest-reading ini file, and each
-        ``pyproject.toml`` with a ``[tool.pytest`` table in either version.
+        That is each ``conftest.py`` and pytest-reading ini file. It is also each
+        ``pyproject.toml`` with a ``tool.pytest`` table in either version, or that does not parse.
         """
         for relative in sorted(_tree_files(checkout) | self.base_paths):
             name = PurePosixPath(relative).name
@@ -425,28 +512,41 @@ class ExternalTask(Task):
             base = self.base_file(relative)
             if name == "pyproject.toml":
                 target = checkout_path(checkout, relative)
-                current = target.read_bytes() if target.is_file() else b""
-                if b"[tool.pytest" not in current + (base or b""):
+                current = target.read_bytes() if target.is_file() else None
+                if not (_configures_pytest(current) or _configures_pytest(base)):
                     continue
             write_or_remove(checkout, relative, base)
 
     @abstractmethod
-    def test_output(self, checkout: Path) -> str:
-        """Run the held-out tests natively in ``checkout`` and return their output."""
+    def test_output(self, checkout: Path) -> tuple[str, str]:
+        """Run the held-out tests natively in ``checkout``; return ``(log, report)``.
+
+        The log is the process output, for diagnosis only.
+        The report is the machine-readable result that ``entry_results`` reads.
+        Code that the agent wrote runs in the tests.
+        So a report must not be text that the tests can print.
+        """
 
     @abstractmethod
-    def entry_results(self, output: str) -> dict[str, bool]:
-        """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether it passed."""
+    def entry_results(self, report: str) -> dict[str, bool]:
+        """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether the report shows it passed."""
 
     def grade_env(self, checkout: Path) -> dict[str, str]:
-        """``proc.toolchain_env`` with a fresh HOME beside ``checkout``, for running the held-out tests."""
+        """``proc.toolchain_env`` with a fresh HOME and private Cargo and Go caches beside ``checkout``."""
         home = checkout.with_name(f"{checkout.name}-home")
         home.mkdir(exist_ok=True)
-        return proc.toolchain_env(home)
+        env = proc.toolchain_env(home)
+        proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language)
+        return env
 
     def grading_env(self, checkout: Path) -> dict[str, str]:
-        """The grading venv's environment, importing the project from ``checkout`` before the venv's install."""
-        venv = self.grade_venv()
+        """The environment of a private copy of the grading venv, importing the project from ``checkout`` first.
+
+        The copy lives beside ``checkout``.
+        So code that the agent runs during the grade cannot change the shared venv.
+        """
+        venv = checkout.with_name(f"{checkout.name}-venv")
+        shutil.copytree(self.grade_venv(), venv, symlinks=True)
         env = self.grade_env(checkout)
         sources = [str(path) for path in (checkout, checkout / "src") if path.is_dir()]
         env.update(VIRTUAL_ENV=str(venv), PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=os.pathsep.join(sources),
@@ -471,17 +571,18 @@ class ExternalTask(Task):
                 self.export_prepared(checkout)
                 _copy_changes(workdir, checkout)
                 if self.language == "python":
+                    self.prune_added_top_level(checkout)
                     self.restore_test_config(checkout)
                 self.restore_heldout(checkout)
             except (PrepareError, OSError) as error:
                 return False, f"Grading checkout failed: {error}"
             try:
-                output = self.test_output(checkout)
+                log, report = self.test_output(checkout)
             except subprocess.TimeoutExpired:
                 return False, f"Held-out tests timed out after {self.timeout_s}s"
             except (PrepareError, EnvBuildError, OSError) as error:
                 return False, f"Held-out tests could not run: {error}"
-        results = self.entry_results(output)
+        results = self.entry_results(report)
         self._details = self._count(results)
         details = self._details
         summary = (f"F2P {details['f2p_passed']}/{details['f2p_total']}, "
@@ -489,7 +590,7 @@ class ExternalTask(Task):
         failed = [entry for entry in (*self.fail_to_pass, *self.pass_to_pass) if not results.get(entry)]
         if not failed and details["f2p_total"] + details["p2p_total"]:
             return True, f"Held-out tests pass ({summary})"
-        return False, f"Held-out tests failed ({summary}): {', '.join(failed[:10])}\n{output[-1500:]}"
+        return False, f"Held-out tests failed ({summary}): {', '.join(failed[:10])}\n{log[-1500:]}"
 
     def grade_details(self) -> dict[str, float | int]:
         """Entry counts from the last ``check_correctness``; no test source or output."""
