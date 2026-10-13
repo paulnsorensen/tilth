@@ -88,6 +88,7 @@ class PaidCalls:
         except ValueError:
             priced = 0.0
         return (priced, "pricing") if priced else (estimate, "estimate")
+
     def call(self, kind: str, argv: list[str], prompt: str, cwd: Path) -> CallOutcome | None:
         """Run one isolated ``claude -p`` with ``prompt`` on stdin; None when it did not start or failed."""
         run.guard_claude_auth(os.environ)
@@ -99,9 +100,14 @@ class PaidCalls:
                      f"${self.ledger.reserve:.4f} reserved exceeds ${self.ledger.max_usd}")
             self.stop.set("ceiling")
             return None
-        if self.ledger.max_usd is not None:
+        if self.ledger.exhausted():
+            self.log(f"{kind}: not started; ${self.ledger.spent:.4f} spent + ${self.ledger.reserve:.4f} reserved "
+                     f"leaves no budget under ${self.ledger.max_usd}")
+            self.stop.set("ceiling")
+            return None
+        headroom = self.ledger.headroom()
+        if headroom is not None:
             # The CLI itself stops a call before it spends past what the run has left.
-            headroom = self.ledger.max_usd - self.ledger.spent - self.ledger.reserve
             argv = [*argv, "--max-budget-usd", f"{headroom:.4f}"]
         env = run.build_runner_env("claude", tilth_bin=None)
         with tempfile.TemporaryDirectory(prefix=f"tilth-{kind}-config-") as config_dir:

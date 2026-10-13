@@ -9,6 +9,7 @@ _INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)\s*!\s*([(\[{])")
 _PATH_ATTR = re.compile(r"#\s*!?\s*\[\s*path\s*=")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
+_RAW = re.compile(r'r(#*)"')
 _STRING = r'("(?:[^"\\]|\\.)*")'
 _COUNT = re.compile(r"SERVER_INSTRUCTIONS\.len\(\),\s*(\d+)")
 _STARTS = re.compile(r"SERVER_INSTRUCTIONS\.starts_with\(\s*" + _STRING, re.S)
@@ -20,7 +21,7 @@ def _blank(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
-def code_mask(text: str) -> str:
+def _code_mask(text: str) -> str:
     """``text`` with comments, strings, and char literals blanked; newlines and code kept in place."""
     out: list[str] = []
     i, n = 0, len(text)
@@ -42,7 +43,7 @@ def code_mask(text: str) -> str:
                     depth, end = depth - 1, end + 2
                 else:
                     end += 1
-        elif char == "r" and (raw := re.match(r'r(#*)"', text[i:])) and (
+        elif char == "r" and (raw := _RAW.match(text, i)) and (
                 not ident_before(i) or (text[i - 1] == "b" and not ident_before(i - 1))):
             closing = '"' + raw[1]
             end = text.find(closing, i + len(raw[0]))
@@ -84,14 +85,14 @@ def _line(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
-def cfg_test_items(text: str) -> list[tuple[int, int, str]]:
+def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
     """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``.
 
     That covers ``cfg(test)``, ``cfg(any(.., test))``, ``cfg(all(test, ..))``, ``cfg(not(test))``, and
     ``cfg_attr(test, ..)``; the span starts at the attribute, so the attribute itself is part of the item.
     ``head`` is the item's code before ``{`` or ``;``. An inner ``#![cfg(..test..)]`` spans the whole file.
     """
-    mask = code_mask(text)
+    mask = _code_mask(text)
     items = []
     for match in _CFG_ATTR.finditer(mask):
         close = _match_brace(mask, mask.index("[", match.start()), "[]")
@@ -109,7 +110,7 @@ def cfg_test_items(text: str) -> list[tuple[int, int, str]]:
 
 
 def cfg_test_spans(text: str) -> list[tuple[int, int]]:
-    return [(first, last) for first, last, _head in cfg_test_items(text)]
+    return [(first, last) for first, last, _head in _cfg_test_items(text)]
 
 
 def test_module_files(path: str, text: str) -> set[str]:
@@ -117,7 +118,7 @@ def test_module_files(path: str, text: str) -> set[str]:
     source = PurePosixPath(path)
     base = source.parent if source.name in {"mod.rs", "lib.rs", "main.rs"} else source.parent / source.stem
     files = set()
-    for _first, _last, head in cfg_test_items(text):
+    for _first, _last, head in _cfg_test_items(text):
         if declared := _MODULE_DECL.search(head.split("]")[-1]):
             files |= {str(base / f"{declared[1]}.rs"), str(base / declared[1] / "mod.rs")}
     return files
@@ -128,7 +129,7 @@ def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
 
     ``argument`` is the source text between the macro's delimiters, stripped.
     """
-    mask = code_mask(text)
+    mask = _code_mask(text)
     found = []
     for match in _INCLUDE.finditer(mask):
         close = _match_brace(mask, match.end() - 1, {"(": "()", "[": "[]", "{": "{}"}[match[2]])
@@ -138,7 +139,7 @@ def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
 
 def path_attributes(text: str) -> list[int]:
     """The first line of each ``#[path = ..]`` or ``#![path = ..]`` attribute, which can point a module outside the tree."""
-    mask = code_mask(text)
+    mask = _code_mask(text)
     return [_line(text, match.start()) for match in _PATH_ATTR.finditer(mask)]
 
 
@@ -162,7 +163,7 @@ def declaring_files(path: str) -> list[str]:
 
 
 def _byte_lock_matches(text: str) -> list[re.Match]:
-    mask = code_mask(text)
+    mask = _code_mask(text)
     start = mask.find(BYTE_LOCK_FN)
     if start < 0:
         raise ValueError(f"{BYTE_LOCK_FN} not found")
@@ -189,7 +190,7 @@ def blank_byte_lock(text: str) -> str:
     return text
 
 
-def rust_literal(value: str) -> str:
+def _rust_literal(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return '"' + escaped.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + '"'
 
@@ -204,8 +205,8 @@ def rewrite_byte_lock(text: str, instructions: str) -> str:
     lead_lines = escapes.count("n") + 1
     replacements = [
         (count.span(1), str(len(instructions.encode("utf-8")))),
-        (starts.span(1), rust_literal("\n".join(instructions.split("\n")[:lead_lines]))),
-        (ends.span(1), rust_literal(instructions.rsplit("\n", 1)[-1])),
+        (starts.span(1), _rust_literal("\n".join(instructions.split("\n")[:lead_lines]))),
+        (ends.span(1), _rust_literal(instructions.rsplit("\n", 1)[-1])),
     ]
     for (begin, finish), literal in sorted(replacements, reverse=True):
         text = text[:begin] + literal + text[finish:]
