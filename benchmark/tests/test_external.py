@@ -20,6 +20,7 @@ import external.preflight
 import external.proc
 import external.swebench_ml
 import external.task
+import external_support
 from external_support import (
     FB_F2P_EDIT, FB_LV1, OUTPUTS, SWE_GO, SWE_PY, SWE_RS, git, parquet_bytes, projects, rows,
 )
@@ -625,3 +626,61 @@ def test_container_after_prefix_options_is_refused(external_bench, tmp_path: Pat
 
     with pytest.raises(external.task.EnvBuildError, match="container steps"):
         task.prepare(tmp_path / "workdir")
+
+
+@pytest.mark.parametrize("shadow", ["pytest.py", "_pytest/__init__.py", "src/pytest.py", "pytest-9.0.dist-info/METADATA"])
+def test_agent_added_modules_cannot_shadow_pytest(external_bench, tmp_path: Path, shadow: str) -> None:
+    task, workdir = prepared(external_bench, SWE_PY, tmp_path)
+    apply_patch(workdir, task.gold_patch)
+    target = workdir / shadow
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("raise SystemExit(1)\n")
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct, reason
+
+
+@pytest.mark.parametrize("header", ['[tool."pytest".ini_options]', "[tool.pytest.ini_options]", "[tool.pytest"])
+def test_pyproject_pytest_tables_are_reset_however_spelled(external_bench, tmp_path: Path, header: str) -> None:
+    task, workdir = prepared(external_bench, FB_LV1, tmp_path)
+    _wrong_fix(workdir)
+    (workdir / "shapes" / "forcepass.py").write_text(_FORCE_PASS)
+    (workdir / "pyproject.toml").write_text(f'{header}\naddopts = "-p shapes.forcepass"\n')
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
+    assert task.grade_details()["f2p_passed"] == 0
+
+
+def test_pytest_table_detection_parses_toml() -> None:
+    configures = external.task._configures_pytest
+
+    assert configures(b'[tool."pytest".ini_options]\nx = 1\n')
+    assert configures(b"[tool.pytest]\n") and configures(b"[tool.pytest") and configures(b"\xff")
+    assert not configures(b"[tool.black]\nline-length = 1\n# [tool.pytest]\n") and not configures(None)
+
+
+def test_repo_settings_are_part_of_the_task_identity(external_bench) -> None:
+    first = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.1de00001.lv1",
+                                  test_cmd="pytest -rA")
+    second = _featurebench_variant(external_bench, "fixture__shapes.0a1b2c3d.test_area.1de00002.lv1",
+                                   test_cmd="pytest -rA -x")
+
+    assert first.identity_inputs()["repo_settings"] != second.identity_inputs()["repo_settings"]
+    assert first.identity_inputs() != second.identity_inputs()
+
+
+def test_copy_changes_skips_git_and_follows_type_changes(tmp_path: Path) -> None:
+    workdir, checkout = tmp_path / "workdir", tmp_path / "checkout"
+    external_support.write_tree(checkout, {"a": "file", "b/inner.txt": "inner", "keep.txt": "keep", "gone/x.txt": "x"})
+    external_support.write_tree(workdir, {"a/inner.txt": "now a directory", "b": "now a file", "keep.txt": "keep",
+                                          "sub/.git": "gitdir: /elsewhere", ".git": "gitdir: /elsewhere"})
+
+    external.task._copy_changes(workdir, checkout)
+
+    assert (checkout / "a" / "inner.txt").read_text() == "now a directory"
+    assert (checkout / "b").is_file() and (checkout / "b").read_text() == "now a file"
+    assert not (checkout / "gone" / "x.txt").exists()
+    assert not (checkout / ".git").exists() and not (checkout / "sub" / ".git").exists()

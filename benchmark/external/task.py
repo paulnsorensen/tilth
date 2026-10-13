@@ -36,7 +36,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 # Paths the prepared workdir excludes from git; grading never copies them.
 EXCLUDED_PATHS = (".venv/", "target/")
 _SKIPPED_TOP = {".git", ".venv", "target"}
-_SKIPPED_ANYWHERE = {"__pycache__", ".pytest_cache"}
+_SKIPPED_ANYWHERE = {".git", "__pycache__", ".pytest_cache"}
 _PREPARED_COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "tilth-bench",
     "GIT_AUTHOR_EMAIL": "tilth-bench@localhost",
@@ -98,13 +98,29 @@ def _tree_files(root: Path) -> set[str]:
                 directories.remove(directory)
                 if not skipped:
                     files.add((relative / directory).as_posix())
-        files.update((relative / name).as_posix() for name in names)
+        files.update((relative / name).as_posix() for name in names if name != ".git")
     return files
 
 
+def _configures_pytest(pyproject: bytes | None) -> bool:
+    """True when a ``pyproject.toml`` has a ``tool.pytest`` table or cannot be parsed."""
+    if pyproject is None:
+        return False
+    try:
+        tool = tomllib.loads(pyproject.decode()).get("tool")
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+    return isinstance(tool, dict) and "pytest" in tool
+
+
 def _copy_changes(workdir: Path, checkout: Path) -> None:
-    """Make ``checkout`` hold the agent's tree: copy changed and new files, drop deleted ones."""
+    """Make ``checkout`` hold the agent's tree: copy changed and new files, drop deleted ones.
+
+    A path that is a file in one tree and a directory in the other gets the agent's type.
+    """
     agent, clean = _tree_files(workdir), _tree_files(checkout)
+    for relative in clean - agent:
+        (checkout / relative).unlink()
     for relative in sorted(agent):
         source, target = workdir / relative, checkout / relative
         unchanged = (relative in clean and not source.is_symlink() and not target.is_symlink()
@@ -112,11 +128,11 @@ def _copy_changes(workdir: Path, checkout: Path) -> None:
         if unchanged:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink() or target.exists():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.is_symlink() or target.exists():
             target.unlink()
         shutil.copy2(source, target, follow_symlinks=False)
-    for relative in clean - agent:
-        (checkout / relative).unlink()
 
 
 def checkout_path(root: Path, relative: str) -> Path:
@@ -255,6 +271,7 @@ class ExternalTask(Task):
             "PASS_TO_PASS": list(self.pass_to_pass),
             "base_commit": self.base_commit,
             "data_revision": self.data_rev,
+            "repo_settings": self.row.get("repo_settings"),
             # Grading helpers outside the task's class files (patches, preflight, proc, ...).
             "external_package": package_digest(),
         }
@@ -412,11 +429,29 @@ class ExternalTask(Task):
     def restore_heldout(self, checkout: Path) -> None:
         """Put the held-out tests into the grading checkout, overriding any agent edit."""
 
+    def prune_added_top_level(self, checkout: Path) -> None:
+        """Remove each entry in ``checkout`` and ``checkout/src`` that the base tree lacks.
+
+        Both directories are on the import path. An added ``pytest.py``, ``_pytest/``, or
+        dist-info there could shadow pytest, a plugin, or the standard library.
+        """
+        for directory, prefix in ((checkout, ""), (checkout / "src", "src/")):
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            known = {path[len(prefix):].split("/", 1)[0] for path in self.base_paths if path.startswith(prefix)}
+            for entry in directory.iterdir():
+                if entry.name in known:
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+
     def restore_test_config(self, checkout: Path) -> None:
         """Reset every pytest configuration file to ``base_commit``, removing ones the agent added.
 
-        That is each ``conftest.py`` and pytest-reading ini file, and each
-        ``pyproject.toml`` with a ``[tool.pytest`` table in either version.
+        That is each ``conftest.py`` and pytest-reading ini file. It is also each
+        ``pyproject.toml`` with a ``tool.pytest`` table in either version, or that does not parse.
         """
         for relative in sorted(_tree_files(checkout) | self.base_paths):
             name = PurePosixPath(relative).name
@@ -425,8 +460,8 @@ class ExternalTask(Task):
             base = self.base_file(relative)
             if name == "pyproject.toml":
                 target = checkout_path(checkout, relative)
-                current = target.read_bytes() if target.is_file() else b""
-                if b"[tool.pytest" not in current + (base or b""):
+                current = target.read_bytes() if target.is_file() else None
+                if not (_configures_pytest(current) or _configures_pytest(base)):
                     continue
             write_or_remove(checkout, relative, base)
 
@@ -478,6 +513,7 @@ class ExternalTask(Task):
                 self.export_prepared(checkout)
                 _copy_changes(workdir, checkout)
                 if self.language == "python":
+                    self.prune_added_top_level(checkout)
                     self.restore_test_config(checkout)
                 self.restore_heldout(checkout)
             except (PrepareError, OSError) as error:
