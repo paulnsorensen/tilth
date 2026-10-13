@@ -13,9 +13,10 @@ import shlex
 from collections.abc import Sequence
 from functools import cached_property
 from pathlib import Path
+from xml.etree import ElementTree
 
 from . import data, patches, proc
-from .task import ExternalTask, PrepareError, apply_patch, read_row, write_or_remove
+from .task import ExternalTask, PrepareError, apply_patch, read_report, read_row, report_path, write_or_remove
 
 # COSPA featurebench_lite_pareto12_v1.json task_ids (accessed 2026-10-03).
 PARETO12_IDS = (
@@ -38,7 +39,8 @@ DEFERRED_REPOS = frozenset({
     "mlflow/mlflow",
 })
 _PASSING = {"PASSED", "XFAIL", "XPASS"}
-_RESULT_LINE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS) (.+?)(?: - .*)?$")
+# xunit1 records each test's file; xunit2 does not.
+JUNIT_OPTIONS = ("-o", "junit_family=xunit1")
 
 
 def level_of(instance_id: str) -> str | None:
@@ -58,14 +60,40 @@ def candidates(pareto_ids: Sequence[str] | None = None) -> list[str]:
             if level_of(instance_id) == "lv1" and repo_of(instance_id) not in DEFERRED_REPOS]
 
 
-def pytest_results(output: str) -> list[tuple[str, str]]:
-    """``(status, node ID)`` for every result line of ``pytest -rA`` output."""
-    return [(match[1], match[2]) for line in output.splitlines() if (match := _RESULT_LINE.match(line))]
+def junit_results(report: str) -> list[tuple[str, str]]:
+    """``(status, node ID)`` for every recorded test of a pytest JUnit XML report (``junit_family=xunit1``).
+
+    The report is a file pytest writes outside the checkout, so test output the agent prints
+    cannot add a result. A plain skip records no result.
+    """
+    try:
+        root = ElementTree.fromstring(report)
+    except ElementTree.ParseError:
+        return []
+    results = []
+    for case in root.iter("testcase"):
+        file, classname = case.get("file"), case.get("classname") or ""
+        if not file or not file.endswith(".py") or case.get("name") is None:
+            continue
+        module = file[:-3].replace("/", ".")
+        classes = classname[len(module):].split(".") if classname.startswith(module) else []
+        node = "::".join([file, *(part for part in classes if part), case.get("name")])
+        children = {child.tag: child for child in case}
+        if "failure" in children:
+            results.append(("FAILED", node))
+        elif "error" in children:
+            results.append(("ERROR", node))
+        elif "skipped" in children:
+            if children["skipped"].get("type") == "pytest.xfail":
+                results.append(("XFAIL", node))
+        else:
+            results.append(("PASSED", node))
+    return results
 
 
-def file_verdicts(output: str, entries: Sequence[str]) -> dict[str, bool]:
+def file_verdicts(report: str, entries: Sequence[str]) -> dict[str, bool]:
     """A file entry passes when pytest collected at least one ``<path>::`` node and all of them passed."""
-    results = pytest_results(output)
+    results = junit_results(report)
     verdicts = {}
     for entry in entries:
         statuses = [status for status, node in results if node.startswith(f"{entry}::")]
@@ -128,18 +156,19 @@ class FeatureBenchTask(ExternalTask):
                 break
         return tokens if "-rA" in tokens else ["-rA", *tokens]
 
-    def test_output(self, checkout: Path) -> str:
+    def test_output(self, checkout: Path) -> tuple[str, str]:
         env = self.grading_env(checkout)
+        report = report_path(checkout, "pytest.xml")
         argv = [str(Path(env["VIRTUAL_ENV"]) / "bin" / "python"), "-m", "pytest", *self._pytest_options(),
                 "--continue-on-collection-errors", "-p", "no:cacheprovider",
-                # pytest-pretty replaces the -rA summary these results are parsed from.
-                "-p", "no:pretty",
+                # pytest-pretty replaces the -rA summary in the log.
+                "-p", "no:pretty", *JUNIT_OPTIONS, f"--junitxml={report}",
                 *self.fail_to_pass, *self.pass_to_pass]
         result = proc.run(argv, cwd=checkout, env=env, timeout=self.timeout_s)
-        return result.stdout + result.stderr
+        return result.stdout + result.stderr, read_report(report)
 
-    def entry_results(self, output: str) -> dict[str, bool]:
-        return file_verdicts(output, [*self.fail_to_pass, *self.pass_to_pass])
+    def entry_results(self, report: str) -> dict[str, bool]:
+        return file_verdicts(report, [*self.fail_to_pass, *self.pass_to_pass])
 
 
 def load(instance_id: str, data_rev: str) -> FeatureBenchTask:

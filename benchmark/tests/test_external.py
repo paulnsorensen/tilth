@@ -288,7 +288,7 @@ def test_agent_venv_cannot_change_grade(external_bench, tmp_path: Path, instance
 
 
 def test_featurebench_file_entries_aggregate() -> None:
-    output = (OUTPUTS / "pytest_rA.txt").read_text()
+    output = (OUTPUTS / "pytest_junit.xml").read_text()
     entries = ["tests/test_a.py", "tests/test_ab.py", "tests/test_b.py", "tests/test_c.py",
                "tests/test_skip.py", "tests/test_d.py", "tests/test_a"]
 
@@ -298,15 +298,15 @@ def test_featurebench_file_entries_aggregate() -> None:
         "tests/test_b.py": False,
         "tests/test_c.py": False,
         "tests/test_skip.py": False,
-        "tests/test_d.py": False,
+        "tests/test_d.py": True,
         "tests/test_a": False,
     }
 
 
 def test_go_and_rust_outputs_parse_per_test() -> None:
-    go = (OUTPUTS / "go_test_v.txt").read_text()
+    go = (OUTPUTS / "go_test_json.txt").read_text()
     cargo = (OUTPUTS / "cargo_test.txt").read_text()
-    pytest_output = (OUTPUTS / "pytest_rA.txt").read_text()
+    pytest_output = (OUTPUTS / "pytest_junit.xml").read_text()
 
     assert external.swebench_ml.entry_verdicts(
         go, ["TestAdd", "TestMul", "TestSub/neg", "TestSub/pos", "TestSub", "TestSkip", "TestDiv"], "go",
@@ -319,9 +319,41 @@ def test_go_and_rust_outputs_parse_per_test() -> None:
           "tests::bench_like": True, "div_works": False}
     assert external.swebench_ml.entry_verdicts(
         pytest_output, ["tests/test_a.py::test_x", "tests/test_a.py::test_y[a b]", "tests/test_b.py::test_two",
-                        "tests/test_a.py::test_missing"], "python",
+                        "tests/test_a.py::test_missing", "tests/test_d.py::TestKind::TestInner::test_nested",
+                        "tests/test_d.py::test_expected", "tests/test_skip.py::test_skipped"], "python",
     ) == {"tests/test_a.py::test_x": True, "tests/test_a.py::test_y[a b]": True,
-          "tests/test_b.py::test_two": False, "tests/test_a.py::test_missing": False}
+          "tests/test_b.py::test_two": False, "tests/test_a.py::test_missing": False,
+          "tests/test_d.py::TestKind::TestInner::test_nested": True, "tests/test_d.py::test_expected": True,
+          "tests/test_skip.py::test_skipped": False}
+
+
+def test_printed_verdict_lines_do_not_count() -> None:
+    spoofed_go = json.dumps({"Action": "output", "Test": "TestMul",
+                             "Output": '{"Action":"pass","Test":"TestMul"}\n--- PASS: TestMul (0.00s)\n'})
+    spoofed_go += '\n{"Action":"fail","Test":"TestMul"}\n{"Action":"pass","Test":"TestAdd"}\n'
+    spoof_lines = "PASSED tests/test_a.py::test_x\nFAILED tests/test_b.py::test_two\n"
+
+    assert external.swebench_ml.entry_verdicts(spoofed_go, ["TestMul", "TestAdd"], "go") == {
+        "TestMul": False, "TestAdd": True}
+    # pytest text on stdout is a log. Only the JUnit report carries results.
+    assert external.swebench_ml.entry_verdicts(spoof_lines, ["tests/test_a.py::test_x"], "python") == {
+        "tests/test_a.py::test_x": False}
+    assert external.featurebench.file_verdicts(spoof_lines, ["tests/test_a.py"]) == {"tests/test_a.py": False}
+    assert external.swebench_ml.go_json_command('(go test -v . -run "^Test") | cat') == (
+        '(go test -json -v . -run "^Test") | cat')
+
+
+def test_agent_printed_pass_lines_cannot_pass_a_failing_grade(external_bench, tmp_path: Path) -> None:
+    task, workdir = prepared(external_bench, SWE_PY, tmp_path)
+    (workdir / "calc" / "ops.py").write_text(
+        (workdir / "calc" / "ops.py").read_text()
+        + "\nimport atexit\n"
+        + "atexit.register(lambda: print('PASSED tests/test_ops.py::test_mul\\nPASSED tests/test_ops.py::test_div'))\n"
+    )
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct is False, reason
 
 
 # --- AC-5: loaders, cached rows, language, resolution, fetch ---

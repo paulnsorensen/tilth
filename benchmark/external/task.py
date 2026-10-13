@@ -102,6 +102,18 @@ def _tree_files(root: Path) -> set[str]:
     return files
 
 
+def report_path(checkout: Path, name: str) -> Path:
+    """A path for a test report in a fresh directory beside ``checkout``, outside the agent's tree."""
+    directory = checkout.with_name(f"{checkout.name}-reports")
+    directory.mkdir(exist_ok=True)
+    return directory / name
+
+
+def read_report(path: Path) -> str:
+    """The report file's text, or an empty string when the run wrote none."""
+    return path.read_text(errors="replace") if path.is_file() else ""
+
+
 def _configures_pytest(pyproject: bytes | None) -> bool:
     """True when a ``pyproject.toml`` has a ``tool.pytest`` table or cannot be parsed."""
     if pyproject is None:
@@ -466,12 +478,17 @@ class ExternalTask(Task):
             write_or_remove(checkout, relative, base)
 
     @abstractmethod
-    def test_output(self, checkout: Path) -> str:
-        """Run the held-out tests natively in ``checkout`` and return their output."""
+    def test_output(self, checkout: Path) -> tuple[str, str]:
+        """Run the held-out tests natively in ``checkout``; return ``(log, report)``.
+
+        The log is the process output, for diagnosis only. The report is the
+        machine-readable result that ``entry_results`` reads. Code the agent wrote
+        runs in the tests, so a report must not be text the tests can print.
+        """
 
     @abstractmethod
-    def entry_results(self, output: str) -> dict[str, bool]:
-        """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether it passed."""
+    def entry_results(self, report: str) -> dict[str, bool]:
+        """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether the report shows it passed."""
 
     def grade_env(self, checkout: Path) -> dict[str, str]:
         """``proc.toolchain_env`` with a fresh HOME and private Cargo and Go caches beside ``checkout``."""
@@ -519,12 +536,12 @@ class ExternalTask(Task):
             except (PrepareError, OSError) as error:
                 return False, f"Grading checkout failed: {error}"
             try:
-                output = self.test_output(checkout)
+                log, report = self.test_output(checkout)
             except subprocess.TimeoutExpired:
                 return False, f"Held-out tests timed out after {self.timeout_s}s"
             except (PrepareError, EnvBuildError, OSError) as error:
                 return False, f"Held-out tests could not run: {error}"
-        results = self.entry_results(output)
+        results = self.entry_results(report)
         self._details = self._count(results)
         details = self._details
         summary = (f"F2P {details['f2p_passed']}/{details['f2p_total']}, "
@@ -532,7 +549,7 @@ class ExternalTask(Task):
         failed = [entry for entry in (*self.fail_to_pass, *self.pass_to_pass) if not results.get(entry)]
         if not failed and details["f2p_total"] + details["p2p_total"]:
             return True, f"Held-out tests pass ({summary})"
-        return False, f"Held-out tests failed ({summary}): {', '.join(failed[:10])}\n{output[-1500:]}"
+        return False, f"Held-out tests failed ({summary}): {', '.join(failed[:10])}\n{log[-1500:]}"
 
     def grade_details(self) -> dict[str, float | int]:
         """Entry counts from the last ``check_correctness``; no test source or output."""
