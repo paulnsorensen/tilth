@@ -31,7 +31,7 @@ _GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 
 @dataclass(frozen=True)
 class _Upstream:
-    """Fetch hosts always count; a github.com URL counts only inside a fetch command."""
+    """Fetch hosts always count; a github.com URL counts inside a fetch command or a fetch tool's input."""
 
     hosts: re.Pattern
     repo_url: re.Pattern
@@ -154,8 +154,13 @@ def _fetches_package(text: str, rules: _Rules) -> bool:
     return False
 
 
-def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
+def _is_fetch_tool(name: object) -> bool:
+    return isinstance(name, str) and "fetch" in name.lower()
+
+
+def _call_reasons(tool_input: object, rules: _Rules, tool: object = None) -> list[str]:
     reasons: list[str] = []
+    fetching = _is_fetch_tool(tool)
     for text in _strings(tool_input):
         for path in _paths(text):
             if _under(path, rules.benchmark_roots):
@@ -164,7 +169,8 @@ def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
                 reasons.append("harness_data")
             elif _under(path, rules.foreign_roots):
                 reasons.append("foreign_repo_clone")
-        if rules.upstream is not None and rules.upstream.fetched_by(text):
+        if rules.upstream is not None and (rules.upstream.fetched_by(text)
+                                           or (fetching and rules.upstream.repo_url.search(text))):
             reasons.append("upstream_fetch")
         if _fetches_package(text, rules):
             reasons.append("package_source")
@@ -178,7 +184,7 @@ def find_hits(sidecar_path: str | Path | None, task: object) -> list[dict]:
     rules = _rules(task)
     hits = []
     for call in tolerant_jsonl(Path(sidecar_path).read_text()):
-        for reason in _call_reasons(call.get("input"), rules):
+        for reason in _call_reasons(call.get("input"), rules, call.get("name")):
             hits.append({"reason": reason, "tool": call.get("name"), "input": call.get("input")})
     return hits
 

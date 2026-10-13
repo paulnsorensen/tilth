@@ -74,6 +74,25 @@ def test_upstream_raw_and_gh_fetch_marks_contaminated(tmp_path: Path) -> None:
                     "git fetch https://github.com/gin-gonic/gin.git"):
         assert "upstream_fetch" in reasons(sidecar(tmp_path, ("Bash", {"command": command})), task), command
 
+@pytest.mark.parametrize("url", [
+    "https://github.com/gin-gonic/gin/pull/3741",
+    "https://github.com/gin-gonic/gin/commit/abc123",
+    "https://github.com/gin-gonic/gin",
+])
+def test_web_fetch_of_upstream_url_marks_contaminated(tmp_path: Path, url: str) -> None:
+    task = TASKS["gin_edit_render_context"]
+    path = sidecar(tmp_path, ("WebFetch", {"url": url, "prompt": "summarize"}))
+
+    assert "upstream_fetch" in reasons(path, task)
+
+
+def test_web_fetch_of_other_repo_is_clean(tmp_path: Path) -> None:
+    task = TASKS["gin_edit_render_context"]
+    path = sidecar(tmp_path, ("WebFetch", {"url": "https://github.com/other/project/pull/1", "prompt": "x"}))
+
+    assert "upstream_fetch" not in reasons(path, task)
+
+
 def test_benchmark_tree_read_marks_local_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     task = TASKS["rg_search_dispatch"]
     home = config.BENCHMARK_DIR.parent.parent
