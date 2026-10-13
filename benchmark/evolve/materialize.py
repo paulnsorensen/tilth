@@ -27,14 +27,33 @@ class ApplyRejected(RuntimeError):
         self.tail = f"{reason}\n{tail}".strip()
 
 
+def _diff_path(marker: str, line: str) -> str | None:
+    """The path on a ``---`` or ``+++`` line; None for ``/dev/null``. Git appends a tab when the path has spaces."""
+    name = line[4:].removesuffix("\t")
+    if name == "/dev/null":
+        return None
+    if not name.startswith(marker):
+        raise ApplyRejected(f"cannot read a changed path from the diff line {line!r}")
+    return name[len(marker):]
+
+
 def changed_lines(diff: str) -> dict[str, tuple[set[int], set[int]]]:
-    """Map each file in a ``-U0`` diff to its (removed seed lines, added candidate lines)."""
+    """Map each file in a ``-U0`` diff to its (removed seed lines, added candidate lines).
+
+    The path comes from the ``---`` and ``+++`` lines, so a path with spaces keeps its full name.
+    """
     files: dict[str, tuple[set[int], set[int]]] = {}
     current = None
+    old_path = None
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            current = line.split(" b/", 1)[1]
-            files[current] = (set(), set())
+            current = old_path = None
+        elif line.startswith("--- ") and current is None:
+            old_path = _diff_path("a/", line)
+        elif line.startswith("+++ ") and current is None:
+            current = _diff_path("b/", line) or old_path
+            if current is not None:
+                files[current] = (set(), set())
         elif current and (hunk := _HUNK.match(line)):
             old, old_count = int(hunk[1]), int(hunk[2] or 1)
             new, new_count = int(hunk[3]), int(hunk[4] or 1)
@@ -176,7 +195,7 @@ class Materializer:
 
     def _refuse_harness_reach(self, worktree: Path, diff: str) -> None:
         """Refuse added ``src/**`` lines that name the harness, include a file outside ``src/`` and ``prompts/``,
-        or carry a ``#[path]`` attribute."""
+        import an include macro, test ``cfg!(test)``, or carry a ``#[path]`` attribute."""
         root = Path(worktree).resolve()
         allowed = [root / prefix.rstrip("/") for prefix in ALLOWED_PREFIXES]
         for path, (_removed, added) in changed_lines(diff).items():
@@ -190,8 +209,15 @@ class Materializer:
                 if any(term.lower() in line for term in self.forbidden):
                     # The tail reaches the proposer, so it does not repeat the harness name.
                     raise ApplyRejected(f"{path}:{number} names the benchmark harness")
-            if not path.endswith(".rs"):
-                continue
+            # Every file under src/ is lexed, not only .rs: an include! can pull in any extension.
+            for first, last in rust.include_aliases(text):
+                if any(first <= number <= last for number in added):
+                    raise ApplyRejected(f"{path}:{first} imports include, include_str, or include_bytes by a path, "
+                                        "which can rename the macro and hide its file")
+            for first, last in rust.cfg_test_macros(text):
+                if any(first <= number <= last for number in added):
+                    raise ApplyRejected(f"{path}:{first} uses cfg!(..test..), which makes code differ between tests and "
+                                        "release")
             for number in rust.path_attributes(text):
                 if number in added:
                     raise ApplyRejected(f"{path}:{number} uses a #[path] attribute, which can point a module outside "

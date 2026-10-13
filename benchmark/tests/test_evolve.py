@@ -1775,3 +1775,62 @@ def test_paid_call_refuses_below_the_minimum_headroom(world, tmp_path: Path) -> 
 
     assert paid.call("reflection", ["claude", "-p"], "prompt", tmp_path) is None
     assert started == [] and stop.reason == "ceiling"
+
+
+def test_real_gepa_reflection_prompt_carries_the_records(world) -> None:
+    world.judge.calibrated = True
+    evo = build(world, calls="12")
+    assert evo.preflight() is None and evo.buy_baselines() is None
+    evo.search()
+
+    prompts = [call["input"] for call in world.spawned if "<records>" in call.get("input", "")]
+    assert prompts, "gepa never reached the reflection"
+    records = prompts[0].split("<records>", 1)[1]
+    assert "[dev_a:" in records  # the rollout's tool output reached the real gepa reflection prompt
+    assert '"label": "strong"' in records and "verdict: apt" in records
+
+
+HIDDEN = 'concat!(env!("CARGO_MANIFEST_DIR"), "/../x")'
+
+
+@pytest.mark.parametrize("files", [
+    {"src/lib.rs": LIB + f"use std::include_str as grab;\npub const P: &str = grab!({HIDDEN});\n"},
+    {"src/lib.rs": LIB + f"use std::{{include_str as grab, mem}};\npub const P: &str = grab!({HIDDEN});\n"},
+    {"src/lib.rs": LIB + "pub use core::include_bytes as grab;\n"},
+    {"src/lib.rs": LIB + 'include!("evil.inc");\n',
+     "src/evil.inc": f"pub const P: &str = include_str!({HIDDEN});\n"},
+    {"src/lib.rs": LIB + 'include!("evil.inc");\n',
+     "src/evil.inc": 'pub const P: &str = include_str!("../../outside.txt");\n'},
+], ids=["alias", "grouped-alias", "reexport", "nested-inc-concat", "nested-inc-outside"])
+def test_rejects_include_bypasses(world, files: dict[str, str]) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+
+    with pytest.raises(ApplyRejected, match="include"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, files)})
+    assert refs(world) == []
+
+
+def test_rejects_a_changed_path_with_spaces(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/x b/evil.rs": 'pub const P: &str = include_str!("../../../Cargo.toml");\n'})
+
+    with pytest.raises(ApplyRejected, match=r"src/x b/evil\.rs:1"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+@pytest.mark.parametrize("expression", ["cfg!(test)", "cfg!(any(test, debug_assertions))", "cfg ! [all(unix, test)]"])
+def test_rejects_cfg_macro_naming_test(world, expression: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + f"pub fn gated() -> bool {{ {expression} }}\n"})
+
+    with pytest.raises(ApplyRejected, match=r"cfg!"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+def test_cfg_macro_without_test_is_kept(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    lines = 'pub fn debug() -> bool { cfg!(debug_assertions) }\npub const S: &str = "cfg!(test)"; // cfg!(test)\n'
+    sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
+    assert sha != world.seed_sha

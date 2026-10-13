@@ -6,6 +6,9 @@ from pathlib import PurePosixPath
 _CFG_ATTR = re.compile(r"#(!?)\[\s*(?:cfg|cfg_attr)\s*\(")
 _TEST_TOKEN = re.compile(r"\btest\b")
 _INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)\s*!\s*([(\[{])")
+_USE = re.compile(r"\buse\b([^;]*);")
+_INCLUDE_NAME = re.compile(r"\binclude(?:_str|_bytes)?\b")
+_CFG_MACRO = re.compile(r"\bcfg\s*!\s*([(\[{])")
 _PATH_ATTR = re.compile(r"#\s*!?\s*\[\s*path\s*=")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
@@ -134,6 +137,28 @@ def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
     for match in _INCLUDE.finditer(mask):
         close = _match_brace(mask, match.end() - 1, {"(": "()", "[": "[]", "{": "{}"}[match[2]])
         found.append((_line(text, match.start()), _line(text, close), match[1], text[match.end():close].strip()))
+    return found
+
+
+def include_aliases(text: str) -> list[tuple[int, int]]:
+    """``(first_line, last_line)`` of each ``use`` that names ``include``, ``include_str``, or ``include_bytes``.
+
+    Such a ``use`` can rename the macro and hide it from ``include_invocations``, so callers refuse it.
+    It covers any path form and grouped imports.
+    """
+    mask = _code_mask(text)
+    return [(_line(text, match.start()), _line(text, match.end()))
+            for match in _USE.finditer(mask) if _INCLUDE_NAME.search(match[1])]
+
+
+def cfg_test_macros(text: str) -> list[tuple[int, int]]:
+    """``(first_line, last_line)`` of each ``cfg!(..)`` call that names ``test``."""
+    mask = _code_mask(text)
+    found = []
+    for match in _CFG_MACRO.finditer(mask):
+        close = _match_brace(mask, match.end() - 1, {"(": "()", "[": "[]", "{": "{}"}[match[1]])
+        if _TEST_TOKEN.search(mask, match.end(), close):
+            found.append((_line(text, match.start()), _line(text, close)))
     return found
 
 
