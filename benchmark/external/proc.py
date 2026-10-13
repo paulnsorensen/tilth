@@ -7,6 +7,8 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+_DRAIN_TIMEOUT_S = 5.0
+
 # Harness variables that environment builds and grades keep: locale, terminal, network, index, and
 # toolchain selection. Credentials (tokens, agent sockets, SSH and GPG agents) are not in it.
 _KEPT_KEYS = frozenset({
@@ -53,10 +55,12 @@ def toolchain_env(home: Path, source: Mapping[str, str] | None = None) -> dict[s
     return env
 
 def isolate_caches(env: dict[str, str], root: Path, language: str) -> None:
-    """Give one grade private copies of the shared Cargo or Go caches, under ``root``.
+    """Give one grade private caches under ``root``.
 
-    The copies seed from the host caches, so the grade needs no network. Agent code
-    that writes into them cannot reach a later grade. Credentials files stay behind.
+    The Cargo registry and git directories and the Go module cache are copies of the host caches,
+    so the grade needs no network. A copy-on-write copy keeps them cheap where the file system allows it.
+    Agent code that writes into a copy cannot reach a later grade. Credentials files stay behind.
+    The Go build cache starts empty, because it holds only build output and the build refills it.
     """
     if language == "rust":
         cargo_home = root / "cargo"
@@ -65,22 +69,27 @@ def isolate_caches(env: dict[str, str], root: Path, language: str) -> None:
             _seed(Path(env["CARGO_HOME"]) / name, cargo_home / name)
         env["CARGO_HOME"] = str(cargo_home)
     elif language == "go":
-        for key, name in (("GOMODCACHE", "gomodcache"), ("GOCACHE", "gocache")):
-            _seed(Path(env[key]), root / name)
-            env[key] = str(root / name)
+        _seed(Path(env["GOMODCACHE"]), root / "gomodcache")
+        env["GOMODCACHE"] = str(root / "gomodcache")
+        (root / "gocache").mkdir(parents=True)
+        env["GOCACHE"] = str(root / "gocache")
         (root / "gopath").mkdir(parents=True, exist_ok=True)
         env["GOPATH"] = str(root / "gopath")
 
 
 def _seed(source: Path, target: Path) -> None:
-    if source.is_dir():
-        shutil.copytree(source, target, symlinks=True)
-    elif source.is_file():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not (source.is_dir() or source.is_file()):
+        return
+    try:
+        subprocess.run(["cp", "-a", "--reflink=auto", "--", str(source), str(target)],
+                       check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        shutil.rmtree(target, ignore_errors=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=True)
+        else:
+            shutil.copy2(source, target)
 
 def run(
     argv: Sequence[str],
@@ -105,9 +114,20 @@ def run(
             stdout, stderr = process.communicate(input, timeout=timeout)
         except BaseException:
             _kill_group(process)
-            process.communicate()
+            _reap(process)
             raise
         return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
+
+
+def _reap(process: subprocess.Popen) -> None:
+    """Collect a killed child. A grandchild that left the group may still hold a pipe open, so drain with a limit."""
+    try:
+        process.communicate(timeout=_DRAIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        process.wait()
 
 
 def _kill_group(process: subprocess.Popen) -> None:

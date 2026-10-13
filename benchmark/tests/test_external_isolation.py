@@ -138,3 +138,49 @@ def test_isolate_caches_copies_seeds_and_drops_credentials(tmp_path: Path) -> No
     assert (cargo / "registry" / "crate.txt").read_text() == "crate"
     assert (gomod / "mod.txt").read_text() == "mod"
     assert go_env["GOCACHE"] != str(gocache) and go_env["GOPATH"] != str(tmp_path / "gopath")
+
+
+def test_setsid_grandchild_holding_the_pipe_cannot_block_a_timeout(tmp_path: Path) -> None:
+    pidfile = tmp_path / "grandchild.pid"
+    script = f"setsid sleep 30 & echo $! > {pidfile}; sleep 100"
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            external.proc.run(["bash", "-c", script], timeout=1)
+    finally:
+        if pidfile.exists():
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+    assert time.monotonic() - started < 15
+
+
+def test_isolate_caches_starts_the_go_build_cache_empty(tmp_path: Path) -> None:
+    gomod, gocache = tmp_path / "gomod", tmp_path / "gocache"
+    gomod.mkdir()
+    gocache.mkdir()
+    (gocache / "object").write_text("build output")
+    env = {"GOMODCACHE": str(gomod), "GOCACHE": str(gocache), "GOPATH": str(tmp_path / "gopath")}
+
+    external.proc.isolate_caches(env, tmp_path / "grade", "go")
+
+    assert list(Path(env["GOCACHE"]).iterdir()) == []
+    assert (gocache / "object").read_text() == "build output"
+
+
+def test_build_env_runs_uv_in_copy_link_mode(external_bench, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    external_bench.seed(SWE_PY)
+    task = external.swebench_ml.load(SWE_PY, external.data.SWEBENCH_ML_REVISION)
+    envs: list[dict] = []
+    recording_run = external.proc.run
+
+    def capture(argv, **kwargs):
+        if argv[0] == "uv":
+            envs.append(dict(kwargs["env"]))
+        return recording_run(argv, **kwargs)
+
+    monkeypatch.setattr(external.proc, "run", capture)
+    task.prepare(tmp_path / "workdir")
+    task.grade_venv()
+
+    assert envs and all(env.get("UV_LINK_MODE") == "copy" for env in envs)
