@@ -1314,7 +1314,7 @@ def estimate_cell_cost(
     costs = [
         row["total_cost_usd"] for row in rows
         if row.get("task") == task and row.get("mode") == mode and row.get("model") == model
-        and baselines.is_completed(row) and isinstance(row.get("total_cost_usd"), (int, float))
+        and row.get("reused") is not True and baselines.is_completed(row) and isinstance(row.get("total_cost_usd"), (int, float))
     ]
     if costs:
         return sum(costs) / len(costs)
@@ -1361,19 +1361,26 @@ def mcp_server_commands(mode_name: str, runner: str | None) -> dict[str, str]:
     }
 
 
-def _store_reused_panel_row(stored: dict, stamp: dict, *, store_path: Path) -> None:
+def _store_reused_panel_row(stored: dict, stamp: dict, *, store_path: Path, history: list[dict] | None = None) -> None:
     """Record a panel's stamp for a reused row, so the panel's split lock sees it.
 
     The copy costs nothing and keeps the stored run key and outcome, so reuse lookup is unchanged.
     No row for the run key that already carries this panel's name and split digest is stored again.
+    A caller that holds the store rows passes them as ``history``; the new row joins that list.
     """
     if not stamp:
         return
     fields = ("panel_name", "panel_split_digest")
-    if any(row.get("run_key") == stored.get("run_key") and all(row.get(key) == stamp.get(key) for key in fields)
-           for row in [stored, *baselines.load_rows(store_path)]):
+
+    def carries(row: dict) -> bool:
+        return row.get("run_key") == stored.get("run_key") and all(row.get(key) == stamp.get(key) for key in fields)
+
+    if carries(stored) or any(carries(row) for row in (baselines.load_rows(store_path) if history is None else history)):
         return
-    baselines.store({**stored, **stamp, "charged_usd": 0.0, "reused": True}, path=store_path)
+    copy = {**stored, **stamp, "charged_usd": 0.0, "reused": True}
+    baselines.store(copy, path=store_path)
+    if history is not None:
+        history.append(copy)
 
 
 def main():
@@ -1743,7 +1750,8 @@ Examples:
                 row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
             row["charged_usd"] = amount
             ledger.charge(amount, source=row.get("cost_source") or "native")
-            run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
+            if row.get("infra") != "prepare":
+                run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
             baselines.store(row, path=store_path)
             history.append(row)
 
@@ -1807,7 +1815,8 @@ Examples:
                     else contamination_fields(stored.get("trajectory_path"), task)
                 )
                 if panel:
-                    _store_reused_panel_row({**stored, **scanned}, panel.stamp(task_name), store_path=store_path)
+                    _store_reused_panel_row({**stored, **scanned}, panel.stamp(task_name), store_path=store_path,
+                                              history=history)
                 record({
                     **panels.unstamp(stored), **scanned, **experiment_metadata, "tilth_version": reported_version,
                     "variant": _variant_metadata(MODES[mode_name], reported_version=reported_version),

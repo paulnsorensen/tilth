@@ -133,7 +133,7 @@ def split_digest(members: Iterable[Member]) -> str:
     lists: dict[str, list[str]] = {split: [] for split in SPLITS}
     for member in members:
         lists[member.split].append(member.id)
-    return baselines._digest({split: sorted(ids) for split, ids in lists.items()})
+    return baselines.canonical_digest({split: sorted(ids) for split, ids in lists.items()})
 
 
 def _parse(path: Path) -> tuple[str, int, list[Member]]:

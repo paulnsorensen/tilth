@@ -420,7 +420,7 @@ def _flags_section(results: list[dict]) -> list[str]:
 
 
 def _failure_type(result: dict) -> tuple[str, str] | None:
-    """Classify an unsuccessful cell from runner error first, then grader reason."""
+    """Classify an unsuccessful cell from contamination first, then runner error, then grader reason."""
     if result.get("correct", False):
         return None
     if is_contaminated_panel_row(result):

@@ -36,7 +36,7 @@ BASELINE_SLOT_FIELDS = (
 )
 
 
-def _digest(payload: object) -> str:
+def canonical_digest(payload: object) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -59,7 +59,7 @@ def harness_digest(
     hook settings, and ``--setting-sources``. ``bash_guard_sha256`` hashes the
     strict-mode Bash allowlist source, which the settings only name by path.
     """
-    return _digest({
+    return canonical_digest({
         "system_prompt": system_prompt, "tools": tools, "strict_file_tools": strict_file_tools,
         "bare": bare, "max_budget_usd": max_budget_usd, "mcp_shape": mcp_shape,
         "command": list(command), "bash_guard_sha256": bash_guard_sha256,
@@ -94,12 +94,12 @@ def task_digest(
     }
     if identity_inputs is not None:
         payload["identity_inputs"] = dict(identity_inputs)
-    return _digest(payload)
+    return canonical_digest(payload)
 
 
 def env_fingerprint(*, toolchains: Mapping[str, str | None], lockfile_hash: str) -> str:
     """Hash toolchain versions and the dependency lockfiles a cell builds against."""
-    return _digest({"toolchains": toolchains, "lockfile_hash": lockfile_hash})
+    return canonical_digest({"toolchains": toolchains, "lockfile_hash": lockfile_hash})
 
 
 TOOLCHAIN_PROBES = {
@@ -179,7 +179,7 @@ def tree_sha256(root: Path, pattern: str = "*", *, exclude: Collection[str] = ()
 
 def run_key(cell: Mapping[str, Any]) -> str:
     """Hash a cell's key inputs; unrelated row fields are ignored."""
-    return _digest({field: cell.get(field) for field in (*CELL_KEY_FIELDS, *DIGEST_FIELDS)})
+    return canonical_digest({field: cell.get(field) for field in (*CELL_KEY_FIELDS, *DIGEST_FIELDS)})
 
 
 def is_completed(row: Mapping[str, Any]) -> bool:
@@ -207,9 +207,9 @@ def rows(path: Path, *, panel_name: str | None = None) -> Iterator[dict]:
             yield row
 
 
-def completed_by_key(rows: list[dict]) -> dict[str, dict]:
+def completed_by_key(stored: list[dict]) -> dict[str, dict]:
     """Map each run key to its newest completed row."""
-    return {row["run_key"]: row for row in rows if row.get("run_key") and is_completed(row)}
+    return {row["run_key"]: row for row in stored if row.get("run_key") and is_completed(row)}
 
 
 def lookup(key: str, *, path: Path) -> dict | None:

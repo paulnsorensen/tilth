@@ -431,7 +431,7 @@ class ExternalTask(Task):
             version = ["--python", self.python_version] if self.python_version else []
             steps = [["uv", "venv", *version, str(venv)]]
             steps += [_install_argv(step, venv) for step in self.install_steps()]
-        with tempfile.TemporaryDirectory(prefix="tilth-external-home-") as home:
+        with tempfile.TemporaryDirectory(prefix="tilth-external-home-", ignore_cleanup_errors=True) as home:
             env = proc.toolchain_env(Path(home))
             # uv hardlinks venv files to its cache by default, so an in-place edit of a venv would reach every venv.
             env.update(UV_LINK_MODE="copy", VIRTUAL_ENV=str(venv),
