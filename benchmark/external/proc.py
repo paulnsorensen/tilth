@@ -1,6 +1,7 @@
 """The one subprocess entry point for loading, preparing, admitting, and grading external tasks."""
 
 import os
+import shutil
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -50,6 +51,35 @@ def toolchain_env(home: Path, source: Mapping[str, str] | None = None) -> dict[s
     env.update(_toolchain_dirs(source))
     env["HOME"] = str(home)
     return env
+
+def isolate_caches(env: dict[str, str], root: Path, language: str) -> None:
+    """Give one grade private copies of the shared Cargo or Go caches, under ``root``.
+
+    The copies seed from the host caches, so the grade needs no network. Agent code
+    that writes into them cannot reach a later grade. Credentials files stay behind.
+    """
+    if language == "rust":
+        cargo_home = root / "cargo"
+        cargo_home.mkdir(parents=True)
+        for name in ("registry", "git", "config.toml"):
+            _seed(Path(env["CARGO_HOME"]) / name, cargo_home / name)
+        env["CARGO_HOME"] = str(cargo_home)
+    elif language == "go":
+        for key, name in (("GOMODCACHE", "gomodcache"), ("GOCACHE", "gocache")):
+            _seed(Path(env[key]), root / name)
+            env[key] = str(root / name)
+        (root / "gopath").mkdir(parents=True, exist_ok=True)
+        env["GOPATH"] = str(root / "gopath")
+
+
+def _seed(source: Path, target: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, target, symlinks=True)
+    elif source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
 
 
 def run(

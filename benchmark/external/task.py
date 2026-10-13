@@ -439,14 +439,21 @@ class ExternalTask(Task):
         """Map every FAIL_TO_PASS and PASS_TO_PASS entry to whether it passed."""
 
     def grade_env(self, checkout: Path) -> dict[str, str]:
-        """``proc.toolchain_env`` with a fresh HOME beside ``checkout``, for running the held-out tests."""
+        """``proc.toolchain_env`` with a fresh HOME and private Cargo and Go caches beside ``checkout``."""
         home = checkout.with_name(f"{checkout.name}-home")
         home.mkdir(exist_ok=True)
-        return proc.toolchain_env(home)
+        env = proc.toolchain_env(home)
+        proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language)
+        return env
 
     def grading_env(self, checkout: Path) -> dict[str, str]:
-        """The grading venv's environment, importing the project from ``checkout`` before the venv's install."""
-        venv = self.grade_venv()
+        """The environment of a private copy of the grading venv, importing the project from ``checkout`` first.
+
+        The copy lives beside ``checkout``, so code the agent runs during the grade cannot
+        change the shared venv that later grades use.
+        """
+        venv = checkout.with_name(f"{checkout.name}-venv")
+        shutil.copytree(self.grade_venv(), venv, symlinks=True)
         env = self.grade_env(checkout)
         sources = [str(path) for path in (checkout, checkout / "src") if path.is_dir()]
         env.update(VIRTUAL_ENV=str(venv), PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=os.pathsep.join(sources),

@@ -94,3 +94,47 @@ def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
         time.sleep(0.1)
     os.kill(child, signal.SIGKILL)
     pytest.fail("the background child outlived the timeout")
+
+
+def test_grade_cannot_persist_into_the_shared_grade_venv(external_bench, tmp_path: Path) -> None:
+    external_bench.seed(SWE_PY)
+    task = external.swebench_ml.load(SWE_PY, external.data.SWEBENCH_ML_REVISION)
+    workdir = tmp_path / "workdir"
+    task.prepare(workdir)
+    external.task.apply_patch(workdir, task.gold_patch)
+    ran = tmp_path / "agent-code-ran"
+    with (workdir / "calc" / "ops.py").open("a") as source:
+        source.write(
+            "\nimport pathlib, sysconfig\n"
+            "pathlib.Path(sysconfig.get_path('purelib'), 'poison.pth').write_text('import sys\\n')\n"
+            f"pathlib.Path({str(ran)!r}).write_text('ran')\n"
+        )
+
+    correct, reason = task.check_correctness("", str(workdir))
+
+    assert correct, reason
+    assert ran.read_text() == "ran"
+    assert not list(task.grade_venv().rglob("poison.pth"))
+
+
+def test_isolate_caches_copies_seeds_and_drops_credentials(tmp_path: Path) -> None:
+    cargo, gomod, gocache = tmp_path / "cargo", tmp_path / "gomod", tmp_path / "gocache"
+    (cargo / "registry").mkdir(parents=True)
+    (cargo / "registry" / "crate.txt").write_text("crate")
+    (cargo / "credentials.toml").write_text("token")
+    gomod.mkdir()
+    (gomod / "mod.txt").write_text("mod")
+    gocache.mkdir()
+
+    rust_env = {"CARGO_HOME": str(cargo)}
+    external.proc.isolate_caches(rust_env, tmp_path / "rust-grade", "rust")
+    go_env = {"GOMODCACHE": str(gomod), "GOCACHE": str(gocache), "GOPATH": str(tmp_path / "gopath")}
+    external.proc.isolate_caches(go_env, tmp_path / "go-grade", "go")
+    (Path(rust_env["CARGO_HOME"]) / "registry" / "crate.txt").write_text("poisoned")
+    (Path(go_env["GOMODCACHE"]) / "mod.txt").write_text("poisoned")
+
+    assert rust_env["CARGO_HOME"] != str(cargo) and go_env["GOMODCACHE"] != str(gomod)
+    assert not (Path(rust_env["CARGO_HOME"]) / "credentials.toml").exists()
+    assert (cargo / "registry" / "crate.txt").read_text() == "crate"
+    assert (gomod / "mod.txt").read_text() == "mod"
+    assert go_env["GOCACHE"] != str(gocache) and go_env["GOPATH"] != str(tmp_path / "gopath")
