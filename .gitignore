@@ -23,9 +23,8 @@ Thumbs.db
 .serena/*
 !.serena/project.yml
 
-# Cheese workflow artifacts — track specs only
-.cheese/*
-!.cheese/specs/
+# Cheese workflow artifacts stay local; durable knowledge goes to .hallouminate/wiki
+.cheese/
 
 # Python
 __pycache__/

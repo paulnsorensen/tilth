@@ -1145,8 +1145,9 @@ def statistical_analysis_section(valid_results: list[dict], all_results: list[di
 def _power_readout(all_results: list[dict]) -> list[str]:
     """Report task-clustered paired accuracy and an informational power readout by model.
 
-    The readout no longer gates task-pool growth (the old phase-4 plan is retired);
-    it only describes the observed power.
+    The readout no longer gates task-pool growth (the old phase-4 plan is retired; see
+    ADR-006 in .hallouminate/wiki/adr/benchmark-gepa-overhaul.md); it only describes the
+    observed power.
     """
     modes = ordered_modes({
         run.get("mode")
