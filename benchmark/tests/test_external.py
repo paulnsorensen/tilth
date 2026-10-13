@@ -729,3 +729,25 @@ def test_prune_keeps_top_level_names_the_gold_patch_creates(external_bench, monk
 
     assert (checkout / "newpkg" / "__init__.py").is_file()
     assert not (checkout / "pytest.py").exists() and not (checkout / "extra").exists()
+
+
+def test_package_digest_covers_grading_modules_only(monkeypatch, tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    external_support.write_tree(package, {"task.py": "grade", "contamination.py": "scan", "download.py": "fetch"})
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    before = external.task.package_digest()
+
+    (package / "contamination.py").write_text("scan changed")
+    (package / "download.py").write_text("fetch changed")
+    assert external.task.package_digest() == before
+
+    (package / "task.py").write_text("grade changed")
+    assert external.task.package_digest() != before
+
+
+def test_verdict_cache_key_changes_with_the_grading_code(monkeypatch) -> None:
+    monkeypatch.setattr(external.preflight, "package_digest", lambda: "a" * 32)
+    first = external.preflight.verdict_path(SWE_PY, external.SWEBENCH_ML_REVISION, "fp")
+    monkeypatch.setattr(external.preflight, "package_digest", lambda: "b" * 32)
+
+    assert external.preflight.verdict_path(SWE_PY, external.SWEBENCH_ML_REVISION, "fp") != first

@@ -10,7 +10,7 @@ row it is given, keyed by run key, but only a completed row is reusable.
 import hashlib
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,24 @@ def task_digest(
 def env_fingerprint(*, toolchains: Mapping[str, str | None], lockfile_hash: str) -> str:
     """Hash toolchain versions and the dependency lockfiles a cell builds against."""
     return _digest({"toolchains": toolchains, "lockfile_hash": lockfile_hash})
+
+
+def file_sha256(path: Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def tree_sha256(root: Path, pattern: str = "*", *, exclude: Collection[str] = ()) -> str:
+    """Hash the files under ``root`` that match ``pattern`` by relative path and content.
+
+    ``.git`` is skipped. ``exclude`` names relative paths to leave out.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob(pattern)):
+        relative = path.relative_to(root)
+        if path.is_file() and ".git" not in relative.parts and relative.as_posix() not in exclude:
+            digest.update(f"{relative.as_posix()}\0{file_sha256(path)}\n".encode())
+    return digest.hexdigest()
 
 
 def run_key(cell: Mapping[str, Any]) -> str:

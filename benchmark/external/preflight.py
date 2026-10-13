@@ -29,8 +29,10 @@ import tempfile
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from fixtures.reset import reset_repo
+
 from . import data, download, featurebench, patches, proc, registry, swebench_ml
-from .task import EnvBuildError, ExternalTask, PrepareError, apply_patch
+from .task import EnvBuildError, ExternalTask, PrepareError, apply_patch, package_digest
 
 Reason = Literal[
     "admitted", "admitted:mask_patch_forward", "level2", "unclassified", "env_build_failed",
@@ -80,7 +82,8 @@ class PreflightVerdict:
 
 
 def verdict_path(instance_id: str, data_rev: str, fingerprint: str) -> Path:
-    return data.data_dir() / "verdicts" / data_rev / instance_id / f"{fingerprint}.json"
+    """The cache file of one verdict, keyed by host environment and by the grading code that decided it."""
+    return data.data_dir() / "verdicts" / data_rev / instance_id / f"{fingerprint}-{package_digest()[:16]}.json"
 
 
 def _read_verdict(path: Path) -> PreflightVerdict | None:
@@ -122,9 +125,10 @@ def env_fingerprint(task: ExternalTask) -> str:
 
 
 def _reset(workdir: Path) -> None:
-    for argv in (["git", "reset", "-q", "--hard"], ["git", "clean", "-q", "-f", "-d"]):
-        if proc.run(argv, cwd=workdir).returncode:
-            raise PrepareError(f"{' '.join(argv)} failed in {workdir}")
+    try:
+        reset_repo(workdir)
+    except subprocess.CalledProcessError as error:
+        raise PrepareError(f"{' '.join(error.cmd)} failed in {workdir}") from error
 
 
 def _grade(task: ExternalTask, workdir: Path, patch: str) -> tuple[bool, tuple[int, int]]:

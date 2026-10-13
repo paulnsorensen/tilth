@@ -578,19 +578,8 @@ def cli_version(runner: str, *, fresh: bool = False) -> str | None:
     return (_run_probe if fresh else _probe_version)((runner, "--version"))
 
 
-def _file_sha256(path: Path) -> str:
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def _tree_sha256(root: Path) -> str:
-    """Hash every file under a directory by relative path and content, skipping `.git`."""
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if path.is_file() and ".git" not in relative.parts:
-            digest.update(f"{relative.as_posix()}\0{_file_sha256(path)}\n".encode())
-    return digest.hexdigest()
+_file_sha256 = baselines.file_sha256
+_tree_sha256 = baselines.tree_sha256
 
 
 def _is_prepared(task: object) -> bool:

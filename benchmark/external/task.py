@@ -12,12 +12,12 @@ the agent-writable ``<workdir>/.venv``.
 import fcntl
 import filecmp
 import hashlib
-import io
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -27,12 +27,14 @@ from collections.abc import Iterable, Mapping
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
+import baselines
 from tasks.base import GroundTruth, Task, TaskSource
 
 from . import data, patches, proc
 
-# The external package; every .py file in it keys an external task's run.
+# The external package; its grading modules key an external task's run.
 PACKAGE_DIR = Path(__file__).resolve().parent
+_NON_GRADING_MODULES = frozenset({"contamination.py", "download.py", "preflight.py"})
 # Paths the prepared workdir excludes from git; grading never copies them.
 EXCLUDED_PATHS = (".venv/", "target/")
 _SKIPPED_TOP = {".git", ".venv", "target"}
@@ -176,11 +178,11 @@ def write_or_remove(root: Path, relative: str, content: bytes | None) -> None:
 
 
 def package_digest() -> str:
-    """SHA-256 over every .py file in the external package, keyed by sorted relative path."""
-    digest = hashlib.sha256()
-    for relative in sorted(path.relative_to(PACKAGE_DIR).as_posix() for path in PACKAGE_DIR.rglob("*.py")):
-        digest.update(f"{relative}\0{hashlib.sha256((PACKAGE_DIR / relative).read_bytes()).hexdigest()}\n".encode())
-    return digest.hexdigest()
+    """SHA-256 over the grading modules of the external package.
+
+    Contamination scanning, downloads, and admission do not grade a cell, so an edit to them keeps the digest.
+    """
+    return baselines.tree_sha256(PACKAGE_DIR, "*.py", exclude=_NON_GRADING_MODULES)
 
 
 def read_row(dataset: str, data_rev: str, instance_id: str) -> dict:
@@ -358,16 +360,25 @@ class ExternalTask(Task):
 
     def export_prepared(self, dest: Path) -> None:
         """Write the prepared tree (base tree plus mask) to ``dest`` without git metadata."""
-        archive = proc.run(["git", f"--git-dir={self.mirror}", "archive", "--format=tar", self.base_commit],
-                           text=False)
-        if archive.returncode:
-            raise PrepareError(f"git archive {self.base_commit} failed: {archive.stderr.decode()[-500:]}")
         dest.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tree:
+        with tempfile.TemporaryFile() as errors, subprocess.Popen(
+            ["git", f"--git-dir={self.mirror}", "archive", "--format=tar", self.base_commit],
+            stdout=subprocess.PIPE, stderr=errors, start_new_session=True,
+        ) as archive:
             try:
-                tree.extractall(dest, filter="data")
+                with tarfile.open(fileobj=archive.stdout, mode="r|") as tree:
+                    tree.extractall(dest, filter="data")
+                while archive.stdout.read(1 << 16):
+                    pass
             except tarfile.TarError as error:
+                os.killpg(archive.pid, signal.SIGKILL)
                 raise PrepareError(f"git archive {self.base_commit} does not extract safely: {error}") from error
+            except BaseException:
+                os.killpg(archive.pid, signal.SIGKILL)
+                raise
+            if archive.wait():
+                errors.seek(0)
+                raise PrepareError(f"git archive {self.base_commit} failed: {errors.read().decode()[-500:]}")
         self.apply_mask(dest)
 
     def prepare_tree(self, workdir: Path) -> None:
