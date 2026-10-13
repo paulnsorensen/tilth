@@ -60,8 +60,8 @@ def candidates(pareto_ids: Sequence[str] | None = None) -> list[str]:
             if level_of(instance_id) == "lv1" and repo_of(instance_id) not in DEFERRED_REPOS]
 
 
-def junit_results(report: str) -> list[tuple[str, str]]:
-    """``(status, node ID)`` for every recorded test of a pytest JUnit XML report (``junit_family=xunit1``).
+def _junit_cases(report: str) -> list[tuple[str, str, str]]:
+    """``(status, classname, node ID)`` for every recorded test of a pytest JUnit XML report (``junit_family=xunit1``).
 
     The report is a file pytest writes outside the checkout, so test output the agent prints
     cannot add a result. A plain skip records no result.
@@ -80,23 +80,35 @@ def junit_results(report: str) -> list[tuple[str, str]]:
         node = "::".join([file, *(part for part in classes if part), case.get("name")])
         children = {child.tag: child for child in case}
         if "failure" in children:
-            results.append(("FAILED", node))
+            results.append(("FAILED", classname, node))
         elif "error" in children:
-            results.append(("ERROR", node))
+            results.append(("ERROR", classname, node))
         elif "skipped" in children:
             if children["skipped"].get("type") == "pytest.xfail":
-                results.append(("XFAIL", node))
+                results.append(("XFAIL", classname, node))
         else:
-            results.append(("PASSED", node))
+            results.append(("PASSED", classname, node))
     return results
 
 
+def junit_results(report: str) -> list[tuple[str, str]]:
+    """``(status, node ID)`` for every recorded test; the file of a node is the file that defines the test."""
+    return [(status, node) for status, _, node in _junit_cases(report)]
+
+
 def file_verdicts(report: str, entries: Sequence[str]) -> dict[str, bool]:
-    """A file entry passes when pytest collected at least one ``<path>::`` node and all of them passed."""
-    results = junit_results(report)
+    """A file entry passes when pytest collected at least one test of its module and all of them passed.
+
+    A test belongs to the module in its ``classname``, not to the ``file`` attribute.
+    The ``file`` attribute names the file that defines the test function,
+    so a test that a subclass inherits from another file's mixin would count for the wrong entry.
+    """
+    cases = _junit_cases(report)
     verdicts = {}
     for entry in entries:
-        statuses = [status for status, node in results if node.startswith(f"{entry}::")]
+        module = entry[:-3].replace("/", ".") if entry.endswith(".py") else None
+        statuses = [status for status, classname, _ in cases
+                    if module and (classname == module or classname.startswith(f"{module}."))]
         verdicts[entry] = bool(statuses) and all(status in _PASSING for status in statuses)
     return verdicts
 

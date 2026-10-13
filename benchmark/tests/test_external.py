@@ -305,6 +305,22 @@ def test_featurebench_file_entries_aggregate() -> None:
     }
 
 
+def test_featurebench_inherited_test_failure_fails_the_subclass_file() -> None:
+    report = (
+        '<testsuites><testsuite>'
+        '<testcase classname="tests.test_a.TestA" name="test_own" file="tests/test_a.py" />'
+        '<testcase classname="tests.test_a.TestA" name="test_inherited" file="tests/mixin.py">'
+        '<failure message="boom" /></testcase>'
+        '<testcase classname="tests.mixin.TestMixin" name="test_base" file="tests/mixin.py" />'
+        '</testsuite></testsuites>'
+    )
+
+    assert external.featurebench.file_verdicts(report, ["tests/test_a.py", "tests/mixin.py"]) == {
+        "tests/test_a.py": False,
+        "tests/mixin.py": True,
+    }
+
+
 def test_go_and_rust_outputs_parse_per_test() -> None:
     go = (OUTPUTS / "go_test_json.txt").read_text()
     cargo = (OUTPUTS / "cargo_test.txt").read_text()
