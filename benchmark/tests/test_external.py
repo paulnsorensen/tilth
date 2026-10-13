@@ -716,3 +716,16 @@ def test_copy_changes_skips_git_and_follows_type_changes(tmp_path: Path) -> None
     assert (checkout / "b").is_file() and (checkout / "b").read_text() == "now a file"
     assert not (checkout / "gone" / "x.txt").exists()
     assert not (checkout / ".git").exists() and not (checkout / "sub" / ".git").exists()
+
+
+def test_prune_keeps_top_level_names_the_gold_patch_creates(external_bench, monkeypatch, tmp_path: Path) -> None:
+    task, _ = prepared(external_bench, SWE_PY, tmp_path)
+    gold = "diff --git a/newpkg/__init__.py b/newpkg/__init__.py\nnew file mode 100644\n--- /dev/null\n+++ b/newpkg/__init__.py\n@@ -0,0 +1 @@\n+X = 1\n"
+    monkeypatch.setattr(type(task), "gold_patch", property(lambda self: gold))
+    checkout = tmp_path / "checkout"
+    external_support.write_tree(checkout, {"newpkg/__init__.py": "X = 1\n", "pytest.py": "", "extra/x.py": ""})
+
+    task.prune_added_top_level(checkout)
+
+    assert (checkout / "newpkg" / "__init__.py").is_file()
+    assert not (checkout / "pytest.py").exists() and not (checkout / "extra").exists()

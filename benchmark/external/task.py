@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 
 from tasks.base import GroundTruth, Task, TaskSource
 
-from . import data, proc
+from . import data, patches, proc
 
 # The external package; every .py file in it keys an external task's run.
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -446,11 +446,13 @@ class ExternalTask(Task):
 
         Both directories are on the import path. An added ``pytest.py``, ``_pytest/``, or
         dist-info there could shadow pytest, a plugin, or the standard library.
+        A top-level name that the gold patch creates stays: the feature needs it.
         """
         for directory, prefix in ((checkout, ""), (checkout / "src", "src/")):
             if not directory.is_dir() or directory.is_symlink():
                 continue
-            known = {path[len(prefix):].split("/", 1)[0] for path in self.base_paths if path.startswith(prefix)}
+            paths = self.base_paths | patches.touched_paths(self.gold_patch)
+            known = {path[len(prefix):].split("/", 1)[0] for path in paths if path.startswith(prefix)}
             for entry in directory.iterdir():
                 if entry.name in known:
                     continue
