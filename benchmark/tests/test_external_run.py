@@ -83,6 +83,7 @@ def _verdict(instance_id: str, admitted: bool, reason: str) -> external.prefligh
 @dataclass
 class PreparedTask(StoreTask):
     repo: str = "not_a_fixture_repo"
+    fixture_path = None
     prepared_into: Path | None = None
 
     def prepare(self, workdir: Path) -> None:

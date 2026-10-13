@@ -205,9 +205,9 @@ class ExternalTask(Task):
     def __init__(self, row: Mapping, data_rev: str) -> None:
         self.row = dict(row)
         self.data_rev = data_rev
-        self.language = data.language_of(row)
-        if self.language not in data.LANGUAGES:
-            raise ValueError(f"{self.name}: unsupported language {self.language!r}")
+        self._language = data.language_of(row)
+        if self._language not in data.LANGUAGES:
+            raise ValueError(f"{self.name}: unsupported language {self._language!r}")
         self._details = self._count({})
 
     # --- Task surface ---
@@ -244,6 +244,14 @@ class ExternalTask(Task):
     def source(self) -> TaskSource:
         return TaskSource(origin=data.upstream_url(self.upstream_repo), license="upstream",
                           commit_or_tag=self.base_commit, transformation=self.transformation)
+
+    @property
+    def language(self) -> str:
+        return self._language
+
+    @property
+    def fixture_path(self) -> None:
+        return None
 
     @property
     def timeout_s(self) -> int:

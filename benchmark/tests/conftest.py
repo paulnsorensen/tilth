@@ -20,7 +20,7 @@ import external.proc
 import external_support
 import run
 from config import DEFAULT_MAX_BUDGET_USD, ModeConfig
-from tasks.base import GroundTruth, TaskSource
+from tasks.base import GroundTruth, Task, TaskSource
 
 STREAMS = Path(__file__).parent / "fixtures" / "streams"
 
@@ -32,13 +32,18 @@ Behavior = Callable[[Path], float]
 
 
 @dataclass
-class StoreTask:
+class StoreTask(Task):
+    name: str = "store_task"
     repo: str = "synthetic"
     prompt: str = "Name the dispatcher."
     capability: str = "trace"
     hide_git: bool = False
-    ground_truth: GroundTruth = field(default_factory=lambda: GroundTruth(required_strings=["handler_3"]))
+    ground_truth: GroundTruth | None = None
     source: TaskSource = TaskSource(origin="fixture", license="MIT", commit_or_tag="test-pin", transformation="test-only")
+
+    def __post_init__(self) -> None:
+        if self.ground_truth is None:
+            self.ground_truth = GroundTruth(required_strings=["handler_3"])
 
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
         return True, "expected answer"

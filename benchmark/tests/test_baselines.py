@@ -228,6 +228,9 @@ class DemoTask:
     ground_truth = {"required_strings": ["handler_3"]}
     test_command = ["go", "test", "./..."]
 
+    def identity_inputs(self):
+        return None
+
     def check_correctness(self, result_text, repo_path):
         return "{answer}" in result_text, "graded"
 '''
