@@ -1775,7 +1775,12 @@ mod tests {
         let out = tool_read(&tc(&args), &cache, &session).expect("suffix accepted");
         assert!(out.contains("l2"), "expected l2 in output: {out}");
         assert!(out.contains("l4"), "expected l4 in output: {out}");
-        assert!(!out.contains("l5"), "must not include l5: {out}");
+        // Assert on the numbered body line, not the whole output: the header
+        // echoes the temp path, which can itself contain "l5" (issue #248).
+        assert!(
+            !out.lines().any(|l| l == "5:l5"),
+            "must not include line 5: {out}"
+        );
     }
 
     /// `tilth_read` heading suffix `path## Heading` resolves to that section.
@@ -1853,7 +1858,12 @@ mod tests {
         let out = tool_read(&tc(&args), &cache, &session).expect("from-line suffix ok");
         assert!(out.contains("l3"), "line 3 expected: {out}");
         assert!(out.contains("l4"), "line 4 expected: {out}");
-        assert!(!out.contains("l1"), "line 1 must be excluded: {out}");
+        // Assert on the numbered body line, not the whole output: the header
+        // echoes the temp path, which can itself contain "l1" (issue #248).
+        assert!(
+            !out.lines().any(|l| l == "1:l1"),
+            "line 1 must be excluded: {out}"
+        );
     }
 
     /// `mode: signature` emits numbered signature lines, not full bodies.
