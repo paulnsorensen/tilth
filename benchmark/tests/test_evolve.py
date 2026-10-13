@@ -776,7 +776,7 @@ def test_single_rollout_never_finalist_on_tie(monkeypatch: pytest.MonkeyPatch, t
     world = make_world(monkeypatch, tmp_path, files)
     members = tuple(panels.Member(task, "local", "rust", split)
                     for split, tasks in (("cheap", CHEAP), ("dev", dev3), ("test", TEST)) for task in tasks)
-    world.panel = panels.Panel(name="tie", split_seed=7, cheap=CHEAP, dev=dev3, test=TEST,
+    world.panel = panels.Panel(name="tie", cheap=CHEAP, dev=dev3, test=TEST,
                                split_digest=panels.split_digest(members), members=members)
     seed_mcp = files["prompts/mcp.md"]
     better = mcp(dev_a="1", dev_b="1", dev_c="1000", cheap_a="1", test_a="1")

@@ -134,9 +134,14 @@ class EvolveTask:
     ground_truth: GroundTruth = field(default_factory=lambda: GroundTruth(required_strings=["SECRET_GT", "AGENT_GT"]))
     source: TaskSource = TaskSource(origin="fixture", license="MIT", commit_or_tag="test-pin", transformation="test-only")
 
+    timeout_s: int | None = None
+
     @property
     def prompt(self) -> str:
         return f"Name the dispatcher for {self.name}."
+
+    def identity_inputs(self) -> dict[str, object] | None:
+        return None
 
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
         return True, "expected answer"
@@ -145,7 +150,7 @@ class EvolveTask:
 def fixture_panel(name: str = "evolve-fixture", dev: tuple[str, ...] = DEV) -> panels.Panel:
     members = tuple(panels.Member(id=task, family="local", language="rust", split=split)
                     for split, tasks in (("cheap", CHEAP), ("dev", dev), ("test", TEST)) for task in tasks)
-    return panels.Panel(name=name, split_seed=7, cheap=CHEAP, dev=dev, test=TEST,
+    return panels.Panel(name=name, cheap=CHEAP, dev=dev, test=TEST,
                         split_digest=panels.split_digest(members), members=members)
 
 
