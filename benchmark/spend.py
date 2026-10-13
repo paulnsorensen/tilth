@@ -25,6 +25,10 @@ class SpendLedger:
         ceiling = math.inf if self.max_usd is None else self.max_usd
         return self.spent + estimate + self.reserve > ceiling
 
+    def headroom(self) -> float | None:
+        """Unreserved spend left under the ceiling; ``None`` when unbounded."""
+        return None if self.max_usd is None else self.max_usd - self.spent - self.reserve
+
     def charge(self, cost: float, *, source: str) -> None:
         if cost < 0:
             raise ValueError(f"negative charge {cost} from {source}")

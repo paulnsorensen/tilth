@@ -410,6 +410,45 @@ def test_run_plan_native_failure_cost_is_both_cost_and_charge(world, monkeypatch
     assert ledger.spent == pytest.approx(0.7)
 
 
+def test_run_plan_caps_cell_at_unreserved_headroom(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    budgets: list[float] = []
+
+    def recording(*args, **kwargs):
+        budgets.append(kwargs["max_budget_usd"])
+        return world.fake_run_single(*args, **kwargs)
+
+    monkeypatch.setattr(run, "run_single", recording)
+    ledger = SpendLedger(1.0, reserve=0.7)
+    [row] = plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.05)
+
+    assert budgets == [pytest.approx(0.3)]
+    assert row["applied_max_budget_usd"] == pytest.approx(0.3)
+    assert row["max_budget_usd"] == run.DEFAULT_MAX_BUDGET_USD
+
+
+def test_run_plan_keeps_default_cap_with_ample_headroom(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    budgets: list[float] = []
+
+    def recording(*args, **kwargs):
+        budgets.append(kwargs["max_budget_usd"])
+        return world.fake_run_single(*args, **kwargs)
+
+    monkeypatch.setattr(run, "run_single", recording)
+    plan(world, cells("dev_a"), ledger=SpendLedger(100.0, reserve=5.0))
+    plan(world, cells("dev_b"), ledger=SpendLedger(None))
+
+    assert budgets == [run.DEFAULT_MAX_BUDGET_USD, run.DEFAULT_MAX_BUDGET_USD]
+
+
+def test_run_plan_spawns_no_cell_without_unreserved_headroom(world) -> None:
+    ledger = SpendLedger(1.0, spent=0.5, reserve=0.5)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.0)
+
+    assert stopped.value.reason == "ceiling"
+    assert world.runner_calls() == []
+
+
 def test_candidate_build_env_is_allowlisted(candidate_repo, monkeypatch: pytest.MonkeyPatch) -> None:
     repo, candidate, _builds = candidate_repo
     for key, value in {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",

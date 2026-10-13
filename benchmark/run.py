@@ -1609,11 +1609,19 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
                                         f"_{attempt}.jsonl")
+        # The run key pins the default budget. The cap passed to the runner shrinks to the unreserved headroom,
+        # so a cell that overruns its estimate cannot spend the evolve finish reserve.
+        headroom = ledger.headroom() if runner == "claude" else None
+        cell_cap = DEFAULT_MAX_BUDGET_USD if headroom is None else min(DEFAULT_MAX_BUDGET_USD, headroom)
+        if cell_cap <= 0:
+            raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${ledger.reserve:.4f} reserved leaves no "
+                                         f"budget for {cell_id} under ${ledger.max_usd}", rows)
+        applied_cap = {"applied_max_budget_usd": cell_cap} if runner == "claude" else {}
         metadata = {
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
             **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
             "capability": getattr(task, "capability", None), "repetition": cell.repetition,
-            "variant": _variant_metadata(mode), **stamp, **identity, "reused": False,
+            "variant": _variant_metadata(mode), **stamp, **identity, **applied_cap, "reused": False,
         }
 
         def fail(fields: dict) -> None:
@@ -1626,7 +1634,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
 
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
-                                bare=True, max_budget_usd=DEFAULT_MAX_BUDGET_USD)
+                                bare=True, max_budget_usd=cell_cap)
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
@@ -1643,7 +1651,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                 raise PlanStopped("quota", quota, rows) from error
             fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
         else:
-            result.update({**stamp, **identity, "variant": _variant_metadata(mode), "reused": False})
+            result.update({**stamp, **identity, **applied_cap, "variant": _variant_metadata(mode), "reused": False})
             result.setdefault("trajectory_path", None)
             settle(result, result["total_cost_usd"])
     return rows
