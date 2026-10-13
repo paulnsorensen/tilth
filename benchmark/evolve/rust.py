@@ -218,6 +218,7 @@ def blank_byte_lock(text: str) -> str:
 
     Everything else, including the rest of each literal's line, is kept byte for byte;
     ``text`` comes back unchanged when it has no byte lock.
+    A whole-line exemption once let a candidate append ``return;`` after the literal and skip later assertions.
     """
     try:
         count, starts, ends = _byte_lock_matches(text)
