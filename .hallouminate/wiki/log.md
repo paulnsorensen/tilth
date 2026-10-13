@@ -81,3 +81,24 @@
 
 2026-10-08 · 5d588557962c2ca8 · merged · benchmark-harness-gotchas.md; mcp-instructions-limits-and-format.md; multi-agent-workflow-notes.md; index.md · Add GEPA overhaul gotchas, prompts/tools description files, the self-review lesson, and index links. Correct the stale mcp-base/mcp-edit byte-lock note. Tool-description probe ranks second.
 
+2026-10-13 · f31eb08a7bd42ccd · merged · adr/benchmark-gepa-overhaul.md · Fold umbrella and child specs: goals, non-goals, picks and fallbacks, cloud admission, curd-to-stack map (#313-#319), deferred follow-ups, references, ADR-008 child-spec defaults. #312 closes unmerged; layer 1 deletes PHASE4_PLAN.md. Retrieval probes skipped.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-gepa-invariants.md; mcp-instructions-limits-and-format.md · Add result-store, prepare/grade, panel-file, judge-isolation, and finish-reserve headroom rules at 70466b9. Fix six stop reasons and #312 wording. Confirm build tail reaches reflection; archive note stale. Repoint footer to #313.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-harness-gotchas.md · Correct the #312 wording: it closes unmerged and the work lands as #313-#319. Add 5 gepa 0.1.4 gotchas verified against benchmark/evolve/ and 3 external-data gotchas; the gin-fixture item is still a spec claim.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · sources/benchmark-subscription-auth-2026-10.md · Add the full precedence order 1-7, refresh-lock and rate_limit_event signals, Codex auth and exec limits, the pinned FeatureBench and Harbor harness facts, both terms questions, and the --bare and paused-plan risks. Provenance is 9e84659 via refs/pull/312/head.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · sources/swe-bench-multilingual-candidates-2026-10.md; sources/index.md · Record the 846e647b dataset pin, the missing revision parameter, the run_id/instance_id cache key, mini-SWE-agent solve counts, image digests from 2026-10-03, and the panel primaries gin-3741 and bat-2650.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/grok-qualifier-disambiguation.md · Record the #61 qualifier owner match and depth-cap removal, grok retirement (#297), and the ast-grep walk (#300) with no depth limit.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/post-edit-parse-check.md · Record the advisory parse check shipped in #21 and deleted in #99; successor issue #221 stays open.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-search-revival.md · Record the PR-A #45 and PR-B #46 search restoration, what search-v2 replaced, and the stale kind hint in format.rs.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-api-adoption.md · Record replace_text and create_file (#177), the retired list overview, and follow-ups #173-#175 (#175 shipped by #308, issue still open).
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-mcp-overhaul.md · Record the 80,515-call analytics, the #23 surface, what lasted, and supersession by #116 and the search-v2 roadmap.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · specs/fuzzy-suggest-only.md; specs/index.md; index.md · Add the auto-open predecessor (#57, nucleo, miss-rate evidence) and verified current state; add five spec links and a spec-history index row. The repo stops tracking .cheese/specs; the wiki holds their durable content.

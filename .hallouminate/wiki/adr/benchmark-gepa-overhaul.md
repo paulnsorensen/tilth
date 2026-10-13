@@ -1,8 +1,24 @@
 # ADR: benchmark GEPA overhaul
 
-The benchmark GEPA overhaul (PR #312, landed as the `stack/bench-gepa/*` stack) grows the benchmark with FeatureBench, SWE-bench Multilingual, and the Gin render-context task, freezes stock baselines, adds a model judge, and adds a GEPA evolution loop over tilth commits.
-These decisions explain why the harness looks the way it does. The specs are the contracts: `.cheese/specs/benchmark-gepa-overhaul.md` (umbrella, forks F-1 to F-6) and its children `bench-prompt-files`, `bench-result-substrate`, `bench-external-tasks`, `bench-panel-manifest`, `bench-model-judge`, and `bench-evolution-loop`.
+The benchmark GEPA overhaul grows the benchmark with FeatureBench, SWE-bench Multilingual, and the Gin render-context task, freezes stock baselines, adds a model judge, and adds a GEPA evolution loop over tilth commits.
+PR #312 is the all-in-one PR, and it closes unmerged. The work lands as the stacked PRs #313 to #319 (`stack/bench-gepa/0-prompt-files` to `stack/bench-gepa/6-wiki`).
+In the #312 session archive, "Landed" means implemented on the #312 branch, not merged.
+The umbrella spec `benchmark-gepa-overhaul` (forks F-1 to F-6) and six `bench-*` child specs held the contracts. The stack removes the spec files, so this page keeps their goals, picks, and curd map.
+Each spec used its three fork-coherence rounds and was accepted with a recorded override. paulnsorensen/easy-cheese#745 tracks that Mold override gap.
 The invariants and guards that enforce these decisions are on [Benchmark GEPA loop invariants and guards](../benchmark-gepa-invariants.md).
+
+## Goals and non-goals
+
+- **G-1:** FeatureBench tasks run in the harness.
+- **G-2:** The Gin render-context task (`gin_edit_render_context`) is in the panel.
+- **G-3:** The three local hard tasks plus one Go and one Rust SWE-bench Multilingual instance are in the panel.
+- **G-4:** The research model reasons over raw result JSONL.
+- **G-5:** Stock baselines run once, are stored, and are reused.
+- **G-6:** A model judge decides where structural (ast-grep) tools apply.
+
+Non-goals: a structural write op in `tilth_write` (issue #310); Docker, Harbor, or native `fb infer`/`fb eval`; GPU tasks, Level 2 tasks, and tasks whose environment does not build in a local `uv` venv; matching published leaderboard numbers; auto-merging a winner; a crate or npm version bump.
+
+## Decisions
 
 ### ADR-001: Run external tasks fully native, with no Docker (F-1) [status: accepted]
 
@@ -41,7 +57,7 @@ The invariants and guards that enforce these decisions are on [Benchmark GEPA lo
 ### ADR-006: Retire the Phase 4 power gate; require a spend ceiling (F-6) [status: accepted]
 
 - **Context:** The power gate in `benchmark/PHASE4_PLAN.md` had no exception process and blocked task growth.
-- **Decision:** The gate is retired (`PHASE4_PLAN.md` is marked superseded; `analyze.py` power readout is informational). Every paid run requires `--max-usd`.
+- **Decision:** The gate is retired. Stack layer 1 (`stack/bench-gepa/1-result-substrate`, #314) deletes `benchmark/PHASE4_PLAN.md`. The spec planned a superseded marker in the file; that plan did not ship. The `analyze.py` power readout is informational only. Every paid run requires `--max-usd`.
 - **Consequences:** `--max-usd` limits spend, not false-positive conclusions. Nothing replaces the statistical stop.
 
 ### ADR-007: Admit a task only when a single gold hunk is load-bearing [status: accepted]
@@ -50,4 +66,64 @@ The invariants and guards that enforce these decisions are on [Benchmark GEPA lo
 - **Decision:** Admission requires that the gold patch resolves, the empty patch does not, and removing some single gold hunk fails the held-out tests. Removals are tried largest first, bounded by `$TILTH_BENCH_TAMPER_MAX_HUNKS` (default 8). Cached verdicts carry a version and recompute on a rule change.
 - **Supersedes:** the gold-minus-last-hunk rule in the first `bench-external-tasks` implementation.
 
-_Source: PR #312 session archive (umbrella and child specs, wheypoint decisions, phase outcomes), verified against code at `e77a567` · Updated: 2026-10-08 · Supersedes: gold-minus-last-hunk admission rule_
+### ADR-008: Child-spec defaults [status: accepted]
+
+- **Context:** The child specs marked some choices `[AGENT-DECIDED]` and recorded an alternative for each. The maintainer approved the specs with these defaults.
+- **Decision:**
+  - Harness data lives in `$TILTH_BENCH_DATA`, default `~/.local/share/tilth-bench/external` (`benchmark/external/data.py:44`), not beside the `/tmp` fixture repos.
+  - External cells time out per language: Python 1200 s, Go and Rust 1800 s (`benchmark/external/task.py:53-54,220`), not one global flag.
+  - `pass_rate` counts FAIL_TO_PASS plus PASS_TO_PASS entries (`benchmark/external/task.py:460`), not FAIL_TO_PASS only.
+  - The contamination scan reads tool-call inputs only, not outputs. A row with no sidecar is `contaminated: true` with an `unscanned` hit (spec claim, not re-verified).
+  - Panel strata are source families, not family plus language (`benchmark/panels.py:115-129`). Family plus language left single-member strata and could empty the test split.
+  - The split locks on the first completed stored row, not on any row, and every `load_panel` call checks it (`benchmark/panels.py:282-285`).
+  - The panel loader does not re-run a primary's preflight before it accepts a fallback (spec claim, not re-verified).
+  - `run.py --tasks <instance_id>` resolves an admitted external task; `--tasks all` stays local-only. `preflight.py --panel` reads only `members[].id` and `members[].family` (spec claim, not re-verified).
+- **Alternatives:** Each bullet names the rejected alternative.
+
+## Task picks and fallbacks
+
+- SWE-bench Multilingual at HF revision `846e647b9f33c0b51b739d005d13d85493c9af09` (`benchmark/external/data.py:16`): Go `gin-gonic__gin-3741` with fallback `prometheus__prometheus-14861`; Rust `sharkdp__bat-2650` with fallback `tokio-rs__tokio-6724`.
+- FeatureBench Lite `v1.1` (`benchmark/external/data.py:15`): the COSPA Pareto-12 list restricted to `.lv1` IDs, minus pandas, astropy, transformers, Lightning, and mlflow.
+- Local: `rg_search_dispatch`, `rg_trait_implementors`, and `gin_servehttp_flow` form the dev-only cheap tier. `gin_edit_render_context` joins the stratified split.
+- The committed `gepa-v1` panel uses both primaries and no fallback (`benchmark/panels/gepa-v1.json:60,66`).
+
+## Admission on the cloud host
+
+The model-free preflight on the #312 cloud host admitted 5 of 7 FeatureBench Lite Level 1 candidates (sphinx, metaflow, seaborn x2, sympy), plus `gin-gonic__gin-3741` and `sharkdp__bat-2650`.
+It refused pydantic (gold 4/6) and xarray (pytest-mypy-plugins option mismatch) as `gold_unresolved`.
+Dataset rows hold gold patches and held-out tests, so they are not in the checkout. To regenerate them, run `python3 benchmark/external/preflight.py --panel benchmark/panels/gepa-v1.json`.
+
+## Curd to stack map
+
+The umbrella planned a diamond (c0 beside c1, c3 beside c4). The stack lands the curds in a line.
+
+| Curd | Child spec | Stack layer | PR |
+|---|---|---|---|
+| c0 | `bench-prompt-files` | `0-prompt-files` | #313 |
+| c1 | `bench-result-substrate` | `1-result-substrate` | #314 |
+| c2 | `bench-external-tasks` | `2-external-tasks` | #315 |
+| c3 | `bench-panel-manifest` | `3-panels` | #316 |
+| c4 | `bench-model-judge` | `4-judge` | #317 |
+| c5 | `bench-evolution-loop` | `5-evolve` | #318 |
+| (none) | wiki ingest | `6-wiki` | #319 |
+
+## Deferred follow-ups
+
+- `bench-gpu-host`: rent a GPU host to admit the GPU-flagged FeatureBench Lite tasks.
+- `bench-heavy-python-envs`: admit the pandas, astropy, transformers, Lightning, and mlflow Pareto-12 tasks when a native environment recipe exists.
+- `bench-hgm-parent-selection`: replace GEPA parent selection with HGM clade-metaproductivity if frontier noise dominates.
+- `bench-oauth-fixture`: the maintainer records a scrubbed real `claude -p` OAuth stream and commits it as a parser fixture.
+- `fix-tilth-deps-route`: done. #311 removed the retired `tilth_deps` route from `prompts/mcp.md` and `AGENTS.md` and added a guard test.
+
+## References
+
+- FeatureBench dataset: https://huggingface.co/datasets/LiberCoders/FeatureBench
+- COSPA Pareto-12: https://raw.githubusercontent.com/shisa-ai/cospa/main/configs/featurebench_lite_pareto12_v1.json
+- SWE-bench Multilingual: https://www.swebench.com/multilingual.html
+- Claude Code authentication: https://code.claude.com/docs/en/authentication
+- GEPA `optimize_anything`: https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/
+- Huxley-Gödel Machine: https://arxiv.org/html/2510.21614v2
+
+All were accessed on 2026-10-03.
+
+_Source: umbrella and child specs at `e42d451` (removed from the stack) and the PR #312 session archive README. ADR-001 to ADR-007 verified against code at `e77a567`; later additions at `70466b9` · Updated: 2026-10-13 · Supersedes: gold-minus-last-hunk admission rule_
