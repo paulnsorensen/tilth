@@ -96,12 +96,15 @@ class FakeLocalTask:
     ground_truth: GroundTruth = field(default_factory=lambda: GroundTruth(required_strings=["fixture_symbol"]))
     test_command: list[str] = field(default_factory=list)
 
+    def identity_inputs(self) -> None:
+        return None
+
 
 @pytest.fixture
 def external_instance(monkeypatch: pytest.MonkeyPatch) -> FakeExternalTask:
     task = FakeExternalTask()
     assert EXTERNAL_ID not in TASKS
-    monkeypatch.setattr(external, "resolve_task", lambda name: task if name == EXTERNAL_ID else None)
+    monkeypatch.setattr(core, "_load_external", lambda name: task if name == EXTERNAL_ID else None)
     return task
 
 
@@ -201,9 +204,26 @@ def test_local_label_inputs() -> None:
 
 
 def test_trusted_reference_only_on_render_context() -> None:
-    assert "render_context_heldout_test.go" in TASKS["gin_edit_render_context"].trusted_reference
-    assert [name for name, task in TASKS.items() if getattr(task, "trusted_reference", None)] == [
-        "gin_edit_render_context"]
+    assert "render_context_heldout_test.go" in core.trusted_reference(TASKS["gin_edit_render_context"])
+    assert [name for name, task in TASKS.items() if core.trusted_reference(task)] == ["gin_edit_render_context"]
+    assert not hasattr(TASKS["gin_edit_render_context"], "trusted_reference")
+
+
+def test_default_resolve_task_returns_one_task_without_admission(
+    external_bench, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_bench.seed("fixture__calc-1")
+
+    def no_admission(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the judge asked for admission")
+
+    monkeypatch.setattr(external.preflight, "admit", no_admission)
+    monkeypatch.setattr(core, "_external_tasks", {})
+    task = core.default_resolve_task("fixture__calc-1")
+    assert isinstance(task, external.ExternalTask) and task.name == "fixture__calc-1"
+    assert core.default_resolve_task("fixture__calc-1") is task
+    assert core.default_resolve_task("rg_search_dispatch") is TASKS["rg_search_dispatch"]
+    assert core.default_resolve_task("nobody__unknown-1") is None
 
 
 def test_calibrated_label_is_cached() -> None:
@@ -214,13 +234,14 @@ def test_calibrated_label_is_cached() -> None:
     assert len(client.prompts) == 1
 
 
-def test_analyze_import_leaves_judge_runner_unloaded() -> None:
-    probe = ("import sys, analyze, judge; assert 'judge.core' not in sys.modules; "
-             "assert judge.Judge is sys.modules['judge.core'].Judge; print('ok')")
+def test_judge_config_and_store_import_leave_runner_unloaded() -> None:
+    probe = ("import sys; from judge import config, store; "
+             "assert 'run' not in sys.modules and 'judge.core' not in sys.modules; print('ok')")
     result = subprocess.run([sys.executable, "-c", probe], cwd=BENCHMARK_DIR, capture_output=True, text=True,
                             check=False)
     assert result.returncode == 0, result.stderr
     assert result.stdout == "ok\n"
+
 
 @pytest.mark.parametrize("torn_file", ["labels.jsonl", "agreements.jsonl"])
 def test_append_after_torn_tail_keeps_new_entry(torn_file: str) -> None:
@@ -230,6 +251,7 @@ def test_append_after_torn_tail_keeps_new_entry(torn_file: str) -> None:
     seed_agreement()
     assert store.cached_label("digest-alpha") == "weak"
     assert store.current_agreement() is not None
+
 
 def test_label_cache_key_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     client = StubClient()
@@ -295,19 +317,54 @@ def test_label_is_categorical() -> None:
 def test_external_instance_labelled_and_calibrated(
     external_instance: FakeExternalTask, judge_home: Path,
 ) -> None:
-    client = StubClient(answer=lambda prompt: "strong" if is_label_prompt(prompt) else "verdict: apt")
+    def answer(prompt: str) -> str:
+        if is_label_prompt(prompt):
+            return "strong" if "PS_TEXT" in prompt else "weak"
+        return "verdict: apt" if int(prompt.split("ROLLOUT[")[1][:2]) < 10 else "verdict: missed"
+
+    client = StubClient(answer=answer)
     assert cli.main(["label", "--tasks", EXTERNAL_ID, "--max-usd", "5", "--cell-estimate-usd", "0.1"],
                     client=client) == 0
-    assert store.cached_label(run._cell_task_digest(external_instance)) == "strong"
+    digest = run._cell_task_digest(external_instance)
+    assert store.cached_label(digest) == "strong"
 
     rows = seed_rollouts(judge_home, judge_config.MIN_CALIBRATION_TRAJECTORIES)
     write_calibration({EXTERNAL_ID: "strong", "rg_search_dispatch": "weak"},
-                      [{"run_key": row["run_key"], "verdict": "apt"} for row in rows])
+                      [{"run_key": row["run_key"], "verdict": "apt" if index < 10 else "missed"}
+                       for index, row in enumerate(rows)])
     assert cli.main(["calibrate", "--max-usd", "5", "--cell-estimate-usd", "0.1"], client=client) == 0
 
     agreement = store.current_agreement()
-    assert agreement is not None
+    assert agreement is not None and agreement.calibrated
     assert EXTERNAL_ID in agreement.tasks
+    assert store.released_label(agreement, EXTERNAL_ID, digest) == "strong"
+
+
+def test_released_label_needs_calibrated_covering_agreement() -> None:
+    store.put_label(task="alpha", task_digest="digest-alpha", label="weak", cost=0.0)
+    covering = store.Agreement(calibrated=True, tasks=("alpha",))
+    assert store.released_label(covering, "alpha", "digest-alpha") == "weak"
+    assert store.released_label(covering, "alpha", "digest-edited") is None
+    assert store.released_label(covering, "beta", "digest-alpha") is None
+    assert store.released_label(store.Agreement(calibrated=False, tasks=("alpha",)), "alpha", "digest-alpha") is None
+    assert store.released_label(None, "alpha", "digest-alpha") is None
+
+
+@pytest.mark.parametrize(("name", "value"), [("KAPPA_THRESHOLD", 0.7), ("MIN_CALIBRATION_TRAJECTORIES", 30)])
+def test_agreement_goes_stale_when_calibration_policy_changes(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: float,
+) -> None:
+    seed_agreement()
+    assert store.current_agreement() is not None
+    monkeypatch.setattr(judge_config, name, value)
+    assert store.current_agreement() is None
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
+def test_cli_refuses_non_finite_or_non_positive_spend_flags(value: str) -> None:
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["label", "--tasks", "rg_search_dispatch", "--max-usd", value])
+    assert refused.value.code == 2
 
 
 # AC-2: stripped record and critiques
@@ -335,7 +392,7 @@ def test_stripped_record_contents(judge_home: Path) -> None:
 
 
 def test_stripped_record_refuses_unresolvable_task(monkeypatch: pytest.MonkeyPatch, judge_home: Path) -> None:
-    monkeypatch.setattr(external, "resolve_task", lambda name: None)
+    monkeypatch.setattr(core, "_load_external", lambda name: None)
     row, sidecar = rollout(judge_home, task=EXTERNAL_ID)
     with pytest.raises(core.UnresolvableTask, match=EXTERNAL_ID):
         core.stripped_record(row, sidecar)
@@ -437,9 +494,12 @@ def test_contaminated_rollout_gets_no_critique(judge_home: Path, contamination: 
     assert client.prompts == []
 
 
-def test_missing_trajectory_gets_no_critique(judge_home: Path) -> None:
+@pytest.mark.parametrize("case", ["no-path", "no-text"])
+def test_missing_trajectory_gets_no_critique(judge_home: Path, case: str) -> None:
     seed_agreement()
-    row, sidecar = rollout(judge_home, trajectory_path=None)
+    row, sidecar = rollout(judge_home, trajectory_path=None) if case == "no-path" else rollout(judge_home)
+    if case == "no-text":
+        sidecar = None
     client = echo_client()
     with pytest.raises(core.CritiqueWithheld) as withheld:
         make_judge(client).critique(row, sidecar)
@@ -522,6 +582,53 @@ def test_kappa_gate_both_dimensions(
     assert sorted(stored.tasks) == sorted(calibration_tasks)
 
 
+def test_label_kappa_below_threshold_blocks_calibration(judge_home: Path, calibration_tasks: list[str]) -> None:
+    rows = seed_rollouts(judge_home, 20)
+    labels = calibration_set(calibration_tasks, rows)
+    flipped = {0: "none", 1: "none", 2: "none", 5: "strong", 6: "strong", 7: "strong"}
+    judge_labels = {name: flipped.get(index, "strong" if index < 5 else "none")
+                    for index, name in enumerate(calibration_tasks)}
+    judge_verdicts = {index: ("apt" if index < 10 else "missed") for index in range(20)}
+    agreement = make_judge(StubClient(answer=scripted(judge_labels, judge_verdicts))).calibrate(labels)
+
+    assert agreement.verdict_kappa == pytest.approx(1.0)
+    assert agreement.label_kappa is not None and agreement.label_kappa < judge_config.KAPPA_THRESHOLD
+    assert agreement.calibrated is False
+    assert "label kappa" in agreement.reason and "verdict kappa" not in agreement.reason
+
+
+def test_kappa_exactly_at_threshold_is_calibrated(judge_home: Path, calibration_tasks: list[str]) -> None:
+    rows = seed_rollouts(judge_home, 20)
+    labels = calibration_set(calibration_tasks, rows)
+    flipped = {0: "none", 5: "strong"}
+    judge_labels = {name: flipped.get(index, "strong" if index < 5 else "none")
+                    for index, name in enumerate(calibration_tasks)}
+    judge_verdicts = {index: ("apt" if index < 10 else "missed") for index in range(20)}
+    agreement = make_judge(StubClient(answer=scripted(judge_labels, judge_verdicts))).calibrate(labels)
+
+    assert agreement.label_kappa == pytest.approx(judge_config.KAPPA_THRESHOLD)
+    assert agreement.label_kappa >= judge_config.KAPPA_THRESHOLD
+    assert agreement.calibrated is True
+
+
+def test_critique_cache_key_tracks_critique_prompt(
+    judge_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    row, sidecar = rollout(judge_home)
+    client = echo_client()
+    judge = make_judge(client)
+    judge._critique(row, sidecar)
+    judge._critique(row, sidecar)
+    assert len(client.prompts) == 1
+
+    prompts = tmp_path / "prompts"
+    shutil.copytree(judge_config.PROMPTS_DIR, prompts)
+    (prompts / "critique.md").write_text((prompts / "critique.md").read_text() + "\nOne more rule.\n")
+    monkeypatch.setattr(judge_config, "PROMPTS_DIR", prompts)
+    judge._critique(row, sidecar)
+    assert len(client.prompts) == 2
+
+
 def test_undefined_kappa_is_uncalibrated(judge_home: Path, calibration_tasks: list[str]) -> None:
     rows = seed_rollouts(judge_home, 20)
     write_calibration({name: "strong" for name in calibration_tasks},
@@ -545,7 +652,7 @@ def test_rejected_answer_counts_as_disagreement(judge_home: Path, calibration_ta
 
     assert (agreement.label_count, agreement.verdict_count) == (10, 20)
     assert agreement.label_kappa == pytest.approx(0.45 / 0.55)
-    assert agreement.verdict_kappa < 1.0
+    assert agreement.verdict_kappa == pytest.approx(19 / 21)
 
 
 @pytest.mark.parametrize("case", [
@@ -601,7 +708,7 @@ def test_calibration_file_rejects_bad_entries(judge_home: Path, case: str) -> No
 def test_calibration_refuses_unresolvable_trajectory_task(
     monkeypatch: pytest.MonkeyPatch, judge_home: Path,
 ) -> None:
-    monkeypatch.setattr(external, "resolve_task", lambda name: None)
+    monkeypatch.setattr(core, "_load_external", lambda name: None)
     rows = seed_rollouts(judge_home, 20)
     stranded, _ = rollout(judge_home, 30, task=EXTERNAL_ID, run_key="run-key-stranded")
     baselines.store(stranded, path=judge_config.RESULT_STORE)
@@ -850,6 +957,21 @@ def test_judge_cost_falls_back_to_pricing() -> None:
     make_judge(core.ClaudeJudgeClient(spawn=recorder), ledger=ledger).applicability(TASKS["rg_search_dispatch"])
     cost, source = ledger.charges[-1]
     assert source == "pricing" and cost > 0
+
+
+def test_reply_exit_zero_with_error_result_is_a_failure() -> None:
+    events = [json.loads(line) for line in claude_stream("model refused", 0.1).splitlines()]
+    assert events[-1]["type"] == "result"
+    events[-1]["is_error"] = True
+    reply = core._reply("".join(json.dumps(event) + "\n" for event in events), 0, "")
+    assert reply.error == "model refused"
+
+
+def test_reply_exit_zero_without_result_event_is_a_failure() -> None:
+    lines = claude_stream("unused", 0.1).splitlines(keepends=True)
+    assert json.loads(lines[-1])["type"] == "result"
+    reply = core._reply("".join(lines[:-1]), 0, "")
+    assert reply.error == "claude exited 0"
 
 
 def test_judge_quota_stops_calls() -> None:
