@@ -22,7 +22,25 @@ _HOME_REFERENCE = re.compile(r"\$\{HOME\}|\$HOME")
 _PIP_COMMAND = re.compile(r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+(?:download|install)\b([^;&|\n]*)")
 _UV_ADD = re.compile(r"\buv\s+add\b([^;&|\n]*)")
 _GO_COMMAND = re.compile(r"\bgo\s+(?:get|install|mod\s+download)\b([^;&|\n]*)")
+_FETCH_COMMAND = re.compile(
+    r"\b(?:git\s+(?:clone|fetch|pull|remote\s+add)|curl|wget|go\s+(?:get|install)|gh\s+(?:repo\s+clone|api))\b"
+)
+_COMMAND_SEGMENTS = re.compile(r"[;&|\n]+")
 _GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+
+
+@dataclass(frozen=True)
+class _Upstream:
+    """Fetch hosts always count; a github.com URL counts only inside a fetch command."""
+
+    hosts: re.Pattern
+    repo_url: re.Pattern
+
+    def fetched_by(self, text: str) -> bool:
+        if self.hosts.search(text):
+            return True
+        return any(_FETCH_COMMAND.search(segment) and self.repo_url.search(segment)
+                   for segment in _COMMAND_SEGMENTS.split(text))
 
 
 @dataclass(frozen=True)
@@ -32,7 +50,7 @@ class _Rules:
     benchmark_roots: tuple[str, ...]
     data_roots: tuple[str, ...]
     foreign_roots: tuple[str, ...]
-    upstream: re.Pattern | None
+    upstream: "_Upstream | None"
     packages: tuple[str, ...]
     go_module: str | None
 
@@ -62,8 +80,11 @@ def _rules(task: object) -> _Rules:
             packages = (repo.name,)
     upstream = None
     if slug:
-        hosts = r"(?:github\.com[/:]|codeload\.github\.com/|raw\.githubusercontent\.com/|api\.github\.com/repos/)"
-        upstream = re.compile(hosts + re.escape(slug) + r"(?:\.git)?(?=$|[/\s'\"#?@:])", re.IGNORECASE)
+        tail = re.escape(slug) + r"(?:\.git)?(?=$|[/\s'\"#?@:])"
+        hosts = re.compile(r"(?:codeload\.github\.com/|raw\.githubusercontent\.com/|api\.github\.com/repos/)" + tail,
+                           re.IGNORECASE)
+        clone = r"(?:github\.com[/:]|\bgh\s+repo\s+clone\s+|\bgh\s+api\s+(?:-\S+\s+)*repos/)"
+        upstream = _Upstream(hosts, re.compile(clone + tail, re.IGNORECASE))
     return _Rules(
         benchmark_roots=_roots(config.BENCHMARK_DIR),
         data_roots=_roots(data.data_dir()),
@@ -143,7 +164,7 @@ def _call_reasons(tool_input: object, rules: _Rules) -> list[str]:
                 reasons.append("harness_data")
             elif _under(path, rules.foreign_roots):
                 reasons.append("foreign_repo_clone")
-        if rules.upstream is not None and rules.upstream.search(text):
+        if rules.upstream is not None and rules.upstream.fetched_by(text):
             reasons.append("upstream_fetch")
         if _fetches_package(text, rules):
             reasons.append("package_source")
