@@ -1581,7 +1581,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
         row["charged_usd"] = amount
         ledger.charge(amount, source=row.get("cost_source") or "native")
-        run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
+        if row.get("infra") != "prepare":
+            run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
         baselines.store(row, path=store_path)
         history.append(row)
         emit(row)

@@ -207,6 +207,34 @@ def test_reused_cells_of_a_stamped_panel_add_no_store_rows(world) -> None:
     assert len(baselines.load_rows(store)) == before
 
 
+def test_reused_cells_of_an_unstamped_row_add_one_stamped_copy(world) -> None:
+    plan(world, cells("dev_a"))
+    store = run.RESULTS_DIR / baselines.STORE_FILENAME
+    unstamped = [{key: value for key, value in row.items() if not key.startswith("panel_")}
+                 for row in baselines.load_rows(store)]
+    store.write_text("".join(json.dumps(row) + "\n" for row in unstamped))
+
+    rows = plan(world, cells("dev_a", "dev_a"))
+
+    assert [row["reused"] for row in rows] == [True, True]
+    stored = baselines.load_rows(store)
+    assert len(stored) == len(unstamped) + 1
+    assert sum(row.get("panel_name") == world.panel.name for row in stored) == 1
+
+
+def test_prepare_failure_does_not_zero_the_next_cell_estimate(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_then_slow(task_name, *args, **kwargs):
+        if task_name == "dev_a":
+            raise run.external.task.PrepareError("patch does not apply")
+        raise subprocess.TimeoutExpired(["claude"], run.CELL_TIMEOUT_S)
+
+    monkeypatch.setattr(run, "run_single", broken_then_slow)
+    prepare_row, timeout_row = plan(world, cells("dev_a", "dev_b"), cell_estimate_usd=0.25)
+
+    assert (prepare_row["infra"], prepare_row["charged_usd"]) == ("prepare", 0.0)
+    assert timeout_row["error"] == "timeout" and timeout_row["charged_usd"] > 0
+
+
 @pytest.mark.parametrize("current", ["2.2.0", None], ids=["changed", "probe-failed"])
 def test_run_plan_reprobes_cli_before_each_paid_cell(world, monkeypatch: pytest.MonkeyPatch, current) -> None:
     plan(world, cells("dev_a"))
