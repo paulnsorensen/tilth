@@ -21,7 +21,6 @@ if __name__ == "__main__" and not __package__:
     raise SystemExit(_main())
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -29,24 +28,16 @@ import tempfile
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+import baselines
 from fixtures.reset import reset_repo
 
-from . import data, download, featurebench, patches, proc, registry, swebench_ml
+from . import data, download, featurebench, patches, registry, swebench_ml
 from .task import EnvBuildError, ExternalTask, PrepareError, apply_patch, package_digest
 
 Reason = Literal[
     "admitted", "admitted:mask_patch_forward", "level2", "unclassified", "env_build_failed",
     "prepare_failed", "gold_unresolved", "empty_resolved", "tampered_resolved",
 ]
-_PROBES = {
-    "python": (("uv", "--version"), ("python3", "--version")),
-    "go": (("go", "version"),),
-    "rust": (("rustc", "--version"), ("cargo", "--version")),
-}
-_DEPENDENCY_FILES = (
-    "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pyproject.toml", "setup.py", "setup.cfg",
-    "requirements.txt", "uv.lock", "poetry.lock", "Pipfile.lock",
-)
 _EXTERNAL_FAMILIES = (data.FEATUREBENCH, data.SWEBENCH_ML)
 # Bump when admission or grading changes, so cached verdicts are recomputed.
 VERDICT_VERSION = 2
@@ -105,23 +96,9 @@ def _read_verdict(path: Path) -> PreflightVerdict | None:
         return None
 
 
-def _probe(argv: tuple[str, ...]) -> str | None:
-    try:
-        result = proc.run(argv, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = (result.stdout or result.stderr).strip().splitlines()
-    return lines[0] if result.returncode == 0 and lines else None
-
-
-def env_fingerprint(task: ExternalTask) -> str:
+def env_fingerprint(task: ExternalTask, probe=None) -> str:
     """Hash this host's toolchain versions for the task's language and its base dependency files."""
-    payload = {
-        "toolchains": {" ".join(argv): _probe(argv) for argv in _PROBES[task.language]},
-        "python": task.python_version,
-        "dependency_files": task.base_file_hashes(_DEPENDENCY_FILES),
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return baselines.host_env_fingerprint(task.language, task.dependency_hashes(), probe=probe)
 
 
 def _reset(workdir: Path) -> None:

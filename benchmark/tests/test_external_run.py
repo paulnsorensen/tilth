@@ -274,13 +274,41 @@ def test_identity_inputs_change_run_key(external_bench, monkeypatch: pytest.Monk
     if changed == "toolchain":
         monkeypatch.setattr(run, "_probe_version", lambda argv: f"{argv[0]} 9.9.9")
     elif changed == "lockfile":
-        monkeypatch.setattr(base, "base_file_hashes", lambda names: {"Cargo.lock": "f" * 64})
+        edited = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+        monkeypatch.setattr(edited, "base_file_hashes", lambda names: {"Cargo.lock": "f" * 64})
+        monkeypatch.setitem(run.TASKS, SWE_RS, edited)
     else:
         row, revision = _changed_rows(external_bench)[changed]
         monkeypatch.setitem(run.TASKS, SWE_RS, external.swebench_ml.SweBenchTask(row, revision))
 
     assert _identity(SWE_RS)["run_key"] != before
 
+
+def test_preflight_and_run_share_one_external_fingerprint(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+    probe = lambda argv: f"{argv[0]} 1.2.3"  # noqa: E731
+    monkeypatch.setattr(run, "_probe_version", probe)
+
+    assert run.env_fingerprint(task) == external.preflight.env_fingerprint(task, probe=probe)
+
+
+def test_external_dependency_hashes_are_computed_once_per_instance(
+    external_bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.SweBenchTask(external_bench.row(SWE_RS), external.SWEBENCH_ML_REVISION)
+    reads = []
+    original = task.base_file
+    monkeypatch.setattr(task, "base_file", lambda name: reads.append(name) or original(name))
+
+    run.env_fingerprint(task)
+    after_first = len(reads)
+    run.env_fingerprint(task)
+    external.preflight.env_fingerprint(task)
+
+    assert after_first > 0
+    assert len(reads) == after_first
 
 def test_external_helper_edit_changes_only_external_run_key(bench, external_bench,
                                                             monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

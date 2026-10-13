@@ -9,8 +9,9 @@ row it is given, keyed by run key, but only a completed row is reusable.
 
 import hashlib
 import json
+import subprocess
 import sys
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,63 @@ def task_digest(
 def env_fingerprint(*, toolchains: Mapping[str, str | None], lockfile_hash: str) -> str:
     """Hash toolchain versions and the dependency lockfiles a cell builds against."""
     return _digest({"toolchains": toolchains, "lockfile_hash": lockfile_hash})
+
+
+TOOLCHAIN_PROBES = {
+    "rustc": ("rustc", "--version"),
+    "cargo": ("cargo", "--version"),
+    "go": ("go", "version"),
+    "node": ("node", "--version"),
+    "python3": ("python3", "--version"),
+    "uv": ("uv", "--version"),
+}
+# The toolchains a repo's language builds and tests with; a rustc bump must not
+# re-key a Go, JavaScript, or Python task.
+LANGUAGE_TOOLCHAINS = {
+    "rust": ("rustc", "cargo"),
+    "go": ("go",),
+    "javascript": ("node",),
+    "python": ("python3", "uv"),
+}
+# A repo without a lockfile (express) pins its dependencies through these instead.
+UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
+LOCKFILES = (
+    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
+)
+# What an external instance's base tree contributes to its environment key.
+EXTERNAL_DEPENDENCY_FILES = (
+    "Cargo.toml", "go.mod", "pyproject.toml", "setup.py", "setup.cfg", *LOCKFILES,
+)
+
+
+def run_probe(argv: tuple[str, ...]) -> str | None:
+    """Return a tool's version line, or None when it is unavailable."""
+    try:
+        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (probe.stdout or probe.stderr).strip().splitlines()
+    return lines[0] if probe.returncode == 0 and lines else None
+
+
+def local_dependency_hashes(read: Callable[[Sequence[str]], Mapping[str, str]]) -> Mapping[str, str]:
+    """Lockfile hashes of a tree, else the hashes of its unlocked dependency files."""
+    return read(LOCKFILES) or read(UNLOCKED_DEPENDENCY_FILES)
+
+
+def host_env_fingerprint(
+    language: str,
+    dependency_hashes: Mapping[str, str],
+    *,
+    probe: Callable[[tuple[str, ...]], str | None] | None = None,
+) -> str:
+    """Fingerprint the language's toolchains and a tree's dependency file hashes."""
+    probe = probe or run_probe
+    return env_fingerprint(
+        toolchains={name: probe(TOOLCHAIN_PROBES[name]) for name in LANGUAGE_TOOLCHAINS.get(language, ())},
+        lockfile_hash=hashlib.sha256(json.dumps(dependency_hashes, sort_keys=True).encode()).hexdigest(),
+    )
 
 
 def file_sha256(path: Path) -> str:

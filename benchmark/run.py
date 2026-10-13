@@ -529,40 +529,10 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
 
 
 CELL_TIMEOUT_S = 600
-_TOOLCHAIN_PROBES = {
-    "rustc": ("rustc", "--version"),
-    "cargo": ("cargo", "--version"),
-    "go": ("go", "version"),
-    "node": ("node", "--version"),
-    "python3": ("python3", "--version"),
-    "uv": ("uv", "--version"),
-}
-# The toolchains a repo's language builds and tests with; a rustc bump must not
-# re-key a Go, JavaScript, or Python task.
-_LANGUAGE_TOOLCHAINS = {
-    "rust": ("rustc", "cargo"),
-    "go": ("go",),
-    "javascript": ("node",),
-    "python": ("python3", "uv"),
-}
 # The synthetic fixture repo is a Python project (fixtures/template/pyproject.toml).
 _SYNTHETIC_LANGUAGE = "python"
-# A repo without a lockfile (express) pins its dependencies through these instead.
-_UNLOCKED_DEPENDENCY_FILES = ("package.json", "node_modules/.package-lock.json")
-_LOCKFILES = (
-    "Cargo.lock", "go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "poetry.lock", "uv.lock", "Pipfile.lock", "requirements.txt",
-)
 
-
-def _run_probe(argv: tuple[str, ...]) -> str | None:
-    """Return a tool's version line, or None when it is unavailable."""
-    try:
-        probe = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    lines = (probe.stdout or probe.stderr).strip().splitlines()
-    return lines[0] if probe.returncode == 0 and lines else None
+_run_probe = baselines.run_probe
 
 
 # Probed once per run when planning cell identities.
@@ -603,23 +573,16 @@ def env_fingerprint(task_or_repo: object) -> str:
     language = getattr(task, "language", None) or (
         _SYNTHETIC_LANGUAGE if repo_name == "synthetic" else REPOS[repo_name].language
     )
-    if _is_prepared(task):
-        base_file_hashes = getattr(task, "base_file_hashes", lambda _names: {})
-        lockfiles = base_file_hashes(_LOCKFILES) or base_file_hashes(_UNLOCKED_DEPENDENCY_FILES)
+    if hasattr(task, "dependency_hashes"):
+        hashes = task.dependency_hashes()
+    elif _is_prepared(task):
+        hashes = baselines.local_dependency_hashes(getattr(task, "base_file_hashes", lambda _names: {}))
     else:
         repo_path = get_repo_path(repo_name)
-        lockfiles = {
-            name: _file_sha256(repo_path / name)
-            for name in _LOCKFILES if (repo_path / name).is_file()
-        } or {
-            name: _file_sha256(repo_path / name)
-            for name in _UNLOCKED_DEPENDENCY_FILES if (repo_path / name).is_file()
-        }
-    return baselines.env_fingerprint(
-        toolchains={name: _probe_version(_TOOLCHAIN_PROBES[name])
-                    for name in _LANGUAGE_TOOLCHAINS.get(language, ())},
-        lockfile_hash=hashlib.sha256(json.dumps(lockfiles, sort_keys=True).encode()).hexdigest(),
-    )
+        hashes = baselines.local_dependency_hashes(lambda names: {
+            name: _file_sha256(repo_path / name) for name in names if (repo_path / name).is_file()
+        })
+    return baselines.host_env_fingerprint(language, hashes, probe=_probe_version)
 
 
 def _is_tilth_arm(mode: ModeConfig) -> bool:

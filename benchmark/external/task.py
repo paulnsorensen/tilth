@@ -327,6 +327,17 @@ class ExternalTask(Task):
                 hashes[name] = hashlib.sha256(content).hexdigest()
         return hashes
 
+    @cached_property
+    def _dependency_hashes(self) -> dict[str, str]:
+        hashes = self.base_file_hashes(baselines.EXTERNAL_DEPENDENCY_FILES)
+        if self.python_version:
+            hashes["python_version"] = self.python_version
+        return hashes
+
+    def dependency_hashes(self) -> dict[str, str]:
+        """The base tree's dependency file hashes and requested interpreter; computed once per instance."""
+        return self._dependency_hashes
+
     def declared_package(self) -> str | None:
         """A package name the row itself declares; datasets override."""
         return None
