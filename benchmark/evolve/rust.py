@@ -8,6 +8,7 @@ _TEST_TOKEN = re.compile(r"\btest\b")
 _INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)\s*!\s*([(\[{])")
 _USE = re.compile(r"\buse\b([^;]*);")
 _INCLUDE_NAME = re.compile(r"\binclude(?:_str|_bytes)?\b")
+_BARE_MACRO = re.compile(r"\b(?:include(?:_str|_bytes)?(?!\w)(?!\s*!)|cfg(?!\w)(?!\s*[!(]))")
 _CFG_MACRO = re.compile(r"\bcfg\s*!\s*([(\[{])")
 _PATH_ATTR = re.compile(r"#\s*!?\s*\[\s*path\s*=")
 _MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
@@ -149,6 +150,17 @@ def include_aliases(text: str) -> list[tuple[int, int]]:
     mask = _code_mask(text)
     return [(_line(text, match.start()), _line(text, match.end()))
             for match in _USE.finditer(mask) if _INCLUDE_NAME.search(match[1])]
+
+
+def bare_macro_names(text: str) -> list[int]:
+    """Lines with ``include``, ``include_str``, ``include_bytes``, or ``cfg`` used as a plain name.
+
+    A name not followed by ``!`` can reach a macro through a ``macro_rules!`` parameter (``$m!(..)``) and hide
+    it from ``include_invocations`` and ``cfg_test_macros``. ``cfg`` before ``(`` is an attribute, which
+    ``cfg_test_spans`` already guards.
+    """
+    mask = _code_mask(text)
+    return [_line(text, match.start()) for match in _BARE_MACRO.finditer(mask)]
 
 
 def cfg_test_macros(text: str) -> list[tuple[int, int]]:

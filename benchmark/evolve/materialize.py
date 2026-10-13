@@ -217,6 +217,10 @@ class Materializer:
                 if any(first <= number <= last for number in added):
                     raise ApplyRejected(f"{path}:{first} imports include, include_str, or include_bytes by a path, "
                                         "which can rename the macro and hide its file")
+            for number in rust.bare_macro_names(text):
+                if number in added:
+                    raise ApplyRejected(f"{path}:{number} names include, include_str, include_bytes, or cfg without "
+                                        "a call, which can pass the macro through a macro_rules! parameter")
             for first, last in rust.cfg_test_macros(text):
                 if any(first <= number <= last for number in added):
                     raise ApplyRejected(f"{path}:{first} uses cfg!(..test..), which makes code differ between tests and "

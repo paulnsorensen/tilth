@@ -958,7 +958,8 @@ def test_finish_refuses_winner_without_just_check_pass(world) -> None:
     assert "just check" in log_text(world)
 
 
-def test_finish_no_pr_when_seed_wins(world) -> None:
+def test_finish_no_pr_when_seed_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = make_world(monkeypatch, tmp_path, seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="1")))
     evo = ready(world)
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
     accept(evo, child(evo.seed, test_a="0"), {"dev_a": 0.9, "dev_b": 0.9})
@@ -1808,6 +1809,34 @@ def test_rejects_include_bypasses(world, files: dict[str, str]) -> None:
     with pytest.raises(ApplyRejected, match="include"):
         materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, files)})
     assert refs(world) == []
+
+
+MACRO_BY_NAME = (
+    "macro_rules! call {{ ($m:ident) => {{ $m!({arg}) }} }}\n"
+    "pub const X: &str = call!({name});\n")
+
+
+@pytest.mark.parametrize("name, arg", [
+    ("include_str", HIDDEN),
+    ("include_bytes", HIDDEN),
+    ("cfg", "test"),
+], ids=["include_str", "include_bytes", "cfg"])
+def test_rejects_a_guarded_macro_passed_by_name(world, name: str, arg: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + MACRO_BY_NAME.format(name=name, arg=arg)})
+
+    with pytest.raises(ApplyRejected, match="without a call"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+def test_names_that_only_resemble_the_guarded_macros_are_kept(world) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    lines = ("#[cfg(feature = \"x\")]\npub fn gated() {}\n"
+             "#[cfg_attr(feature = \"x\", derive(Debug))]\npub struct S;\n"
+             "pub fn included(include_count: usize) -> usize { include_count }\n")
+    sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
+    assert sha != world.seed_sha
 
 
 def test_rejects_a_changed_path_with_spaces(world) -> None:
