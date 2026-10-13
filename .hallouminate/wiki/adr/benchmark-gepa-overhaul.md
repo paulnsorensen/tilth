@@ -1,6 +1,6 @@
 # ADR: benchmark GEPA overhaul
 
-The benchmark GEPA overhaul grows the benchmark with FeatureBench, SWE-bench Multilingual, and the Gin render-context task, freezes stock baselines, adds a model judge, and adds a GEPA evolution loop over tilth commits.
+The benchmark GEPA overhaul grows the benchmark with FeatureBench, SWE-bench Multilingual, and the Gin render-context task. It also freezes stock baselines, adds a model judge, and adds a GEPA evolution loop over tilth commits.
 PR #312 is the all-in-one PR, and it closes unmerged. The work lands as the stacked PRs #313 to #319 (`stack/bench-gepa/0-prompt-files` to `stack/bench-gepa/6-wiki`).
 In the #312 session archive, "Landed" means implemented on the #312 branch, not merged.
 The umbrella spec `benchmark-gepa-overhaul` (forks F-1 to F-6) and six `bench-*` child specs held the contracts. The stack removes the spec files, so this page keeps their goals, picks, and curd map.
@@ -16,28 +16,34 @@ The invariants and guards that enforce these decisions are on [Benchmark GEPA lo
 - **G-5:** Stock baselines run once, are stored, and are reused.
 - **G-6:** A model judge decides where structural (ast-grep) tools apply.
 
-Non-goals: a structural write op in `tilth_write` (issue #310); Docker, Harbor, or native `fb infer`/`fb eval`; GPU tasks, Level 2 tasks, and tasks whose environment does not build in a local `uv` venv; matching published leaderboard numbers; auto-merging a winner; a crate or npm version bump.
+Non-goals:
+
+- A structural write op in `tilth_write` (issue #310).
+- Docker, Harbor, or native `fb infer`/`fb eval`.
+- GPU tasks, Level 2 tasks, and tasks whose environment does not build in a local `uv` venv.
+- Matching published leaderboard numbers.
+- Auto-merging a winner, and a crate or npm version bump.
 
 ## Decisions
 
 ### ADR-001: Run external tasks fully native, with no Docker (F-1) [status: accepted]
 
 - **Context:** The maintainer runs the benchmark on a Claude and Codex subscription on his own machine and asked for no container infrastructure. Research ([subscription-auth research note](../sources/benchmark-subscription-auth-2026-10.md)) showed grading fidelity comes from host preflight, not from images.
-- **Decision:** FeatureBench Lite Level 1 and SWE-bench Multilingual tasks run on a local checkout without upstream history, a local `uv` venv or Go/Rust toolchain, and our own replay of FAIL_TO_PASS and PASS_TO_PASS tests on a clean copy. Any `docker` or `podman` step is an error.
+- **Decision:** FeatureBench Lite Level 1 and SWE-bench Multilingual tasks run on a local checkout without upstream history. They use a local `uv` venv or Go/Rust toolchain. Our own code replays FAIL_TO_PASS and PASS_TO_PASS tests on a clean copy. Any `docker` or `podman` step is an error.
 - **Alternatives:** Harbor supports both subscription logins, but its FeatureBench verifier shares the agent container and leaves the gold patch readable. Native `fb infer` requires `OPENAI_API_KEY` for Codex and has no MCP hook. Upstream Docker graders were rejected with the container requirement.
 - **Consequences:** Agent cells get no network or filesystem isolation, so a contamination scan replaces isolation. Tasks that need a GPU or a heavy Python environment are deferred (`bench-gpu-host`, `bench-heavy-python-envs`). A task enters the panel only after a native admission round trip on the host.
 
 ### ADR-002: Authenticate only through subscription OAuth [status: accepted]
 
 - **Context:** The maintainer directed subscription use, not an API key. Under `claude -p`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` beat `CLAUDE_CODE_OAUTH_TOKEN`, so a stray key silently moves billing to the API. `claude --bare` ignores OAuth.
-- **Decision:** Claude cells, the judge, reflection, and the proposer all call `claude -p` with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. One shared guard refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set (`benchmark/run.py:207-220`). A usage-limit rejection stops the run as `quota`. Cells run one at a time, and Codex uses the host `CODEX_HOME`, because Codex rotates `auth.json` and forbids sharing it across concurrent jobs.
+- **Decision:** Claude cells, the judge, reflection, and the proposer all call `claude -p` with `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. One shared guard refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set. A usage-limit rejection stops the run as `quota`. Cells run one at a time, and Codex uses the host `CODEX_HOME`, because Codex rotates `auth.json` and forbids sharing it across concurrent jobs.
 - **Alternatives:** API-key billing (rejected by directive). Per-cell copies of `/login` credentials (refresh tokens rotate; the one-year setup token does not).
 - **Consequences:** `total_cost_usd` is a notional price-table estimate, and quota is the binding limit. Anthropic's Consumer Terms on automated access are unreconciled with its `setup-token` docs; the exposure falls on the maintainer's account. The archive's umbrella text names only `ANTHROPIC_API_KEY`; the code also refuses `ANTHROPIC_AUTH_TOKEN`, and the code wins.
 
 ### ADR-003: Buy stock baselines once and refuse silent drift [status: accepted]
 
 - **Context:** Published leaderboards have no per-instance rows for current stock agents. Every A/B run used to re-buy the baselines.
-- **Decision:** Every row carries a run key, and a result store answers any baseline cell whose key matches a completed row. When a baseline slot has a completed row only under a different key, the run refuses until `--refreeze-baselines` buys the baseline once under the new key.
+- **Decision:** Every row carries a run key. A result store answers any baseline cell whose key matches a completed row. When a baseline slot has a completed row only under a different key, the run refuses. The flag `--refreeze-baselines` then buys the baseline once under the new key.
 - **Alternatives:** Re-running baselines per experiment (cost). Letting a changed key silently start a new baseline (hides drift and re-buys without consent).
 - **Consequences:** A host toolchain or agent CLI update between runs costs one deliberate re-buy. Expect one `--refreeze-baselines` the first time an older store meets the new key.
 
@@ -70,26 +76,27 @@ Non-goals: a structural write op in `tilth_write` (issue #310); Docker, Harbor, 
 
 - **Context:** The child specs marked some choices `[AGENT-DECIDED]` and recorded an alternative for each. The maintainer approved the specs with these defaults.
 - **Decision:**
-  - Harness data lives in `$TILTH_BENCH_DATA`, default `~/.local/share/tilth-bench/external` (`benchmark/external/data.py:44`), not beside the `/tmp` fixture repos.
-  - External cells time out per language: Python 1200 s, Go and Rust 1800 s (`benchmark/external/task.py:53-54,220`), not one global flag.
-  - `pass_rate` counts FAIL_TO_PASS plus PASS_TO_PASS entries (`benchmark/external/task.py:460`), not FAIL_TO_PASS only.
+  - Harness data lives in `$TILTH_BENCH_DATA`, default `~/.local/share/tilth-bench/external`, not beside the `/tmp` fixture repos.
+  - External cells time out per language: Python 1200 s, Go and Rust 1800 s, not one global flag.
+  - `pass_rate` counts FAIL_TO_PASS plus PASS_TO_PASS entries, not FAIL_TO_PASS only.
   - The contamination scan reads tool-call inputs only, not outputs. A row with no sidecar is `contaminated: true` with an `unscanned` hit (spec claim, not re-verified).
-  - Panel strata are source families, not family plus language (`benchmark/panels.py:115-129`). Family plus language left single-member strata and could empty the test split.
-  - The split locks on the first completed stored row, not on any row, and every `load_panel` call checks it (`benchmark/panels.py:282-285`).
+  - Panel strata are source families, not family plus language. Family plus language left single-member strata and could empty the test split.
+  - The split locks on the first completed stored row, not on any row. Every `load_panel` call checks it.
   - The panel loader does not re-run a primary's preflight before it accepts a fallback (spec claim, not re-verified).
   - `run.py --tasks <instance_id>` resolves an admitted external task; `--tasks all` stays local-only. `preflight.py --panel` reads only `members[].id` and `members[].family` (spec claim, not re-verified).
 - **Alternatives:** Each bullet names the rejected alternative.
+- **Enforcement:** [Benchmark GEPA loop invariants and guards](../benchmark-gepa-invariants.md) holds the code citations.
 
 ## Task picks and fallbacks
 
-- SWE-bench Multilingual at HF revision `846e647b9f33c0b51b739d005d13d85493c9af09` (`benchmark/external/data.py:16`): Go `gin-gonic__gin-3741` with fallback `prometheus__prometheus-14861`; Rust `sharkdp__bat-2650` with fallback `tokio-rs__tokio-6724`.
-- FeatureBench Lite `v1.1` (`benchmark/external/data.py:15`): the COSPA Pareto-12 list restricted to `.lv1` IDs, minus pandas, astropy, transformers, Lightning, and mlflow.
+- SWE-bench Multilingual at HF revision `846e647b9f33c0b51b739d005d13d85493c9af09` (`benchmark/external/data.py:17`): Go `gin-gonic__gin-3741` with fallback `prometheus__prometheus-14861`; Rust `sharkdp__bat-2650` with fallback `tokio-rs__tokio-6724`.
+- FeatureBench Lite at commit `76b4a4566e04f4bcc13c35125d4f301791efa736` (`benchmark/external/data.py:16`). That commit is the Hugging Face tag `v1.1` on 2026-10-13. A pinned parquet sha256 checks the download (`benchmark/external/data.py:25-28`). The task list is the COSPA Pareto-12 list restricted to `.lv1` IDs, minus pandas, astropy, transformers, Lightning, and mlflow.
 - Local: `rg_search_dispatch`, `rg_trait_implementors`, and `gin_servehttp_flow` form the dev-only cheap tier. `gin_edit_render_context` joins the stratified split.
 - The committed `gepa-v1` panel uses both primaries and no fallback (`benchmark/panels/gepa-v1.json:60,66`).
 
 ## Admission on the cloud host
 
-The model-free preflight on the #312 cloud host admitted 5 of 7 FeatureBench Lite Level 1 candidates (sphinx, metaflow, seaborn x2, sympy), plus `gin-gonic__gin-3741` and `sharkdp__bat-2650`.
+The model-free preflight on the #312 cloud host admitted 5 of 7 FeatureBench Lite Level 1 candidates (sphinx, metaflow, seaborn x2, sympy). It also admitted `gin-gonic__gin-3741` and `sharkdp__bat-2650`.
 It refused pydantic (gold 4/6) and xarray (pytest-mypy-plugins option mismatch) as `gold_unresolved`.
 Dataset rows hold gold patches and held-out tests, so they are not in the checkout. To regenerate them, run `python3 benchmark/external/preflight.py --panel benchmark/panels/gepa-v1.json`.
 
@@ -126,4 +133,4 @@ The umbrella planned a diamond (c0 beside c1, c3 beside c4). The stack lands the
 
 All were accessed on 2026-10-03.
 
-_Source: umbrella and child specs at `e42d451` (removed from the stack) and the PR #312 session archive README. ADR-001 to ADR-007 verified against code at `e77a567`; later additions at `70466b9` · Updated: 2026-10-13 · Supersedes: gold-minus-last-hunk admission rule_
+_Source: umbrella and child specs at `e42d451` (removed from the stack) and the PR #312 session archive README. Stack-only commits `e42d451`, `70466b9`, and `e77a567` are reachable through `refs/pull/319/head`. Decisions verified against the layer 6 head of PR #319 · Updated: 2026-10-13 · Supersedes: gold-minus-last-hunk admission rule_

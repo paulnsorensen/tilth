@@ -102,3 +102,7 @@
 2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-mcp-overhaul.md · Record the 80,515-call analytics, the #23 surface, what lasted, and supersession by #116 and the search-v2 roadmap.
 
 2026-10-13 · f31eb08a7bd42ccd · merged · specs/fuzzy-suggest-only.md; specs/index.md; index.md · Add the auto-open predecessor (#57, nucleo, miss-rate evidence) and verified current state; add five spec links and a spec-history index row. The repo stops tracking .cheese/specs; the wiki holds their durable content.
+
+2026-10-13 · cure-pr-319-wiki · merged · benchmark-gepa-invariants.md; adr/benchmark-gepa-overhaul.md; benchmark-harness-gotchas.md; sources/benchmark-subscription-auth-2026-10.md; sources/swe-bench-multilingual-candidates-2026-10.md; index.md · Re-pin citations to the layer 6 head, correct the run-key, finish-reserve, and grading-guard rules, link #320, #322, #325, and split long sentences. The ADR keeps decisions only.
+
+2026-10-13 · cure-pr-319-wiki · new-page · benchmark-gepa-gotchas.md · Move the October 2026 GEPA, gepa 0.1.4, and external-data gotchas out of benchmark-harness-gotchas.md; note that grading reads JUnit XML.

@@ -1,6 +1,7 @@
 # Running FeatureBench and SWE-bench Multilingual on subscription auth, one eval per attempt
 
-The tilth benchmark-overhaul session's research note, accessed 2026-10-03, supports running external benchmark tasks on a Claude and Codex subscription with one agent run and one test-only grading pass per attempt.
+The tilth benchmark-overhaul session's research note was accessed on 2026-10-03.
+It supports running external benchmark tasks on a Claude and Codex subscription. Each attempt needs one agent run and one test-only grading pass.
 Canonical source: [Running FeatureBench and SWE-bench Multilingual on subscription auth, one eval per attempt](https://github.com/paulnsorensen/tilth/blob/9e84659b2d27715a0d995b30a760213cefd01096/.cheese/archive/benchmark-gepa-overhaul/corpus/research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md)
 The link points at the PR #312 head commit `9e84659`, which stays reachable through `refs/pull/312/head`. PR #312 is the all-in-one provenance PR; it closes unmerged, and the work lands as the stacked PRs #313-#319. The session archive leaves the tree after that PR, so the primary sources below are the durable evidence. The raw notes are `raw/auth-terms.md` and `raw/harness-options.md` in the same archive directory. The SWE-bench Multilingual notes are on [SWE-bench Multilingual candidates](swe-bench-multilingual-candidates-2026-10.md).
 

@@ -1,7 +1,7 @@
 # SWE-bench Multilingual candidates for the GEPA panel
 
 The GEPA panel uses two SWE-bench Multilingual tasks: `gin-gonic__gin-3741` (dev) and `sharkdp__bat-2650` (test) (`benchmark/panels/gepa-v1.json:60,66`).
-The dataset is pinned to revision `846e647b9f33c0b51b739d005d13d85493c9af09`, because the dataset changed in August 2026 (`benchmark/external/data.py:15-16`).
+The dataset is pinned to revision `846e647b9f33c0b51b739d005d13d85493c9af09`, because the dataset changed in August 2026 (`benchmark/external/data.py:16-17`).
 The solve counts below come from mini-SWE-agent runs, not from Claude Code or Codex runs. Use them only as a difficulty signal.
 
 Canonical source: `raw/swe-multilingual.md` in the PR #312 session archive, accessed 2026-10-03 ([research note at the PR #312 head](https://github.com/paulnsorensen/tilth/blob/9e84659b2d27715a0d995b30a760213cefd01096/.cheese/archive/benchmark-gepa-overhaul/corpus/research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md)). PR #312 closes unmerged; its head `9e84659` stays reachable through `refs/pull/312/head`.
@@ -24,7 +24,7 @@ The counts are out of 14 runs in `github.com/SWE-bench/experiments` `evaluation/
 | `sharkdp__bat-2650` | 7 | primary, test |
 | `tokio-rs__tokio-6724` | 12 | candidate, not used |
 
-The local gin fixture already holds the gin-3741 fix, so an external gin-3741 cell must not read the local clones. See [Benchmark harness gotchas](../benchmark-harness-gotchas.md).
+The local gin fixture already holds the gin-3741 fix, so an external gin-3741 cell must not read the local clones. See [Benchmark GEPA overhaul gotchas](../benchmark-gepa-gotchas.md).
 
 ## Images
 
@@ -42,4 +42,4 @@ The archive did not capture sizes or digests for prometheus-14861 or bat-2650. G
 - [Running FeatureBench and SWE-bench Multilingual on subscription auth](benchmark-subscription-auth-2026-10.md)
 - [ADR: benchmark GEPA overhaul](../adr/benchmark-gepa-overhaul.md)
 
-_Source: PR #312 session archive `raw/swe-multilingual.md` (head `9e84659`), accessed 2026-10-03; repo cites verified at `70466b9` · Updated: 2026-10-13_
+_Source: PR #312 session archive `raw/swe-multilingual.md` (head `9e84659`), accessed 2026-10-03; repo cites verified at the layer 6 head of PR #319 · Updated: 2026-10-13_
