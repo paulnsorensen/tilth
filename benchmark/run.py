@@ -677,6 +677,7 @@ def _cell_task_digest(task: object) -> str:
 
 _REPO_PLACEHOLDER = Path("<repo>")
 _TILTH_BIN_PLACEHOLDER = "<tilth-bin>"
+_BUDGET_PLACEHOLDER = "<max-budget>"
 
 
 def _command_template(
@@ -711,7 +712,8 @@ def _command_template(
     except (ValueError, RuntimeError) as error:
         # The cell fails when it runs; key it by the reason it cannot be built.
         return [f"unbuildable: {error}"]
-    return cmd
+    # The digest records max_budget_usd on its own; the budget format must not change the key.
+    return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd" else part for i, part in enumerate(cmd)]
 
 
 def cell_identity(
@@ -1588,7 +1590,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         if stored is not None:
             scanned = {} if isinstance(stored.get("contaminated"), bool) else contamination_fields(
                 stored.get("trajectory_path"), task)
-            _store_reused_panel_row({**stored, **scanned}, stamp, store_path=store_path)
+            _store_reused_panel_row({**stored, **scanned}, stamp, store_path=store_path, history=history)
             emit({**stored, **scanned, **stamp, "variant": _variant_metadata(mode), "charged_usd": 0.0,
                   "reused": True})
             continue
@@ -1627,13 +1629,13 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             "variant": _variant_metadata(mode), **stamp, **identity, **applied_cap, "reused": False,
         }
 
-        def fail(fields: dict) -> None:
+        def fail(fields: dict, charge: float | None = None) -> None:
             native = stream_native_cost(_read_stream(stream_log_path))
             settle({**metadata, **fields, "correct": False,
                     **({"total_cost_usd": native} if native is not None else {}),
                     "cost_source": "native" if native is not None else "estimate",
                     "trajectory_path": write_trajectory(stream_log_path, runner)},
-                   native if native is not None else estimate)
+                   charge if charge is not None else native if native is not None else estimate)
 
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
@@ -1646,6 +1648,10 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             raise PlanStopped("mcp-unavailable", str(error), rows) from error
         except subprocess.TimeoutExpired:
             fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
+        except (external.task.EnvBuildError, external.task.PrepareError) as error:
+            # As in main: no model call ran, so the cell estimate is not charged.
+            fail({"infra": "prepare", "error": f"infra:prepare: {error}",
+                  "correctness_reason": f"Prepare failed: {error}"}, charge=0.0)
         except Exception as error:
             quota = str(error) if isinstance(error, QuotaExhaustedError) else detect_quota_rejection(
                 _read_stream(stream_log_path))

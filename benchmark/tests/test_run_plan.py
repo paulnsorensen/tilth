@@ -185,6 +185,28 @@ def test_run_plan_stops_on_quota(world, monkeypatch: pytest.MonkeyPatch) -> None
     assert world.stored()[0]["infra"] == "quota"
 
 
+def test_run_plan_scores_a_prepare_failure_as_free_infra(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*args, **kwargs):
+        world.calls.append(args)
+        raise run.external.task.PrepareError("patch does not apply")
+
+    monkeypatch.setattr(run, "run_single", broken)
+    ledger = SpendLedger(100.0)
+    rows = plan(world, cells("dev_a"), ledger=ledger, cell_estimate_usd=0.5)
+    assert ledger.spent == 0.0
+    assert [(row["infra"], row["correct"], row["charged_usd"]) for row in rows] == [("prepare", False, 0.0)]
+    assert "patch does not apply" in rows[0]["error"]
+
+
+def test_reused_cells_of_a_stamped_panel_add_no_store_rows(world) -> None:
+    plan(world, cells("dev_a"))
+    store = run.RESULTS_DIR / baselines.STORE_FILENAME
+    before = len(baselines.load_rows(store))
+    rows = plan(world, cells("dev_a", "dev_a"))
+    assert [row["reused"] for row in rows] == [True, True]
+    assert len(baselines.load_rows(store)) == before
+
+
 @pytest.mark.parametrize("current", ["2.2.0", None], ids=["changed", "probe-failed"])
 def test_run_plan_reprobes_cli_before_each_paid_cell(world, monkeypatch: pytest.MonkeyPatch, current) -> None:
     plan(world, cells("dev_a"))

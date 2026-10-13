@@ -96,6 +96,16 @@ def test_setting_sources_reach_the_hashed_command() -> None:
     assert "--setting-sources" in bare and "--setting-sources" not in plain
 
 
+def test_command_template_does_not_depend_on_the_budget_format() -> None:
+    def template(budget: float) -> list[str]:
+        return run._command_template(StoreTask(), run.MODES["baseline"], "baseline", "sonnet5", bare=True,
+                                     reasoning_effort=None, max_budget_usd=budget, strict_file_tools=False)
+
+    assert template(1.0) == template(2.5)
+    assert "--max-budget-usd" in template(1.0)
+    assert "1.0000" not in template(1.0)
+
+
 def test_any_runner_command_change_feeds_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
     before = _key()
     original = run._runner_command
