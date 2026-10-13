@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import panels
 import run
 from evolve_support import CHEAP, DEV, MODEL, TEST, git, make_repo, make_world
 from panel_support import COMPLETE, FB_ALGORITHMS, admit_all, load, read, restratify, stub_loaders, write
@@ -408,6 +409,27 @@ def test_run_plan_native_failure_cost_is_both_cost_and_charge(world, monkeypatch
 
     assert (row["total_cost_usd"], row["charged_usd"], row["cost_source"]) == (0.7, 0.7, "native")
     assert ledger.spent == pytest.approx(0.7)
+
+
+def test_run_plan_all_reused_rows_reach_the_store_stamped(world) -> None:
+    plan(world, cells(*DEV))
+    unstamped = [{key: value for key, value in row.items() if not key.startswith("panel_")}
+                 for row in world.stored()]
+    world.store_path.write_text("".join(json.dumps(row) + "\n" for row in unstamped))
+    ledger = SpendLedger(100.0)
+
+    reused = plan(world, cells(*DEV), ledger=ledger)
+
+    assert all(row["reused"] and row["charged_usd"] == 0.0 for row in reused) and ledger.spent == 0.0
+    assert len(world.runner_calls()) == len(DEV)
+    copies = [row for row in world.stored() if row.get("panel_name") == world.panel.name]
+    assert sorted(row["task"] for row in copies) == sorted(DEV)
+    assert all(row["charged_usd"] == 0.0 and row["reused"] is True for row in copies)
+    with pytest.raises(panels.PanelError, match="split changed"):
+        panels._check_lock(world.panel.name, "0" * 64, world.store_path)
+
+    plan(world, cells(*DEV))
+    assert len(world.stored()) == 2 * len(DEV)
 
 
 def test_run_plan_caps_cell_at_unreserved_headroom(world, monkeypatch: pytest.MonkeyPatch) -> None:

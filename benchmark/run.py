@@ -1588,6 +1588,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         if stored is not None:
             scanned = {} if isinstance(stored.get("contaminated"), bool) else contamination_fields(
                 stored.get("trajectory_path"), task)
+            _store_reused_panel_row({**stored, **scanned}, stamp, store_path=store_path)
             emit({**stored, **scanned, **stamp, "variant": _variant_metadata(mode), "charged_usd": 0.0,
                   "reused": True})
             continue
