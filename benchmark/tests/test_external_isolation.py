@@ -1,6 +1,7 @@
 """Grading and environment builds keep harness credentials and row paths contained."""
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import external.data
 import external.proc
 import external.swebench_ml
 import external.task
-from external_support import SWE_PY
+from external_support import SWE_PY, SWE_RS
 
 
 def test_toolchain_env_drops_credentials_and_swaps_home(tmp_path: Path) -> None:
@@ -184,3 +185,45 @@ def test_build_env_runs_uv_in_copy_link_mode(external_bench, monkeypatch: pytest
     task.grade_venv()
 
     assert envs and all(env.get("UV_LINK_MODE") == "copy" for env in envs)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not on PATH")
+def test_refresh_sources_makes_cargo_rebuild_an_edited_source_after_a_seed_copy(tmp_path: Path) -> None:
+    crate = tmp_path / "seed-tree"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text('[package]\nname = "calc"\nversion = "0.1.0"\nedition = "2021"\n')
+    main = crate / "src" / "main.rs"
+    main.write_text('fn main() { println!("base"); }\n')
+    env = {key: value for key, value in os.environ.items() if key != "CARGO_TARGET_DIR"}
+    build = ["cargo", "run", "--offline", "--quiet"]
+    assert subprocess.run(build, cwd=crate, env=env, capture_output=True, text=True).stdout.strip() == "base"
+
+    checkout = tmp_path / "checkout"
+    shutil.copytree(crate, checkout, symlinks=True)
+    edited = checkout / "src" / "main.rs"
+    edited.write_text('fn main() { println!("gold"); }\n')
+    old = main.stat().st_mtime - 100
+    os.utime(edited, (old, old))
+    external.swebench_ml.refresh_sources(checkout)
+
+    result = subprocess.run(build, cwd=checkout, env=env, capture_output=True, text=True)
+    assert result.stdout.strip() == "gold", result.stderr
+
+
+def test_failed_cargo_seed_is_not_retried(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.load(SWE_RS, external.data.SWEBENCH_ML_REVISION)
+    calls: list[list[str]] = []
+    real_run = external.proc.run
+
+    def failing(argv, **kwargs):
+        if argv[0] != "cargo":
+            return real_run(argv, **kwargs)
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 101, "", "build failed")
+
+    monkeypatch.setattr(external.proc, "run", failing)
+
+    assert task.cargo_seed() is None
+    assert task.cargo_seed() is None
+    assert calls == [["cargo", "test", "--no-run"]]

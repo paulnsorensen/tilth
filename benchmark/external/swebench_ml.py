@@ -10,6 +10,7 @@ It matches each FAIL_TO_PASS and PASS_TO_PASS test ID against exactly one parsed
 
 import fcntl
 import json
+import os
 import re
 import shlex
 import shutil
@@ -88,6 +89,18 @@ def test_results(report: str, language: str) -> list[tuple[str, bool]]:
     return [(node, status in _PYTEST_PASSING) for status, node in junit_results(report)]
 
 
+def refresh_sources(checkout: Path) -> None:
+    """Set the mtime of every file outside ``target/`` to now, so cargo sees each source as changed."""
+    for directory, names, files in os.walk(checkout):
+        if Path(directory) == checkout:
+            names[:] = [name for name in names if name != "target"]
+        for name in files:
+            try:
+                os.utime(Path(directory, name), follow_symlinks=False)
+            except OSError:
+                pass
+
+
 def entry_verdicts(report: str, entries: Sequence[str], language: str) -> dict[str, bool]:
     """An entry passes only when exactly one parsed verdict has its exact ID and that verdict passed."""
     results = test_results(report, language)
@@ -123,8 +136,11 @@ class SweBenchTask(ExternalTask):
         """A ``target/`` built once from the prepared tree, per (instance, env fingerprint).
 
         Each Rust grade copies it into its checkout, so dependencies build once.
-        The workspace crates still rebuild, because their path is part of the build hash.
+        Cargo judges freshness by file mtimes against its fingerprints, and those hold paths relative to the workspace.
+        So a copied seed would also hide a changed workspace source with an old mtime.
+        ``refresh_sources`` makes cargo rebuild the workspace crates after the copy.
         Returns None when the seed build fails. The grade then builds cold.
+        A failed build leaves a marker, so later grades skip the retry.
         """
         from .preflight import env_fingerprint  # preflight imports this module
 
@@ -132,6 +148,8 @@ class SweBenchTask(ExternalTask):
         root.mkdir(parents=True, exist_ok=True)
         with open(root / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if (root / "failed").is_file():
+                return None
             if not (root / "ready").is_file():
                 with tempfile.TemporaryDirectory(prefix="tilth-external-seed-") as temp:
                     tree = Path(temp) / "tree"
@@ -139,6 +157,7 @@ class SweBenchTask(ExternalTask):
                     result = proc.run(["cargo", "test", "--no-run"], cwd=tree, env=self.grade_env(tree),
                                       timeout=self.timeout_s)
                     if result.returncode or not (tree / "target").is_dir():
+                        (root / "failed").touch()
                         return None
                     shutil.rmtree(root / "target", ignore_errors=True)
                     shutil.move(tree / "target", root / "target")
@@ -158,6 +177,7 @@ class SweBenchTask(ExternalTask):
         # because exported sources keep the commit's mtime.
         if self.language == "rust" and (seed := self.cargo_seed()):
             shutil.copytree(seed, checkout / "target", symlinks=True)
+            refresh_sources(checkout)
         result = proc.run(["bash", "-c", command], cwd=checkout, env=env, timeout=self.timeout_s)
         if self.language == "python":
             return result.stdout + result.stderr, read_report(report)
