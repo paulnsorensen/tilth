@@ -71,3 +71,40 @@
 2026-10-02 · 5cd6b764a7b36652 · merged · local-gate-gotchas.md · Record that the default macOS TMPDIR breaks `!contains("l1")` assertions, that `/tmp` overrides still hit the symlink, and that a shared CARGO_TARGET_DIR across worktrees can skip new tests.
 
 2026-10-04 · 0f156690e9e51193 · merged · adr/tilth-write-teaching-errors.md · Align ADR-009 retry guidance with the emitted current-tag hint after PR #308 review. Frozen probes rank the target page first, second, and first.
+
+
+2026-10-08 · 5d588557962c2ca8 · new-page · sources/benchmark-subscription-auth-2026-10.md · Preserve the PR #312 subscription-auth research note (setup-token, key precedence, --bare, quota, Codex auth.json, Consumer Terms question). Exact-title probe ranks first.
+
+2026-10-08 · 5d588557962c2ca8 · new-page · adr/benchmark-gepa-overhaul.md · Record F-1 to F-6, OAuth-only auth, frozen baselines with drift refusal, and the single-hunk tampered rule. Exact and native-grading probes rank first.
+
+2026-10-08 · 5d588557962c2ca8 · new-page · benchmark-gepa-invariants.md · Record run keys, spend ledger and finish reserve, admission and grading venvs, contamination scan, split lock, kappa gate, candidate guards, paid-run checklist, and open risks, verified against the stack head. Exact and natural probes rank first.
+
+2026-10-08 · 5d588557962c2ca8 · merged · benchmark-harness-gotchas.md; mcp-instructions-limits-and-format.md; multi-agent-workflow-notes.md; index.md · Add GEPA overhaul gotchas, prompts/tools description files, the self-review lesson, and index links. Correct the stale mcp-base/mcp-edit byte-lock note. Tool-description probe ranks second.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · adr/benchmark-gepa-overhaul.md · Fold umbrella and child specs: goals, non-goals, picks and fallbacks, cloud admission, curd-to-stack map (#313-#319), deferred follow-ups, references, ADR-008 child-spec defaults. #312 closes unmerged; layer 1 deletes PHASE4_PLAN.md. Retrieval probes skipped.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-gepa-invariants.md; mcp-instructions-limits-and-format.md · Add result-store, prepare/grade, panel-file, judge-isolation, and finish-reserve headroom rules against the stack head. Fix six stop reasons and #312 wording. Confirm build tail reaches reflection; archive note stale. Repoint footer to #313.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-harness-gotchas.md · Correct the #312 wording: it closes unmerged and the work lands as #313-#319. Add 5 gepa 0.1.4 gotchas verified against benchmark/evolve/ and 3 external-data gotchas; the gin-fixture item is still a spec claim.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · sources/benchmark-subscription-auth-2026-10.md · Add the full precedence order 1-7, refresh-lock and rate_limit_event signals, Codex auth and exec limits, the pinned FeatureBench and Harbor harness facts, both terms questions, and the --bare and paused-plan risks. Provenance is 9e84659 via refs/pull/312/head.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · sources/swe-bench-multilingual-candidates-2026-10.md; sources/index.md · Record the 846e647b dataset pin, the missing revision parameter, the run_id/instance_id cache key, mini-SWE-agent solve counts, image digests from 2026-10-03, and the panel primaries gin-3741 and bat-2650.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/grok-qualifier-disambiguation.md · Record the #61 qualifier owner match and depth-cap removal, grok retirement (#297), and the ast-grep walk (#300) with no depth limit.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/post-edit-parse-check.md · Record the advisory parse check shipped in #21 and deleted in #99; successor issue #221 stays open.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-search-revival.md · Record the PR-A #45 and PR-B #46 search restoration, what search-v2 replaced, and the stale kind hint in format.rs.
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-api-adoption.md · Record replace_text and create_file (#177), the retired list overview, and follow-ups #173-#175 (#175 shipped by #308, issue still open).
+
+2026-10-13 · f31eb08a7bd42ccd · new-page · specs/tilth-mcp-overhaul.md · Record the 80,515-call analytics, the #23 surface, what lasted, and supersession by #116 and the search-v2 roadmap.
+
+2026-10-13 · f31eb08a7bd42ccd · merged · specs/fuzzy-suggest-only.md; specs/index.md; index.md · Add the auto-open predecessor (#57, nucleo, miss-rate evidence) and verified current state; add five spec links and a spec-history index row. The repo stops tracking .cheese/specs; the wiki holds their durable content.
+
+2026-10-13 · cure-pr-319-wiki · merged · benchmark-gepa-invariants.md; adr/benchmark-gepa-overhaul.md; benchmark-harness-gotchas.md; sources/benchmark-subscription-auth-2026-10.md; sources/swe-bench-multilingual-candidates-2026-10.md; index.md · Re-pin citations to the layer 6 head, correct the run-key, finish-reserve, and grading-guard rules, link #320, #322, #325, and split long sentences. The ADR keeps decisions only.
+
+2026-10-13 · cure-pr-319-wiki · new-page · benchmark-gepa-gotchas.md · Move the October 2026 GEPA, gepa 0.1.4, and external-data gotchas out of benchmark-harness-gotchas.md; note that grading reads JUnit XML.
+
+2026-10-14 · cure-pr-319-wiki-2 · merged · benchmark-gepa-invariants.md; benchmark-gepa-gotchas.md; adr/benchmark-gepa-overhaul.md; sources/swe-bench-multilingual-candidates-2026-10.md; mcp-instructions-limits-and-format.md; index.md · Re-pin spec citations to 9e84659 (refs/pull/312/head) and drop pre-rebase commits and the stale diff base. Recompute benchmark line cites after the PR #318 cure. Record dev-mean winner selection, the 2-set finish reserve, strict test win, and the cfg, debug_assertions, line-count, and file-mode guards.

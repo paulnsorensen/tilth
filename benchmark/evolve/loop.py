@@ -253,6 +253,8 @@ class Evolution:
                 run.check_baseline_drift(baseline_cells, panel=self.panel)
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
+        # The estimate counts every unstored baseline test cell, so the reserve over-counts them; that error is kept
+        # because holding too much is safe and holding too little would starve finish.
         per_finalist = self.finalist_test_cost()
         reserve = FINISH_CELL_SETS * per_finalist
         if self.settings.max_usd <= reserve:

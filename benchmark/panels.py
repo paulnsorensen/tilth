@@ -55,6 +55,8 @@ class Member:
 
 @dataclass(frozen=True)
 class Panel:
+    """A validated panel. Build it only through ``load_panel``; the constructor checks nothing."""
+
     name: str
     cheap: tuple[str, ...]
     dev: tuple[str, ...]
