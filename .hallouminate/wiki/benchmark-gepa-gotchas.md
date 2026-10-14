@@ -17,17 +17,17 @@ General harness failures from the August 2026 investigation are on [Benchmark ha
 
 ## gepa 0.1.4 integration
 
-Each item is a gepa 0.1.4 behavior that silently breaks a naive integration. The gepa source lines come from the evolve spec (`e42d451:.cheese/specs/bench-evolution-loop.md:47,50,52-54,92`). That commit is reachable through `refs/pull/319/head`. The evolve lines match the layer 6 head of PR #319.
+Each item is a gepa 0.1.4 behavior that silently breaks a naive integration. The gepa source lines come from the evolve spec (`9e84659:.cheese/specs/bench-evolution-loop.md:47,50,52-54,92`). That commit is the head of closed PR #312, reachable through `refs/pull/312/head`. The evolve lines match the layer 6 head of PR #319 after the PR #318 cure.
 
-- gepa sends each dataset item to the evaluator only as the keyword `example`. It drops each keyword that the evaluator does not name (`gepa/optimize_anything.py:1002-1044`). So the evaluator signature is `evaluate(candidate, example)` (`Cascade.evaluate`, `benchmark/evolve/loop.py:323`).
+- gepa sends each dataset item to the evaluator only as the keyword `example`. It drops each keyword that the evaluator does not name (`gepa/optimize_anything.py:1002-1044`). So the evaluator signature is `evaluate(candidate, example)` (`Evolution.evaluate`, `benchmark/evolve/loop.py:325`).
 - When `custom_candidate_proposer` is set, it owns every proposal, and gepa never calls `reflection_lm`. The default `reflection_lm` is `openai/gpt-5.1` through litellm, which needs an OpenAI API key. Evolve sets `reflection_lm=None` and registers one dispatcher (`optimize`, `benchmark/evolve/engine.py:109-118`).
 - A proposer exception does not stop the search. gepa catches it, calls the proposer again, and then skips the proposal (`gepa/proposer/reflective_mutation/reflective_mutation.py:203-225`, `gepa/core/engine.py:846-849`). So evolve never stops by raising. It sets a shared stop state, and a `StopperProtocol` callback ends the run (`benchmark/evolve/engine.py:37-44`; reasons at `benchmark/evolve/calls.py:16`).
-- A candidate that ties the best score on an instance joins that instance's Pareto front (`gepa/core/state.py:496-508`). Grader scores of 0 and 1 make ties routine, so the front can hold a candidate with one rollout. Evolve keeps its own accepted frontier and never reads the gepa front (`_admit`, `benchmark/evolve/loop.py:414-446`).
-- gepa evaluates a child on its minibatch before the child gets a pool index. A child that fails minibatch acceptance never gets an index (`gepa/proposer/reflective_mutation/reflective_mutation.py:517,533-550`). So evolve gives each content id a first-seen sequence number and orders candidates only by it (`new_cascade`, `benchmark/evolve/loop.py:216`).
+- A candidate that ties the best score on an instance joins that instance's Pareto front (`gepa/core/state.py:496-508`). Grader scores of 0 and 1 make ties routine, so the front can hold a candidate with one rollout. Evolve keeps its own accepted frontier and never reads the gepa front (`_admit`, `benchmark/evolve/loop.py:421-453`).
+- gepa evaluates a child on its minibatch before the child gets a pool index. A child that fails minibatch acceptance never gets an index (`gepa/proposer/reflective_mutation/reflective_mutation.py:517,533-550`). So evolve gives each content id a first-seen sequence number and orders candidates only by it (`new_cascade`, `benchmark/evolve/loop.py:215`).
 
 ## External-task data
 
-These items come from the external-tasks spec (`e42d451:.cheese/specs/bench-external-tasks.md:59,68,101`).
+These items come from the external-tasks spec (`9e84659:.cheese/specs/bench-external-tasks.md:59,68,101`).
 
 - The gin fixture at `d7776de7` (`benchmark/config.py:130`) already holds the gold change of `gin-gonic__gin-3741` (`logger.go:93-94`). An external cell that reads the local clones under `/tmp/tilth_bench/repos/` can see the fix. The contamination scan flags such a read as `foreign_repo_clone` (`benchmark/external/contamination.py:175`). Unverified: this is a spec claim. The fixture was not on disk for a check on 2026-10-13.
 - A FeatureBench mask `patch` can also edit a FAIL_TO_PASS file. The row `pydata__xarray.97f3a746.test_backends_chunks.fa55f68a.lv1` removes an import line from `xarray/tests/test_backends_chunks.py`. The `test_patch` is a deleted-file diff against `base_commit`, so it does not apply after a mask hunk edits that file. The mask applies forward (`mask_patch_forward`, `benchmark/external/featurebench.py:118`).
@@ -47,4 +47,4 @@ Use this list to route a failure to the right section above.
 - A GPU task passes admission on a CPU host. Do not trust `cuda_visible_devices`; use the curated CPU list.
 - Rows from older stores never match. Expect one `--refreeze-baselines`.
 
-_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `e42d451`; code verified at the layer 6 head of PR #319 · Updated: 2026-10-13_
+_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `9e84659` (`refs/pull/312/head`); code verified at the layer 6 head of PR #319 after the PR #318 cure · Updated: 2026-10-14_

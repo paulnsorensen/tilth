@@ -76,4 +76,4 @@ transcripts (anthropic.com/engineering/writing-tools-for-agents).
   compares served bytes with the files, not frozen bytes, so GEPA candidates can
   evolve them. `tool_descriptions_fit_2kb` caps each at 2,048 bytes.
 
-_Source: child spec `bench-prompt-files`, stack PR #313 (`stack/bench-gepa/0-prompt-files`), verified at `e77a567` · Updated: 2026-10-13_
+_Source: child spec `bench-prompt-files`, stack PR #313 (`stack/bench-gepa/0-prompt-files`), verified at the layer 6 head of PR #319 · Updated: 2026-10-13_

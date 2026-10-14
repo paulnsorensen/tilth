@@ -133,4 +133,4 @@ The umbrella planned a diamond (c0 beside c1, c3 beside c4). The stack lands the
 
 All were accessed on 2026-10-03.
 
-_Source: umbrella and child specs at `e42d451` (removed from the stack) and the PR #312 session archive README. Stack-only commits `e42d451`, `70466b9`, and `e77a567` are reachable through `refs/pull/319/head`. Decisions verified against the layer 6 head of PR #319 · Updated: 2026-10-13 · Supersedes: gold-minus-last-hunk admission rule_
+_Source: umbrella and child specs at `9e84659` (removed from the stack; the head of closed PR #312, reachable through `refs/pull/312/head`) and the PR #312 session archive README. Decisions verified against the layer 6 head of PR #319 after the PR #318 cure · Updated: 2026-10-14 · Supersedes: gold-minus-last-hunk admission rule_

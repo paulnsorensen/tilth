@@ -1,8 +1,8 @@
 # Benchmark GEPA loop invariants and guards
 
 The benchmark GEPA overhaul adds a result store, native external tasks, a locked panel, a calibrated judge, and a GEPA evolution loop under `benchmark/`.
-This page lists the invariants and guards a future change must keep. Code citations match the layer 6 head of PR #319 (diff base `085c44b`).
-The commits `e42d451`, `70466b9`, and `e77a567` exist only in the stack. Fetch them through `refs/pull/319/head`.
+This page lists the invariants and guards a future change must keep. Code citations match the layer 6 head of PR #319, after the PR #318 cure.
+Spec citations point at commit `9e84659`, the head of closed PR #312. Fetch it with `git fetch origin refs/pull/312/head`.
 The reasons behind the guards, the goals, and the task picks are in [ADR: benchmark GEPA overhaul](adr/benchmark-gepa-overhaul.md).
 The umbrella and child specs that held the contracts are removed from the stack. The ADR page keeps their durable content.
 
@@ -10,7 +10,7 @@ The umbrella and child specs that held the contracts are removed from the stack.
 
 The umbrella spec states six invariants, and `benchmark/tests/test_invariants.py` tests them.
 
-- The only score is grader correctness. A contaminated rollout counts as incorrect (`correct()`, `benchmark/evolve/loop.py:121-126`).
+- The only score is grader correctness. A contaminated rollout counts as incorrect (`correct()`, `benchmark/evolve/loop.py:123-128`).
 - No optimizer-side model reads grader inputs. Reflective records keep `correct`, `pass_rate`, and F2P/P2P counts. They drop `correctness_reason`, ground-truth strings, gold patches, and held-out test source or output. Text the agent itself produced stays.
 - One `--max-usd` ceiling and one OAuth guard cover agent cells, judge calls, reflection calls, and proposer calls.
 - Baselines are reused, never silently re-bought.
@@ -24,36 +24,36 @@ A benchmark run key hashes `CELL_KEY_FIELDS`: task, model, CLI version, effort, 
 Any other key input that differs for a matched slot, including `harness_digest`, is drift. The run refuses without `--refreeze-baselines` (`benchmark/baselines.py:233-254`).
 The task digest covers grader source and every `<stem>_fixtures` directory (`_cell_task_digest`, `benchmark/run.py:662-675`; `task_digest`, `benchmark/baselines.py:69-97`). The first version missed both.
 The digest hashes `identity_inputs` only when a task gives them. An external task gives `external_package = package_digest()`. `package_digest` hashes every `benchmark/external/*.py` except `contamination.py`, `download.py`, and `preflight.py` (`benchmark/external/task.py:40,183-188,291-302`).
-The evolve preflight checks test-split baseline drift before any paid call (`benchmark/evolve/loop.py:247-253`).
+The evolve preflight checks test-split baseline drift before any paid call (`benchmark/evolve/loop.py:249-255`).
 
 ## Result store and paid runs
 
 - A completed row has no `error`, no `infra` value, and no timeout (`is_completed`, `benchmark/baselines.py:185-187`). Only a completed row is reusable. The store re-runs error, quota, and timeout rows.
 - A reused row goes to the run's output JSONL like a fresh row, with `reused: true`, so `analyze.py` sees it.
 - A run is paid when at least one planned cell has no reusable row. A run that the store answers fully is not paid and needs no `--max-usd` (spec claim, not re-verified).
-- A row records `cost_source`: `native` when the stream reports `total_cost_usd`, else `pricing` from `pricing.yaml` (`benchmark/parse.py:63,223`). Parsing keeps an absent cost apart from a reported 0.0. A failed cell charges its native cost, else its pre-run estimate as `estimate` (`fail()` in `_run_plan`, `benchmark/run.py:1636-1642`).
-- The cell estimate is the mean stored cost for that task and arm, else the run's largest cell cost so far, else `--cell-estimate-usd`. Reused rows do not enter it (`estimate_cell_cost`, `benchmark/run.py:1307-1330`).
+- A row records `cost_source`: `native` when the stream reports `total_cost_usd`, else `pricing` from `pricing.yaml` (`benchmark/parse.py:63,223`). Parsing keeps an absent cost apart from a reported 0.0. A failed cell charges its native cost, else its pre-run estimate as `estimate` (`fail()` in `_run_plan`, `benchmark/run.py:1641-1647`).
+- The cell estimate is the mean stored cost for that task and arm, else the run's largest cell cost so far, else `--cell-estimate-usd`. Reused rows do not enter it (`estimate_cell_cost`, `benchmark/run.py:1307-1326`).
 - Runner subprocesses set `DISABLE_AUTOUPDATER=1` (`benchmark/run.py:250`), so the agent CLI version cannot change in a run.
 - Claude and Codex cells write an untruncated trajectory sidecar. OpenCode cells record `trajectory_path: null`.
 
 ## Spend ledger and finish reserve
 
 The shared `spend.SpendLedger` refuses a paid call when spent plus estimate plus reserve would cross `--max-usd` (`would_cross`, `benchmark/spend.py:27`).
-The evolve loop holds a finish reserve of `3 * finalist_test_cost`. The value `finalist_test_cost` estimates one finalist's test-split cells plus unstored baseline test cells (`benchmark/evolve/loop.py:221-234`).
-The preflight refuses to start when `max_usd <= reserve` (`benchmark/evolve/loop.py:254-260`). The loop releases the reserve at finish. The reserve over-counts baseline cells. Review left this because it is conservative; `loop.py` records the rationale next to the code.
-Reused rows charge `0.0`, and `main` charges `0.0` when a cell fails in prepare (`benchmark/run.py:2267-2275`). `--cell-estimate-usd` sets the per-cell estimate.
+The evolve loop holds a finish reserve of `FINISH_CELL_SETS * finalist_test_cost`. `FINISH_CELL_SETS` is 2: finish scores the dev winner and the seed on the test split (`benchmark/evolve/loop.py:40`). The value `finalist_test_cost` estimates one finalist's test-split cells plus unstored baseline test cells (`benchmark/evolve/loop.py:223-236`).
+The preflight refuses to start when `max_usd <= reserve` (`benchmark/evolve/loop.py:258-262`). The loop releases the reserve at finish. The reserve over-counts baseline cells. Review left this because it is conservative; `loop.py` records the rationale next to the code (`benchmark/evolve/loop.py:256-257`).
+Reused rows charge `0.0`, and `main` charges `0.0` when a cell fails in prepare (`benchmark/run.py:2274-2283`). `--cell-estimate-usd` sets the per-cell estimate.
 
 ### No paid call spends the finish reserve
 
 A paid call never spends into the finish reserve.
 
 - `SpendLedger.headroom()` returns `max_usd - spent - reserve`, or `None` when the run has no ceiling. `exhausted()` is true when headroom is below `MIN_HEADROOM_USD` (0.01) (`benchmark/spend.py:15,31,35-38`).
-- `_run_plan` stops the plan as `ceiling` when `ledger.exhausted()` holds, for every runner (`benchmark/run.py:1622`). The 0.01 floor therefore applies to Codex and OpenCode cells too.
-- `_run_plan` caps each Claude cell at `min(DEFAULT_MAX_BUDGET_USD, headroom)` and passes that cap to the runner (`benchmark/run.py:1625-1628`). The row records the cap as `applied_max_budget_usd`. The run key still uses the `<max-budget>` placeholder (`benchmark/run.py:680`).
-- A capped Claude cell that ends `error_max_budget_usd` stops the plan as `ceiling` (`benchmark/run.py:1666-1668`).
+- `_run_plan` stops the plan as `ceiling` when `ledger.exhausted()` holds, for every runner (`benchmark/run.py:1626-1629`). The 0.01 floor therefore applies to Codex and OpenCode cells too.
+- `_run_plan` caps each Claude cell at `min(DEFAULT_MAX_BUDGET_USD, headroom)` and passes that cap to the runner (`benchmark/run.py:1630-1633`). The row records the cap as `applied_max_budget_usd`. The run key still uses the `<max-budget>` placeholder (`benchmark/run.py:680`).
+- A capped Claude cell that ends `error_max_budget_usd` stops the plan as `ceiling` (`benchmark/run.py:1671-1673`).
 - `ClaudeJudgeClient` passes the headroom as `--max-budget-usd` (`benchmark/judge/core.py:324-333`). `Judge._call` raises `JudgeSpendCeiling` when `exhausted()` holds or the estimate would cross (`benchmark/judge/core.py:472-475`).
 - Reflection and proposer calls pass the headroom as `--max-budget-usd` and check `would_cross` and `exhausted()` first (`PaidCalls.call`, `benchmark/evolve/calls.py:92-136`).
-- A reused row with an older panel stamp is stored again with the current stamp, `charged_usd: 0.0`, and `reused: true` (`_store_reused_panel_row`, `benchmark/run.py:1690-1709`). The store skips the copy when a row for the run key already carries this panel name and split digest. `_run_plan` and `main` both call it (`benchmark/run.py:1593-1600,2157`). So the split lock holds on a run where every cell is a cache hit.
+- A reused row with an older panel stamp is stored again with the current stamp, `charged_usd: 0.0`, and `reused: true` (`_store_reused_panel_row`, `benchmark/run.py:1695-1714`). The store skips the copy when a row for the run key already carries this panel name and split digest. `_run_plan` and `main` both call it (`benchmark/run.py:1602,2163-2164`). So the split lock holds on a run where every cell is a cache hit.
 
 ## Admission, grading, and contamination
 
@@ -89,7 +89,7 @@ The `gepa-v1` panel (`benchmark/panels/gepa-v1.json`) has a cheap tier of the th
 - The split locks at the first completed result. A stored row that `baselines.is_completed` accepts, with the panel name and a different `panel_split_digest`, raises `PanelError` (`_check_lock`, `benchmark/panels.py:277-283`). There is no unlock flag. Register a changed split under a new panel name.
 - Committed panel fixtures hold redacted rows only: `instance_id`, `repo`, `base_commit`, and the language column. No file in the checkout holds a real `patch`, `test_patch`, FAIL_TO_PASS, PASS_TO_PASS, or `problem_statement` value (spec claim, not re-verified).
 - `analyze.py` counts a contaminated panel row as incorrect and keeps it in its denominators (`paired.is_contaminated_panel_row`, `benchmark/paired.py:43-63`; `_contaminated_section`, `benchmark/analyze.py:71-94`).
-- Build panels through `load_panel` and the other loaders. The `Panel` docstring says so (`benchmark/panels.py:57`); constructing `Panel` directly bypasses checks by convention only.
+- Build panels through `load_panel` and the other loaders. The `Panel` docstring says so (`benchmark/panels.py:58`); constructing `Panel` directly bypasses checks by convention only.
 
 ## Judge calibration gate
 
@@ -102,7 +102,7 @@ The label cache key is `sha256(subject, model, prompt_hash)`, where the subject 
 
 - Every judge call runs `claude -p --output-format stream-json --verbose --model JUDGE_MODEL --tools "" --strict-mcp-config --setting-sources "" --no-session-persistence --disable-slash-commands` (`benchmark/judge/core.py:324-333`). It never passes `--bare`, which refuses OAuth, or `--mcp-config`.
 - The call runs in a fresh empty temporary cwd with a fresh empty `CLAUDE_CONFIG_DIR`. So no settings, hooks, MCP servers, or files load (`benchmark/judge/core.py:339-342`).
-- `stripped_record` is the one grader-free view of a rollout: the task prompt, allowlisted row fields, integer `f2p_`/`p2p_` counts, and the verbatim sidecar (`benchmark/judge/core.py:131`). It raises `UnresolvableTask` when the task does not resolve. Evolve builds its reflective records with it (`_records`, `benchmark/evolve/loop.py:387-410`).
+- `stripped_record` is the one grader-free view of a rollout: the task prompt, allowlisted row fields, integer `f2p_`/`p2p_` counts, and the verbatim sidecar (`benchmark/judge/core.py:131`). It raises `UnresolvableTask` when the task does not resolve. Evolve builds its reflective records with it (`_records`, `benchmark/evolve/loop.py:394-417`).
 - The default resolver loads a cached external task without admission (`default_resolve_task`, `benchmark/judge/core.py:112-119`). The judge must read rollouts of tasks that admission may since refuse.
 - `critique` withholds a row as `contaminated` (when `contaminated` is not exactly false), `no-trajectory`, or `uncalibrated` before any call (`benchmark/judge/core.py:397-405`).
 - Evolve releases labels only through `judge.store.released_label` (`benchmark/judge/store.py:160`).
@@ -112,14 +112,21 @@ The label cache key is `sha256(subject, model, prompt_hash)`, where the subject 
 
 The materializer refuses a candidate before any paid call when it breaks a guard.
 
-- Paths outside `src/` and `prompts/` are refused (`benchmark/evolve/materialize.py:15,170-172`).
-- The materializer lexes every changed file under `src/` (`_refuse_harness_reach`, `benchmark/evolve/materialize.py:199-239`). Added lines may not name the forbidden terms: `benchmark/`, the panel path, `panel.resolve()`, `panel.name`, and the data directory (`benchmark/evolve/loop.py:178-180`).
-- The same guard refuses `include!`, `include_str!`, and `include_bytes!` targets outside `src/` and `prompts/`. It resolves `include` aliases, `cfg!(test)` macros, and `#[path]` attributes (`benchmark/evolve/rust.py:130-165`).
-- Any `cfg` or `cfg_attr` predicate that names `test` guards its item, and an inner `#![cfg(..test..)]` guards the file (`_refuse_cfg_test`, `benchmark/evolve/materialize.py:241-266`).
-- The byte-lock test exemption covers only the three literal spans: count, `starts_with`, and `ends_with`. The rest of each line must stay byte-identical (`blank_byte_lock`, `benchmark/evolve/rust.py:202-216`). Whole-line exemption once let a candidate append `return;` and skip later assertions.
+- Paths outside `src/` and `prompts/` are refused (`benchmark/evolve/materialize.py:15,180-182`).
+- Only regular file modes `000000`, `100644`, and `100755` pass. A symlink or gitlink under `src/` could point outside the allowlist, so the materializer refuses it (`REGULAR_MODES`, `benchmark/evolve/materialize.py:19,176-179`).
+- The materializer lexes every changed file under `src/` (`_refuse_harness_reach`, `benchmark/evolve/materialize.py:209-253`). Added lines may not name a forbidden term. There are two sources. `HARNESS_TERMS` holds `benchmark`, `.cheese`, `tilth_bench`, `tilth-bench`, and `TILTH_BENCH_DATA` (`benchmark/evolve/materialize.py:17`, merged at `:100`). The loop adds `benchmark/`, the panel path, `panel.resolve()`, `panel.name`, and the data directory (`benchmark/evolve/loop.py:180-183`).
+- The same guard refuses `include!`, `include_str!`, and `include_bytes!` targets outside `src/` and `prompts/`. It also refuses `include` aliases, bare macro names, `cfg!(test)` and `cfg!(debug_assertions)` macros, and `#[path]` attributes (`benchmark/evolve/materialize.py:226-253`). The helpers are at `benchmark/evolve/rust.py:133-182`.
+- Any `cfg` or `cfg_attr` predicate that names `test` or `debug_assertions` guards its item, and an inner `#![cfg(..)]` with either name guards the file (`_refuse_cfg_test`, `benchmark/evolve/materialize.py:255-280`). The gate builds in debug mode and the benchmark builds in release mode, so `debug_assertions` differs between them like `test` does. The lexer masks comments and strings first, and the attribute pattern allows spaces, so a spaced or commented attribute does not hide a predicate (`benchmark/evolve/rust.py:6-8,93-115`).
+- Line numbers count `\n` only, in both the lexer and the diff splitter (`benchmark/evolve/rust.py:89-90`, `benchmark/evolve/materialize.py:219`).
+- The byte-lock test exemption covers only the three literal spans: count, `starts_with`, and `ends_with`. The rest of each line must stay byte-identical (`blank_byte_lock`, `benchmark/evolve/rust.py:216-230`). Whole-line exemption once let a candidate append `return;` and skip later assertions.
 - The proposer works in a worktree without `benchmark/`, and Glob patterns are normalised before the path check.
-- A failed build scores 0 as stage `build` (`benchmark/evolve/loop.py:351-352`). `Cascade.side_info` returns the stage and the build-output tail (`benchmark/evolve/loop.py:103-109`). The dispatcher adds that record to both the reflection prompt and the `src_patch` proposer prompt (`benchmark/evolve/engine.py:76-106`). The #312 archive README says reflection gets no build-failure feedback; that follow-up is stale.
-- The GEPA score uses the means of the re-runs (`Cascade.score`, `benchmark/evolve/loop.py:91-97`). `finish` lets the seed win test-score ties (`benchmark/evolve/loop.py:530`).
+- A failed build scores 0 as stage `build` (`benchmark/evolve/loop.py:333-334,358-359`). `Cascade.side_info` returns the stage and the build-output tail (`benchmark/evolve/loop.py:105-111`). The dispatcher adds that record to both the reflection prompt and the `src_patch` proposer prompt (`benchmark/evolve/engine.py:76-106`). The #312 archive README says reflection gets no build-failure feedback; that follow-up is stale.
+- The GEPA score uses the means of the re-runs (`Cascade.score`, `benchmark/evolve/loop.py:98-99`).
+- The dev mean picks the finish winner. The seed wins a tie, and the test split never selects among candidates (`Evolution.finish`, `benchmark/evolve/loop.py:511-521`).
+- Finish runs the test split only for that winner and the seed (`FINISH_CELL_SETS`, `benchmark/evolve/loop.py:40,522-530`). The winner needs a strictly higher test mean than the seed (`benchmark/evolve/loop.py:549-551`). The reported test delta is the delta of the pre-chosen winner (`benchmark/evolve/loop.py:560`).
+- Finish fails, and the run exits nonzero, when a winner or seed test cell does not complete (`benchmark/evolve/loop.py:541-547`).
+- The loop stops before candidate spend when the seed is not accepted. `cascade` raises `EvolveError` for a non-seed candidate whose seed is off the accepted frontier (`benchmark/evolve/loop.py:342-344`).
+- `just check` for a candidate has a 1800 s timeout (`JUST_CHECK_TIMEOUT_S`, `benchmark/evolve/cli.py:37`).
 
 Candidate refs live at `refs/evolve/<run-id>/<content-id[:12]>`. Builds are cached once per sha. Defaults are 3 frontier re-runs and a 5-round plateau.
 The six stop reasons are `ceiling`, `quota`, `plateau`, `cli-version`, `mcp-unavailable`, and `invalid-cell` (`benchmark/evolve/calls.py:16`).
@@ -146,4 +153,4 @@ These risks remained open at the end of the PR #312 session, the provenance of t
 - Spend accounting is incomplete: the ledger does not carry across resumes, and partial streams are priced loosely. Issue [#325](https://github.com/paulnsorensen/tilth/issues/325) tracks it, with the pre-runner estimate charge and undercharged timeouts.
 - Reflection prompt size is unbounded, and the result store is local-only.
 
-_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319; stack-only commits `e42d451`, `70466b9`, `e77a567` via `refs/pull/319/head` · Updated: 2026-10-13_
+_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319 after the PR #318 cure; spec lines at `9e84659` via `refs/pull/312/head` · Updated: 2026-10-14_

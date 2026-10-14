@@ -77,13 +77,13 @@
 
 2026-10-08 · 5d588557962c2ca8 · new-page · adr/benchmark-gepa-overhaul.md · Record F-1 to F-6, OAuth-only auth, frozen baselines with drift refusal, and the single-hunk tampered rule. Exact and native-grading probes rank first.
 
-2026-10-08 · 5d588557962c2ca8 · new-page · benchmark-gepa-invariants.md · Record run keys, spend ledger and finish reserve, admission and grading venvs, contamination scan, split lock, kappa gate, candidate guards, paid-run checklist, and open risks, verified at e77a567. Exact and natural probes rank first.
+2026-10-08 · 5d588557962c2ca8 · new-page · benchmark-gepa-invariants.md · Record run keys, spend ledger and finish reserve, admission and grading venvs, contamination scan, split lock, kappa gate, candidate guards, paid-run checklist, and open risks, verified against the stack head. Exact and natural probes rank first.
 
 2026-10-08 · 5d588557962c2ca8 · merged · benchmark-harness-gotchas.md; mcp-instructions-limits-and-format.md; multi-agent-workflow-notes.md; index.md · Add GEPA overhaul gotchas, prompts/tools description files, the self-review lesson, and index links. Correct the stale mcp-base/mcp-edit byte-lock note. Tool-description probe ranks second.
 
 2026-10-13 · f31eb08a7bd42ccd · merged · adr/benchmark-gepa-overhaul.md · Fold umbrella and child specs: goals, non-goals, picks and fallbacks, cloud admission, curd-to-stack map (#313-#319), deferred follow-ups, references, ADR-008 child-spec defaults. #312 closes unmerged; layer 1 deletes PHASE4_PLAN.md. Retrieval probes skipped.
 
-2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-gepa-invariants.md; mcp-instructions-limits-and-format.md · Add result-store, prepare/grade, panel-file, judge-isolation, and finish-reserve headroom rules at 70466b9. Fix six stop reasons and #312 wording. Confirm build tail reaches reflection; archive note stale. Repoint footer to #313.
+2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-gepa-invariants.md; mcp-instructions-limits-and-format.md · Add result-store, prepare/grade, panel-file, judge-isolation, and finish-reserve headroom rules against the stack head. Fix six stop reasons and #312 wording. Confirm build tail reaches reflection; archive note stale. Repoint footer to #313.
 
 2026-10-13 · f31eb08a7bd42ccd · merged · benchmark-harness-gotchas.md · Correct the #312 wording: it closes unmerged and the work lands as #313-#319. Add 5 gepa 0.1.4 gotchas verified against benchmark/evolve/ and 3 external-data gotchas; the gin-fixture item is still a spec claim.
 
@@ -106,3 +106,5 @@
 2026-10-13 · cure-pr-319-wiki · merged · benchmark-gepa-invariants.md; adr/benchmark-gepa-overhaul.md; benchmark-harness-gotchas.md; sources/benchmark-subscription-auth-2026-10.md; sources/swe-bench-multilingual-candidates-2026-10.md; index.md · Re-pin citations to the layer 6 head, correct the run-key, finish-reserve, and grading-guard rules, link #320, #322, #325, and split long sentences. The ADR keeps decisions only.
 
 2026-10-13 · cure-pr-319-wiki · new-page · benchmark-gepa-gotchas.md · Move the October 2026 GEPA, gepa 0.1.4, and external-data gotchas out of benchmark-harness-gotchas.md; note that grading reads JUnit XML.
+
+2026-10-14 · cure-pr-319-wiki-2 · merged · benchmark-gepa-invariants.md; benchmark-gepa-gotchas.md; adr/benchmark-gepa-overhaul.md; sources/swe-bench-multilingual-candidates-2026-10.md; mcp-instructions-limits-and-format.md; index.md · Re-pin spec citations to 9e84659 (refs/pull/312/head) and drop pre-rebase commits and the stale diff base. Recompute benchmark line cites after the PR #318 cure. Record dev-mean winner selection, the 2-set finish reserve, strict test win, and the cfg, debug_assertions, line-count, and file-mode guards.

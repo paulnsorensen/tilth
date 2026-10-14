@@ -1,10 +1,10 @@
 # SWE-bench Multilingual candidates for the GEPA panel
 
 The GEPA panel uses two SWE-bench Multilingual tasks: `gin-gonic__gin-3741` (dev) and `sharkdp__bat-2650` (test) (`benchmark/panels/gepa-v1.json:60,66`).
-The dataset is pinned to revision `846e647b9f33c0b51b739d005d13d85493c9af09`, because the dataset changed in August 2026 (`benchmark/external/data.py:16-17`).
+The dataset is pinned to revision `846e647b9f33c0b51b739d005d13d85493c9af09`, because the dataset changed in August 2026 (`benchmark/external/data.py:17`).
 The solve counts below come from mini-SWE-agent runs, not from Claude Code or Codex runs. Use them only as a difficulty signal.
 
-Canonical source: `raw/swe-multilingual.md` in the PR #312 session archive, accessed 2026-10-03 ([research note at the PR #312 head](https://github.com/paulnsorensen/tilth/blob/9e84659b2d27715a0d995b30a760213cefd01096/.cheese/archive/benchmark-gepa-overhaul/corpus/research/benchmark-subscription-harness-auth/benchmark-subscription-harness-auth.md)). PR #312 closes unmerged; its head `9e84659` stays reachable through `refs/pull/312/head`.
+Canonical source: `raw/swe-multilingual.md` in the PR #312 session archive, accessed 2026-10-03 ([raw note at the PR #312 head](https://github.com/paulnsorensen/tilth/blob/9e84659b2d27715a0d995b30a760213cefd01096/.cheese/archive/benchmark-gepa-overhaul/corpus/research/benchmark-subscription-harness-auth/raw/swe-multilingual.md)). PR #312 closes unmerged; its head `9e84659` stays reachable through `refs/pull/312/head`.
 
 ## Dataset pin
 
