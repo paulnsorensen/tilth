@@ -7,7 +7,6 @@ with context efficiency metrics and comparisons.
 """
 
 import argparse
-import json
 import math
 import sys
 from collections import Counter, defaultdict
@@ -20,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import stats
 from flags import detect_flags
 from paired import (
+    is_contaminated_panel_row,
+    load_runs,
     measured_cost,
     pair_modes,
     paired_accuracy_delta,
@@ -58,14 +59,38 @@ def format_cost_delta(baseline_costs: dict[str, float], tilth_costs: dict[str, f
 
 
 def load_results(path: Path) -> list[dict]:
-    """Load JSONL results file."""
-    results = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                results.append(json.loads(line))
-    return results
+    """Load JSONL results file.
+
+    A contaminated panel row counts as incorrect whatever its grader verdict; it
+    stays in its task and arm denominators. Rows without ``panel_name`` are unchanged.
+    """
+    return load_runs(path)
+
+
+def _contaminated_section(results: list[dict], modes: list[str]) -> list[str]:
+    """Per-task and per-arm tally of contaminated panel rows (counted as incorrect)."""
+    panel_rows = [r for r in results if r.get("panel_name")]
+    if not panel_rows:
+        return []
+    lines = [
+        "## Contaminated panel rows",
+        "",
+        "Panel rows marked `contaminated` count as incorrect and stay in their denominators.",
+        "",
+        "| Task | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "---|" * len(modes),
+    ]
+
+    def tally(rows: list[dict], mode: str) -> str:
+        arm = [r for r in rows if r.get("mode") == mode]
+        return f"{sum(is_contaminated_panel_row(r) for r in arm)} / {len(arm)}"
+
+    for task in sorted({r.get("task", "unknown") for r in panel_rows}):
+        rows = [r for r in panel_rows if r.get("task", "unknown") == task]
+        lines.append(f"| {task} | " + " | ".join(tally(rows, mode) for mode in modes) + " |")
+    lines.append("| **All tasks** | " + " | ".join(tally(panel_rows, mode) for mode in modes) + " |")
+    lines.append("")
+    return lines
 
 
 def group_by(results: list[dict], *keys: str) -> dict:
@@ -395,9 +420,11 @@ def _flags_section(results: list[dict]) -> list[str]:
 
 
 def _failure_type(result: dict) -> tuple[str, str] | None:
-    """Classify an unsuccessful cell from runner error first, then grader reason."""
+    """Classify an unsuccessful cell from contamination first, then runner error, then grader reason."""
     if result.get("correct", False):
         return None
+    if is_contaminated_panel_row(result):
+        return "contaminated", "agent saw grader material"
     error = result.get("error")
     if error:
         error_text = str(error)
@@ -746,6 +773,7 @@ def generate_report(results: list[dict]) -> str:
     lines.extend(_flags_section(results))
     lines.extend(_tool_usage_section(valid_results))
     lines.extend(_failure_taxonomy_section(results))
+    lines.extend(_contaminated_section(valid_results, modes))
     lines.extend([
         "## Context Efficiency",
         "",

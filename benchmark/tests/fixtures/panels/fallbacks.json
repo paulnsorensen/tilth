@@ -1,0 +1,64 @@
+{
+  "name": "fixture-fallbacks",
+  "split_seed": 7,
+  "members": [
+    {
+      "id": "rg_search_dispatch",
+      "family": "local",
+      "language": "rust",
+      "split": "cheap"
+    },
+    {
+      "id": "rg_trait_implementors",
+      "family": "local",
+      "language": "rust",
+      "split": "cheap"
+    },
+    {
+      "id": "gin_servehttp_flow",
+      "family": "local",
+      "language": "go",
+      "split": "cheap"
+    },
+    {
+      "id": "gin_edit_render_context",
+      "family": "local",
+      "language": "go",
+      "split": "dev"
+    },
+    {
+      "id": "mwaskom__seaborn.7001ebe7.test_algorithms.1f0181c2.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "dev"
+    },
+    {
+      "id": "mwaskom__seaborn.7001ebe7.test_regression.ce8c62e2.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "test"
+    },
+    {
+      "id": "sympy__sympy.c1097516.test_nullspace.f14fc970.lv1",
+      "family": "featurebench",
+      "language": "python",
+      "split": "dev"
+    },
+    {
+      "id": "prometheus__prometheus-14861",
+      "family": "swebench_ml",
+      "language": "go",
+      "split": "dev",
+      "fallback_for": "gin-gonic__gin-3741",
+      "fallback_reason": "gold_unresolved: the gold patch did not resolve FAIL_TO_PASS on this host"
+    },
+    {
+      "id": "tokio-rs__tokio-6724",
+      "family": "swebench_ml",
+      "language": "rust",
+      "split": "test",
+      "fallback_for": "sharkdp__bat-2650",
+      "fallback_reason": "env_build_failed: cargo fetch could not resolve the lockfile"
+    }
+  ]
+}

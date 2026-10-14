@@ -120,6 +120,24 @@ Every row records `contaminated` and `contamination_hits`. These inputs count as
 
 A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit. `correct` stays the grader verdict.
 
+## Pre-registered panels
+
+A panel (`benchmark/panels/<name>.json`) is a fixed task set. The cheap tier holds the three local hard tasks: `rg_search_dispatch`, `rg_trait_implementors`, and `gin_servehttp_flow`.
+The panel also holds `gin_edit_render_context`, at least one FeatureBench Lite Level 1 instance, and one Go and one Rust SWE-bench Multilingual slot member. A slot member is the primary or its fallback: `gin-gonic__gin-3741` or `prometheus__prometheus-14861`, and `sharkdp__bat-2650` or `tokio-rs__tokio-6724`. A fallback names `fallback_for` and `fallback_reason`.
+`panels.stratify` splits the other members into dev and test. Within each source family, members sort by language and `sha256("<split_seed>:<id>")`. The split then alternates dev, test.
+
+```bash
+python3 benchmark/run.py --panel benchmark/panels/gepa-v1.json --panel-split dev \
+  --models sonnet5 --modes baseline,tilth --reps 1 --max-usd 20
+```
+
+`panels.load_panel` is the only loader. It refuses these faults: an unknown key or family, a missing required member, and a hand-picked split. It also refuses a declared language that differs from the repo language or from `external.language_of` on the dataset row. It also refuses an external member that `external.preflight.admit` does not admit on this host.
+`--panel` accepts only Claude and Codex models: other runners write no trajectory sidecar, so every panel row would be `contaminated`.
+Every row of a panel run carries `panel_name`, `panel_split_digest`, and `panel_split` (not run-key inputs).
+The first completed stored row for a panel name locks its split: a later split change is refused; register it under a new panel name.
+`analyze.py` counts a `contaminated` panel row as incorrect, keeps it in its denominators, and tallies it per task and arm.
+`benchmark/tests/fixtures/panels/gepa-v1-rows/` holds redacted rows (`instance_id`, `repo`, `base_commit`) for the committed panel's language check; full rows stay in `$TILTH_BENCH_DATA`.
+
 ## Larger Luna edit task
 
 `gin_edit_render_context` migrates Gin's renderer API to accept request context.

@@ -1496,6 +1496,22 @@ def test_failed_cell_with_native_cost_counts_native_amount(bench) -> None:
     assert [(row["total_cost_usd"], row["cost_source"]) for row in bench.output_rows()] == [(0.7, "native")]
 
 
+def test_prepare_failure_does_not_zero_the_run_maximum(bench) -> None:
+    def prepare_fails_then_times_out(_stream: Path) -> float:
+        if len(bench.calls) == 1:
+            raise run.external.task.EnvBuildError("pip exited 1")
+        raise subprocess.TimeoutExpired(["claude"], 600)
+
+    bench.runner(prepare_fails_then_times_out)
+
+    bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "2",
+               "--max-usd", "5.0")
+
+    prepare, timeout = bench.output_rows()
+    assert prepare["infra"] == "prepare" and prepare["charged_usd"] == 0.0
+    assert timeout["error"] == "timeout" and timeout["charged_usd"] > 0
+
+
 def test_quota_rejection_stops_run(bench) -> None:
     def first_completes_then_quota(stream: Path) -> float:
         if len(bench.calls) == 1:
