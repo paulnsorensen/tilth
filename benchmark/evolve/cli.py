@@ -11,6 +11,7 @@ seed, is pushed as one branch and opened as one draft PR. Nothing is merged.
 import argparse
 import math
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
@@ -48,12 +49,16 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
         shared = run.candidate_target_dir()
         shared.mkdir(parents=True, exist_ok=True)
         target.symlink_to(shared, target_is_directory=True)
+    # A new session lets a timeout kill cargo and the test binaries too, not only ``just``.
+    process = subprocess.Popen(["just", "check"], cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=run.build_tool_env(), start_new_session=True)
     try:
-        completed = subprocess.run(["just", "check"], cwd=worktree, capture_output=True, text=True,
-                                   env=run.build_tool_env(), timeout=JUST_CHECK_TIMEOUT_S)
+        stdout, stderr = process.communicate(timeout=JUST_CHECK_TIMEOUT_S)
     except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
         return False, f"just check timed out after {JUST_CHECK_TIMEOUT_S} s"
-    return completed.returncode == 0, completed.stdout + completed.stderr
+    return process.returncode == 0, stdout + stderr
 
 
 def _parser() -> argparse.ArgumentParser:

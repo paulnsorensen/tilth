@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -948,11 +949,24 @@ def test_seed_wins_a_dev_tie_without_buying_the_test_split(world) -> None:
     assert "no improvement" in log_text(world)
 
 
-@pytest.mark.parametrize("incomplete", ["winner", "seed"])
+def test_stopped_search_without_a_dev_winner_fails_finish(world) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.5, "dev_b": 0.5})
+    worse = accept(evo, child(evo.seed, test_a="1", tag="worse"), {"dev_a": 0.4, "dev_b": 0.4})
+    evo.stop.set("ceiling")
+
+    assert evo.finish() is None
+    assert evo.finish_failure is not None and tilth_calls(world, worse.sha) == [] and world.pr.calls == []
+    assert "finish: incomplete (ceiling)" in log_text(world)
+
+
+@pytest.mark.parametrize("incomplete", ["winner", "seed", "baseline"])
 def test_finish_refuses_to_compare_incomplete_test_cells(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
                                                          incomplete: str) -> None:
     files = seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="E" if incomplete == "seed" else "0"))
     world = make_world(monkeypatch, tmp_path, files)
+    if incomplete == "baseline":
+        world.baseline["test_a"] = "E"
     evo = ready(world)
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
     accept(evo, child(evo.seed, test_a="E" if incomplete == "winner" else "1"), {"dev_a": 0.9, "dev_b": 0.9})
@@ -1718,11 +1732,17 @@ def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypa
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     seen: dict = {}
 
-    def fake_run(argv, **kwargs):
-        seen.update(argv=argv, **kwargs)
-        return subprocess.CompletedProcess(argv, 0, "ok", "")
+    class FakePopen:
+        returncode = 0
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        def __init__(self, argv, **kwargs):
+            seen.update(argv=argv, **kwargs)
+
+        def communicate(self, timeout=None):
+            seen["timeout"] = timeout
+            return "ok", ""
+
+    monkeypatch.setattr(cli.subprocess, "Popen", FakePopen)
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
@@ -1734,25 +1754,43 @@ def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypa
     assert seen["env"]["MISE_DATA_DIR"] == "/tmp/mise" and "CARGO_TARGET_DIR" not in seen["env"]
     link = worktree / "target"
     assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
+    assert seen["timeout"] == cli.JUST_CHECK_TIMEOUT_S and seen["start_new_session"] is True
 
 
-def test_default_just_check_times_out_as_a_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_default_just_check_timeout_kills_the_whole_process_group(monkeypatch: pytest.MonkeyPatch,
+                                                                   tmp_path: Path) -> None:
     from evolve import cli
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
-    seen: dict = {}
-
-    def hanging(argv, **kwargs):
-        seen.update(kwargs)
-        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-
-    monkeypatch.setattr(cli.subprocess, "run", hanging)
+    monkeypatch.setattr(cli, "JUST_CHECK_TIMEOUT_S", 1)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_just = bin_dir / "just"
+    # A stand-in for cargo: a child that outlives ``just`` unless the whole group is killed.
+    fake_just.write_text("#!/bin/sh\nsleep 60 &\necho $! > child.pid\nwait\n")
+    fake_just.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
+    started = time.monotonic()
     ok, output = cli.default_just_check(worktree)
 
-    assert ok is False and "timed out" in output
-    assert seen["timeout"] == cli.JUST_CHECK_TIMEOUT_S
+    # A surviving child holds the output pipes open, so a partial kill waits for the 60 s sleep.
+    assert ok is False and "timed out" in output and time.monotonic() - started < 30
+    child = int((worktree / "child.pid").read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _alive(child):
+        time.sleep(0.05)
+    assert not _alive(child)
+
+
+def _alive(pid: int) -> bool:
+    """True while ``pid`` runs; a zombie counts as dead."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 # --- paid calls: the CLI budget flag and the cost sources ---

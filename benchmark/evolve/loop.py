@@ -515,6 +515,9 @@ class Evolution:
             return None
         winner = nonseed[0]
         if winner.dev_mean <= seed.dev_mean:
+            if self.stop.is_set and self.stop.reason != "plateau":
+                return self._finish_failed(f"finish: incomplete ({self.stop.reason}); no accepted candidate beats "
+                                           "the seed's dev mean")
             self.log("finish: no improvement (no candidate beats the seed's dev mean)")
             return None
         finalists = [winner, seed]
@@ -540,6 +543,8 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
         unfinished = [member.cid[:12] for member in finalists
                       if not all(baselines.is_completed(row) for row in test_rows[member.cid])]
+        if not all(baselines.is_completed(row) for row in baseline_rows):
+            unfinished.append("baseline")
         if unfinished:
             return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
                                        f"{', '.join(unfinished)}); test-split means not compared: {scores}")
