@@ -3,8 +3,9 @@
 import re
 from pathlib import PurePosixPath
 
-_CFG_ATTR = re.compile(r"#(!?)\[\s*(?:cfg|cfg_attr)\s*\(")
-_TEST_TOKEN = re.compile(r"\btest\b")
+_CFG_ATTR = re.compile(r"#\s*(!?)\s*\[\s*(?:cfg|cfg_attr)\s*\(")
+# Predicates that differ between the gate (debug, test) and the benchmark (release) builds.
+_TEST_TOKEN = re.compile(r"\b(?:test|debug_assertions)\b")
 _INCLUDE = re.compile(r"\b(include(?:_str|_bytes)?)\s*!\s*([(\[{])")
 _USE = re.compile(r"\buse\b([^;]*);")
 _INCLUDE_NAME = re.compile(r"\binclude(?:_str|_bytes)?\b")
@@ -90,7 +91,8 @@ def _line(text: str, index: int) -> int:
 
 
 def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
-    """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``.
+    """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``
+    or ``debug_assertions``.
 
     That covers ``cfg(test)``, ``cfg(any(.., test))``, ``cfg(all(test, ..))``, ``cfg(not(test))``, and
     ``cfg_attr(test, ..)``; the span starts at the attribute, so the attribute itself is part of the item.
@@ -164,7 +166,7 @@ def bare_macro_names(text: str) -> list[int]:
 
 
 def cfg_test_macros(text: str) -> list[tuple[int, int]]:
-    """``(first_line, last_line)`` of each ``cfg!(..)`` call that names ``test``."""
+    """``(first_line, last_line)`` of each ``cfg!(..)`` call that names ``test`` or ``debug_assertions``."""
     mask = _code_mask(text)
     found = []
     for match in _CFG_MACRO.finditer(mask):

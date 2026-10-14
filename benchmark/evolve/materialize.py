@@ -16,6 +16,7 @@ ALLOWED_PREFIXES = ("src/", "prompts/")
 # Names that point a candidate's code at the harness; the loop adds the panel file and the data directory.
 HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA")
 BYTE_LOCK_FILE = "src/mcp/mod.rs"
+REGULAR_MODES = {"000000", "100644", "100755"}
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -45,7 +46,7 @@ def changed_lines(diff: str) -> dict[str, tuple[set[int], set[int]]]:
     files: dict[str, tuple[set[int], set[int]]] = {}
     current = None
     old_path = None
-    for line in diff.splitlines():
+    for line in diff.split("\n"):
         if line.startswith("diff --git "):
             current = old_path = None
         elif line.startswith("--- ") and current is None:
@@ -62,11 +63,16 @@ def changed_lines(diff: str) -> dict[str, tuple[set[int], set[int]]]:
     return files
 
 
+def _read(path: Path) -> str:
+    """File text with every byte kept, so line numbers count only ``\\n`` as git does."""
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
 def _line_changes(old: str, new: str) -> tuple[set[int], set[int]]:
     """(removed ``old`` lines, added ``new`` lines), 1-based, of a line diff between two texts."""
     removed: set[int] = set()
     added: set[int] = set()
-    matcher = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False)
+    matcher = difflib.SequenceMatcher(None, old.split("\n"), new.split("\n"), autojunk=False)
     for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
         if tag != "equal":
             removed.update(range(old_start + 1, old_end + 1))
@@ -165,8 +171,12 @@ class Materializer:
             except GitError as error:
                 raise ApplyRejected("the cumulative src_patch does not apply onto the seed", error.output) from error
         git("add", "-A", cwd=worktree)
-        changed = git("diff", "--cached", "--name-only", "--no-renames", self.seed_sha, cwd=worktree).split("\n")
-        changed = [path for path in changed if path]
+        raw = git("diff", "--cached", "--raw", "-z", "--no-renames", self.seed_sha, cwd=worktree).split("\0")
+        changed = raw[1::2]
+        # Only regular files may change: a symlink or gitlink under src/ can point outside the allowlist.
+        special = [path for meta, path in zip(raw[0::2], changed) if meta.split()[1] not in REGULAR_MODES]
+        if special:
+            raise ApplyRejected(f"changes a symlink or submodule instead of a regular file: {', '.join(special)}")
         outside = [path for path in changed if not path.startswith(ALLOWED_PREFIXES)]
         if outside:
             raise ApplyRejected(f"changes outside src/** and prompts/**: {', '.join(outside)}")
@@ -205,8 +215,8 @@ class Materializer:
             new_file = worktree / path
             if not added or not new_file.is_file():
                 continue
-            text = new_file.read_text(encoding="utf-8", errors="replace")
-            lines = text.splitlines()
+            text = _read(new_file)
+            lines = text.split("\n")
             for number in sorted(added):
                 line = lines[number - 1].lower() if number <= len(lines) else ""
                 if any(term.lower() in line for term in self.forbidden):
@@ -223,8 +233,8 @@ class Materializer:
                                         "a call, which can pass the macro through a macro_rules! parameter")
             for first, last in rust.cfg_test_macros(text):
                 if any(first <= number <= last for number in added):
-                    raise ApplyRejected(f"{path}:{first} uses cfg!(..test..), which makes code differ between tests and "
-                                        "release")
+                    raise ApplyRejected(f"{path}:{first} uses cfg!(..test..) or cfg!(..debug_assertions..), which makes code "
+                                        "differ between the gate and the release build")
             for number in rust.path_attributes(text):
                 if number in added:
                     raise ApplyRejected(f"{path}:{number} uses a #[path] attribute, which can point a module outside "
@@ -252,11 +262,11 @@ class Materializer:
                 continue
             new_file = worktree / path
             old_text = self._seed_text(path) or ""
-            new_text = new_file.read_text(encoding="utf-8") if new_file.is_file() else ""
+            new_text = _read(new_file) if new_file.is_file() else ""
             for declarer in rust.declaring_files(path):
                 declared_new = worktree / declarer
                 texts = [self._seed_text(declarer) or "",
-                         declared_new.read_text(encoding="utf-8") if declared_new.is_file() else ""]
+                         _read(declared_new) if declared_new.is_file() else ""]
                 if any(path in rust.test_module_files(declarer, text) for text in texts):
                     raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
             if path == BYTE_LOCK_FILE:
@@ -267,4 +277,4 @@ class Materializer:
                 for first, last in rust.cfg_test_spans(text):
                     touched = sorted(line for line in lines if first <= line <= last)
                     if touched:
-                        raise ApplyRejected(f"{path}:{touched[0]} is inside a #[cfg(test)] item (lines {first}-{last})")
+                        raise ApplyRejected(f"{path}:{touched[0]} is inside a #[cfg(test)] or #[cfg(debug_assertions)] item (lines {first}-{last})")
