@@ -122,11 +122,12 @@ The materializer refuses a candidate before any paid call when it breaks a guard
 - The proposer works in a worktree without `benchmark/`, and Glob patterns are normalised before the path check.
 - A failed build scores 0 as stage `build` (`benchmark/evolve/loop.py:333-334,358-359`). `Cascade.side_info` returns the stage and the build-output tail (`benchmark/evolve/loop.py:105-111`). The dispatcher adds that record to both the reflection prompt and the `src_patch` proposer prompt (`benchmark/evolve/engine.py:76-106`). The #312 archive README says reflection gets no build-failure feedback; that follow-up is stale.
 - The GEPA score uses the means of the re-runs (`Cascade.score`, `benchmark/evolve/loop.py:98-99`).
-- The dev mean picks the finish winner. The seed wins a tie, and the test split never selects among candidates (`Evolution.finish`, `benchmark/evolve/loop.py:511-521`).
-- Finish runs the test split only for that winner and the seed (`FINISH_CELL_SETS`, `benchmark/evolve/loop.py:40,522-530`). The winner needs a strictly higher test mean than the seed (`benchmark/evolve/loop.py:549-551`). The reported test delta is the delta of the pre-chosen winner (`benchmark/evolve/loop.py:560`).
-- Finish fails, and the run exits nonzero, when a winner or seed test cell does not complete (`benchmark/evolve/loop.py:541-547`).
+- The dev mean picks the finish winner. The seed wins a tie, and the test split never selects among candidates (`Evolution.finish`, `benchmark/evolve/loop.py:511-524`).
+- A ceiling or quota stop with no candidate above the seed's dev mean fails finish, as an empty frontier does (`benchmark/evolve/loop.py:513-523`).
+- Finish runs the test split only for that winner and the seed (`FINISH_CELL_SETS`, `benchmark/evolve/loop.py:40,525-533`). The winner needs a strictly higher test mean than the seed (`benchmark/evolve/loop.py:554-556`). The reported test delta is the delta of the pre-chosen winner (`benchmark/evolve/loop.py:565`).
+- Finish fails, and the run exits nonzero, when a winner, seed, or baseline test cell does not complete (`benchmark/evolve/loop.py:546-552`).
 - The loop stops before candidate spend when the seed is not accepted. `cascade` raises `EvolveError` for a non-seed candidate whose seed is off the accepted frontier (`benchmark/evolve/loop.py:342-344`).
-- `just check` for a candidate has a 1800 s timeout (`JUST_CHECK_TIMEOUT_S`, `benchmark/evolve/cli.py:37`).
+- `just check` for a candidate has a 1800 s timeout (`JUST_CHECK_TIMEOUT_S`, `benchmark/evolve/cli.py:38`). A timeout kills the whole process group, so cargo and the test binaries stop too.
 
 Candidate refs live at `refs/evolve/<run-id>/<content-id[:12]>`. Builds are cached once per sha. Defaults are 3 frontier re-runs and a 5-round plateau.
 The six stop reasons are `ceiling`, `quota`, `plateau`, `cli-version`, `mcp-unavailable`, and `invalid-cell` (`benchmark/evolve/calls.py:16`).
