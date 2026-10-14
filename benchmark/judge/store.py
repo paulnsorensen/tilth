@@ -1,0 +1,171 @@
+"""Judge caches and agreement records under ``config.JUDGE_DIR``.
+
+Labels are keyed by task digest, judge model, and applicability prompt hash;
+critiques by run key, judge model, and critique prompt hash. Each cache entry keeps
+the cost of the call that produced it, which feeds the judge-call estimate. Nothing
+here touches result rows or the result store.
+"""
+
+import hashlib
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, fields
+from typing import Literal
+
+import baselines
+
+from . import config
+
+Kind = Literal["applicability", "critique"]
+
+_CACHE_FILES: dict[Kind, str] = {"applicability": "labels.jsonl", "critique": "critiques.jsonl"}
+_AGREEMENT_FILE = "agreements.jsonl"
+NO_RECORD_REASON = "no calibration record for the current judge model, prompts, and calibration file"
+
+
+@dataclass(frozen=True)
+class Agreement:
+    """Judge-versus-hand-label agreement from one calibration run."""
+
+    calibrated: bool
+    reason: str = ""
+    label_kappa: float | None = None
+    verdict_kappa: float | None = None
+    label_count: int = 0
+    verdict_count: int = 0
+    threshold: float = config.KAPPA_THRESHOLD
+    min_trajectories: int = config.MIN_CALIBRATION_TRAJECTORIES
+    model: str = ""
+    applicability_prompt_hash: str = ""
+    critique_prompt_hash: str = ""
+    calibration_digest: str = ""
+    tasks: tuple[str, ...] = ()
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def prompt_template(kind: Kind) -> str:
+    return (config.PROMPTS_DIR / f"{kind}.md").read_text()
+
+
+def prompt_hash(kind: Kind) -> str:
+    return sha256(prompt_template(kind).encode())
+
+
+def calibration_digest() -> str:
+    return sha256(config.CALIBRATION_FILE.read_bytes())
+
+
+def judge_stamp() -> dict[str, object]:
+    """The judge model, prompt hashes, and calibration policy an agreement record carries."""
+    return {
+        "model": config.JUDGE_MODEL,
+        "threshold": config.KAPPA_THRESHOLD,
+        "min_trajectories": config.MIN_CALIBRATION_TRAJECTORIES,
+        "applicability_prompt_hash": prompt_hash("applicability"),
+        "critique_prompt_hash": prompt_hash("critique"),
+    }
+
+
+def current_stamp() -> dict[str, object]:
+    """The identity a stored agreement must match to count as current."""
+    return {**judge_stamp(), "calibration_digest": calibration_digest()}
+
+
+def _key(kind: Kind, subject: str, kind_prompt_hash: str | None = None) -> str:
+    return sha256(json.dumps([subject, config.JUDGE_MODEL, kind_prompt_hash or prompt_hash(kind)]).encode())
+
+
+def label_key(task_digest: str) -> str:
+    return _key("applicability", task_digest)
+
+
+def critique_key(run_key: str) -> str:
+    return _key("critique", run_key)
+
+
+def _read(name: str) -> list[dict]:
+    return baselines.load_rows(config.JUDGE_DIR / name)
+
+
+def _append(name: str, entry: dict) -> None:
+    # The result-store append starts a fresh line after a torn tail that a killed run left.
+    baselines.store(entry, path=config.JUDGE_DIR / name)
+
+
+def entries(kind: Kind) -> list[dict]:
+    return _read(_CACHE_FILES[kind])
+
+
+def _cached(kind: Kind, key: str) -> dict | None:
+    return next((entry for entry in reversed(entries(kind)) if entry.get("key") == key), None)
+
+
+def cached_label(task_digest: str) -> str | None:
+    entry = _cached("applicability", label_key(task_digest))
+    return entry["label"] if entry else None
+
+
+def cached_labels(task_digests: Iterable[str]) -> dict[str, str]:
+    """Map each task digest with a cached label to that label, reading the cache once."""
+    by_key = {entry.get("key"): entry["label"] for entry in entries("applicability")}
+    applicability_hash = prompt_hash("applicability")
+    return {
+        digest: by_key[key] for digest in set(task_digests)
+        if (key := _key("applicability", digest, applicability_hash)) in by_key
+    }
+
+
+def cached_critique(run_key: str) -> str | None:
+    entry = _cached("critique", critique_key(run_key))
+    return entry["critique"] if entry else None
+
+
+def put_label(*, task: str, task_digest: str, label: str, cost: float) -> None:
+    _append(_CACHE_FILES["applicability"], {
+        "key": label_key(task_digest), "task": task, "task_digest": task_digest,
+        "model": config.JUDGE_MODEL, "label": label, "cost": cost,
+    })
+
+
+def put_critique(*, run_key: str, critique: str, cost: float) -> None:
+    _append(_CACHE_FILES["critique"], {
+        "key": critique_key(run_key), "run_key": run_key, "model": config.JUDGE_MODEL,
+        "critique": critique, "cost": cost,
+    })
+
+
+def write_agreement(agreement: Agreement) -> None:
+    _append(_AGREEMENT_FILE, asdict(agreement))
+
+
+def current_agreement() -> Agreement | None:
+    """The newest stored agreement whose model, prompt hashes, and calibration digest are current.
+
+    None when no record matches, or when the calibration file is missing.
+    """
+    if not config.CALIBRATION_FILE.is_file():
+        return None
+    stamp = current_stamp()
+    names = {field.name for field in fields(Agreement)}
+    for record in reversed(_read(_AGREEMENT_FILE)):
+        if all(record.get(key) == value for key, value in stamp.items()):
+            known = {key: value for key, value in record.items() if key in names}
+            return Agreement(**{**known, "tasks": tuple(known.get("tasks", ()))})
+    return None
+
+
+def released_label(
+    agreement: Agreement | None, task_name: str, task_digest: str, labels: Mapping[str, str] | None = None,
+) -> str | None:
+    """The cached label for a task digest, only when ``agreement`` releases it.
+
+    ``agreement`` comes from ``current_agreement()``. It releases a label when it is calibrated
+    and its hand-labelled tasks cover ``task_name``. A caller that checks many digests passes
+    ``labels`` from one ``cached_labels`` read.
+    """
+    if agreement is None or not agreement.calibrated or task_name not in agreement.tasks:
+        return None
+    return (labels if labels is not None else cached_labels([task_digest])).get(task_digest)
