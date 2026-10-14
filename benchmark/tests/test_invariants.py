@@ -1,6 +1,7 @@
 """Cross-cutting benchmark invariants: a panel run reaches every member, refuses incomplete panels, and never starts a container."""
 
 import io
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -9,9 +10,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import evolve_support as es
 import external.preflight
 import run
 from conftest import STREAMS, link_suite_site
+from evolve import candidate as evolve_candidate
+from evolve import engine as evolve_engine
+from evolve.finish import GitHubPRClient
+from judge import core as judge_core
+from judge import store as judge_store
 from panel_support import (
     CHEAP, COMPLETE, FB_IDS, GO_SLOT, RENDER, RUST_SLOT, SYNTHETIC_FB, admit_all, hermetic_repos, panel_run, read,
     restratify, seed_synthetic_data, synthetic_panel, without, write,
@@ -136,16 +143,6 @@ def test_external_cell_never_invokes_container(bench, monkeypatch: pytest.Monkey
 
 
 # --- c5: the evolution loop never shows the grader to reflection, scores only by correctness ---
-
-import json  # noqa: E402
-
-import evolve_support as es  # noqa: E402
-from evolve import candidate as evolve_candidate  # noqa: E402
-from evolve import engine as evolve_engine  # noqa: E402
-from evolve.finish import GitHubPRClient  # noqa: E402
-from judge import core as judge_core  # noqa: E402
-from judge import store as judge_store  # noqa: E402
-
 
 @pytest.fixture
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -345,7 +342,9 @@ def test_proposer_cannot_see_grader_inputs(world, monkeypatch: pytest.MonkeyPatc
     assert "[test_a:" not in prompts[0]
 
 
-def test_baselines_bought_once_then_reused(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_baselines_bought_once_then_reused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = es.make_world(monkeypatch, tmp_path,
+                          es.seed_files(es.mcp(dev_a="0", dev_b="0", cheap_a="1", test_a="0")))
     _engine(monkeypatch, [es.child(es.seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert es.main(world) == 0
     planned = {(task, rep) for task in (*es.CHEAP, *es.DEV, *es.TEST) for rep in (0, 1)}
@@ -452,7 +451,8 @@ def test_one_ceiling_spans_all_paid_calls(world, monkeypatch: pytest.MonkeyPatch
     with pytest.raises(judge_core.JudgeSpendCeiling):
         evo.judge.critique(row, Path(row["trajectory_path"]).read_text())
     assert Client.calls == 0
-    assert evo.ledger.spent <= evo.ledger.max_usd
+    assert evo.ledger.reserve > 0
+    assert evo.ledger.spent <= evo.ledger.max_usd - evo.ledger.reserve
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert es.main(world, "--run-id", "keyed") != 0

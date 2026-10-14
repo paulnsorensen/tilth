@@ -1433,7 +1433,10 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
     directory = RESULTS_DIR / "candidates" / sha
     binary, record = directory / "tilth", directory / "build.json"
     if binary.is_file() and record.is_file():
-        built = json.loads(record.read_text())
+        try:
+            built = json.loads(record.read_text())
+        except json.JSONDecodeError:
+            built = {}  # a torn record counts as a missing cache: rebuild
         if built.get("binary_sha256") == _file_sha256(binary):
             return CandidateBuild(git_sha=sha, binary_path=str(binary), binary_sha256=built["binary_sha256"])
     # A stable checkout path per sha; the target dir is shared so dependencies build once.
@@ -1441,6 +1444,7 @@ def _build_candidate(sha: str, repo: Path) -> CandidateBuild:
     if worktree.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, capture_output=True)
         shutil.rmtree(worktree, ignore_errors=True)
+    subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True)  # drop a stale registration
     _git("worktree", "add", "--detach", str(worktree), sha, cwd=repo)
     try:
         head = _git("rev-parse", "HEAD", cwd=worktree).strip()
@@ -1539,8 +1543,8 @@ def run_plan(
         try:
             build = build_candidate(candidate_sha, repo=repo)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            output = getattr(error, "stderr", None) or ""
-            raise CandidateBuildFailed(f"{error}\n{output}".strip()) from error
+            detail = getattr(error, "stderr", None) or ""
+            raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)

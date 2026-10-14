@@ -21,8 +21,8 @@ class StopState:
     """Why the search stopped, if it has: ``ceiling``, ``quota``, ``plateau``, ``cli-version``,
     ``mcp-unavailable``, or ``invalid-cell``.
 
-    gepa swallows proposer exceptions and retries, so evolve never stops by
-    raising: the engine's stop callback reads this state instead. ``quota`` is
+    gepa 0.1.4 raises proposer exceptions by default. Evolve ends the search
+    through the engine's stop callback, which reads this state. ``quota`` is
     the strictest reason and replaces any other; no other reason replaces one.
     """
 

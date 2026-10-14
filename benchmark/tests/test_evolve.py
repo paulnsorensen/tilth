@@ -125,7 +125,8 @@ def test_records_are_judge_stripped_records(world) -> None:
 # --- test-split rollouts never feed reflection ---
 
 
-def test_test_split_never_reflected(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_test_split_never_reflected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
     world.judge.calibrated = True
     prompts: list[str] = []
 
@@ -504,6 +505,7 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
         "just check": child(evo.seed, dev_a="1", cheap_a="1", BROKEN="1"),
         "cheap tier": child(evo.seed, dev_a="1", dev_b="1", cheap_a="0"),
     }[stage]
+    evo.evaluate(evo.seed, "dev_a")
     checks_before = len(_broken_check.calls)
 
     score, info = evo.evaluate(failing, "dev_a")
@@ -749,6 +751,7 @@ def test_dominated_candidate_not_rerun(world) -> None:
 def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     world = weak_world(monkeypatch, tmp_path)
     evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
     member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 0.5})
     # One rollout scores (1, 1), which the member does not dominate; the re-run brings the means to (0.5, 0.5).
     candidate = child(evo.seed, dev_a="10", dev_b="10", cheap_a="1")
@@ -759,8 +762,47 @@ def test_rerun_dominated_candidate_not_accepted(monkeypatch: pytest.MonkeyPatch,
         ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
     assert result.means == {"dev_a": 0.5, "dev_b": 0.5} and not result.accepted
     assert score == 0.5  # GEPA sees the re-run mean, not the first rollout's 1.0
-    assert evo.frontier == [member]
+    assert member in evo.frontier and result not in evo.frontier
     assert "dominated after 2 rollouts" in log_text(world)
+
+
+def test_first_rollout_that_did_not_complete_is_not_rerun(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    candidate = child(evo.seed, dev_a="E", dev_b="1", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 0), ("dev_b", 0)]
+    assert not result.accepted and result not in evo.frontier
+    assert "a first rollout did not complete; not re-run" in log_text(world)
+
+
+def test_rerun_that_did_not_complete_is_not_accepted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    candidate = child(evo.seed, dev_a="1E", dev_b="11", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
+        ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
+    assert not result.accepted and result not in evo.frontier
+    assert "a re-run did not complete; not accepted" in log_text(world)
+
+
+def test_candidate_buys_nothing_when_the_seed_is_not_on_the_frontier(monkeypatch: pytest.MonkeyPatch,
+                                                                   tmp_path: Path) -> None:
+    files = seed_files(mcp(dev_a="E", dev_b="1", cheap_a="1", test_a="0"))
+    world = make_world(monkeypatch, tmp_path, files)
+    use_engine(monkeypatch, [child(seed_candidate(files), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
+
+    assert main(world) == 1
+
+    assert [call for call in world.calls if call[1] == "tilth" and call[3] != world.seed_sha] == []
+    assert "the seed is not on the accepted frontier" in log_text(world)
 
 
 def test_dev_delta_never_buys_baseline_cells(world) -> None:
@@ -867,7 +909,7 @@ def _finalist_runs(world, evo, *results) -> dict[str, list[tuple[str, int]]]:
             for result in results}
 
 
-def test_finalists_are_top_two_nonseed_plus_seed(world) -> None:
+def test_finalists_are_the_dev_winner_and_the_seed(world) -> None:
     evo = ready(world)
     seed_result = accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
     members = [accept(evo, child(evo.seed, test_a="1", tag=str(mean)), {"dev_a": mean, "dev_b": mean})
@@ -876,12 +918,12 @@ def test_finalists_are_top_two_nonseed_plus_seed(world) -> None:
 
     reps = [("test_a", rep) for rep in (0, 1)]
     runs = _finalist_runs(world, evo, seed_result, *members)
-    assert runs[members[1].cid[:12]] == reps and runs[members[2].cid[:12]] == reps
-    assert runs[seed_result.cid[:12]] == reps
-    assert runs[members[0].cid[:12]] == [] and runs[members[3].cid[:12]] == []
+    assert runs[members[1].cid[:12]] == reps and runs[seed_result.cid[:12]] == reps
+    assert all(runs[members[index].cid[:12]] == [] for index in (0, 2, 3))
 
 
-def test_winner_is_best_test_mean(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_winner_is_chosen_on_dev_and_its_test_delta_is_reported(monkeypatch: pytest.MonkeyPatch,
+                                                                tmp_path: Path) -> None:
     world = make_world(monkeypatch, tmp_path,
                        seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="1" * 10 + "0" * 10)))
     evo = ready(world, "--reruns", "19")
@@ -890,8 +932,34 @@ def test_winner_is_best_test_mean(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     second_dev = accept(evo, child(evo.seed, test_a="1" * 12 + "0" * 8, tag="b"), {"dev_a": 0.8, "dev_b": 0.8})
 
     assert evo.finish() is not None
-    assert world.pr.pushes == [(second_dev.sha, "evolve/run1-winner")]
-    assert best_dev.sha != second_dev.sha
+    assert world.pr.pushes == [(best_dev.sha, "evolve/run1-winner")]
+    assert tilth_calls(world, second_dev.sha) == []
+    assert [report["candidate"] for report in evo.deltas if report["split"] == "test"] == [best_dev.cid[:12]]
+
+
+def test_seed_wins_a_dev_tie_without_buying_the_test_split(world) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.5, "dev_b": 0.5})
+    tied = accept(evo, child(evo.seed, test_a="1", tag="tied"), {"dev_a": 0.5, "dev_b": 0.5})
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls and tilth_calls(world, tied.sha) == [] and world.pr.calls == []
+    assert "no improvement" in log_text(world)
+
+
+@pytest.mark.parametrize("incomplete", ["winner", "seed"])
+def test_finish_refuses_to_compare_incomplete_test_cells(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                         incomplete: str) -> None:
+    files = seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="E" if incomplete == "seed" else "0"))
+    world = make_world(monkeypatch, tmp_path, files)
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="E" if incomplete == "winner" else "1"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    assert evo.finish() is None
+    assert world.pr.calls == [] and evo.finish_failure is not None
+    assert "test-split cells did not complete" in log_text(world)
 
 
 def test_finalists_come_from_accepted_frontier(world) -> None:
@@ -932,8 +1000,8 @@ def test_finish_opens_one_draft_for_nonseed_winner(world) -> None:
 
     evo = ready(world, pr_client=GitHubPRClient(world.repo, remote="origin", run=run_gh))
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
-    loser = accept(evo, child(evo.seed, test_a="0", tag="loser"), {"dev_a": 0.9, "dev_b": 0.9})
-    winner = accept(evo, child(evo.seed, test_a="1", tag="winner"), {"dev_a": 0.5, "dev_b": 0.5})
+    loser = accept(evo, child(evo.seed, test_a="0", tag="loser"), {"dev_a": 0.5, "dev_b": 0.5})
+    winner = accept(evo, child(evo.seed, test_a="1", tag="winner"), {"dev_a": 0.9, "dev_b": 0.9})
     evo.finish()
 
     heads = dict(line.split("\t")[::-1] for line in git("ls-remote", "--heads", str(remote), cwd=world.tmp).splitlines())
@@ -968,7 +1036,8 @@ def test_finish_no_pr_when_seed_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert "no improvement" in log_text(world)
 
 
-def test_test_split_scored_once_at_finish(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_test_split_scored_once_at_finish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
     use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     evo = build(world)
     real_finish = evo.finish
@@ -1069,8 +1138,9 @@ def test_finish_stops_before_crossing_full_ceiling(world) -> None:
     assert evo.ledger.spent <= 2.0 + 1e-9
 
 
-def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch: pytest.MonkeyPatch,
+def test_test_split_baseline_drift_refuses_before_paid_calls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    world = weak_world(monkeypatch, tmp_path)
     use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     monkeypatch.setattr(run, "env_fingerprint", lambda task: "env-test-b" if "test_a" in str(task) else world.env)
@@ -1084,7 +1154,8 @@ def test_test_split_baseline_drift_refuses_before_paid_calls(world, monkeypatch:
     assert [call for call in world.calls[calls:] if call[:2] == ("test_a", "baseline")]
 
 
-def test_finish_baseline_drift_is_incomplete_not_traceback(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_finish_baseline_drift_is_incomplete_not_traceback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
     use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
     assert main(world) == 0
     world.pr.calls.clear()
@@ -1356,16 +1427,16 @@ def test_insufficient_reserve_refuses_at_start(world, capsys: pytest.CaptureFixt
     assert main(world, max_usd="0.15") != 0
     assert world.calls == [] and world.judge.labelled == [] and world.spawned == []
     error = capsys.readouterr().err
-    assert "$0.15" in error and "$1.20" in error and "$0.40" in error
+    assert "$0.15" in error and "$0.80" in error and "$0.40" in error
 
 
 def test_max_usd_equal_to_the_reserve_is_refused(world, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(world, max_usd="1.2") == 2
+    assert main(world, max_usd="0.8") == 2
     error = capsys.readouterr().err
-    assert "$1.20" in error and "$0.40" in error
+    assert "$0.80" in error and "$0.40" in error
     assert world.calls == [] and world.judge.labelled == []
 
-    assert build(world, max_usd="1.25").preflight() is None
+    assert build(world, max_usd="0.85").preflight() is None
 
 
 def test_stop_state_neutralizes_calls(world) -> None:
@@ -1403,13 +1474,13 @@ def test_run_log_has_no_gate_verdict(world, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def _ceiling_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn):
-    """max 1.2, a 0.3 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
+    """max 1.2, a 0.2 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
     world = weak_world(monkeypatch, tmp_path)
     world.costs.update(dev_a=0.0, dev_b=0.0, cheap_a=0.0, test_a=0.1)
     evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="2000", spawn=spawn)
     monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
     assert evo.preflight() is None
-    assert evo.ledger.reserve == pytest.approx(0.3)
+    assert evo.ledger.reserve == pytest.approx(0.2)
     assert evo.buy_baselines() is None
     return world, evo
 
@@ -1438,10 +1509,12 @@ def test_real_gepa_ceiling_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     world, evo = _ceiling_world(monkeypatch, tmp_path, spawn)
     better = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="better")
     for task in DEV:
+        evo.evaluate(evo.seed, task)
+    for task in DEV:
         evo.evaluate(better, task)
     evo.paid.costs.setdefault("reflection", []).append(0.2)
     evo.paid.costs.setdefault("proposer", []).append(0.2)
-    evo.ledger.charge(0.8 - evo.ledger.spent, source="search")
+    evo.ledger.charge(0.85 - evo.ledger.spent, source="search")
     after_stop = count_evaluations_after_stop(evo)
 
     evo.search()
@@ -1663,6 +1736,25 @@ def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypa
     assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
 
 
+def test_default_just_check_times_out_as_a_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from evolve import cli
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    seen: dict = {}
+
+    def hanging(argv, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(cli.subprocess, "run", hanging)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    ok, output = cli.default_just_check(worktree)
+
+    assert ok is False and "timed out" in output
+    assert seen["timeout"] == cli.JUST_CHECK_TIMEOUT_S
+
+
 # --- paid calls: the CLI budget flag and the cost sources ---
 
 _HAIKU = "claude-haiku-4-5-20251001"
@@ -1725,7 +1817,7 @@ def test_tie_with_the_seed_opens_no_draft(world) -> None:
     evo.finish()
 
     assert world.pr.pushes == [] and evo.finish_failure is None
-    assert "no candidate beats the seed" in log_text(world)
+    assert "does not beat the seed's test-split mean" in log_text(world)
 
 
 @pytest.mark.parametrize(("reason", "failed"), [("quota", True), ("ceiling", True), ("plateau", False)])
@@ -1848,7 +1940,9 @@ def test_rejects_a_changed_path_with_spaces(world) -> None:
     assert refs(world) == []
 
 
-@pytest.mark.parametrize("expression", ["cfg!(test)", "cfg!(any(test, debug_assertions))", "cfg ! [all(unix, test)]"])
+@pytest.mark.parametrize("expression", ["cfg!(test)", "cfg!(any(test, debug_assertions))", "cfg ! [all(unix, test)]",
+                                        "cfg!(debug_assertions)", "cfg!(not(debug_assertions))",
+                                        "cfg!(any(unix, debug_assertions))"])
 def test_rejects_cfg_macro_naming_test(world, expression: str) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     patch = patch_for(world, {"src/lib.rs": LIB + f"pub fn gated() -> bool {{ {expression} }}\n"})
@@ -1860,6 +1954,65 @@ def test_rejects_cfg_macro_naming_test(world, expression: str) -> None:
 
 def test_cfg_macro_without_test_is_kept(world) -> None:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
-    lines = 'pub fn debug() -> bool { cfg!(debug_assertions) }\npub const S: &str = "cfg!(test)"; // cfg!(test)\n'
+    lines = 'pub fn unix() -> bool { cfg!(unix) }\npub const S: &str = "cfg!(test)"; // cfg!(test)\n'
     sha = materializer.materialize({**seed_candidate(), "src_patch": patch_for(world, {"src/lib.rs": LIB + lines})})
     assert sha != world.seed_sha
+
+
+@pytest.mark.parametrize("attribute", ["# [cfg(test)]", "#/**/[cfg(test)]", "#\n[cfg(test)]", "# ! [cfg(test)]",
+                                       "#!/**/[cfg(test)]", "# [ cfg_attr(test, inline) ]"],
+                         ids=["spaced", "comment", "newline", "spaced-inner", "comment-inner", "cfg-attr"])
+def test_rejects_cfg_test_attribute_with_whitespace_or_comment(world, attribute: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\npub fn gated() {}\n"})
+
+    with pytest.raises(ApplyRejected, match=r"#\[cfg\(test\)\]"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+@pytest.mark.parametrize("attribute", [
+    "#[cfg(debug_assertions)]", "#[cfg(not(debug_assertions))]", "#[cfg(all(unix, debug_assertions))]",
+    "#[cfg_attr(debug_assertions, inline)]", "# [cfg(debug_assertions)]",
+])
+def test_rejects_cfg_debug_assertions_item(world, attribute: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\npub fn gated() {}\n"})
+
+    with pytest.raises(ApplyRejected, match="debug_assertions"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+@pytest.mark.parametrize("separator", ["\x0b", "\x0c", "\x1c", "\x85", " "])
+def test_line_numbers_count_only_newlines(world, separator: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = patch_for(world, {"src/lib.rs": LIB + f"// a{separator}b\n// benchmark\n"})
+
+    with pytest.raises(ApplyRejected, match=r"src/lib\.rs:8 names"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []
+
+
+def _special_file_patch(world, kind: str) -> str:
+    """A diff that adds a symlink under ``src/``, or turns ``src/lib.rs`` into a symlink."""
+    scratch = world.tmp / f"scratch-special-{kind}"
+    git("worktree", "add", "-q", "--detach", str(scratch), world.seed_sha, cwd=world.repo)
+    name = "src/lib.rs" if kind == "type-change" else "src/link.rs"
+    (scratch / name).unlink(missing_ok=True)
+    (scratch / name).symlink_to("main.rs")
+    git("add", "-A", cwd=scratch)
+    diff = git("diff", "--cached", world.seed_sha, cwd=scratch)
+    git("worktree", "remove", "--force", str(scratch), cwd=world.repo)
+    return diff
+
+
+@pytest.mark.parametrize("kind", ["symlink", "type-change"])
+def test_rejects_symlink_under_src(world, kind: str) -> None:
+    materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
+    patch = _special_file_patch(world, kind)
+    assert "120000" in patch
+
+    with pytest.raises(ApplyRejected, match="symlink or submodule"):
+        materializer.materialize({**seed_candidate(), "src_patch": patch})
+    assert refs(world) == []

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -375,6 +376,29 @@ def test_failed_candidate_build_reports_cargo_error(candidate_repo, monkeypatch:
     monkeypatch.setattr(run, "_run_cargo", failing_cargo)
     with pytest.raises(RuntimeError, match=r"E0425"):
         run.build_candidate(candidate, repo=repo)
+
+
+def test_torn_build_record_triggers_a_rebuild(candidate_repo) -> None:
+    repo, candidate, builds = candidate_repo
+    run.build_candidate(candidate, repo=repo)
+    (run.RESULTS_DIR / "candidates" / candidate / "build.json").write_text('{"git_sha": ')
+    run._CANDIDATE_BUILDS.clear()
+
+    rebuilt = run.build_candidate(candidate, repo=repo)
+
+    assert len(builds) == 2 and rebuilt.git_sha == candidate
+
+
+def test_stale_worktree_registration_does_not_fail_the_build(candidate_repo) -> None:
+    repo, candidate, builds = candidate_repo
+    stale = run.RESULTS_DIR / "candidates" / candidate / "src"
+    stale.parent.mkdir(parents=True)
+    git("worktree", "add", "-q", "--detach", str(stale), candidate, cwd=repo)
+    shutil.rmtree(stale)
+
+    assert run.build_candidate(candidate, repo=repo).git_sha == candidate
+    assert len(builds) == 1
+
 
 
 def test_run_plan_reports_any_build_failure_as_candidate_build_failed(world, monkeypatch: pytest.MonkeyPatch) -> None:

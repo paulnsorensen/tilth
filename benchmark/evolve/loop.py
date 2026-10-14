@@ -3,7 +3,8 @@
 A candidate's score is grader correctness only: the mean ``correct`` over its
 paid-tier dev rollouts. A contaminated rollout counts as incorrect.
 Reflection and the proposer see only stripped records.
-Test-split rollouts appear only in ``finish``.
+Test-split rollouts appear only in ``finish``. Finish picks the winner on dev means, so the test split
+only confirms one pre-chosen candidate against the seed and never selects among candidates.
 """
 
 import json
@@ -36,6 +37,7 @@ CANDIDATE_MODE = "tilth"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
 NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell"})
+FINISH_CELL_SETS = 2  # finish scores two candidates on the test split: the dev winner and the seed
 
 
 class EvolveError(RuntimeError):
@@ -252,10 +254,10 @@ class Evolution:
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
         per_finalist = self.finalist_test_cost()
-        reserve = 3 * per_finalist
+        reserve = FINISH_CELL_SETS * per_finalist
         if self.settings.max_usd <= reserve:
             return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} must exceed the finish reserve ${reserve:.2f} "
-                               f"(3 x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
+                               f"({FINISH_CELL_SETS} x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
         self.ledger.reserve = reserve
         self.log(f"reserve: ${reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
 
@@ -335,6 +337,9 @@ class Evolution:
         result = self.new_cascade(candidate)
         if result.done:
             return result
+        if result.cid != self.seed_id and not self.cascade(self.seed).accepted:
+            raise EvolveError("the seed is not on the accepted frontier (its dev run failed or did not complete); "
+                              "refusing to buy candidate rollouts")
         if result.sha is None:
             try:
                 result.sha = self.materializer.materialize(candidate)
@@ -359,7 +364,7 @@ class Evolution:
             result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
             result.cheap_score = mean(correct(row) for row in rows) if rows else 0.0
         if result.cid != self.seed_id:
-            seed = self.cascade(self.seed)
+            seed = self.results[self.seed_id]
             if result.cheap_score < (seed.cheap_score or 0.0):
                 # Only a failing candidate shows its cheap-tier records to reflection; critiques cost money.
                 records = self._records(result.cheap_rows)
@@ -491,20 +496,28 @@ class Evolution:
         self.log(line)
 
     def finish(self):
-        """Score the finalists once on the test split and open a draft PR for a non-seed winner."""
+        """Pick the best-dev non-seed candidate, confirm it against the seed on the test split, and open a draft PR.
+
+        The dev mean selects the winner; the seed wins a tie. The test split scores only the seed and that
+        winner, and the winner needs a strictly higher test mean than the seed.
+        """
         self.ledger.reserve = 0.0
         no_spend = self.stop.reason in NO_SPEND_REASONS
         seed = self.new_cascade(self.seed)
         if seed.sha is None:
             seed.sha = self.settings.seed_sha
         nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
-                         key=lambda member: (-member.dev_mean, member.seq))[:2]
+                         key=lambda member: (-member.dev_mean, member.seq))
         if not nonseed:
             if self.stop.is_set and self.stop.reason != "plateau":
                 return self._finish_failed(f"finish: incomplete ({self.stop.reason}); the search accepted no candidate")
             self.log("finish: no improvement (no non-seed candidate on the frontier)")
             return None
-        finalists = [*nonseed, seed]
+        winner = nonseed[0]
+        if winner.dev_mean <= seed.dev_mean:
+            self.log("finish: no improvement (no candidate beats the seed's dev mean)")
+            return None
+        finalists = [winner, seed]
         self.log("finish: finalists " + ", ".join(f"{member.cid[:12]} (dev mean {member.dev_mean:.3f})"
                                                   for member in finalists))
         reps = self._reps()
@@ -525,10 +538,14 @@ class Evolution:
         expected = len(self.panel.test) * len(reps)
         if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
             return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
+        unfinished = [member.cid[:12] for member in finalists
+                      if not all(baselines.is_completed(row) for row in test_rows[member.cid])]
+        if unfinished:
+            return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
+                                       f"{', '.join(unfinished)}); test-split means not compared: {scores}")
         self.log(f"finish: test-split means {scores}")
-        winner = max(finalists, key=lambda member: (test_means[member.cid], member.dev_mean, -member.seq))
-        if winner is seed or test_means[winner.cid] <= test_means[seed.cid]:
-            self.log("finish: no improvement (no candidate beats the seed's test-split mean)")
+        if test_means[winner.cid] <= test_means[seed.cid]:
+            self.log("finish: no improvement (the dev winner does not beat the seed's test-split mean)")
             return None
         if not winner.just_check_ok:
             return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "

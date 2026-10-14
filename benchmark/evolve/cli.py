@@ -34,6 +34,8 @@ from evolve.loop import Evolution, EvolveError, Settings  # noqa: E402
 from judge import core as judge  # noqa: E402
 from spend import SpendLedger  # noqa: E402
 
+JUST_CHECK_TIMEOUT_S = 1800
+
 
 def default_just_check(worktree: Path) -> tuple[bool, str]:
     """Run ``just check`` in an allowlisted env, with ``<worktree>/target`` linked to the shared candidate target dir.
@@ -46,8 +48,11 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
         shared = run.candidate_target_dir()
         shared.mkdir(parents=True, exist_ok=True)
         target.symlink_to(shared, target_is_directory=True)
-    completed = subprocess.run(["just", "check"], cwd=worktree, capture_output=True, text=True,
-                               env=run.build_tool_env())
+    try:
+        completed = subprocess.run(["just", "check"], cwd=worktree, capture_output=True, text=True,
+                                   env=run.build_tool_env(), timeout=JUST_CHECK_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, f"just check timed out after {JUST_CHECK_TIMEOUT_S} s"
     return completed.returncode == 0, completed.stdout + completed.stderr
 
 
