@@ -73,6 +73,7 @@ The run stops before a cell whose estimate would cross the ceiling.
 The estimate is the mean stored cost for that task, arm, and model, else this run's largest cell cost, else `--cell-estimate-usd` (default: `--max-budget-usd`).
 
 A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
+The run key of a Claude cell includes a per-cell budget placeholder, so rows stored before this change need `--refreeze-baselines` to be reused.
 Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives any `ANTHROPIC_*` variable.
 A usage-limit rejection (a terminal result with usage-limit text or a rate-limit subtype) records the cell as `infra: quota` and stops the run with exit status 1, as does the spend ceiling.
 
@@ -166,6 +167,31 @@ A stored agreement goes stale when the model, a prompt, the calibration file, th
 Until the judge is calibrated, critiques are withheld.
 Until then, `analyze.py` prints `## Applicability (uncalibrated)` with no label table.
 An external instance needs only a cached dataset row: the judge does not run admission.
+
+## Evolution loop
+
+`benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits.
+A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
+Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
+The commit passes `just check`, then a cheap tier, then the panel's dev split.
+The score is grader correctness only, and contaminated rollouts count as incorrect.
+Reflection and the `src/` proposer are isolated `claude -p` calls.
+They see only the judge's stripped records, never grader text or test-split rollouts.
+The loop buys baseline cells once and answers them from the result store afterwards.
+A candidate is accepted only after `--reruns` more rollouts.
+The finish step picks the accepted candidate with the best dev mean (the seed wins a tie), then scores only that candidate and the seed once on the test split.
+The candidate wins only if its test mean beats the seed's, and its test delta is the one reported.
+
+```bash
+python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha "$(git rev-parse HEAD)" \
+  --base-branch main --max-usd 200 --max-metric-calls 60 --cell-estimate-usd 0.5
+```
+
+`--max-usd` is required.
+It bounds every cell, judge, reflection, and proposer call.
+The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
+A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
+Run logs, delta reports, and candidate worktrees live under the gitignored `benchmark/results/evolve/<run-id>/`.
 
 ## Larger Luna edit task
 

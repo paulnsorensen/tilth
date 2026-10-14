@@ -309,8 +309,9 @@ def pending_calls(
 class ClaudeJudgeClient:
     """One isolated, tool-less ``claude -p`` call per prompt, the prompt on stdin.
 
-    With a bounded ``ledger``, each call passes the ledger's headroom as ``--max-budget-usd``,
-    so one call cannot spend past the run's ceiling.
+    With a bounded ``ledger``, each call passes the ledger's unreserved headroom (ceiling minus spend
+    minus the finish reserve) as ``--max-budget-usd``, so one call cannot spend past the run's ceiling
+    or into the reserve.
     """
 
     def __init__(self, *, spawn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -328,13 +329,11 @@ class ClaudeJudgeClient:
             "--no-session-persistence", "--disable-slash-commands",
         ]
         if max_budget_usd is not None:
-            argv += ["--max-budget-usd", str(max_budget_usd)]
+            argv += ["--max-budget-usd", f"{max_budget_usd:.4f}"]
         return argv
 
     def _headroom(self) -> float | None:
-        if self.ledger is None or self.ledger.max_usd is None:
-            return None
-        return self.ledger.max_usd - self.ledger.spent
+        return None if self.ledger is None else self.ledger.headroom()
 
     def __call__(self, prompt: str) -> JudgeReply:
         env = run.build_runner_env("claude", tilth_bin=None)
@@ -470,10 +469,10 @@ class Judge:
         if _quota_reason is not None:
             raise JudgeQuota(f"judge calls stopped after a usage-limit rejection: {_quota_reason}")
         estimate = self._estimate(kind)
-        exhausted = self.ledger.max_usd is not None and self.ledger.spent >= self.ledger.max_usd
-        if exhausted or self.ledger.would_cross(estimate):
+        if self.ledger.exhausted() or self.ledger.would_cross(estimate):
             raise JudgeSpendCeiling(f"{kind} judge call estimated at ${estimate:.4f} would cross the "
-                                    f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f})")
+                                    f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f} + "
+                                    f"${self.ledger.reserve:.4f} reserved)")
         reply = self.client(prompt)
         failed = reply.quota is not None or reply.error is not None
         # A failed call charges only a native cost; a pricing-derived cost is not trusted.

@@ -995,7 +995,7 @@ def test_claude_runtime_options_and_local_tilth_config(
                                      bare=True, reasoning_effort="high", max_budget_usd=2.5)
     cmd = captured["cmd"]
     assert cmd[cmd.index("--effort") + 1] == "high"
-    assert cmd[cmd.index("--max-budget-usd") + 1] == "2.5"
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "2.5000"
     assert cmd[cmd.index("--setting-sources") + 1] == ""
     assert "--disable-slash-commands" in cmd
     assert "Agent,Task" == cmd[cmd.index("--disallowedTools") + 1]
