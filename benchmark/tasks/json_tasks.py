@@ -312,6 +312,12 @@ def _register_mined_repo(repo_url: str, base_sha: str, language: str = DEFAULT_L
     base_sha)` pair. Naming by repo+base (not task id) means mined tasks that
     share a repo and base commit share one clone."""
     repo_name = f"{_repo_slug(repo_url)}-{base_sha[:12]}"
+    existing = REPOS.get(repo_name)
+    if existing is not None and existing.language != language:
+        raise ValueError(
+            f"mined repo {repo_url}@{base_sha[:12]} is declared as both "
+            f"{existing.language!r} and {language!r}; one clone has one language"
+        )
     REPOS[repo_name] = RepoConfig(
         name=repo_name,
         url=repo_url,

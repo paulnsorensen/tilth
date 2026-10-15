@@ -602,6 +602,14 @@ def test_json_repos_default_to_python_and_honor_a_declared_language(tmp_path) ->
     assert json_tasks.REPOS[mutation.repo].language == "python"
 
 
+def test_one_mined_clone_cannot_carry_two_languages(tmp_path) -> None:
+    json_tasks.load_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED))
+
+    with pytest.raises(ValueError, match="declared as both 'python' and 'go'"):
+        json_tasks.load_json_tasks(
+            _write_mined_file(tmp_path, {**_GOOD_MINED, "id": "acme-go-same-base", "language": "go"})
+        )
+
 def test_mutation_file_with_an_unknown_language_is_refused(tmp_path) -> None:
     path = _write_mutation_file(tmp_path, _GOOD_MUTATION)
     path.write_text(json.dumps({**json.loads(path.read_text()), "language": "cobol"}))
