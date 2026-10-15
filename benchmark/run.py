@@ -1940,6 +1940,112 @@ def load_modes_json(path: Path) -> list[str]:
     return list(loaded)
 
 
+def _select_tasks(args: argparse.Namespace, models: list[str]) -> tuple[object, list[str]]:
+    """Resolve the panel (None unless --panel) and the task list from the CLI args."""
+    if args.panel:
+        if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
+            raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
+                             "sidecar, so every panel row would count as contaminated")
+        panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
+        panel.register(TASKS)
+        return panel, panel.select(args.panel_split)
+    if args.tasks_json:
+        json_tasks = register_json_tasks(args.tasks_json, TASKS)
+        return None, list(json_tasks)
+    return None, select_tasks(args.tasks)
+
+
+def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) -> tuple[list[str], object]:
+    """Resolve the arm (mode) names and the experiment manifest, if any, from the CLI args."""
+    experiment = None
+    if args.experiment:
+        experiment = load_experiment(args.experiment)
+        configured_modes = experiment_modes(
+            experiment,
+            RESULTS_DIR / "configs" / timestamp,
+        )
+        compiler = rustc_version()
+        configured_modes = {
+            name: hydrate_mode_metadata(mode, compiler)
+            for name, mode in configured_modes.items()
+        }
+        MODES.update(configured_modes)
+        modes = [variant.name for variant in experiment.variants]
+        if args.runner == "codex" and "tilth_forced" in modes:
+            raise ValueError("tilth_forced is not supported by the codex runner")
+    elif args.modes_json:
+        modes = load_modes_json(args.modes_json)
+        if any(RUNNERS[model] != "claude" for model in models) and any(
+            _uses_claude_session_features(MODES[name]) for name in modes
+        ):
+            raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
+    else:
+        requested_modes = args.modes or ("baseline,tilth,wozcode" if args.wozcode_plugin_dir else None)
+        modes = select_modes(requested_modes, args.runner)
+        if "wozcode" in modes and not args.wozcode_plugin_dir:
+            raise ValueError("wozcode mode requires --wozcode-plugin-dir")
+    return modes, experiment
+
+
+def _verify_mcp_servers(modes: list[str], runner: Optional[str]) -> None:
+    """Verify the exact MCP command that each selected runner will launch."""
+    for mode_name in modes:
+        cfg_path = MODES[mode_name].mcp_config_path
+        try:
+            server_commands = mcp_server_commands(mode_name, runner)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"ERROR: cannot read MCP config {cfg_path} for mode '{mode_name}': {e}", file=sys.stderr)
+            sys.exit(1)
+        for server_name, cmd_str in server_commands.items():
+            resolved = shutil.which(cmd_str) if "/" not in cmd_str else (cmd_str if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) else None)
+            if not resolved:
+                print(f"ERROR: MCP server '{server_name}' in {cfg_path} (mode '{mode_name}')", file=sys.stderr)
+                print(f"       command '{cmd_str}' is not executable / not on PATH.", file=sys.stderr)
+                print(f"       Fix the 'command' field in {cfg_path} or install the binary.", file=sys.stderr)
+                sys.exit(1)
+            # Smoke-test the binary with --version to catch broken installs.
+            try:
+                probe = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
+                if probe.returncode != 0:
+                    print(f"WARNING: MCP server '{server_name}' --version exited {probe.returncode}: {probe.stderr.strip()}", file=sys.stderr)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                print(f"ERROR: MCP server '{server_name}' at {resolved} failed to run: {e}", file=sys.stderr)
+                sys.exit(1)
+            if server_name == "tilth" and MODES[mode_name].binary_sha256 is None:
+                with open(resolved, "rb") as binary:
+                    digest = hashlib.file_digest(binary, "sha256").hexdigest()
+                MODES[mode_name] = replace(
+                    MODES[mode_name], binary_path=str(Path(resolved).resolve()),
+                    binary_sha256=digest,
+                )
+
+
+def _prepare_repos(selected_repos: set[str], *, verbose: bool) -> None:
+    """Check each selected real-world repo exists (cloning mined ones), then clean it."""
+    for repo_name in selected_repos:
+        if REPOS[repo_name].on_demand_clone:
+            # A mined task's clone is made here, under the harness data directory.
+            try:
+                REPOS[repo_name].ensure_cloned()
+            except (OSError, subprocess.CalledProcessError) as error:
+                print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
+                sys.exit(1)
+        repo_path = REPOS[repo_name].path
+        if not repo_path.exists():
+            print(f"ERROR: Repo '{repo_name}' not cloned.")
+            print(f"Expected at: {repo_path}")
+            print("Run setup_repos.py to clone repositories:")
+            print("  python benchmark/fixtures/setup_repos.py")
+            sys.exit(1)
+
+    # Clean real-world repos before starting (removes junk files from previous runs)
+    for repo_name in selected_repos:
+        repo_path = REPOS[repo_name].path
+        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
+        if verbose:
+            print(f"Cleaned repo: {repo_name}")
+
+
 def main(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
@@ -2113,44 +2219,8 @@ Examples:
             if any(RUNNERS[model] != "claude" for model in models):
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
-        if args.panel:
-            if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
-                raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
-                                 "sidecar, so every panel row would count as contaminated")
-            panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
-            panel.register(TASKS)
-            tasks_list = panel.select(args.panel_split)
-        elif args.tasks_json:
-            json_tasks = register_json_tasks(args.tasks_json, TASKS)
-            tasks_list = list(json_tasks)
-        else:
-            tasks_list = select_tasks(args.tasks)
-        if args.experiment:
-            experiment = load_experiment(args.experiment)
-            configured_modes = experiment_modes(
-                experiment,
-                RESULTS_DIR / "configs" / timestamp,
-            )
-            compiler = rustc_version()
-            configured_modes = {
-                name: hydrate_mode_metadata(mode, compiler)
-                for name, mode in configured_modes.items()
-            }
-            MODES.update(configured_modes)
-            modes = [variant.name for variant in experiment.variants]
-            if args.runner == "codex" and "tilth_forced" in modes:
-                raise ValueError("tilth_forced is not supported by the codex runner")
-        elif args.modes_json:
-            modes = load_modes_json(args.modes_json)
-            if any(RUNNERS[model] != "claude" for model in models) and any(
-                _uses_claude_session_features(MODES[name]) for name in modes
-            ):
-                raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
-        else:
-            requested_modes = args.modes or ("baseline,tilth,wozcode" if args.wozcode_plugin_dir else None)
-            modes = select_modes(requested_modes, args.runner)
-            if "wozcode" in modes and not args.wozcode_plugin_dir:
-                raise ValueError("wozcode mode requires --wozcode-plugin-dir")
+        panel, tasks_list = _select_tasks(args, models)
+        modes, experiment = _select_arms(args, models, timestamp)
     except (ValueError, OSError) as error:
         parser.error(str(error))
     if args.candidate_sha:
@@ -2164,36 +2234,7 @@ Examples:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
 
-    # Verify the exact MCP command that each selected runner will launch.
-    for mode_name in modes:
-        cfg_path = MODES[mode_name].mcp_config_path
-        try:
-            server_commands = mcp_server_commands(mode_name, args.runner)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"ERROR: cannot read MCP config {cfg_path} for mode '{mode_name}': {e}", file=sys.stderr)
-            sys.exit(1)
-        for server_name, cmd_str in server_commands.items():
-            resolved = shutil.which(cmd_str) if "/" not in cmd_str else (cmd_str if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) else None)
-            if not resolved:
-                print(f"ERROR: MCP server '{server_name}' in {cfg_path} (mode '{mode_name}')", file=sys.stderr)
-                print(f"       command '{cmd_str}' is not executable / not on PATH.", file=sys.stderr)
-                print(f"       Fix the 'command' field in {cfg_path} or install the binary.", file=sys.stderr)
-                sys.exit(1)
-            # Smoke-test the binary with --version to catch broken installs.
-            try:
-                probe = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
-                if probe.returncode != 0:
-                    print(f"WARNING: MCP server '{server_name}' --version exited {probe.returncode}: {probe.stderr.strip()}", file=sys.stderr)
-            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                print(f"ERROR: MCP server '{server_name}' at {resolved} failed to run: {e}", file=sys.stderr)
-                sys.exit(1)
-            if server_name == "tilth" and MODES[mode_name].binary_sha256 is None:
-                with open(resolved, "rb") as binary:
-                    digest = hashlib.file_digest(binary, "sha256").hexdigest()
-                MODES[mode_name] = replace(
-                    MODES[mode_name], binary_path=str(Path(resolved).resolve()),
-                    binary_sha256=digest,
-                )
+    _verify_mcp_servers(modes, args.runner)
 
     # Filter tasks by repo
     if args.repos.lower() != "all":
@@ -2226,30 +2267,8 @@ Examples:
             )
         reset_repo()
 
-    # Validate real-world repos exist (for selected tasks)
     selected_repos = set(TASKS[t].repo for t in fixture_tasks) - {"synthetic"}
-    for repo_name in selected_repos:
-        if REPOS[repo_name].on_demand_clone:
-            # A mined task's clone is made here, under the harness data directory.
-            try:
-                REPOS[repo_name].ensure_cloned()
-            except (OSError, subprocess.CalledProcessError) as error:
-                print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
-                sys.exit(1)
-        repo_path = REPOS[repo_name].path
-        if not repo_path.exists():
-            print(f"ERROR: Repo '{repo_name}' not cloned.")
-            print(f"Expected at: {repo_path}")
-            print("Run setup_repos.py to clone repositories:")
-            print("  python benchmark/fixtures/setup_repos.py")
-            sys.exit(1)
-
-    # Clean real-world repos before starting (removes junk files from previous runs)
-    for repo_name in selected_repos:
-        repo_path = REPOS[repo_name].path
-        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
-        if args.verbose:
-            print(f"Cleaned repo: {repo_name}")
+    _prepare_repos(selected_repos, verbose=args.verbose)
 
 
     bare = args.bare or experiment is not None or args.wozcode_plugin_dir is not None or args.strict_file_tools
