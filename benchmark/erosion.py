@@ -67,9 +67,9 @@ def _git(args: list[str], env: dict[str, str], stdin: bytes = b"") -> bytes:
     return done.stdout
 
 
-def _files(root: Path, env: dict[str, str], *, honor_ignores: bool = True) -> list[str]:
-    """Regular, non-symlink files under ``root`` (git-ignored ones dropped unless told otherwise), minus harness paths."""
-    listed = _git(["ls-files", "-z", "--cached", "--others", *(["--exclude-standard"] if honor_ignores else [])], env)
+def _files(root: Path, env: dict[str, str]) -> list[str]:
+    """Regular, non-symlink files under ``root`` that its own ignore files keep, minus harness paths."""
+    listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], env)
     found = []
     for raw in listed.split(b"\0"):
         if not raw:
@@ -84,36 +84,62 @@ def _files(root: Path, env: dict[str, str], *, honor_ignores: bool = True) -> li
     return sorted(set(found))
 
 
-def _gitignores(root: Path, files: list[str]) -> dict[str, bytes]:
-    return {rel: (root / rel).read_bytes() for rel in files if Path(rel).name == ".gitignore"}
+def _walk_files(root: Path) -> list[str]:
+    """Regular, non-symlink files found by walking ``root``, minus harness paths and ``.git`` internals.
+
+    The walk reads the real filesystem, so nothing the agent wrote into git config or ignore
+    files changes what is listed. A nested repository's working files stay in.
+    """
+    found = []
+    for top, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_NAMES]
+        for name in names:
+            path = Path(top) / name
+            if name in EXCLUDED_NAMES or path.is_symlink() or not path.is_file():
+                continue
+            found.append(path.relative_to(root).as_posix())
+    return sorted(found)
 
 
 def _after_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
-    """The workdir files to compare, judged by the ignore rules of the pre-agent ``baseline``.
+    """The workdir files to compare, judged only by the ignore rules the pre-agent ``baseline`` holds.
 
-    An agent must not hide work by editing a ``.gitignore``. When the visible ``.gitignore``
-    files match the baseline's, the tree's own rules are the baseline's. Otherwise every file
-    is re-judged against the baseline's rules on a placeholder tree. ``.gitignore`` files
-    that the workdir shows are always counted.
+    An agent must not hide work by writing a ``.gitignore`` or a nested repository. The
+    ``.gitignore`` files of the baseline are copied to a rules tree, and every workdir path is
+    checked against them with ``git check-ignore --no-index``. A ``.gitignore`` that the workdir
+    shows is counted unless a directory above it is already ignored by the baseline rules.
     """
-    visible = _files(workdir, _git_env(scratch / "git", workdir, scratch / "index-after"))
-    rules = _gitignores(workdir, visible)
-    before = _gitignores(baseline, [str(p.relative_to(baseline)) for p in baseline.rglob(".gitignore")])
-    if rules == before:
-        return visible
-    raw = _files(workdir, _git_env(scratch / "git", workdir, scratch / "index-raw"), honor_ignores=False)
+    found = _walk_files(workdir)
     with tempfile.TemporaryDirectory(prefix="tilth-rules-") as temp:
-        overlay = Path(temp)
-        for rel, content in before.items():
-            (overlay / rel).parent.mkdir(parents=True, exist_ok=True)
-            (overlay / rel).write_bytes(content)
-        for rel in raw:
-            if Path(rel).name != ".gitignore":
-                (overlay / rel).parent.mkdir(parents=True, exist_ok=True)
-                (overlay / rel).touch()
-        judged = _files(overlay, _git_env(scratch / "git", overlay, scratch / "index-rules"))
-    kept = {rel for rel in judged if Path(rel).name != ".gitignore"}
-    return sorted(kept | set(rules))
+        rules = Path(temp)
+        for path in baseline.rglob(".gitignore"):
+            rel = path.relative_to(baseline)
+            (rules / rel).parent.mkdir(parents=True, exist_ok=True)
+            (rules / rel).write_bytes(path.read_bytes())
+        probes = set()
+        for rel in found:
+            parent = Path(rel).parent
+            if Path(rel).name == ".gitignore":
+                if parent != Path("."):
+                    (rules / parent).mkdir(parents=True, exist_ok=True)
+                    probes.add(parent.as_posix())
+            else:
+                probes.add(rel)
+        env = _git_env(scratch / "git", rules, scratch / "index-rules")
+        env.pop("GIT_LITERAL_PATHSPECS")  # check-ignore rejects literal pathspec magic
+        done = _RUN(
+            ["git", "check-ignore", "--no-index", "--stdin", "-z"], capture_output=True,
+            timeout=GIT_TIMEOUT_S, input=b"\0".join(map(os.fsencode, sorted(probes))), env=env,
+        )
+    if done.returncode not in (0, 1):
+        raise RuntimeError(f"git check-ignore failed: {os.fsdecode(done.stderr or b'').strip()}")
+    ignored = {os.fsdecode(raw) for raw in done.stdout.split(b"\0") if raw}
+    kept = []
+    for rel in found:
+        probe = rel if Path(rel).name != ".gitignore" else Path(rel).parent.as_posix()
+        if probe not in ignored:
+            kept.append(rel)
+    return kept
 
 
 def _tree(root: Path, scratch: Path, name: str, files: Optional[list[str]] = None) -> str:
@@ -122,10 +148,8 @@ def _tree(root: Path, scratch: Path, name: str, files: Optional[list[str]] = Non
     if files is None:
         files = _files(root, env)
     if files:
-        _git(
-            ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], env,
-            b"\0".join(map(os.fsencode, files)),
-        )
+        # update-index, unlike add, also takes files that sit inside a nested repository.
+        _git(["update-index", "--add", "-z", "--stdin"], env, b"\0".join(map(os.fsencode, files)) + b"\0")
     return _git(["write-tree"], env).decode().strip()
 
 

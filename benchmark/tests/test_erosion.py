@@ -301,3 +301,37 @@ def test_skill_audit_fields_are_none_on_unmeasured_rows() -> None:
     assert run._SKILL_AUDIT_UNMEASURED == dict.fromkeys(
         ("skill_calls", "non_plugin_skill_calls", "bundled_skills_exposed")
     )
+
+
+def test_a_new_self_ignoring_gitignore_does_not_hide_its_directory(cell) -> None:
+    (cell.source / "keep.txt").write_text("k\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / "newpkg").mkdir()
+        (cwd / "newpkg" / ".gitignore").write_text("*\n")  # 1 added
+        (cwd / "newpkg" / "mod.py").write_text("a\nb\n")  # 2 added
+
+    assert cell(act)["workspace_diff_lines"] == 3
+
+
+def test_a_nested_git_repo_counts_its_working_files_but_not_its_git_dir(cell) -> None:
+    (cell.source / "keep.txt").write_text("k\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / "vendored").mkdir()
+        (cwd / "vendored" / "lib.py").write_text("1\n2\n3\n")  # 3 added
+        assert erosion._RUN(["git", "init", "-q", str(cwd / "vendored")]).returncode == 0  # real git
+
+    assert cell(act)["workspace_diff_lines"] == 3
+
+
+def test_a_pre_existing_ignored_cache_dir_stays_excluded_after_new_gitignores(cell) -> None:
+    (cell.source / ".gitignore").write_text(".mypy_cache/\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / ".mypy_cache").mkdir()
+        (cwd / ".mypy_cache" / ".gitignore").write_text("*\n")
+        (cwd / ".mypy_cache" / "meta.json").write_text("{}\n" * 50)
+        (cwd / "new.txt").write_text("n\n")  # 1 added
+
+    assert cell(act)["workspace_diff_lines"] == 1
