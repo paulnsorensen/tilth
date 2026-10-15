@@ -307,16 +307,19 @@ def _repo_slug(repo_url: str) -> str:
     return name[: -len(".git")] if name.endswith(".git") else name
 
 
-def _register_mined_repo(repo_url: str, base_sha: str, language: str = DEFAULT_LANGUAGE) -> str:
+def _register_mined_repo(path: Path, index: int, raw: dict) -> str:
     """Register (without cloning) the on-demand repo for a `(repo_url,
     base_sha)` pair. Naming by repo+base (not task id) means mined tasks that
     share a repo and base commit share one clone."""
+    repo_url, base_sha = raw["repo_url"], raw["base_sha"]
+    language = raw.get("language", DEFAULT_LANGUAGE)
     repo_name = f"{_repo_slug(repo_url)}-{base_sha[:12]}"
     existing = REPOS.get(repo_name)
     if existing is not None and existing.language != language:
-        raise ValueError(
+        raise _fail(
+            path, index, raw, "language",
             f"mined repo {repo_url}@{base_sha[:12]} is declared as both "
-            f"{existing.language!r} and {language!r}; one clone has one language"
+            f"{existing.language!r} and {language!r}; one clone has one language",
         )
     REPOS[repo_name] = RepoConfig(
         name=repo_name,
@@ -449,8 +452,8 @@ def _build_mutation_task(raw: dict, repo_name: str, fixture_dir: Path) -> JsonMu
     )
 
 
-def _build_mined_task(raw: dict) -> JsonMinedTask:
-    repo_name = _register_mined_repo(raw["repo_url"], raw["base_sha"], raw.get("language", DEFAULT_LANGUAGE))
+def _build_mined_task(path: Path, index: int, raw: dict) -> JsonMinedTask:
+    repo_name = _register_mined_repo(path, index, raw)
     return JsonMinedTask(
         **_common_fields(raw, repo_name),
         base_sha=raw["base_sha"],
@@ -493,7 +496,7 @@ def load_json_tasks(path: Path) -> dict[str, Task]:
         repo_name = _register_mutation_repo(path, data["repo"], language)
         fixture_dir = (path.parent / data["repo"]).resolve()
         return {raw["id"]: _build_mutation_task(raw, repo_name, fixture_dir) for raw in raw_tasks}
-    return {raw["id"]: _build_mined_task(raw) for raw in raw_tasks}
+    return {raw["id"]: _build_mined_task(path, index, raw) for index, raw in enumerate(raw_tasks)}
 
 
 def register_json_tasks(path: Path, registry: dict[str, Task]) -> dict[str, Task]:

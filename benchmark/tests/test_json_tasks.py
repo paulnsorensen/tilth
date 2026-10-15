@@ -670,6 +670,18 @@ def test_one_mined_clone_cannot_carry_two_languages(tmp_path) -> None:
             _write_mined_file(tmp_path, {**_GOOD_MINED, "id": "acme-go-same-base", "language": "go"})
         )
 
+
+def test_the_two_language_error_names_the_file_and_entry_index(tmp_path) -> None:
+    json_tasks.load_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED))
+    second = _write_mined_file(tmp_path, {**_GOOD_MINED, "id": "acme-go-same-base", "language": "go"})
+
+    with pytest.raises(ValueError) as caught:
+        json_tasks.load_json_tasks(second)
+
+    assert str(second) in str(caught.value)
+    assert "entry 0" in str(caught.value)
+    assert "'language'" in str(caught.value)
+
 def test_mutation_file_with_an_unknown_language_is_refused(tmp_path) -> None:
     path = _write_mutation_file(tmp_path, _GOOD_MUTATION)
     path.write_text(json.dumps({**json.loads(path.read_text()), "language": "cobol"}))
