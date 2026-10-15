@@ -439,12 +439,30 @@ def _built_workdir():
         yield Path(temp_dir) / "repo"
 
 
-class McpUnavailableError(RuntimeError):
+class ArmUnavailableError(RuntimeError):
+    """An arm lacks something its config promised; every later cell of the arm would fail alike."""
+
+    kind = "arm"
+    abort_hint = "the arm is misconfigured"
+
+
+class McpUnavailableError(ArmUnavailableError):
     """A mode expected an MCP server that the session did not expose."""
 
+    kind = "mcp"
+    abort_hint = "the MCP-armed mode is misconfigured"
 
-class SkillUnavailableError(RuntimeError):
+
+class SkillUnavailableError(ArmUnavailableError):
     """A skill arm expected a plugin skill that the session did not load."""
+
+    kind = "skill"
+    abort_hint = "the skill arm is misconfigured"
+
+
+def _uses_claude_session_features(mode: ModeConfig) -> bool:
+    """Skill arms and appended-prompt arms need Claude's session init, which other runners lack."""
+    return _is_skill_arm(mode) or mode.prompt_mode != "replace"
 
 
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
@@ -1279,7 +1297,7 @@ def _run_single_in_repo(
         "mcp_servers": run_result.mcp_servers,
         **({"skills": run_result.skills, "plugins": run_result.plugins,
             "plugin_errors": run_result.plugin_errors, "prompt_mode": mode.prompt_mode}
-           if _is_skill_arm(mode) or mode.prompt_mode != "replace" else {}),
+           if _uses_claude_session_features(mode) else {}),
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
         "op_kinds": tool_op_kinds(run_result),
@@ -1714,12 +1732,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
-        except McpUnavailableError as error:
-            fail({"error": f"mcp_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
-            raise PlanStopped("mcp-unavailable", str(error), rows) from error
-        except SkillUnavailableError as error:
-            fail({"error": f"skill_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
-            raise PlanStopped("skill-unavailable", str(error), rows) from error
+        except ArmUnavailableError as error:
+            fail({"error": f"{error.kind}_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
+            raise PlanStopped(f"{error.kind}-unavailable", str(error), rows) from error
         except subprocess.TimeoutExpired:
             fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
         except (external.task.EnvBuildError, external.task.PrepareError) as error:
@@ -1781,6 +1796,24 @@ def _store_reused_panel_row(stored: dict, stamp: dict, *, store_path: Path, hist
 
 _MODE_FIELDS = frozenset(field.name for field in _dataclass_fields(ModeConfig))
 _MODE_REQUIRED = frozenset({"name", "tools", "description"})
+# The caller sets policy only. Every other ModeConfig field is provenance the harness computes.
+_MODE_CALLER_FIELDS = frozenset({"name", "tools", "description", "plugin_dir", "prompt_mode", "mcp_config_path"})
+
+
+def _validate_plugin_arm(path: Path, mode: ModeConfig) -> ModeConfig:
+    """Check a plugin arm's manifest and return it stamped with the plugin tree digest."""
+    if mode.mcp_config_path:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' sets plugin_dir with mcp_config_path; "
+                         "a skill arm serves no MCP server")
+    if not os.path.isabs(mode.plugin_dir):
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin_dir must be an absolute path")
+    try:
+        declared = _expected_plugin_skills(mode.plugin_dir)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest failed to load: {error}") from error
+    if not declared:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest declares no skills")
+    return replace(mode, plugin_sha256=_tree_sha256(Path(mode.plugin_dir)))
 
 
 def load_modes_json(path: Path) -> list[str]:
@@ -1801,7 +1834,11 @@ def load_modes_json(path: Path) -> list[str]:
             raise ValueError(f"--modes-json {path}: every entry must be an object")
         unknown = sorted(set(entry) - _MODE_FIELDS)
         if unknown:
-            raise ValueError(f"--modes-json {path}: unknown mode field(s) {unknown}; allowed: {sorted(_MODE_FIELDS)}")
+            raise ValueError(f"--modes-json {path}: unknown mode field(s) {unknown}; allowed: {sorted(_MODE_CALLER_FIELDS)}")
+        computed = sorted(set(entry) - _MODE_CALLER_FIELDS)
+        if computed:
+            raise ValueError(f"--modes-json {path}: mode entry '{entry.get('name')}' sets harness-computed "
+                             f"field(s) {computed}; allowed: {sorted(_MODE_CALLER_FIELDS)}")
         absent = sorted(_MODE_REQUIRED - set(entry))
         if absent:
             raise ValueError(f"--modes-json {path}: mode entry lacks {absent}")
@@ -1813,18 +1850,7 @@ def load_modes_json(path: Path) -> list[str]:
         if mode.name in MODES or mode.name in loaded:
             raise ValueError(f"--modes-json {path}: mode name '{mode.name}' is already taken")
         if mode.plugin_dir:
-            if mode.mcp_config_path:
-                raise ValueError(f"--modes-json {path}: mode '{mode.name}' sets plugin_dir with mcp_config_path; "
-                                 "a skill arm serves no MCP server")
-            if not os.path.isabs(mode.plugin_dir):
-                raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin_dir must be an absolute path")
-            try:
-                declared = _expected_plugin_skills(mode.plugin_dir)
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest failed to load: {error}") from error
-            if not declared:
-                raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest declares no skills")
-            mode = replace(mode, plugin_sha256=_tree_sha256(Path(mode.plugin_dir)))
+            mode = _validate_plugin_arm(path, mode)
         loaded[mode.name] = mode
     MODES.update(loaded)
     return list(loaded)
@@ -1905,6 +1931,12 @@ Examples:
              "Excludes --tasks and --panel",
     )
     parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write result rows to this JSONL path (default: benchmark/results/benchmark_<timestamp>.jsonl); "
+             "stream logs go to a sibling <stem>_streams directory",
+    )
+    parser.add_argument(
         "--panel",
         type=Path,
         help="Run a pre-registered panel (benchmark/panels/<name>.json); excludes --tasks and --repos",
@@ -1980,6 +2012,8 @@ Examples:
         parser.error("--tasks-json cannot be combined with --panel")
     if args.tasks_json and args.tasks.lower() != "all":
         parser.error("--tasks-json selects its own tasks; it cannot be combined with --tasks")
+    if args.output is not None and args.output.is_dir():
+        parser.error(f"--output {args.output} is a directory; pass a file path")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2025,7 +2059,7 @@ Examples:
         elif args.modes_json:
             modes = load_modes_json(args.modes_json)
             if any(RUNNERS[model] != "claude" for model in models) and any(
-                _is_skill_arm(MODES[name]) or MODES[name].prompt_mode != "replace" for name in modes
+                _uses_claude_session_features(MODES[name]) for name in modes
             ):
                 raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
         else:
@@ -2203,8 +2237,13 @@ Examples:
 
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
-    output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
-    stream_log_dir = RESULTS_DIR / "streams" / timestamp
+    if args.output is not None:
+        output_file = args.output
+        stream_log_dir = output_file.parent / f"{output_file.stem}_streams"
+    else:
+        output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
+        stream_log_dir = RESULTS_DIR / "streams" / timestamp
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Print configuration summary
     print("=" * 70)
@@ -2396,32 +2435,17 @@ Examples:
                 print("\nAborting run: invalid Codex cell; inspect its raw stream.")
                 sys.exit(1)
 
-            except McpUnavailableError as error:
-                # Config-level failure: every later cell in this
-                # mode would fail identically. Abort instead of
-                # burning budget on an invalid comparison.
-                print(f"  ✗ MCP UNAVAILABLE: {error}")
+            except ArmUnavailableError as error:
+                # Config-level failure: every later cell of this arm would fail
+                # identically. Abort instead of burning budget on an invalid comparison.
+                print(f"  ✗ {error.kind.upper()} UNAVAILABLE: {error}")
                 record_failure({
                     **record_metadata,
-                    "error": f"mcp_unavailable: {error}",
+                    "error": f"{error.kind}_unavailable: {error}",
                     "correct": False,
                     "correctness_reason": f"Exception: {error}",
                 }, stream_log_path, runner, estimate)
-                print("\nAborting run: the MCP-armed mode is "
-                      "misconfigured; fix it and re-run.")
-                sys.exit(1)
-
-            except SkillUnavailableError as error:
-                # Config-level failure, like an unavailable MCP server: every later
-                # cell of this arm would run without its skill.
-                print(f"  ✗ SKILL UNAVAILABLE: {error}")
-                record_failure({
-                    **record_metadata,
-                    "error": f"skill_unavailable: {error}",
-                    "correct": False,
-                    "correctness_reason": f"Exception: {error}",
-                }, stream_log_path, runner, estimate)
-                print("\nAborting run: the skill arm is misconfigured; fix it and re-run.")
+                print(f"\nAborting run: {error.abort_hint}; fix it and re-run.")
                 sys.exit(1)
 
             except subprocess.TimeoutExpired:
