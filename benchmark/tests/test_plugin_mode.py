@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -14,17 +13,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import run
 from config import ModeConfig
 from parse import RunResult
-from tasks.base import TaskSource
+from tasks.base import GroundTruth, Task, TaskSource
 
 FIXTURE_PLUGIN_DIR = str(Path(__file__).parent / "fixtures" / "probe_plugin")
 
 
-@dataclass
-class _PluginTask:
-    repo: str = "synthetic"
-    prompt: str = "Answer the task."
-    capability: str = "trace"
-    source: TaskSource = TaskSource(
+class _PluginTask(Task):
+    """A local read task over the synthetic repo whose answer always passes."""
+
+    name = "plugin_task"
+    prompt = "Answer the task."
+    capability = "trace"
+    ground_truth = GroundTruth()
+    source = TaskSource(
         origin="fixture",
         license="MIT",
         commit_or_tag="test-pin",
