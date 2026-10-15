@@ -133,4 +133,40 @@ The page records the reporting rules and the native admission round trip. This p
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.
 
+## Skill-plugin arms, `--tasks-json` and `--modes-json` (PR #277)
+
+`--tasks-json FILE` runs exactly the tasks in a JSON file (mutation shape with a top-level `repo`, or mined shape without it).
+`--modes-json FILE` registers extra `ModeConfig` arms. It excludes `--modes` and `--experiment`.
+Both flags refuse `--panel`. `--tasks-json` also refuses a `--tasks` value other than `all`.
+A `--modes-json` entry takes `ModeConfig` fields only, so no arm can raise the per-cell cap.
+The harness keeps `DEFAULT_MAX_BUDGET_USD=1.0` and `CELL_TIMEOUT_S=600`.
+The non-panel CLI loop passes `--max-budget-usd` unclamped. Only `run_plan` clamps a cell to the `--max-usd` headroom.
+Every documented run command passes `--max-usd`.
+
+`SkillUnavailableError` fails a cell closed when `<plugin>:<skill>` is missing from the `skills` list of the `subtype==init` event.
+The init event is not always line 1. `parse.py` keeps `plugins`, `skills` and `plugin_errors` from it.
+
+Live probes (two paid cells, subscription OAuth, `--max-usd 1`):
+
+- Probe 1 used main's plugin argv with `--disable-slash-commands`. The plugin loaded, but `skills` was empty. Fixture: `plugin_probe1_skills_stripped.jsonl`.
+- Probe 2 dropped `--disable-slash-commands` for skill arms only. The init event listed `probe:demo`. Fixture: `plugin_probe2_skills_loaded.jsonl`.
+
+The flag change applies only when `plugin_dir` is set. Stock-arm argv and run keys stay byte-identical.
+Plugin cells keep `--setting-sources ""`, never pass real `--bare`, and keep `DISABLE_AUTOUPDATER=1`.
+
+Mined clones live under `$TILTH_BENCH_DATA` (`data_dir()`), not in the checkout or the agent workdir.
+The agent workdir holds no test patch and no `.git` history until grading.
+
+### easy-cheese #728 compatibility check
+
+The companion `agent_lab_tilth.py` breaks against this harness. The breaks do not block the merge.
+
+- It passes `--output`. `run.py` has no such flag.
+- It passes `--modes-json` together with `--modes`. The two flags are mutually exclusive.
+- It passes `--tasks-json` with `--tasks id1,id2`. The harness refuses a `--tasks` value other than `all`.
+- Its mode sets `plugin_dir` and `mcp_config_path`. `load_modes_json` rejects that pair.
+- It reads `workspace_diff_lines`, `reference_changed_lines` and `lint_ok`. Result rows do not carry them, so its erosion guard never fires.
+- It uses `--models fable`. The pricing row was dropped, as the user decided.
+
+The mined task shape, the `skills` and `error` row fields, and `model_alias` match.
 _Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-10-13 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
