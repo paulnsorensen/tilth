@@ -282,28 +282,33 @@ def test_nonmutation_task_reports_no_preflight_and_succeeds(monkeypatch, capsys)
 
 
 def test_tasks_json_restricts_universe_and_routes_mined_tasks(monkeypatch, tmp_path):
-    mined_task = FakeTask(name="mined_task", mutations=[], test_command=[])
-    mined_task.base_sha = "a" * 40
-    mined_task.head_sha = "b" * 40
+    from tasks.json_tasks import JsonMinedTask
+
+    mined_task = JsonMinedTask(
+        id="mined_task", capability_="fix", prompt_="p", repo_name="r",
+        base_sha="a" * 40, head_sha="b" * 40, test_patch="",
+        test_command_=["python3", "-m", "pytest"], reference_changed_lines_=1,
+    )
 
     def fake_load_json_tasks(path):
         return {"mined_task": mined_task}
 
     monkeypatch.setattr("tasks.json_tasks.load_json_tasks", fake_load_json_tasks)
     monkeypatch.setattr(check_task, "TASKS", {"other_task": FakeTask(name="other_task")})
+    monkeypatch.setattr(check_task, "validate_task_metadata", lambda task: None)
 
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
         check_task, "check_mined_task",
-        lambda name: calls.append(name) or True,
+        lambda name: calls.append(("mined", name)) or True,
     )
     monkeypatch.setattr(
         check_task, "check_task",
-        lambda name: calls.append(name) or True,
+        lambda name: calls.append(("plain", name)) or True,
     )
 
     assert check_task.main(["--tasks-json", str(tmp_path / "tasks.json")]) == 0
-    assert calls == ["mined_task"]
+    assert calls == [("mined", "mined_task")]
 
 
 def test_routing_uses_isinstance_not_duck_typing(monkeypatch, tmp_path):
@@ -406,11 +411,39 @@ def _install_mined_task(monkeypatch, tmp_path, task_id, base_sha, head_sha, bare
     return task
 
 
-def test_check_mined_task_passes_when_base_fails_and_head_passes(monkeypatch, tmp_path):
+def test_check_mined_task_passes_when_base_fails_and_head_passes(monkeypatch, tmp_path, capsys):
     bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
     _install_mined_task(monkeypatch, tmp_path, "acme-42", base_sha, head_sha, bare_url, "clone")
 
     assert check_task.main(["acme-42"]) == 0
+    assert capsys.readouterr().out == "PASS acme-42: fails at base_sha, passes at head_sha\n"
+    assert _git("rev-parse", "HEAD", cwd=str(tmp_path / "clone")).stdout.strip() == base_sha
+
+
+def test_check_mined_task_reports_a_clone_failure_as_fail_with_stderr(monkeypatch, tmp_path, capsys):
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-45", base_sha, head_sha, bare_url, "clone4")
+
+    def failing_clone(repo):
+        raise subprocess.CalledProcessError(128, ["git", "clone"], stderr="fatal: repository not found")
+
+    monkeypatch.setattr(check_task, "get_repo_path", failing_clone)
+
+    assert check_task.main(["acme-45"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("FAIL acme-45: ") and "fatal: repository not found" in out
+
+
+def test_check_mined_task_restores_untracked_files_and_hidden_git(monkeypatch, tmp_path):
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-46", base_sha, head_sha, bare_url, "clone5")
+    clone = tmp_path / "clone5"
+    (clone / "junk.txt").write_text("left by a previous run")
+    (clone / ".git").rename(clone / ".git_hidden")
+
+    assert check_task.main(["acme-46"]) == 0
+    assert (clone / ".git").is_dir() and not (clone / ".git_hidden").exists()
+    assert not (clone / "junk.txt").exists()
 
 
 def test_check_mined_task_fails_when_test_passes_at_base(monkeypatch, tmp_path, capsys):
