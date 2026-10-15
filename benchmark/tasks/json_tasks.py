@@ -44,6 +44,9 @@ from external.task import PrepareError, apply_patch, checkout_path, read_report,
 from tasks.base import GroundTruth, Mutation, Task, dev_git_env
 
 GRADER_TIMEOUT_SECONDS = 300
+DEFAULT_LANGUAGE = "python"
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_URL_RE = re.compile(r"(https://|ssh://|file://|git@[\w.-]+:)[^\s]+")
 OUTPUT_TAIL_CHARS = 600
 
 
@@ -250,7 +253,21 @@ def _junit_verdict(report: str, command: str) -> tuple[bool, str]:
     return True, "Test passed"
 
 
-def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:
+def _fixture_git(command: list[str], cwd: Path, fixture: Path) -> str:
+    """Run a bootstrap git command; a failure names the fixture instead of tracing back."""
+    try:
+        done = subprocess.run(
+            command, cwd=cwd, check=True, capture_output=True, text=True, env=dev_git_env(),
+        )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip()[-OUTPUT_TAIL_CHARS:]
+        raise ValueError(
+            f"cannot bootstrap fixture {fixture}: `{' '.join(command[:2])}` failed: {detail}"
+        ) from error
+    return done.stdout
+
+
+def _register_mutation_repo(json_path: Path, repo_rel: str, language: str = DEFAULT_LANGUAGE) -> str:
     """Copy the fixture directory named by a mutation-shape `repo` key into
     `REPOS_DIR` and git-bootstrap the copy. Never writes a `.git` into the
     source tree."""
@@ -270,17 +287,14 @@ def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:
                 ["git", "add", "-A"],
                 ["git", "commit", "-m", "chore: bootstrap fixture repo"],
             ):
-                subprocess.run(command, cwd=stage, check=True, capture_output=True, env=dev_git_env())
+                _fixture_git(command, stage, source_dir)
             os.rename(str(stage), str(repo_dir))
-    head = subprocess.run(
-        ["git", "rev-list", "--max-parents=0", "HEAD"],
-        cwd=repo_dir, check=True, capture_output=True, text=True, env=dev_git_env(),
-    ).stdout.split()[0]
+    head = _fixture_git(["git", "rev-list", "--max-parents=0", "HEAD"], repo_dir, source_dir).split()[0]
     REPOS[repo_name] = RepoConfig(
         name=repo_name,
         url=str(repo_dir),
         commit_sha=head,
-        language="",
+        language=language,
         description="json fixture repo",
         path_override=repo_dir,
     )
@@ -293,7 +307,7 @@ def _repo_slug(repo_url: str) -> str:
     return name[: -len(".git")] if name.endswith(".git") else name
 
 
-def _register_mined_repo(repo_url: str, base_sha: str) -> str:
+def _register_mined_repo(repo_url: str, base_sha: str, language: str = DEFAULT_LANGUAGE) -> str:
     """Register (without cloning) the on-demand repo for a `(repo_url,
     base_sha)` pair. Naming by repo+base (not task id) means mined tasks that
     share a repo and base commit share one clone."""
@@ -302,7 +316,7 @@ def _register_mined_repo(repo_url: str, base_sha: str) -> str:
         name=repo_name,
         url=repo_url,
         commit_sha=base_sha,
-        language="",
+        language=language,
         description=f"mined fixture repo for {repo_url}@{base_sha[:12]}",
         on_demand_clone=True,
         path_override=data_dir() / "mined" / repo_name,
@@ -321,6 +335,29 @@ def _need_str(path: Path, index: int, raw: dict, key: str) -> str:
     if not isinstance(value, str) or not value:
         raise _fail(path, index, raw, key, "must be a nonempty string")
     return value
+
+
+def _opt_language(path: Path, index: int, raw: dict) -> str:
+    """The optional `language`, checked against the harness's known languages."""
+    value = raw.get("language", DEFAULT_LANGUAGE)
+    if value not in baselines.LANGUAGE_TOOLCHAINS:
+        known = ", ".join(sorted(baselines.LANGUAGE_TOOLCHAINS))
+        raise _fail(path, index, raw, "language", f"must be one of: {known}")
+    return value
+
+
+def _check_sha(path: Path, index: int, raw: dict, key: str) -> None:
+    if not _SHA_RE.fullmatch(_need_str(path, index, raw, key)):
+        raise _fail(path, index, raw, key, "must be a 40-character lowercase hex SHA")
+
+
+def _check_repo_url(path: Path, index: int, raw: dict) -> None:
+    url = _need_str(path, index, raw, "repo_url")
+    if url.startswith("-") or not (_URL_RE.fullmatch(url) or (url.startswith("/") and "\0" not in url)):
+        raise _fail(
+            path, index, raw, "repo_url",
+            "must be an https://, ssh://, file:// or git@host: URL, or an absolute path",
+        )
 
 
 def _opt_str_list(path: Path, index: int, raw: dict, key: str, *, nonempty: bool = False) -> Optional[list[str]]:
@@ -366,8 +403,10 @@ def _validate_mutation_entry(path: Path, index: int, raw: object) -> None:
 
 def _validate_mined_entry(path: Path, index: int, raw: object) -> None:
     raw = _validate_common(path, index, raw)
-    for key in ("repo_url", "base_sha", "head_sha"):
-        _need_str(path, index, raw, key)
+    _check_repo_url(path, index, raw)
+    _check_sha(path, index, raw, "base_sha")
+    _check_sha(path, index, raw, "head_sha")
+    _opt_language(path, index, raw)
     if not isinstance(raw.get("test_patch"), str) or not raw["test_patch"].strip():
         raise _fail(path, index, raw, "test_patch", "is required and must be a nonempty string")
     lines = raw.get("reference_changed_lines", 0)
@@ -405,7 +444,7 @@ def _build_mutation_task(raw: dict, repo_name: str, fixture_dir: Path) -> JsonMu
 
 
 def _build_mined_task(raw: dict) -> JsonMinedTask:
-    repo_name = _register_mined_repo(raw["repo_url"], raw["base_sha"])
+    repo_name = _register_mined_repo(raw["repo_url"], raw["base_sha"], raw.get("language", DEFAULT_LANGUAGE))
     return JsonMinedTask(
         **_common_fields(raw, repo_name),
         base_sha=raw["base_sha"],
@@ -433,6 +472,10 @@ def load_json_tasks(path: Path) -> dict[str, Task]:
     mutation_shape = "repo" in data
     if mutation_shape and (not isinstance(data["repo"], str) or not data["repo"]):
         raise ValueError(f"{path}: bad field 'repo': must be a nonempty string")
+    language = data.get("language", DEFAULT_LANGUAGE)
+    if mutation_shape and language not in baselines.LANGUAGE_TOOLCHAINS:
+        known = ", ".join(sorted(baselines.LANGUAGE_TOOLCHAINS))
+        raise ValueError(f"{path}: bad field 'language': must be one of: {known}")
     validate = _validate_mutation_entry if mutation_shape else _validate_mined_entry
     seen: set[str] = set()
     for index, raw in enumerate(raw_tasks):
@@ -441,7 +484,7 @@ def load_json_tasks(path: Path) -> dict[str, Task]:
             raise _fail(path, index, raw, "id", "duplicates an earlier entry in this file")
         seen.add(raw["id"])
     if mutation_shape:
-        repo_name = _register_mutation_repo(path, data["repo"])
+        repo_name = _register_mutation_repo(path, data["repo"], language)
         fixture_dir = (path.parent / data["repo"]).resolve()
         return {raw["id"]: _build_mutation_task(raw, repo_name, fixture_dir) for raw in raw_tasks}
     return {raw["id"]: _build_mined_task(raw) for raw in raw_tasks}

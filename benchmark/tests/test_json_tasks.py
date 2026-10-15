@@ -222,6 +222,71 @@ def test_repo_config_git_calls_never_prompt_for_credentials(tmp_path, monkeypatc
     assert envs and set(envs) == {"0"}
 
 
+def test_repo_config_network_git_calls_are_bounded_by_a_timeout(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    real_run = subprocess.run
+    timeouts: list[object] = []
+
+    def spy(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "clone"]:
+            timeouts.append(kwargs.get("timeout"))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _mined_cfg(tmp_path, upstream, first, "up-first").ensure_cloned()
+
+    assert timeouts and all(isinstance(value, (int, float)) and value > 0 for value in timeouts)
+
+
+def test_repo_config_a_hung_clone_times_out_as_an_oserror(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+
+    def hang(cmd, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+
+    with pytest.raises(OSError, match="timed out"):
+        cfg.ensure_cloned()
+    assert not cfg.path.exists()
+
+
+def test_repo_config_losing_the_rename_race_to_a_valid_clone_succeeds(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+    real_rename = os.rename
+
+    def lose_race(src, dst):
+        if Path(dst) == cfg.path:
+            shutil.copytree(src, dst)  # the winner's clone lands first
+            raise OSError(39, "Directory not empty")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", lose_race)
+    cfg.ensure_cloned()
+
+    assert _git(cfg.path, "rev-parse", "HEAD") == first
+    assert not list(cfg.path.parent.glob("tmp*"))
+
+
+def test_repo_config_a_failed_rename_without_a_valid_clone_still_fails(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+    real_rename = os.rename
+
+    def broken(src, dst):
+        if Path(dst) == cfg.path:
+            raise OSError(13, "Permission denied")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", broken)
+
+    with pytest.raises(OSError, match="Permission denied"):
+        cfg.ensure_cloned()
+    assert not list(cfg.path.parent.glob("tmp*"))
+
+
 def test_loading_a_mined_json_file_clones_nothing_and_fixture_path_clones_on_demand(tmp_path, monkeypatch) -> None:
     import tasks.base as base_module
     monkeypatch.setattr(base_module, "REPOS", json_tasks.REPOS)
@@ -500,6 +565,66 @@ def test_a_duplicate_id_inside_one_file_is_refused(tmp_path) -> None:
         json_tasks.load_json_tasks(path)
 
 
+@pytest.mark.parametrize("raw, field_name", [
+    ({**_GOOD_MINED, "base_sha": "-" + "a" * 39}, "base_sha"),
+    ({**_GOOD_MINED, "base_sha": "abc123"}, "base_sha"),
+    ({**_GOOD_MINED, "base_sha": "../" + "a" * 37}, "base_sha"),
+    ({**_GOOD_MINED, "head_sha": "A" * 40}, "head_sha"),
+    ({**_GOOD_MINED, "repo_url": "--upload-pack=touch /tmp/x"}, "repo_url"),
+    ({**_GOOD_MINED, "repo_url": "ext::sh -c id"}, "repo_url"),
+    ({**_GOOD_MINED, "repo_url": "relative/path"}, "repo_url"),
+    ({**_GOOD_MINED, "language": "cobol"}, "language"),
+])
+def test_mined_task_refuses_unsafe_urls_shas_and_unknown_languages(tmp_path, raw, field_name) -> None:
+    with pytest.raises(ValueError) as refused:
+        json_tasks.load_json_tasks(_write_mined_file(tmp_path, raw))
+
+    assert repr(field_name) in str(refused.value)
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/acme/widgets.git", "ssh://git@github.com/acme/widgets.git",
+    "git@github.com:acme/widgets.git", "file:///srv/widgets", "/srv/widgets",
+])
+def test_mined_task_accepts_allowlisted_repo_urls(tmp_path, url) -> None:
+    assert json_tasks.load_json_tasks(_write_mined_file(tmp_path, {**_GOOD_MINED, "repo_url": url}))
+
+
+def test_json_repos_default_to_python_and_honor_a_declared_language(tmp_path) -> None:
+    mined = json_tasks.load_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED))["acme-mined"]
+    go = json_tasks.load_json_tasks(
+        _write_mined_file(tmp_path, {**_GOOD_MINED, "id": "acme-go", "language": "go", "base_sha": "b" * 40})
+    )["acme-go"]
+    mutation = json_tasks.load_json_tasks(_write_mutation_file(tmp_path, _GOOD_MUTATION))[_GOOD_MUTATION["id"]]
+
+    assert json_tasks.REPOS[mined.repo].language == "python"
+    assert json_tasks.REPOS[go.repo].language == "go"
+    assert json_tasks.REPOS[mutation.repo].language == "python"
+
+
+def test_mutation_file_with_an_unknown_language_is_refused(tmp_path) -> None:
+    path = _write_mutation_file(tmp_path, _GOOD_MUTATION)
+    path.write_text(json.dumps({**json.loads(path.read_text()), "language": "cobol"}))
+
+    with pytest.raises(ValueError, match="language"):
+        json_tasks.load_json_tasks(path)
+
+
+def test_a_failed_fixture_bootstrap_is_a_value_error_naming_the_fixture(tmp_path, monkeypatch) -> None:
+    path = _write_mutation_file(tmp_path, _GOOD_MUTATION)
+    real_run = subprocess.run
+
+    def fail_commit(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "commit"]:
+            raise subprocess.CalledProcessError(1, cmd, "", "Author identity unknown")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fail_commit)
+
+    with pytest.raises(ValueError, match=r"cannot bootstrap fixture .*repo.*Author identity unknown"):
+        json_tasks.load_json_tasks(path)
+
+
 @pytest.mark.parametrize("body", ['[]', '{"tasks": "x"}', '{"repo": 3, "tasks": []}'])
 def test_a_malformed_top_level_is_a_value_error(tmp_path, body) -> None:
     path = tmp_path / "bad.json"
@@ -718,7 +843,7 @@ def test_a_failed_copy_leaves_no_staging_directory(tmp_path, monkeypatch) -> Non
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(json_tasks.subprocess, "run", failing)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(ValueError, match="cannot bootstrap fixture"):
         json_tasks.load_json_tasks(tasks_json)
 
     assert list((tmp_path / "repos").iterdir()) == []

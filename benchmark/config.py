@@ -143,6 +143,7 @@ class RepoConfig:
 
 
 _GIT_ENV_OVERRIDES = {"GIT_TERMINAL_PROMPT": "0"}
+GIT_NETWORK_TIMEOUT_S = 900
 
 
 def _git_env() -> dict[str, str]:
@@ -157,9 +158,13 @@ def _ensure_commit(shared: Path, sha: str) -> None:
     pin it under a branch so later local clones of the shared clone carry it.
     """
     def run(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args], cwd=str(shared), capture_output=True, text=True, env=_git_env(),
-        )
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=str(shared), capture_output=True, text=True, env=_git_env(),
+                timeout=GIT_NETWORK_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(args, 124, "", "timed out")
 
     probe = ("cat-file", "-e", f"{sha}^{{commit}}")
     if run(*probe).returncode != 0:
@@ -174,14 +179,35 @@ def _clone_into(source: str, dest: Path, *, checkout: Optional[str] = None, no_c
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(dest.parent)) as staging:
         clone_path = Path(staging) / "clone"
-        command = ["git", "clone", *(["--no-checkout"] if no_checkout else []), source, str(clone_path)]
-        subprocess.run(command, check=True, capture_output=True, text=True, env=_git_env())
-        if checkout:
+        command = ["git", "clone", *(["--no-checkout"] if no_checkout else []), "--", source, str(clone_path)]
+        try:
             subprocess.run(
-                ["git", "checkout", checkout],
-                cwd=str(clone_path), check=True, capture_output=True, text=True, env=_git_env(),
+                command, check=True, capture_output=True, text=True, env=_git_env(),
+                timeout=GIT_NETWORK_TIMEOUT_S,
             )
-        os.rename(str(clone_path), str(dest))
+            if checkout:
+                subprocess.run(
+                    ["git", "checkout", checkout, "--"],
+                    cwd=str(clone_path), check=True, capture_output=True, text=True, env=_git_env(),
+                    timeout=GIT_NETWORK_TIMEOUT_S,
+                )
+        except subprocess.TimeoutExpired as error:
+            raise OSError(f"git {error.cmd[1]} of {source} timed out after {GIT_NETWORK_TIMEOUT_S}s") from error
+        try:
+            os.rename(str(clone_path), str(dest))
+        except OSError:
+            # Another process finished the same clone first; its copy stands if it is a valid repo.
+            if not _is_git_repo(dest):
+                raise
+
+
+def _is_git_repo(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    probe = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(path), capture_output=True, text=True, env=_git_env(),
+    )
+    return probe.returncode == 0
 
 
 REPOS = {
