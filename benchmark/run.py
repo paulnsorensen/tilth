@@ -902,6 +902,175 @@ _CODEX_TILTH_GUIDANCE = (
 )
 
 
+def _codex_command(
+    task: object,
+    mode: ModeConfig,
+    model_id: str,
+    repo_path: Path,
+    *,
+    reasoning_effort: str | None,
+    skill_paths: list[str],
+) -> list[str]:
+    cmd = [
+        "codex", "exec", "--json", "--ephemeral",
+        "--ignore-user-config", "--ignore-rules",
+        "--sandbox", "workspace-write",
+        "--enable", "skip_host_skill_discovery",
+        "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks",
+        "--disable", "apps", "--disable", "multi_agent",
+        "--disable", "skill_mcp_dependency_install",
+        "-m", model_id,
+        "-c", "mcp_servers={}",
+        "-c", "project_doc_max_bytes=0",
+        "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
+    ]
+    skills_config = ",".join(
+        f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
+    )
+    cmd += ["-c", f"skills.config=[{skills_config}]"]
+    instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
+    if mode.mcp_config_path:
+        instructions += _CODEX_TILTH_GUIDANCE
+    cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
+    if reasoning_effort is not None:
+        cmd += ["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"]
+    if getattr(task, "hide_git", False):
+        cmd.append("--skip-git-repo-check")
+
+    if mode.mcp_config_path:
+        tilth_bin = mode.binary_path or TILTH_BIN
+        cmd += [
+            "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
+            "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
+            "-c", "mcp_servers.tilth.required=true",
+            "-c", 'mcp_servers.tilth.tools.tilth_write.approval_mode="approve"',
+        ]
+
+    cmd += ["--", task.prompt]
+    return cmd
+
+
+def _opencode_command(
+    task: object,
+    mode: ModeConfig,
+    mode_name: str,
+    model_id: str,
+    repo_path: Path,
+    *,
+    bare: bool,
+) -> tuple[list[str], str]:
+    opencode_config = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
+    if opencode_config is None:
+        raise RuntimeError(
+            f"opencode runner has no config for mode '{mode_name}'. "
+            f"Supported modes: {', '.join(sorted(OPENCODE_CONFIGS))}."
+        )
+    # opencode has no --system-prompt; prepend like codex. OPENCODE_CONFIG
+    # (set by the caller) selects the MCP servers; --dangerously-skip-permissions
+    # keeps the headless run from blocking on tool-permission prompts.
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
+    cmd = [
+        "opencode", "run",
+        "--format", "json",
+        "--dir", str(repo_path),
+        "--model", model_id,
+        "--dangerously-skip-permissions",
+    ]
+    if bare:
+        cmd.append("--pure")  # strip external plugins (claude --bare parity)
+    cmd.append(full_prompt)
+    return cmd, opencode_config
+
+
+@dataclass(frozen=True)
+class _ClaudeArmFlags:
+    """The arm-shape facts that decide a Claude argv."""
+
+    skill: bool
+    woz: bool
+    mcp: bool
+    append_prompt: bool
+
+
+def _claude_arm_flags(mode: ModeConfig) -> _ClaudeArmFlags:
+    return _ClaudeArmFlags(
+        skill=_is_skill_arm(mode),
+        woz=_is_woz_arm(mode),
+        mcp=bool(mode.mcp_config_path),
+        append_prompt=mode.prompt_mode == "append",
+    )
+
+
+def _claude_command(
+    task: object,
+    mode: ModeConfig,
+    model_id: str,
+    repo_path: Path,
+    *,
+    bare: bool,
+    reasoning_effort: str | None,
+    max_budget_usd: float,
+    strict_file_tools: bool,
+    strict_hook_command: str | None,
+) -> list[str]:
+    arm = _claude_arm_flags(mode)
+    cmd = [
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--model", model_id,
+        "--max-budget-usd", f"{max_budget_usd:.4f}",
+    ]
+    if not arm.skill:
+        # Live probe 1: with this flag a skill arm's plugin loads but its skills do not (see
+        # benchmark-harness-gotchas.md). Only a skill arm drops it, so every other arm's argv is unchanged.
+        cmd.append("--disable-slash-commands")
+    cmd += [
+        "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and arm.mcp else "Agent,Task",
+        "--no-session-persistence",
+        "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+    ]
+    cwd_prompt = f"Your current working directory is: {repo_path}" + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else "")
+    if arm.append_prompt:
+        # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
+        cmd += ["--append-system-prompt", cwd_prompt]
+    else:
+        cmd += ["--system-prompt", SYSTEM_PROMPT + "\n" + cwd_prompt]
+
+    # --setting-sources "" loads no user/project/local settings (hooks, env,
+    # user MCP servers) while retaining OAuth/keychain auth and honoring
+    # --mcp-config. --safe-mode is documented to disable ALL MCP servers,
+    # including --mcp-config ones, which silently ran tilth arms
+    # native-only; --bare refuses OAuth and needs ANTHROPIC_API_KEY.
+    if bare or mode.plugin_dir:
+        cmd += ["--setting-sources", ""]
+    if reasoning_effort is not None:
+        cmd += ["--effort", reasoning_effort]
+    if mode.plugin_dir:
+        cmd += ["--plugin-dir", mode.plugin_dir]
+    if arm.woz:
+        cmd += ["--agent", "woz:code"]
+
+    if strict_file_tools:
+        cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
+    tools_list = (list(_STRICT_BASELINE_TOOLS) if not arm.mcp else ["Bash"]) if strict_file_tools else list(mode.tools)
+    if arm.skill and tools_list and "Skill" not in tools_list:
+        tools_list.append("Skill")
+
+    # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
+    if tools_list:
+        cmd += ["--tools", ",".join(tools_list)]
+    elif arm.mcp:
+        cmd += ["--tools", ""]
+
+    if arm.mcp:
+        cmd += ["--mcp-config", json.dumps(claude_mcp_config(mode))]
+
+    cmd += ["--", task.prompt]
+    return cmd
+
+
 def _runner_command(
     task: object,
     mode: ModeConfig,
@@ -919,126 +1088,22 @@ def _runner_command(
     """Build one cell's runner argv and, for opencode, the config it selects."""
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
-    opencode_config: Optional[str] = None
     if runner == "codex":
         if mode_name == "tilth_forced":
             raise ValueError("Codex cannot enforce tilth_forced tool restrictions")
-        cmd = [
-            "codex", "exec", "--json", "--ephemeral",
-            "--ignore-user-config", "--ignore-rules",
-            "--sandbox", "workspace-write",
-            "--enable", "skip_host_skill_discovery",
-            "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks",
-            "--disable", "apps", "--disable", "multi_agent",
-            "--disable", "skill_mcp_dependency_install",
-            "-m", model_id,
-            "-c", "mcp_servers={}",
-            "-c", "project_doc_max_bytes=0",
-            "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
-        ]
-        skills_config = ",".join(
-            f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
+        cmd = _codex_command(
+            task, mode, model_id, repo_path,
+            reasoning_effort=reasoning_effort, skill_paths=skill_paths,
         )
-        cmd += ["-c", f"skills.config=[{skills_config}]"]
-        instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
-        if mode.mcp_config_path:
-            instructions += _CODEX_TILTH_GUIDANCE
-        cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
-        if reasoning_effort is not None:
-            cmd += ["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"]
-        if getattr(task, "hide_git", False):
-            cmd.append("--skip-git-repo-check")
-
-        if mode.mcp_config_path:
-            tilth_bin = mode.binary_path or TILTH_BIN
-            cmd += [
-                "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
-                "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
-                "-c", "mcp_servers.tilth.required=true",
-                "-c", 'mcp_servers.tilth.tools.tilth_write.approval_mode="approve"',
-            ]
-
-        cmd += ["--", task.prompt]
-
-    elif runner == "opencode":
-        opencode_config = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
-        if opencode_config is None:
-            raise RuntimeError(
-                f"opencode runner has no config for mode '{mode_name}'. "
-                f"Supported modes: {', '.join(sorted(OPENCODE_CONFIGS))}."
-            )
-        # opencode has no --system-prompt; prepend like codex. OPENCODE_CONFIG
-        # (set below) selects the MCP servers; --dangerously-skip-permissions
-        # keeps the headless run from blocking on tool-permission prompts.
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
-        cmd = [
-            "opencode", "run",
-            "--format", "json",
-            "--dir", str(repo_path),
-            "--model", model_id,
-            "--dangerously-skip-permissions",
-        ]
-        if bare:
-            cmd.append("--pure")  # strip external plugins (claude --bare parity)
-        cmd.append(full_prompt)
-
-    else:  # claude
-        cmd = [
-            "claude", "-p",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", model_id,
-            "--max-budget-usd", f"{max_budget_usd:.4f}",
-        ]
-        if not _is_skill_arm(mode):
-            # Live probe 1: with this flag a skill arm's plugin loads but its skills do not (see
-            # benchmark-harness-gotchas.md). Only a skill arm drops it, so every other arm's argv is unchanged.
-            cmd.append("--disable-slash-commands")
-        cmd += [
-            "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and mode.mcp_config_path else "Agent,Task",
-            "--no-session-persistence",
-            "--dangerously-skip-permissions",
-            "--strict-mcp-config",
-        ]
-        cwd_prompt = f"Your current working directory is: {repo_path}" + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else "")
-        if mode.prompt_mode == "append":
-            # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
-            cmd += ["--append-system-prompt", cwd_prompt]
-        else:
-            cmd += ["--system-prompt", SYSTEM_PROMPT + "\n" + cwd_prompt]
-
-        # --setting-sources "" loads no user/project/local settings (hooks, env,
-        # user MCP servers) while retaining OAuth/keychain auth and honoring
-        # --mcp-config. --safe-mode is documented to disable ALL MCP servers,
-        # including --mcp-config ones, which silently ran tilth arms
-        # native-only; --bare refuses OAuth and needs ANTHROPIC_API_KEY.
-        if bare or mode.plugin_dir:
-            cmd += ["--setting-sources", ""]
-        if reasoning_effort is not None:
-            cmd += ["--effort", reasoning_effort]
-        if mode.plugin_dir:
-            cmd += ["--plugin-dir", mode.plugin_dir]
-        if _is_woz_arm(mode):
-            cmd += ["--agent", "woz:code"]
-
-        if strict_file_tools:
-            cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
-        tools_list = (list(_STRICT_BASELINE_TOOLS) if not mode.mcp_config_path else ["Bash"]) if strict_file_tools else list(mode.tools)
-        if _is_skill_arm(mode) and tools_list and "Skill" not in tools_list:
-            tools_list.append("Skill")
-
-        # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
-        if tools_list:
-            cmd += ["--tools", ",".join(tools_list)]
-        elif mode.mcp_config_path:
-            cmd += ["--tools", ""]
-
-        if mode.mcp_config_path:
-            cmd += ["--mcp-config", json.dumps(claude_mcp_config(mode))]
-
-        cmd += ["--", task.prompt]
-
-    return cmd, opencode_config
+        return cmd, None
+    if runner == "opencode":
+        return _opencode_command(task, mode, mode_name, model_id, repo_path, bare=bare)
+    cmd = _claude_command(
+        task, mode, model_id, repo_path,
+        bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
+        strict_file_tools=strict_file_tools, strict_hook_command=strict_hook_command,
+    )
+    return cmd, None
 
 
 def _run_single_in_repo(
