@@ -26,7 +26,7 @@ Canonical sources: [config.md](https://github.com/LiberCoders/FeatureBench/blob/
 
 Their contribution is operational: version pinning, agent options, environment injection, attempt handling, and grading semantics.
 Important constraints include mini-swe-only cost limiting, secret-bearing run metadata, default failed-attempt exclusion, and best-attempt summaries.
-Use the [integration checklist](../featurebench-integration.md#native-featurebench-pitfalls) before constructing a run.
+The native runner in `benchmark/external` already applies these constraints; see the [FeatureBench integration page](../featurebench-integration.md). Treat the `fb infer` and `fb eval` route as a rejected alternative: see [rejected alternatives](../featurebench-integration.md#rejected-alternatives).
 
 Harbor's **FeatureBench** adapter README documents conversion, execution configs, resource splits, and parity experiments.
 Canonical source: [Harbor FeatureBench adapter](https://github.com/harbor-framework/harbor/blob/main/adapters/featurebench/README.md).
@@ -37,7 +37,7 @@ Its README does not establish v1.1 mapping.
 Harbor's agent implementation documents usable extension points through code.
 Canonical source: [Claude Code agent](https://github.com/harbor-framework/harbor/blob/main/src/harbor/agents/installed/claude_code.py).
 It supports effort, a dollar budget parameter, tool controls, and MCP registration.
-These features still require a container-level Tilth test.
+This is historical evidence for a rejected route. The [rejected alternatives](../featurebench-integration.md#rejected-alternatives) record that Harbor is not a path for this harness.
 
 ## Harbor verifier boundary
 
@@ -47,7 +47,7 @@ The default can share the agent environment; separate verification requires conf
 Do not infer fresh-state grading merely because a task runs through Harbor.
 
 Harbor's [Custom Agents](https://docs.harborframework.com/core-concepts/agents/custom-agents) documentation describes installed and external agent extensions.
-This supports a thin adapter design, not an assertion that this repository already has one.
+This is historical evidence only. The Harbor route is rejected (see [rejected alternatives](../featurebench-integration.md#rejected-alternatives)), and this repository has no Harbor adapter.
 
 ## SWE-bench Pro V2
 

@@ -38,7 +38,7 @@ The round trip is model-free (`preflight.py:154-191`).
 1. Prepare the masked tree and build the grading venv. Failure gives `prepare_failed` or `env_build_failed`.
 2. Grade the gold patch. It must resolve; otherwise the verdict is `gold_unresolved`.
 3. Grade the empty patch. It must not resolve; otherwise the verdict is `empty_resolved`.
-4. Grade the gold patch minus one hunk at a time, largest hunk first, up to `$TILTH_BENCH_TAMPER_MAX_HUNKS` hunks (default 8). Some removal must fail the held-out tests; otherwise the verdict is `tampered_resolved`.
+4. Grade the gold patch minus one hunk at a time, largest hunk first, up to `$TILTH_BENCH_TAMPER_MAX_HUNKS` hunks (default 8). Some removal must fail the held-out tests; otherwise the verdict is `tampered_resolved`. A gold patch with no removable hunk (a single add-only hunk) records `tampered: n/a` and is admitted.
 
 Verdicts cache under the data directory.
 The cache key joins the host environment fingerprint and a digest of the grading code, so a toolchain or grader change recomputes the verdict (`preflight.py:76-78`).

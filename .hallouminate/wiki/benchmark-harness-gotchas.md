@@ -126,8 +126,8 @@ Retarget report links to the rebased archive commit, which remains in the PR his
 
 The [FeatureBench integration page](featurebench-integration.md) records the native Lite Level 1 runner on main.
 It extends these attachment and billing checks to that runner.
-Native FeatureBench has failure-denominator, best-attempt, credential-metadata, and agent-specific budget pitfalls.
-The page records primary sources and acceptance checks. This page documents no FeatureBench run.
+Native FeatureBench has failure-denominator, best-attempt, and credential-metadata pitfalls.
+The page records the reporting rules and the native admission round trip. This page documents no FeatureBench run.
 
 ## Related GEPA gotchas
 
