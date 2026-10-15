@@ -420,6 +420,24 @@ def test_check_mined_task_passes_when_base_fails_and_head_passes(monkeypatch, tm
     assert _git("rev-parse", "HEAD", cwd=str(tmp_path / "clone")).stdout.strip() == base_sha
 
 
+def test_check_mined_task_fetches_a_head_sha_the_clone_does_not_hold(monkeypatch, tmp_path, capsys):
+    """`head_sha` sits only on `refs/pull/1/head` and the per-commit clone predates it, so
+    the preflight passes only if `check_mined_task` asks `ensure_cloned` for `head_sha`."""
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    branch = _git("symbolic-ref", "--short", "HEAD", cwd=bare_url).stdout.strip()
+    _git("update-ref", "refs/pull/1/head", head_sha, cwd=bare_url)
+    _git("update-ref", f"refs/heads/{branch}", base_sha, cwd=bare_url)
+    # A file:// URL makes the clone transfer only the refs it asks for; a plain path hardlinks every object.
+    _install_mined_task(monkeypatch, tmp_path, "acme-47", base_sha, head_sha, f"file://{bare_url}", "clone6")
+    from tasks import base as base_module
+
+    monkeypatch.setattr(base_module.REPOS["acme-local"], "on_demand_clone", True)
+    monkeypatch.setattr(check_task, "REPOS", base_module.REPOS)  # `check_task` bound its own name
+
+    assert check_task.main(["acme-47"]) == 0
+    assert capsys.readouterr().out == "PASS acme-47: fails at base_sha, passes at head_sha\n"
+
+
 def test_check_mined_task_reports_a_clone_failure_as_fail_with_stderr(monkeypatch, tmp_path, capsys):
     bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
     _install_mined_task(monkeypatch, tmp_path, "acme-45", base_sha, head_sha, bare_url, "clone4")
