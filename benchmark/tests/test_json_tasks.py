@@ -3,6 +3,8 @@ sources (AC-3's `load_json_tasks` contract)."""
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -145,7 +147,7 @@ def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
 
     source = tmp_path / "source"
     source.mkdir()
-    (source / "code.py").write_text("value = 1\n")
+    (source / "valmod.py").write_text("value = 1\n")
     env = {
         **__import__("os").environ,
         "GIT_AUTHOR_NAME": "dev", "GIT_AUTHOR_EMAIL": "dev@test.com",
@@ -154,7 +156,7 @@ def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, env=env)
     subprocess.run(["git", "-C", str(source), "commit", "-qm", "base"], check=True, env=env)
-    (source / "code.py").write_text("value = 2\n")
+    (source / "valmod.py").write_text("value = 2\n")
     subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, env=env)
     head = subprocess.run(
         ["git", "-C", str(source), "commit", "-qm", "fix: reference commit"],
@@ -179,3 +181,139 @@ def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
             ["git", "log"], cwd=str(workspace), capture_output=True, text=True,
         )
         assert head_sha not in log.stdout
+
+
+# --- AC-4: JSON task content feeds task_digest through identity_inputs (D-9) ---
+
+GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "dev", "GIT_AUTHOR_EMAIL": "dev@test.com",
+    "GIT_COMMITTER_NAME": "dev", "GIT_COMMITTER_EMAIL": "dev@test.com",
+}
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=GIT_ENV,
+    ).stdout.strip()
+
+
+def _digest(task) -> str:
+    import run as run_module
+    return run_module._cell_task_digest(task)
+
+
+def _mined_task(**overrides):
+    fields = dict(
+        id="acme-digest", family="acme-digest", split="train", capability_="fix", prompt_="Fix acme.",
+        repo_name="acme-digest-repo", base_sha="a" * 40, head_sha="b" * 40,
+        test_patch="diff --git a/t.py b/t.py\n", test_command_=["python3", "-m", "pytest", "t.py"],
+        reference_changed_lines_=3, lint_command_=[],
+    )
+    json_tasks.REPOS["acme-digest-repo"] = json_tasks.RepoConfig(
+        name="acme-digest-repo", url="https://example.com/acme.git", commit_sha="a" * 40, language="",
+        description="mined", on_demand_clone=True,
+    )
+    return json_tasks.JsonMinedTask(**{**fields, **overrides})
+
+
+def test_ac4_every_json_task_type_implements_identity_inputs() -> None:
+    mutation = json_tasks.load_json_tasks(MUTATION_FIXTURE)["greet-missing-comma"]
+
+    for task in (mutation, _mined_task()):
+        inputs = task.identity_inputs()
+        assert isinstance(inputs, dict) and inputs
+        assert inputs["prompt"] == task.prompt
+
+
+@pytest.mark.parametrize("change", [
+    {"prompt_": "Fix acme differently."},
+    {"test_command_": ["python3", "-m", "pytest", "other.py"]},
+    {"test_patch": "diff --git a/t.py b/t.py\n+x\n"},
+    {"base_sha": "c" * 40},
+    {"head_sha": "d" * 40},
+    {"lint_command_": ["ruff", "check"]},
+    {"reference_changed_lines_": 9},
+])
+def test_ac4_mined_task_content_changes_the_task_digest(change) -> None:
+    assert _digest(_mined_task()) == _digest(_mined_task())
+    assert _digest(_mined_task(**change)) != _digest(_mined_task())
+
+
+def test_ac4_mutation_task_content_changes_the_task_digest(tmp_path) -> None:
+    from dataclasses import replace
+
+    fixture = tmp_path / "tasks"
+    shutil.copytree(MUTATION_FIXTURE.parent, fixture)
+    task = json_tasks.load_json_tasks(fixture / "agent_tasks.json")["greet-missing-comma"]
+    before = _digest(task)
+
+    assert _digest(replace(task, prompt_="Fix the greeting.")) != before
+    assert _digest(replace(task, test_command_=["python3", "-c", "pass"])) != before
+    assert _digest(replace(task, mutations_=[])) != before
+    # The fixture repo's files feed the digest, so editing one moves it.
+    (fixture / "repo" / "greet.py").write_text("def greet(name):\n    return name\n")
+    assert _digest(task) != before
+
+
+# --- AC-7: mined clones live under $TILTH_BENCH_DATA; the workdir hides the test patch and history (D-5) ---
+
+
+def _fixture_upstream(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """A local git repo whose head commit fixes valmod.py and adds tests/test_valmod.py."""
+    source = tmp_path / "upstream"
+    (source / "tests").mkdir(parents=True)
+    (source / "valmod.py").write_text("value = 1\n")
+    _git(source.parent, "init", "-q", str(source))
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "base")
+    base = _git(source, "rev-parse", "HEAD")
+    (source / "valmod.py").write_text("value = 2\n")
+    (source / "tests" / "test_valmod.py").write_text("import valmod as c\n\n\ndef test_value():\n    assert c.value == 2\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "fix: reference commit")
+    head = _git(source, "rev-parse", "HEAD")
+    test_patch = subprocess.run(
+        ["git", "-C", str(source), "diff", base, head, "--", "tests/test_valmod.py"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return source, base, head, test_patch
+
+
+def test_ac7_mined_clone_lands_under_bench_data_and_workdir_hides_patch_and_history(
+    monkeypatch, tmp_path,
+) -> None:
+    import config as config_module
+    import run as run_module
+
+    data = tmp_path / "bench-data"
+    monkeypatch.setenv("TILTH_BENCH_DATA", str(data))
+    source, base, head, test_patch = _fixture_upstream(tmp_path)
+    mined_json = tmp_path / "mined.json"
+    mined_json.write_text(json.dumps({"tasks": [{
+        "id": "local-fix", "prompt": "Make value equal 2.", "repo_url": str(source), "base_sha": base,
+        "head_sha": head, "test_patch": test_patch,
+        "test_command": [sys.executable, "-B", "-m", "pytest", "tests/test_valmod.py", "-q", "-p", "no:cacheprovider"],
+    }]}))
+
+    task = json_tasks.load_json_tasks(mined_json)["local-fix"]
+    repo_cfg = json_tasks.REPOS[task.repo]
+    assert repo_cfg.path.is_relative_to(data.resolve() / "mined")
+    assert not repo_cfg.path.exists()  # loading never clones
+
+    monkeypatch.setattr(run_module, "REPOS", json_tasks.REPOS)
+    clone = run_module.get_repo_path(task.repo)
+
+    assert clone == repo_cfg.path
+    assert not clone.is_relative_to(config_module.REPO_ROOT)
+    assert _git(clone, "rev-parse", "HEAD") == base
+    with run_module._agent_repo(clone, task.hide_git) as workspace:
+        assert not workspace.is_relative_to(data.resolve())
+        assert not (workspace / ".git").exists()
+        assert not (workspace / "tests" / "test_valmod.py").exists()
+        assert not any(path.suffix in {".patch", ".diff"} for path in workspace.rglob("*"))
+        assert head not in "".join(path.read_text() for path in workspace.rglob("*") if path.is_file())
+        # Grading applies the PR's test: the unfixed workspace fails it, the fixed one passes.
+        assert task.check_correctness("", str(workspace))[0] is False
+        (workspace / "valmod.py").write_text("value = 2\n")
+        assert task.check_correctness("", str(workspace)) == (True, "Test passed")
