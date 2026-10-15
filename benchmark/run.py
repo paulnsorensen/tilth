@@ -469,7 +469,10 @@ def _uses_claude_session_features(mode: ModeConfig) -> bool:
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
     """The ``<plugin>:<skill>`` names that a ``--plugin-dir`` manifest declares."""
     manifest = json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())
-    return [f"{manifest['name']}:{Path(skill).name}" for skill in manifest.get("skills", [])]
+    skills = manifest.get("skills", [])
+    if isinstance(skills, str):
+        skills = [skills]
+    return [f"{manifest['name']}:{Path(skill).name}" for skill in skills]
 
 
 def _require_plugin_skills(mode_name: str, mode: ModeConfig, run_result) -> None:
@@ -495,6 +498,9 @@ def _plugin_name(plugin_dir: str) -> str:
     return json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())["name"]
 
 
+_SKILL_AUDIT_UNMEASURED = {"skill_calls": None, "non_plugin_skill_calls": None, "bundled_skills_exposed": None}
+
+
 def _skill_audit_fields(mode: ModeConfig, run_result) -> dict:
     """Audit which skills a skill arm could and did call; ``None`` fields for other arms.
 
@@ -502,7 +508,7 @@ def _skill_audit_fields(mode: ModeConfig, run_result) -> dict:
     init event also lists Claude Code's bundled skills and the agent may call them.
     """
     if not _is_skill_arm(mode):
-        return {"skill_calls": None, "non_plugin_skill_calls": None, "bundled_skills_exposed": None}
+        return dict(_SKILL_AUDIT_UNMEASURED)
     prefix = f"{_plugin_name(mode.plugin_dir)}:"
     calls = [
         str(call.input.get("skill", ""))
@@ -1824,7 +1830,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
             **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
             "capability": getattr(task, "capability", None), "repetition": cell.repetition,
-            "variant": _variant_metadata(mode), **erosion.UNMEASURED_FIELDS, **stamp, **identity, **applied_cap,
+            "variant": _variant_metadata(mode), **erosion.UNMEASURED_FIELDS, **_SKILL_AUDIT_UNMEASURED,
+            **stamp, **identity, **applied_cap,
             "reused": False,
         }
 
@@ -2046,16 +2053,22 @@ def _verify_mcp_servers(modes: list[str], runner: Optional[str]) -> None:
                 )
 
 
+def _clone_on_demand_repos(repo_names: set[str]) -> None:
+    """Clone each mined repo a selected task needs, ahead of any `Task.fixture_path` read."""
+    for repo_name in sorted(repo_names):
+        repo = REPOS.get(repo_name)
+        if repo is None or not repo.on_demand_clone:
+            continue
+        try:
+            repo.ensure_cloned()
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
+            sys.exit(1)
+
+
 def _prepare_repos(selected_repos: set[str], *, verbose: bool) -> None:
-    """Check each selected real-world repo exists (cloning mined ones), then clean it."""
+    """Check each selected real-world repo exists, then clean it."""
     for repo_name in selected_repos:
-        if REPOS[repo_name].on_demand_clone:
-            # A mined task's clone is made here, under the harness data directory.
-            try:
-                REPOS[repo_name].ensure_cloned()
-            except (OSError, subprocess.CalledProcessError) as error:
-                print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
-                sys.exit(1)
         repo_path = REPOS[repo_name].path
         if not repo_path.exists():
             print(f"ERROR: Repo '{repo_name}' not cloned.")
@@ -2070,6 +2083,10 @@ def _prepare_repos(selected_repos: set[str], *, verbose: bool) -> None:
         ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
         if verbose:
             print(f"Cleaned repo: {repo_name}")
+
+
+def _run_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def main(argv: Optional[list[str]] = None):
@@ -2232,7 +2249,7 @@ Examples:
         parser.error(f"--output {args.output} is a directory; pass a file path")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = _run_timestamp()
     experiment = None
     panel = None
     try:
@@ -2279,6 +2296,9 @@ Examples:
         enforce_cell_ceiling(total_runs, maximum=args.max_cells)
     except ValueError as error:
         parser.error(str(error))
+
+    # Mined repos clone first: `fixture_path` clones on demand and must not escape as a traceback.
+    _clone_on_demand_repos({TASKS[name].repo for name in tasks_list})
 
     # Tasks without a fixture build their own workdirs; only the rest copy fixtures.
     fixture_tasks = [name for name in tasks_list if TASKS[name].fixture_path is not None]
@@ -2368,7 +2388,7 @@ Examples:
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
     if args.output is not None:
         output_file = args.output
-        stream_log_dir = output_file.parent / f"{output_file.stem}_streams"
+        stream_log_dir = output_file.parent / f"{output_file.stem}_streams" / timestamp
     else:
         output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
         stream_log_dir = RESULTS_DIR / "streams" / timestamp
@@ -2525,6 +2545,7 @@ Examples:
                 "per_turn_output_tokens": [],
                 "variant": _variant_metadata(mode),
                 **erosion.UNMEASURED_FIELDS,
+                **_SKILL_AUDIT_UNMEASURED,
                 **experiment_metadata,
                 **cell.identity,
                 "reused": False,

@@ -78,7 +78,48 @@ def test_output_keeps_stream_logs_beside_the_chosen_file(monkeypatch, tmp_path) 
 
     _drive_main(monkeypatch, tmp_path, "--output", str(target), runner=timeout)
 
-    assert seen and all(path.parent == target.parent / "rows_streams" for path in seen)
+    streams = target.parent / "rows_streams"
+    assert seen and all(path.parent.parent == streams for path in seen)
+    assert len({path.parent for path in seen}) == 1 and seen[0].parent.name.startswith("20")
+
+
+def test_a_second_run_with_the_same_output_does_not_overwrite_earlier_streams(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "out" / "rows.jsonl"
+    stamps = iter(["20260101_000000", "20260101_000001"])
+    monkeypatch.setattr(run, "_run_timestamp", lambda: next(stamps))
+    seen: list[Path] = []
+
+    def timeout(*_args, **kwargs):
+        seen.append(kwargs["stream_log_path"])
+        raise subprocess.TimeoutExpired(["claude"], 600)
+
+    _drive_main(monkeypatch, tmp_path, "--output", str(target), runner=timeout)
+    _drive_main(monkeypatch, tmp_path, "--output", str(target), runner=timeout)
+
+    assert len(seen) == 2 and seen[0].parent != seen[1].parent
+    assert {path.parent.parent for path in seen} == {target.parent / "rows_streams"}
+
+
+def test_a_failed_first_clone_prints_the_clean_error_and_exits_1(monkeypatch, tmp_path, capsys) -> None:
+    import config
+
+    monkeypatch.setitem(config.REPOS, "boomrepo", config.RepoConfig(
+        name="boomrepo", url=str(tmp_path / "no-such-upstream"), commit_sha="a" * 40,
+        language="python", description="unclonable", on_demand_clone=True,
+        path_override=tmp_path / "mined" / "boomrepo",
+    ))
+    monkeypatch.setitem(run.TASKS, "boom_task", _CliTask(name="boom_task", repo="boomrepo"))
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "boom_task", "--models", "sonnet5",
+                                      "--modes", "baseline", "--reps", "1", "--max-cells", "1",
+                                      "--max-usd", "100"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        run.main()
+
+    out = capsys.readouterr().out
+    assert exit_info.value.code == 1
+    assert "ERROR: cannot clone repo 'boomrepo'" in out and "no-such-upstream" in out
 
 
 def test_default_output_stays_in_the_results_dir(monkeypatch, tmp_path) -> None:

@@ -1309,6 +1309,7 @@ def test_strict_timeout_row_retains_mode_metadata(
     assert seen == [True]
     assert row["strict_file_tools"] is True
     assert row["error"] == "timeout"
+    assert {key: row[key] for key in run._SKILL_AUDIT_UNMEASURED} == dict.fromkeys(run._SKILL_AUDIT_UNMEASURED)
 
 
 # --- result substrate: run keys, sidecars, spend, auth, quota -----------------

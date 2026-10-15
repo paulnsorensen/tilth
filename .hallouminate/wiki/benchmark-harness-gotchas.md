@@ -139,7 +139,7 @@ The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas
 `--modes-json FILE` registers extra `ModeConfig` arms. It excludes `--modes` and `--experiment`.
 Both flags refuse `--panel`. `--tasks-json` also refuses a `--tasks` value other than `all`.
 `--output PATH` writes the result rows to `PATH` and refuses a directory.
-Stream logs go to `<output.parent>/<output.stem>_streams/`. The reuse store stays global.
+Stream logs go to `<output.parent>/<output.stem>_streams/<run timestamp>/`, so a second run with the same `--output` keeps the first run's logs and trajectories. The reuse store stays global.
 The harness keeps `DEFAULT_MAX_BUDGET_USD=1.0` and `CELL_TIMEOUT_S=600`.
 The non-panel CLI loop passes `--max-budget-usd` unclamped. Only `run_plan` clamps a cell to the `--max-usd` headroom.
 Every documented run command passes `--max-usd`.
@@ -156,12 +156,15 @@ A `plugin_dir` cannot combine with `mcp_config_path` (`benchmark/run.py:1916`).
 ### Task validation, grading and fixtures
 
 The loader validates JSON task files and raises `ValueError` with the path, entry and field.
-Mutation tasks need `mutations` and `test_command`. Mined tasks need a pytest `test_command`.
+Mutation tasks need `mutations` and `test_command`. Mined tasks need a pytest `test_command`, a nonempty `test_patch`, 40-hex `base_sha` and `head_sha`, and a `repo_url` that is `https://`, `ssh://`, `file://`, `git@host:` or an absolute path (never a leading `-`).
+A JSON repo takes an optional `language` (default `python`; a top-level key for mutation files, a per-entry key for mined entries) so `env_fingerprint` selects toolchain probes.
+A git failure while bootstrapping a mutation fixture is a `ValueError` that names the fixture.
 `register_json_tasks` refuses an empty file and an id collision, including a duplicate id inside one file.
 Mined grading restores held-out test files as bytes, with path containment. It handles renames, deletes, pure renames, CRLF and non-UTF-8 content.
 It grades from a JUnit report passed through `PYTEST_ADDOPTS`. A skipped test does not count as a pass. The grader times out after 300 s.
 Fixture copies are content-addressed: the registry name carries a digest, and `commit_sha` is the copy's root commit.
 `RepoConfig.ensure_cloned()` clones in the producer, from one shared `--no-checkout` clone per `repo_url`.
+Clone and fetch run with `GIT_TERMINAL_PROMPT=0` and a 900 s timeout. A process that loses the rename race onto a valid clone treats the clone as done.
 Preflight uses `ensure_repo_clean` and reports each clone failure per task with its stderr.
 
 `SkillUnavailableError` fails a cell closed when `<plugin>:<skill>` is missing from the `skills` list of the `subtype==init` event.
@@ -186,15 +189,15 @@ A reused row keeps its stored fields. Rows stored before PR #277 lack all seven 
 
 Erosion fields (`benchmark/erosion.py`):
 
-- `workspace_diff_lines`: added plus removed lines between a snapshot taken before the agent ran and the workdir after it. Binary changes count 0. `None` when the diff is not computable or the cell failed.
+- `workspace_diff_lines`: added plus removed lines between a snapshot taken before the agent ran and the workdir after it. Binary changes count 0. Git-ignored files do not count. The ignore rules come from the snapshot, so editing a `.gitignore` cannot hide work, and `.gitignore` changes count. `None` when the diff is not computable or the cell failed.
 - `reference_changed_lines`: the task's reference patch size (`Task.reference_changed_lines`, `benchmark/tasks/base.py:158`). Mined tasks read it from the JSON entry (default 0). `None` for tasks without one and for unmeasured rows.
 - `lint_ok`: `True` when the task lint command exits 0, `False` when it fails. `None` when the task has no lint command or the lint gave no verdict.
-- `lint_reason`: `timeout` (300 s) or `unavailable` (command missing or not runnable) when `lint_ok` is `None` for a failed lint. `None` otherwise.
+- `lint_reason`: `failed (exit N)` when the lint exits nonzero, `timeout` (300 s) or `unavailable` (command missing or not runnable) when `lint_ok` is `None` for a failed lint. `None` otherwise. A command with a path separator, such as `./scripts/lint.sh`, resolves inside the workspace copy it runs in.
 
 The lint runs on a throwaway copy. It runs offline under `unshare -rn` when the host allows it, and otherwise with a scrubbed environment (`PATH`, `LANG`, `LC_ALL`, temporary `HOME`).
 Both measures run before grading, which restores and patches test files.
 
-Skill-arm audit fields (`benchmark/run.py:498`). All three are `None` on non-skill arms:
+Skill-arm audit fields (`benchmark/run.py:498`). All three are `None` on non-skill arms and on failure and timeout rows:
 
 - `skill_calls`: the `skill` argument of every `Skill` tool call, in order.
 - `non_plugin_skill_calls`: the count of those calls whose name lacks the `<plugin>:` prefix.

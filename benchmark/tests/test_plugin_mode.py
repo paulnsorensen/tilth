@@ -132,6 +132,14 @@ def test_expected_plugin_skills_reads_plugin_manifest() -> None:
     assert run._expected_plugin_skills(FIXTURE_PLUGIN_DIR) == ["probe:demo"]
 
 
+def test_expected_plugin_skills_treats_a_string_skills_field_as_one_skill(tmp_path) -> None:
+    manifest = tmp_path / ".claude-plugin"
+    manifest.mkdir()
+    (manifest / "plugin.json").write_text(json.dumps({"name": "cook", "skills": "./skills/solo"}))
+
+    assert run._expected_plugin_skills(str(tmp_path)) == ["cook:solo"]
+
+
 def test_ac3_skill_arm_passes_plugin_dir_and_skill_tool(monkeypatch, tmp_path) -> None:
     calls = _install(monkeypatch, tmp_path, mode=_skill_mode(), stdout=LOADED_STREAM)
 
