@@ -5,6 +5,8 @@ It is closer to a real coding task than keyword navigation or a one-line injecte
 
 ## Version and purpose
 
+For panel membership and split placement of this task, see the [ADR: benchmark GEPA overhaul](adr/benchmark-gepa-overhaul.md). This page does not restate it.
+
 PR #280 merges this task into main on 2026-09-29.
 This page describes `9fa37b51fb655294f6718ff4da1a00ba52a68a53`, not an unmerged proposal.[^1]
 The fixture pins Gin at `d7776de7d444935ea4385999711bd6331a98fecb`.

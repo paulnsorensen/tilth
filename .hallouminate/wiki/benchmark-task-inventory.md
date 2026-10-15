@@ -4,10 +4,11 @@ Keep the local suite as a tool regression suite. Strengthen its graders before t
 
 ## Snapshot and count correction
 
-The opening inventory contains **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`.
-PR #280 merges during this session and adds `gin_edit_render_context`.
-The publication baseline is **58 tasks** at `9fa37b51fb655294f6718ff4da1a00ba52a68a53`.[^1]
-The older “51 tasks” prose in `CLAUDE.md` does not match either registry snapshot.
+The built-in registry holds **58 tasks** at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5` (main after #313 to #319).[^1]
+Registry introspection at that SHA gives the same counts as at `9fa37b51fb655294f6718ff4da1a00ba52a68a53` (the #280 merge), so #313 to #319 add no built-in task.
+The opening inventory held **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`; #280 added `gin_edit_render_context`.
+`CLAUDE.md` states 58 tasks and matches the registry.
+FeatureBench and SWE-bench Multilingual instances are external tasks. They are not in this registry (see [FeatureBench integration](featurebench-integration.md)).
 
 | Repository | Original tasks | Current tasks | Read/navigation | Edit |
 | --- | ---: | ---: | ---: | ---: |
@@ -24,7 +25,7 @@ These are registry labels, not measured difficulty ratings.
 
 ## All registered items
 
-The table comes from registry-object introspection at the publication baseline.
+The table comes from registry-object introspection at the SHA above.
 Response strings check answer substrings, not executable behavior.
 Workspace tests run inside the candidate workspace.
 The base grader only selects that test route for edit tasks with mutations and a test command.[^2]
@@ -95,7 +96,7 @@ The base grader only selects that test route for edit tasks with mutations and a
 The current grading mix is 35 response-string checks, 21 workspace-test checks, one diff-pattern check, and one held-out replay.
 The opening snapshot has the same mix without the held-out replay task.
 
-<speculative> Apply these changes only after the execution gate permits task work.
+<speculative> These changes are proposals. No gate blocks task growth, and every paid run needs `--max-usd`.
 
 | Task group | Keep because | Required improvement |
 | --- | --- | --- |
@@ -119,13 +120,12 @@ The registry is the count authority; task names alone do not prove complexity.
 The general grader permits candidate-workspace tests. This is weaker than a protected replay grader, not proof of an observed exploit.
 The new Gin task improves that boundary but still grades on the host.[^3]
 
-The accepted Phase 4 plan gates task growth on a power readout.[^4]
-This inventory does not approve execution or replace that plan.
+The `analyze.py` power readout is informational only; it gates nothing.
+This inventory does not approve execution.
 See [benchmark selection and rigor](benchmark-selection-and-rigor.md) and [Gin render-context benchmark](benchmark-gin-render-context.md).
 
-[^1]: [Registry at the publication baseline](https://github.com/paulnsorensen/tilth/blob/9fa37b51fb655294f6718ff4da1a00ba52a68a53/benchmark/tasks/__init__.py); [merged PR #280](https://github.com/paulnsorensen/tilth/pull/280), merged 2026-09-29.
-[^2]: `benchmark/tasks/base.py:143-186`, at the publication baseline.
-[^3]: `benchmark/tasks/gin_render_context_tasks.py:116-167`, at the publication baseline.
-[^4]: `benchmark/PHASE4_PLAN.md:1-29`.
+[^1]: Registry introspection of `benchmark/tasks/__init__.py` at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5`: 58 tasks; task types edit 23, read 20, navigate 15; repositories gin 18, synthetic 11, fastapi 10, ripgrep 10, express 9. PR #280 added the 58th task.
+[^2]: `Task.check_correctness` in `benchmark/tasks/base.py`, at the SHA above. The test route needs task type `edit`, mutations, and a test command, so `gin_diff_comprehension` (type `read`) uses response strings.
+[^3]: `benchmark/tasks/gin_render_context_tasks.py`, at the SHA above.
 
-_Source: Registry introspection and grader inspection at 9fa37b51fb655294f6718ff4da1a00ba52a68a53 · Updated: 2026-09-29 · Supersedes: The opening 57-task count for current-main use only._
+_Source: Registry introspection and grader inspection at 1cbebb313dccce0166d8cfc82856dbe5a7c737a5 · Updated: 2026-10-15 · Supersedes: The opening 57-task count for current-main use only._

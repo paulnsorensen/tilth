@@ -2,10 +2,11 @@
 
 Budget from measured attempts, not from the benchmark name or “Sonnet high.”
 The numbers below are planning scenarios, not observed benchmark costs.
+Measured costs in this repository are CLI-reported inference costs, not billing audits.
 
 ## Model identity correction
 
-The session's price scenario uses Sonnet 5.5.
+The session's price scenario uses Sonnet 5.5. These scenarios do not match the local `sonnet` or `sonnet5` aliases.
 Anthropic's “Introducing Claude Sonnet 5.5” lists $2 per million input tokens and $10 per million output tokens.
 Cache reads cost $0.20 per million tokens.[^1]
 Cache writes and other billable categories need their own rates.
@@ -24,6 +25,8 @@ The [historical MCP cost analysis](mcp-cost-model-sonnet5.md) concerns a differe
 Its small-task cost and 97.5% baseline accuracy do not forecast these larger tasks.
 
 ## Full Pro Verified budget scenarios
+
+These are Sonnet 5.5 scenarios, not CLI-reported costs, and they do not match the local `sonnet` or `sonnet5` aliases.
 
 Pro Verified contains 731 tasks.
 For one attempt per task:
@@ -47,6 +50,7 @@ Verify the actual runner's enforcement and reserve headroom.
 
 Formula: `tasks × arms × repetitions × assumed mean attempt spend`.
 This table uses two arms and one repetition.
+It shares the Sonnet 5.5 scenario label above.
 
 | Panel | Tasks | At $3/attempt | At $5/attempt | At $10/attempt |
 | --- | ---: | ---: | ---: | ---: |
@@ -80,12 +84,11 @@ Stop new launches before the global reserve is exhausted.
 Account for in-flight requests and teardown.
 Report all planned attempts and their costs, including unsuccessful ones.
 
-Use [FeatureBench integration](featurebench-integration.md) to choose the runner-specific controls.
-The native FeatureBench `--cost-limit` switch does not cap Claude Code.
-Harbor exposes a Claude Code budget parameter, but its behavior still needs a stop-path test.
+See [FeatureBench integration](featurebench-integration.md) for the native runner.
+Every paid run needs `--max-usd`. Under subscription auth, `total_cost_usd` is a notional price-table estimate and quota binds first ([ADR-002](adr/benchmark-gepa-overhaul.md)).
 
 [^1]: [Anthropic, Introducing Claude Sonnet 5.5](https://www.anthropic.com/claude-sonnet-5-5), published 2026-09-28, checked 2026-09-29.
-[^2]: `benchmark/config.py:23-35`, at `9fa37b51fb655294f6718ff4da1a00ba52a68a53`.
+[^2]: `benchmark/config.py:23-27`, at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5`.
 [^3]: [AgentCompass SWE-bench Pro Verified guide](https://agent-compass.mintlify.app/en/user_guide/modules/benchmarks/swebench_pro_verified).
 
-_Source: Dated provider pricing; local model aliases; computed budget arithmetic · Updated: 2026-09-29 · Supersedes: Any interpretation of the session's $3–$10 scenarios as measured Sonnet costs._
+_Source: Dated provider pricing; local model aliases at 1cbebb313dccce0166d8cfc82856dbe5a7c737a5; computed budget arithmetic · Updated: 2026-10-15 · Supersedes: Any interpretation of the session's $3–$10 scenarios as measured Sonnet costs._

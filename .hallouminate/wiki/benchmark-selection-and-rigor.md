@@ -1,13 +1,13 @@
 # Benchmark selection and rigor
 
-Keep local tool regressions. Add a separately reported external coding benchmark only after qualification and the execution gate.
+Keep local tool regressions. Report external coding benchmarks separately, and admit each task through the native round trip first.
 
 ## Recommended evaluation layers
 
 <speculative> Use these layers instead of treating one benchmark as a complete coding assessment.
 
 1. Use the [local inventory](benchmark-task-inventory.md) for fast tool regression checks.
-2. Qualify one FeatureBench task without a model before attempting a paid comparison.
+2. Admit each FeatureBench task through the native model-free round trip before a paid comparison (see [FeatureBench integration](featurebench-integration.md)).
 3. Use a fixed small FeatureBench panel for integration and large-effect screening.
 4. Use a larger, independently frozen panel for confirmation when the pilot supports it.
 5. Use HARD-51 as a stress test, not as a representative coding-work distribution.
@@ -25,7 +25,7 @@ The [source register](sources/benchmark-research.md) records sources and limitat
 | --- | --- | --- | --- |
 | FeatureBench | Full 200; fast 100; Lite 30 | Multi-file feature implementation | Lite includes GPU tasks; large implementations can make each attempt costly |
 | COSPA FeatureBench Pareto-12 | 12 Level-1 tasks, 11 repositories | Cheap feature-task smoke panel | Selected partly for verifier cost; not a random or independent benchmark |
-| Harbor FeatureBench Lite CPU panel | 23 of Lite's 30 tasks | CPU-only feature pilot | Custom subset; never label its score as full Lite |
+| FeatureBench Lite CPU subset | 23 of Lite's 30 tasks | CPU-only feature pilot | Custom subset; never label its score as full Lite |
 | SWE-bench Pro V2 HARD-51 | 51 difficult cases from V2 | Long-horizon failure and tool stress | Selected through model failures; not representative |
 | SWE-bench Pro V2 | 642 tasks, 11 repositories | Larger rigorous issue-resolution evaluation | Too expensive for the first integration check |
 | SWE-bench Pro Verified | 731 tasks, including 102 refined cases | Audited Pro variant with fresh-image patch grading | Different dataset and harness from V2/HARD-51 |
@@ -98,17 +98,17 @@ Do not repeatedly inspect results and stop at significance without a prespecifie
 
 ## Existing plan and decision still needed
 
-`benchmark/PHASE4_PLAN.md:1-76` accepts a power-gated task-growth plan.
-It favors importing ContextBench tasks into this harness and requires a tool-set-swap spike for an external harness.
-It also describes repeated significance checks; a confirmatory design needs an explicit stopping-rule correction.
+The old power gate is retired; [ADR-006](adr/benchmark-gepa-overhaul.md) records the decision.
+The `analyze.py` power readout is informational only.
+Every paid run needs `--max-usd`, and that flag limits spend, not false-positive conclusions.
+A confirmatory design still needs a stated stopping rule and its correction.
 
-<speculative> FeatureBench is a proposed additional feature-development layer, not an approved replacement for that plan.
-Before implementation or paid execution, record whether the gate opens or the user explicitly authorizes a bounded exception.
-Then choose the task manifest, native or Harbor route, arm policy, exact model, and budget.
-See [integration requirements](featurebench-integration.md) and [cost planning](benchmark-cost-planning.md).
+FeatureBench Lite Level 1 runs natively on main.
+Task picks and panel membership are in the [ADR: benchmark GEPA overhaul](adr/benchmark-gepa-overhaul.md).
+See [FeatureBench integration](featurebench-integration.md) and [cost planning](benchmark-cost-planning.md).
 
 [^1]: [COSPA panel construction](https://github.com/shisa-ai/cospa/blob/main/docs/PANEL-CONSTRUCTION.md).
 [^2]: [OpenAI, Separating signal from noise in coding evaluations](https://openai.com/index/separating-signal-from-noise-coding-evaluations/).
 [^3]: [SWE-bench Pro V2 README](https://github.com/scaleapi/SWE-bench_Pro-os/blob/main/v2/README.md).
 
-_Source: Primary-source research in the source register; local Phase 4 plan · Updated: 2026-09-29 · Supersedes: No accepted execution decision._
+_Source: Primary-source research in the source register; ADR-006 · Updated: 2026-10-15 · Supersedes: The 2026-09-29 text that cited the retired plan as live._
