@@ -38,7 +38,18 @@ LINT_TIMEOUT_S = 300
 GIT_TIMEOUT_S = 60
 
 # Harness-managed or tool-generated paths that are never the agent's work.
-EXCLUDED_NAMES = (".git", ".git_hidden", "__pycache__", ".pytest_cache")
+EXCLUDED_NAMES = (
+    ".git", ".git_hidden", ".venv", "venv", ".tox", ".nox", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", "__pycache__", "node_modules",
+)
+# A directory holding one of these files is a virtualenv or a tool cache, whatever its name.
+EXCLUDED_DIR_MARKERS = ("pyvenv.cfg", "CACHEDIR.TAG")
+
+
+def _excluded_dir(top: str, name: str) -> bool:
+    if name in EXCLUDED_NAMES or name.endswith(".egg-info"):
+        return True
+    return any(os.path.isfile(os.path.join(top, name, marker)) for marker in EXCLUDED_DIR_MARKERS)
 
 # Row fields a failed, timed-out or reused-less row carries when nothing was measured.
 UNMEASURED_FIELDS = {
@@ -67,32 +78,17 @@ def _git(args: list[str], env: dict[str, str], stdin: bytes = b"") -> bytes:
     return done.stdout
 
 
-def _files(root: Path, env: dict[str, str]) -> list[str]:
-    """Regular, non-symlink files under ``root`` that its own ignore files keep, minus harness paths."""
-    listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], env)
-    found = []
-    for raw in listed.split(b"\0"):
-        if not raw:
-            continue
-        rel = os.fsdecode(raw)
-        path = root / rel
-        if set(Path(rel).parts) & set(EXCLUDED_NAMES):
-            continue
-        if path.is_symlink() or not path.is_file():
-            continue
-        found.append(rel)
-    return sorted(set(found))
-
-
 def _walk_files(root: Path) -> list[str]:
     """Regular, non-symlink files found by walking ``root``, minus harness paths and ``.git`` internals.
 
     The walk reads the real filesystem, so nothing the agent wrote into git config or ignore
-    files changes what is listed. A nested repository's working files stay in.
+    files changes what is listed. A nested repository's working files stay in. Tool folders
+    drop out by fixed name or marker file (``pyvenv.cfg``, ``CACHEDIR.TAG``), never by an
+    ignore file. Both sides of the diff use this one walk.
     """
     found = []
     for top, dirs, names in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_NAMES]
+        dirs[:] = [d for d in dirs if not _excluded_dir(top, d)]
         for name in names:
             path = Path(top) / name
             if name in EXCLUDED_NAMES or path.is_symlink() or not path.is_file():
@@ -101,8 +97,8 @@ def _walk_files(root: Path) -> list[str]:
     return sorted(found)
 
 
-def _after_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
-    """The workdir files to compare, judged only by the ignore rules the pre-agent ``baseline`` holds.
+def _kept_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
+    """The ``workdir`` files to compare, judged only by the ignore rules the pre-agent ``baseline`` holds.
 
     An agent must not hide work by writing a ``.gitignore`` or a nested repository. The
     ``.gitignore`` files of the baseline are copied to a rules tree, and every workdir path is
@@ -126,14 +122,14 @@ def _after_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
             else:
                 probes.add(rel)
         env = _git_env(scratch / "git", rules, scratch / "index-rules")
-        env.pop("GIT_LITERAL_PATHSPECS")  # check-ignore rejects literal pathspec magic
+        env.pop("GIT_LITERAL_PATHSPECS")  # check-ignore rejects it; the "./" prefix defuses pathspec magic
         done = _RUN(
             ["git", "check-ignore", "--no-index", "--stdin", "-z"], capture_output=True,
-            timeout=GIT_TIMEOUT_S, input=b"\0".join(map(os.fsencode, sorted(probes))), env=env,
+            timeout=GIT_TIMEOUT_S, input=b"\0".join(os.fsencode("./" + p) for p in sorted(probes)), env=env,
         )
     if done.returncode not in (0, 1):
         raise RuntimeError(f"git check-ignore failed: {os.fsdecode(done.stderr or b'').strip()}")
-    ignored = {os.fsdecode(raw) for raw in done.stdout.split(b"\0") if raw}
+    ignored = {os.fsdecode(raw).removeprefix("./") for raw in done.stdout.split(b"\0") if raw}
     kept = []
     for rel in found:
         probe = rel if Path(rel).name != ".gitignore" else Path(rel).parent.as_posix()
@@ -142,11 +138,9 @@ def _after_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
     return kept
 
 
-def _tree(root: Path, scratch: Path, name: str, files: Optional[list[str]] = None) -> str:
-    """Write ``root``'s filtered files into the scratch object store; return the tree id."""
+def _tree(root: Path, scratch: Path, name: str, files: list[str]) -> str:
+    """Write ``root``'s ``files`` into the scratch object store; return the tree id."""
     env = _git_env(scratch / "git", root, scratch / f"index-{name}")
-    if files is None:
-        files = _files(root, env)
     if files:
         # update-index, unlike add, also takes files that sit inside a nested repository.
         _git(["update-index", "--add", "-z", "--stdin"], env, b"\0".join(map(os.fsencode, files)) + b"\0")
@@ -165,15 +159,15 @@ def _scratch() -> Iterator[Path]:
 def snapshot(workdir: Path) -> Iterator[Path]:
     """Copy ``workdir``'s non-ignored files (minus harness-managed paths) for the run's duration.
 
-    Git-ignored tool output such as caches and egg-info stays out of the copy.
+    The copy uses the same walk and ignore rules as the after side. Tool folders and
+    git-ignored output stay out of it.
     """
     with tempfile.TemporaryDirectory(prefix="tilth-baseline-") as temp:
         baseline: Optional[Path] = Path(temp) / "tree"
         try:
             baseline.mkdir()
             with _scratch() as scratch:
-                env = _git_env(scratch / "git", workdir, scratch / "index-snapshot")
-                for rel in _files(workdir, env):
+                for rel in _kept_files(workdir, workdir, scratch):
                     target = baseline / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(workdir / rel, target)
@@ -189,8 +183,8 @@ def workspace_diff_lines(baseline: Path, workdir: Path) -> Optional[int]:
     """
     try:
         with _scratch() as scratch:
-            before = _tree(baseline, scratch, "before")
-            after = _tree(workdir, scratch, "after", _after_files(baseline, workdir, scratch))
+            before = _tree(baseline, scratch, "before", _walk_files(baseline))
+            after = _tree(workdir, scratch, "after", _kept_files(baseline, workdir, scratch))
             env = _git_env(scratch / "git", workdir, scratch / "index-diff")
             out = _git(["diff", "--numstat", "--no-renames", "-z", before, after], env)
         total = 0

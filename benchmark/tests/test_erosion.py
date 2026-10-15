@@ -351,3 +351,73 @@ def test_a_pre_existing_ignored_cache_dir_stays_excluded_after_new_gitignores(ce
         (cwd / "new.txt").write_text("n\n")  # 1 added
 
     assert cell(act)["workspace_diff_lines"] == 1
+
+
+def _measure(tmp_path: Path, setup, act) -> int | None:
+    work = tmp_path / "w"
+    work.mkdir()
+    setup(work)
+    with erosion.snapshot(work) as baseline:
+        assert baseline is not None
+        act(work)
+        return erosion.workspace_diff_lines(baseline, work)
+
+
+def _tool_folders(work: Path) -> None:
+    (work / "tools").mkdir()
+    (work / "tools" / "pyvenv.cfg").write_text("home = /usr\n")  # a virtualenv under any name
+    for i in range(30):
+        (work / "tools" / f"mod{i}.py").write_text("x = 1\n" * 10)
+    (work / ".ruff_cache").mkdir()
+    (work / ".ruff_cache" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+    (work / ".ruff_cache" / "entry").write_text("c\n" * 40)
+    (work / "cache2").mkdir()
+    (work / "cache2" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+    (work / "cache2" / "entry").write_text("c\n" * 40)
+    (work / "pkg.egg-info").mkdir()
+    (work / "pkg.egg-info" / "PKG-INFO").write_text("x\n" * 20)
+    (work / "node_modules" / "dep").mkdir(parents=True)
+    (work / "node_modules" / "dep" / "index.js").write_text("y\n" * 20)
+
+
+def test_tool_folders_the_agent_creates_add_no_lines_but_real_source_does(tmp_path) -> None:
+    def setup(work: Path) -> None:
+        (work / "keep.txt").write_text("k\n")
+
+    def act(work: Path) -> None:
+        _tool_folders(work)
+        (work / "real.py").write_text("a\nb\n")  # 2 added
+
+    assert _measure(tmp_path, setup, act) == 2
+
+
+def test_a_self_ignoring_gitignore_in_an_ordinary_dir_still_counts_beside_tool_folders(tmp_path) -> None:
+    def act(work: Path) -> None:
+        _tool_folders(work)
+        (work / "newpkg").mkdir()
+        (work / "newpkg" / ".gitignore").write_text("*\n")  # 1 added
+        (work / "newpkg" / "mod.py").write_text("a\nb\n")  # 2 added
+
+    assert _measure(tmp_path, lambda work: (work / "keep.txt").write_text("k\n"), act) == 3
+
+
+def test_a_tool_folder_present_before_the_agent_runs_diffs_to_zero(tmp_path) -> None:
+    assert _measure(tmp_path, _tool_folders, lambda work: None) == 0
+
+
+def test_an_untouched_pre_existing_nested_repo_diffs_to_zero(tmp_path) -> None:
+    def setup(work: Path) -> None:
+        (work / "keep.txt").write_text("k\n")
+        (work / "vendored").mkdir()
+        (work / "vendored" / "lib.py").write_text("1\n2\n3\n")
+        assert erosion._RUN(["git", "init", "-q", str(work / "vendored")]).returncode == 0
+
+    assert _measure(tmp_path, setup, lambda work: None) == 0
+
+
+@pytest.mark.parametrize("name", [":!x.py", ":(exclude)x", ":_x"])
+def test_pathspec_magic_file_names_are_measured_and_counted(tmp_path, name) -> None:
+    def act(work: Path) -> None:
+        (work / name).write_text("a\nb\n")  # 2 added
+
+    assert _measure(tmp_path, lambda work: (work / "keep.txt").write_text("k\n"), act) == 2
