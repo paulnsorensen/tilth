@@ -971,7 +971,12 @@ def _runner_command(
             "--verbose",
             "--model", model_id,
             "--max-budget-usd", f"{max_budget_usd:.4f}",
-            "--disable-slash-commands",
+        ]
+        if not _is_skill_arm(mode):
+            # Live probe 1: with this flag a skill arm's plugin loads but its skills do not (see
+            # benchmark-harness-gotchas.md). Only a skill arm drops it, so every other arm's argv is unchanged.
+            cmd.append("--disable-slash-commands")
+        cmd += [
             "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and mode.mcp_config_path else "Agent,Task",
             "--no-session-persistence",
             "--dangerously-skip-permissions",
