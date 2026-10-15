@@ -1,3 +1,4 @@
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -184,3 +185,44 @@ def test_generated_report_renders_stale_pricing_warning(monkeypatch):
     report = analyze.generate_report([_report_run()])
 
     assert "WARNING: pricing table as_of 2026-06-01" in report
+
+
+_MAIN_MODEL_KEYS = (
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-opus-5",
+    "gpt-5-codex",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "o3",
+    "gpt-5-mini",
+)
+_PRICING_PATH = Path(__file__).parent.parent / "pricing.yaml"
+
+
+def test_ac8_pricing_keeps_main_model_keys() -> None:
+    models = json.loads(_PRICING_PATH.read_text())["models"]
+
+    assert [key for key in _MAIN_MODEL_KEYS if key not in models] == []
+
+
+def test_ac8_pricing_keeps_top_level_keys() -> None:
+    data = json.loads(_PRICING_PATH.read_text())
+
+    assert {"as_of", "sources", "models", "aliases"} <= set(data)
+
+
+def test_ac8_pricing_has_no_fable_row() -> None:
+    text = _PRICING_PATH.read_text()
+
+    assert "claude-fable-5-1" not in text
+    assert "claude-fable-5-1" not in json.loads(text)["models"]
+
+
+def test_ac8_pricing_stays_multi_line() -> None:
+    text = _PRICING_PATH.read_text()
+    models = json.loads(text)["models"]
+
+    assert len(text.splitlines()) > len(models)
