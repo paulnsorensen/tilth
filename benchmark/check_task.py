@@ -196,6 +196,8 @@ def check_mined_task(task_name: str) -> bool:
     reason: str | None = None
     repo_path: Path | None = None
     try:
+        if task.repo in REPOS:
+            REPOS[task.repo].ensure_cloned([task.head_sha])
         repo_path = get_repo_path(task.repo)
         ensure_repo_clean(repo_path, task.base_sha)
         before_ok, before_reason = task.check_correctness("", str(repo_path))

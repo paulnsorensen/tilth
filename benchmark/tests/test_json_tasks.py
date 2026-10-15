@@ -206,6 +206,66 @@ def test_repo_config_falls_back_to_a_full_fetch_when_fetch_by_sha_is_refused(tmp
     assert any(cmd[:3] == ["git", "fetch", "origin"] and cmd[3] != third for cmd in seen)
 
 
+def _refuse_sha_fetches(monkeypatch):
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if cmd[:3] == ["git", "fetch", "origin"] and len(cmd[3]) == 40:
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal: server refuses sha")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def _pull_head_commit(upstream) -> str:
+    """A commit reachable only from refs/pull/1/head, as a GitHub PR head is."""
+    branch = _git(upstream, "rev-parse", "--abbrev-ref", "HEAD")
+    _git(upstream, "checkout", "-q", "-b", "pr-tmp")
+    (upstream / "mod.py").write_text("value = 9\n")
+    _git(upstream, "commit", "-qam", "pr head")
+    head = _git(upstream, "rev-parse", "HEAD")
+    _git(upstream, "update-ref", "refs/pull/1/head", head)
+    _git(upstream, "checkout", "-q", branch)
+    _git(upstream, "branch", "-q", "-D", "pr-tmp")
+    return head
+
+
+def test_ensure_cloned_fetches_a_head_commit_that_only_a_pull_ref_holds(tmp_path, monkeypatch) -> None:
+    upstream, first, second = _upstream(tmp_path)
+    _mined_cfg(tmp_path, upstream, first, "up-first").ensure_cloned()  # shared clone exists now
+    head = _pull_head_commit(upstream)
+    _refuse_sha_fetches(monkeypatch)
+    cfg = _mined_cfg(tmp_path, upstream, second, "up-base")
+
+    cfg.ensure_cloned([head])
+
+    assert _git(cfg.path, "rev-parse", "HEAD") == second
+    _git(cfg.path, "checkout", "-q", head, "--")  # the mined preflight checks out head_sha
+    assert (cfg.path / "mod.py").read_text() == "value = 9\n"
+
+
+def test_ensure_cloned_adds_a_late_head_commit_to_an_existing_per_commit_repo(tmp_path) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+    cfg.ensure_cloned()  # per-commit repo cloned before head exists
+    head = _pull_head_commit(upstream)
+
+    cfg.ensure_cloned([head])
+
+    _git(cfg.path, "checkout", "-q", head, "--")
+    assert (cfg.path / "mod.py").read_text() == "value = 9\n"
+
+
+def test_a_missing_commit_error_carries_gits_stderr_tail(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+    cfg.ensure_cloned()
+    _refuse_sha_fetches(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="server refuses sha"):
+        cfg.ensure_cloned(["e" * 40])
+
+
 def test_repo_config_git_calls_never_prompt_for_credentials(tmp_path, monkeypatch) -> None:
     upstream, first, _ = _upstream(tmp_path)
     real_run = subprocess.run
