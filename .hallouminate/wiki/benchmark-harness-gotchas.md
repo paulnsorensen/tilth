@@ -133,4 +133,87 @@ The page records the reporting rules and the native admission round trip. This p
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.
 
-_Source: PR #278 at 2b17c3755589a4e89eccaf89c3309ea9591aaa82 · Updated: 2026-10-13 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+## Skill-plugin arms, `--tasks-json`, `--modes-json` and `--output` (PR #277)
+
+`--tasks-json FILE` runs exactly the tasks in a JSON file (mutation shape with a top-level `repo`, or mined shape without it).
+`--modes-json FILE` registers extra `ModeConfig` arms. It excludes `--modes` and `--experiment`.
+Both flags refuse `--panel`. `--tasks-json` also refuses a `--tasks` value other than `all`.
+`--output PATH` writes the result rows to `PATH` and refuses a directory.
+Stream logs go to `<output.parent>/<output.stem>_streams/<run timestamp>/`, so a second run with the same `--output` keeps the first run's logs and trajectories. The reuse store stays global.
+The harness keeps `DEFAULT_MAX_BUDGET_USD=1.0` and `CELL_TIMEOUT_S=600`.
+The non-panel CLI loop passes `--max-budget-usd` unclamped. Only `run_plan` clamps a cell to the `--max-usd` headroom.
+Every documented run command passes `--max-usd`.
+
+### `--modes-json` allowlist
+
+A `--modes-json` entry accepts only `name`, `tools`, `description`, `plugin_dir`, `prompt_mode` and `mcp_config_path` (`benchmark/run.py:1929`).
+The loader rejects every other `ModeConfig` field as harness-computed provenance. So no arm can raise the per-cell cap or forge provenance.
+It also rejects a taken mode name, a non-list `tools`, and a `prompt_mode` other than `replace` or `append`.
+A `plugin_dir` must be absolute and must hold a manifest that declares skills.
+A `plugin_dir` cannot combine with `mcp_config_path` (`benchmark/run.py:1916`).
+`ArmUnavailableError` (`benchmark/run.py:443`) is the base class for MCP and skill aborts. It stops every later cell of the arm.
+
+### Task validation, grading and fixtures
+
+The loader validates JSON task files and raises `ValueError` with the path, entry and field.
+Mutation tasks need `mutations` and `test_command`. Mined tasks need a pytest `test_command`, a nonempty `test_patch`, 40-hex `base_sha` and `head_sha`, and a `repo_url` that is `https://`, `ssh://`, `file://`, `git@host:` or an absolute path (never a leading `-`).
+A JSON repo takes an optional `language` (default `python`; a top-level key for mutation files, a per-entry key for mined entries) so `env_fingerprint` selects toolchain probes.
+A git failure while bootstrapping a mutation fixture is a `ValueError` that names the fixture.
+`register_json_tasks` refuses an empty file and an id collision, including a duplicate id inside one file.
+Mined grading restores held-out test files as bytes, with path containment. It handles renames, deletes, pure renames, CRLF and non-UTF-8 content.
+It grades from a JUnit report passed through `PYTEST_ADDOPTS`. A skipped test does not count as a pass. The grader times out after 300 s.
+Fixture copies are content-addressed: the registry name carries a digest, and `commit_sha` is the copy's root commit.
+`RepoConfig.ensure_cloned()` clones in the producer, from one shared `--no-checkout` clone per `repo_url`.
+Clone and fetch run with `GIT_TERMINAL_PROMPT=0` and a 900 s timeout. A process that loses the rename race onto a valid clone treats the clone as done.
+Preflight uses `ensure_repo_clean` and reports each clone failure per task with its stderr.
+
+`SkillUnavailableError` fails a cell closed when `<plugin>:<skill>` is missing from the `skills` list of the `subtype==init` event.
+The init event is not always line 1. `parse.py` keeps `plugins`, `skills` and `plugin_errors` from it.
+
+Live probes (two paid cells, subscription OAuth, `--max-usd 1`):
+
+- Probe 1 used main's plugin argv with `--disable-slash-commands`. The plugin loaded, but `skills` was empty. Fixture: `plugin_probe1_skills_stripped.jsonl`.
+- Probe 2 dropped `--disable-slash-commands` for skill arms only. The init event listed `probe:demo`. Fixture: `plugin_probe2_skills_loaded.jsonl`.
+
+The flag change applies only to skill arms (`plugin_dir` without `mcp_config_path`). Woz arms and stock arms keep the flag, and their argv and run keys stay byte-identical.
+Plugin cells keep `--setting-sources ""`, never pass real `--bare`, and keep `DISABLE_AUTOUPDATER=1`.
+Because skill arms drop the flag, the init event also lists about 19 bundled Claude Code skills (probe 2). The agent can call them.
+
+Mined clones live under `$TILTH_BENCH_DATA` (`data_dir()`), not in the checkout or the agent workdir.
+The agent workdir holds no test patch and no `.git` history until grading.
+
+### New result-row fields
+
+The fields stay out of the run key, `CELL_KEY_FIELDS` and `harness_digest`, so stored baselines keep matching.
+A reused row keeps its stored fields. Rows stored before PR #277 lack all seven fields, so read them with `.get()`.
+
+Erosion fields (`benchmark/erosion.py`):
+
+- `workspace_diff_lines`: added plus removed lines between a snapshot taken before the agent ran and the workdir after it. Binary changes count 0. Both sides use one filesystem walk (`erosion._walk_files`) and no git index, so an untouched tree diffs to 0, including a nested `git init`. The walk skips these directories: `.git`, `.git_hidden`, `.venv`, `venv`, `.tox`, `.nox`, `.mypy_cache`, `.ruff_cache`, `.pytest_cache`, `__pycache__`, `node_modules`, any `*.egg-info`, and any directory that holds a `pyvenv.cfg` (a virtualenv) or a `CACHEDIR.TAG` (a tool cache). A directory with one of those names is excluded even when the agent creates it. This is a known trade-off: real source in such a directory does not count. Everything else is counted, including the working files of a nested repository and a new directory that holds its own self-ignoring `.gitignore`. Git-ignored files do not count. The ignore rules come only from the `.gitignore` files in the snapshot, never from the agent's tree, so a new or edited `.gitignore` cannot hide work and `.gitignore` changes count. A new `.gitignore` under a directory that the snapshot rules already ignore does not count. Paths go to `git check-ignore` with a `./` prefix, so file names such as `:!x.py` measure. `None` when the diff is not computable or the cell failed.
+- `reference_changed_lines`: the task's reference patch size (`Task.reference_changed_lines`, `benchmark/tasks/base.py:158`). Mined tasks read it from the JSON entry (default 0). `None` for tasks without one and for unmeasured rows.
+- `lint_ok`: `True` when the task lint command exits 0, `False` when it fails. `None` when the task has no lint command or the lint gave no verdict.
+- `lint_reason`: `failed (exit N)` when the lint exits nonzero, `timeout` (300 s) or `unavailable` (command missing or not runnable) when `lint_ok` is `None` for a failed lint. `None` otherwise. A command with a path separator, such as `./scripts/lint.sh`, resolves inside the workspace copy it runs in.
+
+The lint runs on a throwaway copy. It runs offline under `unshare -rn` when the host allows it, and otherwise with a scrubbed environment (`PATH`, `LANG`, `LC_ALL`, temporary `HOME`).
+Both measures run before grading, which restores and patches test files.
+
+Skill-arm audit fields (`benchmark/run.py:498`). All three are `None` on non-skill arms and on failure and timeout rows:
+
+- `skill_calls`: the `skill` argument of every `Skill` tool call, in order.
+- `non_plugin_skill_calls`: the count of those calls whose name lacks the `<plugin>:` prefix.
+- `bundled_skills_exposed`: sorted init-event skills outside the plugin, which are the bundled skills the agent could call.
+
+### easy-cheese #728 compatibility check
+
+The companion `agent_lab_tilth.py` still breaks against this harness. The breaks do not block the merge.
+
+- It passes `--modes-json` together with `--modes`. The two flags stay mutually exclusive.
+- It passes `--tasks-json` with `--tasks id1,id2`. The harness refuses a `--tasks` value other than `all`.
+- Its mode sets `plugin_dir` and `mcp_config_path`. `load_modes_json` rejects that pair.
+- It uses `--models fable`. The `claude-fable-5-1` pricing row and alias stay dropped, as the user decided, until real rates exist.
+
+These breaks from the first check are fixed: `--output` exists, and result rows carry `workspace_diff_lines`, `reference_changed_lines` and `lint_ok`, so its erosion guard can fire on new rows.
+The mined task shape, the `skills` and `error` row fields, and `model_alias` match.
+The live Haiku cell with the real cook plugin stays open. No spend is approved for it.
+
+_Source: PR #277 at 411e183 · Updated: 2026-10-15 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

@@ -24,6 +24,7 @@ import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import fields as _dataclass_fields
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from typing import NamedTuple, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import baselines
+import erosion
 import external
 import external.contamination
 import external.preflight
@@ -72,6 +74,7 @@ from parse import (
 )
 from tasks import TASKS
 from tasks.base import SYNTHETIC_LANGUAGE, Task
+from tasks.json_tasks import register_json_tasks
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -150,8 +153,18 @@ def wozcode_mode(plugin_dir: Path) -> ModeConfig:
     )
 
 
+def _is_woz_arm(mode: ModeConfig) -> bool:
+    """A Woz Code arm: a plugin directory that also serves an MCP server."""
+    return bool(mode.plugin_dir and mode.mcp_config_path)
+
+
+def _is_skill_arm(mode: ModeConfig) -> bool:
+    """A skill arm: a plugin directory loaded for its skills, with no MCP server."""
+    return bool(mode.plugin_dir and not mode.mcp_config_path)
+
+
 def claude_mcp_config(mode: ModeConfig) -> dict:
-    if mode.plugin_dir:
+    if _is_woz_arm(mode):
         plugin_dir = Path(mode.plugin_dir)
         return {"mcpServers": {"plugin_woz_code": {
             "command": "node",
@@ -175,7 +188,7 @@ def get_repo_path(repo_name: str) -> Path:
     """Resolve working directory for a task's repo."""
     if repo_name == "synthetic":
         return SYNTHETIC_REPO
-    return REPOS[repo_name].path
+    return REPOS[repo_name].resolved_path()
 
 
 _RUNTIME_ENV_KEYS = frozenset(
@@ -427,8 +440,97 @@ def _built_workdir():
         yield Path(temp_dir) / "repo"
 
 
-class McpUnavailableError(RuntimeError):
+class ArmUnavailableError(RuntimeError):
+    """An arm lacks something its config promised; every later cell of the arm would fail alike."""
+
+    kind = "arm"
+    abort_hint = "the arm is misconfigured"
+
+
+class McpUnavailableError(ArmUnavailableError):
     """A mode expected an MCP server that the session did not expose."""
+
+    kind = "mcp"
+    abort_hint = "the MCP-armed mode is misconfigured"
+
+
+class SkillUnavailableError(ArmUnavailableError):
+    """A skill arm expected a plugin skill that the session did not load."""
+
+    kind = "skill"
+    abort_hint = "the skill arm is misconfigured"
+
+
+def _uses_claude_session_features(mode: ModeConfig) -> bool:
+    """Skill arms and appended-prompt arms need Claude's session init, which other runners lack."""
+    return _is_skill_arm(mode) or mode.prompt_mode != "replace"
+
+
+def _expected_plugin_skills(plugin_dir: str) -> list[str]:
+    """The ``<plugin>:<skill>`` names that a ``--plugin-dir`` manifest declares.
+
+    A manifest without a ``skills`` field uses the default ``skills/`` folder.
+    """
+    root = Path(plugin_dir)
+    manifest = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+    entries = manifest.get("skills", ["skills"] if (root / "skills").is_dir() else [])  # default folder
+    if isinstance(entries, str):
+        entries = [entries]
+    names: list[str] = []
+    for entry in entries:
+        folder = (root / entry).resolve()
+        if (folder / "SKILL.md").is_file() or not folder.is_dir():
+            names.append(folder.name)  # one skill folder (or a declared path not on disk)
+        else:
+            names.extend(sorted(child.name for child in folder.iterdir() if (child / "SKILL.md").is_file()))
+    return [f"{manifest['name']}:{name}" for name in names]
+
+
+def _require_plugin_skills(mode_name: str, mode: ModeConfig, run_result) -> None:
+    """Fail closed when the init event does not list every skill the plugin declares.
+
+    Claude Code can start without a plugin's skills (a flag or a manifest problem), and
+    the cell would then run as a plain baseline. A manifest that declares no skills
+    cannot be checked, so it fails too.
+    """
+    expected = _expected_plugin_skills(mode.plugin_dir)
+    missing = [skill for skill in expected if skill not in run_result.skills]
+    if expected and not missing:
+        return
+    raise SkillUnavailableError(
+        f"mode '{mode_name}' expects plugin_dir '{mode.plugin_dir}' to load "
+        f"{missing if expected else 'at least one skill (its manifest declares none)'} but the session's "
+        f"skills were {run_result.skills} (plugins={run_result.plugins}, "
+        f"plugin_errors={run_result.plugin_errors})"
+    )
+
+
+def _plugin_name(plugin_dir: str) -> str:
+    return json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())["name"]
+
+
+_SKILL_AUDIT_UNMEASURED = {"skill_calls": None, "non_plugin_skill_calls": None, "bundled_skills_exposed": None}
+
+
+def _skill_audit_fields(mode: ModeConfig, run_result) -> dict:
+    """Audit which skills a skill arm could and did call; ``None`` fields for other arms.
+
+    Skill arms keep the ``Skill`` tool and drop ``--disable-slash-commands``, so the
+    init event also lists Claude Code's bundled skills and the agent may call them.
+    """
+    if not _is_skill_arm(mode):
+        return dict(_SKILL_AUDIT_UNMEASURED)
+    prefix = f"{_plugin_name(mode.plugin_dir)}:"
+    calls = [
+        str(call.input.get("skill", ""))
+        for turn in run_result.turns for call in turn.tool_calls if call.name == "Skill"
+    ]
+    return {
+        "skill_calls": calls,
+        "non_plugin_skill_calls": sum(1 for name in calls if not name.startswith(prefix)),
+        "bundled_skills_exposed": sorted(s for s in run_result.skills if not s.startswith(prefix)),
+    }
+
 
 
 def _copy_private(source: Path, destination: Path) -> None:
@@ -454,24 +556,25 @@ def _cell_claude_config(model_name: str, mode: ModeConfig):
         yield None
         return
     seed = os.environ.get("CLAUDE_CONFIG_DIR")
+    woz = _is_woz_arm(mode)
     if not seed:
-        if mode.plugin_dir:
+        if woz:
             raise ValueError("Woz Code requires an explicit CLAUDE_CONFIG_DIR auth seed")
         yield None
         return
     seed_auth = Path(seed) / "wozcode" / "auth.json"
-    if mode.plugin_dir and not seed_auth.is_file():
+    if woz and not seed_auth.is_file():
         raise ValueError(f"Woz Code auth seed not found: {seed_auth}")
     with tempfile.TemporaryDirectory(prefix="tilth-claude-config-") as temp_dir:
         config_dir = Path(temp_dir)
         cell_auth = config_dir / "wozcode" / "auth.json"
-        if mode.plugin_dir:
+        if woz:
             cell_auth.parent.mkdir()
             _copy_private(seed_auth, cell_auth)
         try:
             yield config_dir
         finally:
-            if mode.plugin_dir and cell_auth.is_file():
+            if woz and cell_auth.is_file():
                 _copy_private(cell_auth, seed_auth)
 
 _STRICT_NATIVE_FILE_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "NotebookEdit", "LS"})
@@ -812,20 +915,22 @@ def run_single(
     )
     with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
         task.prepare(repo_path)
-        return _run_single_in_repo(
-            task_name,
-            mode_name,
-            model_name,
-            repetition,
-            repo_path,
-            verbose=verbose,
-            stream_log_path=stream_log_path,
-            bare=bare,
-            reasoning_effort=reasoning_effort,
-            max_budget_usd=max_budget_usd,
-            strict_file_tools=strict_file_tools,
-            claude_config_dir=config_dir,
-        )
+        with erosion.snapshot(repo_path) as baseline:
+            return _run_single_in_repo(
+                task_name,
+                mode_name,
+                model_name,
+                repetition,
+                repo_path,
+                verbose=verbose,
+                stream_log_path=stream_log_path,
+                bare=bare,
+                reasoning_effort=reasoning_effort,
+                max_budget_usd=max_budget_usd,
+                strict_file_tools=strict_file_tools,
+                claude_config_dir=config_dir,
+                baseline=baseline,
+            )
 
 
 _CODEX_GUIDANCE = (
@@ -837,6 +942,175 @@ _CODEX_TILTH_GUIDANCE = (
     "Batch independent files into one tilth call. "
     "Use shell only for tests and builds. Native tools remain available."
 )
+
+
+def _codex_command(
+    task: object,
+    mode: ModeConfig,
+    model_id: str,
+    repo_path: Path,
+    *,
+    reasoning_effort: str | None,
+    skill_paths: list[str],
+) -> list[str]:
+    cmd = [
+        "codex", "exec", "--json", "--ephemeral",
+        "--ignore-user-config", "--ignore-rules",
+        "--sandbox", "workspace-write",
+        "--enable", "skip_host_skill_discovery",
+        "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks",
+        "--disable", "apps", "--disable", "multi_agent",
+        "--disable", "skill_mcp_dependency_install",
+        "-m", model_id,
+        "-c", "mcp_servers={}",
+        "-c", "project_doc_max_bytes=0",
+        "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
+    ]
+    skills_config = ",".join(
+        f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
+    )
+    cmd += ["-c", f"skills.config=[{skills_config}]"]
+    instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
+    if mode.mcp_config_path:
+        instructions += _CODEX_TILTH_GUIDANCE
+    cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
+    if reasoning_effort is not None:
+        cmd += ["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"]
+    if getattr(task, "hide_git", False):
+        cmd.append("--skip-git-repo-check")
+
+    if mode.mcp_config_path:
+        tilth_bin = mode.binary_path or TILTH_BIN
+        cmd += [
+            "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
+            "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
+            "-c", "mcp_servers.tilth.required=true",
+            "-c", 'mcp_servers.tilth.tools.tilth_write.approval_mode="approve"',
+        ]
+
+    cmd += ["--", task.prompt]
+    return cmd
+
+
+def _opencode_command(
+    task: object,
+    mode: ModeConfig,
+    mode_name: str,
+    model_id: str,
+    repo_path: Path,
+    *,
+    bare: bool,
+) -> tuple[list[str], str]:
+    opencode_config = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
+    if opencode_config is None:
+        raise RuntimeError(
+            f"opencode runner has no config for mode '{mode_name}'. "
+            f"Supported modes: {', '.join(sorted(OPENCODE_CONFIGS))}."
+        )
+    # opencode has no --system-prompt; prepend like codex. OPENCODE_CONFIG
+    # (set by the caller) selects the MCP servers; --dangerously-skip-permissions
+    # keeps the headless run from blocking on tool-permission prompts.
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
+    cmd = [
+        "opencode", "run",
+        "--format", "json",
+        "--dir", str(repo_path),
+        "--model", model_id,
+        "--dangerously-skip-permissions",
+    ]
+    if bare:
+        cmd.append("--pure")  # strip external plugins (claude --bare parity)
+    cmd.append(full_prompt)
+    return cmd, opencode_config
+
+
+@dataclass(frozen=True)
+class _ClaudeArmFlags:
+    """The arm-shape facts that decide a Claude argv."""
+
+    skill: bool
+    woz: bool
+    mcp: bool
+    append_prompt: bool
+
+
+def _claude_arm_flags(mode: ModeConfig) -> _ClaudeArmFlags:
+    return _ClaudeArmFlags(
+        skill=_is_skill_arm(mode),
+        woz=_is_woz_arm(mode),
+        mcp=bool(mode.mcp_config_path),
+        append_prompt=mode.prompt_mode == "append",
+    )
+
+
+def _claude_command(
+    task: object,
+    mode: ModeConfig,
+    model_id: str,
+    repo_path: Path,
+    *,
+    bare: bool,
+    reasoning_effort: str | None,
+    max_budget_usd: float,
+    strict_file_tools: bool,
+    strict_hook_command: str | None,
+) -> list[str]:
+    arm = _claude_arm_flags(mode)
+    cmd = [
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--model", model_id,
+        "--max-budget-usd", f"{max_budget_usd:.4f}",
+    ]
+    if not arm.skill:
+        # Live probe 1: with this flag a skill arm's plugin loads but its skills do not (see
+        # benchmark-harness-gotchas.md). Only a skill arm drops it, so every other arm's argv is unchanged.
+        cmd.append("--disable-slash-commands")
+    cmd += [
+        "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and arm.mcp else "Agent,Task",
+        "--no-session-persistence",
+        "--dangerously-skip-permissions",
+        "--strict-mcp-config",
+    ]
+    cwd_prompt = f"Your current working directory is: {repo_path}" + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else "")
+    if arm.append_prompt:
+        # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
+        cmd += ["--append-system-prompt", cwd_prompt]
+    else:
+        cmd += ["--system-prompt", SYSTEM_PROMPT + "\n" + cwd_prompt]
+
+    # --setting-sources "" loads no user/project/local settings (hooks, env,
+    # user MCP servers) while retaining OAuth/keychain auth and honoring
+    # --mcp-config. --safe-mode is documented to disable ALL MCP servers,
+    # including --mcp-config ones, which silently ran tilth arms
+    # native-only; --bare refuses OAuth and needs ANTHROPIC_API_KEY.
+    if bare or mode.plugin_dir:
+        cmd += ["--setting-sources", ""]
+    if reasoning_effort is not None:
+        cmd += ["--effort", reasoning_effort]
+    if mode.plugin_dir:
+        cmd += ["--plugin-dir", mode.plugin_dir]
+    if arm.woz:
+        cmd += ["--agent", "woz:code"]
+
+    if strict_file_tools:
+        cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
+    tools_list = (list(_STRICT_BASELINE_TOOLS) if not arm.mcp else ["Bash"]) if strict_file_tools else list(mode.tools)
+    if arm.skill and tools_list and "Skill" not in tools_list:
+        tools_list.append("Skill")
+
+    # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
+    if tools_list:
+        cmd += ["--tools", ",".join(tools_list)]
+    elif arm.mcp:
+        cmd += ["--tools", ""]
+
+    if arm.mcp:
+        cmd += ["--mcp-config", json.dumps(claude_mcp_config(mode))]
+
+    cmd += ["--", task.prompt]
+    return cmd
 
 
 def _runner_command(
@@ -856,112 +1130,22 @@ def _runner_command(
     """Build one cell's runner argv and, for opencode, the config it selects."""
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
-    opencode_config: Optional[str] = None
     if runner == "codex":
         if mode_name == "tilth_forced":
             raise ValueError("Codex cannot enforce tilth_forced tool restrictions")
-        cmd = [
-            "codex", "exec", "--json", "--ephemeral",
-            "--ignore-user-config", "--ignore-rules",
-            "--sandbox", "workspace-write",
-            "--enable", "skip_host_skill_discovery",
-            "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks",
-            "--disable", "apps", "--disable", "multi_agent",
-            "--disable", "skill_mcp_dependency_install",
-            "-m", model_id,
-            "-c", "mcp_servers={}",
-            "-c", "project_doc_max_bytes=0",
-            "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
-        ]
-        skills_config = ",".join(
-            f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
+        cmd = _codex_command(
+            task, mode, model_id, repo_path,
+            reasoning_effort=reasoning_effort, skill_paths=skill_paths,
         )
-        cmd += ["-c", f"skills.config=[{skills_config}]"]
-        instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
-        if mode.mcp_config_path:
-            instructions += _CODEX_TILTH_GUIDANCE
-        cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
-        if reasoning_effort is not None:
-            cmd += ["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"]
-        if getattr(task, "hide_git", False):
-            cmd.append("--skip-git-repo-check")
-
-        if mode.mcp_config_path:
-            tilth_bin = mode.binary_path or TILTH_BIN
-            cmd += [
-                "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
-                "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
-                "-c", "mcp_servers.tilth.required=true",
-                "-c", 'mcp_servers.tilth.tools.tilth_write.approval_mode="approve"',
-            ]
-
-        cmd += ["--", task.prompt]
-
-    elif runner == "opencode":
-        opencode_config = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
-        if opencode_config is None:
-            raise RuntimeError(
-                f"opencode runner has no config for mode '{mode_name}'. "
-                f"Supported modes: {', '.join(sorted(OPENCODE_CONFIGS))}."
-            )
-        # opencode has no --system-prompt; prepend like codex. OPENCODE_CONFIG
-        # (set below) selects the MCP servers; --dangerously-skip-permissions
-        # keeps the headless run from blocking on tool-permission prompts.
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
-        cmd = [
-            "opencode", "run",
-            "--format", "json",
-            "--dir", str(repo_path),
-            "--model", model_id,
-            "--dangerously-skip-permissions",
-        ]
-        if bare:
-            cmd.append("--pure")  # strip external plugins (claude --bare parity)
-        cmd.append(full_prompt)
-
-    else:  # claude
-        cmd = [
-            "claude", "-p",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", model_id,
-            "--max-budget-usd", f"{max_budget_usd:.4f}",
-            "--disable-slash-commands",
-            "--disallowedTools", ",".join(("Agent", "Task", *sorted(_STRICT_NATIVE_FILE_TOOLS))) if strict_file_tools and mode.mcp_config_path else "Agent,Task",
-            "--no-session-persistence",
-            "--dangerously-skip-permissions",
-            "--strict-mcp-config",
-            "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}" + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
-        ]
-
-        # --setting-sources "" loads no user/project/local settings (hooks, env,
-        # user MCP servers) while retaining OAuth/keychain auth and honoring
-        # --mcp-config. --safe-mode is documented to disable ALL MCP servers,
-        # including --mcp-config ones, which silently ran tilth arms
-        # native-only; --bare refuses OAuth and needs ANTHROPIC_API_KEY.
-        if bare or mode.plugin_dir:
-            cmd += ["--setting-sources", ""]
-        if reasoning_effort is not None:
-            cmd += ["--effort", reasoning_effort]
-        if mode.plugin_dir:
-            cmd += ["--plugin-dir", mode.plugin_dir, "--agent", "woz:code"]
-
-        if strict_file_tools:
-            cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
-        tools_list = (list(_STRICT_BASELINE_TOOLS) if not mode.mcp_config_path else ["Bash"]) if strict_file_tools else list(mode.tools)
-
-        # --tools "" disables all built-ins (tilth_forced); --tools "a,b,c" allowlists; absent = default
-        if tools_list:
-            cmd += ["--tools", ",".join(tools_list)]
-        elif mode.mcp_config_path:
-            cmd += ["--tools", ""]
-
-        if mode.mcp_config_path:
-            cmd += ["--mcp-config", json.dumps(claude_mcp_config(mode))]
-
-        cmd += ["--", task.prompt]
-
-    return cmd, opencode_config
+        return cmd, None
+    if runner == "opencode":
+        return _opencode_command(task, mode, mode_name, model_id, repo_path, bare=bare)
+    cmd = _claude_command(
+        task, mode, model_id, repo_path,
+        bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
+        strict_file_tools=strict_file_tools, strict_hook_command=strict_hook_command,
+    )
+    return cmd, None
 
 
 def _run_single_in_repo(
@@ -977,8 +1161,13 @@ def _run_single_in_repo(
     max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     strict_file_tools: bool = False,
     claude_config_dir: Path | None = None,
+    baseline: Path | None = None,
 ) -> dict:
-    """Execute and grade one benchmark cell."""
+    """Execute and grade one benchmark cell.
+
+    ``baseline`` is the workspace snapshot taken before the agent ran; without one the
+    workspace diff is not measured.
+    """
     task = TASKS[task_name]
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
@@ -1138,6 +1327,9 @@ def _run_single_in_repo(
                 f"mcp_servers={run_result.mcp_servers})"
             )
 
+    if runner == "claude" and _is_skill_arm(mode):
+        _require_plugin_skills(mode_name, mode, run_result)
+
     strict_denied_bash_calls = (
         _audit_strict_claude(result.stdout, mode, run_result.available_tools)
         if strict_file_tools and runner == "claude" else 0
@@ -1146,6 +1338,12 @@ def _run_single_in_repo(
     # Override duration if needed (subprocess timing may be more accurate)
     if run_result.duration_ms == 0:
         run_result.duration_ms = elapsed_ms
+
+    # Erosion fields are measured before grading, which restores and patches test files.
+    lint_ok, lint_reason = erosion.lint_status(task.lint_command, repo_path)
+    workspace_diff_lines = (
+        erosion.workspace_diff_lines(baseline, repo_path) if baseline is not None else None
+    )
 
     # Check correctness
     correct, reason = task.check_correctness(
@@ -1218,6 +1416,10 @@ def _run_single_in_repo(
         "tool_sequence": _compact_tool_sequence(run_result),
         "available_tools": run_result.available_tools,
         "mcp_servers": run_result.mcp_servers,
+        **({"skills": run_result.skills, "plugins": run_result.plugins,
+            "plugin_errors": run_result.plugin_errors, "prompt_mode": mode.prompt_mode}
+           if _uses_claude_session_features(mode) else {}),
+        **_skill_audit_fields(mode, run_result),
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
         "op_kinds": tool_op_kinds(run_result),
@@ -1225,6 +1427,10 @@ def _run_single_in_repo(
         "trajectory_path": trajectory_path,
         **contamination_fields(trajectory_path, task),
         **details,
+        "workspace_diff_lines": workspace_diff_lines,
+        "reference_changed_lines": task.reference_changed_lines,
+        "lint_ok": lint_ok,
+        "lint_reason": lint_reason,
         "reused": False,
         **identity,
     }
@@ -1377,7 +1583,7 @@ class PlanStopped(RuntimeError):
     ``ceiling``: the spend ceiling. ``quota``: a usage limit.
     ``cli-version``: the agent CLI changed, or stopped answering ``--version``, since the cell was planned.
 
-    After the failed cell is stored, it stops for ``mcp-unavailable`` or ``invalid-cell``.
+    After the failed cell is stored, it stops for ``mcp-unavailable``, ``skill-unavailable`` or ``invalid-cell``.
     Those are config-level failures that main aborts on.
     ``rows`` holds the rows this call produced before it stopped; every paid one is stored.
     """
@@ -1635,7 +1841,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
             **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
             "capability": getattr(task, "capability", None), "repetition": cell.repetition,
-            "variant": _variant_metadata(mode), **stamp, **identity, **applied_cap, "reused": False,
+            "variant": _variant_metadata(mode), **erosion.UNMEASURED_FIELDS, **_SKILL_AUDIT_UNMEASURED,
+            **stamp, **identity, **applied_cap,
+            "reused": False,
         }
 
         def fail(fields: dict, charge: float | None = None) -> None:
@@ -1652,9 +1860,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
-        except McpUnavailableError as error:
-            fail({"error": f"mcp_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
-            raise PlanStopped("mcp-unavailable", str(error), rows) from error
+        except ArmUnavailableError as error:
+            fail({"error": f"{error.kind}_unavailable: {error}", "correctness_reason": f"Exception: {error}"})
+            raise PlanStopped(f"{error.kind}-unavailable", str(error), rows) from error
         except subprocess.TimeoutExpired:
             fail({"error": "timeout", "timed_out": True, "correctness_reason": "Subprocess timed out"})
         except (external.task.EnvBuildError, external.task.PrepareError) as error:
@@ -1714,7 +1922,185 @@ def _store_reused_panel_row(stored: dict, stamp: dict, *, store_path: Path, hist
         history.append(copy)
 
 
-def main():
+_MODE_FIELDS = frozenset(field.name for field in _dataclass_fields(ModeConfig))
+_MODE_REQUIRED = frozenset({"name", "tools", "description"})
+# The caller sets policy only. Every other ModeConfig field is provenance the harness computes.
+_MODE_CALLER_FIELDS = frozenset({"name", "tools", "description", "plugin_dir", "prompt_mode", "mcp_config_path"})
+
+
+def _validate_plugin_arm(path: Path, mode: ModeConfig) -> ModeConfig:
+    """Check a plugin arm's manifest and return it stamped with the plugin tree digest."""
+    if mode.mcp_config_path:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' sets plugin_dir with mcp_config_path; "
+                         "a skill arm serves no MCP server")
+    if not os.path.isabs(mode.plugin_dir):
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin_dir must be an absolute path")
+    try:
+        declared = _expected_plugin_skills(mode.plugin_dir)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest failed to load: {error}") from error
+    if not declared:
+        raise ValueError(f"--modes-json {path}: mode '{mode.name}' plugin manifest declares no skills")
+    return replace(mode, plugin_sha256=_tree_sha256(Path(mode.plugin_dir)))
+
+
+def load_modes_json(path: Path) -> list[str]:
+    """Register the arms of a ``--modes-json`` file in ``MODES``; return their names in file order.
+
+    An entry takes ``ModeConfig`` fields only, so no arm can set its own budget or timeout:
+    the harness owns both caps. A plugin arm loads skills and serves no MCP server.
+    """
+    try:
+        entries = json.loads(path.read_text())
+    except OSError as error:
+        raise ValueError(f"cannot read --modes-json {path}: {error}") from error
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"--modes-json {path} must hold a non-empty list of mode objects")
+    loaded: dict[str, ModeConfig] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"--modes-json {path}: every entry must be an object")
+        unknown = sorted(set(entry) - _MODE_FIELDS)
+        if unknown:
+            raise ValueError(f"--modes-json {path}: unknown mode field(s) {unknown}; allowed: {sorted(_MODE_CALLER_FIELDS)}")
+        computed = sorted(set(entry) - _MODE_CALLER_FIELDS)
+        if computed:
+            raise ValueError(f"--modes-json {path}: mode entry '{entry.get('name')}' sets harness-computed "
+                             f"field(s) {computed}; allowed: {sorted(_MODE_CALLER_FIELDS)}")
+        absent = sorted(_MODE_REQUIRED - set(entry))
+        if absent:
+            raise ValueError(f"--modes-json {path}: mode entry lacks {absent}")
+        mode = ModeConfig(**{"mcp_config_path": None, **entry})
+        if not isinstance(mode.tools, list) or not all(isinstance(tool, str) for tool in mode.tools):
+            raise ValueError(f"--modes-json {path}: mode '{mode.name}' tools must be a list of strings")
+        if mode.prompt_mode not in ("replace", "append"):
+            raise ValueError(f"--modes-json {path}: mode '{mode.name}' prompt_mode must be replace or append")
+        if mode.name in MODES or mode.name in loaded:
+            raise ValueError(f"--modes-json {path}: mode name '{mode.name}' is already taken")
+        if mode.plugin_dir:
+            mode = _validate_plugin_arm(path, mode)
+        loaded[mode.name] = mode
+    MODES.update(loaded)
+    return list(loaded)
+
+
+def _select_tasks(args: argparse.Namespace, models: list[str]) -> tuple[object, list[str]]:
+    """Resolve the panel (None unless --panel) and the task list from the CLI args."""
+    if args.panel:
+        if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
+            raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
+                             "sidecar, so every panel row would count as contaminated")
+        panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
+        panel.register(TASKS)
+        return panel, panel.select(args.panel_split)
+    if args.tasks_json:
+        json_tasks = register_json_tasks(args.tasks_json, TASKS)
+        return None, list(json_tasks)
+    return None, select_tasks(args.tasks)
+
+
+def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) -> tuple[list[str], object]:
+    """Resolve the arm (mode) names and the experiment manifest, if any, from the CLI args."""
+    experiment = None
+    if args.experiment:
+        experiment = load_experiment(args.experiment)
+        configured_modes = experiment_modes(
+            experiment,
+            RESULTS_DIR / "configs" / timestamp,
+        )
+        compiler = rustc_version()
+        configured_modes = {
+            name: hydrate_mode_metadata(mode, compiler)
+            for name, mode in configured_modes.items()
+        }
+        MODES.update(configured_modes)
+        modes = [variant.name for variant in experiment.variants]
+        if args.runner == "codex" and "tilth_forced" in modes:
+            raise ValueError("tilth_forced is not supported by the codex runner")
+    elif args.modes_json:
+        modes = load_modes_json(args.modes_json)
+        if any(RUNNERS[model] != "claude" for model in models) and any(
+            _uses_claude_session_features(MODES[name]) for name in modes
+        ):
+            raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
+    else:
+        requested_modes = args.modes or ("baseline,tilth,wozcode" if args.wozcode_plugin_dir else None)
+        modes = select_modes(requested_modes, args.runner)
+        if "wozcode" in modes and not args.wozcode_plugin_dir:
+            raise ValueError("wozcode mode requires --wozcode-plugin-dir")
+    return modes, experiment
+
+
+def _verify_mcp_servers(modes: list[str], runner: Optional[str]) -> None:
+    """Verify the exact MCP command that each selected runner will launch."""
+    for mode_name in modes:
+        cfg_path = MODES[mode_name].mcp_config_path
+        try:
+            server_commands = mcp_server_commands(mode_name, runner)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"ERROR: cannot read MCP config {cfg_path} for mode '{mode_name}': {e}", file=sys.stderr)
+            sys.exit(1)
+        for server_name, cmd_str in server_commands.items():
+            resolved = shutil.which(cmd_str) if "/" not in cmd_str else (cmd_str if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) else None)
+            if not resolved:
+                print(f"ERROR: MCP server '{server_name}' in {cfg_path} (mode '{mode_name}')", file=sys.stderr)
+                print(f"       command '{cmd_str}' is not executable / not on PATH.", file=sys.stderr)
+                print(f"       Fix the 'command' field in {cfg_path} or install the binary.", file=sys.stderr)
+                sys.exit(1)
+            # Smoke-test the binary with --version to catch broken installs.
+            try:
+                probe = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
+                if probe.returncode != 0:
+                    print(f"WARNING: MCP server '{server_name}' --version exited {probe.returncode}: {probe.stderr.strip()}", file=sys.stderr)
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                print(f"ERROR: MCP server '{server_name}' at {resolved} failed to run: {e}", file=sys.stderr)
+                sys.exit(1)
+            if server_name == "tilth" and MODES[mode_name].binary_sha256 is None:
+                with open(resolved, "rb") as binary:
+                    digest = hashlib.file_digest(binary, "sha256").hexdigest()
+                MODES[mode_name] = replace(
+                    MODES[mode_name], binary_path=str(Path(resolved).resolve()),
+                    binary_sha256=digest,
+                )
+
+
+def _clone_on_demand_repos(repo_names: set[str]) -> None:
+    """Clone each mined repo a selected task needs, ahead of any `Task.fixture_path` read."""
+    for repo_name in sorted(repo_names):
+        repo = REPOS.get(repo_name)
+        if repo is None or not repo.on_demand_clone:
+            continue
+        try:
+            repo.ensure_cloned()
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
+            sys.exit(1)
+
+
+def _prepare_repos(selected_repos: set[str], *, verbose: bool) -> None:
+    """Check each selected real-world repo exists, then clean it."""
+    for repo_name in selected_repos:
+        repo_path = REPOS[repo_name].path
+        if not repo_path.exists():
+            print(f"ERROR: Repo '{repo_name}' not cloned.")
+            print(f"Expected at: {repo_path}")
+            print("Run setup_repos.py to clone repositories:")
+            print("  python benchmark/fixtures/setup_repos.py")
+            sys.exit(1)
+
+    # Clean real-world repos before starting (removes junk files from previous runs)
+    for repo_name in selected_repos:
+        repo_path = REPOS[repo_name].path
+        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
+        if verbose:
+            print(f"Cleaned repo: {repo_name}")
+
+
+def _run_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def main(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1783,6 +2169,18 @@ Examples:
         help="Comma-separated task names or 'all' (default: all)",
     )
     parser.add_argument(
+        "--tasks-json",
+        type=Path,
+        help="JSON file of task definitions (mutation or mined shape); runs exactly those tasks. "
+             "Excludes --tasks and --panel",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write result rows to this JSONL path (default: benchmark/results/benchmark_<timestamp>.jsonl); "
+             "stream logs go to a sibling <stem>_streams directory",
+    )
+    parser.add_argument(
         "--panel",
         type=Path,
         help="Run a pre-registered panel (benchmark/panels/<name>.json); excludes --tasks and --repos",
@@ -1807,6 +2205,12 @@ Examples:
         type=Path,
         help="Pinned variant experiment manifest",
     )
+    arm_group.add_argument(
+        "--modes-json",
+        type=Path,
+        help="JSON list of ModeConfig objects (skill-plugin arms); runs exactly those arms. "
+             "Excludes --panel",
+    )
     parser.add_argument(
         "--repos",
         default="all",
@@ -1830,7 +2234,7 @@ Examples:
              "codex: ignores user config and rules, and resets MCP servers.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.reps < 1:
         parser.error("--reps must be at least 1")
     if args.max_cells is not None and args.max_cells < 1:
@@ -1846,9 +2250,17 @@ Examples:
         parser.error("--panel selects its own tasks; it cannot be combined with --tasks or --repos")
     if args.panel_split != "all" and not args.panel:
         parser.error("--panel-split requires --panel")
+    if args.modes_json and args.panel:
+        parser.error("--modes-json cannot be combined with --panel")
+    if args.tasks_json and args.panel:
+        parser.error("--tasks-json cannot be combined with --panel")
+    if args.tasks_json and args.tasks.lower() != "all":
+        parser.error("--tasks-json selects its own tasks; it cannot be combined with --tasks")
+    if args.output is not None and args.output.is_dir():
+        parser.error(f"--output {args.output} is a directory; pass a file path")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = _run_timestamp()
     experiment = None
     panel = None
     try:
@@ -1861,36 +2273,9 @@ Examples:
             if any(RUNNERS[model] != "claude" for model in models):
                 raise ValueError("--wozcode-plugin-dir requires Claude models")
             MODES["wozcode"] = wozcode_mode(args.wozcode_plugin_dir)
-        if args.panel:
-            if any(RUNNERS[model] not in TRAJECTORY_RUNNERS for model in models):
-                raise ValueError("--panel requires claude or codex models; other runners write no trajectory "
-                                 "sidecar, so every panel row would count as contaminated")
-            panel = panels.load_panel(args.panel, store_path=RESULTS_DIR / baselines.STORE_FILENAME)
-            panel.register(TASKS)
-            tasks_list = panel.select(args.panel_split)
-        else:
-            tasks_list = select_tasks(args.tasks)
-        if args.experiment:
-            experiment = load_experiment(args.experiment)
-            configured_modes = experiment_modes(
-                experiment,
-                RESULTS_DIR / "configs" / timestamp,
-            )
-            compiler = rustc_version()
-            configured_modes = {
-                name: hydrate_mode_metadata(mode, compiler)
-                for name, mode in configured_modes.items()
-            }
-            MODES.update(configured_modes)
-            modes = [variant.name for variant in experiment.variants]
-            if args.runner == "codex" and "tilth_forced" in modes:
-                raise ValueError("tilth_forced is not supported by the codex runner")
-        else:
-            requested_modes = args.modes or ("baseline,tilth,wozcode" if args.wozcode_plugin_dir else None)
-            modes = select_modes(requested_modes, args.runner)
-            if "wozcode" in modes and not args.wozcode_plugin_dir:
-                raise ValueError("wozcode mode requires --wozcode-plugin-dir")
-    except ValueError as error:
+        panel, tasks_list = _select_tasks(args, models)
+        modes, experiment = _select_arms(args, models, timestamp)
+    except (ValueError, OSError) as error:
         parser.error(str(error))
     if args.candidate_sha:
         if experiment is not None:
@@ -1903,36 +2288,7 @@ Examples:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
 
-    # Verify the exact MCP command that each selected runner will launch.
-    for mode_name in modes:
-        cfg_path = MODES[mode_name].mcp_config_path
-        try:
-            server_commands = mcp_server_commands(mode_name, args.runner)
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"ERROR: cannot read MCP config {cfg_path} for mode '{mode_name}': {e}", file=sys.stderr)
-            sys.exit(1)
-        for server_name, cmd_str in server_commands.items():
-            resolved = shutil.which(cmd_str) if "/" not in cmd_str else (cmd_str if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) else None)
-            if not resolved:
-                print(f"ERROR: MCP server '{server_name}' in {cfg_path} (mode '{mode_name}')", file=sys.stderr)
-                print(f"       command '{cmd_str}' is not executable / not on PATH.", file=sys.stderr)
-                print(f"       Fix the 'command' field in {cfg_path} or install the binary.", file=sys.stderr)
-                sys.exit(1)
-            # Smoke-test the binary with --version to catch broken installs.
-            try:
-                probe = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=5)
-                if probe.returncode != 0:
-                    print(f"WARNING: MCP server '{server_name}' --version exited {probe.returncode}: {probe.stderr.strip()}", file=sys.stderr)
-            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                print(f"ERROR: MCP server '{server_name}' at {resolved} failed to run: {e}", file=sys.stderr)
-                sys.exit(1)
-            if server_name == "tilth" and MODES[mode_name].binary_sha256 is None:
-                with open(resolved, "rb") as binary:
-                    digest = hashlib.file_digest(binary, "sha256").hexdigest()
-                MODES[mode_name] = replace(
-                    MODES[mode_name], binary_path=str(Path(resolved).resolve()),
-                    binary_sha256=digest,
-                )
+    _verify_mcp_servers(modes, args.runner)
 
     # Filter tasks by repo
     if args.repos.lower() != "all":
@@ -1952,6 +2308,9 @@ Examples:
     except ValueError as error:
         parser.error(str(error))
 
+    # Mined repos clone first: `fixture_path` clones on demand and must not escape as a traceback.
+    _clone_on_demand_repos({TASKS[name].repo for name in tasks_list})
+
     # Tasks without a fixture build their own workdirs; only the rest copy fixtures.
     fixture_tasks = [name for name in tasks_list if TASKS[name].fixture_path is not None]
 
@@ -1965,23 +2324,8 @@ Examples:
             )
         reset_repo()
 
-    # Validate real-world repos exist (for selected tasks)
     selected_repos = set(TASKS[t].repo for t in fixture_tasks) - {"synthetic"}
-    for repo_name in selected_repos:
-        repo_path = REPOS[repo_name].path
-        if not repo_path.exists():
-            print(f"ERROR: Repo '{repo_name}' not cloned.")
-            print(f"Expected at: {repo_path}")
-            print("Run setup_repos.py to clone repositories:")
-            print("  python benchmark/fixtures/setup_repos.py")
-            sys.exit(1)
-
-    # Clean real-world repos before starting (removes junk files from previous runs)
-    for repo_name in selected_repos:
-        repo_path = REPOS[repo_name].path
-        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
-        if args.verbose:
-            print(f"Cleaned repo: {repo_name}")
+    _prepare_repos(selected_repos, verbose=args.verbose)
 
 
     bare = args.bare or experiment is not None or args.wozcode_plugin_dir is not None or args.strict_file_tools
@@ -2053,8 +2397,13 @@ Examples:
 
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
-    output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
-    stream_log_dir = RESULTS_DIR / "streams" / timestamp
+    if args.output is not None:
+        output_file = args.output
+        stream_log_dir = output_file.parent / f"{output_file.stem}_streams" / timestamp
+    else:
+        output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
+        stream_log_dir = RESULTS_DIR / "streams" / timestamp
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Print configuration summary
     print("=" * 70)
@@ -2206,6 +2555,8 @@ Examples:
                 "repetition": rep,
                 "per_turn_output_tokens": [],
                 "variant": _variant_metadata(mode),
+                **erosion.UNMEASURED_FIELDS,
+                **_SKILL_AUDIT_UNMEASURED,
                 **experiment_metadata,
                 **cell.identity,
                 "reused": False,
@@ -2246,19 +2597,17 @@ Examples:
                 print("\nAborting run: invalid Codex cell; inspect its raw stream.")
                 sys.exit(1)
 
-            except McpUnavailableError as error:
-                # Config-level failure: every later cell in this
-                # mode would fail identically. Abort instead of
-                # burning budget on an invalid comparison.
-                print(f"  ✗ MCP UNAVAILABLE: {error}")
+            except ArmUnavailableError as error:
+                # Config-level failure: every later cell of this arm would fail
+                # identically. Abort instead of burning budget on an invalid comparison.
+                print(f"  ✗ {error.kind.upper()} UNAVAILABLE: {error}")
                 record_failure({
                     **record_metadata,
-                    "error": f"mcp_unavailable: {error}",
+                    "error": f"{error.kind}_unavailable: {error}",
                     "correct": False,
                     "correctness_reason": f"Exception: {error}",
                 }, stream_log_path, runner, estimate)
-                print("\nAborting run: the MCP-armed mode is "
-                      "misconfigured; fix it and re-run.")
+                print(f"\nAborting run: {error.abort_hint}; fix it and re-run.")
                 sys.exit(1)
 
             except subprocess.TimeoutExpired:

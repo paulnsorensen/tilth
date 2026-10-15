@@ -1,8 +1,11 @@
+import hashlib
 import os
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Sequence
 
 
 def resolve_tilth_bin() -> str:
@@ -69,6 +72,7 @@ class ModeConfig:
     plugin_version: Optional[str] = None
     plugin_git_sha: Optional[str] = None
     plugin_sha256: Optional[str] = None
+    prompt_mode: Literal["replace", "append"] = "replace"
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -102,10 +106,147 @@ class RepoConfig:
     language: str
     description: str
     license: str = "MIT"
+    on_demand_clone: bool = False
+    path_override: Optional[Path] = None
 
     @property
     def path(self) -> Path:
+        if self.path_override is not None:
+            return self.path_override
         return REPOS_DIR / self.name
+
+    def _shared_clone(self, extra_commits: Sequence[str] = ()) -> Path:
+        """One no-checkout clone per `url`, shared by every per-commit repo."""
+        shared = self.path.parent / ".shared" / hashlib.sha256(self.url.encode()).hexdigest()[:16]
+        if not shared.exists():
+            _clone_into(self.url, shared, no_checkout=True)
+        _ensure_commit(shared, self.commit_sha, *extra_commits)
+        return shared
+
+    def ensure_cloned(self, extra_commits: Sequence[str] = ()) -> None:
+        """Clone and check out an on-demand repo the first time its path is needed.
+
+        Each `url` is cloned once (no checkout); the per-commit repo is a local
+        clone of that shared clone. Both land via a staging directory and a
+        rename, so a failed clone never leaves a half-cloned path behind.
+        `extra_commits` are further commits the caller will check out (a mined
+        task's `head_sha`); they are fetched into the shared clone and, for a
+        repo cloned earlier, into the per-commit repo.
+        """
+        if not self.on_demand_clone:
+            return
+        if not self.path.exists():
+            _clone_into(
+                str(self._shared_clone(extra_commits)), self.path,
+                checkout=self.commit_sha, no_checkout=True,
+            )
+            return
+        absent = [sha for sha in extra_commits if not _has_commit(self.path, sha)]
+        if absent:
+            shared = self._shared_clone(absent)
+            for sha in absent:
+                subprocess.run(
+                    ["git", "fetch", str(shared), f"+refs/heads/tilth-pin-{sha}:refs/tilth/pin-{sha}"],
+                    cwd=str(self.path), check=True, capture_output=True, text=True, env=_git_env(),
+                    timeout=GIT_NETWORK_TIMEOUT_S,
+                )
+
+    def resolved_path(self, extra_commits: Sequence[str] = ()) -> Path:
+        """The repo's path, cloning an on-demand repo first if it is missing."""
+        self.ensure_cloned(extra_commits)
+        return self.path
+
+
+_GIT_ENV_OVERRIDES = {"GIT_TERMINAL_PROMPT": "0"}
+GIT_NETWORK_TIMEOUT_S = 900
+
+
+def _git_env() -> dict[str, str]:
+    return {**os.environ, **_GIT_ENV_OVERRIDES}
+
+
+def _ensure_commit(shared: Path, *shas: str) -> None:
+    """Make every `sha` present (and reachable from a branch) in the shared clone.
+
+    A shared clone made before a `sha` existed upstream lacks it. Fetch each missing SHA,
+    fall back to a full fetch of heads, tags and pull-request heads when the server refuses
+    fetching by SHA, and pin each under a branch so later local clones of the shared clone carry it.
+    """
+    def run(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=str(shared), capture_output=True, text=True, env=_git_env(),
+                timeout=GIT_NETWORK_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(args, 124, "", "timed out")
+
+    def missing() -> list[str]:
+        return [sha for sha in shas if run("cat-file", "-e", f"{sha}^{{commit}}").returncode != 0]
+
+    last_error = ""
+    absent = missing()
+    for sha in absent:
+        fetched = run("fetch", "origin", sha)
+        if fetched.returncode != 0:
+            last_error = (fetched.stderr or "").strip()
+    absent = missing()
+    if absent:
+        full = run("fetch", "origin", "+refs/heads/*:refs/remotes/origin/*", "--tags")
+        if full.returncode != 0:
+            last_error = (full.stderr or "").strip()
+        run("fetch", "origin", "+refs/pull/*/head:refs/remotes/origin/pr/*")  # absent on non-GitHub remotes
+        absent = missing()
+    if absent:
+        tail = f": {last_error[-300:]}" if last_error else ""
+        raise RuntimeError(
+            f"commit {', '.join(absent)} is missing from {shared} and could not be fetched from origin{tail}"
+        )
+    for sha in shas:
+        run("update-ref", f"refs/heads/tilth-pin-{sha}", sha)
+
+
+def _clone_into(source: str, dest: Path, *, checkout: Optional[str] = None, no_checkout: bool = False) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(dest.parent)) as staging:
+        clone_path = Path(staging) / "clone"
+        command = ["git", "clone", *(["--no-checkout"] if no_checkout else []), "--", source, str(clone_path)]
+        try:
+            subprocess.run(
+                command, check=True, capture_output=True, text=True, env=_git_env(),
+                timeout=GIT_NETWORK_TIMEOUT_S,
+            )
+            if checkout:
+                subprocess.run(
+                    ["git", "checkout", checkout, "--"],
+                    cwd=str(clone_path), check=True, capture_output=True, text=True, env=_git_env(),
+                    timeout=GIT_NETWORK_TIMEOUT_S,
+                )
+        except subprocess.TimeoutExpired as error:
+            raise OSError(f"git {error.cmd[1]} of {source} timed out after {GIT_NETWORK_TIMEOUT_S}s") from error
+        try:
+            os.rename(str(clone_path), str(dest))
+        except OSError:
+            # Another process finished the same clone first; its copy stands if it is a valid repo.
+            if not _is_git_repo(dest):
+                raise
+
+
+def _has_commit(path: Path, sha: str) -> bool:
+    probe = subprocess.run(
+        ["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=str(path), capture_output=True, text=True,
+        env=_git_env(),
+    )
+    return probe.returncode == 0
+
+
+def _is_git_repo(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    probe = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(path), capture_output=True, text=True, env=_git_env(),
+    )
+    return probe.returncode == 0
 
 
 REPOS = {

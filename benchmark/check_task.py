@@ -18,6 +18,7 @@ from config import REPOS
 from fixtures.reset import ensure_repo_clean, reset_repo, restore_git
 from run import get_repo_path
 from tasks import TASKS
+from tasks.json_tasks import JsonMinedTask, register_json_tasks
 
 
 CAPABILITIES = frozenset({"locate", "trace", "fix", "debug", "control"})
@@ -178,14 +179,73 @@ def check_task(task_name: str) -> bool:
     return False
 
 
+def _with_stderr(exc: BaseException) -> str:
+    """`exc` text, plus its captured stderr when a subprocess error carries one."""
+    stderr = _text(getattr(exc, "stderr", None)).strip()
+    return f"{exc}: {stderr}" if stderr else str(exc)
+
+
+def check_mined_task(task_name: str) -> bool:
+    """Prove a mined task fails at `base_sha` and passes at `head_sha`."""
+    task = TASKS[task_name]
+    metadata_error = validate_task_metadata(task)
+    if metadata_error:
+        print(f"FAIL {task_name}: {metadata_error}")
+        return False
+
+    reason: str | None = None
+    repo_path: Path | None = None
+    try:
+        if task.repo in REPOS:
+            REPOS[task.repo].ensure_cloned([task.head_sha])
+        repo_path = get_repo_path(task.repo)
+        ensure_repo_clean(repo_path, task.base_sha)
+        before_ok, before_reason = task.check_correctness("", str(repo_path))
+        if before_ok:
+            reason = f"test_command passed at base_sha (expected a failure): {before_reason}"
+        else:
+            ensure_repo_clean(repo_path, task.head_sha)
+            after_ok, after_reason = task.check_correctness("", str(repo_path))
+            if not after_ok:
+                reason = f"test_command failed at head_sha: {after_reason}"
+    except Exception as exc:
+        reason = f"mined preflight raised {type(exc).__name__}: {_with_stderr(exc)}"
+    finally:
+        if repo_path is not None:
+            try:
+                ensure_repo_clean(repo_path, task.base_sha)
+            except Exception as exc:
+                cleanup_reason = f"cleanup failed: {type(exc).__name__}: {_with_stderr(exc)}"
+                reason = cleanup_reason if reason is None else f"{reason}; {cleanup_reason}"
+
+    if reason is None:
+        print(f"PASS {task_name}: fails at base_sha, passes at head_sha")
+        return True
+    print(f"FAIL {task_name}: {reason}")
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check benchmark mutation tasks")
     parser.add_argument("task", nargs="?", help="registered task name (default: all tasks)")
+    parser.add_argument(
+        "--tasks-json", type=Path,
+        help="JSON file of task definitions to check instead of the static task set",
+    )
     args = parser.parse_args(argv)
 
+    if args.tasks_json:
+        try:
+            task_universe = register_json_tasks(args.tasks_json, TASKS)
+        except (ValueError, OSError) as error:
+            print(f"Cannot load --tasks-json: {error}", file=sys.stderr)
+            return 2
+    else:
+        task_universe = TASKS
+
     if args.task is None:
-        task_names = list(TASKS)
-    elif args.task not in TASKS:
+        task_names = list(task_universe)
+    elif args.task not in task_universe:
         print(f"Unknown task: {args.task}", file=sys.stderr)
         return 2
     else:
@@ -203,7 +263,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     failures = 0
     for name in task_names:
-        if not check_task(name):
+        checker = check_mined_task if isinstance(TASKS[name], JsonMinedTask) else check_task
+        if not checker(name):
             failures += 1
     return 1 if failures else 0
 

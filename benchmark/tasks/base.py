@@ -10,6 +10,19 @@ import baselines
 from config import REPOS, SYNTHETIC_REPO
 
 
+DEV_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "dev",
+    "GIT_AUTHOR_EMAIL": "dev@test.com",
+    "GIT_COMMITTER_NAME": "dev",
+    "GIT_COMMITTER_EMAIL": "dev@test.com",
+}
+
+
+def dev_git_env() -> dict[str, str]:
+    """The current environment with the dev git identity applied, read at call time."""
+    return {**os.environ, **DEV_GIT_IDENTITY}
+
+
 @dataclass
 class Mutation:
     """A single file mutation: replace `original` with `mutated` to introduce a bug."""
@@ -98,7 +111,7 @@ class Task(ABC):
     @property
     def fixture_path(self) -> Path | None:
         """Local fixture repo that cells copy; None for a task that builds its own workdir."""
-        return SYNTHETIC_REPO if self.repo == "synthetic" else REPOS[self.repo].path
+        return SYNTHETIC_REPO if self.repo == "synthetic" else REPOS[self.repo].resolved_path()
 
     def prepare(self, workdir: Path) -> None:
         """Make the cell workdir ready for the agent; a local task applies its mutations."""
@@ -142,6 +155,16 @@ class Task(ABC):
         return []
 
     @property
+    def reference_changed_lines(self) -> int | None:
+        """Changed-line count of the reference fix, for erosion-guard scoring. None = not defined."""
+        return None
+
+    @property
+    def lint_command(self) -> list[str]:
+        """Command to lint the workspace. Empty = no lint-based scoring."""
+        return []
+
+    @property
     def hide_git(self) -> bool:
         """Hide repository history for fix tasks unless the task opts out."""
         return self.capability == "fix" and bool(self.mutations)
@@ -163,13 +186,7 @@ class Task(ABC):
             return
 
         mutated_files = [m.file_path for m in self.mutations]
-        git_env = {
-            "GIT_AUTHOR_NAME": "dev",
-            "GIT_AUTHOR_EMAIL": "dev@test.com",
-            "GIT_COMMITTER_NAME": "dev",
-            "GIT_COMMITTER_EMAIL": "dev@test.com",
-        }
-        env = {**os.environ, **git_env}
+        env = dev_git_env()
         subprocess.run(
             ["git", "add"] + mutated_files,
             cwd=repo_path, check=True, capture_output=True, env=env,

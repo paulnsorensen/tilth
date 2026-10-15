@@ -58,6 +58,10 @@ class RunResult:
     correctness_reason: str = ""
     available_tools: list[str] = field(default_factory=list)
     mcp_servers: list[dict] = field(default_factory=list)
+    # From the init event: loaded skills as "<plugin>:<skill>", plugins trimmed to name and path.
+    skills: list[str] = field(default_factory=list)
+    plugins: list[dict] = field(default_factory=list)
+    plugin_errors: list = field(default_factory=list)
     model_usage: dict[str, dict] = field(default_factory=dict)
     # "native" when the runner reported the cost, "pricing" when pricing.yaml computed it.
     cost_source: Literal["native", "pricing"] = "native"
@@ -130,6 +134,25 @@ def _priced_stream_cost(turns: list[Turn], model: str | None) -> float:
     }).values())
 
 
+def _init_skills(event: dict) -> list[str]:
+    skills = event.get("skills")
+    return [skill for skill in skills if isinstance(skill, str)] if isinstance(skills, list) else []
+
+
+def _init_plugins(event: dict) -> list[dict]:
+    """Keep only each plugin's ``name`` and ``path`` from the init event."""
+    plugins = event.get("plugins")
+    if not isinstance(plugins, list):
+        return []
+    return [{key: plugin[key] for key in ("name", "path") if key in plugin}
+            for plugin in plugins if isinstance(plugin, dict)]
+
+
+def _init_plugin_errors(event: dict) -> list:
+    errors = event.get("plugin_errors")
+    return list(errors) if isinstance(errors, list) else []
+
+
 def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
     """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose.
 
@@ -146,6 +169,9 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
     final_summary = {}
     available_tools: list[str] = []
     mcp_servers: list[dict] = []
+    skills: list[str] = []
+    plugins: list[dict] = []
+    plugin_errors: list = []
     stream_model: str | None = None
 
     for event in events:
@@ -156,6 +182,9 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
             if event.get("subtype") == "init":
                 available_tools = event.get("tools", [])
                 mcp_servers = event.get("mcp_servers", [])
+                skills = _init_skills(event)
+                plugins = _init_plugins(event)
+                plugin_errors = _init_plugin_errors(event)
                 stream_model = event.get("model") or stream_model
 
         elif event_type == "assistant":
@@ -236,6 +265,9 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
         result_text="\n".join(result_text_parts),
         available_tools=available_tools,
         mcp_servers=mcp_servers,
+        skills=skills,
+        plugins=plugins,
+        plugin_errors=plugin_errors,
         model_usage=_trim_model_usage(final_summary.get("modelUsage")),
     )
 

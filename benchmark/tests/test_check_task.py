@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -278,3 +279,250 @@ def test_nonmutation_task_reports_no_preflight_and_succeeds(monkeypatch, capsys)
     assert check_task.main([task.name]) == 0
     assert capsys.readouterr().out == "PASS fixture_task: no mutation preflight needed\n"
     reset.assert_not_called()
+
+
+def test_tasks_json_restricts_universe_and_routes_mined_tasks(monkeypatch, tmp_path):
+    from tasks.json_tasks import JsonMinedTask
+
+    mined_task = JsonMinedTask(
+        id="mined_task", capability_="fix", prompt_="p", repo_name="r",
+        base_sha="a" * 40, head_sha="b" * 40, test_patch="",
+        test_command_=["python3", "-m", "pytest"], reference_changed_lines_=1,
+    )
+
+    def fake_load_json_tasks(path):
+        return {"mined_task": mined_task}
+
+    monkeypatch.setattr("tasks.json_tasks.load_json_tasks", fake_load_json_tasks)
+    monkeypatch.setattr(check_task, "TASKS", {"other_task": FakeTask(name="other_task")})
+    monkeypatch.setattr(check_task, "validate_task_metadata", lambda task: None)
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        check_task, "check_mined_task",
+        lambda name: calls.append(("mined", name)) or True,
+    )
+    monkeypatch.setattr(
+        check_task, "check_task",
+        lambda name: calls.append(("plain", name)) or True,
+    )
+
+    assert check_task.main(["--tasks-json", str(tmp_path / "tasks.json")]) == 0
+    assert calls == [("mined", "mined_task")]
+
+
+def test_routing_uses_isinstance_not_duck_typing(monkeypatch, tmp_path):
+    """A plain task that happens to carry a `base_sha` attribute must still
+    route through `check_task`, not `check_mined_task` (regression for
+    hasattr-based routing)."""
+    plain_task = FakeTask(name="plain_task", mutations=[], test_command=[])
+    plain_task.base_sha = "c" * 40  # duck-typing bait; not a JsonMinedTask
+    monkeypatch.setattr(check_task, "TASKS", {"plain_task": plain_task})
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        check_task, "check_mined_task",
+        lambda name: calls.append(("mined", name)) or True,
+    )
+    monkeypatch.setattr(
+        check_task, "check_task",
+        lambda name: calls.append(("plain", name)) or True,
+    )
+
+    assert check_task.main(["plain_task"]) == 0
+    assert calls == [("plain", "plain_task")]
+
+
+def _git(*args, cwd, env=None):
+    full_env = {**os.environ, **(env or {})}
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True, env=full_env,
+    )
+
+
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "dev", "GIT_AUTHOR_EMAIL": "dev@test.com",
+    "GIT_COMMITTER_NAME": "dev", "GIT_COMMITTER_EMAIL": "dev@test.com",
+}
+
+_TEST_PATCH = (
+    "diff --git a/test_arithmetic.py b/test_arithmetic.py\n"
+    "--- a/test_arithmetic.py\n"
+    "+++ b/test_arithmetic.py\n"
+    "@@ -0,0 +1,3 @@\n"
+    "+def test_add():\n"
+    "+    from arithmetic import add\n"
+    "+    assert add(2, 3) == 5\n"
+)
+_TEST_COMMAND = ["python3", "-m", "pytest", "test_arithmetic.py", "-q"]
+
+
+def _build_local_mined_repo(tmp_path):
+    """Build a bare repo with a buggy base commit and a fixing head commit.
+
+    Returns `(bare_url, base_sha, head_sha)`; `_TEST_PATCH`/`_TEST_COMMAND`
+    describe the regression test the patch adds at grading time.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    _git("init", "-q", str(work), cwd=str(tmp_path))
+    (work / "arithmetic.py").write_text("def add(a, b):\n    return a - b\n")
+    (work / "test_arithmetic.py").write_text("")
+    _git("add", "-A", cwd=str(work), env=_GIT_ENV)
+    _git("commit", "-qm", "base", cwd=str(work), env=_GIT_ENV)
+    base_sha = _git("rev-parse", "HEAD", cwd=str(work)).stdout.strip()
+
+    (work / "arithmetic.py").write_text("def add(a, b):\n    return a + b\n")
+    _git("add", "-A", cwd=str(work), env=_GIT_ENV)
+    _git("commit", "-qm", "fix: add instead of subtract", cwd=str(work), env=_GIT_ENV)
+    head_sha = _git("rev-parse", "HEAD", cwd=str(work)).stdout.strip()
+
+    bare = tmp_path / "bare.git"
+    _git("clone", "-q", "--bare", str(work), str(bare), cwd=str(tmp_path))
+    return str(bare), base_sha, head_sha
+
+
+def _install_mined_task(monkeypatch, tmp_path, task_id, base_sha, head_sha, bare_url, clone_name):
+    """Register a `JsonMinedTask` built directly from real shas, cloned fresh."""
+    from config import RepoConfig
+    from tasks import base as base_module
+    from tasks.json_tasks import JsonMinedTask
+    from tasks import json_tasks as json_tasks_module
+
+    repo_name = "acme-local"
+    task = JsonMinedTask(
+        id=task_id, capability_="fix",
+        prompt_="Fix add().", repo_name=repo_name, base_sha=base_sha,
+        head_sha=head_sha, test_patch=_TEST_PATCH,
+        test_command_=_TEST_COMMAND, reference_changed_lines_=1,
+    )
+    clone_path = tmp_path / clone_name
+    _git("clone", "-q", bare_url, str(clone_path), cwd=str(tmp_path))
+    repo_config = RepoConfig(
+        name=repo_name, url=bare_url, commit_sha=head_sha,
+        language="python", description="test fixture",
+        path_override=clone_path,
+    )
+
+    monkeypatch.setattr(check_task, "TASKS", {task.name: task})
+    monkeypatch.setattr(check_task, "get_repo_path", lambda repo: clone_path)
+    monkeypatch.setattr(base_module, "REPOS", {repo_name: repo_config})
+    monkeypatch.setattr(json_tasks_module, "REPOS", {repo_name: repo_config})
+    return task
+
+
+def test_check_mined_task_passes_when_base_fails_and_head_passes(monkeypatch, tmp_path, capsys):
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-42", base_sha, head_sha, bare_url, "clone")
+
+    assert check_task.main(["acme-42"]) == 0
+    assert capsys.readouterr().out == "PASS acme-42: fails at base_sha, passes at head_sha\n"
+    assert _git("rev-parse", "HEAD", cwd=str(tmp_path / "clone")).stdout.strip() == base_sha
+
+
+def test_check_mined_task_fetches_a_head_sha_the_clone_does_not_hold(monkeypatch, tmp_path, capsys):
+    """`head_sha` sits only on `refs/pull/1/head` and the per-commit clone predates it, so
+    the preflight passes only if `check_mined_task` asks `ensure_cloned` for `head_sha`."""
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    branch = _git("symbolic-ref", "--short", "HEAD", cwd=bare_url).stdout.strip()
+    _git("update-ref", "refs/pull/1/head", head_sha, cwd=bare_url)
+    _git("update-ref", f"refs/heads/{branch}", base_sha, cwd=bare_url)
+    # A file:// URL makes the clone transfer only the refs it asks for; a plain path hardlinks every object.
+    _install_mined_task(monkeypatch, tmp_path, "acme-47", base_sha, head_sha, f"file://{bare_url}", "clone6")
+    from tasks import base as base_module
+
+    monkeypatch.setattr(base_module.REPOS["acme-local"], "on_demand_clone", True)
+    monkeypatch.setattr(check_task, "REPOS", base_module.REPOS)  # `check_task` bound its own name
+
+    assert check_task.main(["acme-47"]) == 0
+    assert capsys.readouterr().out == "PASS acme-47: fails at base_sha, passes at head_sha\n"
+
+
+def test_check_mined_task_reports_a_clone_failure_as_fail_with_stderr(monkeypatch, tmp_path, capsys):
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-45", base_sha, head_sha, bare_url, "clone4")
+
+    def failing_clone(repo):
+        raise subprocess.CalledProcessError(128, ["git", "clone"], stderr="fatal: repository not found")
+
+    monkeypatch.setattr(check_task, "get_repo_path", failing_clone)
+
+    assert check_task.main(["acme-45"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("FAIL acme-45: ") and "fatal: repository not found" in out
+
+
+def test_check_mined_task_restores_untracked_files_and_hidden_git(monkeypatch, tmp_path):
+    bare_url, base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-46", base_sha, head_sha, bare_url, "clone5")
+    clone = tmp_path / "clone5"
+    (clone / "junk.txt").write_text("left by a previous run")
+    (clone / ".git").rename(clone / ".git_hidden")
+
+    assert check_task.main(["acme-46"]) == 0
+    assert (clone / ".git").is_dir() and not (clone / ".git_hidden").exists()
+    assert not (clone / "junk.txt").exists()
+
+
+def test_check_mined_task_fails_when_test_passes_at_base(monkeypatch, tmp_path, capsys):
+    """An already-fixed "base" (base_sha == head_sha) passes the regression
+    test immediately, so `check_mined_task` must fail before checking head."""
+    bare_url, _base_sha, head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-43", head_sha, head_sha, bare_url, "clone2")
+
+    assert check_task.main(["acme-43"]) == 1
+    assert "passed at base_sha" in capsys.readouterr().out
+
+
+def test_check_mined_task_fails_when_test_still_fails_at_head(monkeypatch, tmp_path, capsys):
+    """A "head" that never applied the fix (head_sha == base_sha) still
+    fails the regression test, so `check_mined_task` must fail."""
+    bare_url, base_sha, _head_sha = _build_local_mined_repo(tmp_path)
+    _install_mined_task(monkeypatch, tmp_path, "acme-44", base_sha, base_sha, bare_url, "clone3")
+
+    assert check_task.main(["acme-44"]) == 1
+    assert "failed at head_sha" in capsys.readouterr().out
+
+
+def _mined_json(tmp_path, *ids):
+    path = tmp_path / "tasks.json"
+    import json
+
+    path.write_text(json.dumps({"tasks": [
+        {"id": task_id, "prompt": "p", "repo_url": "https://example.com/a.git",
+         "base_sha": "a" * 40, "head_sha": "b" * 40, "test_command": ["pytest"],
+         "test_patch": "diff --git a/t.py b/t.py\n"}
+        for task_id in ids
+    ]}))
+    return path
+
+
+def test_tasks_json_rejects_a_task_name_outside_the_json_universe(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(check_task, "TASKS", {"static_task": FakeTask(name="static_task")})
+    calls: list[str] = []
+    monkeypatch.setattr(check_task, "check_task", lambda name: calls.append(name) or True)
+    monkeypatch.setattr(check_task, "check_mined_task", lambda name: calls.append(name) or True)
+
+    code = check_task.main(["static_task", "--tasks-json", str(_mined_json(tmp_path, "json_one"))])
+
+    assert code == 2
+    assert "Unknown task: static_task" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_tasks_json_refuses_an_empty_file_and_a_colliding_id(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(check_task, "TASKS", {"static_task": FakeTask(name="static_task")})
+
+    assert check_task.main(["--tasks-json", str(_mined_json(tmp_path))]) == 2
+    assert "holds no tasks" in capsys.readouterr().err
+    assert check_task.main(["--tasks-json", str(_mined_json(tmp_path, "static_task"))]) == 2
+    assert "collides with an existing task" in capsys.readouterr().err
+
+
+def test_no_tasks_json_still_checks_every_static_task(monkeypatch):
+    monkeypatch.setattr(check_task, "TASKS", {"a": FakeTask(name="a"), "b": FakeTask(name="b")})
+    calls: list[str] = []
+    monkeypatch.setattr(check_task, "check_task", lambda name: calls.append(name) or True)
+
+    assert check_task.main([]) == 0
+    assert calls == ["a", "b"]
