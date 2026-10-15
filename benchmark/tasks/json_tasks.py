@@ -15,21 +15,28 @@ Two shapes are supported, detected by whether the JSON has a top-level
   The agent workspace hides `.git` (`hide_git=True`), so the agent cannot
   read `head_sha` or any other post-base history. `test_patch` is applied
   only at grading time (`JsonMinedTask.check_correctness`), never before the
-  agent runs, so the agent cannot see or weaken the regression test.
+  agent runs, so the agent cannot see or weaken the regression test. Grading
+  reads a JUnit XML report that a pytest command writes outside the workdir.
+  A mined clone lives under the harness data directory (`$TILTH_BENCH_DATA`,
+  see `external.data.data_dir`), never in the checkout or an agent workdir.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import baselines
 from config import REPOS, REPOS_DIR, RepoConfig
+from external.data import data_dir
 from tasks.base import GroundTruth, Mutation, Task
 
 _GIT_ENV = {
@@ -54,6 +61,7 @@ class JsonMutationTask(Task):
     mutations_: list[Mutation]
     test_command_: list[str]
     ground_truth_: GroundTruth
+    fixture_dir: Optional[Path] = None
 
     @property
     def name(self) -> str:
@@ -86,6 +94,18 @@ class JsonMutationTask(Task):
     @property
     def test_command(self) -> list[str]:
         return self.test_command_
+
+    def identity_inputs(self) -> dict[str, object]:
+        """The task's own content: prompt, grader, mutations and the fixture repo's file hashes."""
+        return {
+            "kind": "json-mutation",
+            "prompt": self.prompt_,
+            "capability": self.capability_,
+            "test_command": list(self.test_command_),
+            "mutations": [asdict(mutation) for mutation in self.mutations_],
+            "forbidden_strings": list(self.ground_truth_.forbidden_strings),
+            "fixture_sha256": baselines.tree_sha256(self.fixture_dir) if self.fixture_dir else None,
+        }
 
 
 def _test_patch_paths(patch_text: str) -> list[str]:
@@ -159,6 +179,21 @@ class JsonMinedTask(Task):
     def lint_command(self) -> list[str]:
         return self.lint_command_
 
+    def identity_inputs(self) -> dict[str, object]:
+        """The task's own content: prompt, pins, grader command and the test patch hash."""
+        return {
+            "kind": "json-mined",
+            "prompt": self.prompt_,
+            "capability": self.capability_,
+            "repo_url": REPOS[self.repo_name].url,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "test_patch_sha256": hashlib.sha256(self.test_patch.encode()).hexdigest(),
+            "test_command": list(self.test_command_),
+            "lint_command": list(self.lint_command_),
+            "reference_changed_lines": self.reference_changed_lines_,
+        }
+
     @property
     def hide_git(self) -> bool:
         # The agent must never see `head_sha`, the reference-fix commit, or
@@ -185,21 +220,47 @@ class JsonMinedTask(Task):
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             dest_file.write_text(base_content)
 
-        subprocess.run(
+        applied = subprocess.run(
             ["git", "apply", "-"],
             input=self.test_patch, cwd=str(workspace),
-            check=True, capture_output=True, text=True,
+            capture_output=True, text=True,
         )
+        if applied.returncode != 0:
+            return False, f"Test patch did not apply: {applied.stderr.strip()[-300:]}"
 
         if not self.test_command_:
             return False, "mined task requires a nonempty test_command"
-        result = subprocess.run(
-            self.test_command_, cwd=str(workspace), capture_output=True, text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            return False, f"Test failed: {shlex.join(self.test_command_)}"
+        with tempfile.TemporaryDirectory(prefix="tilth-mined-report-") as report_dir:
+            report = Path(report_dir) / "report.xml"
+            command = _graded_command(self.test_command_, report)
+            result = subprocess.run(
+                command, cwd=str(workspace), capture_output=True, text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                return False, f"Test failed: {shlex.join(self.test_command_)}"
+            if command is not self.test_command_ and not _report_passed(report):
+                return False, f"Test report shows no passing run: {shlex.join(self.test_command_)}"
         return True, "Test passed"
+
+
+def _graded_command(argv: list[str], report: Path) -> list[str]:
+    """`argv` plus a JUnit XML report path for a pytest command; any other command is unchanged."""
+    if "pytest" in argv or Path(argv[0]).name in {"pytest", "py.test"}:
+        return [*argv, f"--junitxml={report}"]
+    return argv
+
+
+def _report_passed(report: Path) -> bool:
+    """True when the JUnit report ran at least one test and holds no failure or error."""
+    try:
+        root = ET.parse(report).getroot()
+    except (OSError, ET.ParseError):
+        return False
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    totals = [int(suite.get(key, 0)) for suite in suites for key in ("tests", "failures", "errors")]
+    tests = sum(totals[0::3])
+    return tests > 0 and sum(totals[1::3]) == 0 and sum(totals[2::3]) == 0
 
 
 def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:
@@ -240,15 +301,15 @@ def _register_mined_repo(repo_url: str, base_sha: str) -> str:
     base_sha)` pair. Naming by repo+base (not task id) means mined tasks that
     share a repo and base commit share one clone."""
     repo_name = f"{_repo_slug(repo_url)}-{base_sha[:12]}"
-    if repo_name not in REPOS:
-        REPOS[repo_name] = RepoConfig(
-            name=repo_name,
-            url=repo_url,
-            commit_sha=base_sha,
-            language="",
-            description=f"mined fixture repo for {repo_url}@{base_sha[:12]}",
-            on_demand_clone=True,
-        )
+    REPOS[repo_name] = RepoConfig(
+        name=repo_name,
+        url=repo_url,
+        commit_sha=base_sha,
+        language="",
+        description=f"mined fixture repo for {repo_url}@{base_sha[:12]}",
+        on_demand_clone=True,
+        path_override=data_dir() / "mined" / repo_name,
+    )
     return repo_name
 
 
@@ -276,7 +337,7 @@ def ensure_mined_repo_cloned(repo_cfg: RepoConfig) -> None:
         os.rename(str(clone_path), str(path))
 
 
-def _build_mutation_task(raw: dict, repo_name: str) -> JsonMutationTask:
+def _build_mutation_task(raw: dict, repo_name: str, fixture_dir: Path) -> JsonMutationTask:
     mutations = [Mutation(**m) for m in raw.get("mutations", [])]
     ground_truth = GroundTruth(
         forbidden_strings=raw.get("forbidden_strings", GroundTruth().forbidden_strings),
@@ -291,6 +352,7 @@ def _build_mutation_task(raw: dict, repo_name: str) -> JsonMutationTask:
         mutations_=mutations,
         test_command_=raw.get("test_command", []),
         ground_truth_=ground_truth,
+        fixture_dir=fixture_dir,
     )
 
 
@@ -323,5 +385,6 @@ def load_json_tasks(path: Path) -> dict[str, Task]:
     raw_tasks = data.get("tasks", [])
     if "repo" in data:
         repo_name = _register_mutation_repo(path, data["repo"])
-        return {raw["id"]: _build_mutation_task(raw, repo_name) for raw in raw_tasks}
+        fixture_dir = (path.parent / data["repo"]).resolve()
+        return {raw["id"]: _build_mutation_task(raw, repo_name, fixture_dir) for raw in raw_tasks}
     return {raw["id"]: _build_mined_task(raw) for raw in raw_tasks}
