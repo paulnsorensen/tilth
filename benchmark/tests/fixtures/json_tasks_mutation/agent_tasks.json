@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "provenance": "Synthetic fixture for tasks/json_tasks.py tests.",
+  "repo": "repo",
+  "tasks": [
+    {
+      "id": "greet-missing-comma",
+      "family": "greet",
+      "split": "train",
+      "capability": "fix",
+      "prompt": "greet() in greet.py is missing a comma. Fix it.",
+      "mutations": [
+        {"file_path": "greet.py", "original": "return f\"hi, {name}\"", "mutated": "return f\"hi {name}\""}
+      ],
+      "test_command": ["python3", "-c", "import greet; assert greet.greet('x') == 'hi, x'"],
+      "forbidden_strings": ["I cannot"]
+    }
+  ]
+}

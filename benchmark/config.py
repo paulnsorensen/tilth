@@ -2,7 +2,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 def resolve_tilth_bin() -> str:
@@ -69,6 +69,7 @@ class ModeConfig:
     plugin_version: Optional[str] = None
     plugin_git_sha: Optional[str] = None
     plugin_sha256: Optional[str] = None
+    prompt_mode: Literal["replace", "append"] = "replace"
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -102,9 +103,13 @@ class RepoConfig:
     language: str
     description: str
     license: str = "MIT"
+    on_demand_clone: bool = False
+    path_override: Optional[Path] = None
 
     @property
     def path(self) -> Path:
+        if self.path_override is not None:
+            return self.path_override
         return REPOS_DIR / self.name
 
 
