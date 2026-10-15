@@ -27,6 +27,14 @@ STREAMS = Path(__file__).parent / "fixtures" / "streams"
 LOADED_STREAM = (STREAMS / "plugin_probe2_skills_loaded.jsonl").read_text()
 STRIPPED_STREAM = (STREAMS / "plugin_probe1_skills_stripped.jsonl").read_text()
 STOCK_STREAM = (STREAMS / "claude_native_cost.jsonl").read_text()
+PROBE2_SKILLS = [
+    "deep-research", "probe:demo", "design", "design-sync", "dataviz", "update-config", "verify", "debug",
+    "code-review", "simplify", "batch", "fewer-permission-prompts", "doctor", "loop", "schedule",
+    "claude-api", "workflow-authoring", "run", "run-skill-generator", "plugin-authoring",
+]
+PROBE2_PLUGIN_PATH = (
+    "/home/paul/Dev/tilth/.claude/worktrees/wf_c8c4b90a-469-7/benchmark/tests/fixtures/probe_plugin"
+)
 
 
 class _PluginTask(Task):
@@ -52,6 +60,28 @@ def _skill_mode(name: str = "skill_mode", **fields) -> ModeConfig:
         name=name, tools=["Read"], mcp_config_path=None, description="skill-plugin test arm",
         plugin_dir=FIXTURE_PLUGIN_DIR, plugin_sha256="plugin-tree-sha", **fields,
     )
+
+
+def _stock_mode() -> ModeConfig:
+    return ModeConfig(name="stock_like", tools=["Read"], mcp_config_path=None, description="stock arm")
+
+
+def _write_modes_json(monkeypatch, tmp_path, entries: list[dict]) -> Path:
+    """Write ``entries`` as modes.json and isolate ``run.MODES`` from the registered modes."""
+    monkeypatch.setattr(run, "MODES", dict(run.MODES))
+    path = tmp_path / "modes.json"
+    path.write_text(json.dumps(entries))
+    return path
+
+
+def _stream_with_skill_calls(*skill_names: str) -> str:
+    """The probe 2 stream with one assistant turn that calls each named skill."""
+    content = [
+        {"type": "tool_use", "id": f"toolu_{index}", "name": "Skill", "input": {"skill": name}}
+        for index, name in enumerate(skill_names)
+    ]
+    assistant = {"type": "assistant", "message": {"id": "msg_skills", "content": content}}
+    return LOADED_STREAM + json.dumps(assistant) + "\n"
 
 
 def _stream_with_init(**init_fields) -> str:
@@ -120,7 +150,7 @@ def test_ac3_skill_arm_drops_disable_slash_commands_other_arms_keep_it(monkeypat
         name="woz_like", tools=["Read"], mcp_config_path=str(Path(tmp_path) / "plugin.json"),
         description="woz-shaped arm", plugin_dir=str(tmp_path),
     )
-    stock = ModeConfig(name="stock_like", tools=["Read"], mcp_config_path=None, description="stock arm")
+    stock = _stock_mode()
     monkeypatch.setitem(run.MODELS, "haiku", "configured-claude-model")
     monkeypatch.setitem(run.RUNNERS, "haiku", "claude")
     task = _PluginTask()
@@ -239,8 +269,8 @@ def test_row_records_skills_plugins_and_prompt_mode_fields(monkeypatch, tmp_path
 
     result = run.run_single("plugin_task", "skill_mode", "haiku", 0)
 
-    assert "probe:demo" in result["skills"]
-    assert [plugin for plugin in result["plugins"] if plugin["name"] == "probe"]
+    assert result["skills"] == PROBE2_SKILLS
+    assert {"name": "probe", "path": PROBE2_PLUGIN_PATH} in result["plugins"]
     assert all(set(plugin) == {"name", "path"} for plugin in result["plugins"])
     assert result["plugin_errors"] == []
     assert result["prompt_mode"] == "append"
@@ -254,6 +284,36 @@ def test_stock_row_has_no_plugin_fields(monkeypatch, tmp_path) -> None:
     result = run.run_single("plugin_task", "no_plugin_mode", "haiku", 0)
 
     assert not {"skills", "plugins", "plugin_errors", "prompt_mode"} & set(result)
+    assert result["skill_calls"] is None
+    assert result["non_plugin_skill_calls"] is None
+    assert result["bundled_skills_exposed"] is None
+
+
+def test_skill_arm_row_audits_plugin_and_bundled_skill_calls(monkeypatch, tmp_path) -> None:
+    _install(monkeypatch, tmp_path, mode=_skill_mode(), stdout=_stream_with_skill_calls("probe:demo", "simplify"))
+
+    result = run.run_single("plugin_task", "skill_mode", "haiku", 0)
+
+    assert result["skill_calls"] == ["probe:demo", "simplify"]
+    assert result["non_plugin_skill_calls"] == 1
+
+
+def test_skill_arm_row_lists_the_bundled_skills_the_init_event_exposes(monkeypatch, tmp_path) -> None:
+    _install(monkeypatch, tmp_path, mode=_skill_mode(), stdout=LOADED_STREAM)
+
+    result = run.run_single("plugin_task", "skill_mode", "haiku", 0)
+
+    assert result["skill_calls"] == []
+    assert result["non_plugin_skill_calls"] == 0
+    assert result["bundled_skills_exposed"] == sorted(skill for skill in PROBE2_SKILLS if skill != "probe:demo")
+    assert len(result["bundled_skills_exposed"]) == 19
+
+
+def test_skill_audit_fields_stay_out_of_the_run_key_inputs() -> None:
+    audit = {"skill_calls", "non_plugin_skill_calls", "bundled_skills_exposed"}
+
+    assert not audit & set(baselines.CELL_KEY_FIELDS)
+    assert not audit & set(baselines.DIGEST_FIELDS)
 
 
 # --- run keys (D-2, D-3) ---
@@ -298,7 +358,7 @@ def _golden_stock_argv(*, bare: bool, budget: str) -> list[str]:
 
 @pytest.mark.parametrize("bare", [False, True])
 def test_ac5_stock_arm_argv_is_byte_identical_to_main(bare) -> None:
-    mode = ModeConfig(name="stock_like", tools=["Read"], mcp_config_path=None, description="stock arm")
+    mode = _stock_mode()
     task = type("T", (), {"prompt": "<prompt>", "hide_git": False})()
 
     cmd, _ = run._runner_command(
@@ -310,7 +370,7 @@ def test_ac5_stock_arm_argv_is_byte_identical_to_main(bare) -> None:
 
 
 def test_ac5_stock_arm_run_key_inputs_are_unchanged(keyed) -> None:
-    mode = ModeConfig(name="stock_like", tools=["Read"], mcp_config_path=None, description="stock arm")
+    mode = _stock_mode()
     identity = keyed(mode)
 
     golden_digest = baselines.harness_digest(
@@ -329,7 +389,7 @@ def test_ac5_stock_arm_run_key_inputs_are_unchanged(keyed) -> None:
 
 
 def test_ac5_explicit_replace_prompt_mode_leaves_a_stock_key_unchanged(keyed) -> None:
-    unset = ModeConfig(name="stock_like", tools=["Read"], mcp_config_path=None, description="stock arm")
+    unset = _stock_mode()
     explicit = replace(unset, prompt_mode="replace")
 
     assert keyed(unset)["run_key"] == keyed(explicit)["run_key"]
@@ -488,13 +548,11 @@ def test_ac13_main_without_argv_reads_sys_argv(monkeypatch, capsys, tmp_path) ->
 
 
 def test_ac13_modes_json_loads_skill_arms_in_file_order(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(run, "MODES", dict(run.MODES))
-    path = tmp_path / "modes.json"
-    path.write_text(json.dumps([
+    path = _write_modes_json(monkeypatch, tmp_path, [
         {"name": "skills_b", "tools": ["Read"], "description": "b", "plugin_dir": FIXTURE_PLUGIN_DIR},
         {"name": "skills_a", "tools": ["Read"], "description": "a", "plugin_dir": FIXTURE_PLUGIN_DIR,
          "prompt_mode": "append"},
-    ]))
+    ])
 
     assert run.load_modes_json(path) == ["skills_b", "skills_a"]
     assert run.MODES["skills_a"].prompt_mode == "append"
@@ -502,10 +560,10 @@ def test_ac13_modes_json_loads_skill_arms_in_file_order(monkeypatch, tmp_path) -
 
 
 def test_ac13_modes_json_refuses_a_plugin_arm_with_an_mcp_server(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(run, "MODES", dict(run.MODES))
-    path = tmp_path / "modes.json"
-    path.write_text(json.dumps([{"name": "skills_mcp", "tools": ["Read"], "description": "d",
-                                 "plugin_dir": FIXTURE_PLUGIN_DIR, "mcp_config_path": "x.json"}]))
+    path = _write_modes_json(monkeypatch, tmp_path, [
+        {"name": "skills_mcp", "tools": ["Read"], "description": "d",
+         "plugin_dir": FIXTURE_PLUGIN_DIR, "mcp_config_path": "x.json"},
+    ])
 
     with pytest.raises(ValueError, match="serves no MCP server"):
         run.load_modes_json(path)
@@ -515,10 +573,9 @@ def test_ac13_modes_json_refuses_a_plugin_arm_with_an_mcp_server(monkeypatch, tm
 
 
 def _modes_json_plugin_cell(monkeypatch, tmp_path) -> str:
-    monkeypatch.setattr(run, "MODES", dict(run.MODES))
-    path = tmp_path / "modes.json"
-    path.write_text(json.dumps([{"name": "skills_ac16", "tools": ["Read"], "description": "d",
-                                 "plugin_dir": FIXTURE_PLUGIN_DIR}]))
+    path = _write_modes_json(monkeypatch, tmp_path, [
+        {"name": "skills_ac16", "tools": ["Read"], "description": "d", "plugin_dir": FIXTURE_PLUGIN_DIR},
+    ])
     [name] = run.load_modes_json(path)
     return name
 
@@ -563,10 +620,10 @@ def test_ac16_modes_json_plugin_cell_runs_under_the_default_budget_and_timeout(m
 
 @pytest.mark.parametrize("field", ["max_budget_usd", "applied_max_budget_usd", "timeout_s", "timeout", "budget"])
 def test_ac16_no_per_arm_field_can_raise_a_cap(monkeypatch, tmp_path, field) -> None:
-    monkeypatch.setattr(run, "MODES", dict(run.MODES))
-    path = tmp_path / "modes.json"
-    path.write_text(json.dumps([{"name": "skills_cap", "tools": ["Read"], "description": "d",
-                                 "plugin_dir": FIXTURE_PLUGIN_DIR, field: 99}]))
+    path = _write_modes_json(monkeypatch, tmp_path, [
+        {"name": "skills_cap", "tools": ["Read"], "description": "d",
+         "plugin_dir": FIXTURE_PLUGIN_DIR, field: 99},
+    ])
 
     with pytest.raises(ValueError, match="unknown mode field"):
         run.load_modes_json(path)

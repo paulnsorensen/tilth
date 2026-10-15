@@ -491,6 +491,31 @@ def _require_plugin_skills(mode_name: str, mode: ModeConfig, run_result) -> None
     )
 
 
+def _plugin_name(plugin_dir: str) -> str:
+    return json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())["name"]
+
+
+def _skill_audit_fields(mode: ModeConfig, run_result) -> dict:
+    """Audit which skills a skill arm could and did call; ``None`` fields for other arms.
+
+    Skill arms keep the ``Skill`` tool and drop ``--disable-slash-commands``, so the
+    init event also lists Claude Code's bundled skills and the agent may call them.
+    """
+    if not _is_skill_arm(mode):
+        return {"skill_calls": None, "non_plugin_skill_calls": None, "bundled_skills_exposed": None}
+    prefix = f"{_plugin_name(mode.plugin_dir)}:"
+    calls = [
+        str(call.input.get("skill", ""))
+        for turn in run_result.turns for call in turn.tool_calls if call.name == "Skill"
+    ]
+    return {
+        "skill_calls": calls,
+        "non_plugin_skill_calls": sum(1 for name in calls if not name.startswith(prefix)),
+        "bundled_skills_exposed": sorted(s for s in run_result.skills if not s.startswith(prefix)),
+    }
+
+
+
 def _copy_private(source: Path, destination: Path) -> None:
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{destination.name}.",
@@ -1377,6 +1402,7 @@ def _run_single_in_repo(
         **({"skills": run_result.skills, "plugins": run_result.plugins,
             "plugin_errors": run_result.plugin_errors, "prompt_mode": mode.prompt_mode}
            if _uses_claude_session_features(mode) else {}),
+        **_skill_audit_fields(mode, run_result),
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
         "op_kinds": tool_op_kinds(run_result),
