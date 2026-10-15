@@ -177,7 +177,7 @@ class JsonMinedTask(_JsonTask):
             self._restore_heldout(workspace)
         except PrepareError as error:
             return False, f"Test patch paths unusable: {error}"
-        if self.test_patch and not apply_patch(workspace, self.test_patch):
+        if not apply_patch(workspace, self.test_patch):
             return False, "Test patch did not apply"
 
         if not self.test_command_:
@@ -200,11 +200,11 @@ class JsonMinedTask(_JsonTask):
     def _restore_heldout(self, workspace: Path) -> None:
         """Reset every path `test_patch` names to its `base_sha` bytes (or remove it).
 
-        Raises PrepareError for an unsafe path or a non-empty patch naming none.
+        Raises PrepareError for an unsafe path or a patch naming none.
         """
         paths = sorted(_patch_paths(self.test_patch))
-        if self.test_patch.strip() and not paths:
-            raise PrepareError("the test patch names no path")
+        if not paths:
+            raise PrepareError("the test patch names no path (nothing is held out)")
         root = workspace.resolve()
         for rel_path in paths:
             if not checkout_path(workspace, rel_path).resolve().is_relative_to(root):
@@ -368,8 +368,8 @@ def _validate_mined_entry(path: Path, index: int, raw: object) -> None:
     raw = _validate_common(path, index, raw)
     for key in ("repo_url", "base_sha", "head_sha"):
         _need_str(path, index, raw, key)
-    if not isinstance(raw.get("test_patch", ""), str):
-        raise _fail(path, index, raw, "test_patch", "must be a string")
+    if not isinstance(raw.get("test_patch"), str) or not raw["test_patch"].strip():
+        raise _fail(path, index, raw, "test_patch", "is required and must be a nonempty string")
     lines = raw.get("reference_changed_lines", 0)
     if isinstance(lines, bool) or not isinstance(lines, int):
         raise _fail(path, index, raw, "reference_changed_lines", "must be an integer")

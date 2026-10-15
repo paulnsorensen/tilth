@@ -472,7 +472,8 @@ def _mined_json(tmp_path, *ids):
 
     path.write_text(json.dumps({"tasks": [
         {"id": task_id, "prompt": "p", "repo_url": "https://example.com/a.git",
-         "base_sha": "a" * 40, "head_sha": "b" * 40, "test_command": ["pytest"]}
+         "base_sha": "a" * 40, "head_sha": "b" * 40, "test_command": ["pytest"],
+         "test_patch": "diff --git a/t.py b/t.py\n"}
         for task_id in ids
     ]}))
     return path

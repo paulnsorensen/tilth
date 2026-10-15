@@ -176,6 +176,7 @@ def test_loading_a_mined_json_file_clones_nothing_and_fixture_path_clones_on_dem
     mined_json.write_text(json.dumps({"tasks": [{
         "id": "up-1", "prompt": "fix", "test_command": ["python3", "-m", "pytest"],
         "repo_url": str(upstream), "base_sha": first, "head_sha": first,
+        "test_patch": "diff --git a/t.py b/t.py\n",
     }]}))
     task = json_tasks.load_json_tasks(mined_json)["up-1"]
     cfg = json_tasks.REPOS[task.repo]
@@ -359,7 +360,8 @@ def test_ac7_mined_clone_lands_under_bench_data_and_workdir_hides_patch_and_hist
 _GOOD_MUTATION = json.loads(MUTATION_FIXTURE.read_text())["tasks"][0]
 _GOOD_MINED = {
     "id": "acme-mined", "prompt": "Fix acme.", "repo_url": "https://example.com/acme.git",
-    "base_sha": "a" * 40, "head_sha": "b" * 40, "test_patch": "",
+    "base_sha": "a" * 40, "head_sha": "b" * 40,
+    "test_patch": "diff --git a/t.py b/t.py\n",
     "test_command": ["python3", "-m", "pytest", "t.py"],
 }
 
@@ -597,6 +599,7 @@ def test_mined_task_refuses_a_test_command_that_does_not_invoke_pytest(tmp_path)
     mined_json.write_text(json.dumps({"tasks": [{
         "id": "no-pytest", "prompt": "fix", "test_command": ["make", "test"],
         "repo_url": "https://example.com/a.git", "base_sha": "a" * 40, "head_sha": "b" * 40,
+        "test_patch": "diff --git a/t.py b/t.py\n",
     }]}))
 
     with pytest.raises(ValueError, match="test_command.*pytest"):
@@ -774,7 +777,7 @@ def test_grading_reports_failed_tests_with_an_output_tail(tmp_path) -> None:
 
 def test_grading_reports_a_missing_report(tmp_path) -> None:
     task, workspace = _mined_case(
-        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None,
+        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: (source / "data.txt").write_text("x\n"),
         test_command=[sys.executable, "-c", "pass"],
     )
 
@@ -786,10 +789,35 @@ def test_grading_reports_a_missing_report(tmp_path) -> None:
 def test_grading_times_out_with_a_reason(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(json_tasks, "GRADER_TIMEOUT_SECONDS", 1)
     task, workspace = _mined_case(
-        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None,
+        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: (source / "data.txt").write_text("x\n"),
         test_command=[sys.executable, "-c", "import time; time.sleep(30)"],
     )
 
     passed, reason = task.check_correctness("", str(workspace))
 
     assert passed is False and reason.startswith("Grader timed out after 1s:")
+
+
+def test_a_mined_task_without_a_test_patch_is_refused_at_load(tmp_path) -> None:
+    for patch in (None, "", "  \n"):
+        entry = {**_GOOD_MINED, "id": "no-patch", "test_command": ["python3", "-m", "pytest", "t.py"]}
+        entry.pop("test_patch")
+        if patch is not None:
+            entry["test_patch"] = patch
+        mined_json = tmp_path / "mined.json"
+        mined_json.write_text(json.dumps({"tasks": [entry]}))
+
+        with pytest.raises(ValueError, match=r"mined\.json.*entry 0.*no-patch.*test_patch"):
+            json_tasks.load_json_tasks(mined_json)
+
+
+def test_a_noop_workspace_does_not_grade_correct_with_an_empty_test_patch(tmp_path) -> None:
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: (source / "data.txt").write_text("x\n"),
+    )
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")  # base already passes
+    task.test_patch = ""
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and "names no path" in reason
