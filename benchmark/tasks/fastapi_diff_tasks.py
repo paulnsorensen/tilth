@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from tasks.base import Task, GroundTruth, Mutation
+from tasks.base import Task, GroundTruth, Mutation, dev_git_env
 
 
 class FastAPIDiffWhichCommitTask(Task):
@@ -38,15 +38,7 @@ class FastAPIDiffWhichCommitTask(Task):
 
     def apply_mutations(self, repo_path: str, commit: bool = True) -> None:
         """Override: apply 3 sequential commits — harmless, bug, harmless."""
-        git_env = {
-            "GIT_AUTHOR_NAME": "dev",
-            "GIT_AUTHOR_EMAIL": "dev@test.com",
-            "GIT_COMMITTER_NAME": "dev",
-            "GIT_COMMITTER_EMAIL": "dev@test.com",
-        }
-
-        import os
-        env = {**os.environ, **git_env}
+        env = dev_git_env()
 
         # Commit 1: harmless docstring addition
         utils_path = Path(repo_path) / "fastapi/dependencies/utils.py"
