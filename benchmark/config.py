@@ -118,9 +118,9 @@ class RepoConfig:
     def _shared_clone(self) -> Path:
         """One no-checkout clone per `url`, shared by every per-commit repo."""
         shared = self.path.parent / ".shared" / hashlib.sha256(self.url.encode()).hexdigest()[:16]
-        if shared.exists():
-            return shared
-        _clone_into(self.url, shared, no_checkout=True)
+        if not shared.exists():
+            _clone_into(self.url, shared, no_checkout=True)
+        _ensure_commit(shared, self.commit_sha)
         return shared
 
     def ensure_cloned(self) -> None:
@@ -142,16 +142,44 @@ class RepoConfig:
         return self.path
 
 
+_GIT_ENV_OVERRIDES = {"GIT_TERMINAL_PROMPT": "0"}
+
+
+def _git_env() -> dict[str, str]:
+    return {**os.environ, **_GIT_ENV_OVERRIDES}
+
+
+def _ensure_commit(shared: Path, sha: str) -> None:
+    """Make `sha` present (and reachable from a branch) in the shared clone.
+
+    A shared clone made before `sha` existed upstream lacks it. Fetch the SHA,
+    fall back to a full fetch when the server refuses fetching by SHA, and
+    pin it under a branch so later local clones of the shared clone carry it.
+    """
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(shared), capture_output=True, text=True, env=_git_env(),
+        )
+
+    probe = ("cat-file", "-e", f"{sha}^{{commit}}")
+    if run(*probe).returncode != 0:
+        if run("fetch", "origin", sha).returncode != 0:
+            run("fetch", "origin", "+refs/heads/*:refs/remotes/origin/*", "--tags")
+        if run(*probe).returncode != 0:
+            raise RuntimeError(f"commit {sha} is missing from {shared} and could not be fetched from origin")
+    run("update-ref", f"refs/heads/tilth-pin-{sha}", sha)
+
+
 def _clone_into(source: str, dest: Path, *, checkout: Optional[str] = None, no_checkout: bool = False) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(dest.parent)) as staging:
         clone_path = Path(staging) / "clone"
         command = ["git", "clone", *(["--no-checkout"] if no_checkout else []), source, str(clone_path)]
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True, env=_git_env())
         if checkout:
             subprocess.run(
                 ["git", "checkout", checkout],
-                cwd=str(clone_path), check=True, capture_output=True, text=True,
+                cwd=str(clone_path), check=True, capture_output=True, text=True, env=_git_env(),
             )
         os.rename(str(clone_path), str(dest))
 

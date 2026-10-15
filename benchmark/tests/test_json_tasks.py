@@ -162,10 +162,64 @@ def test_repo_config_ensure_cloned_is_a_noop_when_present_or_not_on_demand(tmp_p
 def test_repo_config_failed_clone_leaves_no_path_behind(tmp_path) -> None:
     upstream, _, _ = _upstream(tmp_path)
     cfg = _mined_cfg(tmp_path, upstream, "f" * 40, "up-missing")
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match="f{40}"):
         cfg.ensure_cloned()
     assert not cfg.path.exists()
     assert not list(cfg.path.parent.glob("tmp*"))
+
+
+def test_repo_config_fetches_a_commit_newer_than_the_shared_clone(tmp_path) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    _mined_cfg(tmp_path, upstream, first, "up-first").ensure_cloned()  # shared clone exists now
+    (upstream / "mod.py").write_text("value = 3\n")
+    _git(upstream, "commit", "-qam", "third")
+    third = _git(upstream, "rev-parse", "HEAD")
+    late = _mined_cfg(tmp_path, upstream, third, "up-third")
+
+    late.ensure_cloned()
+
+    assert _git(late.path, "rev-parse", "HEAD") == third
+    assert (late.path / "mod.py").read_text() == "value = 3\n"
+
+
+def test_repo_config_falls_back_to_a_full_fetch_when_fetch_by_sha_is_refused(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    _mined_cfg(tmp_path, upstream, first, "up-first").ensure_cloned()
+    (upstream / "mod.py").write_text("value = 3\n")
+    _git(upstream, "commit", "-qam", "third")
+    third = _git(upstream, "rev-parse", "HEAD")
+    real_run = subprocess.run
+    seen: list[list[str]] = []
+
+    def refuse_sha_fetch(cmd, *args, **kwargs):
+        seen.append(list(cmd))
+        if cmd[:3] == ["git", "fetch", "origin"] and cmd[3] == third:
+            return subprocess.CompletedProcess(cmd, 128, "", "refused")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", refuse_sha_fetch)
+    late = _mined_cfg(tmp_path, upstream, third, "up-third")
+
+    late.ensure_cloned()
+
+    assert _git(late.path, "rev-parse", "HEAD") == third
+    assert any(cmd[:3] == ["git", "fetch", "origin"] and cmd[3] != third for cmd in seen)
+
+
+def test_repo_config_git_calls_never_prompt_for_credentials(tmp_path, monkeypatch) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    real_run = subprocess.run
+    envs: list[object] = []
+
+    def spy(cmd, *args, **kwargs):
+        if cmd[:1] == ["git"]:
+            envs.append((kwargs.get("env") or {}).get("GIT_TERMINAL_PROMPT"))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _mined_cfg(tmp_path, upstream, first, "up-first").ensure_cloned()
+
+    assert envs and set(envs) == {"0"}
 
 
 def test_loading_a_mined_json_file_clones_nothing_and_fixture_path_clones_on_demand(tmp_path, monkeypatch) -> None:
