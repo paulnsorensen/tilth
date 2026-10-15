@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -201,16 +202,29 @@ class JsonMinedTask(_JsonTask):
 
         Raises PrepareError for an unsafe path or a non-empty patch naming none.
         """
-        paths = sorted(touched_paths(self.test_patch))
+        paths = sorted(_patch_paths(self.test_patch))
         if self.test_patch.strip() and not paths:
             raise PrepareError("the test patch names no path")
         root = workspace.resolve()
         for rel_path in paths:
             if not checkout_path(workspace, rel_path).resolve().is_relative_to(root):
                 raise PrepareError(f"path escapes the workspace: {rel_path!r}")
-        source_dir = REPOS[self.repo_name].path
+        source_dir = REPOS[self.repo_name].resolved_path()
         for rel_path in paths:
             write_or_remove(workspace, rel_path, _git_blob(source_dir, self.base_sha, rel_path))
+
+
+_RENAME_HEADER = re.compile(r"^(?:rename|copy) (?:from|to) (.+)$", re.MULTILINE)
+_DIFF_GIT_HEADER = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
+
+
+def _patch_paths(patch: str) -> set[str]:
+    """Every path a patch names, including those of a hunk-less pure rename or copy."""
+    paths = set(touched_paths(patch))
+    paths.update(_RENAME_HEADER.findall(patch))
+    for old, new in _DIFF_GIT_HEADER.findall(patch):
+        paths.update((old, new))
+    return paths
 
 
 def _output_tail(result: subprocess.CompletedProcess) -> str:
@@ -241,21 +255,31 @@ def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:
     `REPOS_DIR` and git-bootstrap the copy. Never writes a `.git` into the
     source tree."""
     source_dir = (json_path.parent / repo_rel).resolve()
-    repo_name = f"json-mutation:{json_path.stem}:{repo_rel}"
+    digest = hashlib.sha256(
+        f"{source_dir}\0{baselines.tree_sha256(source_dir)}".encode()
+    ).hexdigest()[:12]
+    repo_name = f"json-mutation:{json_path.stem}:{repo_rel}:{digest}"
     repo_dir = REPOS_DIR / repo_name.replace(":", "_").replace(os.sep, "_")
     if not repo_dir.exists():
         repo_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_dir, repo_dir, ignore=shutil.ignore_patterns(".git"))
-        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, env=dev_git_env())
-        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True, env=dev_git_env())
-        subprocess.run(
-            ["git", "commit", "-m", "chore: bootstrap fixture repo"],
-            cwd=repo_dir, check=True, capture_output=True, env=dev_git_env(),
-        )
+        with tempfile.TemporaryDirectory(dir=str(repo_dir.parent)) as staging:
+            stage = Path(staging) / "copy"
+            shutil.copytree(source_dir, stage, ignore=shutil.ignore_patterns(".git"))
+            for command in (
+                ["git", "init"],
+                ["git", "add", "-A"],
+                ["git", "commit", "-m", "chore: bootstrap fixture repo"],
+            ):
+                subprocess.run(command, cwd=stage, check=True, capture_output=True, env=dev_git_env())
+            os.rename(str(stage), str(repo_dir))
+    head = subprocess.run(
+        ["git", "rev-list", "--max-parents=0", "HEAD"],
+        cwd=repo_dir, check=True, capture_output=True, text=True, env=dev_git_env(),
+    ).stdout.split()[0]
     REPOS[repo_name] = RepoConfig(
         name=repo_name,
         url=str(repo_dir),
-        commit_sha="HEAD",
+        commit_sha=head,
         language="",
         description="json fixture repo",
         path_override=repo_dir,
@@ -284,30 +308,6 @@ def _register_mined_repo(repo_url: str, base_sha: str) -> str:
         path_override=data_dir() / "mined" / repo_name,
     )
     return repo_name
-
-
-def ensure_mined_repo_cloned(repo_cfg: RepoConfig) -> None:
-    """Clone and check out an on-demand repo the first time its path is needed.
-
-    Clones into a sibling staging directory and renames into place on success,
-    so a clone that fails partway never leaves a half-cloned path behind for
-    the next call to mistake as already done.
-    """
-    path = repo_cfg.path
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=str(path.parent)) as staging:
-        clone_path = Path(staging) / path.name
-        subprocess.run(
-            ["git", "clone", repo_cfg.url, str(clone_path)],
-            check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "checkout", repo_cfg.commit_sha],
-            cwd=str(clone_path), check=True, capture_output=True, text=True,
-        )
-        os.rename(str(clone_path), str(path))
 
 
 def _fail(path: Path, index: int, raw: object, field_name: str, why: str) -> ValueError:
@@ -374,6 +374,11 @@ def _validate_mined_entry(path: Path, index: int, raw: object) -> None:
     if isinstance(lines, bool) or not isinstance(lines, int):
         raise _fail(path, index, raw, "reference_changed_lines", "must be an integer")
     _opt_str_list(path, index, raw, "lint_command")
+    if not any(Path(token).name in {"pytest", "py.test"} for token in raw["test_command"]):
+        raise _fail(
+            path, index, raw, "test_command",
+            "must invoke pytest (mined grading reads a pytest JUnit report)",
+        )
 
 
 def _common_fields(raw: dict, repo_name: str) -> dict:

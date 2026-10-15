@@ -1,5 +1,8 @@
+import hashlib
 import os
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -111,6 +114,46 @@ class RepoConfig:
         if self.path_override is not None:
             return self.path_override
         return REPOS_DIR / self.name
+
+    def _shared_clone(self) -> Path:
+        """One no-checkout clone per `url`, shared by every per-commit repo."""
+        shared = self.path.parent / ".shared" / hashlib.sha256(self.url.encode()).hexdigest()[:16]
+        if shared.exists():
+            return shared
+        _clone_into(self.url, shared, no_checkout=True)
+        return shared
+
+    def ensure_cloned(self) -> None:
+        """Clone and check out an on-demand repo the first time its path is needed.
+
+        Each `url` is cloned once (no checkout); the per-commit repo is a local
+        clone of that shared clone. Both land via a staging directory and a
+        rename, so a failed clone never leaves a half-cloned path behind.
+        """
+        if not self.on_demand_clone or self.path.exists():
+            return
+        _clone_into(
+            str(self._shared_clone()), self.path, checkout=self.commit_sha, no_checkout=True,
+        )
+
+    def resolved_path(self) -> Path:
+        """The repo's path, cloning an on-demand repo first if it is missing."""
+        self.ensure_cloned()
+        return self.path
+
+
+def _clone_into(source: str, dest: Path, *, checkout: Optional[str] = None, no_checkout: bool = False) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(dest.parent)) as staging:
+        clone_path = Path(staging) / "clone"
+        command = ["git", "clone", *(["--no-checkout"] if no_checkout else []), source, str(clone_path)]
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        if checkout:
+            subprocess.run(
+                ["git", "checkout", checkout],
+                cwd=str(clone_path), check=True, capture_output=True, text=True,
+            )
+        os.rename(str(clone_path), str(dest))
 
 
 REPOS = {

@@ -105,40 +105,85 @@ def test_load_json_tasks_detects_mined_shape_without_cloning(monkeypatch, tmp_pa
     assert repo_cfg.commit_sha == "a" * 40
 
 
-def test_ensure_mined_repo_cloned_is_deferred_to_first_access(monkeypatch, tmp_path) -> None:
-    import config as config_module
-    monkeypatch.setattr(config_module, "REPOS_DIR", tmp_path)
-    repo_cfg = json_tasks.RepoConfig(
-        name="json-mined-acme-42",
-        url="https://example.com/acme/acme.git",
-        commit_sha="a" * 40,
-        language="",
-        description="mined fixture",
-        on_demand_clone=True,
+def _upstream(tmp_path) -> tuple[Path, str, str]:
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _git(upstream.parent, "init", "-q", str(upstream))
+    (upstream / "mod.py").write_text("value = 1\n")
+    _git(upstream, "add", "-A")
+    _git(upstream, "commit", "-qm", "first")
+    first = _git(upstream, "rev-parse", "HEAD")
+    (upstream / "mod.py").write_text("value = 2\n")
+    _git(upstream, "commit", "-qam", "second")
+    return upstream, first, _git(upstream, "rev-parse", "HEAD")
+
+
+def _mined_cfg(tmp_path, upstream, sha, name):
+    return json_tasks.RepoConfig(
+        name=name, url=str(upstream), commit_sha=sha, language="", description="mined",
+        on_demand_clone=True, path_override=tmp_path / "mined" / name,
     )
-    calls: list[list[str]] = []
 
-    def fake_run(cmd, *args, **kwargs):
-        calls.append(cmd)
-        if cmd[:2] == ["git", "clone"]:
-            Path(cmd[3]).mkdir(parents=True, exist_ok=True)
-        return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(json_tasks.subprocess, "run", fake_run)
+def test_repo_config_clones_on_first_access_and_shares_one_clone_per_url(tmp_path) -> None:
+    upstream, first, second = _upstream(tmp_path)
+    one = _mined_cfg(tmp_path, upstream, first, "up-first")
+    two = _mined_cfg(tmp_path, upstream, second, "up-second")
+    assert not one.path.exists()  # nothing is cloned until a path is needed
 
-    json_tasks.ensure_mined_repo_cloned(repo_cfg)
+    assert one.resolved_path() == one.path
+    assert two.resolved_path() == two.path
 
-    assert calls  # clone was attempted once path was actually needed
-    assert calls[0][:2] == ["git", "clone"]
-    assert calls[0][2] == repo_cfg.url
-    assert calls[1][:2] == ["git", "checkout"]
-    assert calls[1][2] == repo_cfg.commit_sha
-    assert repo_cfg.path.exists()
+    assert _git(one.path, "rev-parse", "HEAD") == first
+    assert _git(two.path, "rev-parse", "HEAD") == second
+    shared = list((tmp_path / "mined" / ".shared").iterdir())
+    assert len(shared) == 1  # the url was cloned once
+    assert _git(one.path, "remote", "get-url", "origin") == str(shared[0])
+    assert (two.path / "mod.py").read_text() == "value = 2\n"
 
-    calls.clear()
-    json_tasks.ensure_mined_repo_cloned(repo_cfg)
-    assert not calls  # already cloned; second call is a no-op
 
+def test_repo_config_ensure_cloned_is_a_noop_when_present_or_not_on_demand(tmp_path) -> None:
+    upstream, first, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, first, "up-first")
+    cfg.ensure_cloned()
+    marker = cfg.path / "marker"
+    marker.write_text("x")
+    cfg.ensure_cloned()
+    assert marker.exists()
+
+    local = json_tasks.RepoConfig(
+        name="plain", url=str(upstream), commit_sha=first, language="", description="",
+        path_override=tmp_path / "plain",
+    )
+    local.ensure_cloned()
+    assert not local.path.exists()
+
+
+def test_repo_config_failed_clone_leaves_no_path_behind(tmp_path) -> None:
+    upstream, _, _ = _upstream(tmp_path)
+    cfg = _mined_cfg(tmp_path, upstream, "f" * 40, "up-missing")
+    with pytest.raises(subprocess.CalledProcessError):
+        cfg.ensure_cloned()
+    assert not cfg.path.exists()
+    assert not list(cfg.path.parent.glob("tmp*"))
+
+
+def test_loading_a_mined_json_file_clones_nothing_and_fixture_path_clones_on_demand(tmp_path, monkeypatch) -> None:
+    import tasks.base as base_module
+    monkeypatch.setattr(base_module, "REPOS", json_tasks.REPOS)
+    upstream, first, _ = _upstream(tmp_path)
+    mined_json = tmp_path / "mined.json"
+    mined_json.write_text(json.dumps({"tasks": [{
+        "id": "up-1", "prompt": "fix", "test_command": ["python3", "-m", "pytest"],
+        "repo_url": str(upstream), "base_sha": first, "head_sha": first,
+    }]}))
+    task = json_tasks.load_json_tasks(mined_json)["up-1"]
+    cfg = json_tasks.REPOS[task.repo]
+    cfg.path_override = tmp_path / "mined" / "up-1"
+    assert not cfg.path.exists()
+
+    assert task.fixture_path == cfg.path
+    assert (cfg.path / "mod.py").exists()
 
 def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
     """The agent's workspace must not expose head_sha or later history."""
@@ -531,6 +576,113 @@ def test_grading_restores_a_test_file_the_patch_deletes(tmp_path) -> None:
 
     assert task.check_correctness("", str(workspace)) == (True, "Test passed")
     assert not (workspace / "tests" / "test_gone.py").exists()
+
+
+def test_grading_resets_the_old_path_of_a_pure_rename_patch(tmp_path) -> None:
+    old = _numbered("pure")
+
+    def change(source: Path) -> None:
+        (source / "tests" / "test_old.py").rename(source / "tests" / "test_new.py")
+
+    task, workspace = _mined_case(tmp_path, {"tests/test_old.py": old}, change)
+    assert "@@" not in task.test_patch and "rename from tests/test_old.py" in task.test_patch
+    (workspace / "tests" / "test_old.py").write_text("def test_old():\n    assert False\n")
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert (workspace / "tests" / "test_new.py").read_bytes() == old
+
+
+def test_mined_task_refuses_a_test_command_that_does_not_invoke_pytest(tmp_path) -> None:
+    mined_json = tmp_path / "mined.json"
+    mined_json.write_text(json.dumps({"tasks": [{
+        "id": "no-pytest", "prompt": "fix", "test_command": ["make", "test"],
+        "repo_url": "https://example.com/a.git", "base_sha": "a" * 40, "head_sha": "b" * 40,
+    }]}))
+
+    with pytest.raises(ValueError, match="test_command.*pytest"):
+        json_tasks.load_json_tasks(mined_json)
+
+
+# --- mutation fixture copies: content-addressed, staged, pinned ---
+
+
+def _fixture_file(root: Path, body: str, *, subdir: str = "") -> Path:
+    fixture = root / subdir / "repo" if subdir else root / "repo"
+    fixture.mkdir(parents=True, exist_ok=True)
+    (fixture / "greet.py").write_text(body)
+    tasks_json = fixture.parent / "tasks.json"
+    tasks_json.write_text(json.dumps({"repo": "repo", "tasks": [{
+        "id": f"t-{subdir or 'x'}", "prompt": "fix", "test_command": ["python3", "-c", "pass"],
+        "mutations": [{"file_path": "greet.py", "original": "1", "mutated": "2"}],
+    }]}))
+    return tasks_json
+
+
+def _copy_of(tasks_json: Path) -> Path:
+    return json_tasks.REPOS[next(iter(json_tasks.load_json_tasks(tasks_json).values())).repo].path
+
+
+def test_editing_the_fixture_produces_a_fresh_copy(tmp_path) -> None:
+    tasks_json = _fixture_file(tmp_path, "x = 1\n")
+    first = _copy_of(tasks_json)
+    (tasks_json.parent / "repo" / "greet.py").write_text("x = 99\n")
+
+    second = _copy_of(tasks_json)
+
+    assert second != first
+    assert (second / "greet.py").read_text() == "x = 99\n"
+    assert not (tasks_json.parent / "repo" / ".git").exists()
+
+
+def test_same_stem_task_files_do_not_share_a_copy(tmp_path) -> None:
+    one = _fixture_file(tmp_path, "x = 1\n", subdir="a")
+    two = _fixture_file(tmp_path, "x = 1\n", subdir="b")
+
+    assert one.name == two.name
+    assert _copy_of(one) != _copy_of(two)
+
+
+def test_an_unchanged_fixture_reuses_its_copy_without_rebuilding(tmp_path) -> None:
+    tasks_json = _fixture_file(tmp_path, "x = 1\n")
+    copy = _copy_of(tasks_json)
+    (copy / "marker").write_text("kept")
+
+    assert _copy_of(tasks_json) == copy
+    assert (copy / "marker").read_text() == "kept"
+
+
+def test_a_failed_copy_leaves_no_staging_directory(tmp_path, monkeypatch) -> None:
+    tasks_json = _fixture_file(tmp_path, "x = 1\n")
+    real_run = subprocess.run
+
+    def failing(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "commit"]:
+            raise subprocess.CalledProcessError(1, cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(json_tasks.subprocess, "run", failing)
+    with pytest.raises(subprocess.CalledProcessError):
+        json_tasks.load_json_tasks(tasks_json)
+
+    assert list((tmp_path / "repos").iterdir()) == []
+
+
+def test_the_registered_commit_is_the_bootstrap_commit_not_head(tmp_path) -> None:
+    from fixtures.reset import ensure_repo_clean
+
+    tasks_json = _fixture_file(tmp_path, "x = 1\n")
+    task = next(iter(json_tasks.load_json_tasks(tasks_json).values()))
+    copy = json_tasks.REPOS[task.repo].path
+    (copy / "greet.py").write_text("x = 2\n")
+    _git(copy, "commit", "-qam", "mutation")
+
+    task = next(iter(json_tasks.load_json_tasks(tasks_json).values()))
+    cfg = json_tasks.REPOS[task.repo]
+
+    assert cfg.commit_sha != "HEAD"
+    assert cfg.commit_sha != _git(copy, "rev-parse", "HEAD")
+    ensure_repo_clean(copy, cfg.commit_sha)
+    assert (copy / "greet.py").read_text() == "x = 1\n"
 
 
 def test_grading_round_trips_crlf_test_files(tmp_path) -> None:

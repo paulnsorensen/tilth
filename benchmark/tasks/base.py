@@ -111,7 +111,7 @@ class Task(ABC):
     @property
     def fixture_path(self) -> Path | None:
         """Local fixture repo that cells copy; None for a task that builds its own workdir."""
-        return SYNTHETIC_REPO if self.repo == "synthetic" else REPOS[self.repo].path
+        return SYNTHETIC_REPO if self.repo == "synthetic" else REPOS[self.repo].resolved_path()
 
     def prepare(self, workdir: Path) -> None:
         """Make the cell workdir ready for the agent; a local task applies its mutations."""

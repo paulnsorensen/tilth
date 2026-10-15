@@ -179,6 +179,12 @@ def check_task(task_name: str) -> bool:
     return False
 
 
+def _with_stderr(exc: BaseException) -> str:
+    """`exc` text, plus its captured stderr when a subprocess error carries one."""
+    stderr = _text(getattr(exc, "stderr", None)).strip()
+    return f"{exc}: {stderr}" if stderr else str(exc)
+
+
 def check_mined_task(task_name: str) -> bool:
     """Prove a mined task fails at `base_sha` and passes at `head_sha`."""
     task = TASKS[task_name]
@@ -187,38 +193,28 @@ def check_mined_task(task_name: str) -> bool:
         print(f"FAIL {task_name}: {metadata_error}")
         return False
 
-    repo_path = get_repo_path(task.repo)
-
-    def _checkout(revision: str) -> None:
-        subprocess.run(
-            ["git", "checkout", "--force", revision],
-            cwd=repo_path, check=True, capture_output=True, text=True,
-        )
-        subprocess.run(
-            ["git", "clean", "-fdx"],
-            cwd=repo_path, check=True, capture_output=True, text=True,
-        )
-
     reason: str | None = None
+    repo_path: Path | None = None
     try:
-        _checkout(task.base_sha)
+        repo_path = get_repo_path(task.repo)
+        ensure_repo_clean(repo_path, task.base_sha)
         before_ok, before_reason = task.check_correctness("", str(repo_path))
         if before_ok:
             reason = f"test_command passed at base_sha (expected a failure): {before_reason}"
         else:
-            _checkout(task.base_sha)
-            _checkout(task.head_sha)
+            ensure_repo_clean(repo_path, task.head_sha)
             after_ok, after_reason = task.check_correctness("", str(repo_path))
             if not after_ok:
                 reason = f"test_command failed at head_sha: {after_reason}"
     except Exception as exc:
-        reason = f"mined preflight raised {type(exc).__name__}: {exc}"
+        reason = f"mined preflight raised {type(exc).__name__}: {_with_stderr(exc)}"
     finally:
-        try:
-            _checkout(task.base_sha)
-        except Exception as exc:
-            cleanup_reason = f"cleanup failed: {type(exc).__name__}: {exc}"
-            reason = cleanup_reason if reason is None else f"{reason}; {cleanup_reason}"
+        if repo_path is not None:
+            try:
+                ensure_repo_clean(repo_path, task.base_sha)
+            except Exception as exc:
+                cleanup_reason = f"cleanup failed: {type(exc).__name__}: {_with_stderr(exc)}"
+                reason = cleanup_reason if reason is None else f"{reason}; {cleanup_reason}"
 
     if reason is None:
         print(f"PASS {task_name}: fails at base_sha, passes at head_sha")

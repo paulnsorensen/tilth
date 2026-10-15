@@ -73,7 +73,7 @@ from parse import (
 )
 from tasks import TASKS
 from tasks.base import SYNTHETIC_LANGUAGE, Task
-from tasks.json_tasks import ensure_mined_repo_cloned, register_json_tasks
+from tasks.json_tasks import register_json_tasks
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -187,10 +187,7 @@ def get_repo_path(repo_name: str) -> Path:
     """Resolve working directory for a task's repo."""
     if repo_name == "synthetic":
         return SYNTHETIC_REPO
-    repo_cfg = REPOS[repo_name]
-    if repo_cfg.on_demand_clone:
-        ensure_mined_repo_cloned(repo_cfg)
-    return repo_cfg.path
+    return REPOS[repo_name].resolved_path()
 
 
 _RUNTIME_ENV_KEYS = frozenset(
@@ -2117,7 +2114,7 @@ Examples:
         if REPOS[repo_name].on_demand_clone:
             # A mined task's clone is made here, under the harness data directory.
             try:
-                get_repo_path(repo_name)
+                REPOS[repo_name].ensure_cloned()
             except (OSError, subprocess.CalledProcessError) as error:
                 print(f"ERROR: cannot clone repo '{repo_name}': {getattr(error, 'stderr', None) or error}")
                 sys.exit(1)
