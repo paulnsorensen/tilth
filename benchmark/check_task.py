@@ -18,7 +18,7 @@ from config import REPOS
 from fixtures.reset import ensure_repo_clean, reset_repo, restore_git
 from run import get_repo_path
 from tasks import TASKS
-from tasks.json_tasks import JsonMinedTask, load_json_tasks
+from tasks.json_tasks import JsonMinedTask, register_json_tasks
 
 
 CAPABILITIES = frozenset({"locate", "trace", "fix", "debug", "control"})
@@ -237,15 +237,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.tasks_json:
-        json_tasks = load_json_tasks(args.tasks_json)
-        TASKS.update(json_tasks)
-        task_universe = json_tasks
+        try:
+            task_universe = register_json_tasks(args.tasks_json, TASKS)
+        except (ValueError, OSError) as error:
+            print(f"Cannot load --tasks-json: {error}", file=sys.stderr)
+            return 2
     else:
         task_universe = TASKS
 
     if args.task is None:
         task_names = list(task_universe)
-    elif args.task not in TASKS:
+    elif args.task not in task_universe:
         print(f"Unknown task: {args.task}", file=sys.stderr)
         return 2
     else:

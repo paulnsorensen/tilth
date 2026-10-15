@@ -37,31 +37,18 @@ from typing import Optional
 import baselines
 from config import REPOS, REPOS_DIR, RepoConfig
 from external.data import data_dir
-from tasks.base import GroundTruth, Mutation, Task
-
-_GIT_ENV = {
-    **os.environ,
-    "GIT_AUTHOR_NAME": "dev",
-    "GIT_AUTHOR_EMAIL": "dev@test.com",
-    "GIT_COMMITTER_NAME": "dev",
-    "GIT_COMMITTER_EMAIL": "dev@test.com",
-}
+from tasks.base import GroundTruth, Mutation, Task, dev_git_env
 
 
 @dataclass
-class JsonMutationTask(Task):
-    """A fixed-mutation task loaded from a mutation-shape JSON file."""
+class _JsonTask(Task):
+    """Fields and properties shared by both JSON task shapes."""
 
     id: str
-    family: str
-    split: str
     capability_: str
     prompt_: str
     repo_name: str
-    mutations_: list[Mutation]
     test_command_: list[str]
-    ground_truth_: GroundTruth
-    fixture_dir: Optional[Path] = None
 
     @property
     def name(self) -> str:
@@ -70,10 +57,6 @@ class JsonMutationTask(Task):
     @property
     def prompt(self) -> str:
         return self.prompt_
-
-    @property
-    def ground_truth(self) -> GroundTruth:
-        return self.ground_truth_
 
     @property
     def task_type(self) -> str:
@@ -88,12 +71,25 @@ class JsonMutationTask(Task):
         return self.capability_
 
     @property
-    def mutations(self) -> list[Mutation]:
-        return self.mutations_
-
-    @property
     def test_command(self) -> list[str]:
         return self.test_command_
+
+
+@dataclass
+class JsonMutationTask(_JsonTask):
+    """A fixed-mutation task loaded from a mutation-shape JSON file."""
+
+    mutations_: list[Mutation]
+    ground_truth_: GroundTruth
+    fixture_dir: Optional[Path] = None
+
+    @property
+    def ground_truth(self) -> GroundTruth:
+        return self.ground_truth_
+
+    @property
+    def mutations(self) -> list[Mutation]:
+        return self.mutations_
 
     def identity_inputs(self) -> dict[str, object]:
         """The task's own content: prompt, grader, mutations and the fixture repo's file hashes."""
@@ -127,49 +123,19 @@ def _git_show(repo_dir: Path, revision: str, rel_path: str) -> Optional[str]:
 
 
 @dataclass
-class JsonMinedTask(Task):
+class JsonMinedTask(_JsonTask):
     """A SHA-pinned mined fix task loaded from a mined-shape JSON file."""
 
-    id: str
-    family: str
-    split: str
-    capability_: str
-    prompt_: str
-    repo_name: str
     base_sha: str
     head_sha: str
     test_patch: str
-    test_command_: list[str]
     reference_changed_lines_: int
     lint_command_: list[str] = field(default_factory=list)
-
-    @property
-    def name(self) -> str:
-        return self.id
-
-    @property
-    def prompt(self) -> str:
-        return self.prompt_
 
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth()
 
-    @property
-    def task_type(self) -> str:
-        return "edit"
-
-    @property
-    def repo(self) -> str:
-        return self.repo_name
-
-    @property
-    def capability(self) -> str:
-        return self.capability_
-
-    @property
-    def test_command(self) -> list[str]:
-        return self.test_command_
 
     @property
     def reference_changed_lines(self) -> int:
@@ -273,11 +239,11 @@ def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:
     if not repo_dir.exists():
         repo_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source_dir, repo_dir, ignore=shutil.ignore_patterns(".git"))
-        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, env=_GIT_ENV)
-        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True, env=_GIT_ENV)
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, env=dev_git_env())
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True, env=dev_git_env())
         subprocess.run(
             ["git", "commit", "-m", "chore: bootstrap fixture repo"],
-            cwd=repo_dir, check=True, capture_output=True, env=_GIT_ENV,
+            cwd=repo_dir, check=True, capture_output=True, env=dev_git_env(),
         )
     REPOS[repo_name] = RepoConfig(
         name=repo_name,
@@ -337,20 +303,90 @@ def ensure_mined_repo_cloned(repo_cfg: RepoConfig) -> None:
         os.rename(str(clone_path), str(path))
 
 
+def _fail(path: Path, index: int, raw: object, field_name: str, why: str) -> ValueError:
+    task_id = raw.get("id") if isinstance(raw, dict) else None
+    who = f"entry {index}" if not isinstance(task_id, str) else f"entry {index} (task {task_id!r})"
+    return ValueError(f"{path}: {who}: bad field {field_name!r}: {why}")
+
+
+def _need_str(path: Path, index: int, raw: dict, key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value:
+        raise _fail(path, index, raw, key, "must be a nonempty string")
+    return value
+
+
+def _opt_str_list(path: Path, index: int, raw: dict, key: str, *, nonempty: bool = False) -> Optional[list[str]]:
+    """Return the list at `key` (None when absent), requiring a list of strings."""
+    if key not in raw or raw[key] is None:
+        if nonempty:
+            raise _fail(path, index, raw, key, "is required and must be a nonempty list of strings")
+        return None
+    value = raw[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _fail(path, index, raw, key, "must be a list of strings")
+    if nonempty and not value:
+        raise _fail(path, index, raw, key, "must be a nonempty list of strings")
+    return value
+
+
+def _validate_common(path: Path, index: int, raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raise _fail(path, index, raw, "<entry>", "must be a JSON object")
+    _need_str(path, index, raw, "id")
+    _need_str(path, index, raw, "prompt")
+    if "capability" in raw and not isinstance(raw["capability"], str):
+        raise _fail(path, index, raw, "capability", "must be a string")
+    _opt_str_list(path, index, raw, "test_command", nonempty=True)
+    return raw
+
+
+def _validate_mutation_entry(path: Path, index: int, raw: object) -> None:
+    raw = _validate_common(path, index, raw)
+    mutations = raw.get("mutations")
+    if not isinstance(mutations, list) or not mutations:
+        raise _fail(path, index, raw, "mutations", "is required and must be a nonempty list of objects")
+    for position, mutation in enumerate(mutations):
+        if not isinstance(mutation, dict) or set(mutation) != {"file_path", "original", "mutated"} or not all(
+            isinstance(value, str) for value in mutation.values()
+        ):
+            raise _fail(
+                path, index, raw, f"mutations[{position}]",
+                "must be an object of string file_path, original and mutated",
+            )
+    _opt_str_list(path, index, raw, "forbidden_strings")
+
+
+def _validate_mined_entry(path: Path, index: int, raw: object) -> None:
+    raw = _validate_common(path, index, raw)
+    for key in ("repo_url", "base_sha", "head_sha"):
+        _need_str(path, index, raw, key)
+    if not isinstance(raw.get("test_patch", ""), str):
+        raise _fail(path, index, raw, "test_patch", "must be a string")
+    lines = raw.get("reference_changed_lines", 0)
+    if isinstance(lines, bool) or not isinstance(lines, int):
+        raise _fail(path, index, raw, "reference_changed_lines", "must be an integer")
+    _opt_str_list(path, index, raw, "lint_command")
+
+
+def _common_fields(raw: dict, repo_name: str) -> dict:
+    """Constructor fields shared by both JSON task shapes (`raw` already validated)."""
+    return {
+        "id": raw["id"],
+        "capability_": raw.get("capability", "fix"),
+        "prompt_": raw["prompt"],
+        "repo_name": repo_name,
+        "test_command_": list(raw["test_command"]),
+    }
+
+
 def _build_mutation_task(raw: dict, repo_name: str, fixture_dir: Path) -> JsonMutationTask:
-    mutations = [Mutation(**m) for m in raw.get("mutations", [])]
     ground_truth = GroundTruth(
         forbidden_strings=raw.get("forbidden_strings", GroundTruth().forbidden_strings),
     )
     return JsonMutationTask(
-        id=raw["id"],
-        family=raw.get("family", raw["id"]),
-        split=raw.get("split", "train"),
-        capability_=raw.get("capability", "fix"),
-        prompt_=raw["prompt"],
-        repo_name=repo_name,
-        mutations_=mutations,
-        test_command_=raw.get("test_command", []),
+        **_common_fields(raw, repo_name),
+        mutations_=[Mutation(**m) for m in raw["mutations"]],
         ground_truth_=ground_truth,
         fixture_dir=fixture_dir,
     )
@@ -359,16 +395,10 @@ def _build_mutation_task(raw: dict, repo_name: str, fixture_dir: Path) -> JsonMu
 def _build_mined_task(raw: dict) -> JsonMinedTask:
     repo_name = _register_mined_repo(raw["repo_url"], raw["base_sha"])
     return JsonMinedTask(
-        id=raw["id"],
-        family=raw.get("family", raw["id"]),
-        split=raw.get("split", "train"),
-        capability_=raw.get("capability", "fix"),
-        prompt_=raw["prompt"],
-        repo_name=repo_name,
+        **_common_fields(raw, repo_name),
         base_sha=raw["base_sha"],
         head_sha=raw["head_sha"],
         test_patch=raw.get("test_patch", ""),
-        test_command_=raw.get("test_command", []),
         reference_changed_lines_=raw.get("reference_changed_lines", 0),
         lint_command_=raw.get("lint_command") or [],
     )
@@ -378,13 +408,43 @@ def load_json_tasks(path: Path) -> dict[str, Task]:
     """Load a JSON task file, returning `{task_id: Task}`.
 
     A top-level `repo` key selects the mutation shape; its absence selects
-    the mined shape.
+    the mined shape. Every entry is validated first; a bad file or entry
+    raises one `ValueError` naming the path, entry index and field.
     """
     path = Path(path)
     data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top level must be a JSON object")
     raw_tasks = data.get("tasks", [])
-    if "repo" in data:
+    if not isinstance(raw_tasks, list):
+        raise ValueError(f"{path}: bad field 'tasks': must be a list")
+    mutation_shape = "repo" in data
+    if mutation_shape and (not isinstance(data["repo"], str) or not data["repo"]):
+        raise ValueError(f"{path}: bad field 'repo': must be a nonempty string")
+    validate = _validate_mutation_entry if mutation_shape else _validate_mined_entry
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_tasks):
+        validate(path, index, raw)
+        if raw["id"] in seen:
+            raise _fail(path, index, raw, "id", "duplicates an earlier entry in this file")
+        seen.add(raw["id"])
+    if mutation_shape:
         repo_name = _register_mutation_repo(path, data["repo"])
         fixture_dir = (path.parent / data["repo"]).resolve()
         return {raw["id"]: _build_mutation_task(raw, repo_name, fixture_dir) for raw in raw_tasks}
     return {raw["id"]: _build_mined_task(raw) for raw in raw_tasks}
+
+
+def register_json_tasks(path: Path, registry: dict[str, Task]) -> dict[str, Task]:
+    """Load a JSON task file and add its tasks to `registry`.
+
+    Refuses an empty file and any id already in `registry`; returns the loaded tasks.
+    """
+    loaded = load_json_tasks(path)
+    if not loaded:
+        raise ValueError(f"{path}: holds no tasks")
+    clashes = sorted(task_id for task_id in loaded if task_id in registry)
+    if clashes:
+        raise ValueError(f"{path}: task id collides with an existing task: {', '.join(clashes)}")
+    registry.update(loaded)
+    return loaded

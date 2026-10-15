@@ -289,7 +289,7 @@ def test_tasks_json_restricts_universe_and_routes_mined_tasks(monkeypatch, tmp_p
     def fake_load_json_tasks(path):
         return {"mined_task": mined_task}
 
-    monkeypatch.setattr(check_task, "load_json_tasks", fake_load_json_tasks)
+    monkeypatch.setattr("tasks.json_tasks.load_json_tasks", fake_load_json_tasks)
     monkeypatch.setattr(check_task, "TASKS", {"other_task": FakeTask(name="other_task")})
 
     calls: list[str] = []
@@ -386,7 +386,7 @@ def _install_mined_task(monkeypatch, tmp_path, task_id, base_sha, head_sha, bare
 
     repo_name = "acme-local"
     task = JsonMinedTask(
-        id=task_id, family=task_id, split="train", capability_="fix",
+        id=task_id, capability_="fix",
         prompt_="Fix add().", repo_name=repo_name, base_sha=base_sha,
         head_sha=head_sha, test_patch=_TEST_PATCH,
         test_command_=_TEST_COMMAND, reference_changed_lines_=1,
@@ -431,3 +431,46 @@ def test_check_mined_task_fails_when_test_still_fails_at_head(monkeypatch, tmp_p
 
     assert check_task.main(["acme-44"]) == 1
     assert "failed at head_sha" in capsys.readouterr().out
+
+
+def _mined_json(tmp_path, *ids):
+    path = tmp_path / "tasks.json"
+    import json
+
+    path.write_text(json.dumps({"tasks": [
+        {"id": task_id, "prompt": "p", "repo_url": "https://example.com/a.git",
+         "base_sha": "a" * 40, "head_sha": "b" * 40, "test_command": ["pytest"]}
+        for task_id in ids
+    ]}))
+    return path
+
+
+def test_tasks_json_rejects_a_task_name_outside_the_json_universe(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(check_task, "TASKS", {"static_task": FakeTask(name="static_task")})
+    calls: list[str] = []
+    monkeypatch.setattr(check_task, "check_task", lambda name: calls.append(name) or True)
+    monkeypatch.setattr(check_task, "check_mined_task", lambda name: calls.append(name) or True)
+
+    code = check_task.main(["static_task", "--tasks-json", str(_mined_json(tmp_path, "json_one"))])
+
+    assert code == 2
+    assert "Unknown task: static_task" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_tasks_json_refuses_an_empty_file_and_a_colliding_id(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(check_task, "TASKS", {"static_task": FakeTask(name="static_task")})
+
+    assert check_task.main(["--tasks-json", str(_mined_json(tmp_path))]) == 2
+    assert "holds no tasks" in capsys.readouterr().err
+    assert check_task.main(["--tasks-json", str(_mined_json(tmp_path, "static_task"))]) == 2
+    assert "collides with an existing task" in capsys.readouterr().err
+
+
+def test_no_tasks_json_still_checks_every_static_task(monkeypatch):
+    monkeypatch.setattr(check_task, "TASKS", {"a": FakeTask(name="a"), "b": FakeTask(name="b")})
+    calls: list[str] = []
+    monkeypatch.setattr(check_task, "check_task", lambda name: calls.append(name) or True)
+
+    assert check_task.main([]) == 0
+    assert calls == ["a", "b"]

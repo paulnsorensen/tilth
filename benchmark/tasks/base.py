@@ -10,6 +10,19 @@ import baselines
 from config import REPOS, SYNTHETIC_REPO
 
 
+DEV_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "dev",
+    "GIT_AUTHOR_EMAIL": "dev@test.com",
+    "GIT_COMMITTER_NAME": "dev",
+    "GIT_COMMITTER_EMAIL": "dev@test.com",
+}
+
+
+def dev_git_env() -> dict[str, str]:
+    """The current environment with the dev git identity applied, read at call time."""
+    return {**os.environ, **DEV_GIT_IDENTITY}
+
+
 @dataclass
 class Mutation:
     """A single file mutation: replace `original` with `mutated` to introduce a bug."""
@@ -173,13 +186,7 @@ class Task(ABC):
             return
 
         mutated_files = [m.file_path for m in self.mutations]
-        git_env = {
-            "GIT_AUTHOR_NAME": "dev",
-            "GIT_AUTHOR_EMAIL": "dev@test.com",
-            "GIT_COMMITTER_NAME": "dev",
-            "GIT_COMMITTER_EMAIL": "dev@test.com",
-        }
-        env = {**os.environ, **git_env}
+        env = dev_git_env()
         subprocess.run(
             ["git", "add"] + mutated_files,
             cwd=repo_path, check=True, capture_output=True, env=env,

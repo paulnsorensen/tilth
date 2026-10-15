@@ -168,7 +168,7 @@ def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
     ).stdout.strip()
 
     task = json_tasks.JsonMinedTask(
-        id="acme-hide", family="acme-hide", split="train", capability_="fix",
+        id="acme-hide", capability_="fix",
         prompt_="fix it", repo_name="acme-hide-repo", base_sha="a" * 40,
         head_sha=head_sha, test_patch="", test_command_=[],
         reference_changed_lines_=1,
@@ -205,7 +205,7 @@ def _digest(task) -> str:
 
 def _mined_task(**overrides):
     fields = dict(
-        id="acme-digest", family="acme-digest", split="train", capability_="fix", prompt_="Fix acme.",
+        id="acme-digest", capability_="fix", prompt_="Fix acme.",
         repo_name="acme-digest-repo", base_sha="a" * 40, head_sha="b" * 40,
         test_patch="diff --git a/t.py b/t.py\n", test_command_=["python3", "-m", "pytest", "t.py"],
         reference_changed_lines_=3, lint_command_=[],
@@ -317,3 +317,153 @@ def test_ac7_mined_clone_lands_under_bench_data_and_workdir_hides_patch_and_hist
         assert task.check_correctness("", str(workspace))[0] is False
         (workspace / "valmod.py").write_text("value = 2\n")
         assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+
+
+# --- loader validation and registration ---
+
+_GOOD_MUTATION = json.loads(MUTATION_FIXTURE.read_text())["tasks"][0]
+_GOOD_MINED = {
+    "id": "acme-mined", "prompt": "Fix acme.", "repo_url": "https://example.com/acme.git",
+    "base_sha": "a" * 40, "head_sha": "b" * 40, "test_patch": "",
+    "test_command": ["python3", "-m", "pytest", "t.py"],
+}
+
+
+def _write_mutation_file(tmp_path: Path, *tasks: dict) -> Path:
+    shutil.copytree(MUTATION_FIXTURE.parent / "repo", tmp_path / "repo")
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"version": 1, "repo": "repo", "tasks": list(tasks)}))
+    return path
+
+
+def _write_mined_file(tmp_path: Path, *tasks: dict) -> Path:
+    path = tmp_path / "mined.json"
+    path.write_text(json.dumps({"version": 1, "tasks": list(tasks)}))
+    return path
+
+
+def _without(raw: dict, key: str) -> dict:
+    return {k: v for k, v in raw.items() if k != key}
+
+
+@pytest.mark.parametrize("raw, field_name", [
+    (_without(_GOOD_MUTATION, "test_command"), "test_command"),
+    ({**_GOOD_MUTATION, "test_command": []}, "test_command"),
+    ({**_GOOD_MUTATION, "test_command": "pytest"}, "test_command"),
+    ({**_GOOD_MUTATION, "test_command": ["pytest", 3]}, "test_command"),
+    (_without(_GOOD_MUTATION, "mutations"), "mutations"),
+    ({**_GOOD_MUTATION, "mutations": []}, "mutations"),
+    ({**_GOOD_MUTATION, "mutations": ["greet.py"]}, "mutations[0]"),
+    ({**_GOOD_MUTATION, "mutations": [{"file_path": "greet.py"}]}, "mutations[0]"),
+    (_without(_GOOD_MUTATION, "prompt"), "prompt"),
+    (_without(_GOOD_MUTATION, "id"), "id"),
+    ("not-an-object", "<entry>"),
+])
+def test_mutation_task_without_a_grader_or_mutation_is_refused(tmp_path, raw, field_name) -> None:
+    path = _write_mutation_file(tmp_path, raw)
+
+    with pytest.raises(ValueError) as refused:
+        json_tasks.load_json_tasks(path)
+
+    message = str(refused.value)
+    assert str(path) in message and "entry 0" in message and repr(field_name) in message
+
+
+def test_mutation_task_with_no_test_command_cannot_grade_anything_correct(tmp_path) -> None:
+    # Before the fix such a task loaded and Task.check_correctness fell through to
+    # (True, 'All checks passed') for any output.
+    path = _write_mutation_file(tmp_path, _without(_GOOD_MUTATION, "test_command"))
+
+    with pytest.raises(ValueError, match="test_command"):
+        json_tasks.load_json_tasks(path)
+
+
+@pytest.mark.parametrize("raw, field_name", [
+    (_without(_GOOD_MINED, "test_command"), "test_command"),
+    ({**_GOOD_MINED, "test_command": []}, "test_command"),
+    (_without(_GOOD_MINED, "repo_url"), "repo_url"),
+    (_without(_GOOD_MINED, "base_sha"), "base_sha"),
+    ({**_GOOD_MINED, "reference_changed_lines": "3"}, "reference_changed_lines"),
+    ({**_GOOD_MINED, "lint_command": "ruff"}, "lint_command"),
+])
+def test_mined_task_with_a_bad_field_is_refused(tmp_path, raw, field_name) -> None:
+    path = _write_mined_file(tmp_path, _GOOD_MINED, raw)
+
+    with pytest.raises(ValueError) as refused:
+        json_tasks.load_json_tasks(path)
+
+    message = str(refused.value)
+    assert str(path) in message and "entry 1" in message and repr(field_name) in message
+
+
+def test_a_valid_mined_task_still_loads(tmp_path) -> None:
+    tasks = json_tasks.load_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED))
+
+    assert tasks["acme-mined"].test_command == ["python3", "-m", "pytest", "t.py"]
+
+
+def test_a_duplicate_id_inside_one_file_is_refused(tmp_path) -> None:
+    path = _write_mined_file(tmp_path, _GOOD_MINED, _GOOD_MINED)
+
+    with pytest.raises(ValueError, match="duplicates an earlier entry"):
+        json_tasks.load_json_tasks(path)
+
+
+@pytest.mark.parametrize("body", ['[]', '{"tasks": "x"}', '{"repo": 3, "tasks": []}'])
+def test_a_malformed_top_level_is_a_value_error(tmp_path, body) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(body)
+
+    with pytest.raises(ValueError, match="bad.json"):
+        json_tasks.load_json_tasks(path)
+
+
+def test_register_json_tasks_adds_to_the_registry(tmp_path) -> None:
+    registry: dict = {"existing": object()}
+
+    loaded = json_tasks.register_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED), registry)
+
+    assert set(loaded) == {"acme-mined"}
+    assert set(registry) == {"existing", "acme-mined"}
+
+
+def test_register_json_tasks_refuses_an_empty_file(tmp_path) -> None:
+    registry: dict = {}
+
+    with pytest.raises(ValueError, match="holds no tasks"):
+        json_tasks.register_json_tasks(_write_mined_file(tmp_path), registry)
+
+
+def test_register_json_tasks_refuses_an_id_that_collides_and_leaves_registry_alone(tmp_path) -> None:
+    sentinel = object()
+    registry: dict = {"acme-mined": sentinel}
+
+    with pytest.raises(ValueError, match="collides with an existing task: acme-mined"):
+        json_tasks.register_json_tasks(_write_mined_file(tmp_path, _GOOD_MINED), registry)
+
+    assert registry == {"acme-mined": sentinel}
+
+
+def test_run_main_reports_a_bad_tasks_json_as_a_usage_error(capsys, tmp_path) -> None:
+    import run as run_module
+
+    path = _write_mutation_file(tmp_path, _without(_GOOD_MUTATION, "test_command"))
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main(["--tasks-json", str(path)])
+
+    assert exit_info.value.code == 2
+    assert "test_command" in capsys.readouterr().err
+
+
+def test_run_main_refuses_a_tasks_json_id_that_collides_with_a_static_task(capsys, tmp_path) -> None:
+    import run as run_module
+
+    static_id = next(iter(run_module.TASKS))
+    path = _write_mined_file(tmp_path, {**_GOOD_MINED, "id": static_id})
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main(["--tasks-json", str(path)])
+
+    assert exit_info.value.code == 2
+    assert "collides with an existing task" in capsys.readouterr().err

@@ -73,7 +73,7 @@ from parse import (
 )
 from tasks import TASKS
 from tasks.base import SYNTHETIC_LANGUAGE, Task
-from tasks.json_tasks import ensure_mined_repo_cloned, load_json_tasks
+from tasks.json_tasks import ensure_mined_repo_cloned, register_json_tasks
 from variants import (
     experiment_modes,
     hydrate_mode_metadata,
@@ -2006,10 +2006,7 @@ Examples:
             panel.register(TASKS)
             tasks_list = panel.select(args.panel_split)
         elif args.tasks_json:
-            json_tasks = load_json_tasks(args.tasks_json)
-            if not json_tasks:
-                raise ValueError(f"--tasks-json {args.tasks_json} holds no tasks")
-            TASKS.update(json_tasks)
+            json_tasks = register_json_tasks(args.tasks_json, TASKS)
             tasks_list = list(json_tasks)
         else:
             tasks_list = select_tasks(args.tasks)
@@ -2039,7 +2036,7 @@ Examples:
             modes = select_modes(requested_modes, args.runner)
             if "wozcode" in modes and not args.wozcode_plugin_dir:
                 raise ValueError("wozcode mode requires --wozcode-plugin-dir")
-    except (ValueError, OSError, KeyError, TypeError) as error:
+    except (ValueError, OSError) as error:
         parser.error(str(error))
     if args.candidate_sha:
         if experiment is not None:
