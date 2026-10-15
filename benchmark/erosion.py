@@ -36,55 +36,94 @@ UNMEASURED_FIELDS = {
 }
 
 
+def _git_env(git_dir: Path, work_tree: Path, index: Path) -> dict[str, str]:
+    # Isolate from user/system config so only the tree's own ignore files apply.
+    return {
+        **os.environ, "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(work_tree),
+        "GIT_INDEX_FILE": str(index), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+        "XDG_CONFIG_HOME": str(index.parent), "GIT_TERMINAL_PROMPT": "0", "GIT_LITERAL_PATHSPECS": "1",
+    }
+
+
+def _git(args: list[str], env: dict[str, str], stdin: bytes = b"") -> bytes:
+    done = _RUN(
+        ["git", *args], capture_output=True, timeout=GIT_TIMEOUT_S, input=stdin, env=env,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed: {os.fsdecode(done.stderr or b'').strip()}")
+    return done.stdout
+
+
+def _files(root: Path, env: dict[str, str]) -> list[str]:
+    """Regular, non-symlink files git would not ignore under ``root``, minus harness paths."""
+    listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], env)
+    found = []
+    for raw in listed.split(b"\0"):
+        if not raw:
+            continue
+        rel = os.fsdecode(raw)
+        path = root / rel
+        if set(Path(rel).parts) & set(EXCLUDED_NAMES):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        found.append(rel)
+    return sorted(set(found))
+
+
+def _tree(root: Path, scratch: Path, name: str) -> str:
+    """Write ``root``'s filtered files into the scratch object store; return the tree id."""
+    env = _git_env(scratch / "git", root, scratch / f"index-{name}")
+    files = _files(root, env)
+    if files:
+        _git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], env, b"\0".join(map(os.fsencode, files)))
+    return _git(["write-tree"], env).decode().strip()
+
+
+@contextmanager
+def _scratch() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="tilth-erosion-") as temp:
+        scratch = Path(temp)
+        _git(["init", "-q", "--bare", str(scratch / "git")], {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull})
+        yield scratch
+
+
 @contextmanager
 def snapshot(workdir: Path) -> Iterator[Path]:
-    """Copy ``workdir`` (minus harness-managed paths) to a temp dir for the run's duration."""
+    """Copy ``workdir``'s non-ignored files (minus harness-managed paths) for the run's duration.
+
+    Git-ignored tool output such as caches and egg-info stays out of the copy.
+    """
     with tempfile.TemporaryDirectory(prefix="tilth-baseline-") as temp:
         baseline = Path(temp) / "tree"
-        shutil.copytree(
-            workdir, baseline, symlinks=True, ignore=shutil.ignore_patterns(*EXCLUDED_NAMES),
-        )
+        baseline.mkdir()
+        with _scratch() as scratch:
+            env = _git_env(scratch / "git", workdir, scratch / "index-snapshot")
+            for rel in _files(workdir, env):
+                target = baseline / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(workdir / rel, target)
         yield baseline
 
 
-def _files(root: Path) -> dict[str, Path]:
-    found: dict[str, Path] = {}
-    for current, dirs, names in os.walk(root, followlinks=False):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_NAMES]
-        for name in names:
-            path = Path(current) / name
-            if path.is_symlink() or not path.is_file():
-                continue
-            found[path.relative_to(root).as_posix()] = path
-    return found
-
-
-def _numstat(before: Path, after: Path) -> int:
-    done = _RUN(
-        ["git", "diff", "--no-index", "--numstat", "--no-renames", "--", str(before), str(after)],
-        capture_output=True, text=True, timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
-        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
-    )
-    if done.returncode not in (0, 1):
-        raise RuntimeError(f"git diff --no-index failed: {done.stderr.strip()}")
-    total = 0
-    for line in done.stdout.splitlines():
-        added, removed, _ = line.split("\t", 2)
-        if added != "-":  # a binary change reports "-" and counts as 0 lines
-            total += int(added) + int(removed)
-    return total
-
-
 def workspace_diff_lines(baseline: Path, workdir: Path) -> Optional[int]:
-    """Added plus removed lines between ``baseline`` and ``workdir``; None when not computable."""
+    """Added plus removed lines between ``baseline`` and ``workdir``; None when not computable.
+
+    Both trees are filtered by git's ignore rules and compared with one ``git diff``.
+    """
     try:
-        before, after = _files(baseline), _files(workdir)
+        with _scratch() as scratch:
+            before = _tree(baseline, scratch, "before")
+            after = _tree(workdir, scratch, "after")
+            env = _git_env(scratch / "git", workdir, scratch / "index-diff")
+            out = _git(["diff", "--numstat", "--no-renames", "-z", before, after], env)
         total = 0
-        for rel in sorted(before.keys() | after.keys()):
-            old, new = before.get(rel), after.get(rel)
-            if old is not None and new is not None and old.read_bytes() == new.read_bytes():
+        for entry in out.decode(errors="replace").split("\0"):
+            if not entry:
                 continue
-            total += _numstat(old or Path(os.devnull), new or Path(os.devnull))
+            added, removed, _ = entry.split("\t", 2)
+            if added != "-":  # a binary change reports "-" and counts as 0 lines
+                total += int(added) + int(removed)
         return total
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return None

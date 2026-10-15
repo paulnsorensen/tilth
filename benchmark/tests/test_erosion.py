@@ -201,3 +201,50 @@ def test_erosion_fields_stay_out_of_the_run_key() -> None:
     base = {field: "x" for field in (*baselines.CELL_KEY_FIELDS, *baselines.DIGEST_FIELDS)}
 
     assert baselines.run_key(base) == baselines.run_key({**base, **dict.fromkeys(FIELDS, 5)})
+
+
+def test_git_ignored_tool_output_is_not_counted(cell) -> None:
+    (cell.source / ".gitignore").write_text(".mypy_cache/\n*.egg-info/\n")
+    (cell.source / "edit.txt").write_text("a\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / "edit.txt").write_text("b\n")  # 1 removed + 1 added
+        (cwd / ".mypy_cache").mkdir()
+        (cwd / ".mypy_cache" / "meta.json").write_text("{}\n" * 50)
+        (cwd / "pkg.egg-info").mkdir()
+        (cwd / "pkg.egg-info" / "PKG-INFO").write_text("x\n" * 20)
+
+    assert cell(act)["workspace_diff_lines"] == 2
+
+
+def test_snapshot_leaves_out_ignored_files_and_harness_paths(tmp_path) -> None:
+    work = tmp_path / "w"
+    (work / ".mypy_cache").mkdir(parents=True)
+    (work / "__pycache__").mkdir()
+    (work / ".gitignore").write_text(".mypy_cache/\n")
+    (work / "src.py").write_text("x = 1\n")
+    (work / ".mypy_cache" / "m.json").write_text("{}\n")
+    (work / "__pycache__" / "m.pyc").write_text("c\n")
+
+    with erosion.snapshot(work) as baseline:
+        names = sorted(p.relative_to(baseline).as_posix() for p in baseline.rglob("*") if p.is_file())
+
+    assert names == [".gitignore", "src.py"]
+
+
+def test_total_comes_from_one_git_diff_over_the_filtered_trees(tmp_path, monkeypatch) -> None:
+    before, after = tmp_path / "b", tmp_path / "a"
+    for side in (before, after):
+        side.mkdir()
+        (side / ".gitignore").write_text("junk/\n")
+    for name in ("one", "two", "three"):
+        (before / name).write_text("1\n2\n")
+        (after / name).write_text("1\nX\n")  # 1 removed + 1 added each
+    (after / "junk").mkdir()
+    (after / "junk" / "big").write_text("z\n" * 100)
+    calls: list[list[str]] = []
+    real = erosion._RUN
+    monkeypatch.setattr(erosion, "_RUN", lambda cmd, *a, **k: calls.append(list(cmd)) or real(cmd, *a, **k))
+
+    assert erosion.workspace_diff_lines(before, after) == 6
+    assert sum(cmd[:2] == ["git", "diff"] for cmd in calls) == 1
