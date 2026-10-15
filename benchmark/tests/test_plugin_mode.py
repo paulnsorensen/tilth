@@ -140,6 +140,35 @@ def test_expected_plugin_skills_treats_a_string_skills_field_as_one_skill(tmp_pa
     assert run._expected_plugin_skills(str(tmp_path)) == ["cook:solo"]
 
 
+def _plugin(tmp_path, skills, folders):
+    manifest = tmp_path / ".claude-plugin"
+    manifest.mkdir()
+    (manifest / "plugin.json").write_text(json.dumps({"name": "cook", "skills": skills}))
+    for folder in folders:
+        (tmp_path / folder).mkdir(parents=True, exist_ok=True)
+        (tmp_path / folder / "SKILL.md").write_text("---\nname: x\n---\n")
+    return str(tmp_path)
+
+
+def test_expected_plugin_skills_reads_a_folder_of_skill_folders(tmp_path) -> None:
+    plugin = _plugin(tmp_path, ["./skills"], ["skills/alpha", "skills/beta"])
+    (tmp_path / "skills" / "notes").mkdir()  # no SKILL.md: not a skill
+
+    assert run._expected_plugin_skills(plugin) == ["cook:alpha", "cook:beta"]
+
+
+def test_expected_plugin_skills_reads_a_single_skill_folder_entry(tmp_path) -> None:
+    plugin = _plugin(tmp_path, ["./skills/solo", "./skills/duo"], ["skills/solo", "skills/duo"])
+
+    assert run._expected_plugin_skills(plugin) == ["cook:solo", "cook:duo"]
+
+
+def test_expected_plugin_skills_reads_the_plugin_root_entry(tmp_path) -> None:
+    plugin = _plugin(tmp_path, ".", ["one", "two"])
+
+    assert run._expected_plugin_skills(plugin) == ["cook:one", "cook:two"]
+
+
 def test_ac3_skill_arm_passes_plugin_dir_and_skill_tool(monkeypatch, tmp_path) -> None:
     calls = _install(monkeypatch, tmp_path, mode=_skill_mode(), stdout=LOADED_STREAM)
 

@@ -96,6 +96,22 @@ def test_diff_counts_edit_addition_deletion_and_ignores_binary(cell) -> None:
     assert row["workspace_diff_lines"] == 7
 
 
+def test_a_snapshot_git_timeout_does_not_abort_or_mislabel_the_cell(cell, monkeypatch) -> None:
+    (cell.source / "keep.txt").write_text("same\n")
+    ran: list[bool] = []
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["git"], 60)
+
+    monkeypatch.setattr(erosion, "_git", timeout)
+
+    row = cell(lambda cwd: ran.append(True))
+
+    assert ran == [True]  # the agent still ran
+    assert row["workspace_diff_lines"] is None
+    assert not row.get("timed_out")
+    assert not row.get("error")
+
 def test_untouched_workspace_counts_zero(cell) -> None:
     (cell.source / "keep.txt").write_text("same\n")
 

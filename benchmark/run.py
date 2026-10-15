@@ -469,10 +469,18 @@ def _uses_claude_session_features(mode: ModeConfig) -> bool:
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
     """The ``<plugin>:<skill>`` names that a ``--plugin-dir`` manifest declares."""
     manifest = json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())
-    skills = manifest.get("skills", [])
-    if isinstance(skills, str):
-        skills = [skills]
-    return [f"{manifest['name']}:{Path(skill).name}" for skill in skills]
+    entries = manifest.get("skills", [])
+    if isinstance(entries, str):
+        entries = [entries]
+    root = Path(plugin_dir)
+    names: list[str] = []
+    for entry in entries:
+        folder = (root / entry).resolve()
+        if (folder / "SKILL.md").is_file() or not folder.is_dir():
+            names.append(folder.name)  # one skill folder (or a declared path not on disk)
+        else:
+            names.extend(sorted(child.name for child in folder.iterdir() if (child / "SKILL.md").is_file()))
+    return [f"{manifest['name']}:{name}" for name in names]
 
 
 def _require_plugin_skills(mode_name: str, mode: ModeConfig, run_result) -> None:

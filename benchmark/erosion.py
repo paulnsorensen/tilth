@@ -168,14 +168,17 @@ def snapshot(workdir: Path) -> Iterator[Path]:
     Git-ignored tool output such as caches and egg-info stays out of the copy.
     """
     with tempfile.TemporaryDirectory(prefix="tilth-baseline-") as temp:
-        baseline = Path(temp) / "tree"
-        baseline.mkdir()
-        with _scratch() as scratch:
-            env = _git_env(scratch / "git", workdir, scratch / "index-snapshot")
-            for rel in _files(workdir, env):
-                target = baseline / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(workdir / rel, target)
+        baseline: Optional[Path] = Path(temp) / "tree"
+        try:
+            baseline.mkdir()
+            with _scratch() as scratch:
+                env = _git_env(scratch / "git", workdir, scratch / "index-snapshot")
+                for rel in _files(workdir, env):
+                    target = baseline / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(workdir / rel, target)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            baseline = None  # no snapshot: the cell still runs and its diff is unmeasured
         yield baseline
 
 
