@@ -34,6 +34,7 @@ from typing import NamedTuple, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import baselines
+import erosion
 import external
 import external.contamination
 import external.preflight
@@ -872,20 +873,22 @@ def run_single(
     )
     with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
         task.prepare(repo_path)
-        return _run_single_in_repo(
-            task_name,
-            mode_name,
-            model_name,
-            repetition,
-            repo_path,
-            verbose=verbose,
-            stream_log_path=stream_log_path,
-            bare=bare,
-            reasoning_effort=reasoning_effort,
-            max_budget_usd=max_budget_usd,
-            strict_file_tools=strict_file_tools,
-            claude_config_dir=config_dir,
-        )
+        with erosion.snapshot(repo_path) as baseline:
+            return _run_single_in_repo(
+                task_name,
+                mode_name,
+                model_name,
+                repetition,
+                repo_path,
+                verbose=verbose,
+                stream_log_path=stream_log_path,
+                bare=bare,
+                reasoning_effort=reasoning_effort,
+                max_budget_usd=max_budget_usd,
+                strict_file_tools=strict_file_tools,
+                claude_config_dir=config_dir,
+                baseline=baseline,
+            )
 
 
 _CODEX_GUIDANCE = (
@@ -1051,8 +1054,13 @@ def _run_single_in_repo(
     max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     strict_file_tools: bool = False,
     claude_config_dir: Path | None = None,
+    baseline: Path | None = None,
 ) -> dict:
-    """Execute and grade one benchmark cell."""
+    """Execute and grade one benchmark cell.
+
+    ``baseline`` is the workspace snapshot taken before the agent ran; without one the
+    workspace diff is not measured.
+    """
     task = TASKS[task_name]
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
@@ -1224,6 +1232,12 @@ def _run_single_in_repo(
     if run_result.duration_ms == 0:
         run_result.duration_ms = elapsed_ms
 
+    # Erosion fields are measured before grading, which restores and patches test files.
+    lint_ok, lint_reason = erosion.lint_status(task.lint_command, repo_path)
+    workspace_diff_lines = (
+        erosion.workspace_diff_lines(baseline, repo_path) if baseline is not None else None
+    )
+
     # Check correctness
     correct, reason = task.check_correctness(
         run_result.result_text,
@@ -1305,6 +1319,10 @@ def _run_single_in_repo(
         "trajectory_path": trajectory_path,
         **contamination_fields(trajectory_path, task),
         **details,
+        "workspace_diff_lines": workspace_diff_lines,
+        "reference_changed_lines": task.reference_changed_lines,
+        "lint_ok": lint_ok,
+        "lint_reason": lint_reason,
         "reused": False,
         **identity,
     }
@@ -1715,7 +1733,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
             **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
             "capability": getattr(task, "capability", None), "repetition": cell.repetition,
-            "variant": _variant_metadata(mode), **stamp, **identity, **applied_cap, "reused": False,
+            "variant": _variant_metadata(mode), **erosion.UNMEASURED_FIELDS, **stamp, **identity, **applied_cap,
+            "reused": False,
         }
 
         def fail(fields: dict, charge: float | None = None) -> None:
@@ -2395,6 +2414,7 @@ Examples:
                 "repetition": rep,
                 "per_turn_output_tokens": [],
                 "variant": _variant_metadata(mode),
+                **erosion.UNMEASURED_FIELDS,
                 **experiment_metadata,
                 **cell.identity,
                 "reused": False,

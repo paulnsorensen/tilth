@@ -155,9 +155,9 @@ class Task(ABC):
         return []
 
     @property
-    def reference_changed_lines(self) -> int:
-        """Changed-line count of the reference fix, for erosion-guard scoring."""
-        return 0
+    def reference_changed_lines(self) -> int | None:
+        """Changed-line count of the reference fix, for erosion-guard scoring. None = not defined."""
+        return None
 
     @property
     def lint_command(self) -> list[str]:
