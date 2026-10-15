@@ -30,7 +30,8 @@ _WIKI = _ROOT / ".hallouminate" / "wiki"
 _FEATUREBENCH_PAGE = _WIKI / "featurebench-integration.md"
 _ADR_LINK = "adr/benchmark-gepa-overhaul.md"
 _PHASE4_CLAIM = re.compile(r"PHASE4_PLAN|Phase 4 (power )?gate|power[- ]gate", re.IGNORECASE)
-_RETIRED_WORD = re.compile(r"(?<!not )(?<!never )(?<!n't )\b(retired|deleted|removed|superseded)\b", re.IGNORECASE)
+_RETIRED_WORD = re.compile(r"\b(retired|deleted|removed|superseded)\b", re.IGNORECASE)
+_NEGATION = re.compile(r"\b(not|never)\b|n't", re.IGNORECASE)
 
 
 def _rejected_alternatives(markdown: str) -> str:
@@ -40,7 +41,10 @@ def _rejected_alternatives(markdown: str) -> str:
 
 
 def _is_live_gate_claim(line: str) -> bool:
-    return bool(_PHASE4_CLAIM.search(line)) and not _RETIRED_WORD.search(line)
+    if not _PHASE4_CLAIM.search(line):
+        return False
+    retired = _RETIRED_WORD.search(line)
+    return retired is None or bool(_NEGATION.search(line[: retired.start()]))
 
 
 @pytest.mark.parametrize(
@@ -49,6 +53,9 @@ def _is_live_gate_claim(line: str) -> bool:
         ("The Phase 4 power gate blocks runs.", True),
         ("The power gate was not removed and still blocks runs.", True),
         ("The power gate was never removed.", True),
+        ("The power gate has not been removed and still blocks runs.", True),
+        ("The power gate is not yet retired.", True),
+        ("The power gate hasn't been removed.", True),
         ("The Phase 4 gate was removed.", False),
         ("PHASE4_PLAN is retired.", False),
         ("Phase 4 of the roadmap ships next month.", False),

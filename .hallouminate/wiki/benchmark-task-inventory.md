@@ -5,7 +5,7 @@ Keep the local suite as a tool regression suite. Strengthen its graders before t
 ## Snapshot and count correction
 
 The built-in registry holds **58 tasks** at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5` (main after #313 to #319).[^1]
-Registry introspection at that SHA gives the same counts as at `9fa37b51fb655294f6718ff4da1a00ba52a68a53` (the #280 merge), so #313 to #319 add no built-in task.
+Registry introspection at that SHA gives the same sorted set of 58 task IDs as at `9fa37b51fb655294f6718ff4da1a00ba52a68a53` (the #280 merge), so #313 to #319 add no built-in task.
 The opening inventory held **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`; #280 added `gin_edit_render_context`.
 `CLAUDE.md` states 58 tasks and matches the registry.
 FeatureBench and SWE-bench Multilingual instances are external tasks. They are not in this registry (see [FeatureBench integration](featurebench-integration.md)).

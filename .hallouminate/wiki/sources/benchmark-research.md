@@ -26,7 +26,7 @@ Canonical sources: [config.md](https://github.com/LiberCoders/FeatureBench/blob/
 
 Their contribution is operational: version pinning, agent options, environment injection, attempt handling, and grading semantics.
 Important constraints include mini-swe-only cost limiting, secret-bearing run metadata, default failed-attempt exclusion, and best-attempt summaries.
-The native runner in `benchmark/external` already applies these constraints; see the [FeatureBench integration page](../featurebench-integration.md). Treat the `fb infer` and `fb eval` route as a rejected alternative: see [rejected alternatives](../featurebench-integration.md#rejected-alternatives).
+The [reporting rules](../featurebench-integration.md#reporting-rules) on the integration page counter these pitfalls for the native runner. Treat the `fb infer` and `fb eval` route as a rejected alternative: see [rejected alternatives](../featurebench-integration.md#rejected-alternatives).
 
 Harbor's **FeatureBench** adapter README documents conversion, execution configs, resource splits, and parity experiments.
 Canonical source: [Harbor FeatureBench adapter](https://github.com/harbor-framework/harbor/blob/main/adapters/featurebench/README.md).

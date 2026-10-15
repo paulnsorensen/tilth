@@ -16,14 +16,14 @@ _Source: PR #278 benchmark ingestion · Updated: 2026-09-29_
 
 
 - [Benchmark cost planning](benchmark-cost-planning.md) — Sonnet model identity, paired-run budget scenarios, and unmeasured costs.
-- [Benchmark Gin render-context task](benchmark-gin-render-context.md) — Migration contract, protected grading, recorded controls, and comparison limits.
-- [Benchmark selection and rigor](benchmark-selection-and-rigor.md) — Small external panels, Pro variant distinctions, trusted grading, and statistical limits.
-- [Benchmark task inventory](benchmark-task-inventory.md) — The built-in task registry counts at a stated main SHA, the original 57-task snapshot, and grader notes.
 - [Benchmark GEPA loop invariants and guards](benchmark-gepa-invariants.md) — run keys and `--refreeze-baselines` drift refusal, the spend ledger and finish-reserve headroom caps, native admission and grading guards (private venv copy, JUnit/`go test -json` reports, parquet sha256 pin), the contamination scan, the panel split lock, the judge's Cohen's-kappa gate and call isolation, GEPA candidate guards, finish rules (dev-mean winner, strict test win, two-set reserve), the before-first-paid-run checklist, and open risks linked to #320, #322, #325. Decisions in [ADR: benchmark GEPA overhaul](adr/benchmark-gepa-overhaul.md); research in [subscription-auth source](sources/benchmark-subscription-auth-2026-10.md).
 
 - [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md) — the October 2026 silent failures: `bare` means `--setting-sources ""` not `--bare`, quota rejections with no `result` event, pytest-pretty and JUnit grading, five gepa 0.1.4 integration traps, and external-task data traps (gin fixture holds the gold fix, FeatureBench mask edits a FAIL_TO_PASS file).
+- [Benchmark Gin render-context task](benchmark-gin-render-context.md) — Migration contract, protected grading, recorded controls, and comparison limits.
 - [Benchmark harness gotchas (Sonnet 5 investigation)](benchmark-harness-gotchas.md) — `--safe-mode` silently strips all MCP servers including `--mcp-config` ones (invalidated a full sonnet5 run); the PR #168 guards (available_tools/mcp_servers/model_usage recording, McpUnavailableError abort); pricing.yaml drift vs native billing; the stale `~/.local/bin/tilth` binary that made byte-size, not `--version`, the only trustworthy staleness check; September Codex isolation, strict arms, and invalid attempts.
 - [Benchmark research sources](sources/index.md) — Dated primary evidence for the benchmark investigation.
+- [Benchmark selection and rigor](benchmark-selection-and-rigor.md) — Small external panels, Pro variant distinctions, trusted grading, and statistical limits.
+- [Benchmark task inventory](benchmark-task-inventory.md) — The built-in task registry counts at a stated main SHA, the original 57-task snapshot, and grader notes.
 
 - [Diff: git ref resolution and exit-code handling](diff-git-ref-resolution.md) — why the root commit needs git's empty-tree hash rather than `{hash}^..{hash}`, why `^!` looks right and is not (it degrades to a working-tree diff and breaks `overlay.rs`'s `..`-splitting), git diff's 0-or-1 success convention, and the three constraints on default-branch teaching hints.
 - [Diff: symbol output order is not deterministic](diff-symbol-order-nondeterminism.md) — open bug: `match_symbols` iterates a `HashMap`, so formatted symbol line order varies between `diff()` calls; how to write tests around it and what the workaround costs.
