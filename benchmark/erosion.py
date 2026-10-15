@@ -18,8 +18,21 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
-# Bound at import so a test that fakes ``subprocess.run`` for the agent leaves these alone.
-_RUN = subprocess.run
+# Bound at import so a test that fakes ``subprocess.run`` or ``Popen`` for the agent leaves these alone.
+_POPEN = subprocess.Popen
+
+
+def _RUN(cmd, *, input=None, capture_output=False, text=False, timeout=None, **kwargs):
+    """``subprocess.run`` for the subset used here, on the import-time ``Popen``."""
+    pipe = subprocess.PIPE if capture_output else None
+    stdin = kwargs.pop("stdin", subprocess.PIPE if input is not None else None)
+    with _POPEN(cmd, stdin=stdin, stdout=pipe, stderr=pipe, text=text, **kwargs) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            proc.kill()
+            raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 LINT_TIMEOUT_S = 300
 GIT_TIMEOUT_S = 60
