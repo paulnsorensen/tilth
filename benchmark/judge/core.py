@@ -251,12 +251,17 @@ def load_calibration(
             problems.append(f"tasks.{name}: unknown task")
     stored = baselines.completed_by_key(baselines.load_rows(config.RESULT_STORE))
     trajectories = []
+    seen: set[str] = set()
     for index, entry in enumerate(data["trajectories"]):
         run_key = entry.get("run_key") if isinstance(entry, dict) else None
         if not isinstance(run_key, str):
             problems.append(f"trajectories[{index}]: expected {{run_key, verdict}}")
             continue
         where = f"trajectories[{index}] run_key {run_key}"
+        if run_key in seen:
+            problems.append(f"{where}: duplicate run_key; each trajectory counts once in kappa")
+            continue
+        seen.add(run_key)
         verdict = entry.get("verdict")
         if verdict not in config.VERDICTS:
             problems.append(f"{where}: unknown verdict {verdict!r}; expected one of {', '.join(config.VERDICTS)}")
@@ -346,6 +351,9 @@ class ClaudeJudgeClient:
             except subprocess.TimeoutExpired as error:
                 output = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout
                 return _reply(output or "", None, f"judge call timed out after {self.timeout_s}s")
+            except OSError as error:
+                # No process ran (for example, no claude binary on PATH), so nothing is charged.
+                raise JudgeCallFailed(f"judge call could not start claude: {error}") from error
         return _reply(completed.stdout, completed.returncode, completed.stderr)
 
 

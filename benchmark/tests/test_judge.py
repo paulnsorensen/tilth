@@ -746,6 +746,21 @@ def test_calibration_refuses_contaminated_rows(judge_home: Path, contamination: 
     assert client.prompts == []
 
 
+def test_calibration_refuses_duplicate_run_keys(judge_home: Path) -> None:
+    rows = seed_rollouts(judge_home, 2)
+    trajectories = [{"run_key": row["run_key"], "verdict": "apt"} for row in rows]
+    trajectories.append({"run_key": rows[0]["run_key"], "verdict": "missed"})
+    write_calibration({"rg_search_dispatch": "strong"}, trajectories)
+
+    with pytest.raises(core.CalibrationInvalid) as refused:
+        core.load_calibration()
+    assert "trajectories[2] run_key run-key-00" in str(refused.value) and "duplicate" in str(refused.value)
+
+    client = StubClient()
+    assert cli.main(["calibrate", "--max-usd", "5", "--cell-estimate-usd", "0.1"], client=client) != 0
+    assert client.prompts == []
+
+
 def test_shipped_calibration_file_is_uncalibrated(monkeypatch: pytest.MonkeyPatch) -> None:
     shipped = BENCHMARK_DIR / "judge" / "calibration.json"
     assert json.loads(shipped.read_text()) == {"tasks": {}, "trajectories": []}
@@ -987,6 +1002,22 @@ def test_judge_quota_stops_calls() -> None:
     with pytest.raises(core.JudgeQuota):
         make_judge(core.ClaudeJudgeClient(spawn=recorder)).applicability(TASKS["rg_trait_implementors"])
     assert len(recorder.calls) == 1
+
+
+def test_missing_claude_binary_is_a_judge_error(capsys: pytest.CaptureFixture[str]) -> None:
+    def missing_binary(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    ledger = SpendLedger(10.0)
+    with pytest.raises(core.JudgeCallFailed, match="claude"):
+        make_judge(core.ClaudeJudgeClient(spawn=missing_binary), ledger=ledger).applicability(
+            TASKS["rg_search_dispatch"])
+    assert ledger.charges == []
+
+    client = core.ClaudeJudgeClient(spawn=missing_binary)
+    assert cli.main(["label", "--tasks", "rg_search_dispatch", "--max-usd", "5", "--cell-estimate-usd", "0.1"],
+                    client=client) == 1
+    assert "error:" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("missing", ["--max-usd", "--cell-estimate-usd"])
