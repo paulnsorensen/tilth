@@ -467,12 +467,15 @@ def _uses_claude_session_features(mode: ModeConfig) -> bool:
 
 
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
-    """The ``<plugin>:<skill>`` names that a ``--plugin-dir`` manifest declares."""
-    manifest = json.loads((Path(plugin_dir) / ".claude-plugin" / "plugin.json").read_text())
-    entries = manifest.get("skills", [])
+    """The ``<plugin>:<skill>`` names that a ``--plugin-dir`` manifest declares.
+
+    A manifest without a ``skills`` field uses the default ``skills/`` folder.
+    """
+    root = Path(plugin_dir)
+    manifest = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+    entries = manifest.get("skills", ["skills"] if (root / "skills").is_dir() else [])  # default folder
     if isinstance(entries, str):
         entries = [entries]
-    root = Path(plugin_dir)
     names: list[str] = []
     for entry in entries:
         folder = (root / entry).resolve()

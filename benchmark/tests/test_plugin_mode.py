@@ -280,6 +280,32 @@ def test_ac3_manifest_without_skills_fails_closed(tmp_path) -> None:
         run._require_plugin_skills("skill_mode", mode, parse_stream_json(LOADED_STREAM))
 
 
+def test_ac3_manifest_without_skills_field_uses_the_default_skills_folder(tmp_path) -> None:
+    plugin = tmp_path / "plugin"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "bare"}))
+    for skill in ("alpha", "beta"):
+        (plugin / "skills" / skill).mkdir(parents=True)
+        (plugin / "skills" / skill / "SKILL.md").write_text("---\nname: x\n---\n")
+    (plugin / "skills" / "notes").mkdir()  # no SKILL.md: not a skill
+    mode = replace(_skill_mode(), plugin_dir=str(plugin))
+
+    assert run._expected_plugin_skills(str(plugin)) == ["bare:alpha", "bare:beta"]
+    run._require_plugin_skills("skill_mode", mode, parse_stream_json(_stream_with_init(skills=["bare:alpha", "bare:beta"])))
+    with pytest.raises(run.SkillUnavailableError, match="bare:beta"):
+        run._require_plugin_skills("skill_mode", mode, parse_stream_json(_stream_with_init(skills=["bare:alpha"])))
+
+
+def test_ac3_default_skills_folder_without_a_skill_still_fails_closed(tmp_path) -> None:
+    plugin = tmp_path / "plugin"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "bare"}))
+    (plugin / "skills" / "notes").mkdir(parents=True)
+    mode = replace(_skill_mode(), plugin_dir=str(plugin))
+
+    with pytest.raises(run.SkillUnavailableError, match="declares none"):
+        run._require_plugin_skills("skill_mode", mode, parse_stream_json(LOADED_STREAM))
+
 def test_ac3_init_event_need_not_be_the_first_line() -> None:
     hook = json.dumps({"type": "system", "subtype": "hook_started", "skills": ["decoy:skill"]})
     parsed = parse_stream_json(hook + "\n" + LOADED_STREAM)
