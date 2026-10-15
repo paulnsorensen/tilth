@@ -67,9 +67,9 @@ def _git(args: list[str], env: dict[str, str], stdin: bytes = b"") -> bytes:
     return done.stdout
 
 
-def _files(root: Path, env: dict[str, str]) -> list[str]:
-    """Regular, non-symlink files git would not ignore under ``root``, minus harness paths."""
-    listed = _git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], env)
+def _files(root: Path, env: dict[str, str], *, honor_ignores: bool = True) -> list[str]:
+    """Regular, non-symlink files under ``root`` (git-ignored ones dropped unless told otherwise), minus harness paths."""
+    listed = _git(["ls-files", "-z", "--cached", "--others", *(["--exclude-standard"] if honor_ignores else [])], env)
     found = []
     for raw in listed.split(b"\0"):
         if not raw:
@@ -84,12 +84,48 @@ def _files(root: Path, env: dict[str, str]) -> list[str]:
     return sorted(set(found))
 
 
-def _tree(root: Path, scratch: Path, name: str) -> str:
+def _gitignores(root: Path, files: list[str]) -> dict[str, bytes]:
+    return {rel: (root / rel).read_bytes() for rel in files if Path(rel).name == ".gitignore"}
+
+
+def _after_files(baseline: Path, workdir: Path, scratch: Path) -> list[str]:
+    """The workdir files to compare, judged by the ignore rules of the pre-agent ``baseline``.
+
+    An agent must not hide work by editing a ``.gitignore``. When the visible ``.gitignore``
+    files match the baseline's, the tree's own rules are the baseline's. Otherwise every file
+    is re-judged against the baseline's rules on a placeholder tree. ``.gitignore`` files
+    that the workdir shows are always counted.
+    """
+    visible = _files(workdir, _git_env(scratch / "git", workdir, scratch / "index-after"))
+    rules = _gitignores(workdir, visible)
+    before = _gitignores(baseline, [str(p.relative_to(baseline)) for p in baseline.rglob(".gitignore")])
+    if rules == before:
+        return visible
+    raw = _files(workdir, _git_env(scratch / "git", workdir, scratch / "index-raw"), honor_ignores=False)
+    with tempfile.TemporaryDirectory(prefix="tilth-rules-") as temp:
+        overlay = Path(temp)
+        for rel, content in before.items():
+            (overlay / rel).parent.mkdir(parents=True, exist_ok=True)
+            (overlay / rel).write_bytes(content)
+        for rel in raw:
+            if Path(rel).name != ".gitignore":
+                (overlay / rel).parent.mkdir(parents=True, exist_ok=True)
+                (overlay / rel).touch()
+        judged = _files(overlay, _git_env(scratch / "git", overlay, scratch / "index-rules"))
+    kept = {rel for rel in judged if Path(rel).name != ".gitignore"}
+    return sorted(kept | set(rules))
+
+
+def _tree(root: Path, scratch: Path, name: str, files: Optional[list[str]] = None) -> str:
     """Write ``root``'s filtered files into the scratch object store; return the tree id."""
     env = _git_env(scratch / "git", root, scratch / f"index-{name}")
-    files = _files(root, env)
+    if files is None:
+        files = _files(root, env)
     if files:
-        _git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], env, b"\0".join(map(os.fsencode, files)))
+        _git(
+            ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], env,
+            b"\0".join(map(os.fsencode, files)),
+        )
     return _git(["write-tree"], env).decode().strip()
 
 
@@ -122,12 +158,12 @@ def snapshot(workdir: Path) -> Iterator[Path]:
 def workspace_diff_lines(baseline: Path, workdir: Path) -> Optional[int]:
     """Added plus removed lines between ``baseline`` and ``workdir``; None when not computable.
 
-    Both trees are filtered by git's ignore rules and compared with one ``git diff``.
+    Both trees are filtered by the baseline's git ignore rules and compared with one ``git diff``.
     """
     try:
         with _scratch() as scratch:
             before = _tree(baseline, scratch, "before")
-            after = _tree(workdir, scratch, "after")
+            after = _tree(workdir, scratch, "after", _after_files(baseline, workdir, scratch))
             env = _git_env(scratch / "git", workdir, scratch / "index-diff")
             out = _git(["diff", "--numstat", "--no-renames", "-z", before, after], env)
         total = 0
@@ -158,7 +194,9 @@ def lint_status(
     """Run ``command`` on a throwaway copy of ``workdir``: (ok, reason).
 
     ``ok`` is None with a reason when the lint could not give a verdict: no command is
-    (None, None), a timeout is (None, "timeout"), an unrunnable command is (None, "unavailable").
+    (None, None), a timeout is (None, "timeout"), an unrunnable command is (None, "unavailable"),
+    and a nonzero exit is (False, "failed (exit N)").
+    A command with a path separator resolves against the copy it runs in.
     The copy keeps a lint that writes files from changing what grading sees.
     """
     if not command:
@@ -172,7 +210,11 @@ def lint_status(
             )
             env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL")}
             env["HOME"] = temp
-            if shutil.which(command[0], path=env.get("PATH")) is None:
+            if os.sep in command[0]:
+                runnable = (copy / command[0]).is_file() and os.access(copy / command[0], os.X_OK)
+            else:
+                runnable = shutil.which(command[0], path=env.get("PATH")) is not None
+            if not runnable:
                 return None, "unavailable"
             done = _RUN(
                 [*_offline_prefix(), *command], cwd=str(copy), env=env, stdin=subprocess.DEVNULL,
@@ -182,4 +224,6 @@ def lint_status(
             return None, "timeout"
         except (OSError, shutil.Error):
             return None, "unavailable"
-    return done.returncode == 0, None
+    if done.returncode == 0:
+        return True, None
+    return False, f"failed (exit {done.returncode})"

@@ -140,7 +140,7 @@ def test_row_lint_pass_fail_and_no_command(cell) -> None:
     none = cell(lambda cwd: None)
 
     assert (ok["lint_ok"], ok["lint_reason"]) == (True, None)
-    assert (bad["lint_ok"], bad["lint_reason"]) == (False, None)
+    assert (bad["lint_ok"], bad["lint_reason"]) == (False, "failed (exit 1)")
     assert (none["lint_ok"], none["lint_reason"]) == (None, None)
 
 
@@ -248,3 +248,56 @@ def test_total_comes_from_one_git_diff_over_the_filtered_trees(tmp_path, monkeyp
 
     assert erosion.workspace_diff_lines(before, after) == 6
     assert sum(cmd[:2] == ["git", "diff"] for cmd in calls) == 1
+
+
+def test_an_agent_cannot_hide_a_new_file_by_ignoring_it(cell) -> None:
+    (cell.source / "keep.txt").write_text("k\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / "secret.py").write_text("a\nb\nc\n")  # 3 added
+        (cwd / ".gitignore").write_text("secret.py\n")  # 1 added
+
+    assert cell(act)["workspace_diff_lines"] == 4
+
+
+def test_an_agent_cannot_hide_a_new_nested_file_by_ignoring_it(cell) -> None:
+    (cell.source / "pkg").mkdir()
+    (cell.source / "pkg" / "a.py").write_text("x\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / "pkg" / "new.py").write_text("1\n2\n")  # 2 added
+        (cwd / "pkg" / ".gitignore").write_text("*.py\n!a.py\n")  # 2 added
+
+    assert cell(act)["workspace_diff_lines"] == 4
+
+
+def test_deleting_an_ignore_rule_does_not_count_the_tool_output_it_covered(cell) -> None:
+    (cell.source / ".gitignore").write_text(".mypy_cache/\n")
+
+    def act(cwd: Path) -> None:
+        (cwd / ".gitignore").unlink()  # 1 removed
+        (cwd / ".mypy_cache").mkdir()
+        (cwd / ".mypy_cache" / "meta.json").write_text("{}\n" * 50)
+
+    assert cell(act)["workspace_diff_lines"] == 1
+
+
+def test_a_failed_lint_says_so_with_its_exit_code(tmp_path) -> None:
+    result = erosion.lint_status([sys.executable, "-c", "raise SystemExit(3)"], tmp_path)
+
+    assert result == (False, "failed (exit 3)")
+
+
+def test_a_relative_lint_command_resolves_inside_the_workspace_copy(tmp_path) -> None:
+    script = tmp_path / "lint.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+
+    assert erosion.lint_status(["./lint.sh"], tmp_path) == (True, None)
+    assert erosion.lint_status(["./absent.sh"], tmp_path) == (None, "unavailable")
+
+
+def test_skill_audit_fields_are_none_on_unmeasured_rows() -> None:
+    assert run._SKILL_AUDIT_UNMEASURED == dict.fromkeys(
+        ("skill_calls", "non_plugin_skill_calls", "bundled_skills_exposed")
+    )
