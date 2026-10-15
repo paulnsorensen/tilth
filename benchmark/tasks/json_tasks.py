@@ -37,7 +37,13 @@ from typing import Optional
 import baselines
 from config import REPOS, REPOS_DIR, RepoConfig
 from external.data import data_dir
+from external.featurebench import JUNIT_OPTIONS, junit_results
+from external.patches import touched_paths
+from external.task import PrepareError, apply_patch, checkout_path, read_report, write_or_remove
 from tasks.base import GroundTruth, Mutation, Task, dev_git_env
+
+GRADER_TIMEOUT_SECONDS = 300
+OUTPUT_TAIL_CHARS = 600
 
 
 @dataclass
@@ -104,20 +110,11 @@ class JsonMutationTask(_JsonTask):
         }
 
 
-def _test_patch_paths(patch_text: str) -> list[str]:
-    """Return the `b/`-side paths a unified diff touches."""
-    return [
-        line[len("+++ b/"):].rstrip("\n")
-        for line in patch_text.splitlines()
-        if line.startswith("+++ b/")
-    ]
-
-
-def _git_show(repo_dir: Path, revision: str, rel_path: str) -> Optional[str]:
-    """Return a path's content at `revision`, or None if it did not exist there."""
+def _git_blob(repo_dir: Path, revision: str, rel_path: str) -> Optional[bytes]:
+    """A path's exact bytes at `revision`, or None if it did not exist there."""
     result = subprocess.run(
-        ["git", "show", f"{revision}:{rel_path}"],
-        cwd=repo_dir, capture_output=True, text=True,
+        ["git", "cat-file", "blob", f"{revision}:{rel_path}"],
+        cwd=repo_dir, capture_output=True,
     )
     return result.stdout if result.returncode == 0 else None
 
@@ -167,66 +164,76 @@ class JsonMinedTask(_JsonTask):
         return True
 
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
-        """Reset `test_patch`'s paths to `base_sha`, apply it, then grade.
+        """Reset `test_patch`'s paths to `base_sha`, apply it, then grade from JUnit.
 
         Resetting first means an agent that edited or deleted the new test
         cannot win: grading always runs the PR's own regression test against
         whatever fix code the agent left in place, taken from `base_sha` in
         the source clone's git history (not from the `.git`-free workspace).
         """
-        source_dir = REPOS[self.repo_name].path
         workspace = Path(repo_path)
-        for rel_path in _test_patch_paths(self.test_patch):
-            base_content = _git_show(source_dir, self.base_sha, rel_path)
-            dest_file = workspace / rel_path
-            if base_content is None:
-                if dest_file.exists():
-                    dest_file.unlink()
-                continue
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
-            dest_file.write_text(base_content)
-
-        applied = subprocess.run(
-            ["git", "apply", "-"],
-            input=self.test_patch, cwd=str(workspace),
-            capture_output=True, text=True,
-        )
-        if applied.returncode != 0:
-            return False, f"Test patch did not apply: {applied.stderr.strip()[-300:]}"
+        try:
+            self._restore_heldout(workspace)
+        except PrepareError as error:
+            return False, f"Test patch paths unusable: {error}"
+        if self.test_patch and not apply_patch(workspace, self.test_patch):
+            return False, "Test patch did not apply"
 
         if not self.test_command_:
             return False, "mined task requires a nonempty test_command"
+        command = shlex.join(self.test_command_)
         with tempfile.TemporaryDirectory(prefix="tilth-mined-report-") as report_dir:
             report = Path(report_dir) / "report.xml"
-            command = _graded_command(self.test_command_, report)
-            result = subprocess.run(
-                command, cwd=str(workspace), capture_output=True, text=True,
-                timeout=300,
-            )
+            env = {**os.environ, "PYTEST_ADDOPTS": shlex.join([*JUNIT_OPTIONS, f"--junitxml={report}"])}
+            try:
+                result = subprocess.run(
+                    self.test_command_, cwd=str(workspace), capture_output=True, text=True,
+                    timeout=GRADER_TIMEOUT_SECONDS, env=env,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"Grader timed out after {GRADER_TIMEOUT_SECONDS}s: {command}"
             if result.returncode != 0:
-                return False, f"Test failed: {shlex.join(self.test_command_)}"
-            if command is not self.test_command_ and not _report_passed(report):
-                return False, f"Test report shows no passing run: {shlex.join(self.test_command_)}"
-        return True, "Test passed"
+                return False, f"Test failed: {command}{_output_tail(result)}"
+            return _junit_verdict(read_report(report), command)
+
+    def _restore_heldout(self, workspace: Path) -> None:
+        """Reset every path `test_patch` names to its `base_sha` bytes (or remove it).
+
+        Raises PrepareError for an unsafe path or a non-empty patch naming none.
+        """
+        paths = sorted(touched_paths(self.test_patch))
+        if self.test_patch.strip() and not paths:
+            raise PrepareError("the test patch names no path")
+        root = workspace.resolve()
+        for rel_path in paths:
+            if not checkout_path(workspace, rel_path).resolve().is_relative_to(root):
+                raise PrepareError(f"path escapes the workspace: {rel_path!r}")
+        source_dir = REPOS[self.repo_name].path
+        for rel_path in paths:
+            write_or_remove(workspace, rel_path, _git_blob(source_dir, self.base_sha, rel_path))
 
 
-def _graded_command(argv: list[str], report: Path) -> list[str]:
-    """`argv` plus a JUnit XML report path for a pytest command; any other command is unchanged."""
-    if "pytest" in argv or Path(argv[0]).name in {"pytest", "py.test"}:
-        return [*argv, f"--junitxml={report}"]
-    return argv
+def _output_tail(result: subprocess.CompletedProcess) -> str:
+    """A bounded tail of a failed grader's stdout and stderr, ready to append to a reason."""
+    tail = f"{result.stdout or ''}{result.stderr or ''}".strip()[-OUTPUT_TAIL_CHARS:]
+    return f"\n{tail}" if tail else ""
 
 
-def _report_passed(report: Path) -> bool:
-    """True when the JUnit report ran at least one test and holds no failure or error."""
+def _junit_verdict(report: str, command: str) -> tuple[bool, str]:
+    """Pass when the report records a PASSED test and no FAILED or ERROR one; skips never count."""
+    if not report:
+        return False, f"Test report missing (the command wrote no JUnit XML): {command}"
     try:
-        root = ET.parse(report).getroot()
-    except (OSError, ET.ParseError):
-        return False
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    totals = [int(suite.get(key, 0)) for suite in suites for key in ("tests", "failures", "errors")]
-    tests = sum(totals[0::3])
-    return tests > 0 and sum(totals[1::3]) == 0 and sum(totals[2::3]) == 0
+        ET.fromstring(report)
+    except ET.ParseError:
+        return False, f"Test report malformed: {command}"
+    statuses = [status for status, _ in junit_results(report)]
+    broken = sum(status in {"FAILED", "ERROR"} for status in statuses)
+    if broken:
+        return False, f"Test report shows {broken} failed or errored test(s): {command}"
+    if "PASSED" not in statuses:
+        return False, f"Test report shows zero executed passing tests (skips do not count): {command}"
+    return True, "Test passed"
 
 
 def _register_mutation_repo(json_path: Path, repo_rel: str) -> str:

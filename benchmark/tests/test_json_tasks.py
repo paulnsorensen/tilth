@@ -142,30 +142,18 @@ def test_ensure_mined_repo_cloned_is_deferred_to_first_access(monkeypatch, tmp_p
 
 def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
     """The agent's workspace must not expose head_sha or later history."""
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     import run as run_module
 
     source = tmp_path / "source"
     source.mkdir()
     (source / "valmod.py").write_text("value = 1\n")
-    env = {
-        **__import__("os").environ,
-        "GIT_AUTHOR_NAME": "dev", "GIT_AUTHOR_EMAIL": "dev@test.com",
-        "GIT_COMMITTER_NAME": "dev", "GIT_COMMITTER_EMAIL": "dev@test.com",
-    }
-    subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, env=env)
-    subprocess.run(["git", "-C", str(source), "commit", "-qm", "base"], check=True, env=env)
+    _git(source.parent, "init", "-q", str(source))
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "base")
     (source / "valmod.py").write_text("value = 2\n")
-    subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, env=env)
-    head = subprocess.run(
-        ["git", "-C", str(source), "commit", "-qm", "fix: reference commit"],
-        check=True, env=env,
-    )
-    head_sha = subprocess.run(
-        ["git", "-C", str(source), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "fix: reference commit")
+    head_sha = _git(source, "rev-parse", "HEAD")
 
     task = json_tasks.JsonMinedTask(
         id="acme-hide", capability_="fix",
@@ -179,8 +167,10 @@ def test_mined_task_hidden_workspace_lacks_head_sha(tmp_path) -> None:
         assert not (workspace / ".git").exists()
         log = subprocess.run(
             ["git", "log"], cwd=str(workspace), capture_output=True, text=True,
+            env={**GIT_ENV, "GIT_CEILING_DIRECTORIES": str(workspace.parent)},
         )
-        assert head_sha not in log.stdout
+        assert log.returncode != 0 and "not a git repository" in log.stderr
+        assert head_sha not in "".join(p.read_text() for p in workspace.rglob("*") if p.is_file())
 
 
 # --- AC-4: JSON task content feeds task_digest through identity_inputs (D-9) ---
@@ -467,3 +457,187 @@ def test_run_main_refuses_a_tasks_json_id_that_collides_with_a_static_task(capsy
 
     assert exit_info.value.code == 2
     assert "collides with an existing task" in capsys.readouterr().err
+
+
+# --- mined-task grading: held-out restore, JUnit verdict, timeout ---
+
+PYTEST = [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]
+PASSING = b"def test_ok():\n    assert True\n"
+
+
+def _mined_case(tmp_path, base_files, change, test_command=None):
+    """Build a source repo (base commit, then `change(source)` as head), a base-tree workspace and the task."""
+    import io
+    import tarfile
+
+    source = tmp_path / "w" / "source"
+    source.mkdir(parents=True)
+    for rel, data in base_files.items():
+        (source / rel).parent.mkdir(parents=True, exist_ok=True)
+        (source / rel).write_bytes(data)
+    _git(source.parent, "init", "-q", str(source))
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "base")
+    base = _git(source, "rev-parse", "HEAD")
+    change(source)
+    _git(source, "add", "-A")
+    _git(source, "commit", "-qm", "head", "--allow-empty")
+    head = _git(source, "rev-parse", "HEAD")
+    test_patch = subprocess.run(
+        ["git", "-C", str(source), "diff", "-M", base, head], check=True, capture_output=True,
+    ).stdout.decode()
+    workspace = tmp_path / "w" / "ws"
+    workspace.mkdir()
+    archive = subprocess.run(["git", "-C", str(source), "archive", base], check=True, capture_output=True).stdout
+    tarfile.open(fileobj=io.BytesIO(archive)).extractall(workspace, filter="data")
+    json_tasks.REPOS["mined-grade"] = json_tasks.RepoConfig(
+        name="mined-grade", url=str(source), commit_sha=base, language="", description="", path_override=source,
+    )
+    task = json_tasks.JsonMinedTask(
+        id="grade", capability_="fix", prompt_="p", repo_name="mined-grade", base_sha=base, head_sha=head,
+        test_patch=test_patch, test_command_=test_command or PYTEST,
+        reference_changed_lines_=0,
+    )
+    return task, workspace
+
+
+def _numbered(name: str, extra: str = "") -> bytes:
+    body = "".join(f"# filler {n}\n" for n in range(8))
+    return f"{body}def test_{name}():\n    assert True{extra}\n".encode()
+
+
+def test_grading_restores_a_renamed_test_file_at_both_paths(tmp_path) -> None:
+    old = _numbered("v")
+
+    def change(source: Path) -> None:
+        (source / "tests" / "test_old.py").rename(source / "tests" / "test_new.py")
+        (source / "tests" / "test_new.py").write_bytes(old.replace(b"assert True", b"assert 1 == 1"))
+
+    task, workspace = _mined_case(tmp_path, {"tests/test_old.py": old}, change)
+    (workspace / "tests" / "test_old.py").write_text("def test_old():\n    assert False\n")
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert not (workspace / "tests" / "test_old.py").exists()
+    assert (workspace / "tests" / "test_new.py").exists()
+
+
+def test_grading_restores_a_test_file_the_patch_deletes(tmp_path) -> None:
+    gone = _numbered("gone")
+    change = lambda source: (source / "tests" / "test_gone.py").unlink()  # noqa: E731
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_gone.py": gone, "tests/test_ok.py": PASSING}, change,
+    )
+    (workspace / "tests" / "test_gone.py").write_text("tampered\n")
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert not (workspace / "tests" / "test_gone.py").exists()
+
+
+def test_grading_round_trips_crlf_test_files(tmp_path) -> None:
+    base = _numbered("crlf").replace(b"\n", b"\r\n")
+    head = base.replace(b"assert True", b"assert 2 == 2")
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_crlf.py": base},
+        lambda source: (source / "tests" / "test_crlf.py").write_bytes(head),
+    )
+    (workspace / "tests" / "test_crlf.py").write_bytes(b"tampered\n")
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert (workspace / "tests" / "test_crlf.py").read_bytes() == head
+
+
+def test_grading_round_trips_non_utf8_test_files(tmp_path) -> None:
+    base = b"# -*- coding: latin-1 -*-\n# caf\xe9 \xff\xfe\n" + _numbered("enc")
+    head = base.replace(b"assert True", b"assert 3 == 3")
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_enc.py": base},
+        lambda source: (source / "tests" / "test_enc.py").write_bytes(head),
+    )
+    (workspace / "tests" / "test_enc.py").write_bytes(b"tampered\n")
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert (workspace / "tests" / "test_enc.py").read_bytes() == head
+
+
+def test_grading_ignores_a_content_line_that_looks_like_a_patch_header(tmp_path) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me\n")
+
+    def change(source: Path) -> None:
+        (source / "data.txt").write_text("++ b/../../victim.txt\n")
+
+    task, workspace = _mined_case(tmp_path, {"tests/test_ok.py": PASSING}, change)
+    assert "+++ b/../../victim.txt" in task.test_patch
+
+    assert task.check_correctness("", str(workspace)) == (True, "Test passed")
+    assert victim.read_text() == "keep me\n"
+
+
+def test_grading_refuses_a_header_path_outside_the_workspace(tmp_path) -> None:
+    task, workspace = _mined_case(tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None)
+    victim = tmp_path / "w" / "evil"
+    victim.write_text("keep me\n")
+    task.test_patch = (
+        "diff --git a/../evil b/../evil\n--- a/../evil\n+++ b/../evil\n@@ -1 +1 @@\n-keep me\n+x\n"
+    )
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and "unusable" in reason and "unsafe path" in reason
+    assert victim.read_text() == "keep me\n"
+
+
+def test_grading_fails_closed_when_the_test_patch_names_no_path(tmp_path) -> None:
+    task, workspace = _mined_case(tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None)
+    task.test_patch = "this is not a diff\n"
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and "names no path" in reason
+
+
+def test_grading_does_not_count_an_all_skipped_report(tmp_path) -> None:
+    skipped = b"import pytest\n\n\ndef test_s():\n    pytest.skip('nope')\n"
+    task, workspace = _mined_case(
+        tmp_path, {"valmod.py": b"value = 1\n"},
+        lambda source: (source / "tests").mkdir() or (source / "tests" / "test_skip.py").write_bytes(skipped),
+    )
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and "zero executed passing tests" in reason
+
+
+def test_grading_reports_failed_tests_with_an_output_tail(tmp_path) -> None:
+    failing = b"def test_f():\n    assert 1 == 2, 'marker-from-the-grader'\n"
+    task, workspace = _mined_case(
+        tmp_path, {"valmod.py": b"value = 1\n"},
+        lambda source: (source / "tests").mkdir() or (source / "tests" / "test_f.py").write_bytes(failing),
+    )
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and reason.startswith("Test failed:") and "marker-from-the-grader" in reason
+
+
+def test_grading_reports_a_missing_report(tmp_path) -> None:
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None,
+        test_command=[sys.executable, "-c", "pass"],
+    )
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and "report missing" in reason
+
+
+def test_grading_times_out_with_a_reason(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(json_tasks, "GRADER_TIMEOUT_SECONDS", 1)
+    task, workspace = _mined_case(
+        tmp_path, {"tests/test_ok.py": PASSING}, lambda source: None,
+        test_command=[sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    passed, reason = task.check_correctness("", str(workspace))
+
+    assert passed is False and reason.startswith("Grader timed out after 1s:")
