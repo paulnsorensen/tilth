@@ -1834,7 +1834,7 @@ mod tests {
     /// A coerced bare-string auto read on a large file (outline path) must
     /// book savings against what the caller actually receives (response +
     /// batching note), not the pre-note body — else the note's tokens are
-    /// booked as savings never delivered (`.cheese/affinage/pr-149.md:51-55`).
+    /// booked as savings never delivered (PR #149 affinage review).
     #[test]
     fn tool_read_coerced_paths_savings_excludes_note() {
         let dir = tempfile::tempdir().unwrap();

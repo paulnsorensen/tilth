@@ -41,10 +41,10 @@ Agents went around the tilth API where it fought their trained shapes or lacked 
 
 - #173 (op-kind telemetry): closed, shipped by #178 (`7d527a4`).
 - #174 (block-op teaching line): closed.
-- #175 (`replace_all` escape hatch): still OPEN on GitHub. #308 (`f236f77`) ships the behavior: `Op::TextSwapAll` with `all` and `count` (`src/edit/parser.rs:69`). The issue looks ready to close.
+- #175 (`replace_all` escape hatch): closed on 2026-10-16. #308 (`f236f77`) ships the behavior: `Op::TextSwapAll` with `all` and `count` (`src/edit/parser.rs:69`).
 
 ## Successor
 
 None. The ops are live. Benchmark evidence lives in `op_kinds` rows.
 
-_Source: former `.cheese/specs/tilth-api-adoption.md`; commits `e8f8d9b` (#177), `7d527a4` (#178), `d88bdf0` (#282), `f236f77` (#308); issues #173-#175 · Updated: 2026-10-13_
+_Source: former `.cheese/specs/tilth-api-adoption.md`; commits `e8f8d9b` (#177), `7d527a4` (#178), `d88bdf0` (#282), `f236f77` (#308); issues #173-#175 · Updated: 2026-10-16_

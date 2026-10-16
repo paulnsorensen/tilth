@@ -3021,7 +3021,7 @@ mod tests {
             miss.contains(
                 "\n  Content hits:       0\n  \
                  Files unreadable:   1 (results may be incomplete)\n  \
-                 Hint: no content matches; try kind: symbol or a broader pattern"
+                 Hint: no content matches; try an identifier or a broader pattern"
             ),
             "{miss}"
         );

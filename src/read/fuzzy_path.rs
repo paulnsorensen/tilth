@@ -73,8 +73,7 @@ pub fn resolve_fuzzy_path(scope: &Path, query: &str, _gate: GateProfile) -> Fuzz
 
 /// Rank `candidates` (scope-relative path strings) against `query` and return
 /// the top [`SUGGESTION_K`] by nucleo path-aware fuzzy score, as owned
-/// strings. Shared ranking core for the fuzzy-path fallback above and
-/// `diff::not_found_error`'s "did you mean" suggestions.
+/// strings. Ranking core for the fuzzy-path fallback above.
 pub(crate) fn rank_path_suggestions(query: &str, candidates: &[String]) -> Vec<String> {
     let mut scored = score_candidates(query, candidates);
     // Highest score first; stable tie order keeps equal-score candidates as

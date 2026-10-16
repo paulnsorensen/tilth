@@ -42,6 +42,6 @@ The auto-open design used a confidence gate (unique hit, or a score margin over 
 
 - `src/read/fuzzy_path.rs` is suggest-only: `FuzzyResolution` has `Suggestions` and `None` (`:32-37`), `SUGGESTION_K = 3` (`:29`), and `MAX_FUZZY_CANDIDATES = 20_000` (`:26`).
 - The walk prunes by `.tilthignore`, not `.gitignore` (`src/read/fuzzy_path.rs:12-15`).
-- Stale doc: `src/read/fuzzy_path.rs:77` names `diff::not_found_error`, which the fork removed with `src/diff/`.
+- The `rank_path_suggestions` doc (`src/read/fuzzy_path.rs:74-76`) names only the fuzzy-path fallback. The stale `diff::not_found_error` reference is gone.
 
-_Source: `.cheese/specs/fuzzy-suggest-only.md` (moved here); former `.cheese/specs/fuzzy-path-resolution.md`; commits `f12e74e` (#57), `cc317fa` (#111) · Updated: 2026-10-13_
+_Source: `.cheese/specs/fuzzy-suggest-only.md` (moved here); former `.cheese/specs/fuzzy-path-resolution.md`; commits `f12e74e` (#57), `cc317fa` (#111) · Updated: 2026-10-16_
