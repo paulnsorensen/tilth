@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
+import auth
 import baselines
 import external.data
 import paired
@@ -36,7 +37,7 @@ from .proposer import Proposer
 CANDIDATE_MODE = "tilth"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
-NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell"})
+NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell", "auth"})
 FINISH_CELL_SETS = 2  # finish scores two candidates on the test split: the dev winner and the seed
 
 
@@ -268,6 +269,10 @@ class Evolution:
             try:
                 with self._spending("judge"):
                     self.labels[name] = self.judge.applicability(run.TASKS[name])
+            except auth.ClaudeAuthError as error:
+                self.log(f"labels: auth refused ({error})")
+                self.stop.set("auth")
+                return None
             except judge.JudgeError as error:
                 unlabeled.append(f"{name} ({error})")
         if unlabeled:
@@ -286,6 +291,9 @@ class Evolution:
         except judge.JudgeSpendCeiling as error:
             reason = str(error)
             self.stop.set("ceiling")
+        except auth.ClaudeAuthError as error:
+            reason = str(error)
+            self.stop.set("auth")
         except judge.JudgeError as error:
             reason = str(error)
         self.calibrated = bool(agreement is not None and agreement.calibrated)
@@ -411,6 +419,9 @@ class Evolution:
                 except judge.JudgeSpendCeiling:
                     self.stop.set("ceiling")
                     raise _Stopped("ceiling") from None
+                except auth.ClaudeAuthError:
+                    self.stop.set("auth")
+                    raise _Stopped("auth") from None
                 except judge.JudgeError as error:
                     record["critique_error"] = str(error)
             records.setdefault(row["task"], []).append(record)

@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import analyze
+import auth
 import baselines
 import external
 import run
@@ -916,7 +918,7 @@ class Recorder:
 def test_judge_call_refused_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-fixture")
     recorder = Recorder(claude_stream("strong", 0.3))
-    with pytest.raises(run.ClaudeAuthError):
+    with pytest.raises(auth.ClaudeAuthError):
         make_judge(core.ClaudeJudgeClient(spawn=recorder)).applicability(TASKS["rg_search_dispatch"])
     assert recorder.calls == []
 
@@ -1361,3 +1363,108 @@ def test_missing_calibration_file_is_refused_cleanly() -> None:
     client = StubClient()
     assert cli.main(["calibrate", "--max-usd", "5", "--cell-estimate-usd", "0.1"], client=client) != 0
     assert client.prompts == []
+
+
+# --- subscription auth guard: budget files, init-event gate, preflight ---
+
+_LABEL_ARGS = ["label", "--tasks", "rg_search_dispatch", "--max-usd", "5", "--cell-estimate-usd", "0.1"]
+
+
+def _status_spawn(calls: list[dict], method: str = "oauth_token") -> Callable:
+    def spawn(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        calls.append({"argv": list(argv), **kwargs})
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+    return spawn
+
+
+def _budget_file(name: str) -> Path:
+    return Path(os.environ["TILTH_BENCH_DATA"]) / "budgets" / f"{name}.jsonl"
+
+
+def _disallowed_stream() -> str:
+    events = [json.loads(line) for line in claude_stream("strong", 0.3).splitlines()]
+    assert events[0]["subtype"] == "init"
+    events[0]["apiKeySource"] = "ANTHROPIC_API_KEY"
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def test_judge_budget_id_seeds_and_appends() -> None:
+    path = _budget_file("shared")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"run_key": None, "charged_usd": 1.0, "cost_source": "earlier"}) + "\n")
+    client = StubClient(answer="strong", cost=0.02)
+
+    assert cli.main([*_LABEL_ARGS, "--budget-id", "shared"], client=client, auth_spawn=_status_spawn([])) == 0
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 2 and records[1]["charged_usd"] == pytest.approx(0.02)
+
+    path.write_text(json.dumps({"run_key": None, "charged_usd": 4.99, "cost_source": "earlier"}) + "\n")
+    refused = StubClient(answer="strong")
+    # A different task, so the label is uncached and the call reaches the ceiling check.
+    over_args = ["label", "--tasks", "gin_servehttp_flow", *_LABEL_ARGS[3:], "--budget-id", "shared"]
+    code = cli.main(over_args, client=refused, auth_spawn=_status_spawn([]))
+    assert code != 0
+    assert refused.prompts == [] and len(path.read_text().splitlines()) == 1
+
+
+def test_judge_without_budget_id_writes_no_budget_file() -> None:
+    client = StubClient(answer="strong")
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn([])) == 0
+    assert len(client.prompts) == 1
+    assert not (Path(os.environ["TILTH_BENCH_DATA"]) / "budgets").exists()
+
+
+def test_judge_bad_budget_id_is_refused() -> None:
+    client = StubClient(answer="strong")
+    assert cli.main([*_LABEL_ARGS, "--budget-id", "../escape"], client=client, auth_spawn=_status_spawn([])) != 0
+    assert client.prompts == []
+
+
+def test_judge_disallowed_stream_is_charged_and_discarded(capsys: pytest.CaptureFixture[str]) -> None:
+    recorder = Recorder(_disallowed_stream())
+    ledger = SpendLedger.persistent("judge-auth", 5.0)
+    judge = make_judge(core.ClaudeJudgeClient(spawn=recorder), ledger=ledger)
+    task = TASKS["rg_search_dispatch"]
+
+    with pytest.raises(auth.ClaudeAuthError):
+        judge.applicability(task)
+
+    assert ledger.charges == [(pytest.approx(0.3), "native")]
+    assert [json.loads(line)["charged_usd"] for line in _budget_file("judge-auth").read_text().splitlines()] \
+        == [pytest.approx(0.3)]
+    assert core.uncached_labels({"rg_search_dispatch": task}) == ["rg_search_dispatch"]
+
+    client = core.ClaudeJudgeClient(spawn=recorder)
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn([])) == 1
+    assert "apiKeySource" in capsys.readouterr().err
+    assert core.uncached_labels({"rg_search_dispatch": task}) == ["rg_search_dispatch"]
+
+
+def test_judge_preflight_runs_once_and_only_for_uncached_calls() -> None:
+    statuses: list[dict] = []
+    client = StubClient(answer="strong")
+
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) == 0
+    assert len(statuses) == 1 and statuses[0]["argv"] == ["claude", "auth", "status"]
+    config = Path(statuses[0]["env"]["CLAUDE_CONFIG_DIR"])
+    assert config.name.startswith("tilth-auth-") and config.parent == Path(tempfile.gettempdir())
+
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) == 0
+    assert len(statuses) == 1 and len(client.prompts) == 1
+
+
+def test_judge_non_oauth_status_refuses_before_any_client_call(capsys: pytest.CaptureFixture[str]) -> None:
+    client = StubClient(answer="strong")
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn([], method="claude.ai")) != 0
+    assert client.prompts == [] and "oauth_token" in capsys.readouterr().err
+
+
+def test_judge_missing_oauth_token_is_refused(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    statuses: list[dict] = []
+    client = StubClient(answer="strong")
+
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) != 0
+
+    assert client.prompts == [] and statuses == [] and "CLAUDE_CODE_OAUTH_TOKEN" in capsys.readouterr().err

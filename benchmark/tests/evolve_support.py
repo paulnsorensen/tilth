@@ -140,6 +140,10 @@ class EvolveTask:
     def prompt(self) -> str:
         return f"Name the dispatcher for {self.name}."
 
+    @property
+    def fixture_path(self) -> None:
+        return None
+
     def identity_inputs(self) -> dict[str, object] | None:
         return None
 
@@ -285,7 +289,8 @@ class World:
 
 
 def result_stream(text: str, *, cost: float | None = 0.01, events: list[dict] = ()) -> str:
-    lines = [json.dumps(event) for event in events]
+    init = {"type": "system", "subtype": "init", "apiKeySource": "none"}
+    lines = [json.dumps(event) for event in [init, *events]]
     result = {"type": "result", "subtype": "success", "is_error": False, "result": text}
     if cost is not None:
         result["total_cost_usd"] = cost

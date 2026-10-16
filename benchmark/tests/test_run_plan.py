@@ -12,6 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import baselines
 import panels
 import run
@@ -258,7 +259,7 @@ def test_run_plan_reprobes_cli_before_each_paid_cell(world, monkeypatch: pytest.
 
 def test_run_plan_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    with pytest.raises(run.ClaudeAuthError):
+    with pytest.raises(auth.ClaudeAuthError):
         plan(world, cells(*DEV))
     assert world.runner_calls() == []
 

@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import baselines
 import erosion
 import run
@@ -53,7 +54,7 @@ class _ErosionTask(Task):
 @pytest.fixture
 def cell(monkeypatch, tmp_path):
     """Run one cell whose fake agent calls ``act(cwd)`` inside its workspace."""
-    for key in run._API_BILLING_KEYS:
+    for key in auth.REFUSED_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     source = tmp_path / "source"
     source.mkdir()

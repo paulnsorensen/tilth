@@ -74,7 +74,18 @@ The estimate is the mean stored cost for that task, arm, and model, else this ru
 
 A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
 The run key of a Claude cell includes a per-cell budget placeholder, so rows stored before this change need `--refreeze-baselines` to be reused.
-Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning. A Claude cell refuses to start when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set, because either overrides `CLAUDE_CODE_OAUTH_TOKEN`; no runner receives any `ANTHROPIC_*` variable.
+Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning.
+A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks `CLAUDE_CODE_OAUTH_TOKEN`.
+It also refuses when a settings file that a cell loads sets one of these keys under `env` or sets `apiKeyHelper`; no runner receives any `ANTHROPIC_*` variable.
+Before the first paid cell, a Claude run also needs `CLAUDE_CODE_OAUTH_TOKEN` and a passing `claude auth status` preflight that reports `oauth_token` for each distinct cell environment.
+A live Claude call can report an init `apiKeySource` other than `none`, report no `apiKeySource`, or send an assistant event before its init event.
+The run then records the cell as `infra: auth` and stops.
+Every paid run charges a persistent budget file at `$TILTH_BENCH_DATA/budgets/<budget_id>.jsonl`.
+`--budget-id NAME` names that budget; the default is a digest of the planned run keys.
+`--fresh-budget` appends a reset marker, so only later charges count against `--max-usd`.
+Each charge record carries an `at` timestamp (ISO 8601, UTC).
+An unreadable budget line that appears during a run stops the run before the next cell.
+The paid row is stored first, and the stop reason names the budget file.
 A usage-limit rejection (a terminal result with usage-limit text or a rate-limit subtype) records the cell as `infra: quota` and stops the run with exit status 1, as does the spend ceiling.
 
 ## External tasks: FeatureBench and SWE-bench Multilingual
@@ -159,6 +170,9 @@ Both spend flags are required whenever a call is uncached.
 Judge calls share the `--max-usd` ceiling and pass its remaining headroom as `--max-budget-usd`.
 The first usage-limit rejection stops every later judge call.
 The flags accept finite positive numbers only.
+`--budget-id NAME` keeps the judge spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`; without it, no budget file is written.
+Before the first uncached call, the judge runs one `claude auth status` check and refuses unless `CLAUDE_CODE_OAUTH_TOKEN` is set and the method is `oauth_token`.
+A judge call whose init event reports an API key raises an error, keeps its cost on the ledger, and discards its output.
 The maintainer hand-labels `benchmark/judge/calibration.json`.
 Its shape is `{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, with verdict `apt`, `missed`, or `misapplied`.
 It lists every task an analyzed run holds, plus at least 20 clean, completed rollouts with trajectories.
@@ -189,6 +203,10 @@ python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha
 
 `--max-usd` is required.
 It bounds every cell, judge, reflection, and proposer call.
+`--budget-id NAME` keeps the spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`, so a rerun starts from the recorded spend.
+Without the flag, the evolve ledger lives in the process only.
+The evolve run refuses before any paid call unless `CLAUDE_CODE_OAUTH_TOKEN` is set and `claude auth status` reports `oauth_token`.
+A call whose init event shows an API key stops the run with the `auth` reason, and its cost stays on the ledger.
 The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
 A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
 Run logs, delta reports, and candidate worktrees live under the gitignored `benchmark/results/evolve/<run-id>/`.

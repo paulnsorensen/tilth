@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import baselines
 import run
 from config import DEFAULT_MAX_BUDGET_USD, ModeConfig
@@ -93,7 +94,7 @@ def _stream_with_init(**init_fields) -> str:
 
 @pytest.fixture(autouse=True)
 def oauth_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in run._API_BILLING_KEYS:
+    for key in auth.REFUSED_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
 
@@ -505,7 +506,7 @@ def test_ac6_plugin_cell_env_pins_the_cli_and_keeps_oauth(monkeypatch, tmp_path)
     env = calls.kwargs[0]["env"]
     assert env["DISABLE_AUTOUPDATER"] == "1"
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-token"
-    assert not set(run._API_BILLING_KEYS) & set(env)
+    assert not set(auth.REFUSED_ENV_KEYS) & set(env)
 
 
 @pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
@@ -513,7 +514,7 @@ def test_ac6_plugin_cell_refuses_api_billing_credentials(monkeypatch, tmp_path, 
     calls = _install(monkeypatch, tmp_path, mode=_skill_mode(), stdout=LOADED_STREAM)
     monkeypatch.setenv(key, "sk-test")
 
-    with pytest.raises(run.ClaudeAuthError, match=key):
+    with pytest.raises(auth.ClaudeAuthError, match=key):
         run.run_single("plugin_task", "skill_mode", "haiku", 0)
     assert calls.cmds == []
 
@@ -524,7 +525,7 @@ def test_ac6_run_plan_refuses_a_plugin_cell_before_spawning(bench, monkeypatch, 
     bench.runner(lambda _stream: 0.1)
     monkeypatch.setenv(key, "sk-test")
 
-    with pytest.raises(run.ClaudeAuthError):
+    with pytest.raises(auth.ClaudeAuthError):
         run.run_plan([run.CellSpec("cell_a", "skills", "sonnet5", 0)], panel=_Panel(), ledger=SpendLedger(10.0),
                      candidate_sha=None, refreeze_baselines=False)
     assert bench.calls == []

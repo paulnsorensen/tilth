@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import baselines
 import paired
 import panels
@@ -210,6 +212,67 @@ def test_critique_error_recorded_not_raised(world, error: Exception) -> None:
         assert record["critique_error"] == str(error)
         assert record["label"] == "strong"
     assert evo.stop.reason is None
+
+def test_label_auth_failure_stops_the_run_with_store_only_finish(world) -> None:
+    world.judge.label_errors["dev_a"] = auth.ClaudeAuthError("apiKeySource ANTHROPIC_API_KEY")
+    evo = build(world)
+
+    evo.run()
+
+    assert evo.stop.reason == "auth"
+    assert world.runner_calls() == []
+    assert "finish: incomplete (auth)" in log_text(world)
+
+
+def test_calibration_auth_failure_stops_the_run(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    def refused(_labels):
+        raise auth.ClaudeAuthError("apiKeySource ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(world.judge, "calibrate", refused)
+    evo = build(world)
+
+    assert evo.preflight() is None
+
+    assert evo.stop.reason == "auth"
+
+
+def test_critique_auth_failure_stops_the_search(world) -> None:
+    world.judge.calibrated = True
+    world.judge.critique_error = auth.ClaudeAuthError("apiKeySource ANTHROPIC_API_KEY")
+    evo = ready(world)
+
+    evo.evaluate(evo.seed, "dev_a")
+
+    assert evo.stop.reason == "auth"
+
+
+def test_auth_plan_stop_makes_finish_buy_nothing(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    def refused(*args, **kwargs):
+        raise auth.ClaudeAuthError("apiKeySource ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(run, "run_single", refused)
+    evo.evaluate(child(evo.seed, dev_a="1", cheap_a="1"), "dev_a")
+    assert evo.stop.reason == "auth"
+    monkeypatch.setattr(run, "run_single", world.fake_run_single)
+    calls = len(world.calls)
+
+    assert evo.finish() is None
+    assert len(world.calls) == calls
+    assert "finish: incomplete (auth)" in log_text(world)
+
+
+def test_evolve_preflight_checks_cheap_split_repos(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list] = []
+    real = run.claude_auth_targets
+    monkeypatch.setattr(run, "claude_auth_targets", lambda cells, **kw: seen.append(list(cells)) or real(cells, **kw))
+
+    assert not isinstance(build(world), int)
+
+    assert {task for task, _mode, _model in seen[0]} == {*CHEAP, *DEV, *TEST}
 
 
 # --- the proposer works in an isolated export of the candidate's own tree ---
@@ -1711,9 +1774,9 @@ def test_reflection_call_isolated(world, monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:
     evo = ready(world)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    with pytest.raises(run.ClaudeAuthError):
+    with pytest.raises(auth.ClaudeAuthError):
         evo.reflect("prompts/mcp.md", "text", [])
-    with pytest.raises(run.ClaudeAuthError):
+    with pytest.raises(auth.ClaudeAuthError):
         evo.proposer.propose_src_patch(evo.seed, [])
     assert world.spawned == []
 
@@ -1804,7 +1867,8 @@ def _paid(spawn, ledger):
 
 
 def _usage_stream(*, input_tokens: int = 1_000_000, output_tokens: int = 100_000) -> str:
-    events = [{"type": "assistant", "message": {"id": "m1", "content": [], "usage": {
+    events = [{"type": "system", "subtype": "init", "apiKeySource": "none"},
+              {"type": "assistant", "message": {"id": "m1", "content": [], "usage": {
         "input_tokens": input_tokens, "output_tokens": output_tokens}}},
         {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}]
     return "\n".join(json.dumps(event) for event in events) + "\n"
@@ -2054,3 +2118,114 @@ def test_rejects_symlink_under_src(world, kind: str) -> None:
     with pytest.raises(ApplyRejected, match="symlink or submodule"):
         materializer.materialize({**seed_candidate(), "src_patch": patch})
     assert refs(world) == []
+
+
+# --- subscription auth guard: budget files, init-event gate, preflight ---
+
+
+def _budget_file(name: str) -> Path:
+    return Path(os.environ["TILTH_BENCH_DATA"]) / "budgets" / f"{name}.jsonl"
+
+
+def _budget_records(name: str) -> list[dict]:
+    return [json.loads(line) for line in _budget_file(name).read_text().splitlines()]
+
+
+def _status_spawn(calls: list[dict], method: str = "oauth_token"):
+    def spawn(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+    return spawn
+
+
+_ASSISTANT_FIRST = "\n".join([
+    json.dumps({"type": "assistant", "message": {"id": "m1", "content": []}}),
+    json.dumps({"type": "system", "subtype": "init", "apiKeySource": "none"}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "x", "total_cost_usd": 0.4}),
+]) + "\n"
+_API_KEY_INIT = "\n".join([
+    json.dumps({"type": "system", "subtype": "init", "apiKeySource": "ANTHROPIC_API_KEY"}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "x", "total_cost_usd": 0.4}),
+]) + "\n"
+
+
+def test_budget_id_seeds_and_appends_the_budget_file(world) -> None:
+    path = _budget_file("shared")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"run_key": None, "charged_usd": 1.5, "cost_source": "earlier"}) + "\n")
+
+    evo = build(world, "--budget-id", "shared")
+
+    assert evo.ledger.spent == pytest.approx(1.5)
+    assert evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp) is not None
+    records = _budget_records("shared")
+    assert len(records) == 2 and records[1]["charged_usd"] == pytest.approx(0.01)
+    assert records[1]["cost_source"] == "reflection:native"
+    assert evo.ledger.spent == pytest.approx(1.51)
+
+
+def test_no_budget_id_writes_no_budget_file(world) -> None:
+    evo = build(world)
+    evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp)
+
+    assert evo.ledger.spent == pytest.approx(0.01)
+    assert not (Path(os.environ["TILTH_BENCH_DATA"]) / "budgets").exists()
+
+
+@pytest.mark.parametrize("budget_id", ["../escape", "a/b", "", ".hidden"])
+def test_bad_budget_id_is_refused(world, budget_id: str) -> None:
+    assert main(world, "--budget-id", budget_id) == 2
+    assert world.spawned == [] and world.calls == []
+
+
+@pytest.mark.parametrize("stream", [_ASSISTANT_FIRST, _API_KEY_INIT], ids=["assistant-before-init", "api-key-source"])
+@pytest.mark.parametrize("persistent", [False, True], ids=["per-process", "budget-file"])
+def test_disallowed_stream_is_charged_and_stops_the_run(world, stream: str, persistent: bool) -> None:
+    def spawn(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stream, "")
+
+    evo = build(world, *(["--budget-id", "auth-stop"] if persistent else []), spawn=spawn)
+
+    assert evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp) is None
+
+    assert evo.stop.reason == "auth"
+    assert evo.ledger.charges == [(pytest.approx(0.4), "reflection:native")]
+    if persistent:
+        assert [r["charged_usd"] for r in _budget_records("auth-stop")] == [pytest.approx(0.4)]
+    assert evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp) is None
+    assert len(evo.ledger.charges) == 1
+
+
+def test_build_runs_one_status_call_per_distinct_target(world) -> None:
+    statuses: list[dict] = []
+
+    evo = build(world, auth_spawn=_status_spawn(statuses))
+
+    assert not isinstance(evo, int)
+    assert all(call["argv"] == ["claude", "auth", "status"] for call in statuses)
+    # The isolated call shape and the shared cell target are the two distinct targets of three cells.
+    assert len(statuses) == 2
+    configs = {call["env"]["CLAUDE_CONFIG_DIR"] for call in statuses}
+    assert len(configs) == 2
+    isolated = [c for c in configs if Path(c).name.startswith("tilth-auth-")]
+    assert len(isolated) == 1 and Path(isolated[0]).parent == Path(tempfile.gettempdir())
+    assert world.spawned == [] and world.calls == []
+
+
+def test_non_oauth_status_refuses_before_any_paid_call(world) -> None:
+    statuses: list[dict] = []
+    spawn = _status_spawn(statuses, method="claude.ai")
+
+    assert build(world, auth_spawn=spawn) == 2
+    assert main(world, auth_spawn=spawn) == 2
+
+    assert statuses and world.spawned == [] and world.calls == [] and world.builds == []
+
+
+def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    statuses: list[dict] = []
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+
+    assert main(world, auth_spawn=_status_spawn(statuses)) == 2
+
+    assert statuses == [] and world.spawned == [] and world.calls == []
