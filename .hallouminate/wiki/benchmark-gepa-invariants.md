@@ -31,7 +31,7 @@ The evolve preflight checks test-split baseline drift before any paid call (`ben
 - A completed row has no `error`, no `infra` value, and no timeout (`is_completed`, `benchmark/baselines.py:185-187`). Only a completed row is reusable. The store re-runs error, quota, and timeout rows.
 - A reused row goes to the run's output JSONL like a fresh row, with `reused: true`, so `analyze.py` sees it.
 - A run is paid when at least one planned cell has no reusable row. A run that the store answers fully is not paid and needs no `--max-usd` (spec claim, not re-verified).
-- A row records `cost_source`: `native` when the stream reports `total_cost_usd`, else `pricing` from `pricing.yaml` (`benchmark/parse.py:63,223`). Parsing keeps an absent cost apart from a reported 0.0. A failed cell charges its native cost, else its pre-run estimate as `estimate` (`fail()` in `_run_plan`, `benchmark/run.py:1641-1647`).
+- A row records `cost_source`: `native` when the stream reports `total_cost_usd`, else `pricing` from `pricing.yaml` (`benchmark/parse.py:63,223`). Parsing keeps an absent cost apart from a reported 0.0. A failed cell charges its native cost, else its stream usage priced as `pricing`, else its pre-run estimate as `estimate` (`spend.settle_failed`, `benchmark/spend.py:190`; `failed_cell_cost`, `benchmark/run.py:259`). Codex streams price only the events up to the last `turn.completed`. `parse._native_cost` treats a non-finite or negative cost as absent.
 - The cell estimate is the mean stored cost for that task and arm, else the run's largest cell cost so far, else `--cell-estimate-usd`. Reused rows do not enter it (`estimate_cell_cost`, `benchmark/run.py:1307-1326`).
 - Runner subprocesses set `DISABLE_AUTOUPDATER=1` (`benchmark/run.py:250`), so the agent CLI version cannot change in a run.
 - Claude and Codex cells write an untruncated trajectory sidecar. OpenCode cells record `trajectory_path: null`.
@@ -42,6 +42,17 @@ The shared `spend.SpendLedger` refuses a paid call when spent plus estimate plus
 The evolve loop holds a finish reserve of `FINISH_CELL_SETS * finalist_test_cost`. `FINISH_CELL_SETS` is 2: finish scores the dev winner and the seed on the test split (`benchmark/evolve/loop.py:40`). The value `finalist_test_cost` estimates one finalist's test-split cells plus unstored baseline test cells (`benchmark/evolve/loop.py:223-236`).
 The preflight refuses to start when `max_usd <= reserve` (`benchmark/evolve/loop.py:258-262`). The loop releases the reserve at finish. The reserve over-counts baseline cells. Review left this because it is conservative; `loop.py` records the rationale next to the code (`benchmark/evolve/loop.py:256-257`).
 Reused rows charge `0.0`, and `main` charges `0.0` when a cell fails in prepare (`benchmark/run.py:2274-2283`). `--cell-estimate-usd` sets the per-cell estimate.
+
+### Persistent budget across resumes
+
+Spend persists per budget id, so a rerun of a stopped command does not get a fresh `--max-usd` ceiling (issue #325, PR #334).
+
+- `run.py` derives the budget id from a digest of every planned run key (`plan_budget_id`, `benchmark/spend.py:35`). `--budget-id NAME` overrides it for `run.py`, evolve, and judge. Without `--budget-id`, evolve and judge keep a per-process ledger.
+- `SpendLedger.persistent` seeds `spent` from `$TILTH_BENCH_DATA/budgets/<budget_id>.jsonl` and appends one record per charge with `run_key`, `charged_usd`, `cost_source`, and `at` (`benchmark/spend.py:132,171`). `run.py` opens it only when a cell is pending.
+- Every `would_cross`, `headroom`, and `exhausted` call re-reads the file under a shared `fcntl` lock; appends take an exclusive lock (`_refresh`, `benchmark/spend.py:150`). Two runs that share a budget can still overshoot by one in-flight cell each.
+- `--fresh-budget` appends `{"reset": true, "at": ...}`; only later records count. A rerun with a new `--max-usd` applies it to the recorded spend.
+- A record after the newest reset with no readable amount, such as a torn line, raises `ValueError` instead of counting 0 (`_recorded_spend`, `benchmark/spend.py:81`). A negative amount or an object without `charged_usd` counts 0, which cannot undercount. `charge` refuses a non-finite or negative cost.
+- An unreadable budget file at start is a usage error. Mid-run, `run.py` and `run_plan` store the paid row first, then stop as `ceiling` and name the file. Evolve's reflection and proposer calls stop as `ceiling`, and judge calls raise `JudgeSpendCeiling`.
 
 ### No paid call spends the finish reserve
 
@@ -54,6 +65,16 @@ A paid call never spends into the finish reserve.
 - `ClaudeJudgeClient` passes the headroom as `--max-budget-usd` (`benchmark/judge/core.py:324-333`). `Judge._call` raises `JudgeSpendCeiling` when `exhausted()` holds or the estimate would cross (`benchmark/judge/core.py:472-475`).
 - Reflection and proposer calls pass the headroom as `--max-budget-usd` and check `would_cross` and `exhausted()` first (`PaidCalls.call`, `benchmark/evolve/calls.py:92-136`).
 - A reused row with an older panel stamp is stored again with the current stamp, `charged_usd: 0.0`, and `reused: true` (`_store_reused_panel_row`, `benchmark/run.py:1695-1714`). The store skips the copy when a row for the run key already carries this panel name and split digest. `_run_plan` and `main` both call it (`benchmark/run.py:1602,2163-2164`). So the split lock holds on a run where every cell is a cache hit.
+
+## Claude auth guard
+
+No `claude -p` call may authenticate with anything other than `CLAUDE_CODE_OAUTH_TOKEN` (`benchmark/auth.py`, PR #334).
+
+- `refuse_env` refuses `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, the three `CLAUDE_CODE_USE_*` provider flags, and both federation variables, because each outranks the OAuth token (`REFUSED_ENV_KEYS`, `benchmark/auth.py:29`). Refusals name the key, never the value.
+- `preflight_claude_auth` runs before any paid call, once per distinct cell target. It requires the token, scans the managed settings and, when the cell loads them, the user, project, and local settings for a refused `env` key or `apiKeyHelper`, and requires `claude auth status` to report `oauth_token` (`benchmark/auth.py:87,141`). A passed status is cached per process.
+- A target is the seed repo and seed config dir that each cell copies, so the check is conservative (`claude_auth_targets`, `benchmark/run.py:220`). Evolve and judge calls use one temp-cwd, temp-config target with no settings sources.
+- `InitGate` stops a live cell whose init `apiKeySource` is not `none`, has no `apiKeySource`, or sends an assistant event before init. The cell is charged and stored as `infra: auth`, and the run stops (`benchmark/auth.py:176`, `benchmark/run.py:1252`). Evolve and judge replay captured stdout through `check_captured` (`benchmark/auth.py:197`).
+- The allowlist `{"none"}` comes from a live probe on 2026-10-16 with claude 2.1.301 and only the token set: `authMethod` was `oauth_token` and init `apiKeySource` was `none` (`ALLOWED_API_KEY_SOURCES`, `benchmark/auth.py:43`). `none` alone does not prove the token; the status check gives the positive proof.
 
 ## Admission, grading, and contamination
 
@@ -130,7 +151,7 @@ The materializer refuses a candidate before any paid call when it breaks a guard
 - `just check` for a candidate has a 1800 s timeout (`JUST_CHECK_TIMEOUT_S`, `benchmark/evolve/cli.py:38`). A timeout kills the whole process group, so cargo and the test binaries stop too.
 
 Candidate refs live at `refs/evolve/<run-id>/<content-id[:12]>`. Builds are cached once per sha. Defaults are 3 frontier re-runs and a 5-round plateau.
-The six stop reasons are `ceiling`, `quota`, `plateau`, `cli-version`, `mcp-unavailable`, and `invalid-cell` (`benchmark/evolve/calls.py:16`).
+The seven stop reasons are `ceiling`, `quota`, `plateau`, `cli-version`, `mcp-unavailable`, `invalid-cell`, and `auth` (`benchmark/evolve/calls.py:17`). `auth` is a no-spend reason, so finish runs in store-only mode.
 Finish pushes with an empty-ref lease, so an existing winner branch is a logged refusal. It then opens `gh pr create --draft` with no merge.
 
 ## Before the first paid run
@@ -146,12 +167,12 @@ The archive left this checklist open on 2026-10-08.
 
 These risks remained open at the end of the PR #312 session, the provenance of this page.
 
-- Whether OAuth streams carry `total_cost_usd` and `rate_limit_event` is untested. Cost falls back to `pricing.yaml`.
+- A live OAuth-token cell on 2026-10-16 reported `total_cost_usd` (`cost_source: native`). Whether OAuth streams carry `rate_limit_event` is untested.
 - The contamination scan detects known paths only. Native cells have no isolation. Issue [#322](https://github.com/paulnsorensen/tilth/issues/322) tracks sandboxing for grading, candidate builds, and agent cells. It also covers a symlinked test directory that could let config restore write through the link.
 - Per-instance Pareto selection can chase noise on expensive rollouts.
 - The live `claude -p` judge command line has not run against a real CLI.
 - `run_plan` duplicates the cell loop of `run.main`. Issue [#320](https://github.com/paulnsorensen/tilth/issues/320) tracks one shared scheduler.
-- Spend accounting is incomplete: the ledger does not carry across resumes, and partial streams are priced loosely. Issue [#325](https://github.com/paulnsorensen/tilth/issues/325) tracks it, with the pre-runner estimate charge and undercharged timeouts.
+- Issue [#325](https://github.com/paulnsorensen/tilth/issues/325) (spend across resumes, failed-cell pricing, settings-level auth) closed with PR #334. Open edges: a shared-budget overshoot of one in-flight cell per run, and a token revoked mid-run is not re-probed.
 - Reflection prompt size is unbounded, and the result store is local-only.
 
-_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319 after the PR #318 cure; spec lines at `9e84659` via `refs/pull/312/head` · Updated: 2026-10-14_
+_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319 after the PR #318 cure; spec lines at `9e84659` via `refs/pull/312/head` ; spend and auth sections from PR #334 and the 2026-10-16 live smoke run · Updated: 2026-10-16_

@@ -489,7 +489,11 @@ class Judge:
         if _quota_reason is not None:
             raise JudgeQuota(f"judge calls stopped after a usage-limit rejection: {_quota_reason}")
         estimate = self._estimate(kind)
-        if self.ledger.exhausted() or self.ledger.would_cross(estimate):
+        try:
+            refused = self.ledger.exhausted() or self.ledger.would_cross(estimate)
+        except ValueError as error:  # an unreadable budget record: its spend is unknown, so refuse
+            raise JudgeSpendCeiling(f"{kind} judge call not started: {error}") from error
+        if refused:
             raise JudgeSpendCeiling(f"{kind} judge call estimated at ${estimate:.4f} would cross the "
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f} + "
                                     f"${self.ledger.reserve:.4f} reserved)")

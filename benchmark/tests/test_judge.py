@@ -935,6 +935,16 @@ def test_judge_ceiling_stops_before_crossing_call() -> None:
     assert recorder.calls == []
 
 
+def test_judge_unreadable_budget_file_refuses_as_spend_ceiling(tmp_path: Path) -> None:
+    ledger = SpendLedger.persistent("shared", 5.0, root=tmp_path)
+    (tmp_path / "shared.jsonl").write_text('{"run_key": "k", "charged_usd": 1.0')  # torn record
+    recorder = Recorder(claude_stream("strong", 0.01))
+    with pytest.raises(core.JudgeSpendCeiling, match="shared.jsonl"):
+        make_judge(core.ClaudeJudgeClient(spawn=recorder), ledger=ledger, floor=0.01).applicability(
+            TASKS["rg_search_dispatch"])
+    assert recorder.calls == []
+
+
 def test_fresh_run_floor_refuses_crossing_call() -> None:
     ledger = SpendLedger(1.0)
     ledger.charge(0.5, source="native")

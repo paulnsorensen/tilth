@@ -1874,6 +1874,20 @@ def _usage_stream(*, input_tokens: int = 1_000_000, output_tokens: int = 100_000
     return "\n".join(json.dumps(event) for event in events) + "\n"
 
 
+def test_paid_call_stops_with_ceiling_on_an_unreadable_budget_file(world, tmp_path: Path) -> None:
+    from spend import SpendLedger
+    ledger = SpendLedger.persistent("shared", 5.0, root=tmp_path)
+    (tmp_path / "shared.jsonl").write_text('{"run_key": "k", "charged_usd": 1.0')  # torn record
+    spawned: list[list[str]] = []
+    paid = _paid(lambda argv, **_kw: spawned.append(argv), ledger)
+    lines: list[str] = []
+    paid.log = lines.append
+
+    assert paid.call("reflection", ["claude", "-p"], "prompt", tmp_path) is None
+    assert paid.stop.reason == "ceiling"
+    assert spawned == []
+    assert any("shared.jsonl" in line for line in lines)
+
 def test_paid_call_passes_the_remaining_headroom_to_the_cli(world, tmp_path: Path) -> None:
     from spend import SpendLedger
     seen: list[list[str]] = []
