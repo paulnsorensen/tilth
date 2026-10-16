@@ -32,8 +32,8 @@ The array form (outer batch) and the #38 comma-split (inner targets) are separat
 - Cluster 1 lives on in a narrower form. `tilth_search` takes `queries` with `maxItems: 10` (`src/mcp/tools/definitions.rs:70`), but entries have no `kind`.
 - Clusters 2 and 4 are gone from search. A schema test lists `scope`, `expand`, `context`, and `if_modified_since` as dropped (`src/mcp/tools/definitions.rs:386`). Routing is automatic.
 - Cluster 5 is replaced. #99 removed per-line hashes. Match headers now carry `path#TAG` (#309, `3151ce2`).
-- Cluster 6 survives. `search_empty_header` (`src/format.rs:148`) emits `Files matched glob`, `Files searched`, and `Content hits`. Callers: `src/search/mod.rs:441` and `src/search/mod.rs:1650`.
-- Observation: the `EmptyHint` text at `src/format.rs:161-163` still says "try kind: content" or "try kind: symbol". The search schema no longer has `kind`.
+- Cluster 6 survives. `search_empty_header` (`src/format.rs:147`) emits `Files matched glob`, `Files searched`, and `Content hits`. Callers: `src/search/mod.rs:441` and `src/search/mod.rs:1650`.
+- The `search_empty_header` hints no longer name a `kind` parameter. The Rust test `empty_hints_never_name_a_kind_parameter` and `tests/mcp_v2/test_zero_result_hints.py` lock this.
 - Q1, restore `SymbolMode::Strict`: moot. `SymbolMode` no longer exists in `src/`. Search-v2 routes queries automatically and has no merged-default facets.
 - Q2, advertise singular `query`: no. The schema rejects top-level `query` and requires `queries` (`src/mcp/tools/definitions.rs:394`). No hidden alias exists.
 - Cluster 3, cache-token JSON first line: lives on for `tilth_read` only. `with_meta_header` (`src/mcp/iso.rs:141`) emits `if_modified_since`. The search schema drops that field (`src/mcp/tools/definitions.rs:386`).
@@ -42,4 +42,4 @@ The array form (outer batch) and the #38 comma-split (inner targets) are separat
 
 The search-v2 engine: #193 and #231, with `adr/tilth-search-v2-roadmap-001`.
 
-_Source: former `.cheese/specs/tilth-search-revival.md`; commits `2c043ca` (#45), `a9b3857` (#46), `415f66b` (#231), `3151ce2` (#309) · Updated: 2026-10-13_
+_Source: former `.cheese/specs/tilth-search-revival.md`; commits `2c043ca` (#45), `a9b3857` (#46), `415f66b` (#231), `3151ce2` (#309) · Updated: 2026-10-16_

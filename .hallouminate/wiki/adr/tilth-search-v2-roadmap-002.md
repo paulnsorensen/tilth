@@ -77,6 +77,6 @@ The 2026-09-06 correction selects glob without assuming that directory-valued pa
 [^1]: [Merged roadmap PR #189](https://github.com/paulnsorensen/tilth/pull/189); [Discovery topology](./tilth-search-v2-roadmap-001.md).
 [^2]: User-approved continuation correction for [PR #231](https://github.com/paulnsorensen/tilth/pull/231), 2026-09-06; [Continuation decision](./tilth-search-v2-roadmap-006.md).
 [^3]: [Issue #202](https://github.com/paulnsorensen/tilth/issues/202).
+[^4]: Edit-efficiency request cuts, specs B2 and B3, shipped in [PR #309](https://github.com/paulnsorensen/tilth/pull/309). The repo never tracked the spec file.
 
-_Source: PR #231 user direction · Updated: 2026-09-06 · Supersedes: the original path-filter request sketch; preserves server-owned initial routing._
-[^4]: Edit-efficiency request cuts, specs B2 and B3 in `.cheese/specs/edit-efficiency-request-cuts.md`.
+_Source: PR #231 user direction · Updated: 2026-10-16 · Supersedes: the original path-filter request sketch; preserves server-owned initial routing._

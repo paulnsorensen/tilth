@@ -106,10 +106,9 @@ pub fn search_header(
     usages: usize,
     files_unreadable: usize,
 ) -> String {
-    let parts = match (total, defs, usages) {
-        (0, _, _) => "0 matches (no definitions or usages; try kind=content for strings/comments, widen scope, or check spelling)".to_string(),
-        (_, 0, _) => format!("{total} matches"),
-        (_, d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
+    let parts = match (defs, usages) {
+        (0, _) => format!("{total} matches"),
+        (d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
     };
     format!(
         "# Search: \"{query}\" in {} — {parts}{}",
@@ -141,9 +140,9 @@ pub enum EmptyHint {
 /// from the dispatch table:
 ///
 /// * `files_matched_glob == 0` → `glob matched no files — broaden glob or check path`
-/// * `Symbol` → `no symbols matched; try kind: content or check spelling`
-/// * `Content` → `no content matches; try kind: symbol or a broader pattern`
-/// * `Regex` → `regex matched zero content; try kind: symbol or a broader pattern`
+/// * `Symbol` → `no symbols matched; check spelling or widen the scope`
+/// * `Content` → `no content matches; try an identifier or a broader pattern`
+/// * `Regex` → `regex matched zero content; try an identifier or a broader pattern`
 /// * `Merged` → `no matches in any mode — re-check the query and glob`
 pub fn search_empty_header(
     query: &str,
@@ -158,9 +157,11 @@ pub fn search_empty_header(
         "glob matched no files — broaden glob or check path"
     } else {
         match kind {
-            EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
-            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
-            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
+            EmptyHint::Symbol => "no symbols matched; check spelling or widen the scope",
+            EmptyHint::Content => "no content matches; try an identifier or a broader pattern",
+            EmptyHint::Regex => {
+                "regex matched zero content; try an identifier or a broader pattern"
+            }
             EmptyHint::Merged => "no matches in any mode — re-check the query and glob",
         }
     };
@@ -248,17 +249,6 @@ mod tests {
         assert_eq!(display_path(&outside), outside.display().to_string());
     }
 
-    /// G3: a zero-match search must carry an actionable hint so agents stop
-    /// retrying the same query blindly, not just report "0 matches".
-    #[test]
-    fn search_header_zero_matches_includes_hint() {
-        let header = search_header("doesNotExist", Path::new("/repo"), 0, 0, 0, 0);
-        assert!(header.contains("0 matches"), "{header}");
-        assert!(header.contains("kind=content"), "{header}");
-        assert!(header.contains("widen scope"), "{header}");
-        assert!(header.contains("check spelling"), "{header}");
-    }
-
     #[test]
     fn search_header_with_matches_has_no_hint() {
         let header = search_header("Foo", Path::new("/repo"), 3, 1, 2, 0);
@@ -305,7 +295,7 @@ mod tests {
     fn empty_header_symbol_branch() {
         let out = search_empty_header("Foo", &scope(), 47, 47, 0, 0, EmptyHint::Symbol);
         assert!(
-            out.contains("no symbols matched; try kind: content or check spelling"),
+            out.contains("no symbols matched; check spelling or widen the scope"),
             "{out}"
         );
         assert!(out.contains("Files searched:     47"), "{out}");
@@ -332,7 +322,7 @@ mod tests {
              Files searched:     47\n  \
              Content hits:       0\n  \
              Files unreadable:   1 (results may be incomplete)\n  \
-             Hint: no symbols matched; try kind: content or check spelling"
+             Hint: no symbols matched; check spelling or widen the scope"
         );
     }
 
@@ -340,7 +330,7 @@ mod tests {
     fn empty_header_content_branch() {
         let out = search_empty_header("foo", &scope(), 47, 47, 0, 0, EmptyHint::Content);
         assert!(
-            out.contains("no content matches; try kind: symbol or a broader pattern"),
+            out.contains("no content matches; try an identifier or a broader pattern"),
             "{out}"
         );
     }
@@ -350,7 +340,7 @@ mod tests {
         // Regex has its own hint, distinct from Content's.
         let out = search_empty_header("foo.*bar", &scope(), 47, 47, 0, 0, EmptyHint::Regex);
         assert!(
-            out.contains("regex matched zero content; try kind: symbol or a broader pattern"),
+            out.contains("regex matched zero content; try an identifier or a broader pattern"),
             "{out}"
         );
     }
@@ -362,6 +352,21 @@ mod tests {
             out.contains("no matches in any mode — re-check the query and glob"),
             "{out}"
         );
+    }
+
+    /// Regression: `tilth_search` and the CLI take no `kind` parameter, so no
+    /// zero-result hint may tell the caller to set one.
+    #[test]
+    fn empty_hints_never_name_a_kind_parameter() {
+        for kind in [
+            EmptyHint::Symbol,
+            EmptyHint::Content,
+            EmptyHint::Regex,
+            EmptyHint::Merged,
+        ] {
+            let out = search_empty_header("Foo", &scope(), 47, 47, 0, 0, kind);
+            assert!(!out.contains("kind"), "{out}");
+        }
     }
 
     #[test]
