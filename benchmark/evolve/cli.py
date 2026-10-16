@@ -24,6 +24,7 @@ if not __package__:
     sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _PACKAGE_DIR]
     sys.path.insert(0, str(_PACKAGE_DIR.parent))
 
+import auth  # noqa: E402
 import baselines  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
@@ -77,6 +78,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="estimate for a call with no stored or earlier cost")
     parser.add_argument("--refreeze-baselines", action="store_true",
                         help="buy drifted baseline cells again under their new key")
+    parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
@@ -90,7 +92,7 @@ def _error(message: str) -> int:
 def build(argv: list[str] | None = None, *,
           judge_factory: Callable[[SpendLedger, float], judge.Judge] | None = None,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
-          spawn: Callable | None = None) -> Evolution | int:
+          spawn: Callable | None = None, auth_spawn: Callable | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -101,8 +103,8 @@ def build(argv: list[str] | None = None, *,
     if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1:
         return _error("--max-metric-calls and --plateau must be at least 1, --reruns at least 0")
     try:
-        run.guard_claude_auth(os.environ)
-    except run.ClaudeAuthError as error:
+        auth.refuse_env(os.environ)
+    except auth.ClaudeAuthError as error:
         return _error(str(error))
     repo = args.repo.resolve()
     try:
@@ -118,7 +120,14 @@ def build(argv: list[str] | None = None, *,
         panel.register(run.TASKS)
     except panels.PanelError as error:
         return _error(str(error))
-    ledger = SpendLedger(args.max_usd)
+    cells = [(task, "baseline", args.model) for task in [*panel.cheap, *panel.dev, *panel.test]]
+    try:
+        auth.preflight_claude_auth([run.isolated_call_target(), *run.claude_auth_targets(cells, bare=True)],
+                                   spawn=auth_spawn)
+        ledger = (SpendLedger.persistent(args.budget_id, args.max_usd) if args.budget_id is not None
+                  else SpendLedger(args.max_usd))
+    except (auth.ClaudeAuthError, ValueError) as error:
+        return _error(str(error))
     factory = judge_factory or (lambda shared, floor: judge.Judge(shared, cell_estimate_usd=floor))
     settings = Settings(
         run_id=args.run_id, repo=repo, seed_sha=seed_sha, base_branch=args.base_branch, model=args.model,
@@ -136,7 +145,7 @@ def main(argv: list[str] | None = None, **deps) -> int:
         return evolution
     try:
         return evolution.run()
-    except (EvolveError, run.ClaudeAuthError) as error:
+    except (EvolveError, auth.ClaudeAuthError) as error:
         evolution.log(f"error: {error}")
         print(f"error: {error}", file=sys.stderr)
         return 1

@@ -7,6 +7,7 @@ Records token usage, cost, correctness, and tool usage to JSONL format.
 """
 
 import argparse
+import atexit
 import functools
 import hashlib
 import inspect
@@ -33,13 +34,14 @@ from typing import NamedTuple, Optional
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
+import auth
 import baselines
 import erosion
 import external
 import external.contamination
 import external.preflight
 import panels
-from spend import SpendLedger
+from spend import SpendLedger, plan_budget_id, settle_failed
 from claude_bash_guard import allowed_command
 from config import (
     BENCHMARK_DIR,
@@ -67,7 +69,6 @@ from parse import (
     parse_codex_json,
     parse_opencode_json,
     parse_stream_json,
-    stream_native_cost,
     tool_batch_sizes,
     tool_call_counts,
     tool_op_kinds,
@@ -216,26 +217,50 @@ _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
 _DEFAULT_TILTH_BIN = object()
 
 
-class ClaudeAuthError(RuntimeError):
-    """A Claude subprocess would bill an API key instead of the subscription."""
+def claude_auth_targets(cells, *, bare: bool) -> list[auth.AuthTarget]:
+    """One auth target per claude cell of ``(task, mode, model)`` names; none when no cell uses claude.
 
-
-# API-billing credentials: under ``claude -p`` either overrides
-# ``CLAUDE_CODE_OAUTH_TOKEN`` and bills the API instead of the subscription.
-_API_BILLING_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-
-
-def guard_claude_auth(env: Mapping[str, str]) -> None:
-    """Refuse a Claude call whose environment carries an API-billing credential.
-
-    Judge and proposer callers reuse this.
+    A target holds the seed repo that each cell copies and the seed cell env, and whether the cell loads
+    user, project, and local settings (it does not when it passes ``--setting-sources ""``). A cell runs in a
+    temp worktree or copy and may get a fresh temp config dir, so the check is conservative. A task with no
+    fixture repo builds its own workdir; its target is the system temp dir, so only the init gate checks its
+    project settings.
     """
-    for key in _API_BILLING_KEYS:
-        if env.get(key):
-            raise ClaudeAuthError(
-                f"{key} is set; it overrides CLAUDE_CODE_OAUTH_TOKEN and bills "
-                "the API instead of the subscription. Unset it before running Claude cells."
-            )
+    claude_cells = [(task_name, mode_name) for task_name, mode_name, model_name in cells
+                    if RUNNERS[model_name] == "claude"]
+    if not claude_cells:
+        return []
+    env = build_runner_env("claude", tilth_bin=None)
+    return [
+        auth.AuthTarget(
+            cwd=get_repo_path(TASKS[task_name].repo) if TASKS[task_name].fixture_path is not None
+            else Path(tempfile.gettempdir()),
+            env=env, loads_user_settings=not (bare or MODES[mode_name].plugin_dir),
+        )
+        for task_name, mode_name in claude_cells
+    ]
+
+
+@functools.cache
+def _isolated_config_dir() -> str:
+    """One empty CLAUDE_CONFIG_DIR per process for the evolve and judge preflight, removed at exit."""
+    path = tempfile.mkdtemp(prefix="tilth-auth-")
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
+
+
+def isolated_call_target() -> auth.AuthTarget:
+    """The auth target of an evolve or judge call: temp cwd, temp CLAUDE_CONFIG_DIR, no settings sources."""
+    env = dict(build_runner_env("claude", tilth_bin=None))
+    env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
+    return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
+
+
+def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | None) -> tuple[float, str]:
+    """A failed cell's charge: native cost, else the priced stream, else the estimate, with its source."""
+    if runner in {"claude", "codex"}:
+        return settle_failed(stream, runner, estimate, model)
+    return estimate, "estimate"
 
 
 def build_runner_env(
@@ -249,7 +274,7 @@ def build_runner_env(
     """Build a minimal environment for one runner subprocess."""
     source = os.environ if ambient is None else ambient
     if runner == "claude":
-        guard_claude_auth(source)
+        auth.refuse_env(source)
     env = {
         key: value
         for key, value in source.items()
@@ -1223,6 +1248,8 @@ def _run_single_in_repo(
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         timed_out = False
+        auth_error: auth.ClaudeAuthError | None = None
+        gate = auth.InitGate() if runner == "claude" else None
 
         def _drain_stderr() -> None:
             stderr_chunks.append(stderr_pipe.read())
@@ -1242,6 +1269,17 @@ def _run_single_in_repo(
                     logf.write(line)
                     logf.flush()
                     stdout_chunks.append(line)
+                    if gate is not None:
+                        try:
+                            event = json.loads(line)
+                            if isinstance(event, dict):
+                                gate.observe(event)
+                        except ValueError:
+                            continue
+                        except auth.ClaudeAuthError as error:
+                            auth_error = error
+                            proc.kill()
+                            break
             proc.wait()
             stderr_thread.join()
         finally:
@@ -1250,6 +1288,8 @@ def _run_single_in_repo(
             stderr_pipe.close()
 
         stderr_text = "".join(stderr_chunks)
+        if auth_error is not None:
+            raise auth_error
         if runner == "codex":
             stream_log_path.with_suffix(".stderr").write_text(stderr_text)
         if timed_out:
@@ -1271,6 +1311,8 @@ def _run_single_in_repo(
             timeout=timeout_s,
             env=env,
         )
+        if runner == "claude":
+            auth.check_captured(result.stdout)
     elapsed_ms = int((time.time() - start_time) * 1000)
     trajectory_path = write_trajectory(stream_log_path, runner)
 
@@ -1582,6 +1624,7 @@ class PlanStopped(RuntimeError):
 
     ``ceiling``: the spend ceiling. ``quota``: a usage limit.
     ``cli-version``: the agent CLI changed, or stopped answering ``--version``, since the cell was planned.
+    ``auth``: a cell's init event failed the auth gate; the cell is stored as infra ``auth`` and charged.
 
     After the failed cell is stored, it stops for ``mcp-unavailable``, ``skill-unavailable`` or ``invalid-cell``.
     Those are config-level failures that main aborts on.
@@ -1769,8 +1812,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
     reusable = baselines.completed_by_key(history)
     pending = [(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable]
     if pending and not store_only:
-        if any(RUNNERS[cell.model] == "claude" for cell, _ in pending):
-            guard_claude_auth(os.environ)
+        auth.preflight_claude_auth(
+            claude_auth_targets([(cell.task, cell.mode, cell.model) for cell, _ in pending], bare=True))
         if not refreeze_baselines:
             _refuse_baseline_drift(pending, history)
 
@@ -1790,7 +1833,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         if not isinstance(row.get("contaminated"), bool):
             row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
         row["charged_usd"] = amount
-        ledger.charge(amount, source=row.get("cost_source") or "native")
+        ledger.charge(amount, source=row.get("cost_source") or "native", run_key=row.get("run_key"))
         if row.get("infra") != "prepare":
             run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
         baselines.store(row, path=store_path)
@@ -1814,7 +1857,11 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         cell_id = f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"
         estimate = estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=MODELS[cell.model],
                                       run_max_cost=run_max_cost, fallback=cell_estimate_usd)
-        if ledger.would_cross(estimate):
+        try:
+            crossing = ledger.would_cross(estimate)
+        except ValueError as error:
+            raise PlanStopped("ceiling", str(error), rows) from error
+        if crossing:
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${estimate:.4f} estimated for {cell_id} "
                                          f"+ ${ledger.reserve:.4f} reserved exceeds ${ledger.max_usd}", rows)
         runner = RUNNERS[cell.model]
@@ -1829,8 +1876,12 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                                         f"_{attempt}.jsonl")
         # Any runner stops without unreserved headroom. The run key pins the default budget; a claude cell's
         # --max-budget-usd cap shrinks to the headroom, so an overrunning cell cannot spend the finish reserve.
-        headroom = ledger.headroom()
-        if ledger.exhausted():
+        try:
+            headroom = ledger.headroom()
+            exhausted = ledger.exhausted()
+        except ValueError as error:
+            raise PlanStopped("ceiling", str(error), rows) from error
+        if exhausted:
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${ledger.reserve:.4f} reserved leaves no "
                                          f"budget for {cell_id} under ${ledger.max_usd}", rows)
         cell_cap = DEFAULT_MAX_BUDGET_USD
@@ -1847,12 +1898,12 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         }
 
         def fail(fields: dict, charge: float | None = None) -> None:
-            native = stream_native_cost(_read_stream(stream_log_path))
+            cost, source = failed_cell_cost(_read_stream(stream_log_path), runner, estimate, MODELS[cell.model])
             settle({**metadata, **fields, "correct": False,
-                    **({"total_cost_usd": native} if native is not None else {}),
-                    "cost_source": "native" if native is not None else "estimate",
+                    **({"total_cost_usd": cost} if source != "estimate" else {}),
+                    "cost_source": source,
                     "trajectory_path": write_trajectory(stream_log_path, runner)},
-                   charge if charge is not None else native if native is not None else estimate)
+                   charge if charge is not None else cost)
 
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
@@ -1869,6 +1920,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             # As in main: no model call ran, so the cell estimate is not charged.
             fail({"infra": "prepare", "error": f"infra:prepare: {error}",
                   "correctness_reason": f"Prepare failed: {error}"}, charge=0.0)
+        except auth.ClaudeAuthError as error:
+            fail({"infra": "auth", "error": f"infra:auth: {error}", "correctness_reason": f"Auth refused: {error}"})
+            raise PlanStopped("auth", str(error), rows) from error
         except Exception as error:
             quota = str(error) if isinstance(error, QuotaExhaustedError) else detect_quota_rejection(
                 _read_stream(stream_log_path))
@@ -2155,6 +2209,15 @@ Examples:
         help="Run-wide spend ceiling in USD; required when any cell is not answered from the result store",
     )
     parser.add_argument(
+        "--budget-id",
+        help="Name of the persistent spend budget this run charges (default: a digest of the planned run keys, "
+             "so a rerun of the same command resumes its spend)",
+    )
+    parser.add_argument(
+        "--fresh-budget", action="store_true",
+        help="Start the budget over: record a reset marker so earlier charges stop counting against --max-usd",
+    )
+    parser.add_argument(
         "--cell-estimate-usd", type=float,
         help="Cost estimate for a cell with no stored or earlier cost in this run "
              "(default: --max-budget-usd)",
@@ -2369,11 +2432,11 @@ Examples:
                 f"{len(pending)} of {len(cells)} cells have no reusable stored row; "
                 "a paid run requires --max-usd"
             )
-        if any(RUNNERS[cell.model_name] == "claude" for cell in pending):
-            try:
-                guard_claude_auth(os.environ)
-            except ClaudeAuthError as error:
-                parser.error(str(error))
+        try:
+            auth.preflight_claude_auth(claude_auth_targets(
+                [(cell.task_name, cell.mode_name, cell.model_name) for cell in pending], bare=bare))
+        except auth.ClaudeAuthError as error:
+            parser.error(str(error))
         drift = {}
         for cell in pending:
             if not is_stock_arm(MODES[cell.mode_name]):
@@ -2405,6 +2468,13 @@ Examples:
         stream_log_dir = RESULTS_DIR / "streams" / timestamp
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    budget_id = args.budget_id if args.budget_id is not None else plan_budget_id(cell.run_key for cell in cells)
+    try:
+        ledger = (SpendLedger.persistent(budget_id, args.max_usd, fresh=args.fresh_budget) if pending
+                  else SpendLedger(max_usd=args.max_usd))
+    except ValueError as error:
+        parser.error(str(error))
+
     # Print configuration summary
     print("=" * 70)
     print("tilth Benchmark Runner")
@@ -2420,12 +2490,13 @@ Examples:
     print(f"Reused:      {len(cells) - len(pending)} of {len(cells)} cells from {store_path}")
     if args.max_usd is not None:
         print(f"Spend cap:   ${args.max_usd:.2f}")
+    if pending:
+        print(f"Budget:      {budget_id} (${ledger.spent:.4f} recorded; --fresh-budget starts it over)")
     print(f"Output:      {output_file}")
     print(f"Streams:     {stream_log_dir}/<cell>.jsonl  (tail -f for live agent output)")
     print("=" * 70)
     print()
 
-    ledger = SpendLedger(max_usd=args.max_usd)
     run_max_cost: float | None = None
     stop_reason: str | None = None
     fallback_estimate = args.cell_estimate_usd or args.max_budget_usd
@@ -2443,7 +2514,7 @@ Examples:
             if not isinstance(row.get("contaminated"), bool):
                 row.update(contamination_fields(row.get("trajectory_path"), TASKS.get(row.get("task"))))
             row["charged_usd"] = amount
-            ledger.charge(amount, source=row.get("cost_source") or "native")
+            ledger.charge(amount, source=row.get("cost_source") or "native", run_key=row.get("run_key"))
             if row.get("infra") != "prepare":
                 run_max_cost = amount if run_max_cost is None else max(run_max_cost, amount)
             baselines.store(row, path=store_path)
@@ -2464,19 +2535,19 @@ Examples:
                 print(f"  → {row['correctness_reason']}")
 
         def record_failure(row: dict, stream_log_path: Path, runner: str, estimate: float) -> dict:
-            """Store a failed cell, charging its native cost or else its pre-run estimate.
+            """Store a failed cell, charging its native cost, else the cost priced from its stream, else its estimate.
 
-            Only a native cost is reported as ``total_cost_usd``; an estimate is
+            A native or priced cost is reported as ``total_cost_usd``; an estimate is
             charged to the ledger as ``charged_usd`` but is not a measured cost.
             """
-            native = stream_native_cost(_read_stream(stream_log_path))
+            cost, source = failed_cell_cost(_read_stream(stream_log_path), runner, estimate, row.get("model"))
             failed = {
                 **row,
-                **({"total_cost_usd": native} if native is not None else {}),
-                "cost_source": "native" if native is not None else "estimate",
+                **({"total_cost_usd": cost} if source != "estimate" else {}),
+                "cost_source": source,
                 "trajectory_path": write_trajectory(stream_log_path, runner),
             }
-            settle(failed, native if native is not None else estimate)
+            settle(failed, cost)
             record(failed)
             return failed
 
@@ -2523,9 +2594,21 @@ Examples:
                 history, task=task_name, mode=mode_name, model=MODELS[model_name],
                 run_max_cost=run_max_cost, fallback=fallback_estimate,
             )
-            if ledger.would_cross(estimate):
+            try:
+                exhausted = ledger.exhausted()
+                crossing = not exhausted and ledger.would_cross(estimate)
+            except ValueError as error:
+                stop_reason = f"spend ceiling: {error}"
+                break
+            if exhausted:
                 stop_reason = (
-                    f"spend ceiling: ${ledger.spent:.4f} spent + ${estimate:.4f} estimated for "
+                    f"spend ceiling: budget {budget_id} has ${ledger.spent:.4f} recorded against "
+                    f"--max-usd {args.max_usd}; no paid cell starts for {run_id}"
+                )
+                break
+            if crossing:
+                stop_reason = (
+                    f"spend ceiling: budget {budget_id}: ${ledger.spent:.4f} spent + ${estimate:.4f} estimated for "
                     f"{run_id} exceeds --max-usd {args.max_usd}"
                 )
                 break
@@ -2631,6 +2714,18 @@ Examples:
                     "correctness_reason": f"Prepare failed: {error}",
                 }, stream_log_path, runner, 0.0)
 
+            except auth.ClaudeAuthError as error:
+                print(f"  ✗ AUTH REFUSED: {error}")
+                record_failure({
+                    **record_metadata,
+                    "infra": "auth",
+                    "error": f"infra:auth: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Auth refused: {error}",
+                }, stream_log_path, runner, estimate)
+                stop_reason = f"auth: {error}"
+                break
+
             except Exception as error:
                 quota = (
                     str(error) if isinstance(error, QuotaExhaustedError)
@@ -2681,7 +2776,8 @@ Examples:
     if stop_reason:
         print(f"Stop reason: {stop_reason}")
         print("Re-run the same command to resume; completed cells are reused from the store.")
-        print("Each run has its own --max-usd ceiling, so a resumed run can spend up to it again.")
+        print(f"Spend is recorded in budget {budget_id}; a rerun counts it against --max-usd. "
+              "Pass --fresh-budget to start the budget over.")
     print(f"Spend: ${ledger.spent:.4f}" + (f" of ${args.max_usd:.2f}" if args.max_usd is not None else ""))
     print(f"Results saved to: {output_file}")
     print("=" * 70)

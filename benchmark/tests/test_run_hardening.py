@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import run
 from config import ModeConfig
 from parse import RunResult, Turn
@@ -966,7 +967,7 @@ def test_claude_result_requires_success_even_if_grader_would_pass(
 ) -> None:
     monkeypatch.setitem(run.TASKS, "claude_failure_task", _RunnerTask())
     events = [
-        {"type": "system", "subtype": "init", "tools": []},
+        {"type": "system", "subtype": "init", "apiKeySource": "none", "tools": []},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "answer"}]}},
         {"type": "result", "subtype": "error_max_budget_usd", "is_error": True, "result": "answer"},
     ]
@@ -984,7 +985,7 @@ def test_claude_runtime_options_and_local_tilth_config(
     monkeypatch.setattr(run, "TILTH_BIN", "/release/tilth")
     monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], binary_path="/release/tilth"))
     captured = {}
-    events = [{"type": "system", "subtype": "init", "tools": ["mcp__tilth__tilth_read"]},
+    events = [{"type": "system", "subtype": "init", "apiKeySource": "none", "tools": ["mcp__tilth__tilth_read"]},
               {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}]
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
@@ -1071,7 +1072,7 @@ def test_wozcode_claude_command_requires_its_mcp_tools(
     monkeypatch.setitem(run.TASKS, "woz_task", _RunnerTask())
     captured = {}
     tools = ["mcp__plugin_woz_code__Search"]
-    events = [{"type": "system", "subtype": "init", "tools": tools},
+    events = [{"type": "system", "subtype": "init", "apiKeySource": "none", "tools": tools},
               {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}]
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
@@ -1233,7 +1234,7 @@ def test_strict_file_tools_configures_equal_mcp_restrictions(
     available = expected_tools.split(",")
     if mode_name != "baseline":
         available.append("mcp__plugin_woz_code__Search" if mode_name == "wozcode" else "mcp__tilth__tilth_read")
-    events = [{"type": "system", "subtype": "init", "tools": available},
+    events = [{"type": "system", "subtype": "init", "apiKeySource": "none", "tools": available},
               {"type": "result", "subtype": "success", "is_error": False}]
     captured = {}
     def fake_run(cmd, **kwargs):
@@ -1261,7 +1262,7 @@ def test_strict_file_tools_rejects_successful_forbidden_bash(
 ) -> None:
     monkeypatch.setitem(run.TASKS, "strict_task", _RunnerTask())
     events = [
-        {"type": "system", "subtype": "init", "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]},
+        {"type": "system", "subtype": "init", "apiKeySource": "none", "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]},
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash", "input": {"command": "cat context.go"}}]}},
         {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "is_error": denied}]}},
         {"type": "result", "subtype": "success", "is_error": False},
@@ -1413,7 +1414,7 @@ def test_runner_env_disables_autoupdater(runner: str) -> None:
 def test_build_runner_env_refuses_api_key_for_claude() -> None:
     ambient = {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-ant-api", "CLAUDE_CODE_OAUTH_TOKEN": "oauth"}
 
-    with pytest.raises(run.ClaudeAuthError, match="ANTHROPIC_API_KEY"):
+    with pytest.raises(auth.ClaudeAuthError, match="ANTHROPIC_API_KEY"):
         run.build_runner_env("claude", ambient=ambient, tilth_bin=None)
     assert "ANTHROPIC_API_KEY" not in run.build_runner_env("codex", ambient=ambient, tilth_bin=None)
 
@@ -1600,9 +1601,9 @@ def test_claude_stream_without_init_model_is_priced_with_the_cell_model(
 
 @pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
 def test_claude_auth_guard_refuses_api_billing_credentials(key: str) -> None:
-    with pytest.raises(run.ClaudeAuthError, match=key):
-        run.guard_claude_auth({key: "sk-ant-secret"})
-    with pytest.raises(run.ClaudeAuthError, match=key):
+    with pytest.raises(auth.ClaudeAuthError, match=key):
+        auth.refuse_env({key: "sk-ant-secret"})
+    with pytest.raises(auth.ClaudeAuthError, match=key):
         run.build_runner_env("claude", ambient={"PATH": "/usr/bin", key: "sk-ant-secret"}, tilth_bin=None)
 
 

@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import auth
 import baselines
 import external
 import external.data
@@ -117,6 +118,23 @@ def hermetic_version_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host toolchain and agent CLI probes out of every test's subprocess stubs."""
     monkeypatch.setattr(run, "_probe_version", lambda argv: f"{argv[0]} test-version")
     monkeypatch.setattr(run, "_run_probe", lambda argv: f"{argv[0]} test-version")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Run the real auth guard offline: an OAuth token, empty config and managed roots, a fake status probe.
+
+    Also keep persistent budget files out of the real data directory.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-fixture")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("TILTH_BENCH_DATA", str(tmp_path / "bench-data"))
+    monkeypatch.setattr(auth, "DEFAULT_MANAGED_ROOT", tmp_path / "managed-root")
+    monkeypatch.setattr(auth, "_PASSED_STATUS", set())
+    monkeypatch.setattr(
+        auth, "_run_status",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"authMethod": "oauth_token"}', ""),
+    )
 
 
 @pytest.fixture

@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sys
 from collections import Counter
@@ -100,9 +101,9 @@ def _cache_creation_ttl_tokens(usage: dict) -> tuple[int, int]:
 
 
 def _native_cost(result_event: dict) -> float | None:
-    """Return the result event's reported cost; an absent field is not 0.0."""
+    """Return the result event's reported cost; an absent, non-finite, or negative field is not a cost."""
     cost = result_event.get("total_cost_usd")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
         return float(cost)
     return None
 

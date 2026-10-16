@@ -20,6 +20,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Literal, Protocol
 
+import auth
 import baselines
 import external
 import run
@@ -91,6 +92,7 @@ class JudgeReply:
     cost_source: Literal["native", "pricing"] = "native"
     quota: str | None = None
     error: str | None = None
+    auth_error: str | None = None
 
 
 class JudgeClient(Protocol):
@@ -357,6 +359,14 @@ class ClaudeJudgeClient:
         return _reply(completed.stdout, completed.returncode, completed.stderr)
 
 
+def _auth_error(stdout: str) -> str | None:
+    try:
+        auth.check_captured(stdout)
+    except auth.ClaudeAuthError as error:
+        return str(error)
+    return None
+
+
 def _reply(stdout: str, returncode: int | None, stderr: str) -> JudgeReply:
     native = stream_native_cost(stdout)
     cost, source = native, "native"
@@ -372,7 +382,9 @@ def _reply(stdout: str, returncode: int | None, stderr: str) -> JudgeReply:
     error = None
     if returncode != 0 or not results or final.get("is_error"):
         error = (text if final.get("is_error") else "") or stderr.strip()[-500:] or f"claude exited {returncode}"
-    return JudgeReply(text=text, cost=cost, cost_source=source, quota=detect_quota_rejection(stdout), error=error)
+    auth_error = _auth_error(stdout)
+    return JudgeReply(text="" if auth_error else text, cost=cost, cost_source=source,
+                      quota=detect_quota_rejection(stdout), error=error, auth_error=auth_error)
 
 
 class Judge:
@@ -482,11 +494,13 @@ class Judge:
                                     f"${self.ledger.max_usd} ceiling (spent ${self.ledger.spent:.4f} + "
                                     f"${self.ledger.reserve:.4f} reserved)")
         reply = self.client(prompt)
-        failed = reply.quota is not None or reply.error is not None
+        failed = reply.quota is not None or reply.error is not None or reply.auth_error is not None
         # A failed call charges only a native cost; a pricing-derived cost is not trusted.
         trusted = reply.cost is not None and (reply.cost_source == "native" or not failed)
         cost, source = (reply.cost, reply.cost_source) if trusted else (estimate, "estimate")
         self._charge(cost, source)
+        if reply.auth_error is not None:
+            raise auth.ClaudeAuthError(reply.auth_error)
         if reply.quota is not None:
             _quota_reason = reply.quota
             raise JudgeQuota(reply.quota)
