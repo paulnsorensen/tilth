@@ -82,6 +82,8 @@ A live Claude call can report an init `apiKeySource` other than `none`, report n
 The run then records the cell as `infra: auth` and stops.
 Every paid run charges a persistent budget file at `$TILTH_BENCH_DATA/budgets/<budget_id>.jsonl`.
 `--budget-id NAME` names that budget; the default is a digest of the planned run keys.
+One run at a time holds a budget: a second run with the same budget id exits with status 75 before it changes the budget or the output file.
+The lock is `$TILTH_BENCH_DATA/budgets/runs/<budget_id>.lock`, and the kernel releases it when the run exits.
 `--fresh-budget` appends a reset marker, so only later charges count against `--max-usd`.
 Each charge record carries an `at` timestamp (ISO 8601, UTC).
 An unreadable budget line that appears during a run stops the run before the next cell.

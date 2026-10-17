@@ -9,6 +9,7 @@ phase's budget unspent, then sets it to 0 for finish.
 
 A ledger built with ``SpendLedger.persistent`` also keeps its charges in an append-only file under
 ``$TILTH_BENCH_DATA/budgets/``, so a rerun of a stopped command starts from the spend already recorded.
+``hold_run_lock`` lets one live run own a budget, so two concurrent runs never share its spend or output.
 """
 
 import fcntl
@@ -21,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import IO, Literal
 
 from jsonl import tolerant_jsonl
 from parse import parse_codex_json, parse_stream_json, stream_native_cost
@@ -42,6 +43,35 @@ def _budget_root() -> Path:
     from external.data import data_dir  # lazy: the data directory helper lives in the external package
 
     return data_dir() / "budgets"
+
+
+def _check_budget_id(budget_id: str) -> None:
+    if not _BUDGET_ID.fullmatch(budget_id) or ".." in budget_id:
+        raise ValueError(f"budget id {budget_id!r} must be a plain file name (letters, digits, '.', '_', '-')")
+
+
+class BudgetBusyError(RuntimeError):
+    """Another live run holds the run lock of this budget."""
+
+
+def hold_run_lock(budget_id: str, *, root: Path | None = None) -> IO[str]:
+    """Take the run lock of ``budget_id`` without waiting and return its open file; closing the file releases it.
+
+    The lock lives under the budget root, so runs from every worktree that share the data directory see it.
+    The kernel releases it when the holding process exits, so a crashed run never leaves a stale lock.
+    """
+    _check_budget_id(budget_id)
+    directory = (Path(root) if root is not None else _budget_root()) / "runs"
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = open(directory / f"{budget_id}.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise BudgetBusyError(
+            f"budget {budget_id} is in use by another run; wait for it to finish or pass a different --budget-id"
+        ) from None
+    return lock
 
 
 @contextmanager
@@ -135,8 +165,7 @@ class SpendLedger:
 
         ``fresh`` appends a reset marker first, so only later charges count.
         """
-        if not _BUDGET_ID.fullmatch(budget_id) or ".." in budget_id:
-            raise ValueError(f"budget id {budget_id!r} must be a plain file name (letters, digits, '.', '_', '-')")
+        _check_budget_id(budget_id)
         directory = Path(root) if root is not None else _budget_root()
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{budget_id}.jsonl"

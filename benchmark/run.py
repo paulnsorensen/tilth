@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as _dataclass_fields
 from datetime import datetime
@@ -41,7 +41,7 @@ import external
 import external.contamination
 import external.preflight
 import panels
-from spend import SpendLedger, plan_budget_id, settle_failed
+from spend import BudgetBusyError, SpendLedger, hold_run_lock, plan_budget_id, settle_failed
 from claude_bash_guard import allowed_command
 from config import (
     BENCHMARK_DIR,
@@ -2155,6 +2155,12 @@ def _run_timestamp() -> str:
 
 
 def main(argv: Optional[list[str]] = None):
+    # The stack releases the budget run lock however the run ends, so one process can run main again.
+    with ExitStack() as held:
+        _main(argv, held)
+
+
+def _main(argv: Optional[list[str]], held: ExitStack):
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2469,6 +2475,15 @@ Examples:
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     budget_id = args.budget_id if args.budget_id is not None else plan_budget_id(cell.run_key for cell in cells)
+    # Take the run lock before the budget or the output file changes: a second run with the
+    # same budget would count spend twice and truncate the output of the live run.
+    try:
+        held.enter_context(hold_run_lock(budget_id))
+    except BudgetBusyError as error:
+        print(f"run.py: {error}", file=sys.stderr)
+        sys.exit(os.EX_TEMPFAIL)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         ledger = (SpendLedger.persistent(budget_id, args.max_usd, fresh=args.fresh_budget) if pending
                   else SpendLedger(max_usd=args.max_usd))
