@@ -537,6 +537,9 @@ class ExternalTask(Task):
         home.mkdir(exist_ok=True)
         env = proc.toolchain_env(home)
         proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language)
+        if self.language == "rust":
+            # GCC 15 compiles C23 by default. C23 refuses the K&R prototypes in bundled C crates such as onig_sys.
+            env["CFLAGS"] = "-std=gnu17"
         return env
 
     def grading_env(self, checkout: Path) -> dict[str, str]:
