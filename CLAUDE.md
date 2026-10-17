@@ -71,6 +71,7 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 ```bash
 just check                   # full CI gate via scripts/verify.py (auto-enables sccache when on PATH)
 just verify cargo test edit  # one command with the same sccache setup
+just jobs=8 check            # pin cargo -j and test threads (default: free cores at start, at least 2; or TILTH_JOBS)
 cargo build --release        # release build
 cargo test                   # unit tests (in-source #[cfg(test)] modules)
 python3 -m unittest discover -s tests/mcp_v2 -t tests/mcp_v2  # MCP end-to-end tests (needs target/debug/tilth)
