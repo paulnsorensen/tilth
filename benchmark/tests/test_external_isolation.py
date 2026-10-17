@@ -235,3 +235,28 @@ def test_failed_cargo_seed_is_not_retried(external_bench, monkeypatch: pytest.Mo
     assert task.cargo_seed() is None
     assert task.cargo_seed() is None
     assert calls == [["cargo", "test", "--no-run"]]
+
+
+@pytest.mark.skipif(shutil.which("cc") is None, reason="needs a C compiler")
+def test_rust_grade_env_compiles_k_and_r_prototypes(external_bench, tmp_path: Path) -> None:
+    """GCC 15 refuses this C23-invalid call; the Rust grade env must still compile it, as onig_sys needs."""
+    external_bench.seed(SWE_RS)
+    task = external.swebench_ml.load(SWE_RS, external.data.SWEBENCH_ML_REVISION)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env = task.grade_env(checkout)
+    source = "int g();\nint f(void) { return g(1); }\n"
+
+    result = subprocess.run(["bash", "-c", "cc $CFLAGS -x c -c -o /dev/null -"],
+                            input=source, env=env, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_python_grade_env_keeps_the_compiler_default(external_bench, tmp_path: Path) -> None:
+    external_bench.seed(SWE_PY)
+    task = external.swebench_ml.load(SWE_PY, external.data.SWEBENCH_ML_REVISION)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    assert "CFLAGS" not in task.grade_env(checkout)
