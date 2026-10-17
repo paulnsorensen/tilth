@@ -103,8 +103,8 @@ def _recorded_spend(path: Path) -> float:
         else:
             total += charge
     if unreadable:
-        raise ValueError(f"budget file {path} has no readable charge on line(s) {unreadable}; fix the file "
-                         "or pass --fresh-budget to start the budget over")
+        raise ValueError(f"budget file {path} has no readable charge on line(s) {unreadable}; fix the file, "
+                         "pass --fresh-budget to run.py to start the budget over, or use a new --budget-id")
     return total
 
 

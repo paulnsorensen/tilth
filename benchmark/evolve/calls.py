@@ -89,17 +89,23 @@ class PaidCalls:
         if self.stop.is_set:
             return None
         estimate = self.estimate(kind)
-        if self.ledger.would_cross(estimate):
+        try:
+            crosses, exhausted, headroom = (self.ledger.would_cross(estimate), self.ledger.exhausted(),
+                                            self.ledger.headroom())
+        except ValueError as error:  # an unreadable budget record: its spend is unknown, so stop
+            self.log(f"{kind}: not started; {error}")
+            self.stop.set("ceiling")
+            return None
+        if crosses:
             self.log(f"{kind}: not started; ${self.ledger.spent:.4f} spent + ${estimate:.4f} estimated + "
                      f"${self.ledger.reserve:.4f} reserved exceeds ${self.ledger.max_usd}")
             self.stop.set("ceiling")
             return None
-        if self.ledger.exhausted():
+        if exhausted:
             self.log(f"{kind}: not started; ${self.ledger.spent:.4f} spent + ${self.ledger.reserve:.4f} reserved "
                      f"leaves no budget under ${self.ledger.max_usd}")
             self.stop.set("ceiling")
             return None
-        headroom = self.ledger.headroom()
         if headroom is not None:
             # The CLI itself stops a call before it spends past what the run has left.
             argv = [*argv, "--max-budget-usd", f"{headroom:.4f}"]
