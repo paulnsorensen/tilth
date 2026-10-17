@@ -35,6 +35,8 @@ pub(super) fn require_cwd(args: &Value) -> Result<&std::path::Path, String> {
 /// Anchor a caller-supplied path/scope under the trust-absolute posture:
 ///
 /// - **Absolute** path → used as-is (trusted as explicit intent, no confinement).
+/// - **Home** path (`~/…` or `$HOME/…`) → expanded to the home directory, then
+///   treated as absolute. Only a leading `~` / `$HOME` component expands.
 /// - **Relative** path → joined under `cwd`; `..` traversal is refused so a
 ///   relative spelling cannot climb out of the checkout.
 pub(super) fn resolve_anchored(
@@ -43,6 +45,9 @@ pub(super) fn resolve_anchored(
 ) -> Result<PathBuf, String> {
     if raw.is_absolute() {
         return Ok(raw.to_path_buf());
+    }
+    if let Some(home_path) = expand_home(raw)? {
+        return Ok(home_path);
     }
     if raw
         .components()
@@ -54,6 +59,29 @@ pub(super) fn resolve_anchored(
         ));
     }
     Ok(cwd.join(raw))
+}
+
+/// Expand a leading `~` or `$HOME` component to the home directory. Returns
+/// `None` when `raw` does not start with one, so it anchors under `cwd`.
+fn expand_home(raw: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    let mut components = raw.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return Ok(None);
+    };
+    if first != "~" && first != "$HOME" {
+        return Ok(None);
+    }
+    let home = home::home_dir().ok_or_else(|| {
+        format!(
+            "cannot expand \"{}\": home directory not found ($HOME): pass an absolute path.",
+            raw.display(),
+        )
+    })?;
+    let rest = components.as_path();
+    if rest.as_os_str().is_empty() {
+        return Ok(Some(home));
+    }
+    Ok(Some(home.join(rest)))
 }
 #[cfg(test)]
 mod tests {
@@ -102,6 +130,35 @@ mod tests {
         let cwd = std::path::Path::new("/checkout");
         let abs = std::path::Path::new("/elsewhere/worktree/file.rs");
         assert_eq!(resolve_anchored(abs, cwd).unwrap(), abs);
+    }
+
+    #[test]
+    fn resolve_anchored_expands_tilde_to_home() {
+        // `~/…` names the home directory, not a literal `~` dir under cwd (#83).
+        let home = home::home_dir().expect("home directory");
+        let cwd = std::path::Path::new("/checkout");
+        let out = resolve_anchored(std::path::Path::new("~/.claude/hooks/hook.js"), cwd).unwrap();
+        assert_eq!(out, home.join(".claude/hooks/hook.js"));
+        assert_eq!(
+            resolve_anchored(std::path::Path::new("~"), cwd).unwrap(),
+            home
+        );
+    }
+
+    #[test]
+    fn resolve_anchored_expands_dollar_home() {
+        let home = home::home_dir().expect("home directory");
+        let cwd = std::path::Path::new("/checkout");
+        let out = resolve_anchored(std::path::Path::new("$HOME/Dev/repo/a.rs"), cwd).unwrap();
+        assert_eq!(out, home.join("Dev/repo/a.rs"));
+    }
+
+    #[test]
+    fn resolve_anchored_tilde_inside_path_stays_literal() {
+        // Only a leading `~` component expands; an interior `~` is a real name.
+        let cwd = std::path::Path::new("/checkout");
+        let out = resolve_anchored(std::path::Path::new("src/~/a.rs"), cwd).unwrap();
+        assert_eq!(out, std::path::Path::new("/checkout/src/~/a.rs"));
     }
 
     #[test]
