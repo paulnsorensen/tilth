@@ -281,6 +281,35 @@ def test_fresh_budget_with_named_budget_resets_it(bench, capsys, tmp_path: Path)
     assert sum(1 for r in recs if r.get("reset")) == 1
 
 
+def test_second_run_on_a_held_budget_is_refused_before_any_spend(bench, capsys, tmp_path: Path) -> None:
+    """A concurrent run with the same --budget-id exits 75 and leaves the live run's output and budget alone."""
+    output = tmp_path / "shared.jsonl"
+    output.write_text('{"row": "live run"}\n')
+    argv = ("--tasks", "cell_a", *ARGS, "--reps", "1", "--max-usd", "5", "--budget-id", "shared", "--output", str(output))
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, spend; lock = spend.hold_run_lock('shared'); print('held', flush=True); sys.stdin.read()"],
+        cwd=Path(run.__file__).parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline() == "held\n"
+        bench.runner(lambda _stream: pytest.fail("model call started"))
+
+        code = bench.main(*argv)
+    finally:
+        holder.communicate("")
+
+    err = capsys.readouterr().err
+    assert code == 75
+    assert "budget shared is in use by another run" in err
+    assert bench.calls == []
+    assert output.read_text() == '{"row": "live run"}\n'
+    assert not (budgets(tmp_path) / "shared.jsonl").exists()
+
+    bench.runner(lambda _stream: 0.25)
+    assert bench.main(*argv) == 0
+    assert len(bench.calls) == 1
+
 # --- AC-15/AC-17 preflight through main ---
 
 
