@@ -53,6 +53,14 @@ def test_restore_does_not_follow_an_agent_directory_symlink(tmp_path: Path) -> N
     assert (checkout / "tests" / "test_ops.py").read_bytes() == b"def test_ok(): pass\n"
 
 
+def _is_private_grade_venv(venv: str | None) -> bool:
+    """The host may export its own VIRTUAL_ENV, so key presence does not mark a grading env."""
+    if not venv:
+        return False
+    path = Path(venv)
+    return path.name == "checkout-venv" and path.parent.name.startswith("tilth-external-grade-")
+
+
 def test_grading_runs_without_harness_credentials(external_bench, monkeypatch: pytest.MonkeyPatch,
                                                   tmp_path: Path) -> None:
     external_bench.seed(SWE_PY)
@@ -74,7 +82,7 @@ def test_grading_runs_without_harness_credentials(external_bench, monkeypatch: p
     correct, reason = task.check_correctness("", str(workdir))
 
     assert correct, reason
-    graded = [env for env in envs if "VIRTUAL_ENV" in env]
+    graded = [env for env in envs if _is_private_grade_venv(env.get("VIRTUAL_ENV"))]
     assert graded
     assert all("GH_TOKEN" not in env and env["HOME"] != os.environ["HOME"] for env in graded)
 
