@@ -4,11 +4,13 @@ set positional-arguments
 
 # Worker count for cargo -j and test --test-threads: the cores free when the recipe starts, at least 2.
 # Several worktrees share one host, so a fixed count per core overloads it.
-# Override with `just jobs=8 check` or `TILTH_JOBS=8 just check`.
-jobs := env("TILTH_JOBS", `python3 -c 'import os; print(max(2, int((os.cpu_count() or 1) - os.getloadavg()[0])))'`)
+# TEST_WORKERS_MAX caps the free-core count and keeps it load-aware, for example `TEST_WORKERS_MAX=4 just check`.
+# A pin turns off load awareness: `just jobs=8 check` or `TILTH_JOBS=8 just check`.
+jobs := env("TILTH_JOBS", `python3 -c 'import os; cpus = os.cpu_count() or 1; cap = int(os.environ.get("TEST_WORKERS_MAX", cpus)); print(min(cap, max(2, int(cpus - os.getloadavg()[0]))))'`)
 
 # cargo reads CARGO_BUILD_JOBS as -j; libtest and nextest read these as --test-threads.
 # An explicit flag on a `just verify` command still wins.
+# The BDD suite (`tests/bdd`) runs one scenario at a time and ignores these; see tests/bdd/main.rs.
 export CARGO_BUILD_JOBS := jobs
 export RUST_TEST_THREADS := jobs
 export NEXTEST_TEST_THREADS := jobs

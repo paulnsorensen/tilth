@@ -533,6 +533,8 @@ fn main() {
     futures::executor::block_on(
         TilthWorld::cucumber()
             .with_cli(cli)
+            // Serial on purpose: the suite takes seconds, and the steps block one thread on
+            // `mpsc` receives, so more concurrency needs async steps, not a larger number.
             .max_concurrent_scenarios(1)
             .fail_on_skipped_with(|_, _, _| true)
             .filter_run_and_exit("tests/bdd/features", move |_, _, scenario| {
