@@ -918,9 +918,9 @@ def write_trajectory(stream_log_path: Path | None, runner: str) -> str | None:
     return str(sidecar)
 
 
-def contamination_fields(trajectory_path: str | None, task: object) -> dict:
+def contamination_fields(trajectory_path: str | None, task: object, cwd: str | Path | None = None) -> dict:
     """The ``contaminated`` flag and its hits for a row's trajectory sidecar."""
-    hits = external.contamination.find_hits(trajectory_path, task)
+    hits = external.contamination.find_hits(trajectory_path, task, cwd)
     return {"contaminated": bool(hits), "contamination_hits": hits}
 
 
@@ -1477,7 +1477,7 @@ def _run_single_in_repo(
         "op_kinds": tool_op_kinds(run_result),
         "cost_source": run_result.cost_source,
         "trajectory_path": trajectory_path,
-        **contamination_fields(trajectory_path, task),
+        **contamination_fields(trajectory_path, task, repo_path),
         **details,
         "workspace_diff_lines": workspace_diff_lines,
         "reference_changed_lines": task.reference_changed_lines,
