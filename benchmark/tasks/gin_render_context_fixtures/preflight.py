@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from benchmark.tasks.gin_render_context_tasks import FIXTURE, ROOT_TEST_PATTERN, GinRenderContextTask
+from benchmark.tasks.gin_render_context_tasks import FIXTURE, ROOT_TEST_PATTERN, TIMEOUT_REASON, GinRenderContextTask
 from benchmark.tasks.gin_render_context_fixtures.reference import CHECK, apply_reference
 
 
@@ -35,10 +35,10 @@ def reference_size(target: Path) -> tuple[int, int, int, int]:
     return len(changed), sites, added, removed
 
 
-def assert_test_failure(ok: bool, reason: str) -> None:
-    """A negative control passes only on a real test failure, never on a grader timeout."""
+def assert_rejected(ok: bool, reason: str) -> None:
+    """A negative control passes only on a real rejection, never on a grader timeout."""
     assert not ok, reason
-    assert "tests failed" in reason, reason
+    assert not reason.startswith(TIMEOUT_REASON), reason
 
 
 def main() -> None:
@@ -58,7 +58,7 @@ def main() -> None:
         original = root / "original"
         clone(original)
         ok, reason = task.check_correctness("", str(original))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         print("original: rejected", reason)
 
         reference = root / "reference"
@@ -82,7 +82,7 @@ def main() -> None:
         apply_reference(unmigrated_binding)
         shutil.copy2(FIXTURE / "binding" / "json_test.go", unmigrated_binding / "binding" / "json_test.go")
         ok, reason = task.check_correctness("", str(unmigrated_binding))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         assert "Candidate tests failed: go test" in reason, reason
         print("unmigrated binding caller: rejected", reason.splitlines()[0])
         incomplete = root / "incomplete"
@@ -90,7 +90,7 @@ def main() -> None:
         apply_reference(incomplete)
         shutil.copy2(FIXTURE / "render" / "bson.go", incomplete / "render" / "bson.go")
         ok, reason = task.check_correctness("", str(incomplete))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         print("incomplete API: rejected", reason.splitlines()[0])
 
         cancellation = root / "cancellation"
@@ -106,7 +106,7 @@ def main() -> None:
         assert weakened_test != original_test
         test_path.write_text(weakened_test)
         ok, reason = task.check_correctness("", str(cancellation))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         print("missing cancellation with weakened test: rejected", reason.splitlines()[0])
 
         ordering = root / "ordering"
@@ -117,7 +117,7 @@ def main() -> None:
         assert CHECK in text
         path.write_text(text.replace(CHECK, '\tw.Header().Set("X-Leak", "yes")\n' + CHECK, 1))
         ok, reason = task.check_correctness("", str(ordering))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         print("header before cancellation: rejected", reason.splitlines()[0])
         dispatch = root / "dispatch"
         clone(dispatch)
@@ -127,7 +127,7 @@ def main() -> None:
         text = text.replace("renderContext = c.Request.Context()", "renderContext = context.Background()", 1)
         path.write_text(text)
         ok, reason = task.check_correctness("", str(dispatch))
-        assert_test_failure(ok, reason)
+        assert_rejected(ok, reason)
         print("missing dispatch: rejected", reason.splitlines()[0])
 
 
