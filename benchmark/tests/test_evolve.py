@@ -1875,11 +1875,26 @@ def test_default_just_check_timeout_kills_the_whole_process_group(monkeypatch: p
     assert not _alive(child)
 
 
+def test_alive_is_false_when_the_process_exits_during_the_stat_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Linux returns ESRCH from read() when the process exits after open() of /proc/<pid>/stat.
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    real_read_text = Path.read_text
+
+    def racing_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == stat_path:
+            raise ProcessLookupError(3, "No such process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", racing_read_text)
+    assert _alive(os.getpid()) is False
+
+
 def _alive(pid: int) -> bool:
     """True while ``pid`` runs; a zombie counts as dead."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    # ProcessLookupError: the reaper can collect the process between open() and read().
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
