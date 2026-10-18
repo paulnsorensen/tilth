@@ -13,8 +13,11 @@ from .candidate import SRC_PATCH, TEXT_COMPONENTS, content_id, read_seed, ref_na
 from .gitops import GitError, git
 
 ALLOWED_PREFIXES = ("src/", "prompts/")
+# The candidate `just check` sets this to 1, and the Rust tests then skip their prompt phrase pins.
+PHRASE_PIN_EXEMPT_ENV = "TILTH_EVOLVE_CANDIDATE"
 # Names that point a candidate's code at the harness; the loop adds the panel file and the data directory.
-HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA")
+# The exemption variable is one: candidate code that names it could keep the exemption on outside the search.
+HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA", PHRASE_PIN_EXEMPT_ENV)
 BYTE_LOCK_FILE = "src/mcp/mod.rs"
 REGULAR_MODES = {"000000", "100644", "100755"}
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")

@@ -24,10 +24,10 @@ import panels
 import run
 from evolve import candidate as candidates
 from evolve import engine
-from evolve.finish import GitHubPRClient
+from evolve.finish import REPIN_NOTE, GitHubPRClient
 from evolve.gitops import GitError
 from evolve.loop import Cascade, EvolveError
-from evolve.materialize import ApplyRejected, Materializer
+from evolve.materialize import PHRASE_PIN_EXEMPT_ENV, ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
     main, make_world, mcp, quota_stream, result_stream, scripted_engine, seed_candidate, seed_files,
@@ -427,7 +427,7 @@ def test_includes_inside_src_and_prompts_are_kept(world) -> None:
 
 
 @pytest.mark.parametrize("term", ["benchmark", "Benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA",
-                                  "panel-path", "panel-name", "data-dir"])
+                                  "TILTH_EVOLVE_CANDIDATE", "panel-path", "panel-name", "data-dir"])
 def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, term: str) -> None:
     data = world.tmp / "harness-data"
     monkeypatch.setenv("TILTH_BENCH_DATA", str(data))
@@ -475,6 +475,20 @@ def test_rejects_cfg_test_edit(tilth_clone, tmp_path: Path) -> None:
             materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {name: text})})
     assert git("for-each-ref", "refs/evolve/cfgtest", cwd=repo).strip() == ""
 
+
+def test_rejects_a_candidate_that_flips_the_phrase_pin_exemption(tilth_clone, tmp_path: Path) -> None:
+    repo, seed = tilth_clone
+    mod = git("show", f"{seed}:src/mcp/mod.rs", cwd=repo)
+    definitions = git("show", f"{seed}:src/mcp/tools/definitions.rs", cwd=repo)
+    materializer = Materializer(repo, seed, "exempt", tmp_path / "work")
+    base = candidates.read_seed(repo, seed)
+    always = _edit_line(mod, f'::std::option_env!("{PHRASE_PIN_EXEMPT_ENV}") == Some("1")', "true")
+    unguarded = _edit_line(definitions, "if !crate::mcp::phrase_pins_exempt() {", "if false {")
+
+    for name, text in (("src/mcp/mod.rs", always), ("src/mcp/tools/definitions.rs", unguarded)):
+        with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
+            materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {name: text})})
+    assert git("for-each-ref", "refs/evolve/exempt", cwd=repo).strip() == ""
 
 def _byte_lock(text: str) -> tuple[int, str, str]:
     import re
@@ -1100,6 +1114,9 @@ def test_finish_opens_one_draft_for_nonseed_winner(world) -> None:
     assert create[create.index("--head") + 1] == "evolve/run1-winner"
     body = create[create.index("--body") + 1]
     assert "dev delta" in body and "test delta" in body
+    assert "## Re-pin before landing" in body and REPIN_NOTE in body
+    assert f"{PHRASE_PIN_EXEMPT_ENV}=1" in REPIN_NOTE and "Re-pin those asserts" in REPIN_NOTE
+    assert f"finish: {REPIN_NOTE}" in log_text(world)
     assert not any("merge" in part for part in create)
 
 
@@ -1824,6 +1841,8 @@ def test_default_just_check_gets_an_allowlisted_env_and_a_shared_target(monkeypa
     assert not set(_SECRET_ENV) & set(seen["env"])
     assert seen["env"]["PATH"] == os.environ["PATH"] and seen["env"]["HOME"] == os.environ["HOME"]
     assert seen["env"]["MISE_DATA_DIR"] == "/tmp/mise" and "CARGO_TARGET_DIR" not in seen["env"]
+    # The Rust tests read this exact name through option_env!, so a candidate may reword prompts/.
+    assert seen["env"]["TILTH_EVOLVE_CANDIDATE"] == "1"
     link = worktree / "target"
     assert link.is_symlink() and link.resolve() == run.candidate_target_dir().resolve()
     assert seen["timeout"] == cli.JUST_CHECK_TIMEOUT_S and seen["start_new_session"] is True

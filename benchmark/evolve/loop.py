@@ -29,7 +29,7 @@ from spend import SpendLedger
 from . import engine
 from .calls import PaidCalls, StopState
 from .candidate import content_id
-from .finish import PRClient, outside_allowlist
+from .finish import REPIN_NOTE, PRClient, outside_allowlist
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
 from .proposer import Proposer
@@ -579,9 +579,11 @@ class Evolution:
         body = "\n".join([
             f"Evolve run `{self.settings.run_id}` winner `{winner.cid[:12]}` (commit {winner.sha}).", "",
             f"Test-split means: {scores}", "",
+            "## Re-pin before landing", REPIN_NOTE, "",
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",
         ])
+        self.log(f"finish: {REPIN_NOTE}")
         try:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:

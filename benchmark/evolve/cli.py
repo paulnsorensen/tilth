@@ -33,6 +33,7 @@ from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
 from evolve.loop import Evolution, EvolveError, Settings  # noqa: E402
+from evolve.materialize import PHRASE_PIN_EXEMPT_ENV  # noqa: E402
 from judge import core as judge  # noqa: E402
 from spend import SpendLedger  # noqa: E402
 
@@ -41,6 +42,9 @@ JUST_CHECK_TIMEOUT_S = 1800
 
 def default_just_check(worktree: Path) -> tuple[bool, str]:
     """Run ``just check`` in an allowlisted env, with ``<worktree>/target`` linked to the shared candidate target dir.
+
+    The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
+    reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
 
     A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
     ``/target`` matches a symlink.
@@ -52,7 +56,8 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
         target.symlink_to(shared, target_is_directory=True)
     # A new session lets a timeout kill cargo and the test binaries too, not only ``just``.
     process = subprocess.Popen(["just", "check"], cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env=run.build_tool_env(), start_new_session=True)
+                               text=True, env={**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
+                               start_new_session=True)
     try:
         stdout, stderr = process.communicate(timeout=JUST_CHECK_TIMEOUT_S)
     except subprocess.TimeoutExpired:

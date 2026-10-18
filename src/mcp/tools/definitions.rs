@@ -198,17 +198,20 @@ mod tests {
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present in edit mode");
         let desc = write["description"].as_str().expect("description string");
-        let ops = &desc[desc.find("Ops:").expect("ops list present")..];
-        let replace_text = ops.find("replace_text").expect("replace_text taught");
-        assert!(
-            replace_text < ops.find("create_file").expect("create_file taught")
-                && replace_text < ops.find("replace/delete").expect("line ops taught"),
-            "replace_text must lead the ops list: {ops}"
-        );
-        assert!(
-            desc.contains("ops: [{op: \"replace_text\""),
-            "the worked example must demonstrate replace_text: {desc}"
-        );
+        // Phrase pins on prompts/tools/write.md; the evolve loop exempts its candidates.
+        if !crate::mcp::phrase_pins_exempt() {
+            let ops = &desc[desc.find("Ops:").expect("ops list present")..];
+            let replace_text = ops.find("replace_text").expect("replace_text taught");
+            assert!(
+                replace_text < ops.find("create_file").expect("create_file taught")
+                    && replace_text < ops.find("replace/delete").expect("line ops taught"),
+                "replace_text must lead the ops list: {ops}"
+            );
+            assert!(
+                desc.contains("ops: [{op: \"replace_text\""),
+                "the worked example must demonstrate replace_text: {desc}"
+            );
+        }
         let one_of = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
             ["items"]["oneOf"]
             .as_array()
@@ -378,9 +381,12 @@ mod tests {
             .find(|t| t["name"] == "tilth_search")
             .expect("search tool");
         // prompts/tools/search.md must keep the edit-ready search guidance from #309.
+        // Phrase pins; the evolve loop exempts its candidates.
         let desc = search["description"].as_str().expect("search description");
-        assert!(desc.contains("Match headers carry `path#TAG`"), "{desc}");
-        assert!(desc.contains("then use a `rewrite` op"), "{desc}");
+        if !crate::mcp::phrase_pins_exempt() {
+            assert!(desc.contains("Match headers carry `path#TAG`"), "{desc}");
+            assert!(desc.contains("then use a `rewrite` op"), "{desc}");
+        }
         let schema = &search["inputSchema"];
         assert!(schema["properties"]["kind"].is_null());
         for dropped in ["scope", "expand", "context", "if_modified_since"] {
