@@ -220,6 +220,8 @@ python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha
 It bounds every cell, judge, reflection, and proposer call.
 `--budget-id NAME` keeps the spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`, so a rerun starts from the recorded spend.
 Without the flag, the evolve ledger lives in the process only.
+`--seed-sha` must be an ancestor of `origin/<--base-branch>`, the branch that the winner PR targets.
+When that remote-tracking ref does not exist, the run checks the local branch.
 `--cell-budget-usd` sets the Claude `--max-budget-usd` of every cell in the run: seed, candidate, baseline, and finish cells (default: `1.0`, the `run.py` default).
 The value must be a positive finite number; the run refuses any other value before a paid call.
 The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.

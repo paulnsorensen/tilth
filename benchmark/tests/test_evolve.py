@@ -203,6 +203,35 @@ def test_non_claude_model_refused_before_any_call(world, capsys: pytest.CaptureF
     assert world.runner_calls() == [] and world.spawned == []
     assert "invalid choice: 'gpt5'" in capsys.readouterr().err
 
+
+def _commit_on(world, ref: str) -> str:
+    """One more commit on the seed, pointed to by ``ref``; local ``main`` stays at the seed."""
+    tree = git("rev-parse", f"{world.seed_sha}^{{tree}}", cwd=world.repo).strip()
+    sha = git("commit-tree", tree, "-p", world.seed_sha, "-m", "next", cwd=world.repo).strip()
+    git("update-ref", ref, sha, cwd=world.repo)
+    return sha
+
+
+def test_seed_on_the_remote_base_passes_when_the_local_base_lags(world, capsys: pytest.CaptureFixture[str]) -> None:
+    sha = _commit_on(world, "refs/remotes/origin/main")
+
+    evo = build(world, "--seed-sha", sha)
+
+    assert not isinstance(evo, int), capsys.readouterr().err
+    assert evo.settings.base_branch == "main"
+
+
+def test_seed_only_on_the_local_base_is_refused_when_the_remote_base_exists(world, capsys) -> None:
+    git("update-ref", "refs/remotes/origin/main", world.seed_sha, cwd=world.repo)
+    sha = _commit_on(world, "refs/heads/main")
+
+    assert build(world, "--seed-sha", sha) == 2
+    assert "is not an ancestor of origin/main" in capsys.readouterr().err
+
+
+def test_seed_on_the_local_base_passes_without_a_remote(world) -> None:
+    assert not isinstance(build(world), int)
+
 @pytest.mark.parametrize("error", [
     judge_core.CritiqueRejected("no verdict"), judge_core.CritiqueWithheld("no-trajectory"),
     judge_core.JudgeCallFailed("claude exited 1"),
