@@ -22,8 +22,13 @@ TILTH_MODE = "tilth"
 
 
 MODEL_ALIASES = {
-    # Pinned claude short names. The bare `haiku`, `sonnet`, and `opus` are the
-    # configured model strings themselves, so they map to no other row.
+    # Legacy rows stored the bare short name as `model`; these keep them paired with
+    # their pinned-ID rows. A results file pairs only its own rows, so a bare-alias
+    # row keys under the same label in both arms. Its `resolved_model` holds the real ID.
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+    # Pinned claude short names, for the --model filter.
     "haiku45": "claude-haiku-4-5-20251001",
     "sonnet46": "claude-sonnet-4-6",
     "sonnet5": "claude-sonnet-5",
