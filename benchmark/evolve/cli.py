@@ -81,8 +81,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
     parser.add_argument("--plateau", type=int, default=5,
                         help="stop after P paid-tier candidates leave the best dev mean unimproved (default 5)")
-    parser.add_argument("--cell-estimate-usd", type=float, default=run.DEFAULT_MAX_BUDGET_USD,
-                        help="estimate for a call with no stored or earlier cost")
+    parser.add_argument("--cell-budget-usd", type=float, default=run.DEFAULT_MAX_BUDGET_USD,
+                        help="Claude --max-budget-usd for every cell; part of each cell's run key "
+                             f"(default {run.DEFAULT_MAX_BUDGET_USD})")
+    parser.add_argument("--cell-estimate-usd", type=float,
+                        help="estimate for a call with no stored or earlier cost (default: --cell-budget-usd)")
     parser.add_argument("--refreeze-baselines", action="store_true",
                         help="buy drifted baseline cells again under their new key")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
@@ -104,7 +107,10 @@ def build(argv: list[str] | None = None, *,
     args = _parser().parse_args(argv)
     if args.max_usd is None:
         return _error("--max-usd is required: it bounds every cell, judge, reflection, and proposer call")
-    for flag, value in (("--max-usd", args.max_usd), ("--cell-estimate-usd", args.cell_estimate_usd)):
+    if args.cell_estimate_usd is None:
+        args.cell_estimate_usd = args.cell_budget_usd
+    for flag, value in (("--max-usd", args.max_usd), ("--cell-budget-usd", args.cell_budget_usd),
+                        ("--cell-estimate-usd", args.cell_estimate_usd)):
         if not math.isfinite(value) or value <= 0:
             return _error(f"{flag} must be a positive finite number")
     if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1:
@@ -139,7 +145,8 @@ def build(argv: list[str] | None = None, *,
     settings = Settings(
         run_id=args.run_id, repo=repo, seed_sha=seed_sha, base_branch=args.base_branch, model=args.model,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
-        cell_estimate_usd=args.cell_estimate_usd, refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
+        cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
+        refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,

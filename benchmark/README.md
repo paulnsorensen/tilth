@@ -209,6 +209,12 @@ python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha
 It bounds every cell, judge, reflection, and proposer call.
 `--budget-id NAME` keeps the spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`, so a rerun starts from the recorded spend.
 Without the flag, the evolve ledger lives in the process only.
+`--cell-budget-usd` sets the Claude `--max-budget-usd` of every cell in the run: seed, candidate, baseline, and finish cells (default: `1.0`, the `run.py` default).
+The value must be a positive finite number; the run refuses any other value before a paid call.
+The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.
+A stronger model, such as `sonnet`, costs more per token, so give it a larger budget than `haiku`: at `$1` many external cells stop with `error_max_budget_usd`.
+`--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
+A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, and passed neither `--strict-file-tools` nor `--reasoning-effort`.
 The evolve run refuses before any paid call unless `CLAUDE_CODE_OAUTH_TOKEN` is set and `claude auth status` reports `oauth_token`.
 A call whose init event shows an API key stops the run with the `auth` reason, and its cost stays on the ledger.
 The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
