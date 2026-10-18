@@ -35,6 +35,12 @@ def reference_size(target: Path) -> tuple[int, int, int, int]:
     return len(changed), sites, added, removed
 
 
+def assert_test_failure(ok: bool, reason: str) -> None:
+    """A negative control passes only on a real test failure, never on a grader timeout."""
+    assert not ok, reason
+    assert "tests failed" in reason, reason
+
+
 def main() -> None:
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=FIXTURE, check=True, capture_output=True, text=True).stdout.strip()
     assert revision == "d7776de7d444935ea4385999711bd6331a98fecb", revision
@@ -52,7 +58,7 @@ def main() -> None:
         original = root / "original"
         clone(original)
         ok, reason = task.check_correctness("", str(original))
-        assert not ok, reason
+        assert_test_failure(ok, reason)
         print("original: rejected", reason)
 
         reference = root / "reference"
@@ -76,14 +82,15 @@ def main() -> None:
         apply_reference(unmigrated_binding)
         shutil.copy2(FIXTURE / "binding" / "json_test.go", unmigrated_binding / "binding" / "json_test.go")
         ok, reason = task.check_correctness("", str(unmigrated_binding))
-        assert not ok and "Candidate tests failed: go test" in reason, reason
+        assert_test_failure(ok, reason)
+        assert "Candidate tests failed: go test" in reason, reason
         print("unmigrated binding caller: rejected", reason.splitlines()[0])
         incomplete = root / "incomplete"
         clone(incomplete)
         apply_reference(incomplete)
         shutil.copy2(FIXTURE / "render" / "bson.go", incomplete / "render" / "bson.go")
         ok, reason = task.check_correctness("", str(incomplete))
-        assert not ok, reason
+        assert_test_failure(ok, reason)
         print("incomplete API: rejected", reason.splitlines()[0])
 
         cancellation = root / "cancellation"
@@ -99,7 +106,7 @@ def main() -> None:
         assert weakened_test != original_test
         test_path.write_text(weakened_test)
         ok, reason = task.check_correctness("", str(cancellation))
-        assert not ok, reason
+        assert_test_failure(ok, reason)
         print("missing cancellation with weakened test: rejected", reason.splitlines()[0])
 
         ordering = root / "ordering"
@@ -110,7 +117,7 @@ def main() -> None:
         assert CHECK in text
         path.write_text(text.replace(CHECK, '\tw.Header().Set("X-Leak", "yes")\n' + CHECK, 1))
         ok, reason = task.check_correctness("", str(ordering))
-        assert not ok, reason
+        assert_test_failure(ok, reason)
         print("header before cancellation: rejected", reason.splitlines()[0])
         dispatch = root / "dispatch"
         clone(dispatch)
@@ -120,7 +127,7 @@ def main() -> None:
         text = text.replace("renderContext = c.Request.Context()", "renderContext = context.Background()", 1)
         path.write_text(text)
         ok, reason = task.check_correctness("", str(dispatch))
-        assert not ok, reason
+        assert_test_failure(ok, reason)
         print("missing dispatch: rejected", reason.splitlines()[0])
 
 

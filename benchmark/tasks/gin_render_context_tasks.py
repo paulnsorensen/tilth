@@ -16,6 +16,10 @@ SOURCE_FILES = {"context.go", *(f"render/{name}.go" for name in (
 ))}
 HELD_OUT = Path(__file__).parent / "gin_render_context_fixtures"
 ROOT_TEST_PATTERN = "^(TestContext|TestMiddleware|TestHeldOut)"
+# A cold Go build on a loaded host is slow; a timeout is inconclusive, not a test failure.
+GRADE_TIMEOUT_S = 900
+WARM_TIMEOUT_S = 900
+TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 
 
 def _grade_commands(tags: list[str]) -> list[list[str]]:
@@ -27,8 +31,31 @@ def _grade_commands(tags: list[str]) -> list[list[str]]:
     ]
 
 
-def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=300)
+def _run(command: list[str], cwd: Path, timeout: int = GRADE_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+
+def _grade_variants(directory: Path, label: str) -> str | None:
+    """Run the graded commands in both build variants; return a failure reason or None.
+
+    A timeout says nothing about the code under test, so its reason starts with
+    TIMEOUT_REASON and never reads as "tests failed".
+    """
+    for tags in ([], ["-tags=nomsgpack"]):
+        warm = ["go", "test", *tags, "-run", "^$", "./..."]
+        try:
+            _run(warm, directory, WARM_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return f"{TIMEOUT_REASON}: {label} build warm-up timed out: {' '.join(warm)}"
+        for command in _grade_commands(tags):
+            try:
+                result = _run(command, directory)
+            except subprocess.TimeoutExpired:
+                return f"{TIMEOUT_REASON}: {label} tests timed out: {' '.join(command)}"
+            if result.returncode:
+                detail = (result.stderr + result.stdout)[-1200:]
+                return f"{label} tests failed: {' '.join(command)}\n{detail}"
+    return None
 
 
 def _restore_tests(target: Path, *, held_out: bool = True) -> None:
@@ -146,22 +173,10 @@ class GinRenderContextTask(Task):
             for relative in source_changes:
                 shutil.copy2(candidate / relative, target / relative)
             _restore_tests(target)
-            for tags in ([], ["-tags=nomsgpack"]):
-                for command in _grade_commands(tags):
-                    try:
-                        result = _run(command, target)
-                    except subprocess.TimeoutExpired:
-                        return False, f"Trusted tests timed out: {' '.join(command)}"
-                    if result.returncode:
-                        detail = (result.stderr + result.stdout)[-1200:]
-                        return False, f"Trusted tests failed: {' '.join(command)}\n{detail}"
-        for tags in ([], ["-tags=nomsgpack"]):
-            for command in _grade_commands(tags):
-                try:
-                    result = _run(command, candidate)
-                except subprocess.TimeoutExpired:
-                    return False, f"Candidate tests timed out: {' '.join(command)}"
-                if result.returncode:
-                    detail = (result.stderr + result.stdout)[-1200:]
-                    return False, f"Candidate tests failed: {' '.join(command)}\n{detail}"
+            failure = _grade_variants(target, "Trusted")
+            if failure:
+                return False, failure
+        failure = _grade_variants(candidate, "Candidate")
+        if failure:
+            return False, failure
         return True, "Trusted and candidate tests pass in both build variants"
