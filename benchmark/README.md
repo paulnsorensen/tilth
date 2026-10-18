@@ -190,6 +190,7 @@ An external instance needs only a cached dataset row: the judge does not run adm
 A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
 Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
 The commit passes `just check`, then a cheap tier, then the panel's dev split.
+Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
 The score is grader correctness only, and contaminated rollouts count as incorrect.
 Reflection and the `src/` proposer are isolated `claude -p` calls.
 They see only the judge's stripped records, never grader text or test-split rollouts.

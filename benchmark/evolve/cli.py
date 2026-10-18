@@ -70,7 +70,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="GEPA budget: evaluator calls, one per (candidate, dev task)")
     parser.add_argument("--seed-sha", required=True, help="the tilth commit every candidate builds on")
     parser.add_argument("--base-branch", default="main", help="the branch --seed-sha came from (default: main)")
-    parser.add_argument("--model", default="haiku", choices=sorted(run.MODELS), help="agent model for every cell")
+    # Only the claude runner enforces the tilth_forced tool restriction that candidates run under.
+    claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
+    parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
     parser.add_argument("--plateau", type=int, default=5,
                         help="stop after P paid-tier candidates leave the best dev mean unimproved (default 5)")

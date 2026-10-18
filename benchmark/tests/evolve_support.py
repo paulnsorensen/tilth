@@ -319,9 +319,9 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     monkeypatch.setattr(run, "_CANDIDATE_BUILDS", {})
     for task in (*CHEAP, *DEV, "dev_c", *TEST):
         monkeypatch.setitem(run.TASKS, task, EvolveTask(name=task))
-    monkeypatch.setitem(run.MODES, "tilth", ModeConfig(name="tilth", tools=["Read"],
-                                                       mcp_config_path=run.MODES["tilth"].mcp_config_path,
-                                                       description="candidate arm", binary_path="/fixture/bin/tilth"))
+    monkeypatch.setitem(run.MODES, "tilth_forced", ModeConfig(
+        name="tilth_forced", tools=[], mcp_config_path=run.MODES["tilth_forced"].mcp_config_path,
+        description="candidate arm", binary_path="/fixture/bin/tilth"))
     monkeypatch.setattr(judge_config, "JUDGE_DIR", tmp_path / "judge-cache")
     calibration = tmp_path / "calibration.json"
     calibration.write_text(json.dumps({"tasks": {}, "trajectories": []}))
