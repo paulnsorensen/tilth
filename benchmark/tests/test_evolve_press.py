@@ -12,7 +12,7 @@ from evolve import candidate as candidates
 from evolve import rust
 from evolve.calls import StopState
 from evolve.materialize import Materializer
-from evolve_support import copy_tilth, git, make_world, result_stream, seed_candidate
+from evolve_support import copy_tilth, git, make_world, result_stream, seed_candidate, with_last_line
 
 RAW = 'r#"a { brace } in a raw string"#'
 
@@ -74,7 +74,7 @@ def test_byte_lock_literal_edits_are_rewritten_not_refused(tilth, tmp_path: Path
     materializer = Materializer(repo, seed, "press-lock", tmp_path / "work")
     patch = _patch(repo, seed, "src/mcp/mod.rs", 'ends_with("DO NOT re-read expanded search content.")',
                    'ends_with("a proposer guessed this literal")')
-    new_mcp = base["prompts/mcp.md"] + "\nA new last line."
+    new_mcp = with_last_line(base["prompts/mcp.md"], "A new last line.")
 
     sha = materializer.materialize({**base, "prompts/mcp.md": new_mcp, "src_patch": patch})
     mod = git("show", f"{sha}:src/mcp/mod.rs", cwd=repo)
@@ -213,7 +213,7 @@ def test_byte_lock_count_and_lead_literal_edits_are_rewritten(tilth, tmp_path: P
     (scratch / "src/mcp/mod.rs").write_text(edited)
     patch = git("diff", seed, cwd=scratch)
     git("worktree", "remove", "--force", str(scratch), cwd=repo)
-    new_mcp = base["prompts/mcp.md"] + "\nA new last line."
+    new_mcp = with_last_line(base["prompts/mcp.md"], "A new last line.")
 
     sha = materializer.materialize({**base, "prompts/mcp.md": new_mcp, "src_patch": patch})
     rewritten = git("show", f"{sha}:src/mcp/mod.rs", cwd=repo)

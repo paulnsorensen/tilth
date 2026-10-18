@@ -16,6 +16,9 @@ from .gitops import GitError, git_bytes
 TEXT_COMPONENTS = ("prompts/mcp.md", "prompts/tools/read.md", "prompts/tools/search.md", "prompts/tools/write.md")
 SRC_PATCH = "src_patch"
 COMPONENTS = (*TEXT_COMPONENTS, SRC_PATCH)
+# The MCP host truncates the instructions field and each tool description past 2048 bytes; the src/mcp tests
+# (server_instructions_fit_character_cap, tool_descriptions_fit_2kb) reject a longer prompt file.
+MAX_BYTES = {name: 2048 for name in TEXT_COMPONENTS}
 
 
 class SeedError(ValueError):

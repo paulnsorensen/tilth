@@ -394,6 +394,11 @@ def copy_tilth(tmp_path: Path) -> tuple[Path, str]:
     return target, sha
 
 
+def with_last_line(text: str, line: str) -> str:
+    """``text`` with its last line replaced, so an edit to the real prompt stays under its 2048-byte cap."""
+    return text.rsplit("\n", 1)[0] + "\n" + line
+
+
 def cargo_available() -> bool:
     return shutil.which("cargo") is not None
 

@@ -74,7 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-metric-calls", type=int, required=True,
                         help="GEPA budget: evaluator calls, one per (candidate, dev task)")
     parser.add_argument("--seed-sha", required=True, help="the tilth commit every candidate builds on")
-    parser.add_argument("--base-branch", default="main", help="the branch --seed-sha came from (default: main)")
+    parser.add_argument("--base-branch", default="main",
+                        help="the winner PR's base; --seed-sha must be on origin/<branch>, or on the local "
+                             "branch when there is no remote-tracking ref (default: main)")
     # Only the claude runner enforces the tilth_forced tool restriction that candidates run under.
     claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
     parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
@@ -97,6 +99,17 @@ def _parser() -> argparse.ArgumentParser:
 def _error(message: str) -> int:
     print(f"error: {message}", file=sys.stderr)
     return 2
+
+
+def _base_ref(repo: Path, branch: str) -> str:
+    """The fully qualified remote ref the winner PR merges into, or the local branch ref when absent.
+
+    A local branch can lag or lead the remote one; the draft PR targets the remote branch.
+    """
+    remote = f"refs/remotes/origin/{branch}"
+    found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", remote], cwd=repo,
+                           capture_output=True)
+    return remote if found.returncode == 0 else f"refs/heads/{branch}"
 
 
 def build(argv: list[str] | None = None, *,
@@ -125,9 +138,11 @@ def build(argv: list[str] | None = None, *,
         seed = read_seed(repo, seed_sha)
     except (GitError, SeedError) as error:
         return _error(str(error))
-    if subprocess.run(["git", "merge-base", "--is-ancestor", seed_sha, args.base_branch], cwd=repo,
+    base_ref = _base_ref(repo, args.base_branch)
+    if subprocess.run(["git", "merge-base", "--is-ancestor", seed_sha, base_ref], cwd=repo,
                       capture_output=True).returncode != 0:
-        return _error(f"--seed-sha {args.seed_sha} is not an ancestor of --base-branch {args.base_branch}")
+        base_name = base_ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+        return _error(f"--seed-sha {args.seed_sha} is not an ancestor of {base_name} (--base-branch {args.base_branch})")
     try:
         panel = panels.load_panel(args.panel, store_path=run.RESULTS_DIR / baselines.STORE_FILENAME)
         panel.register(run.TASKS)

@@ -202,6 +202,8 @@ A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulativ
 Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
 The commit passes `just check`, then a cheap tier, then the panel's dev split.
 That `just check` sets `TILTH_EVOLVE_CANDIDATE=1`, so the Rust tests skip their phrase pins on `prompts/` text; CI does not set it, so the winner PR must re-pin them before it lands.
+The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. Reflection is told this cap and the current size, and a candidate prompt file over it is refused before its worktree and `just check`.
+The run log names the stage at which each candidate failed (apply, `just check`, build, or cheap tier), with the output tail.
 Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
 The score is grader correctness only, and contaminated rollouts count as incorrect.
 Reflection and the `src/` proposer are isolated `claude -p` calls.
@@ -220,6 +222,8 @@ python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha
 It bounds every cell, judge, reflection, and proposer call.
 `--budget-id NAME` keeps the spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`, so a rerun starts from the recorded spend.
 Without the flag, the evolve ledger lives in the process only.
+`--seed-sha` must be an ancestor of `origin/<--base-branch>`, the branch that the winner PR targets.
+When that remote-tracking ref does not exist, the run checks the local branch.
 `--cell-budget-usd` sets the Claude `--max-budget-usd` of every cell in the run: seed, candidate, baseline, and finish cells (default: `1.0`, the `run.py` default).
 The value must be a positive finite number; the run refuses any other value before a paid call.
 The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.
