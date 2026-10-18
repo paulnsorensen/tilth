@@ -158,7 +158,7 @@ The first completed stored row for a panel name locks its split: a later split c
 It also critiques stripped rollouts for reflection.
 It uses the claude CLI alias `opus` (`--model opus`) through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN`.
 The alias follows the newest opus release, and cache keys and calibration records store only `opus`.
-Evolve reflection and the proposer stay on `claude-sonnet-5`.
+Evolve reflection and the proposer use the claude CLI alias `sonnet`.
 The call has no tools, MCP servers, settings, or hooks, and the prompt goes on stdin.
 A critique sees only the task prompt, allowlisted row fields, and the verbatim trajectory sidecar.
 It never sees `correctness_reason`, ground truth, gold patches, or held-out tests.

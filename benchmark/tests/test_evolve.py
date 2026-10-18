@@ -1812,9 +1812,9 @@ def test_reflection_and_proposer_stay_on_sonnet_when_the_judge_is_opus(world) ->
     argv = evo.reflect.argv()
 
     assert judge_core.config.JUDGE_MODEL == "opus"
-    assert evo.settings.helper_model == "claude-sonnet-5"
-    assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
-    assert evo.proposer.model == "claude-sonnet-5"
+    assert evo.settings.helper_model == "sonnet"
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert evo.proposer.model == "sonnet"
 
 
 _SECRET_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
