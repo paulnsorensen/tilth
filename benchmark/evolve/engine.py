@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
 
 from .calls import PaidCalls, StopState
-from .candidate import SRC_PATCH
+from .candidate import MAX_BYTES, SRC_PATCH
 
 __all__ = ["Dispatcher", "ReflectionClient", "StopState", "Stopper", "optimize", "reflection_prompt"]
 
@@ -26,12 +26,15 @@ REFLECTION_HEADER = (
     "tasks like these. Keep it concise. Reply with the complete new file text between <new_text> and "
     "</new_text>, and nothing else."
 )
+SIZE_NOTE = ("The new file must be at most {max_bytes} UTF-8 bytes, the size of the MCP instructions field; "
+             "a longer file fails the tilth test suite and is never scored.")
 
 
-def reflection_prompt(text: str, records: list[dict]) -> str:
-    """The reflection prompt: a fixed header, the component's current text, and the records, nothing else."""
+def reflection_prompt(text: str, records: list[dict], *, max_bytes: int | None = None) -> str:
+    """The reflection prompt: a fixed header (with the byte cap when the file has one), the text, and the records."""
+    header = REFLECTION_HEADER if max_bytes is None else f"{REFLECTION_HEADER} {SIZE_NOTE.format(max_bytes=max_bytes)}"
     rendered = json.dumps(records, indent=2, sort_keys=True)
-    return f"{REFLECTION_HEADER}\n\n<current>\n{text}\n</current>\n\n<records>\n{rendered}\n</records>\n"
+    return f"{header}\n\n<current>\n{text}\n</current>\n\n<records>\n{rendered}\n</records>\n"
 
 
 class Stopper:
@@ -59,7 +62,8 @@ class ReflectionClient:
 
     def __call__(self, name: str, text: str, records: list[dict]) -> str:
         with tempfile.TemporaryDirectory(prefix="tilth-reflection-cwd-") as cwd:
-            outcome = self.paid.call("reflection", self.argv(), reflection_prompt(text, records), cwd)
+            prompt = reflection_prompt(text, records, max_bytes=MAX_BYTES.get(name))
+            outcome = self.paid.call("reflection", self.argv(), prompt, cwd)
         if outcome is None:
             return text
         match = re.search(r"<new_text>(.*?)</new_text>", outcome.text, re.S)

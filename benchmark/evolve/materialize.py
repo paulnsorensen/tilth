@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from . import rust
-from .candidate import SRC_PATCH, TEXT_COMPONENTS, content_id, read_seed, ref_name
+from .candidate import MAX_BYTES, SRC_PATCH, TEXT_COMPONENTS, content_id, read_seed, ref_name
 from .gitops import GitError, git
 
 ALLOWED_PREFIXES = ("src/", "prompts/")
@@ -83,12 +83,20 @@ def _line_changes(old: str, new: str) -> tuple[set[int], set[int]]:
     return removed, added
 
 
+def _refuse_oversize(candidate: Mapping[str, str]) -> None:
+    """Refuse a text over its byte cap before a worktree or ``just check`` is spent on it."""
+    for name, limit in MAX_BYTES.items():
+        size = len(candidate[name].encode("utf-8"))
+        if size > limit:
+            raise ApplyRejected(f"{name} is {size} bytes; the MCP instructions field holds at most {limit} bytes")
+
+
 class Materializer:
     """``materialize(candidate) -> sha``, memoized by content id.
 
     The first call for a content id takes these steps:
 
-    1. Write the text components into a worktree at the seed.
+    1. Refuse a text over its ``MAX_BYTES`` cap. Then write the text components into a worktree at the seed.
     2. Apply the cumulative ``src_patch``.
     3. Refuse changes outside ``src/**`` and ``prompts/**``, and changes inside ``#[cfg(test)]`` code.
     4. Refuse reach for the harness: a harness name, an ``include*!`` outside ``src/`` and ``prompts/``,
@@ -117,7 +125,11 @@ class Materializer:
         if memo is not None:
             return memo
         try:
-            sha = self.seed_sha if cid == self._seed_id else self._commit(candidate, cid)
+            if cid == self._seed_id:
+                sha = self.seed_sha
+            else:
+                _refuse_oversize(candidate)
+                sha = self._commit(candidate, cid)
         except ApplyRejected as rejected:
             self._memo[cid] = rejected
             raise

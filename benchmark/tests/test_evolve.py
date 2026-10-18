@@ -30,7 +30,7 @@ from evolve.loop import Cascade, EvolveError
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV, ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
-    main, make_world, mcp, quota_stream, result_stream, scripted_engine, seed_candidate, seed_files,
+    main, make_world, mcp, quota_stream, result_stream, scripted_engine, seed_candidate, seed_files, with_last_line,
 )
 from judge import core as judge_core
 from judge import store as judge_store
@@ -488,6 +488,16 @@ def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, te
     assert refs(world) == []
 
 
+@pytest.mark.parametrize("text", ["x" * 2049, "—" * 683], ids=["ascii", "multibyte"])
+def test_rejects_instructions_over_the_mcp_field_cap_before_a_worktree(world, text: str) -> None:
+    evo = build(world)
+
+    with pytest.raises(ApplyRejected, match="prompts/mcp.md is 2049 bytes; .* at most 2048 bytes"):
+        evo.materializer.materialize({**seed_candidate(), "prompts/mcp.md": text})
+    assert refs(world) == []
+    assert not (evo.run_dir / "worktrees").exists() or list((evo.run_dir / "worktrees").iterdir()) == []
+
+
 @pytest.fixture(scope="module")
 def tilth_clone(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
     return copy_tilth(tmp_path_factory.mktemp("tilth"))
@@ -551,7 +561,9 @@ def _byte_lock(text: str) -> tuple[int, str, str]:
 def test_materialize_commits_text_and_patch(tilth_clone, tmp_path: Path) -> None:
     repo, seed = tilth_clone
     base = candidates.read_seed(repo, seed)
-    new_mcp = "evolved first line\nevolved second line\n" + base["prompts/mcp.md"] + "\nEvolved last line."
+    # Replace the real prompt's first and last lines, so the text stays under its 2048-byte cap.
+    body = with_last_line(base["prompts/mcp.md"], "Evolved last line.").split("\n", 1)[1]
+    new_mcp = "evolved first line\nevolved second line\n" + body
     lib = git("show", f"{seed}:src/lib.rs", cwd=repo) + "\n// evolve marker\n"
     candidate = {**base, "prompts/mcp.md": new_mcp, "src_patch": _clone_patch(repo, seed, {"src/lib.rs": lib})}
     materializer = Materializer(repo, seed, "commit", tmp_path / "work")
@@ -577,9 +589,10 @@ def test_text_only_child_of_patched_parent_materializes(tilth_clone, tmp_path: P
     repo, seed = tilth_clone
     base = candidates.read_seed(repo, seed)
     lib = git("show", f"{seed}:src/lib.rs", cwd=repo) + "\n// evolve marker\n"
-    parent = {**base, "prompts/mcp.md": base["prompts/mcp.md"] + "\nParent line.",
+    parent = {**base, "prompts/mcp.md": with_last_line(base["prompts/mcp.md"], "Parent line."),
               "src_patch": _clone_patch(repo, seed, {"src/lib.rs": lib})}
-    text_child = {**parent, "prompts/mcp.md": base["prompts/mcp.md"] + "\nChild line, longer than the parent's."}
+    text_child = {**parent,
+                  "prompts/mcp.md": with_last_line(base["prompts/mcp.md"], "Child line, longer than the parent's.")}
     tool_child = {**parent, "prompts/tools/search.md": base["prompts/tools/search.md"] + "\nOne more hint.\n"}
     materializer = Materializer(repo, seed, "child", tmp_path / "work")
 
@@ -649,6 +662,9 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
     assert info["stage"] == stage
     result = evo.results[candidates.content_id(failing)]
     assert result.stage == stage and not result.scores
+    assert f"candidate {result.cid[:12]}: failed at {stage}" in log_text(world)
+    if stage == "just check":
+        assert "error[E0425]: cannot find value `x` in this scope" in log_text(world)
     non_seed = [call for call in world.calls if call[1] == "tilth_forced" and call[3] != world.seed_sha]
     if stage in {"apply", "just check"}:
         assert non_seed == []
@@ -678,6 +694,8 @@ def test_failed_candidate_build_is_a_cascade_stage(monkeypatch: pytest.MonkeyPat
 
     [failed] = [result for result in evo.results.values() if "BUILDFAIL" in result.candidate["prompts/mcp.md"]]
     assert failed.stage == "build" and "error[E0308]: mismatched types" in failed.tail
+    assert f"candidate {failed.cid[:12]}: failed at build" in log_text(world)
+    assert "error[E0308]: mismatched types" in log_text(world)
     assert "finish: " in log_text(world)
     assert not any("BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo)
                    for _task, mode, _rep, sha in world.calls if mode == "tilth_forced")
@@ -1840,9 +1858,11 @@ def test_reflection_call_isolated(world, monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-fixture-token"
     prompt = call["input"]
     assert "HOME_HOOK_RAN" not in prompt and ".mcp.json" not in prompt and str(home) not in prompt
-    assert prompt == engine.reflection_prompt(SEED_MCP, records)
+    assert prompt == engine.reflection_prompt(SEED_MCP, records, max_bytes=2048)
+    assert "at most 2048 UTF-8 bytes" in prompt
     remainder = prompt.replace(SEED_MCP, "").replace(json.dumps(records, indent=2, sort_keys=True), "")
-    assert remainder == engine.reflection_prompt("", []).replace("[]", "")
+    assert remainder == engine.reflection_prompt("", [], max_bytes=2048).replace("[]", "")
+    assert "UTF-8 bytes" not in engine.reflection_prompt("", [])
 
 
 def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:

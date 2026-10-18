@@ -16,6 +16,8 @@ from .gitops import GitError, git_bytes
 TEXT_COMPONENTS = ("prompts/mcp.md", "prompts/tools/read.md", "prompts/tools/search.md", "prompts/tools/write.md")
 SRC_PATCH = "src_patch"
 COMPONENTS = (*TEXT_COMPONENTS, SRC_PATCH)
+# The MCP instructions field holds at most 2048 UTF-8 bytes; src/mcp/mod.rs tests reject a longer prompts/mcp.md.
+MAX_BYTES = {"prompts/mcp.md": 2048}
 
 
 class SeedError(ValueError):

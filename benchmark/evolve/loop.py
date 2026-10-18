@@ -359,17 +359,24 @@ class Evolution:
             try:
                 result.sha = self.materializer.materialize(candidate)
             except ApplyRejected as rejected:
-                return result.fail("apply", tail(rejected.tail))
+                return self._fail(result, "apply", tail(rejected.tail))
         if result.just_check_ok is None:
             ok, output = self.just_check(self.materializer.worktree(result.sha))
             result.just_check_ok = ok
             self.materializer.release(result.sha)
             if not ok:
-                return result.fail("just check", tail(output))
+                return self._fail(result, "just check", tail(output))
         try:
             return self._tiers(result)
         except run.CandidateBuildFailed as failed:
-            return result.fail("build", tail(str(failed)))
+            return self._fail(result, "build", tail(str(failed)))
+
+    def _fail(self, result: Cascade, stage: str, output: str = "") -> Cascade:
+        """Mark ``result`` failed at ``stage`` and log the stage with its failure tail."""
+        self.log(f"candidate {result.cid[:12]}: failed at {stage}")
+        for line in output.splitlines():
+            self.log(f"  {line}")
+        return result.fail(stage, output)
 
     def _tiers(self, result: Cascade) -> Cascade:
         """The cheap and paid tiers; the first cell of either builds the candidate binary."""
@@ -384,7 +391,7 @@ class Evolution:
                 # Only a failing candidate shows its cheap-tier records to reflection; critiques cost money.
                 records = self._records(result.cheap_rows)
                 result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
-                return result.fail("cheap tier")
+                return self._fail(result, "cheap tier")
         if not result.scores:
             rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)
