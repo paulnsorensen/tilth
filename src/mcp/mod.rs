@@ -81,6 +81,17 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp.md");
 #[cfg(test)]
 const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.";
 
+/// True only in a build made while the evolve loop checks a candidate commit:
+/// its `just check` sets `TILTH_EVOLVE_CANDIDATE=1`. Tests then skip their
+/// phrase pins on prompt prose, so a candidate can reword `prompts/`.
+/// CI never sets the variable, so a winner PR fails until its pins are re-pinned.
+/// The value is read at compile time through an absolute macro path, so code
+/// that a candidate adds cannot set it at run time or shadow the macro.
+#[cfg(test)]
+pub(in crate::mcp) fn phrase_pins_exempt() -> bool {
+    ::std::option_env!("TILTH_EVOLVE_CANDIDATE") == Some("1")
+}
+
 /// The complete MCP `instructions` string served at `initialize`.
 fn build_instructions() -> String {
     SERVER_INSTRUCTIONS.trim_end().to_string()
@@ -2445,6 +2456,9 @@ mod tests {
     /// Guard the cwd-guidance span against markdown drift in the prompt file.
     #[test]
     fn cwd_guidance_spans_present() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
         assert!(
             SERVER_INSTRUCTIONS.contains(CWD_PATHS_SPAN),
             "PATHS cwd span drifted from prompts/mcp.md"
@@ -2464,17 +2478,20 @@ mod tests {
             "instructions must fit the 2KB field: {} bytes",
             s.len()
         );
-        assert!(s.contains(CWD_PATHS_SPAN), "missing PATHS span");
         for tool in ["tilth_search", "tilth_read", "tilth_write"] {
             assert!(s.contains(tool), "missing tool {tool}");
         }
+        assert!(!s.contains("tilth_list"), "retired tool in instructions");
+        assert!(!s.contains("tilth_diff"), "retired tool in instructions");
+        assert!(!s.contains("tilth_grok"), "retired tool in instructions");
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(s.contains(CWD_PATHS_SPAN), "missing PATHS span");
         assert!(
             s.contains("{pattern: \"Some($A)\", language, glob?}"),
             "structural search entry shape must stay advertised"
         );
-        assert!(!s.contains("tilth_list"), "retired tool in instructions");
-        assert!(!s.contains("tilth_diff"), "retired tool in instructions");
-        assert!(!s.contains("tilth_grok"), "retired tool in instructions");
         assert!(s.contains("shell `git diff` or `git log`"));
         assert!(s.contains("directory browsing (ls/find)"));
         assert!(

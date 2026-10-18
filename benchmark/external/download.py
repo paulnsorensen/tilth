@@ -33,7 +33,9 @@ def _verified(dataset: str, payload: bytes) -> bytes:
     expected = data.PARQUET_SHA256.get(dataset)
     actual = hashlib.sha256(payload).hexdigest()
     if actual != expected:
-        raise RuntimeError(f"{dataset} parquet sha256 {actual} does not match the pinned {expected}")
+        repository, path = data.DATASET_FILES[dataset]
+        raise RuntimeError(f"{repository}/{path} at {data.REVISIONS[dataset]} does not match the pinned sha256: "
+                           f"expected {expected}, actual {actual}")
     return payload
 
 
