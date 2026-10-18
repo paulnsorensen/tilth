@@ -19,6 +19,8 @@ from .task import ExternalTask
 
 _PATH_SEPARATORS = re.compile(r"[\s'\"`;|&<>(),=]+")
 _HOME_REFERENCE = re.compile(r"\$\{HOME\}|\$HOME")
+_STACK_INDEX = re.compile(r"[+-]\d+")
+_REDIRECTION = re.compile(r"\d*[<>]")
 _PIP_COMMAND = re.compile(r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+(?:download|install)\b([^;&|\n]*)")
 _UV_ADD = re.compile(r"\buv\s+add\b([^;&|\n]*)")
 _GO_COMMAND = re.compile(r"\bgo\s+(?:get|install|mod\s+download)\b([^;&|\n]*)")
@@ -132,23 +134,37 @@ def _move(segment: str, base: str | None, previous: str | None, stack: list[str 
     A form this scan cannot resolve leaves the base unchanged.
     """
     words = segment.split()
+    for index, word in enumerate(words):
+        if _REDIRECTION.match(word):
+            words = words[:index]
+            break
     if not words or words[0] not in {"cd", "pushd", "popd"}:
         return base, previous
     command = words[0]
-    arguments = [word for word in words[1:] if word == "-" or not word.startswith("-")]
     if command == "popd":
-        return (stack.pop(), base) if stack else (base, previous)
+        if len(words) > 1 or not stack:
+            return base, previous
+        return stack.pop(), base
+    if any(_STACK_INDEX.fullmatch(word) for word in words[1:]):
+        return base, previous
+    arguments = [word for word in words[1:] if word == "-" or not word.startswith("-")]
+    home = os.path.expanduser("~")
     if not arguments:
         if command == "pushd":
-            return base, previous
-        target = os.path.expanduser("~")
+            if not stack:
+                return base, previous
+            swapped = stack[-1]
+            stack[-1] = base
+            return swapped, base
+        target = home
     elif arguments[0] == "-" and command == "cd":
         return (previous, base) if previous else (base, previous)
     else:
-        home = os.path.expanduser("~")
         target = _HOME_REFERENCE.sub(home, arguments[0].strip("'\""))
         if target == "~" or target.startswith("~/"):
             target = home + target[1:]
+        if target.startswith("~") or "$" in target or "`" in target:
+            return base, previous
     if not target.startswith("/"):
         if not (base and base.startswith("/")):
             return base, previous

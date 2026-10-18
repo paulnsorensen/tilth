@@ -215,6 +215,65 @@ def test_cd_with_flag_still_moves_base(tmp_path: Path) -> None:
     assert "benchmark_tree" in [h["reason"] for h in external.contamination.find_hits(path, task, cwd=WORKDIR)]
 
 
+@pytest.mark.parametrize("segment", [
+    'cd "$(git rev-parse --show-toplevel)"',
+    'cd "$VAR"',
+    "cd `pwd`",
+    "cd ~bob",
+    "pushd +1",
+    "cd -2",
+    "popd -n",
+    "popd +1",
+])
+def test_unresolvable_move_leaves_state_unchanged(segment: str) -> None:
+    stack: list[str | None] = ["/s"]
+
+    assert external.contamination._move(segment, "/w/x/cell", "/p", stack) == ("/w/x/cell", "/p")
+    assert stack == ["/s"]
+
+
+def test_unresolvable_cd_keeps_base_for_later_paths() -> None:
+    command = 'cd "$(git rev-parse --show-toplevel)" && cat ../../tilth/benchmark/t.py'
+
+    paths = list(external.contamination._command_paths(command, "/w/x/cell"))
+
+    assert "/w/tilth/benchmark/t.py" in paths
+
+
+def test_cd_dash_without_previous_keeps_base() -> None:
+    assert external.contamination._move("cd -", "/w", None, []) == ("/w", None)
+
+
+def test_popd_on_empty_stack_keeps_base() -> None:
+    assert external.contamination._move("popd", "/w", "/p", []) == ("/w", "/p")
+
+
+def test_bare_cd_goes_home() -> None:
+    assert external.contamination._move("cd", "/w", None, []) == (os.path.expanduser("~"), "/w")
+
+
+def test_bare_pushd_swaps_with_stack_top() -> None:
+    stack: list[str | None] = ["/a"]
+
+    assert external.contamination._move("pushd", "/b", None, stack) == ("/a", "/b")
+    assert stack == ["/b"]
+
+
+def test_bare_pushd_with_empty_stack_keeps_base() -> None:
+    stack: list[str | None] = []
+
+    assert external.contamination._move("pushd", "/b", None, stack) == ("/b", None)
+    assert stack == []
+
+
+@pytest.mark.parametrize("segment", ["popd >/dev/null", "popd 2>/dev/null", "popd > /dev/null"])
+def test_popd_with_only_a_redirection_still_pops(segment: str) -> None:
+    stack: list[str | None] = ["/a"]
+
+    assert external.contamination._move(segment, "/b", None, stack) == ("/a", "/b")
+    assert stack == []
+
+
 def test_relative_path_escaping_cell_cwd_is_flagged(tmp_path: Path) -> None:
     task = TASKS["rg_search_dispatch"]
     escape = os.path.relpath(config.BENCHMARK_DIR, WORKDIR)
