@@ -662,8 +662,12 @@ def test_fetch_refuses_a_parquet_that_does_not_match_its_pin(external_bench, mon
     payload = parquet_bytes(list(rows("featurebench").values()))
 
     monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": "0" * 64})
-    with pytest.raises(RuntimeError, match="does not match the pinned"):
+    with pytest.raises(RuntimeError, match="does not match the pinned") as refused:
         external.download.fetch("featurebench", client=lambda url: payload)
+    message = str(refused.value)
+    assert "LiberCoders/FeatureBench/data/lite-00000-of-00001.parquet" in message
+    assert f"expected {'0' * 64}" in message
+    assert f"actual {hashlib.sha256(payload).hexdigest()}" in message
     assert not list((external_bench.data / "rows").rglob("_complete"))
 
     monkeypatch.setattr(external.data, "PARQUET_SHA256", {"featurebench": hashlib.sha256(payload).hexdigest()})
