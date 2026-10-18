@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Protocol
 
 from .gitops import GitError, git
+from .materialize import PHRASE_PIN_EXEMPT_ENV
 
+# The draft PR body and the run log carry this; the word "merge" stays out of every `gh pr create` argument.
+REPIN_NOTE = (f"Phrase pins were exempt during the search: each candidate's `just check` set {PHRASE_PIN_EXEMPT_ENV}=1, "
+              "so the Rust tests skipped their exact-phrase asserts on prompts/ text. CI does not set it. "
+              "Re-pin those asserts to this PR's prompt text before it lands.")
 ALLOWED_WINNER_PREFIXES = ("src/", "prompts/")
 ALLOWED_WINNER_FILES = ("AGENTS.md",)
 _GITHUB_URL = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?")
