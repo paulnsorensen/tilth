@@ -177,7 +177,11 @@ They never enter result rows or scores.
 ```bash
 python3 benchmark/judge/cli.py label --tasks rg_search_dispatch,gin_edit_render_context --max-usd 2 --cell-estimate-usd 0.05
 python3 benchmark/judge/cli.py calibrate --max-usd 5 --cell-estimate-usd 0.05
+python3 benchmark/judge/cli.py sheet --count 24
 ```
+
+`sheet` makes no model call and needs no auth.
+It writes `labeling-sheet.md` and `calibration-draft.json` to `.cheese/judge` (or `--out DIR`) from the stored clean rollouts, with no judge label shown, so you can fill `calibration.json` by hand.
 
 Both spend flags are required whenever a call is uncached.
 Judge calls share the `--max-usd` ceiling and pass its remaining headroom as `--max-budget-usd`.

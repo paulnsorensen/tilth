@@ -1492,3 +1492,129 @@ def test_judge_missing_oauth_token_is_refused(monkeypatch: pytest.MonkeyPatch, c
     assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) != 0
 
     assert client.prompts == [] and statuses == [] and "CLAUDE_CODE_OAUTH_TOKEN" in capsys.readouterr().err
+
+
+@pytest.fixture
+def sheet_panel(judge_home: Path, calibration_tasks: list[str]) -> list[str]:
+    names = calibration_tasks[:2]
+    members = [{"id": name, "family": "local", "language": "go", "split": split}
+               for name, split in zip(names, ("cheap", "dev"))]
+    (judge_home / "panel.json").write_text(json.dumps({"name": "sheet-test", "split_seed": 1, "members": members}))
+    return names
+
+
+def seed_sheet_store(directory: Path) -> None:
+    layout = [(0, "rg_search_dispatch", "tilth", {}), (1, "rg_search_dispatch", "tilth", {}),
+              (2, "rg_search_dispatch", "baseline", {}), (3, "gin_servehttp_flow", "tilth", {}),
+              (4, "gin_servehttp_flow", "tilth", {"contaminated": True}),
+              (5, "gin_servehttp_flow", "baseline", {"error": "boom"}),
+              (6, "gin_servehttp_flow", "baseline", {"trajectory_path": None})]
+    for index, task, mode, fields in layout:
+        row, _ = rollout(directory, index, task=task, mode=mode, **fields)
+        baselines.store(row, path=judge_config.RESULT_STORE)
+
+
+def run_sheet(tmp_path: Path, *extra: str) -> tuple[int, Path]:
+    out = tmp_path / "sheet-out"
+    return cli.main(["sheet", "--panel", str(tmp_path / "panel.json"), "--out", str(out), *extra]), out
+
+
+def test_sheet_picks_only_eligible_rows_round_robin(judge_home: Path, sheet_panel: list[str],
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("subprocess call"))
+    code, out = run_sheet(judge_home)
+    assert code == 0
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    # Cells sort as (gin, tilth), (rg, baseline), (rg, tilth); keys 4, 5, 6 are ineligible.
+    assert [entry["run_key"] for entry in draft["trajectories"]] == [
+        "run-key-03", "run-key-02", "run-key-00", "run-key-01"]
+
+
+def test_sheet_count_caps_picks(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    code, out = run_sheet(judge_home, "--count", "2")
+    assert code == 0
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert [entry["run_key"] for entry in draft["trajectories"]] == ["run-key-03", "run-key-02"]
+
+
+def test_sheet_draft_shape_is_exact(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert set(draft) == {"tasks", "trajectories"}
+    assert draft["tasks"] == {name: "" for name in sorted(sheet_panel)}
+    assert all(entry == {"run_key": entry["run_key"], "verdict": ""} for entry in draft["trajectories"])
+
+
+def test_sheet_shows_rollout_facts_and_no_judge_label(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    sheet = (out / "labeling-sheet.md").read_text()
+    assert "Calibration task 00: locate the handler." in sheet
+    assert "run_key: `run-key-03`" in sheet and "gin_servehttp_flow / tilth / correct=True" in sheet
+    assert "`Bash` " in sheet and "rg -n dispatch" in sheet
+    assert sheet.count("label: ____") == 2 and sheet.count("verdict: ____") == 4
+    assert "SECRET_GT" not in sheet
+    assert not judge_config.JUDGE_DIR.exists()
+
+
+def test_sheet_makes_no_judge_or_auth_call(judge_home: Path, sheet_panel: list[str],
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(cli, "_judge", lambda *a, **k: pytest.fail("judge built"))
+    monkeypatch.setattr(auth, "preflight_claude_auth", lambda *a, **k: pytest.fail("auth called"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("process spawned"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("subprocess call"))
+    assert run_sheet(judge_home)[0] == 0
+
+
+def test_sheet_does_not_run_admission(judge_home: Path, sheet_panel: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(cli.panels, "_check_admitted", lambda *a, **k: pytest.fail("admission ran"))
+    monkeypatch.setattr(cli.panels.external.preflight, "admit", lambda *a, **k: pytest.fail("admit called"))
+    assert run_sheet(judge_home)[0] == 0
+
+
+def test_sheet_reports_unresolved_panel_task(judge_home: Path, sheet_panel: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    (judge_home / "panel.json").write_text(json.dumps({"name": "sheet-test", "split_seed": 1, "members": [
+        {"id": "no_such_task", "family": "local", "language": "go", "split": "cheap"}]}))
+    code, out = run_sheet(judge_home)
+    assert code == 1 and "no_such_task" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_sheet_skips_missing_trajectory_file_and_unset_contamination_and_unresolved_task(
+        judge_home: Path, sheet_panel: list[str]) -> None:
+    layout = [(0, {}), (1, {"trajectory_path": str(judge_home / "gone.jsonl")}), (2, {"contaminated": None}),
+              (3, {"task": "vanished_task"})]
+    for index, fields in layout:
+        row, _ = rollout(judge_home, index, **fields)
+        baselines.store(row, path=judge_config.RESULT_STORE)
+    row, _ = rollout(judge_home, 4)
+    del row["contaminated"]
+    row["run_key"] = "run-key-04"
+    baselines.store(row, path=judge_config.RESULT_STORE)
+    _, out = run_sheet(judge_home)
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert [entry["run_key"] for entry in draft["trajectories"]] == ["run-key-00"]
+
+
+def test_sheet_refuses_to_overwrite_draft_without_force(judge_home: Path, sheet_panel: list[str],
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    draft = out / "calibration-draft.json"
+    draft.write_text('{"hand": "labels"}')
+    assert run_sheet(judge_home)[0] == 1
+    assert "--force" in capsys.readouterr().err and draft.read_text() == '{"hand": "labels"}'
+    assert run_sheet(judge_home, "--force")[0] == 0
+    assert set(json.loads(draft.read_text())) == {"tasks", "trajectories"}
+
+
+@pytest.mark.parametrize("count", ["0", "-3", "x"])
+def test_sheet_count_must_be_positive_int(judge_home: Path, sheet_panel: list[str], count: str) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        run_sheet(judge_home, "--count", count)
+    assert exit_info.value.code == 2
