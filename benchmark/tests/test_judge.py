@@ -1062,7 +1062,7 @@ def test_judge_argv_is_toolless_and_pinned() -> None:
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--strict-mcp-config" in argv
-    assert argv[argv.index("--model") + 1] == judge_config.JUDGE_MODEL == "claude-sonnet-5"
+    assert argv[argv.index("--model") + 1] == judge_config.JUDGE_MODEL == "opus"
     assert "--bare" not in argv and "--mcp-config" not in argv
     assert TASKS["rg_search_dispatch"].prompt in call["input"]
     assert not any(TASKS["rg_search_dispatch"].prompt in part for part in argv)
@@ -1136,10 +1136,24 @@ def test_press_large_trajectory_goes_whole_on_stdin(judge_home: Path) -> None:
 
 def test_press_full_judge_argv() -> None:
     assert core.ClaudeJudgeClient.argv() == [
-        "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-sonnet-5",
+        "claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "opus",
         "--tools", "", "--strict-mcp-config", "--setting-sources", "",
         "--no-session-persistence", "--disable-slash-commands",
     ]
+
+
+def test_judge_pricing_fallback_resolves_the_opus_alias() -> None:
+    from parse import parse_stream_json
+    # No native cost and no init-event model, so only the configured alias can price the stream.
+    events = [json.loads(line) for line in claude_stream("strong", None).splitlines()]
+    for event in events:
+        event.pop("model", None)
+    stdout = "".join(json.dumps(event) + "\n" for event in events)
+
+    reply = core._reply(stdout, 0, "")
+
+    assert reply.cost_source == "pricing" and reply.error is None
+    assert reply.cost == parse_stream_json(stdout, "claude-opus-5").total_cost_usd > 0
 
 
 def budget_flags(argv: list[str]) -> list[str]:

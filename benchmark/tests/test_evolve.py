@@ -1807,6 +1807,16 @@ def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> N
     assert world.spawned == []
 
 
+def test_reflection_and_proposer_stay_on_sonnet_when_the_judge_is_opus(world) -> None:
+    evo = build(world)
+    argv = evo.reflect.argv()
+
+    assert judge_core.config.JUDGE_MODEL == "opus"
+    assert evo.settings.helper_model == "sonnet"
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert evo.proposer.model == "sonnet"
+
+
 _SECRET_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth", "GH_TOKEN": "gh", "SSH_AUTH_SOCK": "/tmp/agent.sock",
                "AWS_SECRET_ACCESS_KEY": "aws", "ANTHROPIC_BASE_URL": "https://example.invalid",
                "MISE_GITHUB_TOKEN": "mise"}
