@@ -22,9 +22,12 @@ TILTH_MODE = "tilth"
 
 
 MODEL_ALIASES = {
-    "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
+    # Pinned claude short names. The bare `haiku`, `sonnet`, and `opus` are the
+    # configured model strings themselves, so they map to no other row.
+    "haiku45": "claude-haiku-4-5-20251001",
+    "sonnet46": "claude-sonnet-4-6",
+    "sonnet5": "claude-sonnet-5",
+    "opus5": "claude-opus-5",
     "gpt5": "gpt-5-codex",
     "gpt-5.1-codex": "gpt-5-codex",
     "gpt-5-codex": "gpt-5-codex",

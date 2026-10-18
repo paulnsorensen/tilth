@@ -34,9 +34,10 @@ def _token_value(run: dict, *keys: str) -> float:
 
 
 def _pricing_rates(run: dict) -> dict[str, Any]:
+    """Rates for the stream-reported model ID, else the configured model, else its short name."""
     models = PRICING_DATA["models"]
     aliases = PRICING_DATA.get("aliases", {})
-    candidate = run.get("model") or run.get("model_alias")
+    candidate = run.get("resolved_model") or run.get("model") or run.get("model_alias")
     model_id = aliases.get(candidate, candidate)
     if model_id not in models:
         raise ValueError(f"no pricing entry for model {candidate!r}")

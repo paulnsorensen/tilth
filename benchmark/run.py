@@ -1421,6 +1421,7 @@ def _run_single_in_repo(
         "mode": mode_name,
         "model": model_id,
         "model_alias": model_name,
+        "resolved_model": run_result.resolved_model,
         **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
         **({"max_budget_usd": max_budget_usd} if runner == "claude" else {}),
         **({"strict_file_tools": True, "strict_denied_bash_calls": strict_denied_bash_calls} if strict_file_tools else {}),
