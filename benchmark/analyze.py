@@ -496,7 +496,7 @@ def _failure_type(result: dict) -> tuple[str, str] | None:
 
     reason = str(result.get("correctness_reason") or "unspecified")
     if reason.startswith(TIMEOUT_REASON):
-        return "grader_timeout", reason
+        return "grader_timeout", reason.removeprefix(f"{TIMEOUT_REASON}: ")
     if reason.startswith("Missing: "):
         return "missing_required_literal", reason.removeprefix("Missing: ")
     if reason.startswith("Contains forbidden: "):

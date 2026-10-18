@@ -289,7 +289,10 @@ def test_failure_type_covers_runner_and_grader_reasons():
 
 def test_failure_type_labels_grader_timeout_apart_from_grader_failure():
     reason = f"{TIMEOUT_REASON}: go build warm-up timed out"
-    assert analyze._failure_type({"correctness_reason": reason}) == ("grader_timeout", reason)
+    assert analyze._failure_type({"correctness_reason": reason}) == (
+        "grader_timeout",
+        "go build warm-up timed out",
+    )
     assert analyze._failure_type({"correctness_reason": "Something else"}) == (
         "grader_failure",
         "Something else",
