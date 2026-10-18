@@ -21,14 +21,17 @@ BASELINE_MODE = "baseline"
 TILTH_MODE = "tilth"
 
 
-MODEL_ALIASES = {
-    # Legacy rows stored the bare short name as `model`; these keep them paired with
-    # their pinned-ID rows. A results file pairs only its own rows, so a bare-alias
-    # row keys under the same label in both arms. Its `resolved_model` holds the real ID.
+# Legacy rows have no `model_alias` field and stored the short name as `model`.
+# These are the IDs those short names ran at the time.
+LEGACY_MODEL_IDS = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-6",
-    # Pinned claude short names, for the --model filter.
+}
+
+MODEL_ALIASES = {
+    # Pinned claude short names, for the --model filter. Bare aliases (`sonnet`)
+    # are not here: the model they run changes with the claude CLI.
     "haiku45": "claude-haiku-4-5-20251001",
     "sonnet46": "claude-sonnet-4-6",
     "sonnet5": "claude-sonnet-5",
@@ -43,9 +46,34 @@ MODEL_ALIASES = {
 }
 
 
-def _model_key(run: dict) -> object:
+def model_label(run: dict) -> object:
+    """The model a row ran: its `resolved_model`, else its configured model.
+
+    A bare-alias row without `resolved_model` (a failed cell) keeps the alias.
+    """
+    resolved = run.get("resolved_model")
+    if resolved:
+        return resolved
     model = run.get("model") or run.get("model_alias")
+    if "model_alias" not in run and model in LEGACY_MODEL_IDS:
+        return LEGACY_MODEL_IDS[model]
     return MODEL_ALIASES.get(model, model)
+
+
+def _fill_resolved_models(runs: list[dict]) -> None:
+    """Give an alias row without `resolved_model` the one model its alias resolved to in this file.
+
+    A failed cell records no `resolved_model`. Without this fill it keys apart from
+    its other arm and drops out of the pairing instead of pairing as incorrect.
+    """
+    resolved_by_alias: dict[str, set[str]] = defaultdict(set)
+    for run in runs:
+        if run.get("resolved_model") and run.get("model_alias"):
+            resolved_by_alias[run["model_alias"]].add(run["resolved_model"])
+    for run in runs:
+        resolved = resolved_by_alias.get(run.get("model_alias"), set())
+        if not run.get("resolved_model") and run.get("model") == run.get("model_alias") and len(resolved) == 1:
+            run["resolved_model"] = next(iter(resolved))
 
 
 def is_contaminated_panel_row(result: dict) -> bool:
@@ -68,6 +96,7 @@ def load_runs(path: Path) -> list[dict]:
                 if is_contaminated_panel_row(run):
                     run["correct"] = False
                 runs.append(run)
+    _fill_resolved_models(runs)
     return runs
 
 
@@ -94,7 +123,7 @@ def pair_modes(
     selected = {baseline_mode, experiment_mode}
     for run in runs:
         task = run.get("task")
-        model = _model_key(run)
+        model = model_label(run)
         mode = run.get("mode")
         rep = run.get("repetition")
         if None in (task, model, mode, rep) or mode not in selected:
@@ -141,7 +170,7 @@ def _matched_runs_by_task(
     for run in runs:
         mode = run.get("mode")
         task = run.get("task")
-        model = _model_key(run)
+        model = model_label(run)
         repetition = run.get("repetition")
         if (
             mode not in {baseline_mode, experiment_mode}
@@ -274,10 +303,10 @@ def paired_report(
     )
     print("=" * 72)
 
-    models = sorted({_model_key(run) for run in runs if _model_key(run) is not None})
+    models = sorted({model_label(run) for run in runs if model_label(run) is not None})
     found = False
     for model in models:
-        model_runs = [run for run in runs if _model_key(run) == model]
+        model_runs = [run for run in runs if model_label(run) == model]
         delta, lo, hi, n_tasks = paired_accuracy_delta(
             model_runs,
             experiment_mode,
@@ -325,8 +354,12 @@ def main() -> None:
         parser.error(f"file not found: {args.results_file}")
     runs = load_runs(args.results_file)
     if args.model:
+        # A short name matches the rows run under it; a pinned name or ID matches by model.
         target_model = MODEL_ALIASES.get(args.model, args.model)
-        runs = [run for run in runs if _model_key(run) == target_model]
+        runs = [
+            run for run in runs
+            if args.model in (run.get("model_alias"), run.get("model")) or model_label(run) == target_model
+        ]
     paired_report(runs, args.experiment_mode, args.baseline_mode)
 
 

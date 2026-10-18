@@ -65,6 +65,8 @@ A completed Claude row also records `resolved_model`, the model ID that the stre
 The Claude model names `haiku`, `sonnet`, and `opus` are bare claude CLI aliases (`--model sonnet`). The installed CLI version selects the model, and the run key includes that version.
 The names `haiku45`, `sonnet46`, `sonnet5`, and `opus5` select pinned model IDs. The run key hashes the model ID, so a pinned name reuses the stored rows of its ID.
 Rows stored under a pinned ID do not answer a bare alias. A bare alias buys those cells again.
+`--models all` skips the pinned names (`PINNED_MODELS` in `config.py`), so it does not run one model twice. Name a pinned model to run it.
+`paired.py` and `analyze.py` label a row with its `resolved_model`. A bare-alias row without one takes the one ID that its alias resolved to in the same file, else it keeps the alias.
 The Codex names are `gpt5`, `luna56`, and `o3`. The OpenCode name is `gpt5mini`.
 When a stream reports no native cost, `pricing.yaml` prices the model ID that the stream reports. The `aliases` table is the fallback for a stream that reports no ID.
 

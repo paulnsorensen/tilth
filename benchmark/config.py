@@ -59,6 +59,9 @@ RUNNERS = {
     "gpt5mini": "opencode",
 }
 
+# Pinned claude names. `--models all` skips them: each repeats a model a bare alias
+# can resolve to, so it runs only when named.
+PINNED_MODELS = frozenset({"haiku45", "sonnet46", "sonnet5", "opus5"})
 
 
 @dataclass

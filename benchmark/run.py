@@ -50,6 +50,7 @@ from config import (
     DEFAULT_REPS,
     FIXTURES_DIR,
     MODELS,
+    PINNED_MODELS,
     MODES,
     OPENCODE_CONFIG_HOME,
     OPENCODE_CONFIGS,
@@ -1488,15 +1489,17 @@ def _run_single_in_repo(
 
 
 def select_models(value: str | None, runner: str | None) -> list[str]:
-    """Keep a selected runner from scheduling another provider's models."""
-    if runner is None:
-        return parse_comma_list(value or "sonnet", MODELS, "models")
-    aliases = {name: model for name, model in MODELS.items() if RUNNERS[name] == runner}
+    """Keep a selected runner from scheduling another provider's models.
+
+    ``all`` skips ``PINNED_MODELS``; a pinned name runs only when named.
+    """
     requested = value or ("gpt5" if runner == "codex" else "sonnet")
-    if requested != "all":
-        for name in requested.split(","):
-            if name.strip() in MODELS and name.strip() not in aliases:
-                raise ValueError(f"{name.strip()} is not a {runner} model")
+    aliases = {name: model for name, model in MODELS.items() if runner is None or RUNNERS[name] == runner}
+    if requested.lower() == "all":
+        return [name for name in aliases if name not in PINNED_MODELS]
+    for name in requested.split(","):
+        if name.strip() in MODELS and name.strip() not in aliases:
+            raise ValueError(f"{name.strip()} is not a {runner} model")
     return parse_comma_list(requested, aliases, "models")
 
 

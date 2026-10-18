@@ -418,6 +418,13 @@ def test_codex_selection_rejects_non_codex_models_and_forced_mode():
         run.select_modes("tilth_forced", "codex")
 
 
+def test_all_claude_models_skip_pinned_names():
+    assert run.select_models("all", "claude") == ["haiku", "sonnet", "opus"]
+    assert run.select_models("sonnet46,opus5", "claude") == ["sonnet46", "opus5"]
+    everything = run.select_models("all", None)
+    assert everything == ["haiku", "sonnet", "opus", "gpt5", "luna56", "o3", "gpt5mini"]
+
+
 @pytest.mark.parametrize("returncode", [0, 1])
 def test_codex_stream_is_saved_even_on_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int,
