@@ -188,6 +188,33 @@ def test_bash_cd_sets_base_for_later_relative_paths(tmp_path: Path) -> None:
     assert "benchmark_tree" in reasons(path, task)
 
 
+@pytest.mark.parametrize("command", [
+    f"cd {config.REPO_ROOT} && cd - && cat benchmark/tasks/ripgrep_tasks.py",
+    f"pushd {config.REPO_ROOT} && popd && cat benchmark/tasks/ripgrep_tasks.py",
+])
+def test_cd_back_to_workspace_stays_clean(tmp_path: Path, command: str) -> None:
+    path = sidecar(tmp_path, ("Bash", {"command": command}))
+
+    assert external.contamination.find_hits(path, TASKS["rg_search_dispatch"], cwd=WORKDIR) == []
+
+
+def test_relative_cd_moves_base_for_later_paths(tmp_path: Path) -> None:
+    task = TASKS["rg_search_dispatch"]
+    cell_cwd = config.BENCHMARK_DIR.parent / "cell" / "a" / "b"
+    path = sidecar(tmp_path, ("Bash", {"command": "cd ../../.. && cat benchmark/tasks/ripgrep_tasks.py"}))
+
+    hits = external.contamination.find_hits(path, task, cwd=cell_cwd)
+
+    assert [hit["reason"] for hit in hits] == ["benchmark_tree"]
+
+
+def test_cd_with_flag_still_moves_base(tmp_path: Path) -> None:
+    task = TASKS["rg_search_dispatch"]
+    path = sidecar(tmp_path, ("Bash", {"command": f"cd -P {config.REPO_ROOT} && cat benchmark/tasks/ripgrep_tasks.py"}))
+
+    assert "benchmark_tree" in [h["reason"] for h in external.contamination.find_hits(path, task, cwd=WORKDIR)]
+
+
 def test_relative_path_escaping_cell_cwd_is_flagged(tmp_path: Path) -> None:
     task = TASKS["rg_search_dispatch"]
     escape = os.path.relpath(config.BENCHMARK_DIR, WORKDIR)

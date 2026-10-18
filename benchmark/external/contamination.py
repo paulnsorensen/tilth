@@ -125,25 +125,46 @@ def _paths(text: str, base: str | None = None) -> Iterator[str]:
             yield os.path.normpath(os.path.join(base, token))
 
 
-def _cd_target(segment: str, base: str | None) -> str | None:
-    """The directory a ``cd`` or ``pushd`` segment moves to, or None for any other segment."""
+def _move(segment: str, base: str | None, previous: str | None, stack: list[str | None]) -> tuple[str | None, str | None]:
+    """The ``(base, previous)`` pair after a ``cd``, ``pushd``, or ``popd`` segment; other segments change nothing.
+
+    ``pushd`` pushes the old base on ``stack`` and ``popd`` pops it. ``cd -`` returns to ``previous``.
+    A form this scan cannot resolve leaves the base unchanged.
+    """
     words = segment.split()
-    if len(words) < 2 or words[0] not in {"cd", "pushd"}:
-        return None
-    home = os.path.expanduser("~")
-    target = _HOME_REFERENCE.sub(home, words[1].strip("'\""))
-    if target == "~" or target.startswith("~/"):
-        target = home + target[1:]
-    if target.startswith("/"):
-        return os.path.normpath(target)
-    return None
+    if not words or words[0] not in {"cd", "pushd", "popd"}:
+        return base, previous
+    command = words[0]
+    arguments = [word for word in words[1:] if word == "-" or not word.startswith("-")]
+    if command == "popd":
+        return (stack.pop(), base) if stack else (base, previous)
+    if not arguments:
+        if command == "pushd":
+            return base, previous
+        target = os.path.expanduser("~")
+    elif arguments[0] == "-" and command == "cd":
+        return (previous, base) if previous else (base, previous)
+    else:
+        home = os.path.expanduser("~")
+        target = _HOME_REFERENCE.sub(home, arguments[0].strip("'\""))
+        if target == "~" or target.startswith("~/"):
+            target = home + target[1:]
+    if not target.startswith("/"):
+        if not (base and base.startswith("/")):
+            return base, previous
+        target = os.path.join(base, target)
+    if command == "pushd":
+        stack.append(base)
+    return os.path.normpath(target), base
 
 
 def _command_paths(command: str, base: str | None) -> Iterator[str]:
-    """Paths in a shell command; an absolute ``cd`` or ``pushd`` sets the base for later segments."""
+    """Paths in a shell command; ``cd``, ``pushd``, and ``popd`` move the base for later segments."""
+    previous: str | None = None
+    stack: list[str | None] = []
     for segment in _COMMAND_SEGMENTS.split(command):
         yield from _paths(segment, base)
-        base = _cd_target(segment.strip(), base) or base
+        base, previous = _move(segment.strip(), base, previous, stack)
 
 
 def _input_paths(tool_input: object, cell_cwd: str | None) -> Iterator[str]:
