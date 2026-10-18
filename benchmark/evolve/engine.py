@@ -26,13 +26,15 @@ REFLECTION_HEADER = (
     "tasks like these. Keep it concise. Reply with the complete new file text between <new_text> and "
     "</new_text>, and nothing else."
 )
-SIZE_NOTE = ("The new file must be at most {max_bytes} UTF-8 bytes, the size of the MCP instructions field; "
-             "a longer file fails the tilth test suite and is never scored.")
+SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
+             "the MCP instructions field, so remove at least as much text as you add; a longer file is refused "
+             "and never scored.")
 
 
 def reflection_prompt(text: str, records: list[dict], *, max_bytes: int | None = None) -> str:
     """The reflection prompt: a fixed header (with the byte cap when the file has one), the text, and the records."""
-    header = REFLECTION_HEADER if max_bytes is None else f"{REFLECTION_HEADER} {SIZE_NOTE.format(max_bytes=max_bytes)}"
+    note = None if max_bytes is None else SIZE_NOTE.format(size=len(text.encode("utf-8")), max_bytes=max_bytes)
+    header = REFLECTION_HEADER if note is None else f"{REFLECTION_HEADER} {note}"
     rendered = json.dumps(records, indent=2, sort_keys=True)
     return f"{header}\n\n<current>\n{text}\n</current>\n\n<records>\n{rendered}\n</records>\n"
 

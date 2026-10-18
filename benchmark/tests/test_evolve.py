@@ -1859,9 +1859,11 @@ def test_reflection_call_isolated(world, monkeypatch: pytest.MonkeyPatch, tmp_pa
     prompt = call["input"]
     assert "HOME_HOOK_RAN" not in prompt and ".mcp.json" not in prompt and str(home) not in prompt
     assert prompt == engine.reflection_prompt(SEED_MCP, records, max_bytes=2048)
-    assert "at most 2048 UTF-8 bytes" in prompt
+    size = len(SEED_MCP.encode())
+    assert "at most 2048 UTF-8 bytes" in prompt and f"The current file is {size} bytes" in prompt
     remainder = prompt.replace(SEED_MCP, "").replace(json.dumps(records, indent=2, sort_keys=True), "")
-    assert remainder == engine.reflection_prompt("", [], max_bytes=2048).replace("[]", "")
+    expected = engine.reflection_prompt("", [], max_bytes=2048).replace("[]", "")
+    assert remainder == expected.replace("The current file is 0 bytes", f"The current file is {size} bytes")
     assert "UTF-8 bytes" not in engine.reflection_prompt("", [])
 
 
