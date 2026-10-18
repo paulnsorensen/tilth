@@ -5,8 +5,9 @@ from pathlib import Path
 from baselines import STORE_FILENAME
 from config import RESULTS_DIR
 
-# Full model ID of the current-generation sonnet (benchmark/config.py "sonnet5").
-JUDGE_MODEL = "claude-sonnet-5"
+# The claude CLI alias "opus", passed as --model opus. The alias follows the newest opus release.
+# Pricing resolves it through the pricing.yaml "opus" alias row.
+JUDGE_MODEL = "opus"
 # Unweighted Cohen's kappa each dimension must reach for the judge to count as calibrated.
 KAPPA_THRESHOLD = 0.6
 MIN_CALIBRATION_TRAJECTORIES = 20

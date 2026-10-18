@@ -114,7 +114,7 @@ The `gepa-v1` panel (`benchmark/panels/gepa-v1.json`) has a cheap tier of the th
 
 ## Judge calibration gate
 
-The judge is pinned to `claude-sonnet-5` with labels `strong`, `weak`, `none` and verdicts `apt`, `missed`, `misapplied` (`benchmark/judge/config.py:9-15`).
+The judge uses the claude CLI alias `opus` with labels `strong`, `weak`, `none` and verdicts `apt`, `missed`, `misapplied` (`benchmark/judge/config.py:8-16`). The alias moves when a new opus ships; cache keys and calibration records store only `opus`. Evolve reflection and the proposer stay on `claude-sonnet-5` (`Settings.helper_model`, `benchmark/evolve/loop.py:71`).
 It is calibrated only when unweighted Cohen's kappa reaches 0.6 on label and verdict dimensions. It also needs at least 20 calibration trajectories (`benchmark/judge/core.py:281-289,420-424`).
 A missing or invalid `benchmark/judge/calibration.json` raises `CalibrationInvalid`. Evolve then continues uncalibrated with labels and critiques withheld. The committed file is an empty placeholder.
 The label cache key is `sha256(subject, model, prompt_hash)`, where the subject is the task digest for labels and the run key for critiques (`benchmark/judge/store.py:77-86`). `judge_stamp` also covers the threshold and minimum trajectories (`benchmark/judge/store.py:61-69`).

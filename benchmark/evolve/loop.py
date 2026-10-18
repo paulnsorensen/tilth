@@ -18,6 +18,7 @@ from statistics import mean
 
 import auth
 import baselines
+import config
 import external.data
 import paired
 import panels
@@ -66,7 +67,8 @@ class Settings:
     cell_budget_usd: float
     refreeze_baselines: bool
     panel_path: Path
-    helper_model: str = judge.config.JUDGE_MODEL
+    # Reflection and the proposer stay on the pinned sonnet; the judge model does not move them.
+    helper_model: str = config.MODELS["sonnet5"]
 
 
 @dataclass(eq=False)
