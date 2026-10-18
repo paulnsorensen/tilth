@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from .base import GroundTruth, Task
@@ -19,6 +20,8 @@ ROOT_TEST_PATTERN = "^(TestContext|TestMiddleware|TestHeldOut)"
 # A cold Go build on a loaded host is slow; a timeout is inconclusive, not a test failure.
 GRADE_TIMEOUT_S = 900
 WARM_TIMEOUT_S = 900
+# One deadline bounds all grading in one call, so a slow host cannot hold a cell for hours.
+GRADE_DEADLINE_S = 3600
 TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 
 
@@ -35,7 +38,15 @@ def _run(command: list[str], cwd: Path, timeout: int = GRADE_TIMEOUT_S) -> subpr
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
-def _grade_variants(directory: Path, label: str) -> str | None:
+def _bounded(command: list[str], cwd: Path, per_command: int, deadline: float) -> subprocess.CompletedProcess[str]:
+    """``_run`` with the smaller of ``per_command`` and the time left before ``deadline``."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(command, 0)
+    return _run(command, cwd, min(per_command, remaining))
+
+
+def _grade_variants(directory: Path, label: str, deadline: float) -> str | None:
     """Run the graded commands in both build variants; return a failure reason or None.
 
     A timeout says nothing about the code under test, so its reason starts with
@@ -44,14 +55,14 @@ def _grade_variants(directory: Path, label: str) -> str | None:
     for tags in ([], ["-tags=nomsgpack"]):
         warm = ["go", "test", *tags, "-run", "^$", "./..."]
         try:
-            _run(warm, directory, WARM_TIMEOUT_S)
+            _bounded(warm, directory, WARM_TIMEOUT_S, deadline)
         except subprocess.TimeoutExpired:
-            return f"{TIMEOUT_REASON}: {label} build warm-up timed out: {' '.join(warm)}"
+            return f"{TIMEOUT_REASON}: {label} build warm-up timed out or hit the grading deadline: {' '.join(warm)}"
         for command in _grade_commands(tags):
             try:
-                result = _run(command, directory)
+                result = _bounded(command, directory, GRADE_TIMEOUT_S, deadline)
             except subprocess.TimeoutExpired:
-                return f"{TIMEOUT_REASON}: {label} tests timed out: {' '.join(command)}"
+                return f"{TIMEOUT_REASON}: {label} tests timed out or hit the grading deadline: {' '.join(command)}"
             if result.returncode:
                 detail = (result.stderr + result.stdout)[-1200:]
                 return f"{label} tests failed: {' '.join(command)}\n{detail}"
@@ -167,16 +178,17 @@ class GinRenderContextTask(Task):
                 source_changes.add(relative)
         if not source_changes:
             return False, "No renderer or dispatch changes"
+        deadline = time.monotonic() + GRADE_DEADLINE_S
         with tempfile.TemporaryDirectory(prefix="gin-render-grade-") as temp:
             target = Path(temp)
             shutil.copytree(FIXTURE, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
             for relative in source_changes:
                 shutil.copy2(candidate / relative, target / relative)
             _restore_tests(target)
-            failure = _grade_variants(target, "Trusted")
+            failure = _grade_variants(target, "Trusted", deadline)
             if failure:
                 return False, failure
-        failure = _grade_variants(candidate, "Candidate")
+        failure = _grade_variants(candidate, "Candidate", deadline)
         if failure:
             return False, failure
         return True, "Trusted and candidate tests pass in both build variants"
