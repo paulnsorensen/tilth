@@ -192,6 +192,48 @@ def test_task_timeout_reaches_runner(bench, monkeypatch: pytest.MonkeyPatch, tmp
     assert timeouts == [expected]
 
 
+def _agent_env(monkeypatch: pytest.MonkeyPatch, task_name: str, workdir: Path) -> dict[str, str]:
+    """The environment one cell hands its agent CLI; the cell stops there."""
+    real_run = subprocess.run
+    seen: list[dict[str, str]] = []
+
+    def agent_run(cmd, **kwargs):
+        if cmd[0] != "claude":
+            return real_run(cmd, **kwargs)
+        seen.append(kwargs["env"])
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(run.subprocess, "run", agent_run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        run._run_single_in_repo(task_name, "plain", "sonnet5", 0, workdir, stream_log_path=None)
+    assert len(seen) == 1
+    return seen[0]
+
+
+@pytest.mark.skipif(shutil.which("cc") is None, reason="needs a C compiler")
+def test_rust_agent_env_compiles_k_and_r_prototypes(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
+                                                    tmp_path: Path) -> None:
+    """GCC 15 refuses this C23-invalid call; an agent's own cargo build in a Rust cell must still compile it."""
+    external_bench.seed(SWE_RS)
+    monkeypatch.setitem(run.TASKS, SWE_RS, load(SWE_RS))
+    env = _agent_env(monkeypatch, SWE_RS, tmp_path)
+    source = "int g();\nint f(void) { return g(1); }\n"
+
+    result = subprocess.run(["bash", "-c", "cc $CFLAGS -x c -c -o /dev/null -"],
+                            input=source, env=env, capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_non_rust_agent_env_keeps_compiler_default(bench, external_bench, monkeypatch: pytest.MonkeyPatch,
+                                                   tmp_path: Path) -> None:
+    external_bench.seed(SWE_PY)
+    monkeypatch.setitem(run.TASKS, SWE_PY, load(SWE_PY))
+    monkeypatch.setenv("CFLAGS", "-std=c89")
+
+    assert "CFLAGS" not in _agent_env(monkeypatch, SWE_PY, tmp_path)
+
+
 def test_timeout_message_names_task_timeout(bench, monkeypatch: pytest.MonkeyPatch,
                                             capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setitem(run.TASKS, "timed_task", SlowTask())
