@@ -64,6 +64,8 @@ class RunResult:
     plugins: list[dict] = field(default_factory=list)
     plugin_errors: list = field(default_factory=list)
     model_usage: dict[str, dict] = field(default_factory=dict)
+    # The model ID the claude stream reports (init event, else the first assistant message).
+    resolved_model: str | None = None
     # "native" when the runner reported the cost, "pricing" when pricing.yaml computed it.
     cost_source: Literal["native", "pricing"] = "native"
 
@@ -158,7 +160,8 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
     """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose.
 
     ``model`` is the cell's configured model, used to price a stream that reports
-    neither a native cost nor an init-event model.
+    neither a native cost nor a model ID. A reported ID wins over ``model``, so a
+    bare alias such as ``sonnet`` prices as the model the CLI resolved it to.
     """
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
     events = [json.loads(line) for line in lines]
@@ -174,6 +177,7 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
     plugins: list[dict] = []
     plugin_errors: list = []
     stream_model: str | None = None
+    message_model: str | None = None
 
     for event in events:
         event_type = event.get("type")
@@ -190,6 +194,9 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
 
         elif event_type == "assistant":
             message = event.get("message", {})
+            reported = message.get("model")
+            if message_model is None and isinstance(reported, str) and reported and reported != "<synthetic>":
+                message_model = reported
             usage = message.get("usage", {})
             message_id = message.get("id")
             turn = (
@@ -242,13 +249,14 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
             final_summary = event
 
     native_cost = _native_cost(final_summary)
+    resolved_model = stream_model or message_model
     return RunResult(
         session_id=session_id,
         turns=turns,
         num_turns=final_summary.get("num_turns", len(turns)),
         total_cost_usd=(
             native_cost if native_cost is not None
-            else _priced_stream_cost(turns, stream_model or model)
+            else _priced_stream_cost(turns, resolved_model or model)
         ),
         cost_source="native" if native_cost is not None else "pricing",
         duration_ms=final_summary.get("duration_ms", 0),
@@ -270,6 +278,7 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
         plugins=plugins,
         plugin_errors=plugin_errors,
         model_usage=_trim_model_usage(final_summary.get("modelUsage")),
+        resolved_model=resolved_model,
     )
 
 

@@ -664,3 +664,37 @@ def test_missing_native_cost_and_init_model_prices_with_the_configured_model():
 
     assert result.cost_source == "pricing"
     assert result.total_cost_usd > 0.0
+
+
+def _model_event(text: str, model: str) -> dict:
+    event = _assistant_event(text)
+    event["message"]["model"] = model
+    return event
+
+
+def test_bare_alias_prices_as_the_assistant_reported_model():
+    """No native cost, no init model: the assistant message ID wins over the configured alias."""
+    events = [_model_event("ok", "claude-haiku-4-5-20251001"), {"type": "result", "num_turns": 1}]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events), model="sonnet")
+
+    assert result.resolved_model == "claude-haiku-4-5-20251001"
+    # 10 input and 10 output tokens at haiku rates (1.0 and 5.0 per million), not sonnet rates.
+    assert result.total_cost_usd == pytest.approx(10 * 1.0 / 1e6 + 10 * 5.0 / 1e6)
+
+
+def test_init_model_wins_and_synthetic_messages_are_skipped():
+    events = [_model_event("error", "<synthetic>"), _model_event("ok", "claude-opus-5"),
+              {"type": "result", "num_turns": 1}]
+    raw = "\n".join(json.dumps(e) for e in events)
+
+    assert parse_stream_json(raw, model="opus").resolved_model == "claude-opus-5"
+    init = {"type": "system", "subtype": "init", "model": "claude-sonnet-5"}
+    with_init = "\n".join(json.dumps(e) for e in [init, *events])
+    assert parse_stream_json(with_init, model="sonnet").resolved_model == "claude-sonnet-5"
+
+
+def test_stream_without_a_model_id_has_no_resolved_model():
+    events = [_assistant_event("ok"), {"type": "result", "num_turns": 1, "total_cost_usd": 0.5}]
+
+    assert parse_stream_json("\n".join(json.dumps(e) for e in events), model="sonnet").resolved_model is None

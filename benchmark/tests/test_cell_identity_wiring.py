@@ -30,6 +30,18 @@ def wiring_task(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(run.TASKS, "wiring_task", StoreTask())
 
 
+# --- model name: the key hashes the configured model string, not the short name ---
+
+
+@pytest.mark.parametrize("mode", ["baseline", "tilth"])
+def test_pinned_name_keys_like_the_legacy_id(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """`sonnet46` keys exactly as the old `sonnet` -> claude-sonnet-4-6 cells, so it reuses their rows."""
+    monkeypatch.setitem(run.MODELS, "legacy_sonnet", "claude-sonnet-4-6")
+    monkeypatch.setitem(run.RUNNERS, "legacy_sonnet", "claude")
+
+    assert _key(mode=mode, model="sonnet46") == _key(mode=mode, model="legacy_sonnet")
+    assert _key(mode=mode, model="sonnet") != _key(mode=mode, model="sonnet46")
+
 # --- harness digest: the runner command template (finding 7) ---
 
 

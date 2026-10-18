@@ -174,6 +174,27 @@ def test_actual_model_does_not_fall_back_to_alias_pricing():
         })
 
 
+def test_resolved_model_wins_over_the_configured_alias():
+    """A row run on the bare `sonnet` alias prices as the model ID its stream reported."""
+    costs = pricing.compute_cost_breakdown({
+        "model": "sonnet",
+        "model_alias": "sonnet",
+        "resolved_model": "claude-haiku-4-5-20251001",
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+    })
+
+    assert costs["input_cost"] == 1.0
+    assert costs["output_cost"] == 5.0
+
+
+def test_pinned_short_names_price_as_their_ids():
+    for name, model_id in (("sonnet46", "claude-sonnet-4-6"), ("opus5", "claude-opus-5"),
+                           ("haiku45", "claude-haiku-4-5-20251001")):
+        tokens = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+        assert (pricing.compute_cost_breakdown({"model": name, **tokens})
+                == pricing.compute_cost_breakdown({"model": model_id, **tokens})), name
+
 def test_stale_pricing_warns_only_after_thirty_days():
     assert pricing.pricing_staleness_warning("2026-06-01", today=date(2026, 8, 4))
     assert not pricing.pricing_staleness_warning("2026-07-05", today=date(2026, 8, 4))

@@ -22,6 +22,7 @@ from paired import (
     is_contaminated_panel_row,
     load_runs,
     measured_cost,
+    model_label,
     pair_modes,
     paired_accuracy_delta,
     paired_cpc_delta as paired_cpc_delta_impl,
@@ -801,7 +802,7 @@ def generate_report(results: list[dict]) -> str:
         return "\n".join(lines) + "\n"
 
     # Extract metadata
-    models = sorted(set(r.get("model") or r.get("model_alias") or "unknown" for r in valid_results))
+    models = sorted(set(model_label(r) or "unknown" for r in valid_results))
     tasks = sorted(set(r.get("task", "unknown") for r in valid_results))
     modes = ordered_modes(set(r.get("mode", "unknown") for r in valid_results))
     repos = sorted(set(r.get("repo", "synthetic") for r in valid_results))

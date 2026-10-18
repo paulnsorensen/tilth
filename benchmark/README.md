@@ -60,6 +60,15 @@ The output path appears in the run summary under `benchmark/results/`. Raw Codex
 Every row carries a `run_key` that hashes the model, agent CLI version, effort, timeout, arm, repetition, task, a harness digest (system prompt, tool allowlist, strict-file-tools, bare, per-cell `--max-budget-usd`, MCP config shape, the runner command template with workspace, binary, and prompt paths normalized, and in strict mode the Bash guard source), a task digest (prompt, ground truth, test command, mutations, fixture files, repo commit), an environment fingerprint (the versions of the task repo language's toolchains, with `uv` for Python, plus the repo's lockfiles, or `package.json` and `node_modules/.package-lock.json` when it has none), and, for tilth arms, the candidate `git_sha` and `binary_sha256`.
 Rows also record `harness_digest`, `task_digest`, `env_fingerprint`, `cli_version`, `timeout_s`, `cost_source`, `charged_usd`, `reused`, and `trajectory_path`; a Woz Code cell also records `plugin_sha256`, a hash of the plugin tree that joins the run key.
 For Claude and Codex cells, `trajectory_path` names a sidecar beside the raw stream with every tool call's full input and output; OpenCode cells record `null`.
+A completed Claude row also records `resolved_model`, the model ID that the stream reports. Other rows record `null`. This field is not part of the run key.
+
+The Claude model names `haiku`, `sonnet`, and `opus` are bare claude CLI aliases (`--model sonnet`). The installed CLI version selects the model, and the run key includes that version.
+The names `haiku45`, `sonnet46`, `sonnet5`, and `opus5` select pinned model IDs. The run key hashes the model ID, so a pinned name reuses the stored rows of its ID.
+Rows stored under a pinned ID do not answer a bare alias. A bare alias buys those cells again.
+`--models all` skips the pinned names (`PINNED_MODELS` in `config.py`), so it does not run one model twice. Name a pinned model to run it.
+`paired.py` and `analyze.py` label a row with its `resolved_model`. A bare-alias row without one takes the one ID that its alias resolved to in the same file, else it keeps the alias.
+The Codex names are `gpt5`, `luna56`, and `o3`. The OpenCode name is `gpt5mini`.
+When a stream reports no native cost, `pricing.yaml` prices the model ID that the stream reports. The `aliases` table is the fallback for a stream that reports no ID.
 
 `run.py` appends every row to `benchmark/results/result_store.jsonl`.
 A cell whose key matches a completed row (no `error`, no `infra`, no timeout) is answered from the store without a model call and written to the run's output with `reused: true`, this run's schedule and variant metadata, and the stored outcome.

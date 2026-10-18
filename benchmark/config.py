@@ -24,10 +24,16 @@ def resolve_tilth_bin() -> str:
 TILTH_BIN = resolve_tilth_bin()
 
 MODELS = {
-    "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-6",
+    # Bare claude CLI aliases: `--model sonnet` runs the model the installed CLI
+    # maps the alias to. Rows record that ID as `resolved_model`.
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "opus": "opus",
+    # Pinned claude IDs. A pinned name keeps the run key of rows stored under its ID.
+    "haiku45": "claude-haiku-4-5-20251001",
+    "sonnet46": "claude-sonnet-4-6",
     "sonnet5": "claude-sonnet-5",
-    "opus": "claude-opus-5",
+    "opus5": "claude-opus-5",
     "gpt5": "gpt-5.6-sol",
     "luna56": "gpt-5.6-luna",
     "o3": "o3",
@@ -42,14 +48,20 @@ MODELS = {
 RUNNERS = {
     "haiku": "claude",
     "sonnet": "claude",
-    "sonnet5": "claude",
     "opus": "claude",
+    "haiku45": "claude",
+    "sonnet46": "claude",
+    "sonnet5": "claude",
+    "opus5": "claude",
     "gpt5": "codex",
     "luna56": "codex",
     "o3": "codex",
     "gpt5mini": "opencode",
 }
 
+# Pinned claude names. `--models all` skips them: each repeats a model a bare alias
+# can resolve to, so it runs only when named.
+PINNED_MODELS = frozenset({"haiku45", "sonnet46", "sonnet5", "opus5"})
 
 
 @dataclass

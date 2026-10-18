@@ -428,3 +428,45 @@ def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) 
     assert len(loaded) == 4
     assert paired.paired_accuracy_delta(loaded, "tilth")[0] == pytest.approx(-0.5)
     assert analyze.is_contaminated_panel_row is paired.is_contaminated_panel_row
+
+
+def _paired_models(rows: list[dict]) -> set:
+    return {model for _task, model in paired.pair_modes(rows, "tilth", "baseline")}
+
+
+def _arms(**fields) -> list[dict]:
+    return [{**_run(task="t1", mode=mode, cost=1.0, correct=True), **fields} for mode in ("baseline", "tilth")]
+
+
+def test_alias_row_labels_as_its_resolved_model() -> None:
+    rows = _arms(model="sonnet", model_alias="sonnet", resolved_model="claude-sonnet-5")
+
+    assert _paired_models(rows) == {"claude-sonnet-5"}
+
+
+def test_alias_row_without_resolved_model_labels_as_the_alias() -> None:
+    rows = _arms(model="sonnet", model_alias="sonnet")
+
+    assert _paired_models(rows) == {"sonnet"}
+
+
+def test_old_rows_keep_their_labels() -> None:
+    pinned = _arms(model="claude-sonnet-4-6", model_alias="sonnet")
+    legacy = _arms(model="haiku")
+
+    assert _paired_models(pinned) == {"claude-sonnet-4-6"}
+    assert _paired_models(legacy) == {"claude-haiku-4-5-20251001"}
+
+
+def test_failed_alias_cell_pairs_with_its_resolved_arm(tmp_path: Path) -> None:
+    import json
+
+    ran, failed = _arms(model="sonnet", model_alias="sonnet")
+    rows = [{**ran, "resolved_model": "claude-sonnet-5"}, {**failed, "correct": False, "error": "boom"}]
+    path = tmp_path / "results.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    pairs = paired.pair_modes(paired.load_runs(path), "tilth", "baseline")
+
+    assert list(pairs) == [("t1", "claude-sonnet-5")]
+    assert [(base, exp) for _rep, base, exp, _a, _b in pairs[("t1", "claude-sonnet-5")]] == [(True, False)]
