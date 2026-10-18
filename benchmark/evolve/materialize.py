@@ -88,7 +88,7 @@ def _refuse_oversize(candidate: Mapping[str, str]) -> None:
     for name, limit in MAX_BYTES.items():
         size = len(candidate[name].encode("utf-8"))
         if size > limit:
-            raise ApplyRejected(f"{name} is {size} bytes; the MCP instructions field holds at most {limit} bytes")
+            raise ApplyRejected(f"{name} is {size} bytes; its MCP field holds at most {limit} bytes")
 
 
 class Materializer:

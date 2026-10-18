@@ -488,12 +488,14 @@ def test_rejects_harness_terms_in_src(world, monkeypatch: pytest.MonkeyPatch, te
     assert refs(world) == []
 
 
+@pytest.mark.parametrize("name", ["prompts/mcp.md", "prompts/tools/read.md", "prompts/tools/search.md",
+                                  "prompts/tools/write.md"])
 @pytest.mark.parametrize("text", ["x" * 2049, "—" * 683], ids=["ascii", "multibyte"])
-def test_rejects_instructions_over_the_mcp_field_cap_before_a_worktree(world, text: str) -> None:
+def test_rejects_a_text_over_its_mcp_field_cap_before_a_worktree(world, name: str, text: str) -> None:
     evo = build(world)
 
-    with pytest.raises(ApplyRejected, match="prompts/mcp.md is 2049 bytes; .* at most 2048 bytes"):
-        evo.materializer.materialize({**seed_candidate(), "prompts/mcp.md": text})
+    with pytest.raises(ApplyRejected, match=f"{name} is 2049 bytes; .* at most 2048 bytes"):
+        evo.materializer.materialize({**seed_candidate(), name: text})
     assert refs(world) == []
     assert not (evo.run_dir / "worktrees").exists() or list((evo.run_dir / "worktrees").iterdir()) == []
 
@@ -1895,10 +1897,17 @@ def test_reflection_asks_to_shorten_at_most_once(world) -> None:
     assert len(prompts) == 2
 
 
-def test_uncapped_component_is_never_shortened(world) -> None:
-    evo, prompts = _scripted_reflection(world, ["z" * 3000])
+def test_tool_description_reply_over_the_cap_is_shortened(world) -> None:
+    evo, prompts = _scripted_reflection(world, ["z" * 3000, "short read guidance"])
 
-    assert evo.reflect("prompts/tools/read.md", "read", []) == "z" * 3000
+    assert evo.reflect("prompts/tools/read.md", "read", []) == "short read guidance"
+    assert len(prompts) == 2 and "is 3000 UTF-8 bytes" in prompts[1]
+
+
+def test_reply_under_the_cap_is_not_shortened(world) -> None:
+    evo, prompts = _scripted_reflection(world, ["z" * 2048])
+
+    assert evo.reflect("prompts/tools/read.md", "read", []) == "z" * 2048
     assert len(prompts) == 1
 
 def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:

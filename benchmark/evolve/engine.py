@@ -27,10 +27,10 @@ REFLECTION_HEADER = (
     "</new_text>, and nothing else."
 )
 SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
-             "the MCP instructions field, so remove at least as much text as you add; a longer file is refused "
+             "the MCP field it fills, so remove at least as much text as you add; a longer file is refused "
              "and never scored.")
-SHORTEN_PROMPT = ("Your rewrite of one instruction file for the tilth MCP server is {size} UTF-8 bytes. The MCP "
-                  "instructions field holds at most {max_bytes} bytes. Shorten the file to at most {max_bytes} bytes "
+SHORTEN_PROMPT = ("Your rewrite of one instruction file for the tilth MCP server is {size} UTF-8 bytes. Its MCP "
+                  "field holds at most {max_bytes} bytes. Shorten the file to at most {max_bytes} bytes "
                   "and keep its most important guidance. Reply with the complete new file text between <new_text> "
                   "and </new_text>, and nothing else.")
 
