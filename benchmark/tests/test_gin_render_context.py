@@ -49,3 +49,68 @@ def test_grader_commands_keep_full_render_and_scoped_root():
 @pytest.mark.skipif(not FIXTURE.is_dir(), reason="pinned Gin fixture is not installed")
 def test_grader_reference_and_negative_controls():
     preflight()
+
+
+def test_grader_timeout_is_inconclusive_not_a_test_failure(tmp_path, monkeypatch):
+    import subprocess
+
+    from benchmark.tasks import gin_render_context_tasks as module
+
+    fixture = tmp_path / "fixture"
+    candidate = tmp_path / "candidate"
+    for root in (fixture, candidate):
+        root.mkdir()
+        (root / "context.go").write_text("package gin\n")
+    monkeypatch.setattr(module, "FIXTURE", fixture)
+    monkeypatch.setattr(module, "_restore_tests", lambda *args, **kwargs: None)
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs.get("timeout")))
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout=" M context.go\n", stderr="")
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    ok, reason = module.GinRenderContextTask().check_correctness("", str(candidate))
+
+    assert not ok
+    assert reason.startswith("Grader timeout"), reason
+    assert "tests failed" not in reason
+    go_calls = [call for call in calls if call[0][0] == "go"]
+    assert go_calls[0][0] == ["go", "test", "-run", "^$", "./..."], "build is warmed before graded commands"
+    assert all(timeout >= 900 for _, timeout in go_calls)
+
+
+def test_grading_stops_at_one_total_deadline(tmp_path, monkeypatch):
+    import subprocess
+
+    from benchmark.tasks import gin_render_context_tasks as module
+
+    fixture = tmp_path / "fixture"
+    candidate = tmp_path / "candidate"
+    for root in (fixture, candidate):
+        root.mkdir()
+        (root / "context.go").write_text("package gin\n")
+    monkeypatch.setattr(module, "FIXTURE", fixture)
+    monkeypatch.setattr(module, "_restore_tests", lambda *args, **kwargs: None)
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    go_timeouts = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout=" M context.go\n", stderr="")
+        go_timeouts.append((kwargs["timeout"], module.GRADE_DEADLINE_S - clock[0]))
+        clock[0] += 800  # every go command passes, slowly
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    ok, reason = module.GinRenderContextTask().check_correctness("", str(candidate))
+
+    assert not ok
+    assert reason.startswith(module.TIMEOUT_REASON), reason
+    assert "deadline" in reason
+    assert all(0 < timeout <= remaining for timeout, remaining in go_timeouts), go_timeouts
+    assert len(go_timeouts) < 20, "grading stopped before every command ran"
