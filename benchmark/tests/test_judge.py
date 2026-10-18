@@ -1492,3 +1492,79 @@ def test_judge_missing_oauth_token_is_refused(monkeypatch: pytest.MonkeyPatch, c
     assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) != 0
 
     assert client.prompts == [] and statuses == [] and "CLAUDE_CODE_OAUTH_TOKEN" in capsys.readouterr().err
+
+
+@pytest.fixture
+def sheet_panel(monkeypatch: pytest.MonkeyPatch, calibration_tasks: list[str]) -> list[str]:
+    names = calibration_tasks[:2]
+    panel = type("FakePanel", (), {"cheap": (names[0],), "dev": (names[1],), "test": (),
+                                   "register": lambda self, tasks: None})()
+    monkeypatch.setattr(cli.panels, "load_panel", lambda path, *, store_path: panel)
+    return names
+
+
+def seed_sheet_store(directory: Path) -> None:
+    layout = [(0, "rg_search_dispatch", "tilth", {}), (1, "rg_search_dispatch", "tilth", {}),
+              (2, "rg_search_dispatch", "baseline", {}), (3, "gin_servehttp_flow", "tilth", {}),
+              (4, "gin_servehttp_flow", "tilth", {"contaminated": True}),
+              (5, "gin_servehttp_flow", "baseline", {"error": "boom"}),
+              (6, "gin_servehttp_flow", "baseline", {"trajectory_path": None})]
+    for index, task, mode, fields in layout:
+        row, _ = rollout(directory, index, task=task, mode=mode, **fields)
+        baselines.store(row, path=judge_config.RESULT_STORE)
+
+
+def run_sheet(tmp_path: Path, *extra: str) -> tuple[int, Path]:
+    out = tmp_path / "sheet-out"
+    return cli.main(["sheet", "--out", str(out), *extra]), out
+
+
+def test_sheet_picks_only_eligible_rows_round_robin(judge_home: Path, sheet_panel: list[str],
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("subprocess call"))
+    code, out = run_sheet(judge_home)
+    assert code == 0
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    # Cells sort as (gin, tilth), (rg, baseline), (rg, tilth); keys 4, 5, 6 are ineligible.
+    assert [entry["run_key"] for entry in draft["trajectories"]] == [
+        "run-key-03", "run-key-02", "run-key-00", "run-key-01"]
+
+
+def test_sheet_count_caps_picks(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    code, out = run_sheet(judge_home, "--count", "2")
+    assert code == 0
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert [entry["run_key"] for entry in draft["trajectories"]] == ["run-key-03", "run-key-02"]
+
+
+def test_sheet_draft_shape_is_exact(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert set(draft) == {"tasks", "trajectories"}
+    assert draft["tasks"] == {name: "" for name in sorted(sheet_panel)}
+    assert all(entry == {"run_key": entry["run_key"], "verdict": ""} for entry in draft["trajectories"])
+
+
+def test_sheet_shows_rollout_facts_and_no_judge_label(judge_home: Path, sheet_panel: list[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    sheet = (out / "labeling-sheet.md").read_text()
+    assert "Calibration task 00: locate the handler." in sheet
+    assert "run_key: `run-key-03`" in sheet and "gin_servehttp_flow / tilth / correct=True" in sheet
+    assert "`Bash` " in sheet and "rg -n dispatch" in sheet
+    assert sheet.count("label: ____") == 2 and sheet.count("verdict: ____") == 4
+    assert "SECRET_GT" not in sheet
+    assert not judge_config.JUDGE_DIR.exists()
+
+
+def test_sheet_makes_no_judge_or_auth_call(judge_home: Path, sheet_panel: list[str],
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(cli, "_judge", lambda *a, **k: pytest.fail("judge built"))
+    monkeypatch.setattr(auth, "preflight_claude_auth", lambda *a, **k: pytest.fail("auth called"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("process spawned"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("subprocess call"))
+    assert run_sheet(judge_home)[0] == 0
