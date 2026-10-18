@@ -1737,10 +1737,10 @@ def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
                    binary_sha256=build.binary_sha256)
 
 
-def planned_identity(cell: CellSpec) -> dict:
-    """The run key and key inputs of one ``run_plan`` cell: a bare, non-strict harness at the default budget."""
+def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD) -> dict:
+    """The run key and key inputs of one ``run_plan`` cell: a bare, non-strict harness at ``max_budget_usd``."""
     return cell_identity(cell.task, cell.mode, cell.model, cell.repetition, bare=True, reasoning_effort=None,
-                         max_budget_usd=DEFAULT_MAX_BUDGET_USD, strict_file_tools=False)
+                         max_budget_usd=max_budget_usd, strict_file_tools=False)
 
 
 def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[dict]) -> None:
@@ -1759,10 +1759,11 @@ def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[d
                             "pass --refreeze-baselines to re-run them")
 
 
-def check_baseline_drift(cells, *, panel: panels.Panel) -> None:
+def check_baseline_drift(cells, *, panel: panels.Panel, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD) -> None:
     """Raise ``BaselineDrift`` when a stock-arm cell of ``cells`` that the store cannot answer drifted; runs nothing."""
     panel.register(TASKS)
-    planned = [(cell, planned_identity(cell)) for cell in (CellSpec(*cell) for cell in cells)]
+    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd))
+               for cell in (CellSpec(*cell) for cell in cells)]
     history = baselines.load_rows(RESULTS_DIR / baselines.STORE_FILENAME)
     reusable = baselines.completed_by_key(history)
     _refuse_baseline_drift([(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable],
@@ -1777,7 +1778,8 @@ def run_plan(
     candidate_sha: str | None,
     refreeze_baselines: bool,
     output: Path | None = None,
-    cell_estimate_usd: float = DEFAULT_MAX_BUDGET_USD,
+    cell_estimate_usd: float | None = None,
+    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     store_only: bool = False,
     repo: Path | None = None,
 ) -> list[dict]:
@@ -1786,6 +1788,8 @@ def run_plan(
     Registers the panel's members in ``TASKS`` before planning any cell.
     Merges ``panel.stamp(task)`` into every row before ``baselines.store``.
     Tilth arms use the binary built at ``candidate_sha``, which ``repo`` holds (default: this checkout).
+    Every cell is keyed and run at the per-cell Claude budget ``max_budget_usd``; ``cell_estimate_usd``
+    (default: ``max_budget_usd``) estimates a cell with no stored or earlier cost.
     ``store_only`` returns only stored rows and never starts a runner.
     Every row returned is also appended to ``output``.
 
@@ -1807,14 +1811,15 @@ def run_plan(
             MODES[name] = candidate_mode(MODES[name], build)
     try:
         return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
-                         cell_estimate_usd=cell_estimate_usd, store_only=store_only)
+                         cell_estimate_usd=max_budget_usd if cell_estimate_usd is None else cell_estimate_usd,
+                         max_budget_usd=max_budget_usd, store_only=store_only)
     finally:
         MODES.update(saved)
 
 
 def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_baselines: bool,
-              output: Path | None, cell_estimate_usd: float, store_only: bool) -> list[dict]:
-    planned = [(cell, planned_identity(cell)) for cell in cells]
+              output: Path | None, cell_estimate_usd: float, max_budget_usd: float, store_only: bool) -> list[dict]:
+    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd)) for cell in cells]
     store_path = RESULTS_DIR / baselines.STORE_FILENAME
     history = baselines.load_rows(store_path)
     reusable = baselines.completed_by_key(history)
@@ -1882,7 +1887,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
                                         f"_{attempt}.jsonl")
-        # Any runner stops without unreserved headroom. The run key pins the default budget; a claude cell's
+        # Any runner stops without unreserved headroom. The run key pins the run's budget; a claude cell's
         # --max-budget-usd cap shrinks to the headroom, so an overrunning cell cannot spend the finish reserve.
         try:
             headroom = ledger.headroom()
@@ -1892,13 +1897,13 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         if exhausted:
             raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${ledger.reserve:.4f} reserved leaves no "
                                          f"budget for {cell_id} under ${ledger.max_usd}", rows)
-        cell_cap = DEFAULT_MAX_BUDGET_USD
+        cell_cap = max_budget_usd
         if runner == "claude" and headroom is not None:
-            cell_cap = min(DEFAULT_MAX_BUDGET_USD, headroom)
+            cell_cap = min(max_budget_usd, headroom)
         applied_cap = {"applied_max_budget_usd": cell_cap} if runner == "claude" else {}
         metadata = {
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
-            **({"max_budget_usd": DEFAULT_MAX_BUDGET_USD} if runner == "claude" else {}),
+            **({"max_budget_usd": max_budget_usd} if runner == "claude" else {}),
             "capability": getattr(task, "capability", None), "repetition": cell.repetition,
             "variant": _variant_metadata(mode), **erosion.UNMEASURED_FIELDS, **_SKILL_AUDIT_UNMEASURED,
             **stamp, **identity, **applied_cap,
@@ -1938,7 +1943,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                 fail({"infra": "quota", "error": f"infra:quota: {quota}", "correctness_reason": f"Usage limit: {quota}"})
                 raise PlanStopped("quota", quota, rows) from error
             fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
-            if cell_cap < DEFAULT_MAX_BUDGET_USD and "error_max_budget_usd" in str(error):
+            if cell_cap < max_budget_usd and "error_max_budget_usd" in str(error):
                 raise PlanStopped("ceiling", f"{cell_id} hit its ${cell_cap:.4f} cap at the unreserved headroom",
                                   rows) from error
         else:

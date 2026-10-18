@@ -62,6 +62,8 @@ class Settings:
     max_usd: float
     max_metric_calls: int
     cell_estimate_usd: float
+    # The per-cell Claude --max-budget-usd of every cell in the run; it is part of each cell's run key.
+    cell_budget_usd: float
     refreeze_baselines: bool
     panel_path: Path
     helper_model: str = judge.config.JUDGE_MODEL
@@ -204,7 +206,8 @@ class Evolution:
             with self._spending("cells"):
                 rows = run.run_plan(cells, panel=self.panel, ledger=self.ledger, candidate_sha=sha,
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
-                                    cell_estimate_usd=self.settings.cell_estimate_usd, store_only=store_only,
+                                    cell_estimate_usd=self.settings.cell_estimate_usd,
+                                    max_budget_usd=self.settings.cell_budget_usd, store_only=store_only,
                                     repo=self.settings.repo)
         except run.PlanStopped as stopped:
             self.log(f"cells: stopped ({stopped})")
@@ -232,7 +235,7 @@ class Evolution:
             cost += run.estimate_cell_cost(history, task=cell.task, mode=CANDIDATE_MODE, model=model,
                                            run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         for cell in self._cells(self.panel.test, BASELINE_MODE, self._reps()):
-            if run.planned_identity(cell)["run_key"] not in stored:
+            if run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd)["run_key"] not in stored:
                 cost += run.estimate_cell_cost(history, task=cell.task, mode=BASELINE_MODE, model=model,
                                                run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         return cost
@@ -252,7 +255,7 @@ class Evolution:
             baseline_cells = self._cells((*self.panel.cheap, *self.panel.dev, *self.panel.test), BASELINE_MODE,
                                          self._reps())
             try:
-                run.check_baseline_drift(baseline_cells, panel=self.panel)
+                run.check_baseline_drift(baseline_cells, panel=self.panel, max_budget_usd=self.settings.cell_budget_usd)
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
         # The estimate counts every unstored baseline test cell, so the reserve over-counts them; that error is kept

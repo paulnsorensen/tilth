@@ -78,9 +78,9 @@ def test_run_plan_registers_before_planning(world, monkeypatch: pytest.MonkeyPat
         def __getattr__(self, name):
             return getattr(self.inner, name)
 
-    def recording_identity(cell):
+    def recording_identity(cell, **kwargs):
         order.append(f"plan {cell.task}")
-        return real_identity(cell)
+        return real_identity(cell, **kwargs)
 
     monkeypatch.setattr(run, "planned_identity", recording_identity)
     run.run_plan(cells(*DEV), panel=RecordingPanel(world.panel), ledger=SpendLedger(10.0), candidate_sha=None,
@@ -101,9 +101,9 @@ def test_run_plan_plans_external_member_only_after_registration(bench, monkeypat
     planned: list[tuple[str, bool]] = []
     real_identity = run.planned_identity
 
-    def recording_identity(cell):
+    def recording_identity(cell, **kwargs):
         planned.append((cell.task, cell.task in run.TASKS))
-        return real_identity(cell)
+        return real_identity(cell, **kwargs)
 
     monkeypatch.setattr(run, "planned_identity", recording_identity)
     run.run_plan([run.CellSpec(FB_ALGORITHMS, "plain", "sonnet5", 0)], panel=panel, ledger=SpendLedger(10.0),
