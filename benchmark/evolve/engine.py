@@ -29,6 +29,10 @@ REFLECTION_HEADER = (
 SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
              "the MCP instructions field, so remove at least as much text as you add; a longer file is refused "
              "and never scored.")
+SHORTEN_PROMPT = ("Your rewrite of one instruction file for the tilth MCP server is {size} UTF-8 bytes. The MCP "
+                  "instructions field holds at most {max_bytes} bytes. Shorten the file to at most {max_bytes} bytes "
+                  "and keep its most important guidance. Reply with the complete new file text between <new_text> "
+                  "and </new_text>, and nothing else.")
 
 
 def reflection_prompt(text: str, records: list[dict], *, max_bytes: int | None = None) -> str:
@@ -63,15 +67,29 @@ class ReflectionClient:
                 "--no-session-persistence", "--disable-slash-commands"]
 
     def __call__(self, name: str, text: str, records: list[dict]) -> str:
+        limit = MAX_BYTES.get(name)
+        new = self._ask(name, reflection_prompt(text, records, max_bytes=limit))
+        if new is None:
+            return text
+        size = len(new.encode("utf-8"))
+        if limit is not None and size > limit:
+            # The materializer refuses an oversize text, so one follow-up call is cheaper than a lost candidate.
+            self.paid.log(f"reflection: {name}: the reply is {size} bytes, over the {limit}-byte cap; "
+                          "asking once to shorten it")
+            prompt = f"{SHORTEN_PROMPT.format(size=size, max_bytes=limit)}\n\n<current>\n{new}\n</current>\n"
+            new = self._ask(name, prompt) or new
+        return new
+
+    def _ask(self, name: str, prompt: str) -> str | None:
+        """One isolated call; the ``<new_text>`` block of the reply, or None when there is none."""
         with tempfile.TemporaryDirectory(prefix="tilth-reflection-cwd-") as cwd:
-            prompt = reflection_prompt(text, records, max_bytes=MAX_BYTES.get(name))
             outcome = self.paid.call("reflection", self.argv(), prompt, cwd)
         if outcome is None:
-            return text
+            return None
         match = re.search(r"<new_text>(.*?)</new_text>", outcome.text, re.S)
         if match is None:
-            self.paid.log(f"reflection: {name}: the reply has no <new_text> block; keeping the parent's text")
-            return text
+            self.paid.log(f"reflection: {name}: the reply has no <new_text> block; keeping the earlier text")
+            return None
         return match[1].removeprefix("\n")
 
 

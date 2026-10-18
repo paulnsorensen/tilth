@@ -1867,6 +1867,40 @@ def test_reflection_call_isolated(world, monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert "UTF-8 bytes" not in engine.reflection_prompt("", [])
 
 
+def _scripted_reflection(world, replies: list[str]) -> tuple[object, list[str]]:
+    prompts: list[str] = []
+    pending = iter(replies)
+
+    def spawn(argv, **kwargs):
+        prompts.append(kwargs["input"])
+        return subprocess.CompletedProcess(argv, 0, result_stream(f"<new_text>{next(pending)}</new_text>", cost=0.0), "")
+
+    return ready(world, spawn=spawn), prompts
+
+
+def test_oversize_reflection_reply_is_shortened_once(world) -> None:
+    long_text = "x" * 2100
+    evo, prompts = _scripted_reflection(world, [long_text, "short instructions"])
+
+    assert evo.reflect("prompts/mcp.md", SEED_MCP, []) == "short instructions"
+    assert len(prompts) == 2
+    assert "is 2100 UTF-8 bytes" in prompts[1] and "at most 2048 bytes" in prompts[1] and long_text in prompts[1]
+    assert "the reply is 2100 bytes, over the 2048-byte cap; asking once to shorten it" in log_text(world)
+
+
+def test_reflection_asks_to_shorten_at_most_once(world) -> None:
+    evo, prompts = _scripted_reflection(world, ["x" * 2100, "y" * 2200])
+
+    assert evo.reflect("prompts/mcp.md", SEED_MCP, []) == "y" * 2200
+    assert len(prompts) == 2
+
+
+def test_uncapped_component_is_never_shortened(world) -> None:
+    evo, prompts = _scripted_reflection(world, ["z" * 3000])
+
+    assert evo.reflect("prompts/tools/read.md", "read", []) == "z" * 3000
+    assert len(prompts) == 1
+
 def test_reflection_refuses_api_key(world, monkeypatch: pytest.MonkeyPatch) -> None:
     evo = ready(world)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
