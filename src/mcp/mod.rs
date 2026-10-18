@@ -715,6 +715,9 @@ mod tests {
 
     #[test]
     fn instructions_teach_replace_text_before_line_ops() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
         let rt = SERVER_INSTRUCTIONS
             .find("`replace_text` swaps")
             .expect("replace_text taught in edit instructions");
@@ -925,6 +928,17 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines"
         );
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("mcp__"),
+            "instructions must use protocol tool names, not client-specific prefixes"
+        );
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("tilth_deps"),
+            "instructions must not route to the retired tilth_deps tool"
+        );
+        if super::phrase_pins_exempt() {
+            return;
+        }
         assert!(SERVER_INSTRUCTIONS.contains(
             "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
         ));
@@ -940,14 +954,6 @@ mod tests {
             SERVER_INSTRUCTIONS
                 .contains("DO NOT use `mode: full` to edit; read the section you change."),
             "section-read edit guidance must remain in SERVER_INSTRUCTIONS"
-        );
-        assert!(
-            !SERVER_INSTRUCTIONS.contains("mcp__"),
-            "instructions must use protocol tool names, not client-specific prefixes"
-        );
-        assert!(
-            !SERVER_INSTRUCTIONS.contains("tilth_deps"),
-            "instructions must not route to the retired tilth_deps tool"
         );
     }
 
