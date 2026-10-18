@@ -1,6 +1,7 @@
 """Trajectory contamination scan over sidecar tool inputs (bench-external-tasks AC-6)."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -170,3 +171,40 @@ def test_missing_sidecar_is_unscanned(tmp_path: Path) -> None:
 
     assert reasons(None, task) == ["unscanned"]
     assert reasons(tmp_path / "missing.jsonl", task) == ["unscanned"]
+
+
+def test_tilth_tool_relative_paths_resolve_against_input_cwd(tmp_path: Path) -> None:
+    task = TASKS["rg_search_dispatch"]
+    path = sidecar(tmp_path, ("mcp__tilth__tilth_read",
+                              {"cwd": str(config.REPO_ROOT), "paths": ["benchmark/tasks/ripgrep_tasks.py"]}))
+
+    assert "benchmark_tree" in reasons(path, task)
+
+
+def test_bash_cd_sets_base_for_later_relative_paths(tmp_path: Path) -> None:
+    task = TASKS["rg_search_dispatch"]
+    path = sidecar(tmp_path, ("Bash", {"command": f"cd {config.REPO_ROOT} && cat benchmark/tasks/ripgrep_tasks.py"}))
+
+    assert "benchmark_tree" in reasons(path, task)
+
+
+def test_relative_path_escaping_cell_cwd_is_flagged(tmp_path: Path) -> None:
+    task = TASKS["rg_search_dispatch"]
+    escape = os.path.relpath(config.BENCHMARK_DIR, WORKDIR)
+    path = sidecar(tmp_path, ("Grep", {"pattern": "fn", "path": escape}))
+
+    assert "benchmark_tree" in [h["reason"] for h in external.contamination.find_hits(path, task, cwd=WORKDIR)]
+    assert "benchmark_tree" not in reasons(path, task)
+
+
+@pytest.mark.parametrize("tool_input", [
+    ("Read", {"file_path": "src/main.rs"}),
+    ("Grep", {"pattern": "fn", "path": "benchmark/foo"}),
+    ("Write", {"file_path": "notes.md", "content": "benchmark/tasks/ripgrep_tasks.py"}),
+    ("Bash", {"command": "cat -n src/main.rs && curl https://example.com/a/b"}),
+    ("mcp__tilth__tilth_read", {"cwd": WORKDIR, "paths": ["src/main.rs", "benchmark/foo"]}),
+])
+def test_relative_workspace_paths_stay_clean(tmp_path: Path, tool_input: tuple[str, object]) -> None:
+    path = sidecar(tmp_path, tool_input)
+
+    assert external.contamination.find_hits(path, TASKS["rg_search_dispatch"], cwd=WORKDIR) == []

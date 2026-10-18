@@ -108,8 +108,12 @@ def _strings(value: object) -> Iterator[str]:
             yield from _strings(item)
 
 
-def _paths(text: str) -> Iterator[str]:
-    """Absolute paths named in ``text``, after ``~``, ``$HOME``, and ``..`` normalization."""
+def _paths(text: str, base: str | None = None) -> Iterator[str]:
+    """Paths named in ``text``, after ``~``, ``$HOME``, and ``..`` normalization.
+
+    A relative token resolves against ``base`` when ``base`` is an absolute directory.
+    Flags, URLs, and empty tokens are never paths.
+    """
     home = os.path.expanduser("~")
     for token in _PATH_SEPARATORS.split(_HOME_REFERENCE.sub(home, text)):
         token = token.split("#", 1)[0]
@@ -117,6 +121,41 @@ def _paths(text: str) -> Iterator[str]:
             token = home + token[1:]
         if token.startswith("/"):
             yield os.path.normpath(token)
+        elif token and base and base.startswith("/") and not token.startswith("-") and "://" not in token:
+            yield os.path.normpath(os.path.join(base, token))
+
+
+def _cd_target(segment: str, base: str | None) -> str | None:
+    """The directory a ``cd`` or ``pushd`` segment moves to, or None for any other segment."""
+    words = segment.split()
+    if len(words) < 2 or words[0] not in {"cd", "pushd"}:
+        return None
+    home = os.path.expanduser("~")
+    target = _HOME_REFERENCE.sub(home, words[1].strip("'\""))
+    if target == "~" or target.startswith("~/"):
+        target = home + target[1:]
+    if target.startswith("/"):
+        return os.path.normpath(target)
+    return None
+
+
+def _command_paths(command: str, base: str | None) -> Iterator[str]:
+    """Paths in a shell command; an absolute ``cd`` or ``pushd`` sets the base for later segments."""
+    for segment in _COMMAND_SEGMENTS.split(command):
+        yield from _paths(segment, base)
+        base = _cd_target(segment.strip(), base) or base
+
+
+def _input_paths(tool_input: object, cell_cwd: str | None) -> Iterator[str]:
+    """Paths in a tool input; the input's own absolute ``cwd`` is the base, else the cell cwd."""
+    base = cell_cwd
+    if isinstance(tool_input, dict) and isinstance(tool_input.get("cwd"), str) and tool_input["cwd"].startswith("/"):
+        base = tool_input["cwd"]
+    if isinstance(tool_input, dict) and isinstance(tool_input.get("command"), str):
+        yield from _command_paths(tool_input["command"], base)
+        tool_input = {key: value for key, value in tool_input.items() if key != "command"}
+    for text in _strings(tool_input):
+        yield from _paths(text, base)
 
 
 def _under(path: str, roots: tuple[str, ...]) -> bool:
@@ -160,19 +199,19 @@ def _is_fetch_tool(name: object) -> bool:
     return isinstance(name, str) and "fetch" in name.lower()
 
 
-def _call_reasons(tool_input: object, rules: _Rules, tool: object = None) -> list[str]:
+def _call_reasons(tool_input: object, rules: _Rules, tool: object = None, cwd: str | None = None) -> list[str]:
     reasons: list[str] = []
     fetching = _is_fetch_tool(tool)
+    for path in _input_paths(tool_input, cwd):
+        if _under(path, rules.benchmark_roots):
+            reasons.append("benchmark_tree")
+        elif _under(path, rules.notes_roots):
+            reasons.append("harness_notes")
+        elif _under(path, rules.data_roots):
+            reasons.append("harness_data")
+        elif _under(path, rules.foreign_roots):
+            reasons.append("foreign_repo_clone")
     for text in _strings(tool_input):
-        for path in _paths(text):
-            if _under(path, rules.benchmark_roots):
-                reasons.append("benchmark_tree")
-            elif _under(path, rules.notes_roots):
-                reasons.append("harness_notes")
-            elif _under(path, rules.data_roots):
-                reasons.append("harness_data")
-            elif _under(path, rules.foreign_roots):
-                reasons.append("foreign_repo_clone")
         if rules.upstream is not None and (rules.upstream.fetched_by(text)
                                            or (fetching and rules.upstream.repo_url.search(text))):
             reasons.append("upstream_fetch")
@@ -181,18 +220,22 @@ def _call_reasons(tool_input: object, rules: _Rules, tool: object = None) -> lis
     return list(dict.fromkeys(reasons))
 
 
-def find_hits(sidecar_path: str | Path | None, task: object) -> list[dict]:
-    """Every contamination hit in a trajectory sidecar's tool inputs, with its reason and input."""
+def find_hits(sidecar_path: str | Path | None, task: object, cwd: str | Path | None = None) -> list[dict]:
+    """Every contamination hit in a trajectory sidecar's tool inputs, with its reason and input.
+
+    ``cwd`` is the cell workspace; relative paths in tool inputs resolve against it.
+    """
     if sidecar_path is None or not Path(sidecar_path).is_file():
         return [{"reason": "unscanned", "tool": None, "input": None}]
     rules = _rules(task)
+    base = os.path.normpath(str(cwd)) if cwd else None
     hits = []
     for call in tolerant_jsonl(Path(sidecar_path).read_text()):
-        for reason in _call_reasons(call.get("input"), rules, call.get("name")):
+        for reason in _call_reasons(call.get("input"), rules, call.get("name"), base):
             hits.append({"reason": reason, "tool": call.get("name"), "input": call.get("input")})
     return hits
 
 
-def scan(sidecar_path: str | Path | None, task: object) -> bool:
+def scan(sidecar_path: str | Path | None, task: object, cwd: str | Path | None = None) -> bool:
     """True when the trajectory has any contamination hit, including an unscanned one."""
-    return bool(find_hits(sidecar_path, task))
+    return bool(find_hits(sidecar_path, task, cwd))
