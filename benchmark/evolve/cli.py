@@ -102,14 +102,14 @@ def _error(message: str) -> int:
 
 
 def _base_ref(repo: Path, branch: str) -> str:
-    """The ref the winner PR merges into: ``origin/<branch>`` when it exists, else the local ``branch``.
+    """The fully qualified remote ref the winner PR merges into, or the local branch ref when absent.
 
     A local branch can lag or lead the remote one; the draft PR targets the remote branch.
     """
-    remote = f"origin/{branch}"
-    found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}"], cwd=repo,
+    remote = f"refs/remotes/origin/{branch}"
+    found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", remote], cwd=repo,
                            capture_output=True)
-    return remote if found.returncode == 0 else branch
+    return remote if found.returncode == 0 else f"refs/heads/{branch}"
 
 
 def build(argv: list[str] | None = None, *,
@@ -141,7 +141,8 @@ def build(argv: list[str] | None = None, *,
     base_ref = _base_ref(repo, args.base_branch)
     if subprocess.run(["git", "merge-base", "--is-ancestor", seed_sha, base_ref], cwd=repo,
                       capture_output=True).returncode != 0:
-        return _error(f"--seed-sha {args.seed_sha} is not an ancestor of {base_ref} (--base-branch {args.base_branch})")
+        base_name = base_ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+        return _error(f"--seed-sha {args.seed_sha} is not an ancestor of {base_name} (--base-branch {args.base_branch})")
     try:
         panel = panels.load_panel(args.panel, store_path=run.RESULTS_DIR / baselines.STORE_FILENAME)
         panel.register(run.TASKS)

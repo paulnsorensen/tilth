@@ -212,8 +212,12 @@ def _commit_on(world, ref: str) -> str:
     return sha
 
 
-def test_seed_on_the_remote_base_passes_when_the_local_base_lags(world, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_seed_on_the_remote_base_passes_when_the_local_base_lags(world, capsys: pytest.CaptureFixture[str],
+                                                               shadowed: bool) -> None:
     sha = _commit_on(world, "refs/remotes/origin/main")
+    if shadowed:
+        git("update-ref", "refs/heads/origin/main", world.seed_sha, cwd=world.repo)
 
     evo = build(world, "--seed-sha", sha)
 
@@ -221,16 +225,31 @@ def test_seed_on_the_remote_base_passes_when_the_local_base_lags(world, capsys: 
     assert evo.settings.base_branch == "main"
 
 
-def test_seed_only_on_the_local_base_is_refused_when_the_remote_base_exists(world, capsys) -> None:
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_seed_only_on_the_local_base_is_refused_when_the_remote_base_exists(world, capsys, shadowed: bool) -> None:
     git("update-ref", "refs/remotes/origin/main", world.seed_sha, cwd=world.repo)
     sha = _commit_on(world, "refs/heads/main")
+    if shadowed:
+        git("update-ref", "refs/heads/origin/main", sha, cwd=world.repo)
 
     assert build(world, "--seed-sha", sha) == 2
     assert "is not an ancestor of origin/main" in capsys.readouterr().err
 
 
-def test_seed_on_the_local_base_passes_without_a_remote(world) -> None:
-    assert not isinstance(build(world), int)
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_seed_on_the_local_base_passes_without_a_remote(world, shadowed: bool) -> None:
+    sha = _commit_on(world, "refs/heads/main")
+    if shadowed:
+        git("update-ref", "refs/tags/main", world.seed_sha, cwd=world.repo)
+
+    assert not isinstance(build(world, "--seed-sha", sha), int)
+
+
+def test_seed_only_on_a_tag_is_refused_without_a_remote_base(world, capsys) -> None:
+    sha = _commit_on(world, "refs/tags/main")
+
+    assert build(world, "--seed-sha", sha) == 2
+    assert "is not an ancestor of main (--base-branch main)" in capsys.readouterr().err
 
 @pytest.mark.parametrize("error", [
     judge_core.CritiqueRejected("no verdict"), judge_core.CritiqueWithheld("no-trajectory"),
