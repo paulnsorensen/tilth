@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import analyze
 import paired
+from tasks.gin_render_context_tasks import TIMEOUT_REASON
 
 
 def _run(*, task, mode, cost, correct, repetition=0, model="claude-haiku-4-5-20251001", capability=None):
@@ -283,6 +284,15 @@ def test_failure_type_covers_runner_and_grader_reasons():
     assert analyze._failure_type({"correctness_reason": "No changes in target file"}) == (
         "missing_edit",
         "No changes in target file",
+    )
+
+
+def test_failure_type_labels_grader_timeout_apart_from_grader_failure():
+    reason = f"{TIMEOUT_REASON}: go build warm-up timed out"
+    assert analyze._failure_type({"correctness_reason": reason}) == ("grader_timeout", reason)
+    assert analyze._failure_type({"correctness_reason": "Something else"}) == (
+        "grader_failure",
+        "Something else",
     )
 
 

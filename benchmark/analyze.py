@@ -30,6 +30,7 @@ from paired import (
 from pricing import PRICING_DATA, compute_cost_breakdown, pricing_staleness_warning
 from judge import config as judge_config, store as judge_store
 from tasks import TASKS
+from tasks.gin_render_context_tasks import TIMEOUT_REASON
 
 
 def format_cost_breakdown(costs: dict[str, float], indent: str = "  ") -> str:
@@ -494,6 +495,8 @@ def _failure_type(result: dict) -> tuple[str, str] | None:
         return "runner_error", error_text
 
     reason = str(result.get("correctness_reason") or "unspecified")
+    if reason.startswith(TIMEOUT_REASON):
+        return "grader_timeout", reason
     if reason.startswith("Missing: "):
         return "missing_required_literal", reason.removeprefix("Missing: ")
     if reason.startswith("Contains forbidden: "):
