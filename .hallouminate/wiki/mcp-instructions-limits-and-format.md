@@ -26,11 +26,11 @@ Corollary: **error messages never truncate** — failure-time teaching errors
 ## The whole-surface cap, and paying for new text
 
 Per-field 2KB is not the only budget. A client also receives the
-entire `tools/list` payload, and a hard cap applies to the total (see [API adoption spec](specs/tilth-api-adoption.md); that spec calls the figure superseded, but the test still enforces it):
+`initialize` and `tools/list` responses, and a hard cap applies to their sum (see [API adoption spec](specs/tilth-api-adoption.md); that spec calls the figure superseded, but the test still enforces it):
 `mcp_surface_stays_within_cap` (`src/mcp/mod.rs`) drives `serve` through
-a real initialize + `tools/list` and sums the non-empty response lines —
-envelopes, `serverInfo`, and JSON escaping included — against a `CAP` of
-13,779 bytes.
+a real initialize + `tools/list` and sums `str::len` of the non-empty
+response lines (line terminators excluded) — envelopes, `serverInfo`, and
+JSON escaping included — against a `CAP` of 13,779.
 
 The measurement method is the gotcha. An earlier version of the guard summed
 `SERVER_INSTRUCTIONS.len()` with the tool JSON and reported ~200 chars of

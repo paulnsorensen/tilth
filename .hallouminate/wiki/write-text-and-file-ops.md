@@ -11,9 +11,11 @@ permanent fork law; see [Edit-anchor design](edit-anchor-design.md) and
 
 ## Uniqueness is counted over *overlapping* occurrences
 
-`find_text_span` (`src/edit/apply.rs`) is the whole safety story for
+`find_text_span` (`src/edit/apply.rs`) is the safety check for
 `replace_text`: an `old` that matches once is a span, anything else is an
-error. The first implementation counted non-overlapping matches, so
+error. On an exact miss, `match_text_span` retries with
+`find_text_span_normalized`, which applies the same overlapping second-hit
+probe. The first implementation counted non-overlapping matches, so
 `old: "---"` against `"----"` counted **one** occurrence — the uniqueness
 guard failed open and silently applied one of several candidate spans. The
 scan now advances past only the first char's UTF-8 width, so a
@@ -59,16 +61,18 @@ callers branch on the variant instead of parsing rendered text
 (`ApplyError::is_text_match_failure` lives beside the variants so a new
 text-anchor error cannot silently fall through a consumer's match).
 
-The re-lowering is gated on the section actually containing a `TextSwap`:
+The re-lowering is gated on the section actually containing a text-anchored op (`TextSwap`,
+`TextSwapAll`, or `Rewrite`):
 lowering a block op re-parses the outline uncached (~86ms on 735KB of Rust)
 to produce a diagnosis it cannot produce.
 
 ## `create_file` commits by `hard_link`, not by rename
 
 `create_file` deliberately does **not** reuse `atomic_write_bytes`' stage-then-
-`rename` pattern (`src/util.rs`): `rename` replaces an existing destination,
-and staging through `fs::write` at a predictable temp name follows a symlink
-someone planted there. `atomic_create_bytes_no_replace` instead opens the
+`rename` pattern (`src/util.rs`): `rename` replaces an existing destination
+(before #257 that helper also staged through `fs::write` at a predictable
+temp name, which followed a planted symlink; it now stages through
+`tempfile::Builder`). `atomic_create_bytes_no_replace` instead opens the
 temp with `create_new(true)` (`O_CREAT|O_EXCL` — the exclusive open is what
 makes the staging write safe) and commits with `hard_link`, which fails on an
 existing destination rather than replacing it. Both guarantees then hold: a
@@ -97,7 +101,7 @@ Three ergonomics rules that look arbitrary and are not:
 
 ## Open
 
-- Issue #175 (closed) added the opt-out. `all: true` replaces every exact
+- Issue #175 (closed) asked for the opt-out; PR #308 added it. `all: true` replaces every exact
   occurrence, and `count: N` requires exactly N (`find_all_text_spans`).
   The default stays unique-or-error. The page above describes that default.
 - `<speculative>` The dominant invented field name in the July write-error
