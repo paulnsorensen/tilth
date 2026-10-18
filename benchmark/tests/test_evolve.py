@@ -59,7 +59,8 @@ def ready(world, *extra: str, **kwargs):
 
 
 def tilth_calls(world, sha: str | None = None) -> list[tuple[str, int]]:
-    return [(task, rep) for task, mode, rep, called in world.calls if mode == "tilth" and (sha is None or called == sha)]
+    return [(task, rep) for task, mode, rep, called in world.calls
+            if mode == "tilth_forced" and (sha is None or called == sha)]
 
 
 def patch_for(world, changes: dict[str, str]) -> str:
@@ -113,7 +114,7 @@ def test_records_are_judge_stripped_records(world) -> None:
     evo = ready(world)
     _score, info = evo.evaluate(evo.seed, "dev_a")
 
-    rows = [row for row in world.stored() if row["mode"] == "tilth" and row["task"] == "dev_a"]
+    rows = [row for row in world.stored() if row["mode"] == "tilth_forced" and row["task"] == "dev_a"]
     assert info["records"]
     for record, row in zip(info["records"], rows, strict=True):
         sidecar = Path(row["trajectory_path"]).read_text()
@@ -193,6 +194,14 @@ def test_unlabeled_task_refuses_run(world, capsys: pytest.CaptureFixture[str]) -
     assert world.runner_calls() == []
     assert "dev_b" in capsys.readouterr().err
 
+
+def test_non_claude_model_refused_before_any_call(world, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_:
+        main(world, "--model", "gpt5")
+
+    assert exit_.value.code == 2
+    assert world.runner_calls() == [] and world.spawned == []
+    assert "invalid choice: 'gpt5'" in capsys.readouterr().err
 
 @pytest.mark.parametrize("error", [
     judge_core.CritiqueRejected("no verdict"), judge_core.CritiqueWithheld("no-trajectory"),
@@ -578,7 +587,7 @@ def test_cascade_stops_at_first_failure(world, stage: str) -> None:
     assert info["stage"] == stage
     result = evo.results[candidates.content_id(failing)]
     assert result.stage == stage and not result.scores
-    non_seed = [call for call in world.calls if call[1] == "tilth" and call[3] != world.seed_sha]
+    non_seed = [call for call in world.calls if call[1] == "tilth_forced" and call[3] != world.seed_sha]
     if stage in {"apply", "just check"}:
         assert non_seed == []
         assert len(_broken_check.calls) - checks_before == (0 if stage == "apply" else 1)
@@ -609,7 +618,7 @@ def test_failed_candidate_build_is_a_cascade_stage(monkeypatch: pytest.MonkeyPat
     assert failed.stage == "build" and "error[E0308]: mismatched types" in failed.tail
     assert "finish: " in log_text(world)
     assert not any("BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo)
-                   for _task, mode, _rep, sha in world.calls if mode == "tilth")
+                   for _task, mode, _rep, sha in world.calls if mode == "tilth_forced")
 
 
 def test_build_failure_side_info_names_stage(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -738,9 +747,9 @@ def test_candidate_cells_use_candidate_binary(world) -> None:
 
     assert sha in world.builds
     assert git("rev-parse", "HEAD", cwd=evo.materializer.worktree(sha)).strip() == sha
-    served = [call for call in world.calls if call[1] == "tilth" and call[3] == sha]
+    served = [call for call in world.calls if call[1] == "tilth_forced" and call[3] == sha]
     assert served
-    rows = [row for row in world.stored() if row["mode"] == "tilth" and row.get("git_sha") == sha]
+    rows = [row for row in world.stored() if row["mode"] == "tilth_forced" and row.get("git_sha") == sha]
     assert len(rows) == len(served)
     for row in rows:
         assert row["variant"]["git_sha"] == sha and row["binary_sha256"] == f"sha256-of-{sha}"
@@ -778,7 +787,7 @@ def test_evolve_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch) -
 
     assert [call["store_path"] for call in calls] == [run.RESULTS_DIR / baselines.STORE_FILENAME]
     rows = world.stored()
-    assert {row["mode"] for row in rows} == {"baseline", "tilth"}
+    assert {row["mode"] for row in rows} == {"baseline", "tilth_forced"}
     assert {row["repetition"] for row in rows} == {0, 1}
     for row in rows:
         stamp = world.panel.stamp(row["task"])
@@ -865,7 +874,7 @@ def test_candidate_buys_nothing_when_the_seed_is_not_on_the_frontier(monkeypatch
 
     assert main(world) == 1
 
-    assert [call for call in world.calls if call[1] == "tilth" and call[3] != world.seed_sha] == []
+    assert [call for call in world.calls if call[1] == "tilth_forced" and call[3] != world.seed_sha] == []
     assert "the seed is not on the accepted frontier" in log_text(world)
 
 
@@ -925,8 +934,8 @@ def test_delta_report_matches_paired(world) -> None:
     rows = [row for row in world.stored()
             if row["task"] in DEV and (row["mode"] == "baseline" or row.get("git_sha") == sha)]
     report = next(delta for delta in evo.deltas if delta["candidate"] == candidates.content_id(candidate)[:12])
-    accuracy = paired.paired_accuracy_delta(rows, "tilth", "baseline")
-    cpc = paired.paired_cpc_delta(rows, "tilth", "baseline")
+    accuracy = paired.paired_accuracy_delta(rows, "tilth_forced", "baseline")
+    cpc = paired.paired_cpc_delta(rows, "tilth_forced", "baseline")
     assert report["accuracy_delta"] == pytest.approx(accuracy[0])
     assert report["accuracy_ci"] == pytest.approx(list(accuracy[1:3]))
     assert report["cpc_delta"] == pytest.approx(cpc[0])

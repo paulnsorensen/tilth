@@ -34,7 +34,8 @@ from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
 from .proposer import Proposer
 
-CANDIDATE_MODE = "tilth"
+# Candidates run with tilth MCP only, so a score measures tilth itself and not a fallback to built-in tools.
+CANDIDATE_MODE = "tilth_forced"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
 NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell", "auth"})

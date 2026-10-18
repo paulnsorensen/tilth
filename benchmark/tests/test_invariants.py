@@ -212,7 +212,7 @@ def test_reflective_record_strips_grader_text(monkeypatch: pytest.MonkeyPatch, t
     seen = _engine(monkeypatch, propose=[["prompts/mcp.md"], ["src_patch"]])
     assert es.main(world, spawn=spawn) == 0
 
-    stored = [row for row in world.stored() if row["mode"] == "tilth"]
+    stored = [row for row in world.stored() if row["mode"] == "tilth_forced"]
     assert any(row["correctness_reason"] == "Missing: SECRET_GT" for row in stored)
     assert "SECRET_GT" in run.TASKS["dev_a"].ground_truth.required_strings
     critiques = [es.StubJudge().critique(row, trajectory) for row, trajectory in world.judge.critiques]
