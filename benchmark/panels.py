@@ -283,6 +283,11 @@ def _check_lock(name: str, digest: str, store_path: Path) -> None:
             )
 
 
+def member_ids(path: Path) -> tuple[str, ...]:
+    """Sorted member IDs of a panel file after schema checks only: no admission, no split lock, no build."""
+    return tuple(sorted(member.id for member in _parse(path)[2]))
+
+
 def load_panel(
     path: Path,
     *,

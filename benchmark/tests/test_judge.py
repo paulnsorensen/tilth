@@ -1495,11 +1495,11 @@ def test_judge_missing_oauth_token_is_refused(monkeypatch: pytest.MonkeyPatch, c
 
 
 @pytest.fixture
-def sheet_panel(monkeypatch: pytest.MonkeyPatch, calibration_tasks: list[str]) -> list[str]:
+def sheet_panel(judge_home: Path, calibration_tasks: list[str]) -> list[str]:
     names = calibration_tasks[:2]
-    panel = type("FakePanel", (), {"cheap": (names[0],), "dev": (names[1],), "test": (),
-                                   "register": lambda self, tasks: None})()
-    monkeypatch.setattr(cli.panels, "load_panel", lambda path, *, store_path: panel)
+    members = [{"id": name, "family": "local", "language": "go", "split": split}
+               for name, split in zip(names, ("cheap", "dev"))]
+    (judge_home / "panel.json").write_text(json.dumps({"name": "sheet-test", "split_seed": 1, "members": members}))
     return names
 
 
@@ -1516,7 +1516,7 @@ def seed_sheet_store(directory: Path) -> None:
 
 def run_sheet(tmp_path: Path, *extra: str) -> tuple[int, Path]:
     out = tmp_path / "sheet-out"
-    return cli.main(["sheet", "--out", str(out), *extra]), out
+    return cli.main(["sheet", "--panel", str(tmp_path / "panel.json"), "--out", str(out), *extra]), out
 
 
 def test_sheet_picks_only_eligible_rows_round_robin(judge_home: Path, sheet_panel: list[str],
@@ -1568,3 +1568,53 @@ def test_sheet_makes_no_judge_or_auth_call(judge_home: Path, sheet_panel: list[s
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("process spawned"))
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("subprocess call"))
     assert run_sheet(judge_home)[0] == 0
+
+
+def test_sheet_does_not_run_admission(judge_home: Path, sheet_panel: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_sheet_store(judge_home)
+    monkeypatch.setattr(cli.panels, "_check_admitted", lambda *a, **k: pytest.fail("admission ran"))
+    monkeypatch.setattr(cli.panels.external.preflight, "admit", lambda *a, **k: pytest.fail("admit called"))
+    assert run_sheet(judge_home)[0] == 0
+
+
+def test_sheet_reports_unresolved_panel_task(judge_home: Path, sheet_panel: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    (judge_home / "panel.json").write_text(json.dumps({"name": "sheet-test", "split_seed": 1, "members": [
+        {"id": "no_such_task", "family": "local", "language": "go", "split": "cheap"}]}))
+    code, out = run_sheet(judge_home)
+    assert code == 1 and "no_such_task" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_sheet_skips_missing_trajectory_file_and_unset_contamination_and_unresolved_task(
+        judge_home: Path, sheet_panel: list[str]) -> None:
+    layout = [(0, {}), (1, {"trajectory_path": str(judge_home / "gone.jsonl")}), (2, {"contaminated": None}),
+              (3, {"task": "vanished_task"})]
+    for index, fields in layout:
+        row, _ = rollout(judge_home, index, **fields)
+        baselines.store(row, path=judge_config.RESULT_STORE)
+    row, _ = rollout(judge_home, 4)
+    del row["contaminated"]
+    row["run_key"] = "run-key-04"
+    baselines.store(row, path=judge_config.RESULT_STORE)
+    _, out = run_sheet(judge_home)
+    draft = json.loads((out / "calibration-draft.json").read_text())
+    assert [entry["run_key"] for entry in draft["trajectories"]] == ["run-key-00"]
+
+
+def test_sheet_refuses_to_overwrite_draft_without_force(judge_home: Path, sheet_panel: list[str],
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    seed_sheet_store(judge_home)
+    _, out = run_sheet(judge_home)
+    draft = out / "calibration-draft.json"
+    draft.write_text('{"hand": "labels"}')
+    assert run_sheet(judge_home)[0] == 1
+    assert "--force" in capsys.readouterr().err and draft.read_text() == '{"hand": "labels"}'
+    assert run_sheet(judge_home, "--force")[0] == 0
+    assert set(json.loads(draft.read_text())) == {"tasks", "trajectories"}
+
+
+@pytest.mark.parametrize("count", ["0", "-3", "x"])
+def test_sheet_count_must_be_positive_int(judge_home: Path, sheet_panel: list[str], count: str) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        run_sheet(judge_home, "--count", count)
+    assert exit_info.value.code == 2

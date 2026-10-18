@@ -89,9 +89,13 @@ def _summarize(value: object, limit: int = 160) -> str:
 
 
 def _pick_rollouts(count: int) -> tuple[int, list[dict]]:
-    """Eligible rows as in ``core.load_calibration``, picked round-robin over sorted (task, mode) cells."""
+    """Rows ``core.load_calibration`` accepts (task resolves, trajectory file exists, contaminated is False).
+
+    Picked round-robin over sorted (task, mode) cells.
+    """
     stored = baselines.completed_by_key(baselines.load_rows(core.config.RESULT_STORE))
     eligible = [row for row in stored.values() if row.get("contaminated") is False
+                and core.default_resolve_task(row.get("task")) is not None
                 and row.get("trajectory_path") and Path(row["trajectory_path"]).is_file()]
     by_cell: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
     for row in sorted(eligible, key=lambda item: item["run_key"]):
@@ -106,10 +110,18 @@ def _pick_rollouts(count: int) -> tuple[int, list[dict]]:
 
 
 def _sheet(args: argparse.Namespace) -> int:
-    panel = panels.load_panel(args.panel, store_path=core.config.RESULT_STORE)
-    panel.register(run.TASKS)
+    draft_path = args.out / "calibration-draft.json"
+    if draft_path.exists() and not args.force:
+        print(f"error: {draft_path} exists and may hold hand labels; pass --force to overwrite", file=sys.stderr)
+        return 1
+    names = panels.member_ids(args.panel)
+    prompts = {name: core.default_resolve_task(name) for name in names}
+    unresolved = [name for name, task in prompts.items() if task is None]
+    if unresolved:
+        print(f"error: panel task(s) do not resolve (external instances need a cached download): "
+              f"{', '.join(unresolved)}", file=sys.stderr)
+        return 1
     eligible, picked = _pick_rollouts(args.count)
-    names = sorted({*panel.cheap, *panel.dev, *panel.test})
     lines = ["# Judge calibration labeling sheet", "",
              f"{eligible} eligible rollouts in the store; {len(picked)} picked (round-robin by task and arm).",
              "Fill `calibration-draft.json`, then copy it to `benchmark/judge/calibration.json`.", "",
@@ -117,7 +129,7 @@ def _sheet(args: argparse.Namespace) -> int:
              "`strong`: structural tools (outlines, symbol search, callers, tagged edits) clearly help. "
              "`weak`: they help a little. `none`: plain reads and grep are as good.", ""]
     for name in names:
-        lines += [f"### {name}", "", f"> {_summarize(getattr(run.TASKS[name], 'prompt', ''), 600)}", "", "label: ____", ""]
+        lines += [f"### {name}", "", f"> {_summarize(getattr(prompts[name], 'prompt', ''), 600)}", "", "label: ____", ""]
     lines += ["## Part B: rollout verdicts", "",
               "`apt`: structural tools where they help, plain tools where they do not. "
               "`missed`: structural tools would have saved real work and were not used. "
@@ -134,9 +146,19 @@ def _sheet(args: argparse.Namespace) -> int:
              "trajectories": [{"run_key": row["run_key"], "verdict": ""} for row in picked]}
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "labeling-sheet.md").write_text("\n".join(lines))
-    (args.out / "calibration-draft.json").write_text(json.dumps(draft, indent=2) + "\n")
+    draft_path.write_text(json.dumps(draft, indent=2) + "\n")
     print(f"eligible={eligible} picked={len(picked)} tasks={len(names)} out={args.out}")
     return 0
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return number
 
 
 def _positive(value: str) -> float:
@@ -154,7 +176,8 @@ def main(argv: list[str] | None = None, *, client: core.JudgeClient | None = Non
     label.add_argument("--tasks", required=True, help="comma-separated task names or external instance IDs")
     calibrate = commands.add_parser("calibrate", help="measure agreement with benchmark/judge/calibration.json")
     sheet = commands.add_parser("sheet", help="write a hand-labeling sheet and calibration draft; no model call")
-    sheet.add_argument("--count", type=int, default=24, help="rollouts to pick (default 24)")
+    sheet.add_argument("--count", type=_positive_int, default=24, help="rollouts to pick (default 24)")
+    sheet.add_argument("--force", action="store_true", help="overwrite an existing calibration-draft.json")
     sheet.add_argument("--panel", type=Path, default=_REPO_ROOT / "benchmark/panels/gepa-v1.json")
     sheet.add_argument("--out", type=Path, default=_REPO_ROOT / ".cheese/judge", help="output directory")
     for command in (label, calibrate):
