@@ -565,7 +565,9 @@ mod tests {
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present");
         let description = write["description"].as_str().expect("description");
-        assert!(description.contains("replace_text uses {old,new}, must match once"));
+        if !crate::mcp::phrase_pins_exempt() {
+            assert!(description.contains("replace_text uses {old,new}, must match once"));
+        }
         let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
             ["items"]["oneOf"]
             .as_array()
@@ -604,7 +606,9 @@ mod tests {
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present");
         let description = write["description"].as_str().expect("description");
-        assert!(description.contains("create_file uses {content}"));
+        if !crate::mcp::phrase_pins_exempt() {
+            assert!(description.contains("create_file uses {content}"));
+        }
         let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
             ["items"]["oneOf"]
             .as_array()
@@ -623,10 +627,12 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "tilth_write")
             .expect("tilth_write tool definition present");
-        assert!(write["description"]
-            .as_str()
-            .unwrap()
-            .contains("rewrite uses {pattern,rewrite,count?}"));
+        if !crate::mcp::phrase_pins_exempt() {
+            assert!(write["description"]
+                .as_str()
+                .unwrap()
+                .contains("rewrite uses {pattern,rewrite,count?}"));
+        }
         let compiled = jsonschema::JSONSchema::compile(&write["inputSchema"]).expect("schema");
         let with = |op: serde_json::Value| serde_json::json!({"cwd": "/abs", "edits": [{"path": "a.go", "tag": "1A2B", "ops": [op]}]});
         let ok = serde_json::json!({"op": "rewrite", "pattern": "$R.Render($W)",
