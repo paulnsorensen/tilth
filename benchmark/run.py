@@ -39,6 +39,7 @@ import baselines
 import erosion
 import external
 import external.contamination
+import external.proc
 import external.preflight
 import panels
 from spend import BudgetBusyError, SpendLedger, hold_run_lock, plan_budget_id, settle_failed
@@ -270,8 +271,12 @@ def build_runner_env(
     bare: bool = False,
     ambient: Optional[Mapping[str, str]] = None,
     tilth_bin: object = _DEFAULT_TILTH_BIN,
+    language: str | None = None,
 ) -> dict[str, str]:
-    """Build a minimal environment for one runner subprocess."""
+    """Build a minimal environment for one runner subprocess.
+
+    ``language`` is the task's language. The agent's own builds then get the C settings its grade uses.
+    """
     source = os.environ if ambient is None else ambient
     if runner == "claude":
         auth.refuse_env(source)
@@ -286,6 +291,8 @@ def build_runner_env(
     }
     # Pin the agent CLI for the whole run: a mid-run update changes the run key.
     env["DISABLE_AUTOUPDATER"] = "1"
+    if language is not None:
+        env.update(external.proc.c_build_env(language))
 
     selected_tilth_bin = TILTH_BIN if tilth_bin is _DEFAULT_TILTH_BIN else tilth_bin
     if isinstance(selected_tilth_bin, str):
@@ -1225,6 +1232,7 @@ def _run_single_in_repo(
         opencode_config=opencode_config,
         bare=bare,
         tilth_bin=mode.binary_path,
+        language=task.language,
     )
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)

@@ -54,6 +54,15 @@ def toolchain_env(home: Path, source: Mapping[str, str] | None = None) -> dict[s
     env["HOME"] = str(home)
     return env
 
+
+def c_build_env(language: str) -> dict[str, str]:
+    """The C compiler settings that a build of a ``language`` project needs, for grades and agent cells alike.
+
+    GCC 15 compiles C23 by default. C23 refuses the K&R prototypes in bundled C crates such as onig_sys.
+    """
+    return {"CFLAGS": "-std=gnu17"} if language == "rust" else {}
+
+
 def isolate_caches(env: dict[str, str], root: Path, language: str) -> None:
     """Give one grade private caches under ``root``.
 
