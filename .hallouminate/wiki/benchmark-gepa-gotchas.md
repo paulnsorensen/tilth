@@ -33,6 +33,9 @@ These items come from the external-tasks spec (`9e84659:.cheese/specs/bench-exte
 - A FeatureBench mask `patch` can also edit a FAIL_TO_PASS file. The row `pydata__xarray.97f3a746.test_backends_chunks.fa55f68a.lv1` removes an import line from `xarray/tests/test_backends_chunks.py`. The `test_patch` is a deleted-file diff against `base_commit`, so it does not apply after a mask hunk edits that file. The mask applies forward (`mask_patch_forward`, `benchmark/external/featurebench.py:118`).
 - `repo_settings.docker_specs.run_args.cuda_visible_devices` is not a GPU signal, because CPU-only Pareto-12 rows set it. The curated CPU candidate list and an admission round trip on a CPU host keep GPU tasks out.
 
+
+- Each Rust or Go grade copies the host Cargo registry and Go module cache (`isolate_caches`, `benchmark/external/proc.py:66-101`). The copy uses `cp -a --reflink=auto`, which is a full copy on ext4. On a developer host that is about 2.7 GB per grade. Tests that grade fixture projects must point `CARGO_HOME` and `GOMODCACHE` at empty directories (`empty_dependency_caches`, `benchmark/tests/external_support.py:65`). The fixture projects have no dependencies. Without this, `test_invariants` took 163 s and the Rust preflight tests took about 50 s each on such a host. CI runners have near-empty caches, so CI does not show the cost. Do not make it autouse: `test_evolve` runs a real `cargo check --locked` on tilth, which needs the real registry. Production grades still pay this copy cost.
+
 ## Symptoms and first checks
 
 Use this list to route a failure to the right section above.

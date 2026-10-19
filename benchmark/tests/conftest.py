@@ -210,6 +210,7 @@ def link_suite_site(venv: str) -> None:
 def external_bench(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExternalBench:
     harness = ExternalBench(data=tmp_path / "bench-data", upstream=tmp_path / "upstream")
     monkeypatch.setenv("TILTH_BENCH_DATA", str(harness.data))
+    external_support.empty_dependency_caches(monkeypatch, tmp_path)
     for repo, language in external_support.REPO_LANGUAGES.items():
         monkeypatch.setitem(external.data.REPO_LANGUAGES, repo, language)
     monkeypatch.setattr(external.data, "UPSTREAM_URL", f"file://{harness.upstream}/{{repo}}.git")

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -55,80 +56,105 @@ def main() -> None:
     task = GinRenderContextTask()
     with tempfile.TemporaryDirectory(prefix="gin-render-preflight-") as temp:
         root = Path(temp)
-        original = root / "original"
-        clone(original)
-        ok, reason = task.check_correctness("", str(original))
-        assert_rejected(ok, reason)
-        print("original: rejected", reason)
 
-        reference = root / "reference"
-        clone(reference)
-        apply_reference(reference)
-        binding_test = (reference / "binding" / "json_test.go").read_text()
-        assert "(render.PureJSON{Data: obj}).Render(context.Background(), w)" in binding_test
-        files, sites, added, removed = reference_size(reference)
-        print(f"reference size: {files} files, {sites} edit sites, +{added}/-{removed} lines")
-        ok, reason = task.check_correctness("", str(reference))
-        assert ok, reason
-        print("reference: accepted", reason)
-        (reference / "render" / "context_helper.go").write_text("package render\n")
-        (reference / "context_render_context_test.go").write_text("package gin\n")
-        ok, reason = task.check_correctness("", str(reference))
-        assert ok, reason
-        print("new local helper and test: accepted", reason)
+        def original() -> str:
+            target = root / "original"
+            clone(target)
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            return f"original: rejected {reason}"
 
-        unmigrated_binding = root / "unmigrated-binding"
-        clone(unmigrated_binding)
-        apply_reference(unmigrated_binding)
-        shutil.copy2(FIXTURE / "binding" / "json_test.go", unmigrated_binding / "binding" / "json_test.go")
-        ok, reason = task.check_correctness("", str(unmigrated_binding))
-        assert_rejected(ok, reason)
-        assert "Candidate tests failed: go test" in reason, reason
-        print("unmigrated binding caller: rejected", reason.splitlines()[0])
-        incomplete = root / "incomplete"
-        clone(incomplete)
-        apply_reference(incomplete)
-        shutil.copy2(FIXTURE / "render" / "bson.go", incomplete / "render" / "bson.go")
-        ok, reason = task.check_correctness("", str(incomplete))
-        assert_rejected(ok, reason)
-        print("incomplete API: rejected", reason.splitlines()[0])
+        def reference() -> str:
+            target = root / "reference"
+            clone(target)
+            apply_reference(target)
+            binding_test = (target / "binding" / "json_test.go").read_text()
+            assert "(render.PureJSON{Data: obj}).Render(context.Background(), w)" in binding_test
+            files, sites, added, removed = reference_size(target)
+            lines = [f"reference size: {files} files, {sites} edit sites, +{added}/-{removed} lines"]
+            ok, reason = task.check_correctness("", str(target))
+            assert ok, reason
+            lines.append(f"reference: accepted {reason}")
+            return "\n".join(lines)
 
-        cancellation = root / "cancellation"
-        clone(cancellation)
-        apply_reference(cancellation)
-        path = cancellation / "render" / "json.go"
-        text = path.read_text()
-        assert CHECK in text
-        path.write_text(text.replace(CHECK, "", 1))
-        test_path = cancellation / "render" / "render_test.go"
-        original_test = test_path.read_text()
-        weakened_test = original_test.replace('assert.Equal(t, "application/json; charset=utf-8", w.Header().Get("Content-Type"))', '// removed assertion', 1)
-        assert weakened_test != original_test
-        test_path.write_text(weakened_test)
-        ok, reason = task.check_correctness("", str(cancellation))
-        assert_rejected(ok, reason)
-        print("missing cancellation with weakened test: rejected", reason.splitlines()[0])
+        def local_helper() -> str:
+            target = root / "local-helper"
+            clone(target)
+            apply_reference(target)
+            (target / "render" / "context_helper.go").write_text("package render\n")
+            (target / "context_render_context_test.go").write_text("package gin\n")
+            ok, reason = task.check_correctness("", str(target))
+            assert ok, reason
+            return f"new local helper and test: accepted {reason}"
 
-        ordering = root / "ordering"
-        clone(ordering)
-        apply_reference(ordering)
-        path = ordering / "render" / "json.go"
-        text = path.read_text()
-        assert CHECK in text
-        path.write_text(text.replace(CHECK, '\tw.Header().Set("X-Leak", "yes")\n' + CHECK, 1))
-        ok, reason = task.check_correctness("", str(ordering))
-        assert_rejected(ok, reason)
-        print("header before cancellation: rejected", reason.splitlines()[0])
-        dispatch = root / "dispatch"
-        clone(dispatch)
-        apply_reference(dispatch)
-        path = dispatch / "context.go"
-        text = path.read_text()
-        text = text.replace("renderContext = c.Request.Context()", "renderContext = context.Background()", 1)
-        path.write_text(text)
-        ok, reason = task.check_correctness("", str(dispatch))
-        assert_rejected(ok, reason)
-        print("missing dispatch: rejected", reason.splitlines()[0])
+        def unmigrated_binding() -> str:
+            target = root / "unmigrated-binding"
+            clone(target)
+            apply_reference(target)
+            shutil.copy2(FIXTURE / "binding" / "json_test.go", target / "binding" / "json_test.go")
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            assert "Candidate tests failed: go test" in reason, reason
+            return f"unmigrated binding caller: rejected {reason.splitlines()[0]}"
+
+        def incomplete() -> str:
+            target = root / "incomplete"
+            clone(target)
+            apply_reference(target)
+            shutil.copy2(FIXTURE / "render" / "bson.go", target / "render" / "bson.go")
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            return f"incomplete API: rejected {reason.splitlines()[0]}"
+
+        def cancellation() -> str:
+            target = root / "cancellation"
+            clone(target)
+            apply_reference(target)
+            path = target / "render" / "json.go"
+            text = path.read_text()
+            assert CHECK in text
+            path.write_text(text.replace(CHECK, "", 1))
+            test_path = target / "render" / "render_test.go"
+            original_test = test_path.read_text()
+            weakened_test = original_test.replace('assert.Equal(t, "application/json; charset=utf-8", w.Header().Get("Content-Type"))', '// removed assertion', 1)
+            assert weakened_test != original_test
+            test_path.write_text(weakened_test)
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            return f"missing cancellation with weakened test: rejected {reason.splitlines()[0]}"
+
+        def ordering() -> str:
+            target = root / "ordering"
+            clone(target)
+            apply_reference(target)
+            path = target / "render" / "json.go"
+            text = path.read_text()
+            assert CHECK in text
+            path.write_text(text.replace(CHECK, '\tw.Header().Set("X-Leak", "yes")\n' + CHECK, 1))
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            return f"header before cancellation: rejected {reason.splitlines()[0]}"
+
+        def dispatch() -> str:
+            target = root / "dispatch"
+            clone(target)
+            apply_reference(target)
+            path = target / "context.go"
+            text = path.read_text()
+            text = text.replace("renderContext = c.Request.Context()", "renderContext = context.Background()", 1)
+            path.write_text(text)
+            ok, reason = task.check_correctness("", str(target))
+            assert_rejected(ok, reason)
+            return f"missing dispatch: rejected {reason.splitlines()[0]}"
+
+        # Each control grades its own clone in its own temp trees.
+        # The Go build cache is safe to share, so the controls run in parallel.
+        controls = (original, reference, local_helper, unmigrated_binding, incomplete, cancellation, ordering,
+                    dispatch)
+        with ThreadPoolExecutor(max_workers=len(controls)) as pool:
+            futures = [pool.submit(control) for control in controls]
+            for future in futures:
+                print(future.result())
 
 
 if __name__ == "__main__":

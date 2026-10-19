@@ -12,6 +12,8 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 FIXTURES = Path(__file__).parent / "fixtures" / "external"
 OUTPUTS = FIXTURES / "outputs"
 
@@ -60,6 +62,18 @@ def write_tree(root: Path, files: Mapping[str, str]) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
+
+
+def empty_dependency_caches(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Point the host Cargo home and Go module cache at empty directories under ``root``.
+
+    Each grade copies these host caches (``proc.isolate_caches``). The fixture projects have no
+    dependencies, so a copy of a developer's real caches, often gigabytes, adds only time.
+    """
+    for name in ("CARGO_HOME", "GOMODCACHE"):
+        path = root / "host-caches" / name.lower()
+        path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(name, str(path))
 
 
 def build_upstream(repo: str, files: Mapping[str, str], root: Path) -> tuple[Path, str]:

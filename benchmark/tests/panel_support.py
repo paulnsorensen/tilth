@@ -210,6 +210,7 @@ def seed_synthetic_data(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     data_dir = tmp_path / "bench-data"
     upstream = tmp_path / "upstream"
     monkeypatch.setenv("TILTH_BENCH_DATA", str(data_dir))
+    external_support.empty_dependency_caches(monkeypatch, tmp_path)
     for repo, language in SYNTHETIC_REPO_LANGUAGES.items():
         monkeypatch.setitem(external.data.REPO_LANGUAGES, repo, language)
     for repo, files in read(SYNTHETIC / "projects.json").items():
