@@ -1952,6 +1952,23 @@ mod tests {
         response
     }
 
+    /// Return the response at `ceiling`, which must not be budget-limited, and a
+    /// budget bound just above its size. A budget above the bound returns that
+    /// same response, so scans and sweeps stop at the bound. The probe one step
+    /// above the bound checks this premise.
+    fn untrimmed_bound(h: &Harness, cwd: &Path, entry: &Value, ceiling: u64) -> (Value, u64) {
+        let full = search_at(h, &Session::new(), cwd, entry, ceiling);
+        assert!(full["results"][0]["budget_limited"] != true, "{full}");
+        let size = crate::types::estimate_tokens(full.to_string().len() as u64);
+        let bound = ceiling.min((size + 64).next_multiple_of(4));
+        let above = search_at(h, &Session::new(), cwd, entry, bound + 4);
+        assert_eq!(
+            above["results"][0], full["results"][0],
+            "budgets above the bound must return the untrimmed response"
+        );
+        (full, bound)
+    }
+
     /// Search `h.session` at the loosest budget where `trimmed` holds. Probes
     /// use throwaway sessions so only the returned search records seen lines.
     fn trimmed_search(
@@ -1960,7 +1977,8 @@ mod tests {
         entry: &Value,
         trimmed: impl Fn(&Value) -> bool,
     ) -> Value {
-        let budget = (1..1500u64)
+        let (_, bound) = untrimmed_bound(h, cwd, entry, 1499 * 4);
+        let budget = (1..=bound / 4)
             .rev()
             .map(|step| step * 4)
             .find(|&budget| {
@@ -2051,7 +2069,8 @@ mod tests {
             }
             let h = Harness::new();
             let entry = json!({"pattern": "wrap($A)", "language": "python"});
-            for budget in (1..1200).step_by(4) {
+            let (_, bound) = untrimmed_bound(&h, dir.path(), &entry, 1200);
+            for budget in (1..1200).step_by(4).take_while(|&b| b <= bound) {
                 let session = Session::new();
                 let response = search_at(&h, &session, dir.path(), &entry, budget);
                 for index in 0..file_count {
