@@ -333,8 +333,10 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     return world
 
 
-def evolve_args(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6") -> list[str]:
-    args = ["--panel", str(world.tmp / "panel.json"), "--seed-sha", world.seed_sha, "--repo", str(world.repo),
+def evolve_args(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6",
+                strict: bool = False) -> list[str]:
+    """Evolve argv; tests run non-strict unless ``strict``, because their fake binaries cannot answer a hook."""
+    args = ([] if strict else ["--no-strict-file-tools"]) + ["--panel", str(world.tmp / "panel.json"), "--seed-sha", world.seed_sha, "--repo", str(world.repo),
             "--max-metric-calls", calls, "--model", MODEL, "--run-id", "run1", "--cell-estimate-usd", "0.1",
             "--reruns", "1", "--plateau", "5"]
     if max_usd is not None:
@@ -408,14 +410,18 @@ def deps(world: World, **overrides: object) -> dict:
             **overrides}
 
 
-def build(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", **overrides: object):
+def build(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,
+          **overrides: object):
     from evolve import cli
-    return cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls), **deps(world, **overrides))
+    return cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
+                     **deps(world, **overrides))
 
 
-def main(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", **overrides: object) -> int:
+def main(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,
+         **overrides: object) -> int:
     from evolve import cli
-    return cli.main(evolve_args(world, *extra, max_usd=max_usd, calls=calls), **deps(world, **overrides))
+    return cli.main(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
+                    **deps(world, **overrides))
 
 
 def log_text(world: World, run_id: str = "run1") -> str:

@@ -26,7 +26,7 @@ from judge import core as judge
 from judge import store as judge_store
 from spend import SpendLedger
 
-from . import engine
+from . import engine, hookgate
 from .calls import PaidCalls, StopState
 from .candidate import content_id
 from .finish import REPIN_NOTE, PRClient, outside_allowlist
@@ -68,6 +68,8 @@ class Settings:
     panel_path: Path
     # The claude CLI alias "sonnet" for reflection and the proposer; the judge model does not move them.
     helper_model: str = "sonnet"
+    # Strict cells guard Bash with the hook: candidates run their own hook, the baseline runs the seed's.
+    strict_file_tools: bool = True
 
 
 @dataclass(eq=False)
@@ -81,6 +83,7 @@ class Cascade:
     stage: str | None = None
     tail: str = ""
     just_check_ok: bool | None = None
+    hook_ok: bool | None = None
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
     cheap_rows: list[dict] = field(default_factory=list)
@@ -108,7 +111,7 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check", "build"}:
+        if self.stage in {"apply", "just check", "build", "hook gate"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -209,7 +212,7 @@ class Evolution:
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
                                     cell_estimate_usd=self.settings.cell_estimate_usd,
                                     max_budget_usd=self.settings.cell_budget_usd, store_only=store_only,
-                                    repo=self.settings.repo)
+                                    repo=self.settings.repo, **self._strict_plan_kwargs())
         except run.PlanStopped as stopped:
             self.log(f"cells: stopped ({stopped})")
             self.stop.set(stopped.reason)
@@ -217,6 +220,16 @@ class Evolution:
         for row in rows:
             correct(row)
         return rows
+
+    def _strict_plan_kwargs(self) -> dict:
+        if not self.settings.strict_file_tools:
+            return {}
+        return {"strict_file_tools": True, "hook_sha": self.settings.seed_sha}
+
+    def _strict_identity_kwargs(self) -> dict:
+        if not self.settings.strict_file_tools:
+            return {}
+        return {**self._strict_plan_kwargs(), "hook_repo": self.settings.repo}
 
     def new_cascade(self, candidate: Mapping[str, str]) -> Cascade:
         cid = content_id(candidate)
@@ -236,7 +249,8 @@ class Evolution:
             cost += run.estimate_cell_cost(history, task=cell.task, mode=CANDIDATE_MODE, model=model,
                                            run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         for cell in self._cells(self.panel.test, BASELINE_MODE, self._reps()):
-            if run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd)["run_key"] not in stored:
+            if run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd,
+                                    **self._strict_identity_kwargs())["run_key"] not in stored:
                 cost += run.estimate_cell_cost(history, task=cell.task, mode=BASELINE_MODE, model=model,
                                                run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         return cost
@@ -246,17 +260,35 @@ class Evolution:
         print(f"error: {message}", file=sys.stderr)
         return 2
 
+    def _seed_hook_preflight(self) -> int | None:
+        """Refuse a strict run, before any paid call, when the seed's own hook gets a corpus row wrong."""
+        try:
+            binary = run.build_candidate(self.settings.seed_sha, repo=self.settings.repo).binary_path
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", None) or ""
+            return self.refuse("seed hook does not build: " + tail(f"{error}\n{detail}".strip()))
+        failures = hookgate.corpus_failures(binary)
+        if failures:
+            return self.refuse("the seed hook fails the frozen hook corpus (strict runs need a faithful seed hook):\n"
+                               + "\n".join(failures))
+        self.log("hook: seed hook passes the frozen corpus in both hint modes")
+        return None
+
     def preflight(self) -> int | None:
         """Hold the finish reserve, label every panel task, and calibrate; an exit code when the run is refused.
 
         A drifted cheap, dev, or test-split baseline cell refuses the run here, before any paid call, unless
         ``--refreeze-baselines`` lets finish buy it again.
         """
+        if self.settings.strict_file_tools:
+            if (code := self._seed_hook_preflight()) is not None:
+                return code
         if not self.settings.refreeze_baselines:
             baseline_cells = self._cells((*self.panel.cheap, *self.panel.dev, *self.panel.test), BASELINE_MODE,
                                          self._reps())
             try:
-                run.check_baseline_drift(baseline_cells, panel=self.panel, max_budget_usd=self.settings.cell_budget_usd)
+                run.check_baseline_drift(baseline_cells, panel=self.panel, max_budget_usd=self.settings.cell_budget_usd,
+                                         **self._strict_identity_kwargs())
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
         # The estimate counts every unstored baseline test cell, so the reserve over-counts them; that error is kept
@@ -366,10 +398,30 @@ class Evolution:
             self.materializer.release(result.sha)
             if not ok:
                 return self._fail(result, "just check", tail(output))
+        if self.settings.strict_file_tools and not result.hook_ok:
+            if (failed := self._hook_gate(result)) is not None:
+                return failed
         try:
             return self._tiers(result)
+        except run.HookProbeFailed as failed:
+            return self._fail(result, "hook gate", tail(str(failed)))
         except run.CandidateBuildFailed as failed:
             return self._fail(result, "build", tail(str(failed)))
+
+    def _hook_gate(self, result: Cascade) -> Cascade | None:
+        """Run the corpus through the candidate's hook before any cell; the failed cascade, or None when it passes."""
+        try:
+            binary = run.build_candidate(result.sha, repo=self.settings.repo).binary_path
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", None) or ""
+            return self._fail(result, "build", tail(f"{error}\n{detail}".strip()))
+        failures = hookgate.corpus_failures(binary)
+        if failures:
+            shown = failures[:TAIL_LINES - 1]
+            return self._fail(result, "hook gate", "The candidate's Bash hook fails the frozen hook corpus:\n"
+                              + "\n".join(shown))
+        result.hook_ok = True
+        return None
 
     def _fail(self, result: Cascade, stage: str, output: str = "") -> Cascade:
         """Mark ``result`` failed at ``stage`` and log the stage with its failure tail."""
