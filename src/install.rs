@@ -268,6 +268,47 @@ fn hook_entry(target: &HookTarget, command: &str) -> Value {
     Value::Object(entry)
 }
 
+/// Matcher-group shapes: replace only tilth handlers inside groups. A tilth handler in a
+/// group with the host's exact matcher is replaced in place; otherwise every tilth handler
+/// goes and a new group is appended. Other handlers and groups stay as they were.
+fn upsert_nested(entries: &mut Vec<Value>, target: &HookTarget, new: Value, own_prefix: &str) {
+    let handler = new["hooks"][0].clone();
+    let is_tilth = |h: &Value| {
+        h.get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| is_tilth_hook_command(c, own_prefix))
+    };
+    let exact = |g: &Value| g.get("matcher").and_then(Value::as_str) == target.matcher;
+    let mut placed = false;
+    for group in entries.iter_mut() {
+        let in_exact = exact(group);
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut kept = Vec::with_capacity(hooks.len());
+        let mut removed = false;
+        for h in hooks.drain(..) {
+            if !is_tilth(&h) {
+                kept.push(h);
+            } else if in_exact && !placed {
+                kept.push(handler.clone());
+                placed = true;
+                removed = true;
+            } else {
+                removed = true;
+            }
+        }
+        *hooks = kept;
+        if removed && hooks.is_empty() {
+            group["hooks"] = Value::Null;
+        }
+    }
+    entries.retain(|g| !g.get("hooks").is_some_and(Value::is_null));
+    if !placed {
+        entries.push(new);
+    }
+}
+
 /// Put exactly one tilth entry in the event array. A stale tilth entry is replaced in
 /// place; every other entry stays as it was.
 fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result<(), String> {
@@ -292,19 +333,23 @@ fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result
         .ok_or_else(|| format!("{} is not a JSON array", target.event))?;
     let new = hook_entry(target, command);
     let own_prefix = &command[..command.len() - target.family.len()];
-    match entries
-        .iter()
-        .position(|e| is_tilth_hook_entry(e, own_prefix))
-    {
-        Some(first) => {
-            entries[first] = new;
-            let mut index = 0;
-            entries.retain(|e| {
-                index += 1;
-                index - 1 <= first || !is_tilth_hook_entry(e, own_prefix)
-            });
+    if target.nested {
+        upsert_nested(entries, target, new, own_prefix);
+    } else {
+        match entries
+            .iter()
+            .position(|e| is_tilth_hook_entry(e, own_prefix))
+        {
+            Some(first) => {
+                entries[first] = new;
+                let mut index = 0;
+                entries.retain(|e| {
+                    index += 1;
+                    index - 1 <= first || !is_tilth_hook_entry(e, own_prefix)
+                });
+            }
+            None => entries.push(new),
         }
-        None => entries.push(new),
     }
     Ok(())
 }
