@@ -404,3 +404,99 @@ def test_a_hook_sha_without_src_hook_fails_loudly_instead_of_keying(tmp_path: Pa
 def test_a_hook_sha_that_looks_like_an_option_is_refused(hook_history: dict) -> None:
     with pytest.raises((ValueError, subprocess.CalledProcessError)):
         run._hook_source_key("--all", hook_history["repo"])
+
+
+# --- press round 2: attacks on the denial-text classifier, with shapes recorded in real Oct-20 strict runs ---
+#
+# Real shapes (benchmark/results/strict_go_f4db1e6_sonnet_streams, 182 Bash results, all string content):
+#   hook denial  is_error=True  "PreToolUse:Bash hook error: [<python> <guard>]: <reason>\n"   (83 of 83 start with the marker)
+#   cmd failure  is_error=True  "Exit code N\n<combined output>"   (115 - 83 = 32; none empty, none bare of output)
+# A silent non-zero exit is "Exit code N", never empty text.
+
+_REAL_DENIAL = ("PreToolUse:Bash hook error: [/usr/bin/python3 /x/guard.py]: "
+                "Only go test, go build, go vet, and gofmt -w on local Go files are allowed.\n")
+
+
+def _audit(raw: str, tmp_path: Path) -> int:
+    return run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_the_recorded_real_denial_text_counts_as_a_denial(tmp_path: Path) -> None:
+    assert _audit(_stream(_use("c1", "cat a.go"), _result("c1", _REAL_DENIAL)), tmp_path) == 1
+
+
+def test_a_silent_exit_one_from_a_denied_class_command_is_hook_loosened(tmp_path: Path) -> None:
+    # `grep -q x f` exiting 1 with no output reaches the stream as "Exit code 1", not as empty text.
+    raw = _stream(_use("c1", "grep -q x f"), _result("c1", "Exit code 1"))
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_a_denied_command_whose_failed_output_quotes_the_marker_is_hook_loosened(tmp_path: Path) -> None:
+    # `cat notes.md; false` ran, printed a file that quotes the marker, then exited 1. Real failures
+    # start with "Exit code N"; real denials start with the marker. A substring match misreads this as a denial.
+    text = "Exit code 1\nnotes: PreToolUse:Bash hook error: blocked earlier\n"
+    raw = _stream(_use("c1", "cat notes.md; false"), _result("c1", text))
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_a_denied_command_that_succeeded_printing_the_marker_is_hook_loosened(tmp_path: Path) -> None:
+    raw = _stream(_use("c1", "cat notes.md"), _result("c1", "PreToolUse:Bash hook error: in the notes", is_error=False))
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_a_denial_delivered_as_a_list_of_text_blocks_counts(tmp_path: Path) -> None:
+    blocks = [{"type": "text", "text": "PreToolUse:Bash hook error: "}, {"type": "text", "text": "blocked"}]
+    raw = _stream(_use("c1", "cat a.go"), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "c1", "is_error": True, "content": blocks}]}})
+
+    assert _audit(raw, tmp_path) == 1
+
+
+def test_a_failure_delivered_as_a_list_of_text_blocks_is_hook_loosened(tmp_path: Path) -> None:
+    blocks = [{"type": "text", "text": "Exit code 1\ncat: missing.go: No such file or directory"}]
+    raw = _stream(_use("c1", "cat missing.go"), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "c1", "is_error": True, "content": blocks}]}})
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_a_list_with_non_dict_parts_does_not_crash_the_classifier(tmp_path: Path) -> None:
+    raw = _stream(_use("c1", "cat a.go"), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "c1", "is_error": True,
+         "content": ["stray", {"type": "text", "text": _REAL_DENIAL}]}]}})
+
+    assert _audit(raw, tmp_path) == 1
+
+
+def test_interleaved_id_and_id_less_calls_audit_each_by_its_own_key(tmp_path: Path) -> None:
+    denied = _result("c1", _REAL_DENIAL)
+    allowed_only = _stream(_use("c1", "cat a.go"), denied, _use(None, "go test ./..."), _use("c2", "go vet ./..."))
+
+    assert _audit(allowed_only, tmp_path) == 1
+
+
+def test_an_id_less_denied_call_beside_a_valid_denial_is_hook_loosened(tmp_path: Path) -> None:
+    raw = _stream(_use("c1", "cat a.go"), _result("c1", _REAL_DENIAL), _use(None, "cat b.go"))
+
+    with pytest.raises(run.HookLoosenedError, match="cat b.go"):
+        _audit(raw, tmp_path)
+
+
+def test_a_result_cannot_be_paired_to_a_different_call_by_position(tmp_path: Path) -> None:
+    # c1 (denied class) has no result; the only result belongs to c2. c2's denial must not cover c1.
+    raw = _stream(_use("c1", "cat a.go"), _use("c2", "cat b.go"), _result("c2", _REAL_DENIAL))
+
+    with pytest.raises(run.HookLoosenedError, match="cat a.go"):
+        _audit(raw, tmp_path)
+
+
+def test_empty_error_text_is_the_only_unrecorded_shape_still_counted_as_denied(tmp_path: Path) -> None:
+    # Kept allowance: no real run produced empty error text, so it cannot mask a real failure.
+    assert _audit(_stream(_use("c1", "cat a.go"), _result("c1", "")), tmp_path) == 1
