@@ -496,3 +496,89 @@ fn press_shell_names_without_command_deny() {
         assert_eq!(run(Host::Claude, Hint::Tilth, &ev).0, 2, "{name}");
     }
 }
+
+// ---- press round 2 ----
+
+#[test]
+fn press2_device_dot_dot_variants_deny() {
+    assert_all_deny(&[
+        "cp f /dev/../dev/stdout",
+        "cp f /dev/fd/../stdout",
+        "cp f /./dev/stdout",
+        "cp f /dev/stdout/",
+        "cp f //dev/stdout",
+        "cp f /proc/./self/../self/fd/1",
+        "cp f /dev/././stderr",
+        "cp f --target-directory=/dev/./fd/1",
+    ]);
+}
+
+#[test]
+fn press2_grep_directories_recurse_spellings_deny() {
+    assert_all_deny(&[
+        "grep -drecurse x",
+        "grep --directories recurse x",
+        "grep --directories=recurse x",
+        "grep -nd recurse x",
+        "grep -rd skip x",
+        "grep -d skip -r x",
+        "egrep -d recurse x",
+    ]);
+}
+
+#[test]
+fn press2_grep_directories_abbreviations_deny() {
+    // GNU grep accepts unambiguous abbreviations of the ACTION and of long options.
+    assert_all_deny(&[
+        "grep -d rec x",
+        "grep -d r x",
+        "grep --directories=rec x",
+        "grep --rec x",
+        "grep --recurs x",
+        "grep --directo=recurse x",
+    ]);
+}
+
+#[test]
+fn press2_probe_version_flag_with_file_operand_allows() {
+    assert_all_allow(&[
+        "rg --version f",
+        "rg -V -e x .",
+        "rg --help --files",
+        "grep --help -r x .",
+        "command -v rg",
+        "command -v rg && command -v cat",
+    ]);
+}
+
+#[test]
+fn press2_probe_chains_do_not_launder_reads() {
+    assert_all_deny(&[
+        "command -v rg && rg x",
+        "command -v x; cat f",
+        "command -v x || cat f",
+        "command -v cat | xargs cat",
+        "command cat f",
+        "command -v cat; cat f",
+        "command -vp cat f",
+        "command -v x > f",
+        "command -v x >> f",
+        "command -v $(cat f)",
+        "command -v x & cat f",
+        "command -v x\ncat f",
+        "if command -v rg; then rg x; fi",
+        "command -v rg >/dev/stdout",
+    ]);
+}
+
+#[test]
+fn press2_version_flag_swallowed_as_value_still_denies() {
+    // The value of a valued flag is not a flag; rg then searches recursively.
+    assert_all_deny(&[
+        "rg --path-separator --version x",
+        "rg --context-separator --version x",
+        "grep --exclude-from --version x f",
+        "rg -e --version f",
+        "rg -- --version f",
+    ]);
+}
