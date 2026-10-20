@@ -244,15 +244,24 @@ fn wrapper_opts(name: &str) -> WrapOpts {
     }
 }
 
+/// A `VAR=value` word in a wrapper's argument list.
+fn is_assign_word(t: &str) -> bool {
+    t.contains('=') && !t.starts_with(['=', '-'])
+}
+
 /// Index of the first word after the wrapper's options, or `None` for an unknown option.
 fn skip_options(args: &[Arg], opts: &WrapOpts, assigns: bool) -> Option<usize> {
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         let t = arg.text.as_str();
         if t == "--" {
-            return Some(i + 1);
+            let mut j = i + 1;
+            while args.get(j).is_some_and(|a| is_assign_word(&a.text)) {
+                j += 1;
+            }
+            return Some(j);
         }
-        if assigns && t.contains('=') && !t.starts_with(['=', '-']) {
+        if assigns && is_assign_word(t) {
             i += 1;
         } else if t.len() < 2 || !t.starts_with('-') {
             break;

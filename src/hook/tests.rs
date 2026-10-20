@@ -712,6 +712,17 @@ fn cure1_wrappers_skip_option_values() {
 }
 
 #[test]
+fn cure3_assignments_after_terminator_are_skipped() {
+    assert_all_deny(&[
+        "env -- FOO=1 cat f",
+        "env -- A=1 B=2 grep x f",
+        "command env -- X=1 head f",
+        "sudo -- FOO=1 cat f",
+        "sudo -u root -- FOO=1 cat f",
+    ]);
+}
+
+#[test]
 fn cure1_wrapped_allowed_commands_stay_allowed() {
     assert_all_allow(&[
         "timeout -s KILL 5 go test ./...",
