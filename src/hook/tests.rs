@@ -734,3 +734,105 @@ fn cure1_unknown_wrapper_option_fails_closed() {
         "env -S 'cat f'",
     ]);
 }
+
+fn assert_rules(rows: &[(&str, &str)]) {
+    for (command, rule) in rows {
+        match verdict(command, Hint::Tilth) {
+            Verdict::Deny { rule: got, .. } => {
+                assert_eq!(got, *rule, "wrong rule for {command:?}");
+            }
+            Verdict::Allow => panic!("should deny: {command:?}"),
+        }
+    }
+}
+
+#[test]
+fn cure2_redirects_nested_under_a_heredoc_pass_their_words_to_the_command() {
+    assert_rules(&[
+        ("cat <<EOF 2>/dev/null f\nx\nEOF", "cat"),
+        ("cat <<EOF 2>/dev/null f g\nx\nEOF", "cat"),
+        ("grep x <<EOF 2>&1 f\nx\nEOF", "grep"),
+        ("cat <<EOF >/dev/null 2>&1 f\nx\nEOF", "cat"),
+        ("cat <<EOF >/dev/null 2>/dev/null f\nx\nEOF", "cat"),
+        ("cat <<EOF f\nx\nEOF", "cat"),
+        ("cat <<-EOF 2>/dev/null f\nx\nEOF", "cat"),
+        ("cat <<<x 2>/dev/null f", "cat"),
+        ("cat <<< x f", "cat"),
+        ("{ cat <<EOF 2>/dev/null f\nx\nEOF\n}", "cat"),
+        (
+            "true && cat <<EOF 2>/dev/null f\nx\nEOF",
+            "shell -c unresolved",
+        ),
+        ("cat <<EOF 2>/dev/null $F\nx\nEOF", "cat"),
+    ]);
+}
+
+#[test]
+fn cure2_heredoc_without_extra_words_still_allowed() {
+    assert_all_allow(&[
+        "go test ./... <<EOF 2>/dev/null\nx\nEOF",
+        "cargo build <<EOF >/dev/null 2>&1\nx\nEOF",
+        "cat <<EOF | wc -l\nx\nEOF",
+    ]);
+}
+
+#[test]
+fn cure2_shell_with_non_literal_script_denies() {
+    assert_rules(&[
+        ("sh $X <<<'cat f'", "shell -c unresolved"),
+        ("bash \"$S\"", "shell -c unresolved"),
+        (
+            "bash $(echo /dev/stdin) <<EOF\ncat f\nEOF",
+            "shell -c unresolved",
+        ),
+        ("echo cat f | sh $X", "shell -c unresolved"),
+        ("bash -e \"$S\" arg", "shell -c unresolved"),
+    ]);
+}
+
+#[test]
+fn cure2_xargs_arg_file_denies_as_input_read() {
+    assert_rules(&[
+        ("xargs -a f echo", "input redirect"),
+        ("xargs -af echo", "input redirect"),
+        ("xargs --arg-file=src/lib.rs echo", "input redirect"),
+        ("xargs --arg-file f echo", "input redirect"),
+        ("xargs -n1 -a f echo", "input redirect"),
+        ("xargs -0a f echo", "input redirect"),
+        ("sudo xargs -a f echo", "input redirect"),
+    ]);
+    assert_all_allow(&[
+        "xargs -a /dev/null echo",
+        "xargs -n1 echo",
+        "xargs -I -a echo",
+    ]);
+}
+
+#[test]
+fn cure2_wrappers_skip_leading_assignments() {
+    assert_rules(&[
+        ("sudo FOO=1 cat f", "cat"),
+        ("sudo -E FOO=1 cat f", "cat"),
+        ("doas FOO=1 cat f", "cat"),
+        ("nice FOO=1 cat f", "cat"),
+        ("nohup FOO=1 cat f", "cat"),
+        ("stdbuf -o L FOO=1 cat f", "cat"),
+        ("command FOO=1 cat f", "cat"),
+        ("exec FOO=1 cat f", "cat"),
+    ]);
+    assert_all_allow(&["sudo FOO=1 go test ./...", "nice FOO=1 make test"]);
+}
+
+#[test]
+fn cure2_time_output_option_is_a_write() {
+    assert_rules(&[
+        ("command time -o out.txt ls", "output redirect"),
+        ("env time --output=out.txt ls", "output redirect"),
+        ("command time -f %e -o out.txt ls", "output redirect"),
+        ("command time --output out.txt ls", "output redirect"),
+    ]);
+    assert_all_allow(&[
+        "command time -p make test",
+        "command time -o /dev/null make test",
+    ]);
+}

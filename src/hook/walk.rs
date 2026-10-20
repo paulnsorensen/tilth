@@ -180,8 +180,9 @@ impl Walker {
     }
 }
 
-/// Words a redirect carries beyond its target: the grammar repeats `destination` in a
-/// file redirect and `argument` after a heredoc marker, and the shell passes them to the command.
+/// Words a redirect carries beyond its target: the grammar repeats `destination` in a file
+/// redirect, and a heredoc marker is followed by arguments and further redirects. The shell
+/// passes all of them to the command. Heredoc parts and nested commands are not operands.
 fn redirect_words(node: Node, src: &[u8]) -> Vec<Arg> {
     let mut cursor = node.walk();
     match node.kind() {
@@ -191,11 +192,32 @@ fn redirect_words(node: Node, src: &[u8]) -> Vec<Arg> {
             .map(|d| arg_of(d, src))
             .collect(),
         "heredoc_redirect" => node
-            .children_by_field_name("argument", &mut cursor)
-            .map(|d| arg_of(d, src))
+            .named_children(&mut cursor)
+            .flat_map(|child| match child.kind() {
+                "file_redirect" | "heredoc_redirect" => redirect_words(child, src),
+                kind if is_structure(kind) => Vec::new(),
+                _ => vec![arg_of(child, src)],
+            })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Nodes under a heredoc redirect that are not words: the marker, the body, and nested commands.
+fn is_structure(kind: &str) -> bool {
+    matches!(
+        kind,
+        "heredoc_start"
+            | "heredoc_body"
+            | "heredoc_end"
+            | "herestring_redirect"
+            | "comment"
+            | "variable_assignment"
+    ) || kind.ends_with("_statement")
+        || matches!(
+            kind,
+            "command" | "pipeline" | "list" | "subshell" | "compound_statement"
+        )
 }
 
 fn is_here(kind: &str) -> bool {

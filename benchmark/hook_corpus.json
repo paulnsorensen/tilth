@@ -110,7 +110,15 @@
     {"command": "source $SCRIPT", "rule": "shell -c unresolved"},
     {"command": "timeout -s KILL 5 cat f", "rule": "cat"},
     {"command": "xargs -n 1 cat", "rule": "cat"},
-    {"command": "env --bogus go test", "rule": "shell -c unresolved"}
+    {"command": "env --bogus go test", "rule": "shell -c unresolved"},
+    {"command": "cat <<EOF 2>/dev/null f\nx\nEOF", "rule": "cat"},
+    {"command": "grep x <<EOF 2>&1 f\nx\nEOF", "rule": "grep"},
+    {"command": "sh $X <<<'cat f'", "rule": "shell -c unresolved"},
+    {"command": "bash \"$S\"", "rule": "shell -c unresolved"},
+    {"command": "xargs -a f echo", "rule": "input redirect"},
+    {"command": "xargs --arg-file=src/lib.rs echo", "rule": "input redirect"},
+    {"command": "sudo FOO=1 cat f", "rule": "cat"},
+    {"command": "command time -o out.txt ls", "rule": "output redirect"}
   ],
   "must_allow": [
     {"command": "go test ./..."},

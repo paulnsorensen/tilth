@@ -1,8 +1,8 @@
 //! The deny-list: one simple command in, an outcome out.
 
 use super::hints::{
-    Rule, AWK_INPLACE, DEVICE_PATH, GIT_APPLY, GIT_CAT_FILE, GIT_GREP, GIT_SHOW, JSON_TOOL, PERL_I,
-    SED_I, SHELL_STDIN, UNRESOLVED,
+    Rule, AWK_INPLACE, DEVICE_PATH, GIT_APPLY, GIT_CAT_FILE, GIT_GREP, GIT_SHOW, INPUT_REDIRECT,
+    JSON_TOOL, OUTPUT_REDIRECT, PERL_I, SED_I, SHELL_STDIN, UNRESOLVED,
 };
 
 /// One word of a simple command, with quotes removed.
@@ -285,6 +285,54 @@ fn skip_options(args: &[Arg], opts: &WrapOpts, assigns: bool) -> Option<usize> {
     Some(i.min(args.len()))
 }
 
+/// A wrapper option that reads or writes a file: `xargs -a FILE`, `time -o FILE`.
+fn option_file_rule(name: &str, given: &[Arg], opts: &WrapOpts) -> Option<Rule> {
+    let (short, long, rule) = match name {
+        "xargs" => ('a', "--arg-file", INPUT_REDIRECT),
+        "time" => ('o', "--output", OUTPUT_REDIRECT),
+        _ => return None,
+    };
+    let next = |i: usize| given.get(i).map(|a| a.text.as_str());
+    let mut i = 0;
+    while i < given.len() {
+        let t = given[i].text.as_str();
+        i += 1;
+        let mut value = None;
+        if t == "--" {
+            break;
+        } else if let Some(l) = t.strip_prefix("--") {
+            let (key, inline) = l.split_once('=').map_or((l, None), |(k, v)| (k, Some(v)));
+            let flag = format!("--{key}");
+            if flag == long {
+                value = inline.or_else(|| next(i));
+            } else if inline.is_none() && opts.long_val.contains(&flag.as_str()) {
+                i += 1;
+            }
+        } else if t.len() > 1 && t.starts_with('-') {
+            for (k, ch) in t[1..].char_indices() {
+                let after = &t[1 + k + ch.len_utf8()..];
+                if ch == short {
+                    value = if after.is_empty() {
+                        next(i)
+                    } else {
+                        Some(after)
+                    };
+                    break;
+                }
+                if opts.short_val.contains(ch) {
+                    i += usize::from(after.is_empty());
+                    break;
+                }
+            }
+        }
+        if let Some(v) = value {
+            let harmless = v == "/dev/null" || (name == "xargs" && v == "-");
+            return (!harmless).then_some(rule);
+        }
+    }
+    None
+}
+
 /// Strip wrapper commands. Returns the wrapped command and whether `xargs` feeds it operands.
 fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
     let mut xargs = false;
@@ -295,7 +343,12 @@ fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
             "env" | "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" | "stdbuf"
             | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" => {
                 xargs |= name == "xargs";
-                skip_options(rest, &wrapper_opts(name), name == "env").ok_or(UNRESOLVED)?
+                let opts = wrapper_opts(name);
+                let i = skip_options(rest, &opts, true).ok_or(UNRESOLVED)?;
+                if let Some(rule) = option_file_rule(name, &rest[..i], &opts) {
+                    return Err(rule);
+                }
+                i
             }
             _ => break,
         };
@@ -840,6 +893,7 @@ fn shell(args: &[Arg]) -> Outcome {
     match operand {
         Some(k) if c_mode => reparse(&args[k..=k]),
         Some(k) if stdin_flag || reads_stdin(&args[k]) => Outcome::Deny(SHELL_STDIN),
+        Some(k) if !args[k].literal || args[k].opaque => Outcome::Deny(UNRESOLVED),
         Some(_) => Outcome::Allow,
         None if c_mode || informational => Outcome::Allow,
         None => Outcome::Deny(SHELL_STDIN),
