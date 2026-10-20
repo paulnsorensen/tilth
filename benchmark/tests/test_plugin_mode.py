@@ -389,8 +389,10 @@ def keyed(bench, monkeypatch: pytest.MonkeyPatch):
 
     def identity(mode: ModeConfig, *, strict: bool = False, bare: bool = False) -> dict:
         monkeypatch.setitem(run.MODES, mode.name, mode)
+        monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
         return run.cell_identity("cell_a", mode.name, "sonnet5", 0, bare=bare, reasoning_effort=None,
-                                 max_budget_usd=DEFAULT_MAX_BUDGET_USD, strict_file_tools=strict)
+                                 max_budget_usd=DEFAULT_MAX_BUDGET_USD, strict_file_tools=strict,
+                                 hook_sha="h" if strict else None)
 
     return identity
 

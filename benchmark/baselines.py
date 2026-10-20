@@ -50,19 +50,20 @@ def harness_digest(
     max_budget_usd: float | None,
     mcp_shape: Mapping[str, Any],
     command: Sequence[str] = (),
-    bash_guard_sha256: str | None = None,
+    hook_source_key: str | None = None,
 ) -> str:
     """Hash the runner configuration a cell's agent sees.
 
     ``command`` is the runner argv template with per-cell paths normalized; it
     carries codex developer instructions, ``--disallowedTools``, the strict Bash
-    hook settings, and ``--setting-sources``. ``bash_guard_sha256`` hashes the
-    strict-mode Bash allowlist source, which the settings only name by path.
+    hook settings, and ``--setting-sources``. ``hook_source_key`` names the
+    strict-mode Bash hook source (``src/hook`` tree hash and ``Cargo.lock`` hash),
+    which the settings only name by binary path.
     """
     return canonical_digest({
         "system_prompt": system_prompt, "tools": tools, "strict_file_tools": strict_file_tools,
         "bare": bare, "max_budget_usd": max_budget_usd, "mcp_shape": mcp_shape,
-        "command": list(command), "bash_guard_sha256": bash_guard_sha256,
+        "command": list(command), "hook_source_key": hook_source_key,
     })
 
 

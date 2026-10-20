@@ -43,7 +43,6 @@ import external.proc
 import external.preflight
 import panels
 from spend import BudgetBusyError, SpendLedger, hold_run_lock, plan_budget_id, settle_failed
-from claude_bash_guard import allowed_command
 from config import (
     BENCHMARK_DIR,
     DEFAULT_MAX_BUDGET_USD,
@@ -619,23 +618,56 @@ _STRICT_SYSTEM_GUIDANCE = (
 )
 
 
-_BASH_GUARD = Path(__file__).with_name("claude_bash_guard.py")
+# The hashed command template names the baseline hook binary by placeholder: its path is a
+# host detail, and the hook source is keyed by _hook_source_key.
+_HOOK_BIN_PLACEHOLDER = "<hook-bin>"
 
 
-# The hashed command template names the hook by placeholder: the interpreter and
-# checkout paths are host details, and the guard's content is keyed by its hash.
-_STRICT_HOOK_PLACEHOLDER = "<python> <bash-guard>"
+class HookLoosenedError(RuntimeError):
+    """A strict cell ran a Bash call that the hook at ``hook_sha`` denies."""
 
 
-def _strict_bash_settings(hook_command: str | None = None) -> str:
-    if hook_command is None:
-        hook_command = f"{shlex.quote(str(Path(sys.executable).resolve()))} {shlex.quote(str(_BASH_GUARD.resolve()))}"
-    return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-        {"type": "command", "command": hook_command},
-    ]}]}})
+def _strict_bash_settings(hook_binary: str, hint: str) -> str:
+    # Exec form (no shell) and onFailure=block: a missing or crashing hook binary denies the call.
+    return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
+        "type": "command", "command": hook_binary, "args": ["hook", "--hint", hint], "onFailure": "block",
+    }]}]}})
 
 
-def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str]) -> int:
+def _strict_hook_spec(mode: ModeConfig, baseline_hook_binary: str | None) -> tuple[str, str]:
+    """The hook binary and hint a strict cell registers: a tilth arm runs its own binary."""
+    if _is_tilth_arm(mode):
+        binary = mode.binary_path or baseline_hook_binary
+        hint = "tilth"
+    else:
+        binary, hint = baseline_hook_binary, "native"
+    if not binary:
+        raise ValueError("strict_file_tools needs a hook binary")
+    return binary, hint
+
+
+def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
+    """The git tree hash of ``src/hook`` plus the SHA-256 of ``Cargo.lock``, both at ``hook_sha``."""
+    repo = Path(repo or REPO_ROOT)
+    tree = _git("rev-parse", f"{hook_sha}:src/hook", cwd=repo).strip()
+    lock = subprocess.run(["git", "show", f"{hook_sha}:Cargo.lock"], cwd=repo, check=True, capture_output=True).stdout
+    return f"{tree}:{hashlib.sha256(lock).hexdigest()}"
+
+
+def _hook_denies(hook_binary: str, command: str) -> bool:
+    """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error."""
+    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    try:
+        result = subprocess.run([hook_binary, "hook", "--hint", "native"], input=event,
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"strict audit could not run the hook {hook_binary}: {error}") from error
+    if result.returncode not in (0, 2):
+        raise RuntimeError(f"strict audit hook exited {result.returncode}: {result.stderr[-500:]}")
+    return result.returncode == 2
+
+
+def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str], hook_binary: str) -> int:
     available = set(available_tools)
     if mode.mcp_config_path:
         if "Bash" not in available or available & (_STRICT_NATIVE_FILE_TOOLS | {"Agent", "Task"}):
@@ -646,7 +678,7 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
         raise RuntimeError("strict baseline exposed an MCP tool")
 
     calls = {}
-    denied = set()
+    errored = set()
     for line in raw.splitlines():
         event = json.loads(line)
         message = event.get("message", {})
@@ -658,11 +690,17 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str])
                 if name == "Bash":
                     calls[block.get("id")] = block.get("input", {}).get("command", "")
             elif block.get("type") == "tool_result" and block.get("is_error") is True:
-                denied.add(block.get("tool_use_id"))
+                errored.add(block.get("tool_use_id"))
+    # Replay through the hook at hook_sha, whichever hook the cell ran with: a call that ran and
+    # that hook denies means the cell's own hook let through what the seed denies.
+    denied = 0
     for call_id, command in calls.items():
-        if not allowed_command(command) and call_id not in denied:
-            raise RuntimeError(f"strict cell used forbidden Bash command: {command}")
-    return sum(not allowed_command(command) for command in calls.values())
+        if not _hook_denies(hook_binary, command):
+            continue
+        if call_id not in errored:
+            raise HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: {command}")
+        denied += 1
+    return denied
 
 
 CELL_TIMEOUT_S = 600
@@ -830,8 +868,8 @@ def _command_template(
     """Return the runner argv a cell will run, with its per-cell paths normalized.
 
     The disposable workspace path, the host skill paths codex disables, the
-    tilth binary path (keyed by its SHA-256), the strict Bash hook's interpreter
-    and guard paths (the guard keyed by its SHA-256), and the task prompt (keyed
+    tilth binary path (keyed by its SHA-256), the strict Bash hook's binary
+    path (the baseline hook binary, keyed by the hook source key), and the task prompt (keyed
     by the task digest) become placeholders, so the template changes only when
     the runner configuration does.
     """
@@ -843,7 +881,7 @@ def _command_template(
             template_task, mode, mode_name, model_name, _REPO_PLACEHOLDER,
             bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
             strict_file_tools=strict_file_tools, skill_paths=[],
-            strict_hook_command=_STRICT_HOOK_PLACEHOLDER,
+            strict_hook_binary=_HOOK_BIN_PLACEHOLDER,
         )
     except (ValueError, RuntimeError) as error:
         # The cell fails when it runs; key it by the reason it cannot be built.
@@ -862,8 +900,17 @@ def cell_identity(
     reasoning_effort: str | None,
     max_budget_usd: float,
     strict_file_tools: bool,
+    hook_sha: str | None = None,
+    hook_repo: Path | None = None,
 ) -> dict:
-    """Return the run key, the key-input fields, and the harness variant flags one cell's row records."""
+    """Return the run key, the key-input fields, and the harness variant flags one cell's row records.
+
+    A strict cell needs ``hook_sha``, the commit (of ``hook_repo``, default this checkout) whose hook
+    guards the baseline arm and replays every Bash call; its hook source key joins the harness digest.
+    """
+    if strict_file_tools and hook_sha is None:
+        raise ValueError("strict_file_tools requires hook_sha")
+    hook_source_key = _hook_source_key(hook_sha, hook_repo) if strict_file_tools else None
     task = TASKS[task_name]
     mode = MODES[mode_name]
     runner = RUNNERS[model_name]
@@ -883,7 +930,7 @@ def cell_identity(
                 task, mode, mode_name, model_name, bare=bare, reasoning_effort=reasoning_effort,
                 max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
             ),
-            bash_guard_sha256=_file_sha256(_BASH_GUARD) if strict_file_tools else None,
+            hook_source_key=hook_source_key,
         ),
         "task_digest": _cell_task_digest(task),
         "env_fingerprint": env_fingerprint(task),
@@ -902,7 +949,8 @@ def cell_identity(
         "bare": bare, "strict_file_tools": strict_file_tools,
         "max_budget_usd": max_budget_usd if runner == "claude" else None,
     }
-    return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags}
+    return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags,
+            **({"hook_source_key": hook_source_key} if strict_file_tools else {})}
 
 
 TRAJECTORY_RUNNERS = frozenset({"claude", "codex"})
@@ -939,6 +987,8 @@ def run_single(
     reasoning_effort: str | None = None,
     max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     strict_file_tools: bool = False,
+    hook_sha: str | None = None,
+    hook_repo: Path | None = None,
 ) -> dict:
     """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
@@ -961,6 +1011,8 @@ def run_single(
                 reasoning_effort=reasoning_effort,
                 max_budget_usd=max_budget_usd,
                 strict_file_tools=strict_file_tools,
+                hook_sha=hook_sha,
+                hook_repo=hook_repo,
                 claude_config_dir=config_dir,
                 baseline=baseline,
             )
@@ -1086,7 +1138,7 @@ def _claude_command(
     reasoning_effort: str | None,
     max_budget_usd: float,
     strict_file_tools: bool,
-    strict_hook_command: str | None,
+    strict_hook_binary: str | None,
 ) -> list[str]:
     arm = _claude_arm_flags(mode)
     cmd = [
@@ -1128,7 +1180,7 @@ def _claude_command(
         cmd += ["--agent", "woz:code"]
 
     if strict_file_tools:
-        cmd += ["--settings", _strict_bash_settings(strict_hook_command)]
+        cmd += ["--settings", _strict_bash_settings(*_strict_hook_spec(mode, strict_hook_binary))]
     tools_list = (list(_STRICT_BASELINE_TOOLS) if not arm.mcp else ["Bash"]) if strict_file_tools else list(mode.tools)
     if arm.skill and tools_list and "Skill" not in tools_list:
         tools_list.append("Skill")
@@ -1158,7 +1210,7 @@ def _runner_command(
     max_budget_usd: float,
     strict_file_tools: bool,
     skill_paths: list[str],
-    strict_hook_command: str | None = None,
+    strict_hook_binary: str | None = None,
 ) -> tuple[list[str], Optional[str]]:
     """Build one cell's runner argv and, for opencode, the config it selects."""
     model_id = MODELS[model_name]
@@ -1176,7 +1228,7 @@ def _runner_command(
     cmd = _claude_command(
         task, mode, model_id, repo_path,
         bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
-        strict_file_tools=strict_file_tools, strict_hook_command=strict_hook_command,
+        strict_file_tools=strict_file_tools, strict_hook_binary=strict_hook_binary,
     )
     return cmd, None
 
@@ -1193,6 +1245,8 @@ def _run_single_in_repo(
     reasoning_effort: str | None = None,
     max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     strict_file_tools: bool = False,
+    hook_sha: str | None = None,
+    hook_repo: Path | None = None,
     claude_config_dir: Path | None = None,
     baseline: Path | None = None,
 ) -> dict:
@@ -1212,6 +1266,10 @@ def _run_single_in_repo(
         task_name, mode_name, model_name, repetition,
         bare=bare, reasoning_effort=reasoning_effort,
         max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+        hook_sha=hook_sha, hook_repo=hook_repo,
+    )
+    hook_binary = (
+        build_candidate(hook_sha, repo=hook_repo).binary_path if strict_file_tools and runner == "claude" else None
     )
 
     if runner == "codex":
@@ -1220,7 +1278,7 @@ def _run_single_in_repo(
     cmd, opencode_config = _runner_command(
         task, mode, mode_name, model_name, repo_path,
         bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
-        strict_file_tools=strict_file_tools, skill_paths=skill_paths,
+        strict_file_tools=strict_file_tools, skill_paths=skill_paths, strict_hook_binary=hook_binary,
     )
 
     if verbose:
@@ -1382,7 +1440,7 @@ def _run_single_in_repo(
         _require_plugin_skills(mode_name, mode, run_result)
 
     strict_denied_bash_calls = (
-        _audit_strict_claude(result.stdout, mode, run_result.available_tools)
+        _audit_strict_claude(result.stdout, mode, run_result.available_tools, hook_binary)
         if strict_file_tools and runner == "claude" else 0
     )
 
@@ -1741,10 +1799,16 @@ def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
                    binary_sha256=build.binary_sha256)
 
 
-def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD) -> dict:
-    """The run key and key inputs of one ``run_plan`` cell: a bare, non-strict harness at ``max_budget_usd``."""
+def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+                     strict_file_tools: bool = False, hook_sha: str | None = None,
+                     hook_repo: Path | None = None) -> dict:
+    """The run key and key inputs of one ``run_plan`` cell: a bare harness at ``max_budget_usd``.
+
+    ``strict_file_tools`` guards Bash with the hook built at ``hook_sha``.
+    """
     return cell_identity(cell.task, cell.mode, cell.model, cell.repetition, bare=True, reasoning_effort=None,
-                         max_budget_usd=max_budget_usd, strict_file_tools=False)
+                         max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+                         hook_sha=hook_sha, hook_repo=hook_repo)
 
 
 def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[dict]) -> None:
@@ -1763,10 +1827,13 @@ def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[d
                             "pass --refreeze-baselines to re-run them")
 
 
-def check_baseline_drift(cells, *, panel: panels.Panel, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD) -> None:
+def check_baseline_drift(cells, *, panel: panels.Panel, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+                         strict_file_tools: bool = False, hook_sha: str | None = None,
+                         hook_repo: Path | None = None) -> None:
     """Raise ``BaselineDrift`` when a stock-arm cell of ``cells`` that the store cannot answer drifted; runs nothing."""
     panel.register(TASKS)
-    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd))
+    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+                                       hook_sha=hook_sha, hook_repo=hook_repo))
                for cell in (CellSpec(*cell) for cell in cells)]
     history = baselines.load_rows(RESULTS_DIR / baselines.STORE_FILENAME)
     reusable = baselines.completed_by_key(history)
@@ -1786,6 +1853,8 @@ def run_plan(
     max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
     store_only: bool = False,
     repo: Path | None = None,
+    strict_file_tools: bool = False,
+    hook_sha: str | None = None,
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
@@ -1796,13 +1865,24 @@ def run_plan(
     (default: ``max_budget_usd``) estimates a cell with no stored or earlier cost.
     ``store_only`` returns only stored rows and never starts a runner.
     Every row returned is also appended to ``output``.
+    ``strict_file_tools`` runs every cell with Bash guarded by the hook: a tilth arm runs its own binary's hook,
+    the baseline runs the hook built at ``hook_sha`` (a commit of ``repo``), and that hook replays every Bash call.
 
-    Raises ``CandidateBuildFailed`` when ``candidate_sha`` does not build.
+    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
     Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
     panel.register(TASKS)
     cells = [CellSpec(*cell) for cell in cells]
+    if strict_file_tools:
+        if hook_sha is None:
+            raise ValueError("strict_file_tools requires hook_sha")
+        if not store_only:
+            try:
+                build_candidate(hook_sha, repo=repo)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+                detail = getattr(error, "stderr", None) or ""
+                raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
     saved: dict[str, ModeConfig] = {}
     if candidate_sha is not None:
         try:
@@ -1816,14 +1896,18 @@ def run_plan(
     try:
         return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
                          cell_estimate_usd=max_budget_usd if cell_estimate_usd is None else cell_estimate_usd,
-                         max_budget_usd=max_budget_usd, store_only=store_only)
+                         max_budget_usd=max_budget_usd, store_only=store_only,
+                         strict_file_tools=strict_file_tools, hook_sha=hook_sha, hook_repo=repo)
     finally:
         MODES.update(saved)
 
 
 def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_baselines: bool,
-              output: Path | None, cell_estimate_usd: float, max_budget_usd: float, store_only: bool) -> list[dict]:
-    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd)) for cell in cells]
+              output: Path | None, cell_estimate_usd: float, max_budget_usd: float, store_only: bool,
+              strict_file_tools: bool = False, hook_sha: str | None = None,
+              hook_repo: Path | None = None) -> list[dict]:
+    planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+                                       hook_sha=hook_sha, hook_repo=hook_repo)) for cell in cells]
     store_path = RESULTS_DIR / baselines.STORE_FILENAME
     history = baselines.load_rows(store_path)
     reusable = baselines.completed_by_key(history)
@@ -1924,7 +2008,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
 
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
-                                bare=True, max_budget_usd=cell_cap)
+                                bare=True, max_budget_usd=cell_cap,
+                                **({"strict_file_tools": True, "hook_sha": hook_sha, "hook_repo": hook_repo}
+                                   if strict_file_tools else {}))
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
@@ -2374,6 +2460,15 @@ Examples:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
 
+    # Ad hoc, the hook is the one at the candidate sha, else this checkout's HEAD.
+    hook_sha = None
+    if args.strict_file_tools:
+        try:
+            hook_sha = _git("rev-parse", "--verify", f"{args.candidate_sha or 'HEAD'}^{{commit}}", cwd=REPO_ROOT).strip()
+            build_candidate(hook_sha)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            parser.error(f"cannot build the strict hook at {hook_sha or args.candidate_sha or 'HEAD'}: {error}")
+
     _verify_mcp_servers(modes, args.runner)
 
     # Filter tasks by repo
@@ -2439,7 +2534,7 @@ Examples:
                             task_name, mode_name, model_name, rep,
                             bare=bare, reasoning_effort=args.reasoning_effort,
                             max_budget_usd=args.max_budget_usd,
-                            strict_file_tools=args.strict_file_tools,
+                            strict_file_tools=args.strict_file_tools, hook_sha=hook_sha,
                         ),
                     ))
 
@@ -2689,6 +2784,7 @@ Examples:
                     reasoning_effort=args.reasoning_effort,
                     max_budget_usd=args.max_budget_usd,
                     strict_file_tools=args.strict_file_tools,
+                    **({"hook_sha": hook_sha} if args.strict_file_tools else {}),
                 )
                 result.update(experiment_metadata)
                 if args.reasoning_effort is not None:
