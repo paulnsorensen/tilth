@@ -15,8 +15,31 @@ HOOK_TIMEOUT_S = 30
 WORKERS = 4
 
 
+class CorpusError(ValueError):
+    """The hook corpus is missing, malformed, or empty, so it cannot judge a hook."""
+
+
+def _validate(corpus: object) -> dict:
+    if not isinstance(corpus, dict):
+        raise CorpusError("hook corpus is not a JSON object")
+    for key in ("must_deny", "must_allow"):
+        rows = corpus.get(key)
+        if not isinstance(rows, list) or not rows:
+            raise CorpusError(f"hook corpus needs a non-empty `{key}` list")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("command"), str):
+                raise CorpusError(f"hook corpus `{key}` row without a string `command`: {row!r}")
+    return corpus
+
+
 def load_corpus(path: Path | None = None) -> dict:
-    return json.loads((path or CORPUS_PATH).read_text())
+    path = path or CORPUS_PATH
+    try:
+        return _validate(json.loads(path.read_text()))
+    except (OSError, ValueError) as error:
+        if isinstance(error, CorpusError):
+            raise
+        raise CorpusError(f"hook corpus {path} is unreadable: {error}") from error
 
 
 def _exit_code(binary: str, hint: str, command: str) -> int | str:
@@ -31,7 +54,10 @@ def _exit_code(binary: str, hint: str, command: str) -> int | str:
 
 def corpus_failures(binary: str, corpus: dict | None = None) -> list[str]:
     """One line per corpus row the hook at ``binary`` gets wrong in either hint mode; empty when faithful."""
-    corpus = corpus or load_corpus()
+    try:
+        corpus = load_corpus() if corpus is None else _validate(corpus)
+    except CorpusError as error:
+        return [str(error)]
     checks = [(hint, row, 2) for hint in HINTS for row in corpus["must_deny"]]
     checks += [(hint, row, 0) for hint in HINTS for row in corpus["must_allow"]]
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
