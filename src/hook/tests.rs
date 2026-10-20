@@ -634,3 +634,103 @@ fn press4_short_probe_flags_do_not_launder_file_reads() {
 fn press4_rg_ag_help_probe_still_allowed() {
     assert_all_allow(&["ag -h x f", "ag --help x f", "ack --version x f"]);
 }
+
+#[test]
+fn cure1_every_redirect_destination_word_is_an_operand() {
+    // The grammar repeats `destination`, so words after a redirect target are command arguments.
+    assert_all_deny(&[
+        "cat 2>/dev/null src/lib.rs",
+        "grep foo 2>/dev/null f",
+        "head -n 50 2>&1 f",
+        "tee 2>/dev/null out.txt",
+        "sed 2>/dev/null -i s/a/b/ f",
+        "cat 2>/dev/null a b >/dev/null c",
+        "cat <<EOF src/lib.rs\nx\nEOF",
+    ]);
+}
+
+#[test]
+fn cure1_redirect_to_null_without_operands_still_allowed() {
+    assert_all_allow(&[
+        "go test ./... 2>/dev/null",
+        "cargo build 2>&1",
+        "cat <<EOF | wc -l\nx\nEOF",
+    ]);
+}
+
+#[test]
+fn cure1_shell_reading_stdin_script_denies() {
+    assert_all_deny(&[
+        "bash -s -- a",
+        "sh -s x",
+        "bash /dev/stdin",
+        "bash /dev/fd/0",
+        "zsh /proc/self/fd/0",
+        "bash <(echo ls)",
+        "sh <(cat f)",
+        "source <(echo ls)",
+        ". <(echo ls)",
+        "source /dev/stdin",
+        ". /dev/stdin",
+        "source $SCRIPT",
+        ". \"$HOME/x.sh\"",
+    ]);
+}
+
+#[test]
+fn cure1_shell_and_source_of_literal_file_allowed() {
+    assert_all_allow(&[
+        "bash script.sh",
+        "sh ./run.sh arg",
+        "source ./env.sh",
+        ". ./env.sh",
+    ]);
+}
+
+#[test]
+fn cure1_wrappers_skip_option_values() {
+    assert_all_deny(&[
+        "timeout -s KILL 5 cat f",
+        "timeout --signal KILL 5 cat f",
+        "timeout --signal=KILL 5 cat f",
+        "sudo -u root cat f",
+        "sudo --user root cat f",
+        "stdbuf -o L cat f",
+        "nice --adjustment 5 cat f",
+        "nice -n 5 cat f",
+        "env --chdir /tmp cat f",
+        "env --unset FOO cat f",
+        "env -- cat f",
+        "sudo -- cat f",
+        "xargs -n 1 cat",
+        "xargs -I {} cat {}",
+        "xargs -P 4 cat",
+        "xargs --max-args 1 cat",
+        "xargs -n1 cat",
+        "xargs -- cat",
+    ]);
+}
+
+#[test]
+fn cure1_wrapped_allowed_commands_stay_allowed() {
+    assert_all_allow(&[
+        "timeout -s KILL 5 go test ./...",
+        "sudo -u root go test ./...",
+        "stdbuf -o L cargo build",
+        "nice --adjustment 5 cargo build",
+        "env --chdir /tmp make test",
+        "xargs -n 1 echo",
+        "xargs -I {} echo {}",
+    ]);
+}
+
+#[test]
+fn cure1_unknown_wrapper_option_fails_closed() {
+    assert_all_deny(&[
+        "env --bogus go test",
+        "sudo --bogus go test",
+        "timeout -Z 5 go test",
+        "xargs --bogus echo",
+        "env -S 'cat f'",
+    ]);
+}

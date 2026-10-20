@@ -78,7 +78,10 @@ pub(super) fn check(cmd: &Cmd) -> Outcome {
     {
         return Outcome::Allow;
     }
-    let (words, xargs) = unwrap(cmd.words);
+    let (words, xargs) = match unwrap(cmd.words) {
+        Ok(unwrapped) => unwrapped,
+        Err(rule) => return Outcome::Deny(rule),
+    };
     let Some(first) = words.first() else {
         return Outcome::Allow;
     };
@@ -100,6 +103,7 @@ pub(super) fn check(cmd: &Cmd) -> Outcome {
         "find" => find(args),
         "git" => git(args),
         "bash" | "sh" | "zsh" | "dash" | "ksh" => shell(args),
+        "source" | "." => source(args),
         _ => match interpreter_family(name) {
             Some(family) => interpreter(family, args, cmd),
             None => Outcome::Allow,
@@ -127,62 +131,180 @@ fn reparse(args: &[Arg]) -> Outcome {
     Outcome::Reparse(joined)
 }
 
+/// The options a wrapper command accepts. An option outside these sets fails closed.
+struct WrapOpts {
+    short_val: &'static str,
+    short_flag: &'static str,
+    long_val: &'static [&'static str],
+    long_flag: &'static [&'static str],
+}
+
+fn wrapper_opts(name: &str) -> WrapOpts {
+    let (short_val, short_flag, long_val, long_flag): (_, _, &[&str], &[&str]) = match name {
+        "env" => (
+            "uCaP",
+            "i0v",
+            &["--unset", "--chdir", "--argv0", "--default-signal"],
+            &[
+                "--ignore-environment",
+                "--null",
+                "--debug",
+                "--block-signal",
+                "--ignore-signal",
+                "--list-signal-handling",
+            ],
+        ),
+        "nice" => ("n", "0123456789", &["--adjustment"], &[]),
+        "ionice" => (
+            "cnpPu",
+            "t",
+            &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+            &["--ignore"],
+        ),
+        "timeout" => (
+            "sk",
+            "vf",
+            &["--signal", "--kill-after"],
+            &["--foreground", "--preserve-status", "--verbose"],
+        ),
+        "sudo" => (
+            "ugChprtUDRT",
+            "EHisbkKnPSAlVv",
+            &[
+                "--user",
+                "--group",
+                "--close-from",
+                "--host",
+                "--prompt",
+                "--role",
+                "--type",
+                "--other-user",
+                "--chdir",
+                "--chroot",
+                "--command-timeout",
+            ],
+            &[
+                "--preserve-env",
+                "--set-home",
+                "--login",
+                "--shell",
+                "--background",
+                "--reset-timestamp",
+                "--remove-timestamp",
+                "--non-interactive",
+                "--preserve-groups",
+                "--stdin",
+                "--askpass",
+                "--version",
+            ],
+        ),
+        "doas" => ("uC", "nsL", &[], &[]),
+        "stdbuf" => ("ioe", "", &["--input", "--output", "--error"], &[]),
+        "setsid" => ("", "cfw", &[], &["--ctty", "--fork", "--wait"]),
+        "time" => (
+            "fo",
+            "pavlV",
+            &["--format", "--output"],
+            &["--portability", "--append", "--verbose"],
+        ),
+        "exec" => ("a", "cl", &[], &[]),
+        "command" => ("", "pvV", &[], &[]),
+        "xargs" => (
+            "INPnLdEsaRS",
+            "0tprxoeilhV",
+            &[
+                "--max-args",
+                "--max-procs",
+                "--max-chars",
+                "--max-lines",
+                "--delimiter",
+                "--eof",
+                "--arg-file",
+                "--process-slot-var",
+            ],
+            &[
+                "--null",
+                "--verbose",
+                "--interactive",
+                "--no-run-if-empty",
+                "--exit",
+                "--open-tty",
+                "--replace",
+                "--version",
+                "--help",
+            ],
+        ),
+        _ => ("", "", &[], &[]),
+    };
+    WrapOpts {
+        short_val,
+        short_flag,
+        long_val,
+        long_flag,
+    }
+}
+
+/// Index of the first word after the wrapper's options, or `None` for an unknown option.
+fn skip_options(args: &[Arg], opts: &WrapOpts, assigns: bool) -> Option<usize> {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let t = arg.text.as_str();
+        if t == "--" {
+            return Some(i + 1);
+        }
+        if assigns && t.contains('=') && !t.starts_with(['=', '-']) {
+            i += 1;
+        } else if t.len() < 2 || !t.starts_with('-') {
+            break;
+        } else if let Some(long) = t.strip_prefix("--") {
+            let (key, has_value) = long
+                .split_once('=')
+                .map_or((long, false), |(k, _)| (k, true));
+            let flag = format!("--{key}");
+            if opts.long_val.contains(&flag.as_str()) {
+                i += 1 + usize::from(!has_value);
+            } else if opts.long_flag.contains(&flag.as_str()) {
+                i += 1;
+            } else {
+                return None;
+            }
+        } else {
+            let chars: Vec<char> = t[1..].chars().collect();
+            i += 1;
+            for (k, ch) in chars.iter().enumerate() {
+                if opts.short_val.contains(*ch) {
+                    i += usize::from(k + 1 == chars.len());
+                    break;
+                }
+                if !opts.short_flag.contains(*ch) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(i.min(args.len()))
+}
+
 /// Strip wrapper commands. Returns the wrapped command and whether `xargs` feeds it operands.
-fn unwrap(mut words: &[Arg]) -> (&[Arg], bool) {
+fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
     let mut xargs = false;
     while let Some(first) = words.first() {
         let name = base(&first.text);
         let rest = &words[1..];
-        let mut i = 0;
-        match name {
+        let mut i = match name {
             "env" | "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" | "stdbuf"
-            | "nice" | "ionice" | "timeout" | "sudo" | "doas" => {
-                while let Some(arg) = rest.get(i) {
-                    let t = arg.text.as_str();
-                    if t.len() > 1 && t.starts_with('-') {
-                        i += 1 + usize::from(wrapper_takes_value(name, t));
-                    } else if name == "env" && t.contains('=') && !t.starts_with('=') {
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if name == "timeout" && i < rest.len() {
-                    i += 1;
-                }
-            }
-            "xargs" => {
-                xargs = true;
-                while let Some(arg) = rest.get(i) {
-                    let t = arg.text.as_str();
-                    if t.len() > 1 && t.starts_with('-') {
-                        let separate =
-                            matches!(t, "-I" | "-n" | "-P" | "-d" | "-E" | "-L" | "-s" | "-a");
-                        i += 1 + usize::from(separate);
-                    } else {
-                        break;
-                    }
-                }
+            | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" => {
+                xargs |= name == "xargs";
+                skip_options(rest, &wrapper_opts(name), name == "env").ok_or(UNRESOLVED)?
             }
             _ => break,
+        };
+        if name == "timeout" && i < rest.len() {
+            i += 1;
         }
         words = rest.get(i..).unwrap_or(&[]);
     }
-    (words, xargs)
-}
-
-fn wrapper_takes_value(name: &str, flag: &str) -> bool {
-    matches!(
-        (name, flag),
-        ("nice", "-n")
-            | ("ionice", "-c" | "-n")
-            | ("env", "-u" | "-C")
-            | ("timeout", "-s" | "-k")
-            | (
-                "sudo" | "doas",
-                "-u" | "-g" | "-C" | "-h" | "-p" | "-r" | "-t" | "-U"
-            )
-    )
+    Ok((words, xargs))
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +815,7 @@ fn git(args: &[Arg]) -> Outcome {
 fn shell(args: &[Arg]) -> Outcome {
     let mut c_mode = false;
     let mut informational = false;
+    let mut stdin_flag = false;
     let mut operand = None;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
@@ -708,6 +831,7 @@ fn shell(args: &[Arg]) -> Outcome {
             i += 1;
         } else if t.len() > 1 && (t.starts_with('-') || t.starts_with('+')) {
             c_mode |= t.starts_with('-') && !t.starts_with("--") && t.contains('c');
+            stdin_flag |= t.starts_with('-') && !t.starts_with("--") && t.contains('s');
         } else {
             operand = Some(i - 1);
             break;
@@ -715,6 +839,7 @@ fn shell(args: &[Arg]) -> Outcome {
     }
     match operand {
         Some(k) if c_mode => reparse(&args[k..=k]),
+        Some(k) if stdin_flag || reads_stdin(&args[k]) => Outcome::Deny(SHELL_STDIN),
         Some(_) => Outcome::Allow,
         None if c_mode || informational => Outcome::Allow,
         None => Outcome::Deny(SHELL_STDIN),
@@ -890,5 +1015,24 @@ fn interpreter(family: Rule, args: &[Arg], cmd: &Cmd) -> Outcome {
         ("deno" | "bun", _) | (_, Some(_)) => Outcome::Allow,
         _ if informational => Outcome::Allow,
         _ => Outcome::Deny(family),
+    }
+}
+
+/// The word names stdin or a process substitution, so the shell reads a script nobody can see.
+fn reads_stdin(arg: &Arg) -> bool {
+    let path = normalize_path(&arg.text);
+    matches!(path.as_str(), "/dev/stdin" | "/proc/self/fd/0")
+        || path.starts_with("/dev/fd/")
+        || path.starts_with("/proc/self/fd/")
+        || arg.text.starts_with("<(")
+}
+
+/// `source` and `.` run a file in the current shell; deny a script that is not a literal path.
+fn source(args: &[Arg]) -> Outcome {
+    let operand = args.iter().find(|a| a.text != "--");
+    match operand {
+        Some(a) if a.text == "-" || reads_stdin(a) => Outcome::Deny(SHELL_STDIN),
+        Some(a) if !a.literal || a.opaque => Outcome::Deny(UNRESOLVED),
+        _ => Outcome::Allow,
     }
 }

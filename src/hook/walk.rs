@@ -66,6 +66,29 @@ impl Walker {
                 let mut cursor = node.walk();
                 let here = ctx.here || node.named_children(&mut cursor).any(|c| is_here(c.kind()));
                 let body = node.child_by_field_name("body");
+                let extra: Vec<Arg> = node
+                    .named_children(&mut cursor)
+                    .flat_map(|c| redirect_words(c, src))
+                    .collect();
+                if let Some(b) = body {
+                    if b.kind() == "command" {
+                        if let Some(rule) = self.command(
+                            b,
+                            src,
+                            Ctx {
+                                piped: ctx.piped,
+                                here,
+                            },
+                            extra,
+                        ) {
+                            return Some(rule);
+                        }
+                        return self.redirects(node, src);
+                    }
+                }
+                if !extra.is_empty() {
+                    return Some(UNRESOLVED);
+                }
                 for child in node.named_children(&mut cursor) {
                     let inner = if Some(child.id()) == body.map(|b| b.id()) {
                         Ctx {
@@ -81,7 +104,7 @@ impl Walker {
                 }
                 None
             }
-            "command" => self.command(node, src, ctx),
+            "command" => self.command(node, src, ctx, Vec::new()),
             "file_redirect" => {
                 if let Some(rule) = redirect(node, src) {
                     return Some(rule);
@@ -102,18 +125,37 @@ impl Walker {
         None
     }
 
-    fn command(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Option<Rule> {
+    /// Walk the redirects of a redirected statement whose body command is already checked.
+    fn redirects(&mut self, node: Node, src: &[u8]) -> Option<Rule> {
+        let mut cursor = node.walk();
+        let body = node.child_by_field_name("body").map(|b| b.id());
+        for child in node.named_children(&mut cursor) {
+            if Some(child.id()) != body {
+                if let Some(rule) = self.visit(child, src, Ctx::default()) {
+                    return Some(rule);
+                }
+            }
+        }
+        None
+    }
+
+    fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Option<Rule> {
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
         let mut here = ctx.here;
         for child in node.named_children(&mut cursor) {
             match child.kind() {
                 "command_name" => words.insert(0, arg_of(child, src)),
-                "variable_assignment" | "file_redirect" | "comment" => {}
-                kind if is_here(kind) => here = true,
+                "variable_assignment" | "comment" => {}
+                "file_redirect" => words.extend(redirect_words(child, src)),
+                kind if is_here(kind) => {
+                    here = true;
+                    words.extend(redirect_words(child, src));
+                }
                 _ => words.push(arg_of(child, src)),
             }
         }
+        words.extend(extra);
         if self.depth > 0 && words.first().is_some_and(|w| !w.literal) {
             return Some(UNRESOLVED);
         }
@@ -135,6 +177,24 @@ impl Walker {
             }
         }
         self.children(node, src)
+    }
+}
+
+/// Words a redirect carries beyond its target: the grammar repeats `destination` in a
+/// file redirect and `argument` after a heredoc marker, and the shell passes them to the command.
+fn redirect_words(node: Node, src: &[u8]) -> Vec<Arg> {
+    let mut cursor = node.walk();
+    match node.kind() {
+        "file_redirect" => node
+            .children_by_field_name("destination", &mut cursor)
+            .skip(1)
+            .map(|d| arg_of(d, src))
+            .collect(),
+        "heredoc_redirect" => node
+            .children_by_field_name("argument", &mut cursor)
+            .map(|d| arg_of(d, src))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

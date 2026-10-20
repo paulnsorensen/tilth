@@ -100,7 +100,17 @@
     {"command": "/bin/cat f", "rule": "cat"},
     {"command": "\\cat f", "rule": "cat"},
     {"command": "env FOO=1 cat f", "rule": "cat"},
-    {"command": "sudo -u root cat f", "rule": "cat"}
+    {"command": "sudo -u root cat f", "rule": "cat"},
+    {"command": "perl -E 'say 1'", "rule": "perl"},
+    {"command": "cat 2>/dev/null src/lib.rs", "rule": "cat"},
+    {"command": "sed 2>/dev/null -i s/a/b/ f", "rule": "sed -i"},
+    {"command": "cat <<EOF src/lib.rs\nx\nEOF", "rule": "cat"},
+    {"command": "bash <(echo ls)", "rule": "shell stdin"},
+    {"command": "source /dev/stdin", "rule": "shell stdin"},
+    {"command": "source $SCRIPT", "rule": "shell -c unresolved"},
+    {"command": "timeout -s KILL 5 cat f", "rule": "cat"},
+    {"command": "xargs -n 1 cat", "rule": "cat"},
+    {"command": "env --bogus go test", "rule": "shell -c unresolved"}
   ],
   "must_allow": [
     {"command": "go test ./..."},
