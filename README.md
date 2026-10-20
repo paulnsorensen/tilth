@@ -220,7 +220,7 @@ Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). 
 
 Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json` when it exists, otherwise the `hooks` key of `~/.factory/settings.json`, so existing settings hooks keep running), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
 
-A host that fails open when the guard cannot run gets its documented fail-closed field: `onFailure: "block"` for `claude-code` and `failClosed: true` for `cursor`. The other hosts document no such field, so a missing or moved binary there disables the guard; keep the installed binary path stable.
+A host that fails open when the guard cannot run gets its documented fail-closed field: `onFailure: "block"` for `claude-code`. The other hosts document no compatible field, so a missing or moved binary there disables the guard; keep the installed binary path stable. Cursor's `failClosed` counts the guard's silent allow (exit 0, no output) as a failure, so `cursor` gets none and its guard fails open if the binary is missing.
 
 Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
 

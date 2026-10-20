@@ -199,7 +199,7 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
             nested: false,
             matcher: None,
             version: true,
-            fail_closed: Some(("failClosed", json!(true))),
+            fail_closed: None,
             note: None,
         }),
         "windsurf" => Ok(HookTarget {
@@ -220,26 +220,35 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
     }
 }
 
-/// POSIX single-quote `word` unless it holds only shell-safe characters.
-fn shell_quote(word: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:+@%=,-".contains(c);
-    if !word.is_empty() && word.chars().all(safe) {
-        word.to_string()
+/// Quote `word` for the host shell. Plain paths stay bare; others get double quotes, which
+/// sh, bash, cmd and PowerShell all accept. Characters that expand inside double quotes are refused.
+fn shell_quote(word: &str) -> Result<String, String> {
+    if let Some(bad) = word
+        .chars()
+        .find(|c| matches!(c, '"' | '$' | '`' | '%' | '\n' | '\r'))
+    {
+        return Err(format!(
+            "cannot register a hook for a binary path containing {bad:?}: {word}"
+        ));
+    }
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_./:\\-".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        Ok(word.to_string())
     } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
+        Ok(format!("\"{word}\""))
     }
 }
 
 /// The shell command a host runs for the guard: `<tilth> hook --host <family>`.
-fn hook_command(family: &str) -> String {
+fn hook_command(family: &str) -> Result<String, String> {
     let (command, mut args) = tilth_command_and_args();
     args.retain(|a| a != "--mcp");
-    let mut parts = vec![shell_quote(&command)];
+    let mut parts = vec![shell_quote(&command)?];
     parts.extend(args);
     parts.push("hook".into());
     parts.push("--host".into());
     parts.push(family.into());
-    parts.join(" ")
+    Ok(parts.join(" "))
 }
 
 /// True when `command` runs this binary (`own_prefix`) or any binary named `tilth` as
@@ -391,7 +400,7 @@ fn prepare_hook(host: &str, home: &Path) -> Result<(HookTarget, Value), String> 
     } else {
         json!({})
     };
-    upsert_hook(&mut config, &target, &hook_command(target.family))?;
+    upsert_hook(&mut config, &target, &hook_command(target.family)?)?;
     Ok((target, config))
 }
 
@@ -1566,7 +1575,7 @@ mod tests {
                 .or_else(|| ours.pointer("/hooks/0/command"))
                 .and_then(Value::as_str)
                 .unwrap();
-            assert_eq!(cmd, hook_command(target.family), "{host}: command");
+            assert_eq!(cmd, hook_command(target.family).unwrap(), "{host}: command");
 
             // Fail-closed fields: only where the host's official doc names one.
             let handler = ours.pointer("/hooks/0").unwrap_or(ours);
@@ -1764,7 +1773,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let target = hook_target(host, home.path()).unwrap();
             install_hook(host, home.path()).unwrap();
-            let current = hook_command(target.family);
+            let current = hook_command(target.family).unwrap();
             let raw = fs::read_to_string(&target.path).unwrap().replace(
                 &current,
                 &format!("/old/bin/tilth hook --host {}", target.family),
@@ -1983,7 +1992,9 @@ mod tests {
                 let hs = groups[0]["hooks"].as_array().unwrap();
                 assert_eq!(hs.len(), 2, "{host}/{order}");
                 assert!(hs.contains(&mine), "{host}/{order}: user hook lost");
-                assert!(hs.iter().any(|h| h["command"] == hook_command(t.family)));
+                assert!(hs
+                    .iter()
+                    .any(|h| h["command"] == hook_command(t.family).unwrap()));
                 assert!(!hs.contains(&stale), "{host}/{order}: stale kept");
                 let pos = hs.iter().position(|h| h == &mine).unwrap();
                 assert_eq!(
@@ -2048,7 +2059,7 @@ mod tests {
             let groups = nested_groups(&cfg, &t);
             assert_eq!(
                 groups[0]["hooks"],
-                json!([hook_entry(&t, &hook_command(t.family))["hooks"][0].clone()]),
+                json!([hook_entry(&t, &hook_command(t.family).unwrap())["hooks"][0].clone()]),
                 "{host}"
             );
         }
@@ -2165,7 +2176,8 @@ mod tests {
     }
 
     /// Per-host fail-closed field, each named in that host's official doc
-    /// (claude: raw/claude.md `onFailure`; cursor: raw/cursor.md `failClosed`).
+    /// (claude: raw/claude.md `onFailure`). Cursor gets none: raw/cursor.md counts a silent
+    /// exit-0 allow as a failure under `failClosed`, so its guard fails open if the binary is missing.
     #[test]
     fn only_documented_hosts_get_a_fail_closed_field() {
         for host in HOOK_HOSTS {
@@ -2177,7 +2189,6 @@ mod tests {
             let handler = ours.pointer("/hooks/0").unwrap_or(ours);
             let want = match *host {
                 "claude-code" => Some(("onFailure", json!("block"))),
-                "cursor" => Some(("failClosed", json!(true))),
                 _ => None,
             };
             let mut keys: Vec<&str> = handler
@@ -2196,22 +2207,48 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_escapes_what_a_host_shell_would_expand() {
-        assert_eq!(shell_quote("/usr/bin/tilth"), "/usr/bin/tilth");
-        assert_eq!(shell_quote("/a b/tilth"), "'/a b/tilth'");
-        assert_eq!(shell_quote("/a$HOME/`x`/t"), "'/a$HOME/`x`/t'");
-        assert_eq!(shell_quote("/a\"b"), "'/a\"b'");
-        assert_eq!(shell_quote("/it's/tilth"), "'/it'\\''s/tilth'");
+    fn cursor_entry_has_no_fail_closed_key() {
+        let home = tempfile::tempdir().unwrap();
+        install_hook("cursor", home.path()).unwrap();
+        let cfg = read_json(&home.path().join(".cursor/hooks.json"));
+        let entry = &cfg["hooks"]["beforeShellExecution"][0];
+        assert!(entry.get("failClosed").is_none(), "{entry}");
+    }
+
+    #[test]
+    fn shell_quote_leaves_plain_paths_bare() {
+        assert_eq!(shell_quote("/usr/bin/tilth").unwrap(), "/usr/bin/tilth");
+    }
+
+    #[test]
+    fn shell_quote_double_quotes_paths_with_spaces() {
+        assert_eq!(shell_quote("/a b/tilth").unwrap(), "\"/a b/tilth\"");
+    }
+
+    #[test]
+    fn shell_quote_refuses_expandable_characters() {
+        for bad in ["/a\"b", "/a$HOME", "/a`x`", "/a%PATH%", "/a\nb"] {
+            assert!(shell_quote(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn windows_path_with_space_yields_double_quoted_command() {
+        let quoted = shell_quote(r"C:\Users\a b\tilth.exe").unwrap();
+        assert_eq!(
+            format!("{quoted} hook --host windsurf"),
+            r#""C:\Users\a b\tilth.exe" hook --host windsurf"#
+        );
     }
 
     #[test]
     fn quoted_tilth_path_is_still_recognised_as_stale() {
         assert!(is_tilth_hook_command(
-            "'/a b/tilth' hook --host claude",
+            "\"/a b/tilth\" hook --host claude",
             "/elsewhere/tilth hook --host "
         ));
         assert!(!is_tilth_hook_command(
-            "'/a b/other' hook --host claude",
+            "\"/a b/other\" hook --host claude",
             "/elsewhere/tilth hook --host "
         ));
     }
