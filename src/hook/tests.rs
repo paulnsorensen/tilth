@@ -582,3 +582,37 @@ fn press2_version_flag_swallowed_as_value_still_denies() {
         "rg -- --version f",
     ]);
 }
+
+#[test]
+fn press3_grep_h_is_no_filename_not_help_and_reads() {
+    // In grep and ack, -h is --no-filename; `grep -h x f` reads f. Only rg/ag -h is help.
+    assert_all_deny(&["grep -h x f", "egrep -h x f", "fgrep -h x f", "ack -h x f"]);
+}
+
+#[test]
+fn press3_grep_recursion_variants_deny() {
+    assert_all_deny(&[
+        "grep --dereference-rec x",
+        "grep --dereference-rec x .",
+        "grep --dir=recurse x",
+        "grep -nd recurse x",
+    ]);
+}
+
+#[test]
+fn press3_grep_invalid_directories_action_exits_before_reading() {
+    // GNU grep matches the ACTION case-sensitively; `-d rECURSE` is an error, not a search.
+    assert_all_allow(&["grep -d rECURSE x", "grep -d --version x"]);
+}
+
+#[test]
+fn press3_help_probe_first_exits_before_reading() {
+    assert_all_allow(&[
+        "rg -h x .",
+        "rg --help -e x .",
+        "grep --help x f",
+        "grep -V x f",
+        "grep -V -r x .",
+        "rg -V -r x .",
+    ]);
+}
