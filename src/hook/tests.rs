@@ -616,3 +616,21 @@ fn press3_help_probe_first_exits_before_reading() {
         "rg -V -r x .",
     ]);
 }
+
+#[test]
+fn press4_short_probe_flags_do_not_launder_file_reads() {
+    // -h is --no-filename for grep-family and ack; -hn / -hr are bundles, not help.
+    assert_all_deny(&[
+        "fgrep -hn x f",
+        "grep -hr x .",
+        "ack -h x",
+        "ack -h x f",
+        "ack -V x f",
+        "ag -V x f",
+    ]);
+}
+
+#[test]
+fn press4_rg_ag_help_probe_still_allowed() {
+    assert_all_allow(&["ag -h x f", "ag --help x f", "ack --version x f"]);
+}
