@@ -503,3 +503,33 @@ def test_empty_error_text_is_not_a_denial_and_is_hook_loosened(tmp_path: Path) -
     # No real run produced empty error text; with nothing to show the hook fired, the call ran (fail closed).
     with pytest.raises(run.HookLoosenedError):
         _audit(_stream(_use("c1", "cat a.go"), _result("c1", "")), tmp_path)
+
+
+# --- press round 3: variants of the round 1-2 attacks ---
+
+
+def test_a_denial_with_leading_whitespace_still_counts(tmp_path: Path) -> None:
+    assert _audit(_stream(_use("c1", "cat a.go"), _result("c1", "\n  " + _REAL_DENIAL)), tmp_path) == 1
+
+
+def test_a_failure_whose_later_line_starts_with_the_marker_is_hook_loosened(tmp_path: Path) -> None:
+    text = "Exit code 1\nPreToolUse:Bash hook error: printed by the file\n"
+    raw = _stream(_use("c1", "cat notes.md; false"), _result("c1", text))
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_a_marker_only_in_a_later_text_block_is_hook_loosened(tmp_path: Path) -> None:
+    blocks = [{"type": "text", "text": "Exit code 1"}, {"type": "text", "text": _REAL_DENIAL}]
+    raw = _stream(_use("c1", "cat a.go"), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "c1", "is_error": True, "content": blocks}]}})
+
+    with pytest.raises(run.HookLoosenedError):
+        _audit(raw, tmp_path)
+
+
+def test_empty_error_text_from_a_denied_class_command_is_hook_loosened(tmp_path: Path) -> None:
+    for content in ("", [], None):
+        with pytest.raises(run.HookLoosenedError):
+            _audit(_stream(_use("c1", "cat a.go"), _result("c1", content)), tmp_path)
