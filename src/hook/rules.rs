@@ -604,7 +604,13 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
         return Outcome::Allow;
     }
     if let Some(only) = args.first() {
-        if matches!(only.text.as_str(), "--version" | "-V" | "--help" | "-h") {
+        let probe = match only.text.as_str() {
+            "--version" | "--help" => true,
+            "-V" => matches!(name, "grep" | "egrep" | "fgrep" | "rg"),
+            "-h" => matches!(name, "rg" | "ag"),
+            _ => false,
+        };
+        if probe {
             return Outcome::Allow;
         }
     }
