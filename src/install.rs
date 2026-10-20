@@ -322,11 +322,39 @@ fn build_hook_invocation(
     })
 }
 
+/// Whether `command` is an absolute path as the given platform reads it.
+fn is_absolute_command(command: &str, windows: bool) -> bool {
+    if command.starts_with('/') {
+        return true;
+    }
+    let b = command.as_bytes();
+    windows
+        && (command.starts_with("\\\\")
+            || (b.len() > 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && matches!(b[2], b'/' | b'\\')))
+}
+
+/// Exec form starts the binary directly, with no shell. That works only for an absolute
+/// path to a native binary. `npx` and `node` are launchers, and a `.cmd`, `.bat` or `.ps1`
+/// shim cannot start without a shell on Windows, so those need shell form.
+fn exec_form_applies(host_exec: bool, command: &str, _args: &[String], windows: bool) -> bool {
+    if !host_exec || !is_absolute_command(command, windows) {
+        return false;
+    }
+    let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.rsplit_once('.').map_or(lower.as_str(), |(s, _)| s);
+    let shim = [".cmd", ".bat", ".ps1"].iter().any(|e| lower.ends_with(e));
+    !(shim || matches!(stem, "npx" | "node"))
+}
+
 fn hook_invocation(target: &HookTarget) -> Result<HookInvocation, String> {
     let (command, mut args) = tilth_command_and_args();
     args.retain(|a| a != "--mcp");
     build_hook_invocation(
-        target.exec_form,
+        exec_form_applies(target.exec_form, &command, &args, cfg!(windows)),
         target.powershell,
         target.family,
         &command,
@@ -2369,6 +2397,50 @@ mod tests {
             inv.args,
             Some(vec!["hook".into(), "--host".into(), "claude".into()])
         );
+    }
+
+    #[test]
+    fn exec_form_only_for_native_absolute_binaries() {
+        let a = |s: &[&str]| s.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let tilth = a(&["hook"]);
+        assert!(exec_form_applies(true, "/usr/bin/tilth", &tilth, false));
+        assert!(exec_form_applies(true, WIN_BIN, &tilth, true));
+        assert!(!exec_form_applies(false, "/usr/bin/tilth", &tilth, false));
+        for windows in [false, true] {
+            assert!(!exec_form_applies(true, "npx", &a(&["tilth"]), windows));
+            assert!(!exec_form_applies(true, "tilth", &tilth, windows));
+        }
+        assert!(!exec_form_applies(true, "C:/x/tilth.cmd", &tilth, true));
+        assert!(!exec_form_applies(true, r"C:\x\tilth.BAT", &tilth, true));
+        assert!(!exec_form_applies(true, "C:/x/tilth.ps1", &tilth, true));
+        assert!(!exec_form_applies(
+            true,
+            "/usr/bin/npx",
+            &a(&["tilth"]),
+            false
+        ));
+        assert!(!exec_form_applies(
+            true,
+            "/usr/bin/node",
+            &a(&["t.js"]),
+            false
+        ));
+    }
+
+    #[test]
+    fn npx_hook_is_shell_form_and_replaces_stale_exec_entry() {
+        let args = vec!["tilth".to_string()];
+        let ok = exec_form_applies(true, "npx", &args, true);
+        let inv = build_hook_invocation(ok, true, "claude", "npx", &args).unwrap();
+        assert_eq!(inv.command, "npx tilth hook --host claude");
+        assert!(inv.args.is_none());
+        let stale_exec = "npx tilth hook --host claude";
+        assert!(is_tilth_hook_command(stale_exec, &inv.own_prefix));
+        let native = build_hook_invocation(true, false, "claude", "/a/tilth", &[]).unwrap();
+        assert!(is_tilth_hook_command(
+            &native.line(),
+            "/a/tilth hook --host "
+        ));
     }
 
     #[test]
