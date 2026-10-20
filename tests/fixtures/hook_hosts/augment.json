@@ -1,0 +1,12 @@
+{
+"host":"augment",
+"source_urls":[{"url":"https://docs.augmentcode.com/cli/hooks.md","fetched":"2026-10-20"}],
+"config_path":"~/.augment/settings.json (also <workspace>/.augment/settings.json, /etc/augment/settings.json)",
+"scope":"user (project: <workspace>/.augment/settings.json)",
+"registration":{"format":"json","snippet":"{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"launch-process\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/etc/augment/hooks/validate-command.sh\",\n            \"timeout\": 5000\n          }\n        ]\n      }\n    ]\n  }\n}"},
+"shell_tool_name":"launch-process",
+"stdin":{"snippet":"| `tool_name` | string | Always | Name of the tool (e.g., `\"launch-process\"`, `\"str-replace-editor\"`). | `tool_input` | object | Always | Input parameters passed to the tool. | Doc script: TOOL_NAME=$(echo \"$EVENT_DATA\" | jq -r '.tool_name'); if [[ \"$TOOL_NAME\" == \"launch-process\" ]]; then COMMAND=$(echo \"$EVENT_DATA\" | jq -r '.tool_input.command')","command_path":"tool_input.command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":true,"quote":"Exit code 2 with PreToolUse blocks the tool and shows stderr to the agent (so it knows why)."},
+"verified":true,
+"gaps":["No complete PreToolUse stdin JSON example for launch-process; fields table plus jq extraction only","No cwd documented in the event table excerpt read (workspace_roots field exists)"]
+}

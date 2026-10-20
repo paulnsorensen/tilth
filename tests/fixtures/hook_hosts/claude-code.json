@@ -1,0 +1,12 @@
+{
+"host":"claude-code",
+"source_urls":[{"url":"https://code.claude.com/docs/en/hooks.md","fetched":"2026-10-20"}],
+"config_path":"~/.claude/settings.json",
+"scope":"user (also .claude/settings.json project, .claude/settings.local.json)",
+"registration":{"format":"json","snippet":"{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node\",\n            \"args\": [\"${CLAUDE_PROJECT_DIR}/.claude/hooks/check-command.js\"],\n            \"onFailure\": \"block\"\n          }\n        ]\n      }\n    ]\n  }\n}","doc_sentence":"This `PreToolUse` hook in `.claude/settings.json` runs a project script before each Bash command, and blocks the command if the script fails:","locations_table":"| `~/.claude/settings.json` | All your projects | No, local to your machine | / | `.claude/settings.json` | Single project | Yes, can be committed to the repo |"},
+"shell_tool_name":"Bash",
+"stdin":{"snippet":"For example, a `PreToolUse` hook for a Bash command receives this on stdin:\n{\n  \"session_id\": \"abc123\",\n  \"prompt_id\": \"550e8400-e29b-41d4-a716-446655440000\",\n  \"transcript_path\": \"/home/user/.claude/projects/.../transcript.jsonl\",\n  \"cwd\": \"/home/user/my-project\",\n  \"scratchpad_dir\": \"/tmp/claude-1000/-home-user-my-project/abc123/scratchpad\",\n  \"permission_mode\": \"default\",\n  \"hook_event_name\": \"PreToolUse\",\n  \"tool_name\": \"Bash\",\n  \"tool_input\": {\n    \"command\": \"npm test\",\n    \"description\": \"Run test suite\",\n    \"timeout\": 120000,\n    \"run_in_background\": false\n  },\n  \"tool_use_id\": \"toolu_01ABC123...\"\n}","command_path":"tool_input.command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":true,"quote":"Exit with code 2 to block the action. On events that can block, Claude Code stops the action: a `PreToolUse` hook blocks the tool call, for example, and a `UserPromptSubmit` hook rejects the prompt. | The message that comes with the block is your hook's stderr. If your hook also printed JSON that makes a blocking decision, Claude Code uses that decision's reason instead."},
+"verified":true,
+"gaps":["stderr_shown_to_model inferred from 'The message that comes with the block is your hook's stderr' plus line 'exit 2 instead so Claude sees the stderr' (PostToolUse context)"]
+}

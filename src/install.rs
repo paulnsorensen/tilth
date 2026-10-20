@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -115,6 +115,233 @@ pub fn run(host: &str) -> Result<(), String> {
         eprintln!("  {note}");
     }
 
+    Ok(())
+}
+
+/// Hosts whose pre-tool shell hook `install --hook` can register.
+const HOOK_HOSTS: &[&str] = &[
+    "claude-code",
+    "codex",
+    "droid",
+    "crush",
+    "augment",
+    "cursor",
+    "windsurf",
+];
+
+/// Where and in what shape one host keeps its pre-tool shell hook.
+struct HookTarget {
+    path: PathBuf,
+    /// Value for `tilth hook --host`.
+    family: &'static str,
+    /// Event key holding the entry array.
+    event: &'static str,
+    /// The event map sits under a top-level `hooks` key.
+    wrap: bool,
+    /// The command sits in an inner `hooks: [{type, command}]` array.
+    nested: bool,
+    matcher: Option<&'static str>,
+    /// The file carries a top-level `version: 1`.
+    version: bool,
+    note: Option<&'static str>,
+}
+
+fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
+    let claude_like = |path: PathBuf, matcher: &'static str| HookTarget {
+        path,
+        family: "claude",
+        event: "PreToolUse",
+        wrap: true,
+        nested: true,
+        matcher: Some(matcher),
+        version: false,
+        note: None,
+    };
+    match host {
+        "claude-code" => Ok(claude_like(home.join(".claude/settings.json"), "Bash")),
+        "codex" => Ok(HookTarget {
+            note: Some(
+                "Codex ignores a new hook until you trust it: run /hooks in Codex and approve the tilth entry.",
+            ),
+            ..claude_like(home.join(".codex/hooks.json"), "Bash")
+        }),
+        "droid" => Ok(HookTarget {
+            wrap: false,
+            ..claude_like(home.join(".factory/hooks.json"), "Execute")
+        }),
+        "augment" => Ok(claude_like(
+            home.join(".augment/settings.json"),
+            "launch-process",
+        )),
+        "crush" => Ok(HookTarget {
+            nested: false,
+            ..claude_like(home.join(".config/crush/crush.json"), "^bash$")
+        }),
+        "cursor" => Ok(HookTarget {
+            path: home.join(".cursor/hooks.json"),
+            family: "cursor",
+            event: "beforeShellExecution",
+            wrap: true,
+            nested: false,
+            matcher: None,
+            version: true,
+            note: None,
+        }),
+        "windsurf" => Ok(HookTarget {
+            path: home.join(".codeium/windsurf/hooks.json"),
+            family: "windsurf",
+            event: "pre_run_command",
+            wrap: true,
+            nested: false,
+            matcher: None,
+            version: false,
+            note: None,
+        }),
+        other => Err(format!(
+            "--hook is not supported for `{other}`; supported hosts: {}",
+            HOOK_HOSTS.join(", ")
+        )),
+    }
+}
+
+/// The shell command a host runs for the guard: `<tilth> hook --host <family>`.
+fn hook_command(family: &str) -> String {
+    let (command, mut args) = tilth_command_and_args();
+    args.retain(|a| a != "--mcp");
+    let command = if command.contains(char::is_whitespace) {
+        format!("\"{command}\"")
+    } else {
+        command
+    };
+    let mut parts = vec![command];
+    parts.extend(args);
+    parts.push("hook".into());
+    parts.push("--host".into());
+    parts.push(family.into());
+    parts.join(" ")
+}
+
+/// True when `command` runs this binary (`own_prefix`) or any binary named `tilth` as
+/// `<binary> hook --host <family>`.
+fn is_tilth_hook_command(command: &str, own_prefix: &str) -> bool {
+    if command.starts_with(own_prefix) {
+        return true;
+    }
+    let Some((head, _)) = command.split_once(" hook --host ") else {
+        return false;
+    };
+    let name = head
+        .trim_end_matches('"')
+        .rsplit(['/', '\\', ' '])
+        .next()
+        .unwrap_or("");
+    name == "tilth" || name == "tilth.exe"
+}
+
+fn is_tilth_hook_entry(entry: &Value, own_prefix: &str) -> bool {
+    let direct = entry.get("command").and_then(Value::as_str);
+    let inner = entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(Value::as_str));
+    direct
+        .into_iter()
+        .chain(inner)
+        .any(|c| is_tilth_hook_command(c, own_prefix))
+}
+
+fn hook_entry(target: &HookTarget, command: &str) -> Value {
+    let mut entry = serde_json::Map::new();
+    if let Some(matcher) = target.matcher {
+        entry.insert("matcher".into(), json!(matcher));
+    }
+    if target.nested {
+        entry.insert(
+            "hooks".into(),
+            json!([{ "type": "command", "command": command }]),
+        );
+    } else {
+        entry.insert("command".into(), json!(command));
+    }
+    Value::Object(entry)
+}
+
+/// Put exactly one tilth entry in the event array. A stale tilth entry is replaced in
+/// place; every other entry stays as it was.
+fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result<(), String> {
+    let root = config
+        .as_object_mut()
+        .ok_or("config root is not a JSON object")?;
+    if target.version {
+        root.entry("version").or_insert(json!(1));
+    }
+    let events = if target.wrap {
+        root.entry("hooks")
+            .or_insert(json!({}))
+            .as_object_mut()
+            .ok_or("hooks is not a JSON object")?
+    } else {
+        root
+    };
+    let entries = events
+        .entry(target.event)
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or_else(|| format!("{} is not a JSON array", target.event))?;
+    let new = hook_entry(target, command);
+    let own_prefix = &command[..command.len() - target.family.len()];
+    match entries
+        .iter()
+        .position(|e| is_tilth_hook_entry(e, own_prefix))
+    {
+        Some(first) => {
+            entries[first] = new;
+            let mut index = 0;
+            entries.retain(|e| {
+                index += 1;
+                index - 1 <= first || !is_tilth_hook_entry(e, own_prefix)
+            });
+        }
+        None => entries.push(new),
+    }
+    Ok(())
+}
+
+/// Register the shell guard for `host` under `home`. Returns the report to print.
+fn install_hook(host: &str, home: &Path) -> Result<String, String> {
+    let target = hook_target(host, home)?;
+    let mut config: Value = if target.path.exists() {
+        let raw = fs::read_to_string(&target.path)
+            .map_err(|e| format!("failed to read {}: {e}", target.path.display()))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid JSON in {}: {e}", target.path.display()))?
+    } else {
+        json!({})
+    };
+    upsert_hook(&mut config, &target, &hook_command(target.family))?;
+    if let Some(parent) = target.path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    atomic_write(&target.path, &json)?;
+    let mut report = format!("✓ tilth hook added to {}", target.path.display());
+    if let Some(note) = target.note {
+        report.push_str("\n  ");
+        report.push_str(note);
+    }
+    Ok(report)
+}
+
+/// `install <host> --hook`: write the MCP config, then register the shell guard.
+/// An unsupported host fails before anything is written.
+pub fn run_with_hook(host: &str) -> Result<(), String> {
+    let home = home_dir()?;
+    hook_target(host, &home)?;
+    run(host)?;
+    eprintln!("{}", install_hook(host, &home)?);
     Ok(())
 }
 
@@ -1129,5 +1356,253 @@ mod tests {
     #[test]
     fn stale_hook_warning_absent_when_script_missing() {
         assert_eq!(stale_hook_warning(false), None);
+    }
+
+    fn fixture(host: &str) -> Value {
+        let path = format!(
+            "{}/tests/fixtures/hook_hosts/{host}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Parse an official-doc snippet: a bare `"k": [...]` fragment or JSONC trailing commas.
+    fn parse_snippet(snippet: &str) -> Value {
+        let body = snippet.trim().trim_end_matches(',');
+        let body = if body.starts_with('{') {
+            body.to_string()
+        } else {
+            format!("{{{body}}}")
+        };
+        let chars: Vec<char> = body.chars().collect();
+        let (mut out, mut in_str, mut esc) = (String::new(), false, false);
+        for (i, &c) in chars.iter().enumerate() {
+            if in_str {
+                in_str = c != '"' || esc;
+                esc = c == '\\' && !esc;
+            } else if c == '"' {
+                in_str = true;
+            } else if c == ',' {
+                let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+                if matches!(next, Some('}' | ']')) {
+                    continue;
+                }
+            }
+            out.push(c);
+        }
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("snippet not JSON: {e}\n{out}"))
+    }
+
+    fn first_event_entry<'a>(v: &'a Value, event: &str) -> Option<&'a Value> {
+        let obj = v.as_object()?;
+        if let Some(arr) = obj.get(event).and_then(Value::as_array) {
+            return arr.first();
+        }
+        obj.values().find_map(|c| first_event_entry(c, event))
+    }
+
+    fn structural_keys(entry: &Value) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        for k in ["matcher", "hooks", "command"] {
+            if entry.get(k).is_some() {
+                keys.insert(k.to_string());
+            }
+        }
+        if let Some(inner) = entry.pointer("/hooks/0") {
+            for k in ["type", "command"] {
+                if inner.get(k).is_some() {
+                    keys.insert(format!("hooks.{k}"));
+                }
+            }
+        }
+        keys
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn hook_fixtures_carry_required_fields() {
+        for host in HOOK_HOSTS {
+            let f = fixture(host);
+            assert!(
+                f["source_urls"].as_array().is_some_and(|a| !a.is_empty()),
+                "{host}: source_urls"
+            );
+            assert!(f["registration"]["snippet"].is_string(), "{host}: snippet");
+            assert!(f["stdin"]["command_path"].is_string(), "{host}: stdin");
+            assert!(f["deny"].is_object(), "{host}: deny");
+        }
+    }
+
+    #[test]
+    fn written_hook_entry_matches_fixture_snippet() {
+        for host in HOOK_HOSTS {
+            let f = fixture(host);
+            let home = tempfile::tempdir().unwrap();
+            let target = hook_target(host, home.path()).unwrap();
+            install_hook(host, home.path()).unwrap();
+
+            let rel = target.path.strip_prefix(home.path()).unwrap();
+            assert!(
+                f["config_path"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("~/{}", rel.display())),
+                "{host}: config_path"
+            );
+
+            let snippet = f["registration"]["snippet"].as_str().unwrap();
+            let doc = parse_snippet(snippet);
+            if snippet.trim().starts_with('{') {
+                assert_eq!(doc.get("hooks").is_some(), target.wrap, "{host}: wrap");
+            }
+            let theirs = first_event_entry(&doc, target.event)
+                .unwrap_or_else(|| panic!("{host}: no {} in snippet", target.event));
+            let written = read_json(&target.path);
+            let ours = first_event_entry(&written, target.event).unwrap();
+
+            let mut want = structural_keys(theirs);
+            if target.matcher.is_none() {
+                want.remove("matcher");
+            }
+            assert_eq!(structural_keys(ours), want, "{host}: structural keys");
+            if target.matcher.is_some() {
+                assert_eq!(ours["matcher"], theirs["matcher"], "{host}: matcher");
+            }
+            let cmd = ours
+                .get("command")
+                .or_else(|| ours.pointer("/hooks/0/command"))
+                .and_then(Value::as_str)
+                .unwrap();
+            assert_eq!(cmd, hook_command(target.family), "{host}: command");
+        }
+    }
+
+    #[test]
+    fn hook_rejects_unlanded_hosts_naming_landed_ones() {
+        let home = tempfile::tempdir().unwrap();
+        for host in ["copilot-cli", "vscode", "gemini", "antigravity", "zed"] {
+            let err = install_hook(host, home.path()).unwrap_err();
+            for landed in HOOK_HOSTS {
+                assert!(err.contains(landed), "{host}: error omits {landed}: {err}");
+            }
+        }
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn codex_hook_report_names_slash_hooks() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(install_hook("codex", home.path())
+            .unwrap()
+            .contains("/hooks"));
+        assert!(!install_hook("claude-code", home.path())
+            .unwrap()
+            .contains("/hooks"));
+    }
+
+    #[test]
+    fn claude_hook_merge_is_idempotent_and_keeps_unrelated_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let other_pre =
+            json!({"matcher": "Edit", "hooks": [{"type": "command", "command": "lint.sh"}]});
+        let post =
+            json!([{"matcher": "Bash", "hooks": [{"type": "command", "command": "log.sh"}]}]);
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [other_pre.clone()], "PostToolUse": post.clone()}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_hook("claude-code", home.path()).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            first,
+            "second run changed bytes"
+        );
+
+        let cfg = read_json(&path);
+        assert_eq!(cfg["theme"], json!("dark"));
+        assert_eq!(cfg["hooks"]["PostToolUse"], post);
+        let pre = cfg["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0], other_pre);
+        let (command, mut args) = tilth_command_and_args();
+        args.retain(|a| a != "--mcp");
+        let want = std::iter::once(command)
+            .chain(args)
+            .chain(["hook".into(), "--host".into(), "claude".into()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            pre[1],
+            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": want}]})
+        );
+    }
+
+    #[test]
+    fn stale_tilth_hook_entry_is_replaced_not_duplicated() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stale = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/old/place/tilth hook --host claude"}]});
+        let mine = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/notatilth hook --host claude"}]});
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({"hooks": {"PreToolUse": [stale, mine.clone()]}}))
+                .unwrap(),
+        )
+        .unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        let pre = read_json(&path)["hooks"]["PreToolUse"].clone();
+        let pre = pre.as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert!(!pre[0].to_string().contains("/old/place"));
+        assert_eq!(pre[1], mine);
+    }
+
+    #[test]
+    fn cursor_merge_keeps_existing_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".cursor/hooks.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let other = json!({"command": "./scan.sh", "timeout": 30});
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({"version": 1, "hooks": {"beforeShellExecution": [other.clone()], "stop": [{"command": "x"}]}})).unwrap(),
+        )
+        .unwrap();
+        install_hook("cursor", home.path()).unwrap();
+        install_hook("cursor", home.path()).unwrap();
+        let cfg = read_json(&path);
+        assert_eq!(cfg["version"], json!(1));
+        assert_eq!(cfg["hooks"]["stop"], json!([{"command": "x"}]));
+        let arr = cfg["hooks"]["beforeShellExecution"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], other);
+        assert!(arr[1]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" hook --host cursor"));
+    }
+
+    #[test]
+    fn non_object_hook_config_is_an_error_not_a_clobber() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[1]").unwrap();
+        assert!(install_hook("claude-code", home.path()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[1]");
     }
 }

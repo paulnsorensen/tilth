@@ -1,0 +1,305 @@
+//! End-to-end tests for `tilth hook` and `tilth install <host> --hook`, run through the
+//! real binary.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde_json::{json, Value};
+
+const TILTH: &str = env!("CARGO_BIN_EXE_tilth");
+
+const LANDED: [&str; 7] = [
+    "claude-code",
+    "codex",
+    "droid",
+    "crush",
+    "augment",
+    "cursor",
+    "windsurf",
+];
+
+const SUPPORTED_HOSTS: [&str; 22] = [
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "vscode",
+    "claude-desktop",
+    "opencode",
+    "gemini",
+    "codex",
+    "amp",
+    "droid",
+    "antigravity",
+    "zed",
+    "copilot-cli",
+    "augment",
+    "kiro",
+    "kilo-code",
+    "cline",
+    "roo-code",
+    "trae",
+    "qwen-code",
+    "crush",
+    "pi",
+];
+
+struct Out {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn run(args: &[&str], stdin: &str, home: Option<&Path>) -> Out {
+    let mut cmd = Command::new(TILTH);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(home) = home {
+        // Project-scope hosts (vscode, trae) write relative to the cwd.
+        cmd.env("HOME", home)
+            .env("USERPROFILE", home)
+            .current_dir(home);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    Out {
+        code: out.status.code().unwrap(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn claude_event(command: &str) -> String {
+    json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string()
+}
+
+fn corpus() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark/hook_corpus.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn corpus_must_deny_rows_exit_2_naming_tilth_tools() {
+    let corpus = corpus();
+    let rows = corpus["must_deny"].as_array().unwrap();
+    assert_ne!(rows.len(), 0);
+    for row in rows {
+        let command = row["command"].as_str().unwrap();
+        let out = run(&["hook"], &claude_event(command), None);
+        assert_eq!(out.code, 2, "{command}");
+        assert_eq!(out.stdout, "", "{command}");
+        assert!(out.stderr.contains("tilth_"), "{command}: {}", out.stderr);
+
+        let native = run(&["hook", "--hint", "native"], &claude_event(command), None);
+        assert_eq!(native.code, 2, "{command} native");
+        assert_eq!(native.stdout, "", "{command} native");
+        assert!(!native.stderr.is_empty(), "{command} native");
+        assert!(
+            !native.stderr.to_lowercase().contains("tilth"),
+            "{command}: {}",
+            native.stderr
+        );
+    }
+}
+
+#[test]
+fn corpus_must_allow_rows_exit_0_silently() {
+    let corpus = corpus();
+    let rows = corpus["must_allow"].as_array().unwrap();
+    assert_ne!(rows.len(), 0);
+    for row in rows {
+        let command = row["command"].as_str().unwrap();
+        let out = run(&["hook"], &claude_event(command), None);
+        assert_eq!(out.code, 0, "{command}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{command}");
+        assert_eq!(out.stderr, "", "{command}");
+    }
+}
+
+#[test]
+fn malformed_json_and_unknown_host_deny() {
+    let bad = run(&["hook"], "{not json", None);
+    assert_eq!(bad.code, 2);
+    assert_eq!(bad.stdout, "");
+    assert_ne!(bad.stderr, "");
+
+    let bogus = run(&["hook", "--host", "bogus"], &claude_event("ls"), None);
+    assert_eq!(bogus.code, 2);
+    assert_eq!(bogus.stdout, "");
+    assert!(bogus.stderr.contains("bogus"));
+}
+
+#[test]
+fn non_shell_tool_event_is_allowed() {
+    let event = json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}).to_string();
+    let out = run(&["hook"], &event, None);
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", "")
+    );
+}
+
+#[test]
+fn cursor_and_windsurf_shapes() {
+    let cursor = |c: &str| json!({"command": c, "cwd": "/p", "sandbox": false}).to_string();
+    let deny = run(
+        &["hook", "--host", "cursor"],
+        &cursor("cat src/lib.rs"),
+        None,
+    );
+    assert_eq!(deny.code, 2);
+    assert_eq!(deny.stdout, "");
+    assert!(deny.stderr.contains("tilth_"));
+    let allow = run(&["hook", "--host", "cursor"], &cursor("cargo test"), None);
+    assert_eq!(
+        (allow.code, allow.stdout.as_str(), allow.stderr.as_str()),
+        (0, "", "")
+    );
+
+    let windsurf = |c: &str| json!({"tool_info": {"command_line": c, "cwd": "/p"}}).to_string();
+    let deny = run(
+        &["hook", "--host", "windsurf"],
+        &windsurf("cat src/lib.rs"),
+        None,
+    );
+    assert_eq!(deny.code, 2);
+    assert_eq!(deny.stdout, "");
+    assert!(deny.stderr.contains("tilth_"));
+    let allow = run(
+        &["hook", "--host", "windsurf"],
+        &windsurf("cargo test"),
+        None,
+    );
+    assert_eq!(
+        (allow.code, allow.stdout.as_str(), allow.stderr.as_str()),
+        (0, "", "")
+    );
+
+    // A Claude-shaped event on a cursor hook has no top-level command: fail closed.
+    let wrong = run(&["hook", "--host", "cursor"], &claude_event("ls"), None);
+    assert_eq!(wrong.code, 2);
+}
+
+fn files_under(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, root, out);
+            } else {
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(&p).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn install_claude_code_hook_twice_leaves_one_entry() {
+    let home = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let out = run(&["install", "claude-code", "--hook"], "", Some(home.path()));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+    }
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0]["matcher"], "Bash");
+    assert_eq!(pre[0]["hooks"][0]["type"], "command");
+    assert_eq!(
+        pre[0]["hooks"][0]["command"],
+        format!("{TILTH} hook --host claude")
+    );
+    // The MCP entry still lands in ~/.claude.json.
+    assert!(home.path().join(".claude.json").exists());
+}
+
+#[test]
+fn install_hook_codex_prints_trust_step() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run(&["install", "codex", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("/hooks"), "{}", out.stderr);
+    assert!(home.path().join(".codex/hooks.json").exists());
+}
+
+#[test]
+fn install_hook_refuses_unlanded_hosts_before_writing() {
+    for host in [
+        "copilot-cli",
+        "vscode",
+        "gemini",
+        "antigravity",
+        "zed",
+        "cline",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let out = run(&["install", host, "--hook"], "", Some(home.path()));
+        assert_eq!(out.code, 1, "{host}");
+        for landed in LANDED {
+            assert!(out.stderr.contains(landed), "{host}: {}", out.stderr);
+        }
+        assert!(files_under(home.path()).is_empty(), "{host} wrote files");
+    }
+}
+
+#[test]
+fn install_without_hook_flag_writes_no_hook_config() {
+    for host in SUPPORTED_HOSTS {
+        let plain = tempfile::tempdir().unwrap();
+        let out = run(&["install", host], "", Some(plain.path()));
+        let plain_files = files_under(plain.path());
+        if out.code != 0 {
+            assert!(plain_files.is_empty(), "{host}: failed install wrote files");
+            continue;
+        }
+        assert!(!plain_files.is_empty(), "{host}: wrote nothing");
+        for (path, bytes) in &plain_files {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains(" hook --host ") && !text.contains("PreToolUse"),
+                "{host}: {} holds hook config",
+                path.display()
+            );
+        }
+
+        // Deterministic: a second fresh home gets the same bytes.
+        let again = tempfile::tempdir().unwrap();
+        run(&["install", host], "", Some(again.path()));
+        assert_eq!(files_under(again.path()), plain_files, "{host}");
+
+        // --hook adds hook files only on landed hosts, and leaves MCP bytes alone
+        // wherever the two writers target different files.
+        let hooked = tempfile::tempdir().unwrap();
+        let out = run(&["install", host, "--hook"], "", Some(hooked.path()));
+        let hooked_files = files_under(hooked.path());
+        if LANDED.contains(&host) {
+            assert_eq!(out.code, 0, "{host}: {}", out.stderr);
+            assert!(hooked_files.len() >= plain_files.len(), "{host}");
+        } else {
+            assert_eq!(out.code, 1, "{host}");
+            assert!(hooked_files.is_empty(), "{host}");
+        }
+    }
+}

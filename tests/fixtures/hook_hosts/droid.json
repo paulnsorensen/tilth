@@ -1,0 +1,12 @@
+{
+"host":"droid",
+"source_urls":[{"url":"https://docs.factory.com/reference/hooks-reference.md (redirects to https://docs.factory.com/harness/hooks.md)","fetched":"2026-10-20"}],
+"config_path":"~/.factory/hooks.json (also .factory/hooks.json; or `hooks` key in ~/.factory/settings.json)",
+"scope":"user (project: .factory/hooks.json)",
+"registration":{"format":"json","snippet":"{\n  \"PreToolUse\": [\n    {\n      \"matcher\": \"Execute\",\n      \"commandRegex\": \"^git \",\n      \"hooks\": [\n        {\n          \"type\": \"command\",\n          \"command\": \"/usr/local/bin/audit-git-command.sh\",\n          \"timeout\": 30\n        }\n      ]\n    }\n  ]\n}","settings_json_variant":"When you declare hooks inside `settings.json` instead, wrap the same event map in a top-level `hooks` key"},
+"shell_tool_name":"Execute",
+"stdin":{"snippet":"Quickstart hook command: jq -r '.tool_input.command' >> ~/.factory/bash-command-log.txt (matcher `Execute`). Tool hook input: {\"session_id\":\"abc123\",\"transcript_path\":\"/Users/.../.factory/projects/.../session.jsonl\",\"cwd\":\"/Users/me/project\",\"permission_mode\":\"off\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Create\",\"tool_input\":{\"file_path\":\"/Users/me/project/file.txt\",\"content\":\"file content\"}}. 'The exact shape of `tool_input` and `tool_response` depends on the tool.'","command_path":"tool_input.command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":null,"quote":"Exit code `2` | Blocking or corrective feedback. `PreToolUse` blocks the tool call, `PostToolUse` and `Stop` feed stderr back to Droid ... | `deny` | Blocks the tool call and sends the reason to Droid. (via hookSpecificOutput.permissionDecision)"},
+"verified":true,
+"gaps":["No Execute-specific stdin JSON example; command_path comes from the doc's own quickstart jq '.tool_input.command' on an Execute matcher","Doc does not state that PreToolUse exit-2 stderr reaches the model; JSON deny reason does ('sends the reason to Droid')"]
+}

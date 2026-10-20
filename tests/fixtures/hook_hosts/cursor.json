@@ -1,0 +1,12 @@
+{
+"host":"cursor",
+"source_urls":[{"url":"https://cursor.com/docs/agent/hooks (redirects to https://cursor.com/docs/hooks, fetched as text/markdown)","fetched":"2026-10-20"}],
+"config_path":"~/.cursor/hooks.json (user) ; <project>/.cursor/hooks.json (project)",
+"scope":"user|project",
+"registration":{"format":"json","snippet":"{\n  \"version\": 1,\n  \"hooks\": {\n    \"beforeShellExecution\": [\n      {\n        \"command\": \"./scripts/approve-network.sh\",\n        \"timeout\": 30,\n        \"matcher\": \"curl|wget|nc\"\n      }\n    ]\n  }\n}"},
+"shell_tool_name":"beforeShellExecution (event; no tool name)",
+"stdin":{"snippet":"// beforeShellExecution input\n{\n  \"command\": \"<full terminal command>\",\n  \"cwd\": \"<current working directory>\",\n  \"sandbox\": false\n}","command_path":"command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":null,"quote":"Exit code `2` - Block the action (equivalent to returning `permission: \"deny\"`) ; Output { \"permission\": \"allow\" | \"deny\" | \"ask\", \"user_message\": \"<message shown in client>\", \"agent_message\": \"<message sent to agent>\" }"},
+"verified":true,
+"gaps":["Exit-2 stderr model visibility not documented; JSON agent_message is the documented model-visible channel","Other exit codes fail open unless failClosed true"]
+}

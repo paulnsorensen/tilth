@@ -1,0 +1,12 @@
+{
+"host":"windsurf",
+"source_urls":[{"url":"https://docs.windsurf.com/windsurf/cascade/hooks (redirects to https://docs.devin.ai/desktop/cascade/hooks.md)","fetched":"2026-10-20"}],
+"config_path":"~/.codeium/windsurf/hooks.json (Devin Desktop IDE user) ; ~/.codeium/hooks.json (JetBrains) ; .devin/hooks.json (workspace; legacy .windsurf/hooks.json) ; /etc/devin/hooks.json (system)",
+"scope":"user|project",
+"registration":{"format":"json","snippet":"{\n  \"hooks\": {\n    \"pre_run_command\": [\n      {\n        \"command\": \"python3 /Users/yourname/hooks/block_dangerous_commands.py\",\n        \"show_output\": true\n      }\n    ]\n  }\n}"},
+"shell_tool_name":"pre_run_command (event; no tool name)",
+"stdin":{"snippet":"{\n  \"agent_action_name\": \"pre_run_command\",\n  \"tool_info\": {\n    \"command_line\": \"npm install package-name\",\n    \"cwd\": \"/Users/yourname/project\"\n  }\n}","command_path":"tool_info.command_line"},
+"deny":{"exit_code":2,"stderr_shown_to_model":true,"quote":"| `2` | Blocking Error | The Cascade agent will see the error message from stderr. For pre-hooks, this **blocks** the action. |"},
+"verified":true,
+"gaps":["Only exit code 2 + stderr documented as the block mechanism (no JSON deny)"]
+}

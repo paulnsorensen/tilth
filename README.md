@@ -214,6 +214,14 @@ tilth install pi               # ~/.pi/agent/mcp.json
 
 Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). The old `--edit` flag is still accepted and does nothing.
 
+#### Shell guard hook (opt-in)
+
+`tilth install <host> --hook` also registers `tilth hook`, a pre-tool guard that denies shell file reads, searches, and writes (`cat`, `grep`, `sed -i`, and similar) and points the agent at the tilth tools. It writes the MCP config as usual, then merges one tilth entry into the host's hook file. Re-running it replaces the entry and leaves your other hooks alone.
+
+Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json`), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
+
+Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
+
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
 ### Smaller models

@@ -87,6 +87,21 @@ enum Command {
         /// always serves the edit surface.
         #[arg(long = "edit", hide = true)]
         _edit: bool,
+
+        /// Also register the shell guard (`tilth hook`) in the host's hook config.
+        /// Supported hosts: claude-code, codex, droid, crush, augment, cursor, windsurf.
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Shell guard for agent hosts: read one pre-tool event on stdin, exit 2 to deny.
+    Hook {
+        /// Event shape: claude, copilot, cursor, or windsurf.
+        #[arg(long, default_value = "claude")]
+        host: String,
+
+        /// Tool names the deny reason cites: tilth or native.
+        #[arg(long, default_value = "tilth")]
+        hint: String,
     },
 }
 
@@ -103,11 +118,19 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Command::Install { ref host, .. } => {
-                if let Err(e) = tilth::install::run(host) {
+            Command::Install { ref host, hook, .. } => {
+                let result = if hook {
+                    tilth::install::run_with_hook(host)
+                } else {
+                    tilth::install::run(host)
+                };
+                if let Err(e) = result {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
+            }
+            Command::Hook { ref host, ref hint } => {
+                process::exit(tilth::hook::run_cli(host, hint));
             }
         }
         return;
@@ -369,6 +392,35 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Install { ref host, .. }) if host == "claude-code"
+        ));
+    }
+
+    #[test]
+    fn install_hook_flag_parses() {
+        let cli = Cli::try_parse_from(["tilth", "install", "claude-code", "--hook"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Install { hook: true, .. })
+        ));
+        let cli = Cli::try_parse_from(["tilth", "install", "claude-code"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Install { hook: false, .. })
+        ));
+    }
+
+    #[test]
+    fn hook_subcommand_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["tilth", "hook"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Hook { ref host, ref hint }) if host == "claude" && hint == "tilth"
+        ));
+        let cli =
+            Cli::try_parse_from(["tilth", "hook", "--host", "cursor", "--hint", "native"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Hook { ref host, ref hint }) if host == "cursor" && hint == "native"
         ));
     }
 
