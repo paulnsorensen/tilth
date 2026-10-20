@@ -295,3 +295,204 @@ fn host_and_hint_parse_names() {
     assert_eq!(Host::default(), Host::Claude);
     assert_eq!(Hint::default(), Hint::Tilth);
 }
+
+// Press round 1 attacks.
+
+fn denies(command: &str) -> bool {
+    matches!(verdict(command, Hint::Tilth), Verdict::Deny { .. })
+}
+
+fn assert_all_deny(commands: &[&str]) {
+    let leaked: Vec<&&str> = commands.iter().filter(|c| !denies(c)).collect();
+    assert!(leaked.is_empty(), "allowed but must deny: {leaked:?}");
+}
+
+fn assert_all_allow(commands: &[&str]) {
+    let blocked: Vec<&&str> = commands.iter().filter(|c| denies(c)).collect();
+    assert!(blocked.is_empty(), "denied but must allow: {blocked:?}");
+}
+
+#[test]
+fn press_redirect_forms_deny() {
+    assert_all_deny(&[
+        "cat >| f",
+        "echo x &> f",
+        "echo x >> f",
+        "echo x 2> f",
+        "cat <> f",
+        "exec 3< f",
+        "exec > f",
+        "cat<f",
+        "<f cat",
+        "cat 0<f",
+        "echo x >/dev/stdout",
+    ]);
+}
+
+#[test]
+fn press_quoting_tricks_deny() {
+    assert_all_deny(&[
+        "'c'at f",
+        "\\cat f",
+        "ca\"\"t f",
+        "/bin/cat f",
+        "/usr/bin/grep x f",
+    ]);
+}
+
+#[test]
+fn press_wrappers_deny() {
+    assert_all_deny(&[
+        "env cat f",
+        "env FOO=1 cat f",
+        "command cat f",
+        "builtin cat f",
+        "nice cat f",
+        "nice -n 5 cat f",
+        "timeout 5 cat f",
+        "timeout -s KILL 5 cat f",
+        "sudo cat f",
+        "exec cat f",
+        "time cat f",
+        "! cat f",
+        "nohup cat f",
+        "echo f | xargs -I{} cat {}",
+        "echo f | xargs -I{} sh -c 'cat {}'",
+    ]);
+}
+
+#[test]
+fn press_nested_shell_strings_deny() {
+    assert_all_deny(&[
+        "sh -c \"sh -c 'cat f'\"",
+        "bash -lc 'cat f'",
+        "eval cat f",
+        "eval \"cat f\"",
+        "echo 'cat f' | sh",
+        "sh <<< 'cat f'",
+        "{ cat f; }",
+        "(cat f)",
+        "if true; then cat f; fi",
+        "for i in a; do cat $i; done",
+        "f() { cat f; }; f",
+        "echo \"$(cat f)\"",
+        "echo `cat f`",
+    ]);
+}
+
+#[test]
+fn press_nesting_past_the_depth_limit_denies() {
+    let mut command = String::from("cat f");
+    for _ in 0..12 {
+        command = format!("eval '{}'", command.replace('\'', "'\\''"));
+    }
+    assert!(denies(&command));
+}
+
+#[test]
+fn press_file_readers_with_operands_deny() {
+    assert_all_deny(&[
+        "sed -n p f",
+        "awk 1 f",
+        "sed -ibak s/a/b/ f",
+        "perl -i -pe 1 f",
+        "awk -iinplace 1 f",
+    ]);
+}
+
+#[test]
+fn press_inline_interpreter_code_denies() {
+    assert_all_deny(&[
+        "python -Sc 1",
+        "python3.11 -c 1",
+        "/usr/bin/python3 -c 1",
+        "python3 -W ignore -c 1",
+        "echo x | python -c 'print(1)'",
+        "echo x | python3 -",
+        "node --eval 1",
+        "node -p 1",
+        "deno eval 1",
+        "bun -e 1",
+        "ruby -e 1",
+        "php -r 1",
+        "perl -E 1",
+    ]);
+}
+
+#[test]
+fn press_filters_in_pipelines_allow() {
+    assert_all_allow(&[
+        "echo a | grep x",
+        "echo a | grep -e x",
+        "echo a | sed s/a/b/",
+        "echo a | awk 1",
+        "ls | tail -n 5",
+        "echo a | rg x",
+        "go test ./... 2>&1",
+        "go test ./... >&2",
+        "go test ./... > /dev/null 2>&1",
+    ]);
+}
+
+#[test]
+fn press_recursive_search_via_directories_flag_denies() {
+    assert_all_deny(&["grep -d recurse x", "grep --directories=recurse x"]);
+}
+
+#[test]
+fn press_device_paths_with_dot_segments_deny() {
+    assert_all_deny(&[
+        "cp f /dev/./stdout",
+        "cp f /dev//stdout",
+        "cp f /dev/./stderr",
+        "cp f /proc/self/./fd/1",
+        "cp f /dev/./fd/1",
+    ]);
+}
+
+#[test]
+fn press_availability_probes_for_searchers_allow() {
+    assert_all_allow(&["rg --version", "rg -V", "rg --help", "command -v rg"]);
+}
+
+#[test]
+fn press_bare_rg_recurses_and_denies() {
+    assert_all_deny(&["rg", "rg x .", "rg x"]);
+}
+
+#[test]
+fn press_non_string_command_denies_in_every_shape() {
+    for host in HOSTS {
+        let ev = match host {
+            Host::Claude | Host::Copilot => {
+                json!({"tool_name": "Bash", "tool_input": {"command": 7}})
+            }
+            Host::Cursor => json!({"command": 7}),
+            Host::Windsurf => json!({"tool_info": {"command_line": 7}}),
+        }
+        .to_string();
+        assert_eq!(run(host, Hint::Tilth, &ev).0, 2, "{host:?}");
+    }
+}
+
+#[test]
+fn press_null_command_with_shell_name_denies() {
+    let ev = json!({"tool_name": "Bash", "tool_input": {"command": null}}).to_string();
+    assert_eq!(run(Host::Claude, Hint::Tilth, &ev).0, 2);
+}
+
+#[test]
+fn press_shell_names_without_command_deny() {
+    for name in [
+        "Bash",
+        "bash",
+        "Execute",
+        "launch-process",
+        "run_shell_command",
+        "shell",
+        "run_command",
+    ] {
+        let ev = json!({"tool_name": name, "tool_input": {}}).to_string();
+        assert_eq!(run(Host::Claude, Hint::Tilth, &ev).0, 2, "{name}");
+    }
+}
