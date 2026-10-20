@@ -143,6 +143,8 @@ struct HookTarget {
     matcher: Option<&'static str>,
     /// The file carries a top-level `version: 1`.
     version: bool,
+    /// Host field that makes a failed guard block the action, when its docs name one.
+    fail_closed: Option<(&'static str, Value)>,
     note: Option<&'static str>,
 }
 
@@ -155,20 +157,32 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
         nested: true,
         matcher: Some(matcher),
         version: false,
+        fail_closed: None,
         note: None,
     };
     match host {
-        "claude-code" => Ok(claude_like(home.join(".claude/settings.json"), "Bash")),
+        "claude-code" => Ok(HookTarget {
+            fail_closed: Some(("onFailure", json!("block"))),
+            ..claude_like(home.join(".claude/settings.json"), "Bash")
+        }),
         "codex" => Ok(HookTarget {
             note: Some(
                 "Codex ignores a new hook until you trust it: run /hooks in Codex and approve the tilth entry.",
             ),
             ..claude_like(home.join(".codex/hooks.json"), "Bash")
         }),
-        "droid" => Ok(HookTarget {
-            wrap: false,
-            ..claude_like(home.join(".factory/hooks.json"), "Execute")
-        }),
+        "droid" => {
+            // Droid reads settings.json hooks only while hooks.json is absent.
+            let standalone = home.join(".factory/hooks.json");
+            if standalone.exists() {
+                Ok(HookTarget {
+                    wrap: false,
+                    ..claude_like(standalone, "Execute")
+                })
+            } else {
+                Ok(claude_like(home.join(".factory/settings.json"), "Execute"))
+            }
+        }
         "augment" => Ok(claude_like(
             home.join(".augment/settings.json"),
             "launch-process",
@@ -185,6 +199,7 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
             nested: false,
             matcher: None,
             version: true,
+            fail_closed: Some(("failClosed", json!(true))),
             note: None,
         }),
         "windsurf" => Ok(HookTarget {
@@ -195,6 +210,7 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
             nested: false,
             matcher: None,
             version: false,
+            fail_closed: None,
             note: None,
         }),
         other => Err(format!(
@@ -204,16 +220,21 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
     }
 }
 
+/// POSIX single-quote `word` unless it holds only shell-safe characters.
+fn shell_quote(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:+@%=,-".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// The shell command a host runs for the guard: `<tilth> hook --host <family>`.
 fn hook_command(family: &str) -> String {
     let (command, mut args) = tilth_command_and_args();
     args.retain(|a| a != "--mcp");
-    let command = if command.contains(char::is_whitespace) {
-        format!("\"{command}\"")
-    } else {
-        command
-    };
-    let mut parts = vec![command];
+    let mut parts = vec![shell_quote(&command)];
     parts.extend(args);
     parts.push("hook".into());
     parts.push("--host".into());
@@ -231,7 +252,7 @@ fn is_tilth_hook_command(command: &str, own_prefix: &str) -> bool {
         return false;
     };
     let name = head
-        .trim_end_matches('"')
+        .trim_end_matches(['"', '\''])
         .rsplit(['/', '\\', ' '])
         .next()
         .unwrap_or("");
@@ -257,13 +278,18 @@ fn hook_entry(target: &HookTarget, command: &str) -> Value {
     if let Some(matcher) = target.matcher {
         entry.insert("matcher".into(), json!(matcher));
     }
+    let mut handler = serde_json::Map::new();
     if target.nested {
-        entry.insert(
-            "hooks".into(),
-            json!([{ "type": "command", "command": command }]),
-        );
+        handler.insert("type".into(), json!("command"));
+    }
+    handler.insert("command".into(), json!(command));
+    if let Some((key, value)) = &target.fail_closed {
+        handler.insert((*key).into(), value.clone());
+    }
+    if target.nested {
+        entry.insert("hooks".into(), json!([Value::Object(handler)]));
     } else {
-        entry.insert("command".into(), json!(command));
+        entry.extend(handler);
     }
     Value::Object(entry)
 }
@@ -354,8 +380,8 @@ fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result
     Ok(())
 }
 
-/// Register the shell guard for `host` under `home`. Returns the report to print.
-fn install_hook(host: &str, home: &Path) -> Result<String, String> {
+/// Load the host's hook file and merge the tilth entry in memory, writing nothing.
+fn prepare_hook(host: &str, home: &Path) -> Result<(HookTarget, Value), String> {
     let target = hook_target(host, home)?;
     let mut config: Value = if target.path.exists() {
         let raw = fs::read_to_string(&target.path)
@@ -366,6 +392,12 @@ fn install_hook(host: &str, home: &Path) -> Result<String, String> {
         json!({})
     };
     upsert_hook(&mut config, &target, &hook_command(target.family))?;
+    Ok((target, config))
+}
+
+/// Register the shell guard for `host` under `home`. Returns the report to print.
+fn install_hook(host: &str, home: &Path) -> Result<String, String> {
+    let (target, config) = prepare_hook(host, home)?;
     if let Some(parent) = target.path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -381,12 +413,20 @@ fn install_hook(host: &str, home: &Path) -> Result<String, String> {
 }
 
 /// `install <host> --hook`: write the MCP config, then register the shell guard.
-/// An unsupported host fails before anything is written.
+/// An unsupported host or an unreadable hook file fails before anything is written.
 pub fn run_with_hook(host: &str) -> Result<(), String> {
     let home = home_dir()?;
-    hook_target(host, &home)?;
-    run(host)?;
-    eprintln!("{}", install_hook(host, &home)?);
+    install_with_hook(host, &home, run)
+}
+
+fn install_with_hook(
+    host: &str,
+    home: &Path,
+    write_mcp: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    prepare_hook(host, home)?;
+    write_mcp(host)?;
+    eprintln!("{}", install_hook(host, home)?);
     Ok(())
 }
 
@@ -1500,8 +1540,13 @@ mod tests {
 
             let snippet = f["registration"]["snippet"].as_str().unwrap();
             let doc = parse_snippet(snippet);
-            if snippet.trim().starts_with('{') {
+            if snippet.trim().starts_with('{') && *host != "droid" {
                 assert_eq!(doc.get("hooks").is_some(), target.wrap, "{host}: wrap");
+            }
+            if *host == "droid" {
+                // Doc: standalone hooks.json is unwrapped; settings.json wraps in `hooks`.
+                assert!(target.wrap, "{host}: fresh install targets settings.json");
+                assert!(f["registration"]["settings_json_variant"].is_string());
             }
             let theirs = first_event_entry(&doc, target.event)
                 .unwrap_or_else(|| panic!("{host}: no {} in snippet", target.event));
@@ -1522,6 +1567,21 @@ mod tests {
                 .and_then(Value::as_str)
                 .unwrap();
             assert_eq!(cmd, hook_command(target.family), "{host}: command");
+
+            // Fail-closed fields: only where the host's official doc names one.
+            let handler = ours.pointer("/hooks/0").unwrap_or(ours);
+            let mut extra: Vec<&String> = handler
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| !["type", "command", "matcher"].contains(&k.as_str()))
+                .collect();
+            if let Some((key, value)) = &target.fail_closed {
+                assert_eq!(&handler[*key], value, "{host}: fail-closed value");
+                assert!(f.to_string().contains(key), "{host}: fixture lacks {key}");
+                extra.retain(|k| k.as_str() != *key);
+            }
+            assert!(extra.is_empty(), "{host}: undocumented fields {extra:?}");
         }
     }
 
@@ -1591,7 +1651,7 @@ mod tests {
             .join(" ");
         assert_eq!(
             pre[1],
-            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": want}]})
+            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": want, "onFailure": "block"}]})
         );
     }
 
@@ -1988,7 +2048,7 @@ mod tests {
             let groups = nested_groups(&cfg, &t);
             assert_eq!(
                 groups[0]["hooks"],
-                json!([{"type": "command", "command": hook_command(t.family)}]),
+                json!([hook_entry(&t, &hook_command(t.family))["hooks"][0].clone()]),
                 "{host}"
             );
         }
@@ -2060,5 +2120,117 @@ mod tests {
             assert!(groups[0]["hooks"].as_array().unwrap().contains(&mine));
             assert_eq!(tilth_handlers(groups), 1, "{host}");
         }
+    }
+
+    #[test]
+    fn droid_merges_into_settings_json_when_hooks_json_is_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let user =
+            json!({"matcher": "Execute", "hooks": [{"type": "command", "command": "/u/audit"}]});
+        let path = seed(
+            home.path(),
+            ".factory/settings.json",
+            &json!({"model": "x", "hooks": {"PreToolUse": [user.clone()]}}).to_string(),
+        );
+        install_hook("droid", home.path()).unwrap();
+        install_hook("droid", home.path()).unwrap();
+        assert!(!home.path().join(".factory/hooks.json").exists());
+        let cfg = read_json(&path);
+        assert_eq!(cfg["model"], "x");
+        let cmds = all_commands(&cfg);
+        assert!(cmds.contains(&"/u/audit".to_string()), "{cmds:?}");
+        assert_eq!(tilth_count(&cfg), 1);
+    }
+
+    #[test]
+    fn droid_creates_settings_json_hooks_key_on_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        install_hook("droid", home.path()).unwrap();
+        assert!(!home.path().join(".factory/hooks.json").exists());
+        let cfg = read_json(&home.path().join(".factory/settings.json"));
+        assert_eq!(tilth_count(&cfg), 1);
+        assert_eq!(cfg["hooks"]["PreToolUse"][0]["matcher"], "Execute");
+    }
+
+    #[test]
+    fn droid_uses_unwrapped_hooks_json_when_present() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path(), ".factory/hooks.json", "{}");
+        install_hook("droid", home.path()).unwrap();
+        assert!(!home.path().join(".factory/settings.json").exists());
+        let cfg = read_json(&path);
+        assert!(cfg.get("hooks").is_none());
+        assert_eq!(cfg["PreToolUse"][0]["matcher"], "Execute");
+        assert_eq!(tilth_count(&cfg), 1);
+    }
+
+    /// Per-host fail-closed field, each named in that host's official doc
+    /// (claude: raw/claude.md `onFailure`; cursor: raw/cursor.md `failClosed`).
+    #[test]
+    fn only_documented_hosts_get_a_fail_closed_field() {
+        for host in HOOK_HOSTS {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            install_hook(host, home.path()).unwrap();
+            let written = read_json(&t.path);
+            let ours = first_event_entry(&written, t.event).unwrap();
+            let handler = ours.pointer("/hooks/0").unwrap_or(ours);
+            let want = match *host {
+                "claude-code" => Some(("onFailure", json!("block"))),
+                "cursor" => Some(("failClosed", json!(true))),
+                _ => None,
+            };
+            let mut keys: Vec<&str> = handler
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !["type", "command", "matcher"].contains(k))
+                .collect();
+            if let Some((key, value)) = want {
+                assert_eq!(handler[key], value, "{host}");
+                keys.retain(|k| *k != key);
+            }
+            assert!(keys.is_empty(), "{host}: {keys:?}");
+        }
+    }
+
+    #[test]
+    fn shell_quote_escapes_what_a_host_shell_would_expand() {
+        assert_eq!(shell_quote("/usr/bin/tilth"), "/usr/bin/tilth");
+        assert_eq!(shell_quote("/a b/tilth"), "'/a b/tilth'");
+        assert_eq!(shell_quote("/a$HOME/`x`/t"), "'/a$HOME/`x`/t'");
+        assert_eq!(shell_quote("/a\"b"), "'/a\"b'");
+        assert_eq!(shell_quote("/it's/tilth"), "'/it'\\''s/tilth'");
+    }
+
+    #[test]
+    fn quoted_tilth_path_is_still_recognised_as_stale() {
+        assert!(is_tilth_hook_command(
+            "'/a b/tilth' hook --host claude",
+            "/elsewhere/tilth hook --host "
+        ));
+        assert!(!is_tilth_hook_command(
+            "'/a b/other' hook --host claude",
+            "/elsewhere/tilth hook --host "
+        ));
+    }
+
+    #[test]
+    fn bad_hook_file_fails_before_the_mcp_config_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path(), ".claude/settings.json", "{ not json");
+        let mut wrote_mcp = false;
+        let err = install_with_hook("claude-code", home.path(), |_| {
+            wrote_mcp = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.contains("settings.json"), "{err}");
+        assert!(
+            !wrote_mcp,
+            "MCP config written before the hook file was validated"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
     }
 }

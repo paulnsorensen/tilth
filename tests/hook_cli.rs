@@ -52,18 +52,35 @@ struct Out {
     stderr: String,
 }
 
+fn assert_not_real_home(home: &Path) {
+    if let Some(real) = std::env::var_os("HOME") {
+        assert_ne!(
+            home,
+            Path::new(&real),
+            "test sandbox HOME equals the real home"
+        );
+    }
+}
+
+/// Every child runs with a cleared environment and a sandbox home, so no test can touch the
+/// developer's real config files. `None` still gets a fresh sandbox.
 fn run(args: &[&str], stdin: &str, home: Option<&Path>) -> Out {
+    let scratch = tempfile::tempdir().unwrap();
+    let home = home.unwrap_or_else(|| scratch.path());
+    assert_not_real_home(home);
     let mut cmd = Command::new(TILTH);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(home) = home {
-        // Project-scope hosts (vscode, trae) write relative to the cwd.
-        cmd.env("HOME", home)
-            .env("USERPROFILE", home)
-            .current_dir(home);
-    }
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("APPDATA", home.join("AppData"))
+        .current_dir(home);
     let mut child = cmd.spawn().unwrap();
     child
         .stdin
@@ -343,21 +360,6 @@ fn press_install_hook_with_edit_flag_and_uppercase_host() {
 }
 
 #[test]
-fn press_install_hook_with_unset_home_fails_without_writing() {
-    let cwd = tempfile::tempdir().unwrap();
-    let out = Command::new(TILTH)
-        .args(["install", "claude-code", "--hook"])
-        .env_remove("HOME")
-        .env_remove("USERPROFILE")
-        .current_dir(cwd.path())
-        .output()
-        .unwrap();
-    // The home crate may fall back to the passwd entry; only a clean exit or clean failure is allowed.
-    assert!(matches!(out.status.code(), Some(0 | 1)), "{:?}", out.status);
-    assert!(files_under(cwd.path()).is_empty());
-}
-
-#[test]
 fn press_install_hook_keeps_user_hooks_through_the_binary() {
     let home = tempfile::tempdir().unwrap();
     let settings = home.path().join(".claude/settings.json");
@@ -372,4 +374,43 @@ fn press_install_hook_keeps_user_hooks_through_the_binary() {
     let text = fs::read_to_string(&settings).unwrap();
     assert!(text.contains("/u/audit"), "user hook deleted: {text}");
     assert_eq!(text.matches(" hook --host claude").count(), 1, "{text}");
+}
+
+#[test]
+fn install_hook_bad_hook_file_leaves_mcp_config_unwritten() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "{ not json").unwrap();
+    let out = run(&["install", "claude-code", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(!home.path().join(".claude.json").exists());
+    assert_eq!(fs::read_to_string(&settings).unwrap(), "{ not json");
+}
+
+#[test]
+fn install_hook_droid_keeps_settings_json_hooks_and_claude_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".factory/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let seeded = json!({"hooks": {"PreToolUse": [
+        {"matcher": "Execute", "hooks": [{"type": "command", "command": "/u/audit"}]}]}});
+    fs::write(&settings, seeded.to_string()).unwrap();
+    let out = run(&["install", "droid", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(!home.path().join(".factory/hooks.json").exists());
+    let text = fs::read_to_string(&settings).unwrap();
+    assert!(text.contains("/u/audit"), "{text}");
+    assert_eq!(text.matches(" hook --host claude").count(), 1, "{text}");
+
+    let out = run(&["install", "claude-code", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let claude: Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        claude["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+        "block"
+    );
 }

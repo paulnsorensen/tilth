@@ -218,7 +218,9 @@ Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). 
 
 `tilth install <host> --hook` also registers `tilth hook`, a pre-tool guard that denies shell file reads, searches, and writes (`cat`, `grep`, `sed -i`, and similar) and points the agent at the tilth tools. It writes the MCP config as usual, then merges one tilth entry into the host's hook file. Re-running it replaces the entry and leaves your other hooks alone.
 
-Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json`), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
+Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json` when it exists, otherwise the `hooks` key of `~/.factory/settings.json`, so existing settings hooks keep running), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
+
+A host that fails open when the guard cannot run gets its documented fail-closed field: `onFailure: "block"` for `claude-code` and `failClosed: true` for `cursor`. The other hosts document no such field, so a missing or moved binary there disables the guard; keep the installed binary path stable.
 
 Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
 
