@@ -1280,6 +1280,8 @@ def test_strict_file_tools_rejects_successful_forbidden_bash(
         {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "is_error": denied}]}},
         {"type": "result", "subtype": "success", "is_error": False},
     ]
+    if denied:
+        events[2]["message"]["content"][0]["content"] = "PreToolUse:Bash hook error: [/usr/bin/fake-hook hook]: blocked\n"
     route_hook_to_real_process(monkeypatch, lambda cmd, **kwargs: subprocess.CompletedProcess(
         cmd, 0, stdout="\n".join(map(json.dumps, events)), stderr=""))
     if denied:

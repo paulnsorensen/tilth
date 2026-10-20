@@ -75,8 +75,10 @@ def _trajectory(*calls: tuple[str, str, bool | None]) -> str:
         events.append({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": command}}]}})
         if is_error is not None:
-            events.append({"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": call_id, "is_error": is_error}]}})
+            result = {"type": "tool_result", "tool_use_id": call_id, "is_error": is_error}
+            if is_error:
+                result["content"] = "PreToolUse:Bash hook error: [/usr/bin/fake-hook hook]: blocked\n"
+            events.append({"type": "user", "message": {"content": [result]}})
     return "\n".join(map(json.dumps, events))
 
 
@@ -497,6 +499,7 @@ def test_a_result_cannot_be_paired_to_a_different_call_by_position(tmp_path: Pat
         _audit(raw, tmp_path)
 
 
-def test_empty_error_text_is_the_only_unrecorded_shape_still_counted_as_denied(tmp_path: Path) -> None:
-    # Kept allowance: no real run produced empty error text, so it cannot mask a real failure.
-    assert _audit(_stream(_use("c1", "cat a.go"), _result("c1", "")), tmp_path) == 1
+def test_empty_error_text_is_not_a_denial_and_is_hook_loosened(tmp_path: Path) -> None:
+    # No real run produced empty error text; with nothing to show the hook fired, the call ran (fail closed).
+    with pytest.raises(run.HookLoosenedError):
+        _audit(_stream(_use("c1", "cat a.go"), _result("c1", "")), tmp_path)

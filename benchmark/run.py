@@ -674,11 +674,10 @@ def _hook_denies(hook_binary: str, command: str) -> bool:
     return _hook_replay(hook_binary, command)[0]
 
 
-def _carries_hook_denial(content: object, reason: str) -> bool:
+def _carries_hook_denial(content: object) -> bool:
     if isinstance(content, list):
         content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
-    text = content.strip() if isinstance(content, str) else ""
-    return not text or "PreToolUse:Bash hook" in text or (bool(reason) and reason in text)
+    return isinstance(content, str) and content.lstrip().startswith("PreToolUse:Bash hook")
 
 
 def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str], hook_binary: str) -> int:
@@ -710,15 +709,14 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str],
                 results[block["tool_use_id"]] = block.get("content")
     # Replay through the hook at hook_sha, whichever hook the cell ran with: a call that ran and
     # that hook denies means the cell's own hook let through what the seed denies. A call counts as
-    # hook-denied only when its error result carries the hook's block (Claude Code's
-    # `PreToolUse:Bash hook` marker or the replayed stderr reason); a result with no text at all
-    # has nothing to contradict the denial. Any other error text means the command ran.
+    # hook-denied only when its error result text starts with Claude Code's `PreToolUse:Bash hook`
+    # prefix. Any other error text, or none, means the command ran.
     denied = 0
     for call_id, command in calls.items():
-        denies, reason = _hook_replay(hook_binary, command)
+        denies, _ = _hook_replay(hook_binary, command)
         if not denies:
             continue
-        if call_id not in results or not _carries_hook_denial(results[call_id], reason):
+        if call_id not in results or not _carries_hook_denial(results[call_id]):
             raise HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: {command}")
         denied += 1
     return denied
