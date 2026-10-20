@@ -2530,15 +2530,18 @@ Examples:
     if args.strict_file_tools:
         try:
             hook_sha = _git("rev-parse", "--verify", f"{args.candidate_sha or 'HEAD'}^{{commit}}", cwd=REPO_ROOT).strip()
-            hook_binary = build_candidate(hook_sha).binary_path
             _hook_source_key(hook_sha)
-            probe_strict_hooks(modes, hook_binary)
-        except HookProbeFailed as error:
-            parser.error(f"strict hook probe failed, no cell ran: {error}")
+            hook_binary = build_candidate(hook_sha).binary_path
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             parser.error(f"cannot build the strict hook at {hook_sha or args.candidate_sha or 'HEAD'}: {error}")
 
     _verify_mcp_servers(modes, args.runner)
+
+    if args.strict_file_tools:
+        try:
+            probe_strict_hooks(modes, hook_binary)
+        except HookProbeFailed as error:
+            parser.error(f"strict hook probe failed, no cell ran: {error}")
 
     # Filter tasks by repo
     if args.repos.lower() != "all":

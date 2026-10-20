@@ -639,7 +639,7 @@ def test_run_plan_runs_cells_when_the_probe_passes(monkeypatch: pytest.MonkeyPat
 
 
 def test_main_refuses_a_strict_run_with_a_hookless_binary_before_any_cell_runs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     old = _script(tmp_path / "old-tilth", _NO_HOOK_SUBCOMMAND)
     monkeypatch.setitem(run.TASKS, "strict_probe_task", StoreTask(name="strict_probe_task"))
@@ -647,6 +647,10 @@ def test_main_refuses_a_strict_run_with_a_hookless_binary_before_any_cell_runs(
     monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: run.CandidateBuild(
         git_sha=sha, binary_path=old, binary_sha256="old"))
     monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+    synthetic = tmp_path / "synthetic"
+    synthetic.mkdir()
+    monkeypatch.setattr(run, "SYNTHETIC_REPO", synthetic)
+    monkeypatch.setattr(run, "reset_repo", lambda *a, **kw: None)
     calls: list[str] = []
     monkeypatch.setattr(run, "run_single", lambda *a, **kw: calls.append("ran"))
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_probe_task", "--models", "sonnet5",
@@ -657,6 +661,7 @@ def test_main_refuses_a_strict_run_with_a_hookless_binary_before_any_cell_runs(
         run.main()
 
     assert caught.value.code == 2 and calls == []
+    assert "strict hook probe failed" in capsys.readouterr().err
 
 
 # --- cure pass 1: strict guidance, plan guards, key cache ---
