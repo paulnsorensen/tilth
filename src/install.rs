@@ -1605,4 +1605,198 @@ mod tests {
         assert!(install_hook("claude-code", home.path()).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "[1]");
     }
+
+    fn seed(home: &Path, rel: &str, content: &str) -> PathBuf {
+        let path = home.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn all_commands(v: &Value) -> Vec<String> {
+        fn walk(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::Object(m) => {
+                    for (k, x) in m {
+                        if let ("command", Some(s)) = (k.as_str(), x.as_str()) {
+                            out.push(s.to_string());
+                        }
+                        walk(x, out);
+                    }
+                }
+                Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(v, &mut out);
+        out
+    }
+
+    fn tilth_count(v: &Value) -> usize {
+        all_commands(v)
+            .iter()
+            .filter(|c| c.contains(" hook --host "))
+            .count()
+    }
+
+    #[test]
+    fn press_install_is_byte_idempotent_for_every_landed_host() {
+        for host in HOOK_HOSTS {
+            let home = tempfile::tempdir().unwrap();
+            let path = hook_target(host, home.path()).unwrap().path;
+            install_hook(host, home.path()).unwrap();
+            let first = fs::read(&path).unwrap();
+            install_hook(host, home.path()).unwrap();
+            assert_eq!(first, fs::read(&path).unwrap(), "{host}");
+            assert_eq!(tilth_count(&read_json(&path)), 1, "{host}");
+        }
+    }
+
+    #[test]
+    fn press_stale_entry_at_other_binary_path_is_replaced_for_every_host() {
+        for host in HOOK_HOSTS {
+            let home = tempfile::tempdir().unwrap();
+            let target = hook_target(host, home.path()).unwrap();
+            install_hook(host, home.path()).unwrap();
+            let current = hook_command(target.family);
+            let raw = fs::read_to_string(&target.path).unwrap().replace(
+                &current,
+                &format!("/old/bin/tilth hook --host {}", target.family),
+            );
+            fs::write(&target.path, raw).unwrap();
+            install_hook(host, home.path()).unwrap();
+            let cfg = read_json(&target.path);
+            assert_eq!(tilth_count(&cfg), 1, "{host}");
+            assert_eq!(all_commands(&cfg), vec![current], "{host}");
+        }
+    }
+
+    #[test]
+    fn press_stale_tilth_hook_in_shared_group_keeps_user_sibling() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/usr/local/bin/audit-log"},
+                {"type":"command","command":"/old/bin/tilth hook --host claude"}]}]}}"#,
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        let cmds = all_commands(&cfg);
+        assert!(
+            cmds.iter().any(|c| c == "/usr/local/bin/audit-log"),
+            "user's sibling hook was deleted: {cmds:?}"
+        );
+        assert_eq!(tilth_count(&cfg), 1);
+    }
+
+    #[test]
+    fn press_stale_tilth_hook_in_bash_edit_group_keeps_matcher_and_siblings() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|Edit","hooks":[
+                {"type":"command","command":"/old/bin/tilth hook --host claude"},
+                {"type":"command","command":"/usr/local/bin/fmt-check"}]}]}}"#,
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        let cmds = all_commands(&cfg);
+        assert!(
+            cmds.iter().any(|c| c == "/usr/local/bin/fmt-check"),
+            "user's Edit-matcher sibling hook was deleted: {cmds:?}"
+        );
+        assert_eq!(tilth_count(&cfg), 1);
+    }
+
+    #[test]
+    fn press_two_stale_entries_collapse_to_one_and_keep_others() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".cursor/hooks.json",
+            r#"{"version":2,"hooks":{"beforeShellExecution":[
+                {"command":"/a/tilth hook --host cursor"},
+                {"command":"./mine.sh"},
+                {"command":"/b/tilth hook --host cursor"}],
+              "afterFileEdit":[{"command":"./fmt.sh"}]}}"#,
+        );
+        install_hook("cursor", home.path()).unwrap();
+        let cfg = read_json(&path);
+        assert_eq!(cfg["version"], 2);
+        assert_eq!(tilth_count(&cfg), 1);
+        assert_eq!(
+            cfg["hooks"]["beforeShellExecution"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(cfg["hooks"]["afterFileEdit"][0]["command"], "./fmt.sh");
+        assert!(all_commands(&cfg).contains(&"./mine.sh".to_string()));
+    }
+
+    #[test]
+    fn press_windsurf_keeps_other_events() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".codeium/windsurf/hooks.json",
+            r#"{"hooks":{"post_run_command":[{"command":"./post.sh"}]}}"#,
+        );
+        install_hook("windsurf", home.path()).unwrap();
+        let cfg = read_json(&path);
+        assert_eq!(cfg["hooks"]["post_run_command"][0]["command"], "./post.sh");
+        assert_eq!(tilth_count(&cfg), 1);
+    }
+
+    #[test]
+    fn press_malformed_shapes_error_without_touching_the_file() {
+        let bad = [
+            r#"{"hooks":null}"#,
+            r#"{"hooks":[]}"#,
+            r#"{"hooks":"x"}"#,
+            r#"{"hooks":{"PreToolUse":{}}}"#,
+            r#"{"hooks":{"PreToolUse":null}}"#,
+            "",
+            "\u{feff}{}",
+            "{ // jsonc\n}",
+        ];
+        for content in bad {
+            let home = tempfile::tempdir().unwrap();
+            let path = seed(home.path(), ".claude/settings.json", content);
+            let err = install_hook("claude-code", home.path());
+            assert!(err.is_err(), "accepted {content:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn press_crush_jsonc_error_names_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        seed(home.path(), ".config/crush/crush.json", "{ // c\n}");
+        let err = install_hook("crush", home.path()).unwrap_err();
+        assert!(err.contains("crush.json"), "{err}");
+    }
+
+    #[test]
+    fn press_user_group_with_other_hooks_gets_separate_tilth_group() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./mine.sh"}]}]}}"#,
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        assert_eq!(cfg["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            cfg["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "./mine.sh"
+        );
+    }
 }

@@ -303,3 +303,73 @@ fn install_without_hook_flag_writes_no_hook_config() {
         }
     }
 }
+
+#[test]
+fn press_hook_with_empty_stdin_fails_closed() {
+    for host in ["claude", "cursor", "windsurf"] {
+        let out = run(&["hook", "--host", host], "", None);
+        assert_eq!(out.code, 2, "{host}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn press_hook_with_bogus_hint_is_rejected() {
+    let out = run(
+        &["hook", "--hint", "bogus"],
+        &claude_event("cat a.rs"),
+        None,
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+}
+
+#[test]
+fn press_install_hook_with_edit_flag_and_uppercase_host() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run(
+        &["install", "claude-code", "--hook", "--edit"],
+        "",
+        Some(home.path()),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(home.path().join(".claude/settings.json").exists());
+    let upper = tempfile::tempdir().unwrap();
+    let out = run(
+        &["install", "CLAUDE-CODE", "--hook"],
+        "",
+        Some(upper.path()),
+    );
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(files_under(upper.path()).is_empty());
+}
+
+#[test]
+fn press_install_hook_with_unset_home_fails_without_writing() {
+    let cwd = tempfile::tempdir().unwrap();
+    let out = Command::new(TILTH)
+        .args(["install", "claude-code", "--hook"])
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .current_dir(cwd.path())
+        .output()
+        .unwrap();
+    // The home crate may fall back to the passwd entry; only a clean exit or clean failure is allowed.
+    assert!(matches!(out.status.code(), Some(0 | 1)), "{:?}", out.status);
+    assert!(files_under(cwd.path()).is_empty());
+}
+
+#[test]
+fn press_install_hook_keeps_user_hooks_through_the_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let seeded = json!({"model": "x", "hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/u/audit"},
+            {"type": "command", "command": "/old/tilth hook --host claude"}]}]}});
+    fs::write(&settings, seeded.to_string()).unwrap();
+    let out = run(&["install", "claude-code", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let text = fs::read_to_string(&settings).unwrap();
+    assert!(text.contains("/u/audit"), "user hook deleted: {text}");
+    assert_eq!(text.matches(" hook --host claude").count(), 1, "{text}");
+}
