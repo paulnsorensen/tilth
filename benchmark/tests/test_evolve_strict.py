@@ -178,6 +178,61 @@ def test_unfaithful_seed_hook_refuses_the_whole_run(monkeypatch: pytest.MonkeyPa
     assert world.calls == [] and world.spawned == [] and world.judge.labelled == []
 
 
+def test_seed_hook_without_hint_text_refuses_before_any_paid_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                  capsys) -> None:
+    world = strict_world(monkeypatch, tmp_path, seed_hook=fake_hook(tmp_path, "mute-seed-hook", silent=True))
+    evo = build(world, strict=True)
+
+    assert evo.preflight() == 2
+
+    assert "Read tool" in capsys.readouterr().err and "Read tool" in log_text(world)
+    assert world.calls == [] and world.spawned == [] and world.judge.labelled == []
+    assert not world.stored()
+
+
+def test_seed_hook_source_key_failure_refuses_before_any_paid_call(monkeypatch: pytest.MonkeyPatch,
+                                                                   tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+
+    def broken_key(_sha, _repo=None):
+        raise ValueError("strict_file_tools needs a hook source key")
+
+    monkeypatch.setattr(run, "_hook_source_key", broken_key)
+
+    assert build(world, strict=True).preflight() == 2
+    assert world.calls == [] and world.spawned == [] and world.judge.labelled == []
+
+
+def test_hook_failure_in_buy_baselines_ends_the_run_cleanly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                           capsys) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    evo = build(world, strict=True)
+    assert evo.preflight() is None
+
+    def refuse(*_args, **_kwargs):
+        raise run.HookProbeFailed("strict hook x (--hint native) lacks hint text")
+
+    monkeypatch.setattr(run, "run_plan", refuse)
+
+    assert evo.buy_baselines() == 2
+    assert "lacks hint text" in capsys.readouterr().err and "lacks hint text" in log_text(world)
+
+
+def test_hook_failure_while_finishing_is_logged_not_raised(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    evo = build(world, strict=True)
+    monkeypatch.setattr(evo, "preflight", lambda: None)
+    monkeypatch.setattr(evo, "buy_baselines", lambda: None)
+
+    def broken_search():
+        raise run.HookProbeFailed("strict hook x failed")
+
+    monkeypatch.setattr(evo, "search", broken_search)
+
+    assert evo.run() == 1
+    assert "strict hook x failed" in log_text(world)
+
+
 def test_faithful_seed_hook_passes_the_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     world = strict_world(monkeypatch, tmp_path)
     evo = build(world, strict=True)

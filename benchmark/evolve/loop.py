@@ -271,7 +271,13 @@ class Evolution:
         if failures:
             return self.refuse("the seed hook fails the frozen hook corpus (strict runs need a faithful seed hook):\n"
                                + "\n".join(failures))
-        self.log("hook: seed hook passes the frozen corpus in both hint modes")
+        try:
+            for hint in ("native", "tilth"):
+                run._probe_hook(binary, hint)
+            run._hook_source_key(self.settings.seed_sha, self.settings.repo)
+        except (run.CandidateBuildFailed, ValueError, subprocess.SubprocessError, OSError) as error:
+            return self.refuse(f"seed hook probe failed: {tail(str(error))}")
+        self.log("hook: seed hook passes the frozen corpus and the hint-text probe in both hint modes")
         return None
 
     def preflight(self) -> int | None:
@@ -354,6 +360,8 @@ class Evolution:
             self._plan(cells, None)
         except run.BaselineDrift as error:
             return self.refuse(str(error))
+        except run.CandidateBuildFailed as error:
+            return self.refuse(f"baselines: {tail(str(error))}")
         except _Stopped:
             pass
         return None
@@ -418,6 +426,8 @@ class Evolution:
         failures = hookgate.corpus_failures(binary)
         if failures:
             shown = failures[:TAIL_LINES - 1]
+            if len(failures) > len(shown):
+                shown.append(f"... and {len(failures) - len(shown)} more")
             return self._fail(result, "hook gate", "The candidate's Bash hook fails the frozen hook corpus:\n"
                               + "\n".join(shown))
         result.hook_ok = True
@@ -674,7 +684,7 @@ class Evolution:
             if not self.stop.is_set:
                 self.search()
             self.finish()
-        except (GitError, OSError, EvolveError) as error:
+        except (GitError, OSError, EvolveError, run.CandidateBuildFailed) as error:
             self._finish_failed(f"finish: run failed ({type(error).__name__}): {error}")
         finally:
             self.materializer.cleanup()
