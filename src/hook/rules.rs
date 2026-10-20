@@ -249,22 +249,30 @@ fn is_assign_word(t: &str) -> bool {
     t.contains('=') && !t.starts_with(['=', '-'])
 }
 
-/// Index of the first word after the wrapper's options, or `None` for an unknown option.
-fn skip_options(args: &[Arg], opts: &WrapOpts, assigns: bool) -> Option<usize> {
+/// Required positional words a wrapper takes before the wrapped command.
+fn wrapper_positionals(name: &str) -> usize {
+    usize::from(name == "timeout")
+}
+
+/// Index of the first wrapped-command word, or `None` for an unknown option. One loop
+/// consumes, in any order: options (with values), a `--` terminator, `VAR=value` words,
+/// and `positionals` required operands. Options stop at `--`.
+fn skip_options(args: &[Arg], opts: &WrapOpts, mut positionals: usize) -> Option<usize> {
     let mut i = 0;
+    let mut terminated = false;
     while let Some(arg) = args.get(i) {
         let t = arg.text.as_str();
-        if t == "--" {
-            let mut j = i + 1;
-            while args.get(j).is_some_and(|a| is_assign_word(&a.text)) {
-                j += 1;
-            }
-            return Some(j);
-        }
-        if assigns && is_assign_word(t) {
+        if t == "--" && !terminated {
+            terminated = true;
             i += 1;
-        } else if t.len() < 2 || !t.starts_with('-') {
-            break;
+        } else if is_assign_word(t) {
+            i += 1;
+        } else if terminated || t.len() < 2 || !t.starts_with('-') {
+            if positionals == 0 {
+                break;
+            }
+            positionals -= 1;
+            i += 1;
         } else if let Some(long) = t.strip_prefix("--") {
             let (key, has_value) = long
                 .split_once('=')
@@ -348,12 +356,12 @@ fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
     while let Some(first) = words.first() {
         let name = base(&first.text);
         let rest = &words[1..];
-        let mut i = match name {
+        let i = match name {
             "env" | "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" | "stdbuf"
             | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" => {
                 xargs |= name == "xargs";
                 let opts = wrapper_opts(name);
-                let i = skip_options(rest, &opts, true).ok_or(UNRESOLVED)?;
+                let i = skip_options(rest, &opts, wrapper_positionals(name)).ok_or(UNRESOLVED)?;
                 if let Some(rule) = option_file_rule(name, &rest[..i], &opts) {
                     return Err(rule);
                 }
@@ -361,9 +369,6 @@ fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
             }
             _ => break,
         };
-        if name == "timeout" && i < rest.len() {
-            i += 1;
-        }
         words = rest.get(i..).unwrap_or(&[]);
     }
     Ok((words, xargs))

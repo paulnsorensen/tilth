@@ -361,6 +361,117 @@ fn press_wrappers_deny() {
     ]);
 }
 
+/// Wrapper table: name, one valid option with its value, whether it takes `VAR=value`
+/// words, and how many positionals it requires.
+const WRAPPERS: &[(&str, &[&str], bool, usize)] = &[
+    ("env", &["-u", "X"], true, 0),
+    ("command", &["-p"], false, 0),
+    ("builtin", &[], false, 0),
+    ("exec", &["-a", "x"], false, 0),
+    ("nice", &["-n", "5"], false, 0),
+    ("nohup", &[], false, 0),
+    ("timeout", &["-s", "KILL"], false, 1),
+    ("stdbuf", &["-o", "L"], false, 0),
+    ("sudo", &["-u", "root"], true, 0),
+    ("doas", &["-u", "root"], false, 0),
+    ("time", &["-f", "%e"], false, 0),
+    ("xargs", &["-n", "1"], false, 0),
+];
+
+fn permutations(items: &[String]) -> Vec<Vec<String>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let head = rest.remove(i);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, head.clone());
+            out.push(tail);
+        }
+    }
+    out
+}
+
+/// Every wrapper prefix the real tool accepts: any subset of {option+value, `--`,
+/// `A=1`, required positional} in any order, with the option before `--`.
+fn wrapper_prefixes() -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, opt, assigns, positionals) in WRAPPERS {
+        let mut items: Vec<(&str, String)> = Vec::new();
+        if !opt.is_empty() {
+            items.push(("opt", opt.join(" ")));
+        }
+        items.push(("dd", "--".to_string()));
+        if *assigns {
+            items.push(("asg", "A=1".to_string()));
+        }
+        if *positionals > 0 {
+            items.push(("pos", "5".to_string()));
+        }
+        for mask in 0..(1u32 << items.len()) {
+            let picked: Vec<String> = items
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| mask >> k & 1 == 1)
+                .map(|(_, (tag, text))| format!("{tag}:{text}"))
+                .collect();
+            if *positionals > 0 && !picked.iter().any(|p| p.starts_with("pos:")) {
+                continue;
+            }
+            for order in permutations(&picked) {
+                let at = |tag: &str| order.iter().position(|p| p.starts_with(tag));
+                if let (Some(o), Some(d)) = (at("opt:"), at("dd:")) {
+                    if o > d {
+                        continue;
+                    }
+                }
+                let words: Vec<&str> = order
+                    .iter()
+                    .map(|p| p.split_once(':').map_or(p.as_str(), |(_, t)| t))
+                    .collect();
+                out.push(format!("{name} {}", words.join(" ")));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn press_wrapper_orderings_unwrap() {
+    let prefixes = wrapper_prefixes();
+    assert!(
+        prefixes.len() >= 60,
+        "too few combinations: {}",
+        prefixes.len()
+    );
+    let deny: Vec<String> = prefixes.iter().map(|p| format!("{p} cat f")).collect();
+    let allow: Vec<String> = prefixes
+        .iter()
+        .map(|p| format!("{p} go test ./..."))
+        .collect();
+    let leaked: Vec<&String> = deny.iter().filter(|c| !denies(c)).collect();
+    assert!(leaked.is_empty(), "allowed but must deny: {leaked:?}");
+    let blocked: Vec<&String> = allow.iter().filter(|c| denies(c)).collect();
+    assert!(blocked.is_empty(), "denied but must allow: {blocked:?}");
+}
+
+#[test]
+fn press_nested_wrappers_unwrap() {
+    assert_all_deny(&[
+        "sudo env -- X=1 timeout 5 -- nice cat f",
+        "env -u X -- A=1 nice -n 5 -- timeout -s KILL 5 -- cat f",
+        "nohup timeout 5 -- sudo -u root -- env A=1 -- time cat f",
+        "doas -u root -- stdbuf -o L -- timeout -- 5 cat f",
+    ]);
+    assert_all_allow(&[
+        "sudo env -- X=1 timeout 5 -- nice go test ./...",
+        "env -u X -- A=1 nice -n 5 -- timeout -s KILL 5 -- go test ./...",
+        "nohup timeout 5 -- sudo -u root -- env A=1 -- time go test ./...",
+    ]);
+}
+
 #[test]
 fn press_nested_shell_strings_deny() {
     assert_all_deny(&[
