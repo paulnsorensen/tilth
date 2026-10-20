@@ -276,3 +276,131 @@ def test_strict_plan_without_hook_sha_is_refused(monkeypatch: pytest.MonkeyPatch
 
     with pytest.raises(ValueError, match="hook_sha"):
         _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True)
+
+
+# --- press round 1: attacks on the replay audit and the hook source key ---
+
+
+def _stream(*events: dict) -> str:
+    return "\n".join(map(json.dumps, events))
+
+
+def _use(call_id: str | None, command: object, **extra) -> dict:
+    block = {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+    if call_id is not None:
+        block["id"] = call_id
+    return {"type": "assistant", "message": {"content": [block]}, **extra}
+
+
+def _result(call_id: str, text: str, is_error: bool = True) -> dict:
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": call_id, "is_error": is_error, "content": text}]}}
+
+
+def test_a_denied_command_that_ran_and_failed_on_its_own_is_not_counted_as_a_hook_denial(tmp_path: Path) -> None:
+    # `cat` is denied by the hook. An is_error result whose text is a plain shell failure shows the
+    # command RAN (the cell's hook let it through); only is_error is checked, so the audit fails open.
+    raw = _stream(_use("c1", "cat missing.go"), _result("c1", "cat: missing.go: No such file or directory"))
+
+    with pytest.raises(run.HookLoosenedError):
+        run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_bash_calls_without_an_id_are_each_audited(tmp_path: Path) -> None:
+    # Calls keyed by id: two id-less calls collapse to one and the denied `cat` is overwritten.
+    raw = _stream(_use(None, "cat a.go"), _use(None, "go test ./..."))
+
+    with pytest.raises(run.HookLoosenedError):
+        run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_a_denied_call_among_parallel_calls_in_one_message_is_audited(tmp_path: Path) -> None:
+    blocks = [{"type": "tool_use", "id": f"p{i}", "name": "Bash", "input": {"command": command}}
+              for i, command in enumerate(["go build ./...", "cat a.go", "go vet ./..."])]
+    raw = _stream({"type": "assistant", "message": {"content": blocks}})
+
+    with pytest.raises(run.HookLoosenedError, match="cat a.go"):
+        run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_a_denied_call_inside_a_sidechain_is_audited(tmp_path: Path) -> None:
+    raw = _stream(_use("s1", "cat a.go", parent_tool_use_id="toolu_parent", isSidechain=True))
+
+    with pytest.raises(run.HookLoosenedError):
+        run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_a_newline_smuggled_denied_command_and_unicode_reach_the_hook_intact(tmp_path: Path) -> None:
+    hook = fake_hook(tmp_path)
+
+    with pytest.raises(run.HookLoosenedError):
+        run._audit_strict_claude(_stream(_use("n1", "go test ./...\ncat a.go")), run.MODES["baseline"],
+                                 _BASELINE_TOOLS, str(hook))
+    assert run._audit_strict_claude(_stream(_use("u1", "go test ./... # héllo ☃")), run.MODES["baseline"],
+                                    _BASELINE_TOOLS, str(hook)) == 0
+
+
+def test_a_hook_binary_path_with_spaces_is_replayed(tmp_path: Path) -> None:
+    spaced = tmp_path / "dir with spaces"
+    spaced.mkdir()
+    hook = fake_hook(spaced)
+
+    assert run._hook_denies(str(hook), "cat a.go") is True
+    assert run._hook_denies(str(hook), "go test ./...") is False
+
+
+def test_the_replay_sends_the_exact_live_event_shape(tmp_path: Path) -> None:
+    seen = tmp_path / "seen.json"
+    spy = tmp_path / "spy"
+    spy.write_text(f"#!{sys.executable}\nimport sys\nopen({str(seen)!r}, 'w').write(sys.stdin.read())\n"
+                   f"open({str(seen) + '.argv'!r}, 'w').write(' '.join(sys.argv[1:]))\n")
+    spy.chmod(0o755)
+
+    run._hook_denies(str(spy), "go test ./...")
+
+    assert json.loads(seen.read_text()) == {"tool_name": "Bash", "tool_input": {"command": "go test ./..."}}
+    assert Path(str(seen) + ".argv").read_text() == "hook --hint native"
+
+
+def test_a_non_string_command_does_not_pass_the_audit_silently(tmp_path: Path) -> None:
+    raw = _stream(_use("x1", ["cat", "a.go"]))
+
+    with pytest.raises((run.HookLoosenedError, RuntimeError)):
+        run._audit_strict_claude(raw, run.MODES["baseline"], _BASELINE_TOOLS, str(fake_hook(tmp_path)))
+
+
+def test_hook_source_key_is_the_same_for_a_branch_name_a_full_sha_and_a_clone(
+    hook_history: dict, tmp_path: Path,
+) -> None:
+    repo = hook_history["repo"]
+    git("branch", "tip", hook_history["C"], cwd=repo)
+    clone = tmp_path / "elsewhere" / "clone"
+    clone.parent.mkdir()
+    git("clone", "-q", str(repo), str(clone), cwd=tmp_path)
+    by_sha = run._hook_source_key(hook_history["C"], repo)
+
+    assert run._hook_source_key("tip", repo) == by_sha
+    assert run._hook_source_key(hook_history["C"], clone) == by_sha
+
+
+def test_a_dirty_working_tree_does_not_change_the_hook_source_key(hook_history: dict) -> None:
+    repo = hook_history["repo"]
+    before = run._hook_source_key(hook_history["D"], repo)
+    (repo / "src" / "hook" / "x.rs").write_text("pub fn deny() { /* uncommitted */ }\n")
+    (repo / "Cargo.lock").write_text("# uncommitted\n")
+
+    assert run._hook_source_key(hook_history["D"], repo) == before
+
+
+def test_a_hook_sha_without_src_hook_fails_loudly_instead_of_keying(tmp_path: Path) -> None:
+    repo = tmp_path / "old-seed"
+    sha = make_repo(repo, seed_files())
+
+    with pytest.raises(Exception) as caught:
+        run._hook_source_key(sha, repo)
+    assert "src/hook" in str(caught.value) or "src/hook" in str(getattr(caught.value, "stderr", b""))
+
+
+def test_a_hook_sha_that_looks_like_an_option_is_refused(hook_history: dict) -> None:
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        run._hook_source_key("--all", hook_history["repo"])
