@@ -35,9 +35,28 @@ fn base(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+/// Collapse `//`, `/./`, and `..` in an absolute path without touching the filesystem.
+fn normalize_path(text: &str) -> String {
+    if !text.starts_with('/') {
+        return text.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in text.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 pub(super) fn is_device(text: &str) -> bool {
     let is = |s: &str| {
-        matches!(s, "/dev/stdout" | "/dev/stderr" | "/dev/tty")
+        let s = normalize_path(s);
+        matches!(s.as_str(), "/dev/stdout" | "/dev/stderr" | "/dev/tty")
             || s.starts_with("/dev/fd/")
             || s.starts_with("/proc/self/fd/")
     };
@@ -47,6 +66,17 @@ pub(super) fn is_device(text: &str) -> bool {
 pub(super) fn check(cmd: &Cmd) -> Outcome {
     if cmd.words.iter().any(|a| is_device(&a.text)) {
         return Outcome::Deny(DEVICE_PATH);
+    }
+    if cmd
+        .words
+        .first()
+        .is_some_and(|a| base(&a.text) == "command")
+        && cmd
+            .words
+            .get(1)
+            .is_some_and(|a| matches!(a.text.as_str(), "-v" | "-V"))
+    {
+        return Outcome::Allow;
     }
     let (words, xargs) = unwrap(cmd.words);
     let Some(first) = words.first() else {
@@ -529,10 +559,23 @@ fn searcher_rule(name: &str) -> Rule {
     }
 }
 
+/// `grep -d recurse`, `-drecurse`, `--directories=recurse`, `--directories recurse`.
+fn directories_recurse(args: &[Arg]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        let t = a.text.as_str();
+        let next = args.get(i + 1).is_some_and(|n| n.text == "recurse");
+        t == "--directories=recurse"
+            || (t == "--directories" && next)
+            || (t.starts_with('-')
+                && !t.starts_with("--")
+                && (t.ends_with("drecurse") || (t.ends_with('d') && next)))
+    })
+}
+
 fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> Outcome {
     let rule = searcher_rule(name);
     let p = split(args, spec.valued_short, spec.valued_long);
-    if p.has_any(spec.listing) {
+    if p.has_any(spec.listing) || p.has_any(&["--version", "-V", "--help"]) {
         return Outcome::Allow;
     }
     let pattern_given = p.has_any(&["-e", "-f", "--regexp", "--file"]);
@@ -540,7 +583,9 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
     if p.operands.iter().skip(skip).any(|a| a.text != "-") {
         return Outcome::Deny(rule);
     }
-    let recursive_flag = spec.recursive.is_some_and(|flags| p.has_any(flags));
+    let recursive_flag = spec
+        .recursive
+        .is_some_and(|flags| p.has_any(flags) || directories_recurse(args));
     let stdin_fed = cmd.piped || cmd.here;
     if recursive_flag || xargs || (spec.recursive.is_none() && !stdin_fed) {
         return Outcome::Deny(rule);
