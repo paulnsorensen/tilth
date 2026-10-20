@@ -1844,4 +1844,221 @@ mod tests {
             "./mine.sh"
         );
     }
+
+    /// Grouped hosts as `(host, relative config path, hook target)` with an exact matcher.
+    fn grouped_hosts(home: &Path) -> Vec<(&'static str, HookTarget)> {
+        let hosts: Vec<_> = HOOK_HOSTS
+            .iter()
+            .filter_map(|h| {
+                let t = hook_target(h, home).unwrap();
+                (t.nested && t.matcher.is_some()).then_some((*h, t))
+            })
+            .collect();
+        assert!(hosts.len() >= 4, "expected claude/codex/droid/augment");
+        hosts
+    }
+
+    fn nested_config(target: &HookTarget, groups: Value) -> String {
+        let mut events = serde_json::Map::new();
+        events.insert(target.event.into(), groups);
+        let doc = if target.wrap {
+            json!({ "hooks": events })
+        } else {
+            Value::Object(events)
+        };
+        doc.to_string()
+    }
+
+    fn nested_groups<'a>(cfg: &'a Value, target: &HookTarget) -> &'a Vec<Value> {
+        let root = if target.wrap { &cfg["hooks"] } else { cfg };
+        root[target.event].as_array().unwrap()
+    }
+
+    fn tilth_handlers(groups: &[Value]) -> usize {
+        groups
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .filter(|h| {
+                h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(" hook --host "))
+            })
+            .count()
+    }
+
+    fn run_twice_identical(host: &str, home: &Path, path: &Path) -> Value {
+        install_hook(host, home).unwrap();
+        let first = fs::read_to_string(path).unwrap();
+        install_hook(host, home).unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            first,
+            "{host}: not idempotent"
+        );
+        read_json(path)
+    }
+
+    #[test]
+    fn press2_stale_tilth_first_or_last_in_shared_group_keeps_user_hooks() {
+        for order in ["first", "last"] {
+            let probe = tempfile::tempdir().unwrap();
+            for (host, _) in grouped_hosts(probe.path()) {
+                let home = tempfile::tempdir().unwrap();
+                let t = hook_target(host, home.path()).unwrap();
+                let stale = json!({"type": "command", "command": format!("/old/bin/tilth hook --host {}", t.family)});
+                let mine = json!({"type": "command", "command": "./mine.sh"});
+                let hooks = if order == "first" {
+                    json!([stale, mine])
+                } else {
+                    json!([mine, stale])
+                };
+                let path = seed(
+                    home.path(),
+                    t.path.strip_prefix(home.path()).unwrap().to_str().unwrap(),
+                    &nested_config(&t, json!([{"matcher": t.matcher, "hooks": hooks}])),
+                );
+                let cfg = run_twice_identical(host, home.path(), &path);
+                let groups = nested_groups(&cfg, &t);
+                assert_eq!(groups.len(), 1, "{host}/{order}");
+                let hs = groups[0]["hooks"].as_array().unwrap();
+                assert_eq!(hs.len(), 2, "{host}/{order}");
+                assert!(hs.contains(&mine), "{host}/{order}: user hook lost");
+                assert!(hs.iter().any(|h| h["command"] == hook_command(t.family)));
+                assert!(!hs.contains(&stale), "{host}/{order}: stale kept");
+                let pos = hs.iter().position(|h| h == &mine).unwrap();
+                assert_eq!(
+                    pos,
+                    usize::from(order == "first"),
+                    "{host}/{order}: order moved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn press2_stale_tilth_in_foreign_matcher_group_moves_to_exact_group() {
+        let probe = tempfile::tempdir().unwrap();
+        for (host, _) in grouped_hosts(probe.path()) {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            let stale = json!({"type": "command", "command": format!("/old/tilth hook --host {}", t.family)});
+            let lint = json!({"type": "command", "command": "lint.sh"});
+            let mine = json!({"type": "command", "command": "./mine.sh"});
+            let path = seed(
+                home.path(),
+                t.path.strip_prefix(home.path()).unwrap().to_str().unwrap(),
+                &nested_config(
+                    &t,
+                    json!([
+                        {"matcher": "Bash|Edit", "hooks": [lint, stale]},
+                        {"matcher": t.matcher, "hooks": [mine]}
+                    ]),
+                ),
+            );
+            let cfg = run_twice_identical(host, home.path(), &path);
+            let groups = nested_groups(&cfg, &t);
+            assert_eq!(tilth_handlers(groups), 1, "{host}");
+            assert_eq!(groups[0]["matcher"], "Bash|Edit");
+            assert_eq!(groups[0]["hooks"], json!([lint]), "{host}: foreign group");
+            let exact: Vec<_> = groups
+                .iter()
+                .filter(|g| g["matcher"] == json!(t.matcher))
+                .collect();
+            let all: Vec<&Value> = exact
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap())
+                .collect();
+            assert!(all.contains(&&mine), "{host}: user hook lost");
+        }
+    }
+
+    #[test]
+    fn press2_tilth_handler_with_extra_keys_is_replaced_not_merged() {
+        let probe = tempfile::tempdir().unwrap();
+        for (host, _) in grouped_hosts(probe.path()) {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            let stale = json!({"type": "command", "command": format!("/old/tilth hook --host {}", t.family), "timeout": 5, "statusMessage": "guarding"});
+            let path = seed(
+                home.path(),
+                t.path.strip_prefix(home.path()).unwrap().to_str().unwrap(),
+                &nested_config(&t, json!([{"matcher": t.matcher, "hooks": [stale]}])),
+            );
+            let cfg = run_twice_identical(host, home.path(), &path);
+            let groups = nested_groups(&cfg, &t);
+            assert_eq!(
+                groups[0]["hooks"],
+                json!([{"type": "command", "command": hook_command(t.family)}]),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn press2_group_with_non_array_hooks_is_left_untouched() {
+        let probe = tempfile::tempdir().unwrap();
+        for (host, _) in grouped_hosts(probe.path()) {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            let odd = json!({"matcher": t.matcher, "hooks": "not-an-array", "extra": 1});
+            let path = seed(
+                home.path(),
+                t.path.strip_prefix(home.path()).unwrap().to_str().unwrap(),
+                &nested_config(&t, json!([odd])),
+            );
+            let cfg = run_twice_identical(host, home.path(), &path);
+            let groups = nested_groups(&cfg, &t);
+            assert_eq!(groups[0], odd, "{host}: odd group clobbered");
+            assert_eq!(tilth_handlers(groups), 1, "{host}");
+        }
+    }
+
+    #[test]
+    fn press2_handlers_without_command_survive() {
+        let probe = tempfile::tempdir().unwrap();
+        for (host, _) in grouped_hosts(probe.path()) {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            let bare = json!({"type": "prompt", "prompt": "hi"});
+            let path = seed(
+                home.path(),
+                t.path.strip_prefix(home.path()).unwrap().to_str().unwrap(),
+                &nested_config(&t, json!([{"matcher": t.matcher, "hooks": [bare]}])),
+            );
+            let cfg = run_twice_identical(host, home.path(), &path);
+            let groups = nested_groups(&cfg, &t);
+            let all: Vec<&Value> = groups
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap())
+                .collect();
+            assert!(all.contains(&&bare), "{host}: command-less handler lost");
+            assert_eq!(tilth_handlers(groups), 1, "{host}");
+        }
+    }
+
+    #[test]
+    fn press2_user_hook_appended_to_tilth_group_survives_reinstall() {
+        let probe = tempfile::tempdir().unwrap();
+        for (host, _) in grouped_hosts(probe.path()) {
+            let home = tempfile::tempdir().unwrap();
+            let t = hook_target(host, home.path()).unwrap();
+            install_hook(host, home.path()).unwrap();
+            let mut cfg = read_json(&t.path);
+            let mine = json!({"type": "command", "command": "./mine.sh"});
+            let root = if t.wrap { &mut cfg["hooks"] } else { &mut cfg };
+            let n = root[t.event].as_array().unwrap().len();
+            assert_eq!(n, 1);
+            root[t.event][0]["hooks"]
+                .as_array_mut()
+                .unwrap()
+                .push(mine.clone());
+            fs::write(&t.path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+            let cfg = run_twice_identical(host, home.path(), &t.path);
+            let groups = nested_groups(&cfg, &t);
+            assert_eq!(groups.len(), 1, "{host}");
+            assert_eq!(groups[0]["hooks"].as_array().unwrap().len(), 2, "{host}");
+            assert!(groups[0]["hooks"].as_array().unwrap().contains(&mine));
+            assert_eq!(tilth_handlers(groups), 1, "{host}");
+        }
+    }
 }
