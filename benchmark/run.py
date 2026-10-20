@@ -654,8 +654,11 @@ def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
     return f"{tree}:{hashlib.sha256(lock).hexdigest()}"
 
 
-def _hook_denies(hook_binary: str, command: str) -> bool:
-    """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error."""
+def _hook_replay(hook_binary: str, command: str) -> tuple[bool, str]:
+    """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error.
+
+    Returns (denied, stderr reason).
+    """
     event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     try:
         result = subprocess.run([hook_binary, "hook", "--hint", "native"], input=event,
@@ -664,7 +667,18 @@ def _hook_denies(hook_binary: str, command: str) -> bool:
         raise RuntimeError(f"strict audit could not run the hook {hook_binary}: {error}") from error
     if result.returncode not in (0, 2):
         raise RuntimeError(f"strict audit hook exited {result.returncode}: {result.stderr[-500:]}")
-    return result.returncode == 2
+    return result.returncode == 2, result.stderr.strip()
+
+
+def _hook_denies(hook_binary: str, command: str) -> bool:
+    return _hook_replay(hook_binary, command)[0]
+
+
+def _carries_hook_denial(content: object, reason: str) -> bool:
+    if isinstance(content, list):
+        content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+    text = content.strip() if isinstance(content, str) else ""
+    return not text or "PreToolUse:Bash hook" in text or (bool(reason) and reason in text)
 
 
 def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str], hook_binary: str) -> int:
@@ -677,27 +691,34 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str],
     if not mode.mcp_config_path and any(name.startswith("mcp__") for name in available):
         raise RuntimeError("strict baseline exposed an MCP tool")
 
-    calls = {}
-    errored = set()
-    for line in raw.splitlines():
+    # Pair tool_use with tool_result by id; an id-less call keys by stream position and has no
+    # result to pair, so a denied one is ran-unknown and fails closed as hook_loosened.
+    calls: dict[object, str] = {}
+    results: dict[str, object] = {}
+    for position, line in enumerate(raw.splitlines()):
         event = json.loads(line)
         message = event.get("message", {})
-        for block in message.get("content", []):
+        for index, block in enumerate(message.get("content", [])):
             if block.get("type") == "tool_use":
                 name = block.get("name", "")
                 if name in {"Agent", "Task"} or (mode.mcp_config_path and name in _STRICT_NATIVE_FILE_TOOLS):
                     raise RuntimeError(f"strict cell attempted forbidden native tool: {name}")
                 if name == "Bash":
-                    calls[block.get("id")] = block.get("input", {}).get("command", "")
-            elif block.get("type") == "tool_result" and block.get("is_error") is True:
-                errored.add(block.get("tool_use_id"))
+                    key = block.get("id") or ("position", position, index)
+                    calls[key] = block.get("input", {}).get("command", "")
+            elif block.get("type") == "tool_result" and block.get("is_error") is True and block.get("tool_use_id"):
+                results[block["tool_use_id"]] = block.get("content")
     # Replay through the hook at hook_sha, whichever hook the cell ran with: a call that ran and
-    # that hook denies means the cell's own hook let through what the seed denies.
+    # that hook denies means the cell's own hook let through what the seed denies. A call counts as
+    # hook-denied only when its error result carries the hook's block (Claude Code's
+    # `PreToolUse:Bash hook` marker or the replayed stderr reason); a result with no text at all
+    # has nothing to contradict the denial. Any other error text means the command ran.
     denied = 0
     for call_id, command in calls.items():
-        if not _hook_denies(hook_binary, command):
+        denies, reason = _hook_replay(hook_binary, command)
+        if not denies:
             continue
-        if call_id not in errored:
+        if call_id not in results or not _carries_hook_denial(results[call_id], reason):
             raise HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: {command}")
         denied += 1
     return denied
