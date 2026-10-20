@@ -145,6 +145,10 @@ struct HookTarget {
     version: bool,
     /// Host field that makes a failed guard block the action, when its docs name one.
     fail_closed: Option<(&'static str, Value)>,
+    /// The host documents an exec form (`command` + `args`, no shell).
+    exec_form: bool,
+    /// The host runs shell-form commands through PowerShell on this platform.
+    powershell: bool,
     note: Option<&'static str>,
 }
 
@@ -158,11 +162,15 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
         matcher: Some(matcher),
         version: false,
         fail_closed: None,
+        exec_form: false,
+        powershell: false,
         note: None,
     };
     match host {
         "claude-code" => Ok(HookTarget {
             fail_closed: Some(("onFailure", json!("block"))),
+            // raw/claude.md: `args` present means `command` is spawned directly, no shell.
+            exec_form: true,
             ..claude_like(home.join(".claude/settings.json"), "Bash")
         }),
         "codex" => Ok(HookTarget {
@@ -200,6 +208,8 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
             matcher: None,
             version: true,
             fail_closed: None,
+            exec_form: false,
+            powershell: false,
             note: None,
         }),
         "windsurf" => Ok(HookTarget {
@@ -211,6 +221,9 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
             matcher: None,
             version: false,
             fail_closed: None,
+            exec_form: false,
+            // raw/windsurf.md: commands run through PowerShell on Windows.
+            powershell: cfg!(windows),
             note: None,
         }),
         other => Err(format!(
@@ -220,69 +233,162 @@ fn hook_target(host: &str, home: &Path) -> Result<HookTarget, String> {
     }
 }
 
-/// Quote `word` for the host shell. Plain paths stay bare; others get double quotes, which
-/// sh, bash, cmd and PowerShell all accept. Characters that expand inside double quotes are refused.
+/// Quote `word` for a shell hook command. Plain paths stay bare; others get single quotes,
+/// which POSIX sh, Git Bash and PowerShell all treat literally. Characters that a quoted
+/// word could still expand or break on are refused.
 fn shell_quote(word: &str) -> Result<String, String> {
     if let Some(bad) = word
         .chars()
-        .find(|c| matches!(c, '"' | '$' | '`' | '%' | '\n' | '\r'))
+        .find(|c| matches!(c, '\'' | '"' | '$' | '`' | '%' | '\n' | '\r'))
     {
         return Err(format!(
             "cannot register a hook for a binary path containing {bad:?}: {word}"
         ));
     }
-    let plain = |c: char| c.is_ascii_alphanumeric() || "_./:\\-".contains(c);
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_./:-".contains(c);
     if !word.is_empty() && word.chars().all(plain) {
         Ok(word.to_string())
     } else {
-        Ok(format!("\"{word}\""))
+        Ok(format!("'{word}'"))
     }
 }
 
-/// The shell command a host runs for the guard: `<tilth> hook --host <family>`.
-fn hook_command(family: &str) -> Result<String, String> {
+/// How one host runs the guard: exec form (`command` + `args`) or a shell-form string.
+struct HookInvocation {
+    /// Value of the handler's `command` key.
+    command: String,
+    /// Value of the handler's `args` key; present only in exec form.
+    args: Option<Vec<String>>,
+    /// `<binary> hook --host ` for this binary, unquoted, to recognise its stale entries.
+    own_prefix: String,
+}
+
+impl HookInvocation {
+    /// The command line as one string, the way a stale-entry check reads it.
+    #[cfg(test)]
+    fn line(&self) -> String {
+        let mut line = self.command.clone();
+        for arg in self.args.iter().flatten() {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        line
+    }
+}
+
+/// Build the guard invocation. Exec form keeps the binary path verbatim. Shell form uses
+/// forward slashes and the host shell's quoting; `powershell` adds the `&` call operator
+/// that PowerShell needs before a quoted path.
+fn build_hook_invocation(
+    exec_form: bool,
+    powershell: bool,
+    family: &str,
+    binary: &str,
+    extra_args: &[String],
+) -> Result<HookInvocation, String> {
+    let tail = ["hook", "--host", family];
+    let own_prefix = std::iter::once(binary)
+        .chain(extra_args.iter().map(String::as_str))
+        .chain(["hook", "--host", ""])
+        .collect::<Vec<_>>()
+        .join(" ");
+    if exec_form {
+        let args = extra_args
+            .iter()
+            .map(String::as_str)
+            .chain(tail)
+            .map(String::from)
+            .collect();
+        return Ok(HookInvocation {
+            command: binary.to_string(),
+            args: Some(args),
+            own_prefix,
+        });
+    }
+    let path = shell_quote(&binary.replace('\\', "/"))?;
+    let mut command = if powershell && path.starts_with('\'') {
+        format!("& {path}")
+    } else {
+        path
+    };
+    for word in extra_args.iter().map(String::as_str).chain(tail) {
+        command.push(' ');
+        command.push_str(word);
+    }
+    Ok(HookInvocation {
+        command,
+        args: None,
+        own_prefix,
+    })
+}
+
+fn hook_invocation(target: &HookTarget) -> Result<HookInvocation, String> {
     let (command, mut args) = tilth_command_and_args();
     args.retain(|a| a != "--mcp");
-    let mut parts = vec![shell_quote(&command)?];
-    parts.extend(args);
-    parts.push("hook".into());
-    parts.push("--host".into());
-    parts.push(family.into());
-    Ok(parts.join(" "))
+    build_hook_invocation(
+        target.exec_form,
+        target.powershell,
+        target.family,
+        &command,
+        &args,
+    )
+}
+
+/// Drop quotes and the PowerShell call operator, and turn `\` into `/`, so entries written
+/// in any past quoting style compare equal.
+fn canonical_command(command: &str) -> String {
+    let command = command.trim_start();
+    let command = command.strip_prefix("& ").unwrap_or(command);
+    command
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\''))
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect()
 }
 
 /// True when `command` runs this binary (`own_prefix`) or any binary named `tilth` as
 /// `<binary> hook --host <family>`.
 fn is_tilth_hook_command(command: &str, own_prefix: &str) -> bool {
-    if command.starts_with(own_prefix) {
+    let command = canonical_command(command);
+    if command.starts_with(&canonical_command(own_prefix)) {
         return true;
     }
     let Some((head, _)) = command.split_once(" hook --host ") else {
         return false;
     };
-    let name = head
-        .trim_end_matches(['"', '\''])
-        .rsplit(['/', '\\', ' '])
-        .next()
-        .unwrap_or("");
+    let name = head.rsplit(['/', ' ']).next().unwrap_or("");
     name == "tilth" || name == "tilth.exe"
 }
 
+/// A handler's `command`, followed by its `args` when it uses exec form.
+fn handler_line(handler: &Value) -> Option<String> {
+    let mut line = handler.get("command")?.as_str()?.to_string();
+    for arg in handler
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    Some(line)
+}
+
 fn is_tilth_hook_entry(entry: &Value, own_prefix: &str) -> bool {
-    let direct = entry.get("command").and_then(Value::as_str);
     let inner = entry
         .get("hooks")
         .and_then(Value::as_array)
         .into_iter()
-        .flatten()
-        .filter_map(|h| h.get("command").and_then(Value::as_str));
-    direct
-        .into_iter()
+        .flatten();
+    std::iter::once(entry)
         .chain(inner)
-        .any(|c| is_tilth_hook_command(c, own_prefix))
+        .filter_map(handler_line)
+        .any(|c| is_tilth_hook_command(&c, own_prefix))
 }
 
-fn hook_entry(target: &HookTarget, command: &str) -> Value {
+fn hook_entry(target: &HookTarget, invocation: &HookInvocation) -> Value {
     let mut entry = serde_json::Map::new();
     if let Some(matcher) = target.matcher {
         entry.insert("matcher".into(), json!(matcher));
@@ -291,7 +397,10 @@ fn hook_entry(target: &HookTarget, command: &str) -> Value {
     if target.nested {
         handler.insert("type".into(), json!("command"));
     }
-    handler.insert("command".into(), json!(command));
+    handler.insert("command".into(), json!(invocation.command));
+    if let Some(args) = &invocation.args {
+        handler.insert("args".into(), json!(args));
+    }
     if let Some((key, value)) = &target.fail_closed {
         handler.insert((*key).into(), value.clone());
     }
@@ -308,11 +417,8 @@ fn hook_entry(target: &HookTarget, command: &str) -> Value {
 /// goes and a new group is appended. Other handlers and groups stay as they were.
 fn upsert_nested(entries: &mut Vec<Value>, target: &HookTarget, new: Value, own_prefix: &str) {
     let handler = new["hooks"][0].clone();
-    let is_tilth = |h: &Value| {
-        h.get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|c| is_tilth_hook_command(c, own_prefix))
-    };
+    let is_tilth =
+        |h: &Value| handler_line(h).is_some_and(|c| is_tilth_hook_command(&c, own_prefix));
     let exact = |g: &Value| g.get("matcher").and_then(Value::as_str) == target.matcher;
     let mut placed = false;
     for group in entries.iter_mut() {
@@ -346,7 +452,11 @@ fn upsert_nested(entries: &mut Vec<Value>, target: &HookTarget, new: Value, own_
 
 /// Put exactly one tilth entry in the event array. A stale tilth entry is replaced in
 /// place; every other entry stays as it was.
-fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result<(), String> {
+fn upsert_hook(
+    config: &mut Value,
+    target: &HookTarget,
+    invocation: &HookInvocation,
+) -> Result<(), String> {
     let root = config
         .as_object_mut()
         .ok_or("config root is not a JSON object")?;
@@ -366,8 +476,8 @@ fn upsert_hook(config: &mut Value, target: &HookTarget, command: &str) -> Result
         .or_insert(json!([]))
         .as_array_mut()
         .ok_or_else(|| format!("{} is not a JSON array", target.event))?;
-    let new = hook_entry(target, command);
-    let own_prefix = &command[..command.len() - target.family.len()];
+    let new = hook_entry(target, invocation);
+    let own_prefix = invocation.own_prefix.as_str();
     if target.nested {
         upsert_nested(entries, target, new, own_prefix);
     } else {
@@ -400,7 +510,7 @@ fn prepare_hook(host: &str, home: &Path) -> Result<(HookTarget, Value), String> 
     } else {
         json!({})
     };
-    upsert_hook(&mut config, &target, &hook_command(target.family)?)?;
+    upsert_hook(&mut config, &target, &hook_invocation(&target)?)?;
     Ok((target, config))
 }
 
@@ -1570,20 +1680,24 @@ mod tests {
             if target.matcher.is_some() {
                 assert_eq!(ours["matcher"], theirs["matcher"], "{host}: matcher");
             }
-            let cmd = ours
-                .get("command")
-                .or_else(|| ours.pointer("/hooks/0/command"))
-                .and_then(Value::as_str)
-                .unwrap();
-            assert_eq!(cmd, hook_command(target.family).unwrap(), "{host}: command");
+            let handler = ours.pointer("/hooks/0").unwrap_or(ours);
+            assert_eq!(
+                handler_line(handler).unwrap(),
+                hook_invocation(&target).unwrap().line(),
+                "{host}: command"
+            );
+            assert_eq!(
+                handler.get("args").is_some(),
+                target.exec_form,
+                "{host}: args"
+            );
 
             // Fail-closed fields: only where the host's official doc names one.
-            let handler = ours.pointer("/hooks/0").unwrap_or(ours);
             let mut extra: Vec<&String> = handler
                 .as_object()
                 .unwrap()
                 .keys()
-                .filter(|k| !["type", "command", "matcher"].contains(&k.as_str()))
+                .filter(|k| !["type", "command", "args", "matcher"].contains(&k.as_str()))
                 .collect();
             if let Some((key, value)) = &target.fail_closed {
                 assert_eq!(&handler[*key], value, "{host}: fail-closed value");
@@ -1653,14 +1767,13 @@ mod tests {
         assert_eq!(pre[0], other_pre);
         let (command, mut args) = tilth_command_and_args();
         args.retain(|a| a != "--mcp");
-        let want = std::iter::once(command)
-            .chain(args)
+        let want_args: Vec<String> = args
+            .into_iter()
             .chain(["hook".into(), "--host".into(), "claude".into()])
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect();
         assert_eq!(
             pre[1],
-            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": want, "onFailure": "block"}]})
+            json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command, "args": want_args, "onFailure": "block"}]})
         );
     }
 
@@ -1727,14 +1840,29 @@ mod tests {
         path
     }
 
+    /// Rewrite every handler to the shell-form `line`, dropping any `args`.
+    fn set_stale_command(v: &mut Value, line: &str) {
+        match v {
+            Value::Object(m) => {
+                if m.get("command").is_some_and(Value::is_string) {
+                    m.insert("command".into(), json!(line));
+                    m.remove("args");
+                }
+                m.values_mut().for_each(|x| set_stale_command(x, line));
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| set_stale_command(x, line)),
+            _ => {}
+        }
+    }
+
     fn all_commands(v: &Value) -> Vec<String> {
         fn walk(v: &Value, out: &mut Vec<String>) {
             match v {
                 Value::Object(m) => {
-                    for (k, x) in m {
-                        if let ("command", Some(s)) = (k.as_str(), x.as_str()) {
-                            out.push(s.to_string());
-                        }
+                    if let Some(line) = handler_line(v) {
+                        out.push(line);
+                    }
+                    for x in m.values() {
                         walk(x, out);
                     }
                 }
@@ -1773,16 +1901,17 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let target = hook_target(host, home.path()).unwrap();
             install_hook(host, home.path()).unwrap();
-            let current = hook_command(target.family).unwrap();
-            let raw = fs::read_to_string(&target.path).unwrap().replace(
-                &current,
+            let current = hook_invocation(&target).unwrap();
+            let mut stale = read_json(&target.path);
+            set_stale_command(
+                &mut stale,
                 &format!("/old/bin/tilth hook --host {}", target.family),
             );
-            fs::write(&target.path, raw).unwrap();
+            fs::write(&target.path, stale.to_string()).unwrap();
             install_hook(host, home.path()).unwrap();
             let cfg = read_json(&target.path);
             assert_eq!(tilth_count(&cfg), 1, "{host}");
-            assert_eq!(all_commands(&cfg), vec![current], "{host}");
+            assert_eq!(all_commands(&cfg), vec![current.line()], "{host}");
         }
     }
 
@@ -1947,11 +2076,7 @@ mod tests {
         groups
             .iter()
             .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
-            .filter(|h| {
-                h["command"]
-                    .as_str()
-                    .is_some_and(|c| c.contains(" hook --host "))
-            })
+            .filter(|h| handler_line(h).is_some_and(|c| c.contains(" hook --host ")))
             .count()
     }
 
@@ -1994,7 +2119,7 @@ mod tests {
                 assert!(hs.contains(&mine), "{host}/{order}: user hook lost");
                 assert!(hs
                     .iter()
-                    .any(|h| h["command"] == hook_command(t.family).unwrap()));
+                    .any(|h| handler_line(h) == Some(hook_invocation(&t).unwrap().line())));
                 assert!(!hs.contains(&stale), "{host}/{order}: stale kept");
                 let pos = hs.iter().position(|h| h == &mine).unwrap();
                 assert_eq!(
@@ -2059,7 +2184,7 @@ mod tests {
             let groups = nested_groups(&cfg, &t);
             assert_eq!(
                 groups[0]["hooks"],
-                json!([hook_entry(&t, &hook_command(t.family).unwrap())["hooks"][0].clone()]),
+                json!([hook_entry(&t, &hook_invocation(&t).unwrap())["hooks"][0].clone()]),
                 "{host}"
             );
         }
@@ -2196,7 +2321,7 @@ mod tests {
                 .unwrap()
                 .keys()
                 .map(String::as_str)
-                .filter(|k| !["type", "command", "matcher"].contains(k))
+                .filter(|k| !["type", "command", "args", "matcher"].contains(k))
                 .collect();
             if let Some((key, value)) = want {
                 assert_eq!(handler[key], value, "{host}");
@@ -2221,35 +2346,131 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_double_quotes_paths_with_spaces() {
-        assert_eq!(shell_quote("/a b/tilth").unwrap(), "\"/a b/tilth\"");
+    fn shell_quote_single_quotes_paths_with_spaces() {
+        assert_eq!(shell_quote("/a b/tilth").unwrap(), "'/a b/tilth'");
     }
 
     #[test]
     fn shell_quote_refuses_expandable_characters() {
-        for bad in ["/a\"b", "/a$HOME", "/a`x`", "/a%PATH%", "/a\nb"] {
+        for bad in [
+            "/a'b", "/a\"b", "/a$HOME", "/a`x`", "/a%PATH%", "/a\nb", "/a\rb",
+        ] {
             assert!(shell_quote(bad).is_err(), "{bad:?}");
         }
     }
 
+    const WIN_BIN: &str = r"C:\Users\a b\tilth.exe";
+
     #[test]
-    fn windows_path_with_space_yields_double_quoted_command() {
-        let quoted = shell_quote(r"C:\Users\a b\tilth.exe").unwrap();
+    fn exec_form_keeps_spaces_and_backslashes_verbatim() {
+        let inv = build_hook_invocation(true, false, "claude", WIN_BIN, &[]).unwrap();
+        assert_eq!(inv.command, WIN_BIN);
         assert_eq!(
-            format!("{quoted} hook --host windsurf"),
-            r#""C:\Users\a b\tilth.exe" hook --host windsurf"#
+            inv.args,
+            Some(vec!["hook".into(), "--host".into(), "claude".into()])
         );
     }
 
     #[test]
+    fn claude_code_install_writes_exec_form() {
+        let home = tempfile::tempdir().unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&home.path().join(".claude/settings.json"));
+        let handler = &cfg["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert!(!handler["command"].as_str().unwrap().contains(" hook "));
+        let args = handler["args"].as_array().unwrap();
+        assert_eq!(
+            args[args.len() - 3..],
+            [json!("hook"), json!("--host"), json!("claude")]
+        );
+    }
+
+    #[test]
+    fn posix_shell_form_single_quotes_and_forward_slashes() {
+        let inv = build_hook_invocation(false, false, "codex", "/a b/tilth", &[]).unwrap();
+        assert_eq!(inv.command, "'/a b/tilth' hook --host codex");
+        assert!(inv.args.is_none());
+        let inv = build_hook_invocation(false, false, "codex", WIN_BIN, &[]).unwrap();
+        assert_eq!(inv.command, "'C:/Users/a b/tilth.exe' hook --host codex");
+        let inv = build_hook_invocation(false, false, "codex", r"C:\tilth\tilth.exe", &[]).unwrap();
+        assert_eq!(inv.command, "C:/tilth/tilth.exe hook --host codex");
+    }
+
+    #[test]
+    fn powershell_shell_form_uses_call_operator_for_quoted_paths() {
+        let inv = build_hook_invocation(false, true, "windsurf", WIN_BIN, &[]).unwrap();
+        assert_eq!(
+            inv.command,
+            "& 'C:/Users/a b/tilth.exe' hook --host windsurf"
+        );
+        let inv = build_hook_invocation(false, true, "windsurf", r"C:\t\tilth.exe", &[]).unwrap();
+        assert_eq!(inv.command, "C:/t/tilth.exe hook --host windsurf");
+    }
+
+    #[test]
+    fn shell_form_refuses_unsafe_binary_paths() {
+        for bad in [
+            "/a'b/tilth",
+            "/a\"b/tilth",
+            "/a$b/tilth",
+            "/a`b/tilth",
+            "/a%b/tilth",
+            "/a\nb/tilth",
+        ] {
+            assert!(
+                build_hook_invocation(false, false, "codex", bad, &[]).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_shell_form_entry_is_replaced_by_exec_form() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"\"/old dir/tilth\" hook --host claude"}]}]}}"#,
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = run_twice_identical("claude-code", home.path(), &path);
+        assert_eq!(tilth_count(&cfg), 1);
+        let handler = &cfg["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert!(handler["args"].is_array(), "{handler}");
+    }
+
+    #[test]
+    fn stale_exec_form_entry_is_replaced() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/old dir/tilth","args":["hook","--host","claude"]},
+                {"type":"command","command":"node","args":["audit.js"]}]}]}}"#,
+        );
+        let cfg = run_twice_identical("claude-code", home.path(), &path);
+        assert_eq!(tilth_count(&cfg), 1);
+        let cmds = all_commands(&cfg);
+        assert!(cmds.contains(&"node audit.js".to_string()), "{cmds:?}");
+        assert!(!cmds.iter().any(|c| c.contains("/old dir")), "{cmds:?}");
+    }
+
+    #[test]
     fn quoted_tilth_path_is_still_recognised_as_stale() {
-        assert!(is_tilth_hook_command(
+        let own = "/elsewhere/tilth hook --host ";
+        for cmd in [
             "\"/a b/tilth\" hook --host claude",
-            "/elsewhere/tilth hook --host "
-        ));
+            "'/a b/tilth' hook --host claude",
+            "& 'C:/a b/tilth.exe' hook --host windsurf",
+            r"C:\a\tilth.exe hook --host windsurf",
+        ] {
+            assert!(is_tilth_hook_command(cmd, own), "{cmd}");
+        }
         assert!(!is_tilth_hook_command(
             "\"/a b/other\" hook --host claude",
-            "/elsewhere/tilth hook --host "
+            own
         ));
     }
 

@@ -244,9 +244,10 @@ fn install_claude_code_hook_twice_leaves_one_entry() {
     assert_eq!(pre.len(), 1);
     assert_eq!(pre[0]["matcher"], "Bash");
     assert_eq!(pre[0]["hooks"][0]["type"], "command");
+    assert_eq!(pre[0]["hooks"][0]["command"], TILTH);
     assert_eq!(
-        pre[0]["hooks"][0]["command"],
-        format!("{TILTH} hook --host claude")
+        pre[0]["hooks"][0]["args"],
+        json!(["hook", "--host", "claude"])
     );
     // The MCP entry still lands in ~/.claude.json.
     assert!(home.path().join(".claude.json").exists());
@@ -373,7 +374,8 @@ fn press_install_hook_keeps_user_hooks_through_the_binary() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     let text = fs::read_to_string(&settings).unwrap();
     assert!(text.contains("/u/audit"), "user hook deleted: {text}");
-    assert_eq!(text.matches(" hook --host claude").count(), 1, "{text}");
+    assert!(!text.contains("/old/tilth"), "stale entry kept: {text}");
+    assert_eq!(text.matches("\"--host\"").count(), 1, "{text}");
 }
 
 #[test]
