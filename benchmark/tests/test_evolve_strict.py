@@ -19,10 +19,12 @@ from config import REPO_ROOT
 from evolve import cli, engine, hookgate
 from evolve.materialize import ApplyRejected, Materializer
 from evolve_support import (
-    CHEAP, DEV, TEST, build, child, evolve_args, git, log_text, make_world, scripted_engine, seed_candidate, seed_files,
+    CHEAP, DEV, TEST, build, child, evolve_args, git, log_text, make_world, mcp, scripted_engine, seed_candidate,
+    seed_files,
 )
 
 CORPUS = json.loads(hookgate.CORPUS_PATH.read_text())
+WEAK_SEED = mcp(dev_a="0", dev_b="0", cheap_a="1", test_a="0")
 # Rows the harness's own two-command probe does not use, so a flipped verdict reaches the gate, not the probe.
 DENY_ROW = next(row for row in CORPUS["must_deny"] if row["command"] not in {run._PROBE_DENY, run._PROBE_ALLOW})
 ALLOW_ROW = next(row for row in CORPUS["must_allow"] if row["command"] not in {run._PROBE_DENY, run._PROBE_ALLOW})
@@ -55,9 +57,10 @@ def fake_hook(tmp: Path, name: str, *, flip: dict[str, list[str]] | None = None,
 
 
 def strict_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hooks: dict[str, Path] | None = None,
-                 seed_hook: Path | None = None):
+                 seed_hook: Path | None = None, seed_mcp: str | None = None):
     """A world whose builds return fake hook binaries: the seed's ``seed_hook``, a candidate's by its ``tag=`` mark."""
-    world = make_world(monkeypatch, tmp_path, {**seed_files(), "src/hook/rules.rs": "pub fn deny() {}\n"})
+    files = seed_files(seed_mcp) if seed_mcp else seed_files()
+    world = make_world(monkeypatch, tmp_path, {**files, "src/hook/rules.rs": "pub fn deny() {}\n"})
     seed_hook = seed_hook or fake_hook(tmp_path, "seed-hook")
     hooks = hooks or {}
 
@@ -322,3 +325,275 @@ def test_demo_dropped_cat_rule_fails_the_gate_and_a_reworded_hint_runs_strict_ce
     assert not any(cell[1] == by_tag["dropcat"].sha for cell in strict_cells)
     reworded = [cell for cell in strict_cells if cell[1] == by_tag["reword"].sha]
     assert reworded and all(cell[2:] == (True, world.seed_sha) for cell in strict_cells)
+
+
+# --- press round 1: loosened cells, preflight faults, bounded hooks, strict slots ---
+
+
+def loosen_candidate_cells(monkeypatch: pytest.MonkeyPatch, world, tasks: set[str]) -> list[tuple[str, str]]:
+    """Make every candidate-arm cell of ``tasks`` fail as hook_loosened, as the real harness does on a denied Bash call."""
+    hit: list[tuple[str, str]] = []
+    original = run.run_single
+
+    def loosened(task, mode, model, rep, **kwargs):
+        sha = run.MODES[mode].git_sha
+        if mode == "tilth_forced" and sha != world.seed_sha and task in tasks:
+            hit.append((task, sha))
+            raise run.HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: cat {task}")
+        return original(task, mode, model, rep, **kwargs)
+
+    monkeypatch.setattr(run, "run_single", loosened)
+    return hit
+
+
+def test_a_loosened_dev_cell_scores_zero_and_the_candidate_keeps_running(monkeypatch: pytest.MonkeyPatch,
+                                                                       tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good})
+    evo = ready(world)
+    hit = loosen_candidate_cells(monkeypatch, world, {"dev_a"})
+    candidate = winner("good")
+
+    loosened_score, _ = evo.evaluate(candidate, "dev_a")
+    clean_score, _ = evo.evaluate(candidate, "dev_b")
+
+    assert hit and loosened_score == 0.0
+    assert clean_score == 1.0
+
+
+def test_a_loosened_cheap_cell_does_not_score_as_correct(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good})
+    evo = ready(world)
+    loosen_candidate_cells(monkeypatch, world, {"cheap_a", "dev_a", "dev_b"})
+    candidate = winner("good")
+
+    score, _ = evo.evaluate(candidate, "dev_a")
+
+    result = next(r for r in evo.results.values() if r.candidate == candidate)
+    assert score == 0.0 and not result.accepted
+
+
+def test_control_a_clean_strict_winner_opens_the_draft_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good}, seed_mcp=WEAK_SEED)
+    fake, _seen = scripted_engine([winner("good")])
+    monkeypatch.setattr(engine, "optimize_anything", fake)
+
+    build(world, strict=True).run()
+
+    assert len(world.pr.creates) == 1
+
+
+def test_finish_with_a_loosened_winner_test_cell_opens_no_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good}, seed_mcp=WEAK_SEED)
+    fake, _seen = scripted_engine([winner("good")])
+    monkeypatch.setattr(engine, "optimize_anything", fake)
+    hit = loosen_candidate_cells(monkeypatch, world, {"test_a"})
+    evo = build(world, strict=True)
+
+    evo.run()
+
+    assert hit
+    assert world.pr.pushes == [] and world.pr.creates == []
+    assert "finish: incomplete" in log_text(world)
+
+
+def test_finish_with_a_loosened_seed_test_cell_opens_no_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good}, seed_mcp=WEAK_SEED)
+    fake, _seen = scripted_engine([winner("good")])
+    monkeypatch.setattr(engine, "optimize_anything", fake)
+    original = run.run_single
+
+    def loosen_seed_test(task, mode, model, rep, **kwargs):
+        if mode == "tilth_forced" and run.MODES[mode].git_sha == world.seed_sha and task == "test_a":
+            raise run.HookLoosenedError("hook_loosened: strict cell ran a Bash command the hook denies: cat x")
+        return original(task, mode, model, rep, **kwargs)
+
+    monkeypatch.setattr(run, "run_single", loosen_seed_test)
+    evo = build(world, strict=True)
+
+    evo.run()
+
+    assert world.pr.pushes == [] and world.pr.creates == []
+
+
+# --- seed preflight faults refuse, never crash ---
+
+
+def _refuses(world, capsys) -> None:
+    evo = build(world, strict=True)
+    assert evo.preflight() == 2
+    assert capsys.readouterr().err.startswith("error:")
+    assert world.calls == [] and world.spawned == [] and world.judge.labelled == []
+    assert not world.stored()
+
+
+def test_seed_build_failure_refuses_before_any_paid_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                         capsys) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+
+    def broken(sha, repo=None):
+        raise run.CandidateBuildFailed("cargo build failed", "error[E0432]", [])
+
+    monkeypatch.setattr(run, "build_candidate", broken)
+
+    _refuses(world, capsys)
+
+
+@pytest.mark.parametrize("corpus_text", [None, "{not json", "{}", '{"must_deny": [{"rule": "r"}], "must_allow": []}'])
+def test_unusable_hook_corpus_refuses_the_seed_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+                                                         corpus_text) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    corpus = tmp_path / "corpus.json"
+    if corpus_text is not None:
+        corpus.write_text(corpus_text)
+    monkeypatch.setattr(hookgate, "CORPUS_PATH", corpus)
+
+    _refuses(world, capsys)
+
+
+def test_an_empty_hook_corpus_does_not_pass_the_gate_vacuously(tmp_path: Path) -> None:
+    hook = fake_hook(tmp_path, "any-hook")
+
+    assert hookgate.corpus_failures(str(hook), {"must_deny": [], "must_allow": []})
+
+
+# --- hook gate bounds and missing subcommand ---
+
+
+def test_a_hanging_hook_is_bounded_and_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    hang = tmp_path / "hang-hook"
+    hang.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+    hang.chmod(hang.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(hookgate, "HOOK_TIMEOUT_S", 0.2)
+    corpus = {"must_deny": CORPUS["must_deny"][:2], "must_allow": CORPUS["must_allow"][:2]}
+
+    failures = hookgate.corpus_failures(str(hang), corpus)
+
+    assert len(failures) == 2 * (2 + 2) and all("could not run" in line for line in failures)
+
+
+@pytest.mark.parametrize("code", [0, 2, 1])
+def test_a_binary_without_the_hook_subcommand_fails_the_corpus(tmp_path: Path, code: int) -> None:
+    """A binary that exits the same code for every input (clap usage error is 2) cannot pass both corpus halves."""
+    stub = tmp_path / "no-hook"
+    stub.write_text(f"#!{sys.executable}\nimport sys\nsys.exit({code})\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+
+    assert hookgate.corpus_failures(str(stub))
+
+
+def test_a_candidate_without_the_hook_subcommand_fails_the_hook_gate_stage(monkeypatch: pytest.MonkeyPatch,
+                                                                         tmp_path: Path) -> None:
+    stub = tmp_path / "no-hook"
+    stub.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(2)\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    world = strict_world(monkeypatch, tmp_path, hooks={"nohook": stub})
+    evo = ready(world)
+
+    score, info = evo.evaluate(winner("nohook"), "dev_a")
+
+    assert score == 0 and info["stage"] == "hook gate"
+    assert all(call[3] == world.seed_sha for call in world.calls if call[1] == "tilth_forced")
+
+
+def test_a_candidate_build_failure_in_the_gate_is_a_build_stage(monkeypatch: pytest.MonkeyPatch,
+                                                               tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path, hooks={"bad": fake_hook(tmp_path, "unused")})
+    evo = ready(world)
+    original = run.build_candidate
+
+    def failing(sha, repo=None):
+        if sha != world.seed_sha:
+            raise run.CandidateBuildFailed("cargo build failed", "error[E0432]", [])
+        return original(sha, repo)
+
+    monkeypatch.setattr(run, "build_candidate", failing)
+
+    score, info = evo.evaluate(winner("bad"), "dev_a")
+
+    assert score == 0 and info["stage"] == "build"
+
+
+def test_the_hook_gate_runs_once_per_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    good = fake_hook(tmp_path, "good-candidate-hook")
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": good})
+    evo = ready(world)
+    runs = []
+    original = hookgate.corpus_failures
+    monkeypatch.setattr(hookgate, "corpus_failures", lambda *a, **k: runs.append(a[0]) or original(*a, **k))
+    candidate = winner("good")
+
+    evo.evaluate(candidate, "dev_a")
+    evo.evaluate(candidate, "dev_b")
+
+    assert runs.count(str(good)) == 1
+
+
+# --- strict is its own baseline slot ---
+
+
+def test_strict_run_buys_its_own_baselines_over_stored_non_strict_ones(monkeypatch: pytest.MonkeyPatch,
+                                                                       tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    loose = build(world)
+    assert loose.preflight() is None and loose.buy_baselines() is None
+    loose_calls = len(world.runner_calls("baseline"))
+    assert loose_calls and world.stored()
+
+    strict = build(world, strict=True)
+    assert strict.preflight() is None
+    assert strict.buy_baselines() is None
+
+    assert len(world.runner_calls("baseline")) == 2 * loose_calls
+
+
+def test_a_second_strict_run_reuses_its_stored_strict_baselines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    first = build(world, strict=True)
+    assert first.preflight() is None and first.buy_baselines() is None
+    bought = len(world.runner_calls("baseline"))
+
+    again = build(world, strict=True)
+    assert again.preflight() is None and again.buy_baselines() is None
+
+    assert bought and len(world.runner_calls("baseline")) == bought
+
+
+def test_a_non_strict_run_does_not_reuse_stored_strict_baselines(monkeypatch: pytest.MonkeyPatch,
+                                                                 tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    strict = build(world, strict=True)
+    assert strict.preflight() is None and strict.buy_baselines() is None
+    bought = len(world.runner_calls("baseline"))
+
+    loose = build(world)
+    assert loose.preflight() is None and loose.buy_baselines() is None
+
+    assert len(world.runner_calls("baseline")) == 2 * bought
+
+
+def test_no_strict_flag_with_refreeze_survives_drift_without_a_hook_preflight(monkeypatch: pytest.MonkeyPatch,
+                                                                             tmp_path: Path) -> None:
+    seed_hook = fake_hook(tmp_path, "bad-seed-hook", flip={"native": [DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, seed_hook=seed_hook)
+    first = build(world)
+    assert first.preflight() is None and first.buy_baselines() is None
+    world.env = "env-fingerprint-b"
+
+    assert build(world).preflight() == 2
+    again = build(world, "--refreeze-baselines")
+    assert again.settings.strict_file_tools is False and again.settings.refreeze_baselines
+    assert again.preflight() is None
+
+
+def test_strict_refreeze_runs_the_seed_preflight_first(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seed_hook = fake_hook(tmp_path, "bad-seed-hook", flip={"native": [DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, seed_hook=seed_hook)
+    evo = build(world, "--refreeze-baselines", strict=True)
+
+    assert evo.preflight() == 2
+    assert world.calls == []
