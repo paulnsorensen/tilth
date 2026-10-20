@@ -597,3 +597,73 @@ def test_strict_refreeze_runs_the_seed_preflight_first(monkeypatch: pytest.Monke
 
     assert evo.preflight() == 2
     assert world.calls == []
+
+
+# --- press round 2: corpus validation variants ---
+
+
+@pytest.mark.parametrize("corpus", [
+    {"must_deny": ["cat x"], "must_allow": [{"command": "ls"}]},
+    {"must_deny": [{"command": "cat x"}], "must_allow": ["ls"]},
+    {"must_deny": [{"command": None}], "must_allow": [{"command": "ls"}]},
+    {"must_deny": [{"command": "cat x"}], "must_allow": {"command": "ls"}},
+    [],
+    "text",
+])
+def test_malformed_corpus_shapes_are_reported_not_raised(tmp_path: Path, corpus) -> None:
+    hook = fake_hook(tmp_path, "any-hook")
+
+    failures = hookgate.corpus_failures(str(hook), corpus)
+
+    assert len(failures) == 1 and failures[0].startswith("hook corpus")
+
+
+def test_non_utf8_corpus_bytes_are_a_corpus_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.json"
+    corpus.write_bytes(b'{"must_deny": [{"command": "\xff\xfe"}], "must_allow": []}')
+    monkeypatch.setattr(hookgate, "CORPUS_PATH", corpus)
+
+    failures = hookgate.corpus_failures(str(fake_hook(tmp_path, "any-hook")))
+
+    assert len(failures) == 1 and "unreadable" in failures[0]
+
+
+def test_a_huge_corpus_validates_without_error() -> None:
+    rows = [{"command": f"cmd {i}"} for i in range(200_000)]
+
+    assert hookgate._validate({"must_deny": rows, "must_allow": rows})["must_deny"] is rows
+
+
+@pytest.mark.parametrize("command", ["", "   "])
+def test_blank_commands_are_judged_not_skipped(tmp_path: Path, command: str) -> None:
+    """A blank must_deny row against an allowing hook is a failure; a blank must_allow row against it passes."""
+    hook = fake_hook(tmp_path, "any-hook")
+
+    assert len(hookgate.corpus_failures(str(hook), {"must_deny": [{"command": command}],
+                                                    "must_allow": [{"command": "ls"}]})) == 2
+    assert hookgate.corpus_failures(str(hook), {"must_deny": [{"command": "cat src/lib.rs"}],
+                                                "must_allow": [{"command": command}]}) == []
+
+
+def test_rule_is_optional_and_extra_keys_are_ignored(tmp_path: Path) -> None:
+    hook = fake_hook(tmp_path, "any-hook")
+    corpus = {"version": 9, "extra": [1], "must_deny": [{"command": "ls", "note": "x"}],
+              "must_allow": [{"command": "ls", "rule": "r"}]}
+
+    failures = hookgate.corpus_failures(str(hook), corpus)
+
+    assert len(failures) == 2 and all("must deny (?)" in line for line in failures)
+
+
+def test_a_candidate_gate_with_an_unusable_corpus_scores_zero(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    hooks = {"good": fake_hook(tmp_path, "good"), "later": fake_hook(tmp_path, "later")}
+    world = strict_world(monkeypatch, tmp_path, hooks=hooks)
+    evo = ready(world)
+    evo.evaluate(winner("good"), "dev_a")
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text('{"must_deny": [], "must_allow": []}')
+    monkeypatch.setattr(hookgate, "CORPUS_PATH", corpus)
+
+    score, info = evo.evaluate(winner("later"), "dev_a")
+
+    assert score == 0 and info["stage"] == "hook gate"
