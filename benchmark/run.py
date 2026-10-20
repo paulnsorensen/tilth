@@ -612,9 +612,9 @@ def _cell_claude_config(model_name: str, mode: ModeConfig):
 _STRICT_NATIVE_FILE_TOOLS = frozenset({"Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "NotebookEdit", "LS"})
 _STRICT_BASELINE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash")
 _STRICT_SYSTEM_GUIDANCE = (
-    "Use only the available file tools to read or edit source files. "
-    "Use Bash only for go test, go build, go vet, and gofmt -w on local Go files. "
-    "Do not use Bash to inspect files or run shell wrappers. Do not delegate tasks."
+    "Use only the available file tools to read, search, or edit source files. "
+    "Use Bash only to run tests, builds, and other commands that do not read or write source files. "
+    "Do not delegate tasks."
 )
 
 
@@ -646,19 +646,25 @@ def _strict_hook_spec(mode: ModeConfig, baseline_hook_binary: str | None) -> tup
     return binary, hint
 
 
-def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
-    """The git tree hash of ``src/hook`` plus the SHA-256 of ``Cargo.lock``, both at ``hook_sha``."""
-    repo = Path(repo or REPO_ROOT)
-    tree = _git("rev-parse", f"{hook_sha}:src/hook", cwd=repo).strip()
-    lock = subprocess.run(["git", "show", f"{hook_sha}:Cargo.lock"], cwd=repo, check=True, capture_output=True).stdout
+@functools.lru_cache(maxsize=None)
+def _hook_source_key_at(full_sha: str, repo: str) -> str:
+    tree = _git("rev-parse", f"{full_sha}:src/hook", cwd=Path(repo)).strip()
+    lock = subprocess.run(["git", "show", f"{full_sha}:Cargo.lock"], cwd=repo, check=True, capture_output=True).stdout
     return f"{tree}:{hashlib.sha256(lock).hexdigest()}"
 
 
-def _hook_replay(hook_binary: str, command: str) -> tuple[bool, str]:
-    """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error.
+def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
+    """The git tree hash of ``src/hook`` plus the SHA-256 of ``Cargo.lock``, both at ``hook_sha``.
 
-    Returns (denied, stderr reason).
+    A full commit sha names immutable content, so the key is cached per (full sha, repo).
     """
+    repo = Path(repo or REPO_ROOT)
+    full = _git("rev-parse", "--verify", f"{hook_sha}^{{commit}}", cwd=repo).strip()
+    return _hook_source_key_at(full, str(repo))
+
+
+def _hook_replay(hook_binary: str, command: str) -> bool:
+    """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error."""
     event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     try:
         result = subprocess.run([hook_binary, "hook", "--hint", "native"], input=event,
@@ -667,11 +673,41 @@ def _hook_replay(hook_binary: str, command: str) -> tuple[bool, str]:
         raise RuntimeError(f"strict audit could not run the hook {hook_binary}: {error}") from error
     if result.returncode not in (0, 2):
         raise RuntimeError(f"strict audit hook exited {result.returncode}: {result.stderr[-500:]}")
-    return result.returncode == 2, result.stderr.strip()
+    return result.returncode == 2
 
 
-def _hook_denies(hook_binary: str, command: str) -> bool:
-    return _hook_replay(hook_binary, command)[0]
+_PROBE_ALLOW = "go test ./..."
+_PROBE_DENY = "cat src/lib.rs"
+# Text each hint's denial must contain: tilth names its MCP read tool, native names the host Read tool.
+_PROBE_HINT_TEXT = {"tilth": "tilth_read", "native": "Read tool"}
+
+
+def _probe_hook(binary: str, hint: str) -> None:
+    for command, want_exit in ((_PROBE_ALLOW, 0), (_PROBE_DENY, 2)):
+        event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+        try:
+            result = subprocess.run([binary, "hook", "--hint", hint], input=event,
+                                    capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise HookProbeFailed(f"strict hook probe could not run {binary}: {error}") from error
+        problem = None
+        if result.returncode != want_exit:
+            problem = f"exited {result.returncode} on `{command}`, expected {want_exit}: {result.stderr.strip()[-300:]}"
+        elif want_exit == 2 and _PROBE_HINT_TEXT[hint] not in result.stderr:
+            problem = f"denial for `{command}` lacks the {hint!r} hint text {_PROBE_HINT_TEXT[hint]!r}"
+        if problem:
+            raise HookProbeFailed(f"strict hook {binary} (--hint {hint}) {problem}")
+
+
+def probe_strict_hooks(mode_names, hook_binary: str) -> None:
+    """Refuse a strict run, before any spend, when a hook binary cannot allow and deny correctly.
+
+    Probes each distinct (binary, hint) pair that the modes register: a tilth arm's own binary with
+    ``--hint tilth``, the baseline hook binary with ``--hint native``. Raises ``HookProbeFailed``.
+    """
+    pairs = {_strict_hook_spec(MODES[name], hook_binary) for name in mode_names}
+    for binary, hint in sorted(pairs):
+        _probe_hook(binary, hint)
 
 
 def _carries_hook_denial(content: object) -> bool:
@@ -713,8 +749,7 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str],
     # prefix. Any other error text, or none, means the command ran.
     denied = 0
     for call_id, command in calls.items():
-        denies, _ = _hook_replay(hook_binary, command)
-        if not denies:
+        if not _hook_replay(hook_binary, command):
             continue
         if call_id not in results or not _carries_hook_denial(results[call_id]):
             raise HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: {command}")
@@ -1734,6 +1769,10 @@ class CandidateBuildFailed(RuntimeError):
     """``run_plan`` could not build ``candidate_sha``; the message ends with the failing build output."""
 
 
+class HookProbeFailed(CandidateBuildFailed):
+    """A strict hook binary failed its allow/deny probe; ``run_plan`` raises it before any spend."""
+
+
 _CANDIDATE_BUILDS: dict[str, CandidateBuild] = {}
 
 
@@ -1887,7 +1926,9 @@ def run_plan(
     ``strict_file_tools`` runs every cell with Bash guarded by the hook: a tilth arm runs its own binary's hook,
     the baseline runs the hook built at ``hook_sha`` (a commit of ``repo``), and that hook replays every Bash call.
 
-    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build.
+    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, or ``hook_sha`` has no
+    ``src/hook``; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
+    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
     Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
@@ -1896,9 +1937,12 @@ def run_plan(
     if strict_file_tools:
         if hook_sha is None:
             raise ValueError("strict_file_tools requires hook_sha")
+        if any(RUNNERS[cell.model] != "claude" for cell in cells):
+            raise ValueError("strict_file_tools requires Claude models")
         if not store_only:
             try:
-                build_candidate(hook_sha, repo=repo)
+                hook_binary = build_candidate(hook_sha, repo=repo).binary_path
+                _hook_source_key(hook_sha, repo)
             except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                 detail = getattr(error, "stderr", None) or ""
                 raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
@@ -1913,6 +1957,8 @@ def run_plan(
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)
     try:
+        if strict_file_tools and not store_only:
+            probe_strict_hooks({cell.mode for cell in cells}, hook_binary)
         return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
                          cell_estimate_usd=max_budget_usd if cell_estimate_usd is None else cell_estimate_usd,
                          max_budget_usd=max_budget_usd, store_only=store_only,
@@ -2484,7 +2530,11 @@ Examples:
     if args.strict_file_tools:
         try:
             hook_sha = _git("rev-parse", "--verify", f"{args.candidate_sha or 'HEAD'}^{{commit}}", cwd=REPO_ROOT).strip()
-            build_candidate(hook_sha)
+            hook_binary = build_candidate(hook_sha).binary_path
+            _hook_source_key(hook_sha)
+            probe_strict_hooks(modes, hook_binary)
+        except HookProbeFailed as error:
+            parser.error(f"strict hook probe failed, no cell ran: {error}")
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             parser.error(f"cannot build the strict hook at {hook_sha or args.candidate_sha or 'HEAD'}: {error}")
 

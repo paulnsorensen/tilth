@@ -22,8 +22,12 @@ from spend import SpendLedger
 
 _FAKE_HOOK = """#!{python}
 import json, re, sys
+hint = sys.argv[sys.argv.index("--hint") + 1] if "--hint" in sys.argv else "tilth"
 command = json.load(sys.stdin)["tool_input"]["command"]
-sys.exit(2 if re.search(r"\\b(cat|grep|sed|perl)\\b", command) else 0)
+if re.search(r"\\b(cat|grep|sed|perl)\\b", command):
+    sys.stderr.write("Use tilth_read" if hint == "tilth" else "Use the Read tool")
+    sys.exit(2)
+sys.exit(0)
 """
 
 
@@ -222,7 +226,9 @@ def test_hook_source_key_names_the_tree_and_lock_hashes(hook_history: dict) -> N
 
 
 def _strict_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    return make_world(monkeypatch, tmp_path, {**seed_files(), "src/hook/x.rs": "pub fn deny() {}\n"})
+    world = make_world(monkeypatch, tmp_path, {**seed_files(), "src/hook/x.rs": "pub fn deny() {}\n"})
+    install_fake_hook(monkeypatch, tmp_path)
+    return world
 
 
 def _plan(world, specs, **kwargs) -> list[dict]:
@@ -347,8 +353,8 @@ def test_a_hook_binary_path_with_spaces_is_replayed(tmp_path: Path) -> None:
     spaced.mkdir()
     hook = fake_hook(spaced)
 
-    assert run._hook_denies(str(hook), "cat a.go") is True
-    assert run._hook_denies(str(hook), "go test ./...") is False
+    assert run._hook_replay(str(hook), "cat a.go") is True
+    assert run._hook_replay(str(hook), "go test ./...") is False
 
 
 def test_the_replay_sends_the_exact_live_event_shape(tmp_path: Path) -> None:
@@ -358,7 +364,7 @@ def test_the_replay_sends_the_exact_live_event_shape(tmp_path: Path) -> None:
                    f"open({str(seen) + '.argv'!r}, 'w').write(' '.join(sys.argv[1:]))\n")
     spy.chmod(0o755)
 
-    run._hook_denies(str(spy), "go test ./...")
+    run._hook_replay(str(spy), "go test ./...")
 
     assert json.loads(seen.read_text()) == {"tool_name": "Bash", "tool_input": {"command": "go test ./..."}}
     assert Path(str(seen) + ".argv").read_text() == "hook --hint native"
@@ -533,3 +539,194 @@ def test_empty_error_text_from_a_denied_class_command_is_hook_loosened(tmp_path:
     for content in ("", [], None):
         with pytest.raises(run.HookLoosenedError):
             _audit(_stream(_use("c1", "cat a.go"), _result("c1", content)), tmp_path)
+
+
+# --- cure pass 1: probe every strict hook binary before spend ---
+
+_NO_HOOK_SUBCOMMAND = "#!{python}\nimport sys\nsys.stderr.write('error: unexpected argument --hint')\nsys.exit(2)\n"
+
+
+def _script(path: Path, body: str) -> str:
+    path.write_text(body.format(python=sys.executable))
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_probe_passes_a_binary_that_allows_go_test_and_denies_cat_with_the_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    good = str(fake_hook(tmp_path))
+    monkeypatch.setitem(run.MODES, "tilth_forced", ModeConfig(
+        name="tilth_forced", tools=[], mcp_config_path=run.MODES["tilth_forced"].mcp_config_path,
+        description="arm", binary_path=good))
+
+    run.probe_strict_hooks(["baseline", "tilth_forced"], good)
+
+
+def test_probe_refuses_a_binary_without_hook_support_and_names_it(tmp_path: Path) -> None:
+    old = _script(tmp_path / "old-tilth", _NO_HOOK_SUBCOMMAND)
+
+    with pytest.raises(run.HookProbeFailed, match="old-tilth") as caught:
+        run.probe_strict_hooks(["baseline"], old)
+
+    assert isinstance(caught.value, run.CandidateBuildFailed)
+
+
+def test_probe_refuses_a_missing_binary(tmp_path: Path) -> None:
+    with pytest.raises(run.HookProbeFailed, match="absent"):
+        run.probe_strict_hooks(["baseline"], str(tmp_path / "absent"))
+
+
+def test_probe_refuses_a_binary_that_denies_everything(tmp_path: Path) -> None:
+    deny_all = _script(tmp_path / "deny-all", "#!{python}\nimport sys\nsys.stderr.write('Use tilth_read')\nsys.exit(2)\n")
+
+    with pytest.raises(run.HookProbeFailed, match="expected 0"):
+        run.probe_strict_hooks(["baseline"], deny_all)
+
+
+def test_probe_refuses_a_binary_that_allows_a_file_read(tmp_path: Path) -> None:
+    allow_all = _script(tmp_path / "allow-all", "#!{python}\nimport sys\nsys.exit(0)\n")
+
+    with pytest.raises(run.HookProbeFailed, match="expected 2"):
+        run.probe_strict_hooks(["baseline"], allow_all)
+
+
+def test_probe_refuses_a_denial_with_the_wrong_hint_text(tmp_path: Path) -> None:
+    wrong = _script(tmp_path / "wrong-hint", "#!{python}\nimport sys\nsys.stderr.write('nope')\nsys.exit(2 if 'cat' in sys.stdin.read() else 0)\n")
+
+    with pytest.raises(run.HookProbeFailed, match="hint text"):
+        run.probe_strict_hooks(["baseline"], wrong)
+
+
+def test_probe_checks_a_tilth_arms_own_binary_with_the_tilth_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    good = fake_hook(tmp_path)
+    stale = _script(tmp_path / "stale-tilth", _NO_HOOK_SUBCOMMAND)
+    monkeypatch.setitem(run.MODES, "tilth_forced", ModeConfig(
+        name="tilth_forced", tools=[], mcp_config_path=run.MODES["tilth_forced"].mcp_config_path,
+        description="arm", binary_path=stale))
+
+    run.probe_strict_hooks(["baseline"], str(good))
+    with pytest.raises(run.HookProbeFailed, match="stale-tilth"):
+        run.probe_strict_hooks(["baseline", "tilth_forced"], str(good))
+
+
+def test_run_plan_refuses_a_hookless_binary_before_any_cell_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+    old = _script(tmp_path / "old-tilth", _NO_HOOK_SUBCOMMAND)
+    monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: run.CandidateBuild(
+        git_sha=sha, binary_path=old, binary_sha256="old"))
+    calls: list[str] = []
+    monkeypatch.setattr(run, "run_single", lambda *a, **kw: calls.append("ran"))
+    specs = [run.CellSpec(DEV[0], "baseline", MODEL, 0), run.CellSpec(DEV[0], "tilth_forced", MODEL, 0)]
+
+    with pytest.raises(run.HookProbeFailed, match="old-tilth"):
+        _plan(world, specs, strict_file_tools=True, hook_sha=world.seed_sha)
+
+    assert calls == []
+    assert run.MODES["tilth_forced"].binary_path == "/fixture/bin/tilth"
+
+
+def test_run_plan_runs_cells_when_the_probe_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+
+    rows = _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True, hook_sha=world.seed_sha)
+
+    assert len(rows) == 1
+
+
+def test_main_refuses_a_strict_run_with_a_hookless_binary_before_any_cell_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    old = _script(tmp_path / "old-tilth", _NO_HOOK_SUBCOMMAND)
+    monkeypatch.setitem(run.TASKS, "strict_probe_task", StoreTask(name="strict_probe_task"))
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: run.CandidateBuild(
+        git_sha=sha, binary_path=old, binary_sha256="old"))
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+    calls: list[str] = []
+    monkeypatch.setattr(run, "run_single", lambda *a, **kw: calls.append("ran"))
+    monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_probe_task", "--models", "sonnet5",
+                                      "--modes", "baseline", "--reps", "1", "--max-cells", "1",
+                                      "--strict-file-tools", "--max-usd", "100"])
+
+    with pytest.raises(SystemExit) as caught:
+        run.main()
+
+    assert caught.value.code == 2 and calls == []
+
+
+# --- cure pass 1: strict guidance, plan guards, key cache ---
+
+
+def test_strict_guidance_is_language_agnostic_and_allows_tests_and_builds() -> None:
+    text = run._STRICT_SYSTEM_GUIDANCE
+
+    assert "tests, builds" in text and "Do not delegate" in text
+    assert not any(word in text for word in ("Go ", "go test", "gofmt", "go vet"))
+
+
+def test_strict_guidance_is_hashed_into_the_strict_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+    cell = run.CellSpec(DEV[0], "baseline", MODEL, 0)
+    before = run.planned_identity(cell, max_budget_usd=1.0, strict_file_tools=True, hook_sha=world.seed_sha,
+                                  hook_repo=world.repo)["run_key"]
+    monkeypatch.setattr(run, "_STRICT_SYSTEM_GUIDANCE", run._STRICT_SYSTEM_GUIDANCE + " Extra.")
+    after = run.planned_identity(cell, max_budget_usd=1.0, strict_file_tools=True, hook_sha=world.seed_sha,
+                                 hook_repo=world.repo)["run_key"]
+
+    assert before != after
+
+
+def test_strict_plan_refuses_a_non_claude_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+    non_claude = next(model for model, runner in run.RUNNERS.items() if runner != "claude")
+
+    with pytest.raises(ValueError, match="requires Claude models"):
+        _plan(world, [run.CellSpec(DEV[0], "baseline", non_claude, 0)], strict_file_tools=True,
+              hook_sha=world.seed_sha)
+
+
+def test_strict_plan_reports_a_hook_sha_without_src_hook_as_a_build_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    world = make_world(monkeypatch, tmp_path, seed_files())
+
+    with pytest.raises(run.CandidateBuildFailed):
+        _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True, hook_sha=world.seed_sha)
+
+
+def test_a_hook_loosened_cell_settles_as_an_error_row_and_the_plan_continues(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+    order: list[str] = []
+
+    def loosened_first(task, mode, model, rep, **kwargs):
+        order.append(task)
+        if len(order) == 1:
+            raise run.HookLoosenedError("hook_loosened: strict cell ran a Bash command the hook denies: cat a.go")
+        return world.fake_run_single(task, mode, model, rep, **kwargs)
+
+    monkeypatch.setattr(run, "run_single", loosened_first)
+    specs = [run.CellSpec(task, "baseline", MODEL, 0) for task in DEV[:2]]
+    rows = _plan(world, specs, strict_file_tools=True, hook_sha=world.seed_sha)
+
+    assert len(rows) == 2
+    assert rows[0]["error"].startswith("hook_loosened") and rows[0]["correct"] is False
+    assert not rows[1].get("error")
+
+
+def test_hook_source_key_is_computed_once_per_full_sha(hook_history: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    run._hook_source_key_at.cache_clear()
+    full = git("rev-parse", hook_history["A"], cwd=hook_history["repo"]).strip()
+    first = run._hook_source_key(full, hook_history["repo"])
+    shows: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr(run.subprocess, "run", lambda cmd, **kw: (shows.append(cmd), real_run(cmd, **kw))[1])
+
+    assert run._hook_source_key(full, hook_history["repo"]) == first
+    assert [cmd for cmd in shows if cmd[:2] == ["git", "show"]] == []
