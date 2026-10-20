@@ -559,24 +559,54 @@ fn searcher_rule(name: &str) -> Rule {
     }
 }
 
-/// `grep -d recurse`, `-drecurse`, `--directories=recurse`, `--directories recurse`.
+fn is_prefix_of(word: &str, text: &str, min: usize) -> bool {
+    text.len() >= min && word.starts_with(text)
+}
+
+fn recurse_value(v: &str) -> bool {
+    !v.is_empty() && "recurse".starts_with(v)
+}
+
+/// Structural grep recursion: abbreviated `--rec*`, `--dir*=rec*`, and `-d rec*` forms.
 fn directories_recurse(args: &[Arg]) -> bool {
     args.iter().enumerate().any(|(i, a)| {
         let t = a.text.as_str();
-        let next = args.get(i + 1).is_some_and(|n| n.text == "recurse");
-        t == "--directories=recurse"
-            || (t == "--directories" && next)
-            || (t.starts_with('-')
-                && !t.starts_with("--")
-                && (t.ends_with("drecurse") || (t.ends_with('d') && next)))
+        let next = args.get(i + 1).map_or("", |n| n.text.as_str());
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            return is_prefix_of("recursive", name, 3) && value.is_none()
+                || is_prefix_of("dereference-recursive", name, 3) && value.is_none()
+                || is_prefix_of("directories", name, 3) && recurse_value(value.unwrap_or(next));
+        }
+        let Some(cluster) = t.strip_prefix('-') else {
+            return false;
+        };
+        for (idx, c) in cluster.char_indices() {
+            if "efmABCD".contains(c) {
+                return false;
+            }
+            if c == 'd' {
+                let rest = &cluster[idx + 1..];
+                return recurse_value(if rest.is_empty() { next } else { rest });
+            }
+        }
+        false
     })
 }
 
 fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> Outcome {
     let rule = searcher_rule(name);
     let p = split(args, spec.valued_short, spec.valued_long);
-    if p.has_any(spec.listing) || p.has_any(&["--version", "-V", "--help"]) {
+    if p.has_any(spec.listing) {
         return Outcome::Allow;
+    }
+    if let Some(only) = args.first() {
+        if matches!(only.text.as_str(), "--version" | "-V" | "--help" | "-h") {
+            return Outcome::Allow;
+        }
     }
     let pattern_given = p.has_any(&["-e", "-f", "--regexp", "--file"]);
     let skip = usize::from(!pattern_given);
