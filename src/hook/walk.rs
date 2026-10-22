@@ -23,6 +23,7 @@ struct Walker {
 }
 
 impl Walker {
+    /// Parses shell source and returns the first denial, including parse and depth failures.
     fn source(&mut self, src: &str) -> Option<Rule> {
         if self.depth > MAX_DEPTH {
             return Some(UNRESOLVED);
@@ -44,6 +45,7 @@ impl Walker {
         self.visit(root, src.as_bytes(), Ctx::default())
     }
 
+    /// Checks a syntax node while carrying pipeline and heredoc context.
     fn visit(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Option<Rule> {
         match node.kind() {
             "pipeline" => {
@@ -115,6 +117,7 @@ impl Walker {
         }
     }
 
+    /// Checks named children with fresh context and returns the first denial.
     fn children(&mut self, node: Node, src: &[u8]) -> Option<Rule> {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -139,14 +142,17 @@ impl Walker {
         None
     }
 
+    /// Checks a simple command and reparses any shell source it runs.
     fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Option<Rule> {
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
         let mut here = ctx.here;
+        let mut assigns: Vec<Arg> = Vec::new();
         for child in node.named_children(&mut cursor) {
             match child.kind() {
                 "command_name" => words.insert(0, arg_of(child, src)),
-                "variable_assignment" | "comment" => {}
+                "variable_assignment" => assigns.push(assignment(child, src)),
+                "comment" => {}
                 "file_redirect" => words.extend(redirect_words(child, src)),
                 kind if is_here(kind) => {
                     here = true;
@@ -161,6 +167,7 @@ impl Walker {
         }
         let cmd = Cmd {
             words: &words,
+            assigns: &assigns,
             piped: ctx.piped,
             here,
         };
@@ -177,6 +184,20 @@ impl Walker {
             }
         }
         self.children(node, src)
+    }
+}
+
+/// A leading `NAME=value` word of a command, with the value unquoted.
+fn assignment(node: Node, src: &[u8]) -> Arg {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src).ok())
+        .unwrap_or_default();
+    let value = node.child_by_field_name("value").map(|v| arg_of(v, src));
+    Arg {
+        text: format!("{name}={}", value.as_ref().map_or("", |v| v.text.as_str())),
+        literal: value.as_ref().is_none_or(|v| v.literal),
+        opaque: false,
     }
 }
 
@@ -220,6 +241,7 @@ fn is_structure(kind: &str) -> bool {
         )
 }
 
+/// Recognizes heredoc and here-string redirect nodes.
 fn is_here(kind: &str) -> bool {
     matches!(kind, "heredoc_redirect" | "herestring_redirect")
 }
@@ -253,22 +275,25 @@ fn redirect(node: Node, src: &[u8]) -> Option<Rule> {
     }
 }
 
+/// Builds an argument with its unquoted text, literal status, and opacity.
 fn arg_of(node: Node, src: &[u8]) -> Arg {
     let (text, literal) = literal(node, src);
     Arg {
         text,
         literal,
-        opaque: opaque(node),
+        opaque: opaque(node, src),
     }
 }
 
-fn opaque(node: Node) -> bool {
+/// Classifies expansions and substitutions as opaque while allowing word and string nodes.
+fn opaque(node: Node, src: &[u8]) -> bool {
     match node.kind() {
-        "command_name" => node.named_child(0).is_none_or(opaque),
-        "word" | "number" | "string" | "raw_string" | "ansi_c_string" => false,
+        "command_name" => node.named_child(0).is_none_or(|c| opaque(c, src)),
+        "word" | "number" | "string" | "raw_string" => false,
+        "ansi_c_string" => !literal(node, src).1,
         "concatenation" => {
             let mut cursor = node.walk();
-            let any = node.named_children(&mut cursor).any(|c| opaque(c));
+            let any = node.named_children(&mut cursor).any(|c| opaque(c, src));
             any
         }
         _ => true,
@@ -293,10 +318,13 @@ fn literal(node: Node, src: &[u8]) -> (String, bool) {
             let plain = node
                 .named_children(&mut cursor)
                 .all(|c| c.kind() == "string_content");
-            (unquote(1, 1), plain)
+            (double_quoted_body(node, src), plain)
         }
         "raw_string" => (unquote(1, 1), true),
-        "ansi_c_string" => (unquote(2, 1), true),
+        "ansi_c_string" => match decode_ansi_c(&unquote(2, 1)) {
+            Some(text) => (text, true),
+            None => (unquote(2, 1), false),
+        },
         "concatenation" => {
             let mut cursor = node.walk();
             let mut text = String::new();
@@ -312,6 +340,7 @@ fn literal(node: Node, src: &[u8]) -> (String, bool) {
     }
 }
 
+/// Removes backslash escapes from a bare word without evaluating shell expansions.
 fn unescape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -325,4 +354,126 @@ fn unescape(raw: &str) -> String {
         }
     }
     out
+}
+
+/// The body of a double-quoted string as the shell passes it: `\$`, `` \` ``, `\"`, `\\`, and
+/// backslash-newline lose the backslash. Expansion nodes keep their source text.
+fn double_quoted_body(node: Node, src: &[u8]) -> String {
+    let text = |from: usize, to: usize| {
+        src.get(from..to)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
+    };
+    let end = node.end_byte().saturating_sub(1);
+    let mut pos = node.start_byte() + 1;
+    let mut out = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "string_content" {
+            continue;
+        }
+        out.push_str(&unescape_double(text(pos, child.start_byte())));
+        out.push_str(text(child.start_byte(), child.end_byte()));
+        pos = child.end_byte();
+    }
+    out.push_str(&unescape_double(text(pos, end)));
+    out
+}
+
+fn unescape_double(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\n') => {}
+            Some(n @ ('$' | '`' | '"' | '\\')) => out.push(n),
+            Some(n) => {
+                out.push('\\');
+                out.push(n);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Decode the body of an ANSI-C `$'...'` string. `None` when the result is not the text the
+/// shell would pass: a bad escape, a NUL byte, or bytes that are not UTF-8.
+fn decode_ansi_c(body: &str) -> Option<String> {
+    let b = body.as_bytes();
+    let digits = |from: usize, max: usize, radix: u32| {
+        b[from..]
+            .iter()
+            .take(max)
+            .take_while(|c| char::from(**c).is_digit(radix))
+            .count()
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let c = *b.get(i + 1)?;
+        i += 2;
+        match c {
+            b'a' => out.push(7),
+            b'b' => out.push(8),
+            b'e' | b'E' => out.push(27),
+            b'f' => out.push(12),
+            b'n' => out.push(10),
+            b'r' => out.push(13),
+            b't' => out.push(9),
+            b'v' => out.push(11),
+            b'\\' | b'\'' | b'"' | b'?' => out.push(c),
+            b'0'..=b'7' => {
+                let n = 1 + digits(i, 2, 8);
+                let value =
+                    u32::from_str_radix(std::str::from_utf8(&b[i - 1..i + n - 1]).ok()?, 8).ok()?;
+                out.push((value & 0xff) as u8);
+                i += n - 1;
+            }
+            b'x' => {
+                let n = digits(i, 2, 16);
+                if n == 0 {
+                    out.extend_from_slice(b"\\x");
+                } else {
+                    let value =
+                        u8::from_str_radix(std::str::from_utf8(&b[i..i + n]).ok()?, 16).ok()?;
+                    out.push(value);
+                    i += n;
+                }
+            }
+            b'u' | b'U' => {
+                let n = digits(i, if c == b'u' { 4 } else { 8 }, 16);
+                if n == 0 {
+                    return None;
+                }
+                let value =
+                    u32::from_str_radix(std::str::from_utf8(&b[i..i + n]).ok()?, 16).ok()?;
+                let ch = char::from_u32(value)?;
+                out.extend_from_slice(ch.to_string().as_bytes());
+                i += n;
+            }
+            b'c' => {
+                let x = *b.get(i)?;
+                i += 1;
+                out.push(if x == b'?' { 127 } else { x & 0x1f });
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    String::from_utf8(out).ok()
 }
