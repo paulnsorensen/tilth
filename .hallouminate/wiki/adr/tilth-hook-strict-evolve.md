@@ -56,4 +56,4 @@ The old strict guard, `benchmark/claude_bash_guard.py`, was a Go-only allowlist,
 - opencode, pi, and amp need plugin shims.
 - Retiring `scripts/tilth-bash-guard`.
 - The wozcode strict arm gets native-tool deny hints it cannot use.
-- Policy gaps outside the named rules: top-level `$c f`, `uv run`/`poetry run`/`npx`/`docker run` wrappers, `git blame`, `sed w`, awk `system()`, `busybox`, `find -fprint`.
+- Policy gaps outside the named rules: top-level `$c f`, `uv run`/`poetry run`/`npx`/`docker run` wrappers, `git blame`, `busybox`, `find -fprint`, `parallel` and other shell-string runners, `awk` programs that build file names or commands at run time, `sed` scripts read with `-f`.

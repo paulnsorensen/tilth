@@ -304,7 +304,8 @@ fn install_without_hook_flag_writes_no_hook_config() {
 
         // Deterministic: a second fresh home gets the same bytes.
         let again = tempfile::tempdir().unwrap();
-        run(&["install", host], "", Some(again.path()));
+        let again_out = run(&["install", host], "", Some(again.path()));
+        assert_eq!(again_out.code, 0, "{host}: {}", again_out.stderr);
         assert_eq!(files_under(again.path()), plain_files, "{host}");
 
         // --hook adds hook files only on landed hosts, and leaves MCP bytes alone
@@ -315,6 +316,29 @@ fn install_without_hook_flag_writes_no_hook_config() {
         if LANDED.contains(&host) {
             assert_eq!(out.code, 0, "{host}: {}", out.stderr);
             assert!(hooked_files.len() >= plain_files.len(), "{host}");
+            let marks_hook = |b: &[u8]| {
+                let t = String::from_utf8_lossy(b);
+                t.contains("\"hook\"") || t.contains(" hook --host ")
+            };
+            let mut hook_only = 0;
+            for (path, bytes) in &hooked_files {
+                match plain_files.get(path) {
+                    None => hook_only += 1,
+                    Some(plain) if marks_hook(bytes) => {
+                        assert!(!marks_hook(plain), "{host}: {}", path.display());
+                    }
+                    Some(plain) => assert_eq!(
+                        plain,
+                        bytes,
+                        "{host}: --hook changed MCP file {}",
+                        path.display()
+                    ),
+                }
+            }
+            assert!(
+                hook_only > 0 || hooked_files.values().any(|b| marks_hook(b)),
+                "{host}: no hook config written"
+            );
         } else {
             assert_eq!(out.code, 1, "{host}");
             assert!(hooked_files.is_empty(), "{host}");
@@ -414,5 +438,55 @@ fn install_hook_droid_keeps_settings_json_hooks_and_claude_fails_closed() {
     assert_eq!(
         claude["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
         "block"
+    );
+}
+
+#[test]
+fn hook_accepts_install_host_names_as_families() {
+    for host in LANDED {
+        let event = |command: &str| match host {
+            "cursor" => json!({"command": command}).to_string(),
+            "windsurf" => json!({"tool_info": {"command_line": command}}).to_string(),
+            _ => claude_event(command),
+        };
+        let deny = run(&["hook", "--host", host], &event("cat a.rs"), None);
+        assert_eq!(deny.code, 2, "{host}: {}", deny.stderr);
+        assert!(deny.stderr.contains("tilth_"), "{host}: {}", deny.stderr);
+        let allow = run(&["hook", "--host", host], &event("ls"), None);
+        assert_eq!(allow.code, 0, "{host}: {}", allow.stderr);
+        for out in [&deny, &allow] {
+            assert!(
+                !out.stderr.contains("invalid value") && !out.stderr.contains("unknown host"),
+                "{host}: {}",
+                out.stderr
+            );
+        }
+    }
+    let bogus = run(&["hook", "--host", "bogus"], &claude_event("ls"), None);
+    assert_eq!(bogus.code, 2);
+    let help = run(&["hook", "--help"], "", None);
+    assert!(help.stdout.contains("claude-code"), "{}", help.stdout);
+}
+
+#[test]
+fn reinstall_keeps_a_customised_hint() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let seeded = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command",
+         "command": "/old/tilth hook --host claude --hint native"}]}]}});
+    fs::write(&settings, seeded.to_string()).unwrap();
+    let out = run(&["install", "claude-code", "--hook"], "", Some(home.path()));
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    let handlers = cfg["hooks"]["PreToolUse"][0]["hooks"].as_array().unwrap();
+    assert_eq!(handlers.len(), 1, "{cfg}");
+    assert_eq!(handlers[0]["command"], TILTH, "{cfg}");
+    let args = handlers[0]["args"].as_array().expect("exec-form args");
+    assert_eq!(
+        args[args.len() - 4..],
+        ["--host", "claude", "--hint", "native"],
+        "{cfg}"
     );
 }

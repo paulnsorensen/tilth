@@ -6,7 +6,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ```
 src/
-  main.rs              CLI entry (clap). Dispatches to install, MCP, or single-query mode.
+  main.rs              CLI entry (clap). Dispatches to install, the `hook` shell guard, MCP, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS via include_str! from prompts/mcp.md. Always serves the edit surface.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).

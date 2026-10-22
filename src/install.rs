@@ -339,7 +339,7 @@ fn is_absolute_command(command: &str, windows: bool) -> bool {
 /// Exec form starts the binary directly, with no shell. That works only for an absolute
 /// path to a native binary. `npx` and `node` are launchers, and a `.cmd`, `.bat` or `.ps1`
 /// shim cannot start without a shell on Windows, so those need shell form.
-fn exec_form_applies(host_exec: bool, command: &str, _args: &[String], windows: bool) -> bool {
+fn exec_form_applies(host_exec: bool, command: &str, windows: bool) -> bool {
     if !host_exec || !is_absolute_command(command, windows) {
         return false;
     }
@@ -350,16 +350,48 @@ fn exec_form_applies(host_exec: bool, command: &str, _args: &[String], windows: 
     !(shim || matches!(stem, "npx" | "node"))
 }
 
-fn hook_invocation(target: &HookTarget) -> Result<HookInvocation, String> {
+fn hook_invocation(target: &HookTarget, hint: Option<&str>) -> Result<HookInvocation, String> {
     let (command, mut args) = tilth_command_and_args();
     args.retain(|a| a != "--mcp");
-    build_hook_invocation(
-        exec_form_applies(target.exec_form, &command, &args, cfg!(windows)),
+    let mut invocation = build_hook_invocation(
+        exec_form_applies(target.exec_form, &command, cfg!(windows)),
         target.powershell,
         target.family,
         &command,
         &args,
-    )
+    )?;
+    if let Some(hint) = hint {
+        if let Some(args) = invocation.args.as_mut() {
+            args.extend(["--hint".to_string(), hint.to_string()]);
+        } else {
+            invocation.command.push_str(" --hint ");
+            invocation.command.push_str(hint);
+        }
+    }
+    Ok(invocation)
+}
+
+/// The `--hint` value of an existing tilth hook command anywhere in `config`, so a
+/// reinstall keeps a user's choice. Only a value `tilth hook` accepts is carried over.
+fn existing_hint(config: &Value, own_prefix: &str) -> Option<String> {
+    let own = handler_line(config).filter(|c| is_tilth_hook_command(c, own_prefix));
+    if let Some(line) = own {
+        let mut words = line.split_whitespace();
+        while let Some(word) = words.next() {
+            if word == "--hint" {
+                let value = words.next()?;
+                return value
+                    .parse::<crate::hook::Hint>()
+                    .is_ok()
+                    .then(|| value.to_string());
+            }
+        }
+    }
+    match config {
+        Value::Object(map) => map.values().find_map(|v| existing_hint(v, own_prefix)),
+        Value::Array(items) => items.iter().find_map(|v| existing_hint(v, own_prefix)),
+        _ => None,
+    }
 }
 
 /// Drop quotes and the PowerShell call operator, and turn `\` into `/`, so entries written
@@ -449,7 +481,8 @@ fn upsert_nested(entries: &mut Vec<Value>, target: &HookTarget, new: Value, own_
         |h: &Value| handler_line(h).is_some_and(|c| is_tilth_hook_command(&c, own_prefix));
     let exact = |g: &Value| g.get("matcher").and_then(Value::as_str) == target.matcher;
     let mut placed = false;
-    for group in entries.iter_mut() {
+    let mut emptied = Vec::new();
+    for (index, group) in entries.iter_mut().enumerate() {
         let in_exact = exact(group);
         let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
             continue;
@@ -469,10 +502,14 @@ fn upsert_nested(entries: &mut Vec<Value>, target: &HookTarget, new: Value, own_
         }
         *hooks = kept;
         if removed && hooks.is_empty() {
-            group["hooks"] = Value::Null;
+            emptied.push(index);
         }
     }
-    entries.retain(|g| !g.get("hooks").is_some_and(Value::is_null));
+    let mut index = 0;
+    entries.retain(|_| {
+        index += 1;
+        !emptied.contains(&(index - 1))
+    });
     if !placed {
         entries.push(new);
     }
@@ -538,7 +575,13 @@ fn prepare_hook(host: &str, home: &Path) -> Result<(HookTarget, Value), String> 
     } else {
         json!({})
     };
-    upsert_hook(&mut config, &target, &hook_invocation(&target)?)?;
+    let own_prefix = hook_invocation(&target, None)?.own_prefix;
+    let hint = existing_hint(&config, &own_prefix);
+    upsert_hook(
+        &mut config,
+        &target,
+        &hook_invocation(&target, hint.as_deref())?,
+    )?;
     Ok((target, config))
 }
 
@@ -580,8 +623,32 @@ fn install_with_hook(
 /// Write `content` to `path` atomically: write to a sibling temp file first,
 /// then rename over the target so an interrupted write never truncates `path`.
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
-    crate::util::atomic_write_bytes(path, content.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+    // Rename would replace a symlink with a regular file; write through to its target.
+    let is_link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let resolved = if is_link {
+        fs::canonicalize(path).unwrap_or_else(|_| follow_dangling_link(path))
+    } else {
+        path.to_path_buf()
+    };
+    crate::util::atomic_write_bytes(&resolved, content.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", resolved.display()))
+}
+
+/// The path a symlink chain ends at when its last target is missing.
+fn follow_dangling_link(path: &std::path::Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(target) = is_link.then(|| fs::read_link(&current).ok()).flatten() else {
+            break;
+        };
+        current = if target.is_relative() {
+            current.parent().map_or(target.clone(), |p| p.join(&target))
+        } else {
+            target
+        };
+    }
+    current
 }
 
 fn write_json_config(host_info: &HostInfo) -> Result<(), String> {
@@ -1711,7 +1778,7 @@ mod tests {
             let handler = ours.pointer("/hooks/0").unwrap_or(ours);
             assert_eq!(
                 handler_line(handler).unwrap(),
-                hook_invocation(&target).unwrap().line(),
+                hook_invocation(&target, None).unwrap().line(),
                 "{host}: command"
             );
             assert_eq!(
@@ -1929,7 +1996,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let target = hook_target(host, home.path()).unwrap();
             install_hook(host, home.path()).unwrap();
-            let current = hook_invocation(&target).unwrap();
+            let current = hook_invocation(&target, None).unwrap();
             let mut stale = read_json(&target.path);
             set_stale_command(
                 &mut stale,
@@ -2071,7 +2138,7 @@ mod tests {
         );
     }
 
-    /// Grouped hosts as `(host, relative config path, hook target)` with an exact matcher.
+    /// Grouped hosts as `(host, hook target)` with an exact matcher.
     fn grouped_hosts(home: &Path) -> Vec<(&'static str, HookTarget)> {
         let hosts: Vec<_> = HOOK_HOSTS
             .iter()
@@ -2147,7 +2214,7 @@ mod tests {
                 assert!(hs.contains(&mine), "{host}/{order}: user hook lost");
                 assert!(hs
                     .iter()
-                    .any(|h| handler_line(h) == Some(hook_invocation(&t).unwrap().line())));
+                    .any(|h| handler_line(h) == Some(hook_invocation(&t, None).unwrap().line())));
                 assert!(!hs.contains(&stale), "{host}/{order}: stale kept");
                 let pos = hs.iter().position(|h| h == &mine).unwrap();
                 assert_eq!(
@@ -2212,7 +2279,7 @@ mod tests {
             let groups = nested_groups(&cfg, &t);
             assert_eq!(
                 groups[0]["hooks"],
-                json!([hook_entry(&t, &hook_invocation(&t).unwrap())["hooks"][0].clone()]),
+                json!([hook_entry(&t, &hook_invocation(&t, None).unwrap())["hooks"][0].clone()]),
                 "{host}"
             );
         }
@@ -2401,36 +2468,24 @@ mod tests {
 
     #[test]
     fn exec_form_only_for_native_absolute_binaries() {
-        let a = |s: &[&str]| s.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let tilth = a(&["hook"]);
-        assert!(exec_form_applies(true, "/usr/bin/tilth", &tilth, false));
-        assert!(exec_form_applies(true, WIN_BIN, &tilth, true));
-        assert!(!exec_form_applies(false, "/usr/bin/tilth", &tilth, false));
+        assert!(exec_form_applies(true, "/usr/bin/tilth", false));
+        assert!(exec_form_applies(true, WIN_BIN, true));
+        assert!(!exec_form_applies(false, "/usr/bin/tilth", false));
         for windows in [false, true] {
-            assert!(!exec_form_applies(true, "npx", &a(&["tilth"]), windows));
-            assert!(!exec_form_applies(true, "tilth", &tilth, windows));
+            assert!(!exec_form_applies(true, "npx", windows));
+            assert!(!exec_form_applies(true, "tilth", windows));
         }
-        assert!(!exec_form_applies(true, "C:/x/tilth.cmd", &tilth, true));
-        assert!(!exec_form_applies(true, r"C:\x\tilth.BAT", &tilth, true));
-        assert!(!exec_form_applies(true, "C:/x/tilth.ps1", &tilth, true));
-        assert!(!exec_form_applies(
-            true,
-            "/usr/bin/npx",
-            &a(&["tilth"]),
-            false
-        ));
-        assert!(!exec_form_applies(
-            true,
-            "/usr/bin/node",
-            &a(&["t.js"]),
-            false
-        ));
+        assert!(!exec_form_applies(true, "C:/x/tilth.cmd", true));
+        assert!(!exec_form_applies(true, r"C:\x\tilth.BAT", true));
+        assert!(!exec_form_applies(true, "C:/x/tilth.ps1", true));
+        assert!(!exec_form_applies(true, "/usr/bin/npx", false));
+        assert!(!exec_form_applies(true, "/usr/bin/node", false));
     }
 
     #[test]
     fn npx_hook_is_shell_form_and_replaces_stale_exec_entry() {
         let args = vec!["tilth".to_string()];
-        let ok = exec_form_applies(true, "npx", &args, true);
+        let ok = exec_form_applies(true, "npx", true);
         let inv = build_hook_invocation(ok, true, "claude", "npx", &args).unwrap();
         assert_eq!(inv.command, "npx tilth hook --host claude");
         assert!(inv.args.is_none());
@@ -2562,5 +2617,106 @@ mod tests {
             "MCP config written before the hook file was validated"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+    // Review fixes: symlinked settings, user-owned null-hooks groups, kept hint.
+    #[cfg(unix)]
+    #[test]
+    fn install_hook_writes_through_a_symlinked_settings_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        let real = dotfiles.path().join("settings.json");
+        fs::write(&real, r#"{"model":"x"}"#).unwrap();
+        let link = home.path().join(".claude/settings.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink replaced by a regular file"
+        );
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("\"model\"") && text.contains("--host"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn null_hooks_group_from_the_user_survives_reinstall() {
+        let home = tempfile::tempdir().unwrap();
+        let t = hook_target("claude-code", home.path()).unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Mine","hooks":null}]}}"#,
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        let groups = nested_groups(&cfg, &t);
+        assert!(
+            groups.iter().any(|g| g["matcher"] == "Mine"),
+            "user group dropped: {cfg}"
+        );
+    }
+
+    #[test]
+    fn reinstall_keeps_a_customised_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let t = hook_target("claude-code", home.path()).unwrap();
+        let own = hook_invocation(&t, None).unwrap().own_prefix;
+        let stale = "/old/tilth hook --host claude --hint native";
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":stale}]}]}})
+            .to_string(),
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        let lines = all_commands(&cfg);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("/old/tilth"), "{lines:?}");
+        assert!(lines[0].starts_with(&own), "{lines:?}");
+        assert!(lines[0].ends_with("claude --hint native"), "{lines:?}");
+    }
+
+    #[test]
+    fn reinstall_drops_a_hint_the_hook_rejects() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/old/tilth hook --host claude --hint foo"}]}]}})
+            .to_string(),
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let lines = all_commands(&read_json(&path));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("--hint"), "{lines:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_hook_writes_through_a_dangling_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        let real = dotfiles.path().join("settings.json");
+        let link = home.path().join(".claude/settings.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        install_hook("claude-code", home.path()).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling symlink replaced by a regular file"
+        );
+        assert!(fs::read_to_string(&real).unwrap().contains("--host"));
     }
 }
