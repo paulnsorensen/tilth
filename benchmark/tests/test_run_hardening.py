@@ -18,6 +18,7 @@ import run
 from config import ModeConfig
 from parse import RunResult, Turn
 from tasks.base import GroundTruth, Task, TaskSource
+from test_strict_hook import install_fake_hook, route_hook_to_real_process
 
 _RUNTIME_KEYS = {
     "PATH",
@@ -1238,6 +1239,7 @@ def test_strict_file_tools_configures_equal_mcp_restrictions(
     monkeypatch.setitem(run.MODES, "wozcode", ModeConfig("wozcode", ["Read"], "manifest", "test",
                         plugin_dir=str(tmp_path), plugin_version="1.0"))
     monkeypatch.setattr(run, "_tilth_version", lambda *_args: "test")
+    hook = install_fake_hook(monkeypatch, tmp_path)
     available = expected_tools.split(",")
     if mode_name != "baseline":
         available.append("mcp__plugin_woz_code__Search" if mode_name == "wozcode" else "mcp__tilth__tilth_read")
@@ -1247,9 +1249,9 @@ def test_strict_file_tools_configures_equal_mcp_restrictions(
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(map(json.dumps, events)), stderr="")
-    monkeypatch.setattr(run.subprocess, "run", fake_run)
+    route_hook_to_real_process(monkeypatch, fake_run)
     result = run._run_single_in_repo("strict_task", mode_name, "sonnet5", 0, tmp_path,
-                                     strict_file_tools=True)
+                                     strict_file_tools=True, hook_sha="seed")
     cmd = captured["cmd"]
     assert cmd[cmd.index("--tools") + 1] == expected_tools
     disallowed = cmd[cmd.index("--disallowedTools") + 1].split(",")
@@ -1257,9 +1259,12 @@ def test_strict_file_tools_configures_equal_mcp_restrictions(
     if mode_name != "baseline":
         assert {"Read", "Edit", "Write", "Grep", "Glob"} <= set(disallowed)
     settings = json.loads(cmd[cmd.index("--settings") + 1])
-    hook = settings["hooks"]["PreToolUse"][0]
-    assert hook["matcher"] == "Bash"
-    assert "claude_bash_guard.py" in hook["hooks"][0]["command"]
+    entry = settings["hooks"]["PreToolUse"][0]
+    assert entry["matcher"] == "Bash"
+    expected_binary, expected_hint = (
+        (run.MODES["tilth"].binary_path, "tilth") if mode_name == "tilth" else (str(hook), "native"))
+    assert entry["hooks"] == [{"type": "command", "command": expected_binary,
+                               "args": ["hook", "--hint", expected_hint], "onFailure": "block"}]
     assert result["strict_file_tools"] is True
 
 
@@ -1268,22 +1273,26 @@ def test_strict_file_tools_rejects_successful_forbidden_bash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, denied: bool,
 ) -> None:
     monkeypatch.setitem(run.TASKS, "strict_task", _RunnerTask())
+    install_fake_hook(monkeypatch, tmp_path)
     events = [
         {"type": "system", "subtype": "init", "apiKeySource": "none", "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]},
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "call-1", "name": "Bash", "input": {"command": "cat context.go"}}]}},
         {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "is_error": denied}]}},
         {"type": "result", "subtype": "success", "is_error": False},
     ]
-    monkeypatch.setattr(run.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(
+    if denied:
+        events[2]["message"]["content"][0]["content"] = "PreToolUse:Bash hook error: [/usr/bin/fake-hook hook]: blocked\n"
+    route_hook_to_real_process(monkeypatch, lambda cmd, **kwargs: subprocess.CompletedProcess(
         cmd, 0, stdout="\n".join(map(json.dumps, events)), stderr=""))
     if denied:
         result = run._run_single_in_repo("strict_task", "baseline", "sonnet5", 0, tmp_path,
-                                         strict_file_tools=True)
+                                         strict_file_tools=True, hook_sha="seed")
         assert result["strict_file_tools"] is True
+        assert result["strict_denied_bash_calls"] == 1
     else:
-        with pytest.raises(RuntimeError, match="forbidden Bash"):
+        with pytest.raises(run.HookLoosenedError, match="hook_loosened"):
             run._run_single_in_repo("strict_task", "baseline", "sonnet5", 0, tmp_path,
-                                    strict_file_tools=True)
+                                    strict_file_tools=True, hook_sha="seed")
 
 
 def test_strict_mcp_audit_rejects_native_file_tool_use() -> None:
@@ -1292,7 +1301,7 @@ def test_strict_mcp_audit_rejects_native_file_tool_use() -> None:
         {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "context.go"}},
     ]}})
     with pytest.raises(RuntimeError, match="forbidden native tool"):
-        run._audit_strict_claude(raw, mode, ["Bash", "mcp__tilth__tilth_read"])
+        run._audit_strict_claude(raw, mode, ["Bash", "mcp__tilth__tilth_read"], "unused-hook")
 
 
 def test_strict_timeout_row_retains_mode_metadata(
@@ -1304,6 +1313,7 @@ def test_strict_timeout_row_retains_mode_metadata(
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run, "reset_repo", lambda: None)
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.295")
     seen = []
     def timeout(*_args, **kwargs):
         seen.append(kwargs["strict_file_tools"])

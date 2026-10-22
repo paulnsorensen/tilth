@@ -322,6 +322,7 @@ def test_harness_variant_of_a_baseline_is_not_drift(bench) -> None:
 def test_strict_and_budget_variants_of_a_baseline_are_not_drift(bench, variant: tuple[str, ...]) -> None:
     bench.seed(bench.row("cell_a", "baseline", 0))
     bench.runner(lambda _stream: 0.1)
+    bench.cli = "2.1.295"
 
     code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "baseline",
                       "--reps", "1", "--max-usd", "5", *variant)

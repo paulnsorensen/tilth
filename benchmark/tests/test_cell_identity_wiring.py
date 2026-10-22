@@ -5,6 +5,7 @@ key back through ``run.cell_identity`` (or ``run.env_fingerprint``), never throu
 hand-built digest dicts, so a helper that stops feeding the key fails here.
 """
 
+import inspect
 import json
 import sys
 from dataclasses import replace
@@ -14,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import baselines
 import config
 import run
 from conftest import StoreTask
@@ -22,13 +24,20 @@ from conftest import StoreTask
 def _key(task: str = "wiring_task", mode: str = "baseline", model: str = "sonnet5", *,
          bare: bool = False, strict: bool = False) -> str:
     return run.cell_identity(task, mode, model, 0, bare=bare, reasoning_effort=None,
-                             max_budget_usd=1.0, strict_file_tools=strict)["run_key"]
+                             max_budget_usd=1.0, strict_file_tools=strict,
+                             hook_sha="h" if strict else None)["run_key"]
 
 
 @pytest.fixture(autouse=True)
 def wiring_task(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(run.TASKS, "wiring_task", StoreTask())
 
+
+@pytest.fixture(autouse=True)
+def hook_source(monkeypatch: pytest.MonkeyPatch) -> dict:
+    source = {"key": "tree-a:lock-a"}
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: source["key"])
+    return source
 
 # --- model name: the key hashes the configured model string, not the short name ---
 
@@ -73,30 +82,41 @@ def test_strict_bash_settings_feed_the_strict_key(monkeypatch: pytest.MonkeyPatc
     assert _key(strict=True) != before
 
 
-def test_bash_guard_source_feeds_only_the_strict_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Same path, new content: only the guard's content hash can move the key."""
-    guard = tmp_path / "claude_bash_guard.py"
-    guard.write_text(run._BASH_GUARD.read_text())
-    monkeypatch.setattr(run, "_BASH_GUARD", guard)
+def test_hook_source_key_feeds_only_the_strict_key(hook_source: dict) -> None:
+    """A new hook source (tree hash or Cargo.lock) moves the strict key and no other."""
     strict_before, plain_before = _key(strict=True), _key()
-    guard.write_text(guard.read_text() + "\n# allow cat\n")
+    hook_source["key"] = "tree-b:lock-a"
 
     assert _key(strict=True) != strict_before
     assert _key() == plain_before
 
 
-def test_strict_key_ignores_interpreter_and_checkout_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_digest_carries_hook_source_key_and_not_the_python_guard() -> None:
+    identity = run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=True, reasoning_effort=None,
+                                 max_budget_usd=1.0, strict_file_tools=True, hook_sha="h")
+
+    assert identity["hook_source_key"] == "tree-a:lock-a"
+    assert not hasattr(run, "_BASH_GUARD")
+    assert "bash_guard_sha256" not in inspect.signature(baselines.harness_digest).parameters
+    assert "hook_source_key" in inspect.signature(baselines.harness_digest).parameters
+
+
+def test_strict_cell_without_a_hook_sha_is_refused() -> None:
+    with pytest.raises(ValueError, match="hook_sha"):
+        run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=True, reasoning_effort=None,
+                          max_budget_usd=1.0, strict_file_tools=True)
+
+
+def test_strict_key_ignores_hook_binary_and_checkout_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     before = _key(strict=True)
-    moved = tmp_path / "other-checkout" / "claude_bash_guard.py"
-    moved.parent.mkdir()
-    moved.write_text(run._BASH_GUARD.read_text())
-    monkeypatch.setattr(run, "_BASH_GUARD", moved)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "venv" / "bin" / "python3"))
 
     assert _key(strict=True) == before
     template = run._command_template(StoreTask(), run.MODES["baseline"], "baseline", "sonnet5", bare=True,
                                      reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=True)
     assert not any(str(tmp_path) in arg for arg in template)
+    settings = json.loads(template[template.index("--settings") + 1])
+    assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == run._HOOK_BIN_PLACEHOLDER
 
 
 def test_setting_sources_reach_the_hashed_command() -> None:
