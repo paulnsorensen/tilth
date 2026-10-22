@@ -16,7 +16,7 @@ import auth
 import baselines
 import panels
 import run
-from evolve_support import CHEAP, DEV, MODEL, TEST, git, make_repo, make_world
+from evolve_support import CHEAP, CLI_VERSION, DEV, MODEL, TEST, git, make_repo, make_world
 from panel_support import COMPLETE, FB_ALGORITHMS, admit_all, load, read, restratify, stub_loaders, write
 from spend import SpendLedger
 
@@ -245,8 +245,8 @@ def test_run_plan_reprobes_cli_before_each_paid_cell(world, monkeypatch: pytest.
     def cli_version(runner: str, *, fresh: bool = False) -> str | None:
         if fresh:
             probes.append(runner)
-            return "2.1.0" if len(probes) == 1 else current
-        return "2.1.0"
+            return CLI_VERSION if len(probes) == 1 else current
+        return CLI_VERSION
 
     monkeypatch.setattr(run, "cli_version", cli_version)
     with pytest.raises(run.PlanStopped) as stopped:

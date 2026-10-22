@@ -35,6 +35,7 @@ TEST = ("test_a",)
 LONG_OUTPUT = "src/dispatch.rs walks every handler table entry AGENT_GT " * 4
 assert len(LONG_OUTPUT) > 80
 MODEL = "sonnet5"
+CLI_VERSION = "2.1.300"
 COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.com",
     "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.com",
@@ -312,7 +313,7 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-fixture-token")
     monkeypatch.setattr(run, "RESULTS_DIR", results)
-    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.300")
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: CLI_VERSION)
     monkeypatch.setattr(run, "env_fingerprint", lambda _task: world.env)
     monkeypatch.setattr(run, "run_single", world.fake_run_single)
     monkeypatch.setattr(run, "_build_candidate", world.fake_build)
