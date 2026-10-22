@@ -42,6 +42,7 @@ BASE_TASKS = {
     "fastapi_edit_dep_cache",
     "fastapi_edit_response_filter",
     "fastapi_edit_scope_cache",
+    "fastapi_edit_security_raise_on_missing",
     "gin_radix_tree",
     "gin_client_ip",
     "gin_middleware_chain",
