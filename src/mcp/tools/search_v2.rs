@@ -2328,7 +2328,15 @@ mod tests {
 
     #[test]
     fn regex_with_exact_file_glob_is_bounded_to_that_file() {
-        let start = Instant::now();
+        // Do not assert wall-clock time here. Under heavy load it exceeds any
+        // fixed limit. `exact_file_walk_does_not_descend_unrelated_subtrees`
+        // in `search/mod.rs` checks the single-file walk deterministically.
+        let target = repo_root().join("src/mcp/tools/search_v2.rs");
+        let expected = std::fs::read_to_string(&target)
+            .expect("read exact-glob target")
+            .lines()
+            .filter(|line| line.contains("SearchTelemetryRecord"))
+            .count();
         let resp = call(&json!({
             "cwd": repo_root().to_str().unwrap(),
             "queries": [{
@@ -2337,13 +2345,13 @@ mod tests {
             }],
         }))
         .expect("bounded regex query succeeds");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "exact-file-glob regex must be single-file-bounded and fast: {:?}",
-            start.elapsed()
-        );
         let result = &resp["results"][0];
         assert_eq!(result["resolved_as"], "regex");
+        assert_eq!(
+            result["total_found"],
+            json!(expected),
+            "regex must count only matches in the exact-glob file"
+        );
         let preview = result["preview"].as_str().expect("regex preview");
         assert!(
             preview.contains("src/mcp/tools/search_v2.rs#"),
