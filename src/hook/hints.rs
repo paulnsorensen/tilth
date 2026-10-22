@@ -101,6 +101,7 @@ pub(super) fn all_rules() -> Vec<Rule> {
     [READ_RULES, SEARCH_RULES, WRITE_RULES, OTHER_RULES].concat()
 }
 
+/// Classifies a rule as a read, search, write, or generic denial.
 fn kind(rule: &str) -> Kind {
     if READ_RULES.contains(&rule) {
         Kind::Read
@@ -113,6 +114,7 @@ fn kind(rule: &str) -> Kind {
     }
 }
 
+/// Formats a denial reason with the tool names selected by `hint`.
 pub(super) fn reason(rule: &str, hint: Hint) -> String {
     let kind = kind(rule);
     match hint {
@@ -121,6 +123,7 @@ pub(super) fn reason(rule: &str, hint: Hint) -> String {
     }
 }
 
+/// Formats a denial reason with tilth tool calls for the rule's kind.
 fn tilth_reason(rule: &str, kind: Kind) -> String {
     let read = "mcp__tilth__tilth_read(paths:[\"<path>\"], cwd:\"<checkout>\")";
     let search = "mcp__tilth__tilth_search(queries:[{query:\"<pattern>\"}], cwd:\"<checkout>\")";
@@ -149,6 +152,7 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
     }
 }
 
+/// Formats a denial reason with the host's native tool names.
 fn native_reason(rule: &str, kind: Kind) -> String {
     match kind {
         Kind::Read => format!(

@@ -37,10 +37,12 @@ const AC2: &[&str] = &[
     "ls src",
 ];
 
+/// Parses the embedded command corpus, panicking if the fixture is invalid JSON.
 fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("corpus parses")
 }
 
+/// Extracts commands and optional rule names from a named corpus list.
 fn rows(list: &str) -> Vec<(String, Option<String>)> {
     corpus()[list]
         .as_array()
@@ -55,22 +57,26 @@ fn rows(list: &str) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// Combines the AC-1 commands with the must-deny corpus rows.
 fn all_deny_commands() -> Vec<String> {
     let mut all: Vec<String> = AC1.iter().map(|s| (*s).to_string()).collect();
     all.extend(rows("must_deny").into_iter().map(|(c, _)| c));
     all
 }
 
+/// Combines the AC-2 commands with the must-allow corpus rows.
 fn all_allow_commands() -> Vec<String> {
     let mut all: Vec<String> = AC2.iter().map(|s| (*s).to_string()).collect();
     all.extend(rows("must_allow").into_iter().map(|(c, _)| c));
     all
 }
 
+/// Serializes a Claude-shaped Bash event for the supplied command.
 fn claude_event(command: &str) -> String {
     json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string()
 }
 
+/// Serializes a shell event in the selected host family's format.
 fn event(host: Host, command: &str) -> String {
     match host {
         Host::Claude | Host::Copilot => claude_event(command),
@@ -82,12 +88,14 @@ fn event(host: Host, command: &str) -> String {
     }
 }
 
+/// Evaluates an event and returns its exit code and captured stderr as UTF-8.
 fn run(host: Host, hint: Hint, input: &str) -> (i32, String) {
     let mut err = Vec::new();
     let code = run_io(host, hint, input, &mut err);
     (code, String::from_utf8(err).expect("utf8 stderr"))
 }
 
+/// Reports whether a denial message names at least one tilth tool.
 fn names_tilth_tool(stderr: &str) -> bool {
     ["tilth_read", "tilth_search", "tilth_write"]
         .iter()
@@ -298,15 +306,18 @@ fn host_and_hint_parse_names() {
 
 // Press round 1 attacks.
 
+/// Reports whether a shell command is denied with tilth hints.
 fn denies(command: &str) -> bool {
     matches!(verdict(command, Hint::Tilth), Verdict::Deny { .. })
 }
 
+/// Asserts that every command is denied, reporting any commands that were allowed.
 fn assert_all_deny(commands: &[&str]) {
     let leaked: Vec<&&str> = commands.iter().filter(|c| !denies(c)).collect();
     assert!(leaked.is_empty(), "allowed but must deny: {leaked:?}");
 }
 
+/// Asserts that every command is allowed, reporting any commands that were denied.
 fn assert_all_allow(commands: &[&str]) {
     let blocked: Vec<&&str> = commands.iter().filter(|c| denies(c)).collect();
     assert!(blocked.is_empty(), "denied but must allow: {blocked:?}");
@@ -378,6 +389,7 @@ const WRAPPERS: &[(&str, &[&str], bool, usize)] = &[
     ("xargs", &["-n", "1"], false, 0),
 ];
 
+/// Enumerates every ordering of the supplied wrapper-prefix parts.
 fn permutations(items: &[String]) -> Vec<Vec<String>> {
     if items.len() <= 1 {
         return vec![items.to_vec()];
@@ -857,6 +869,7 @@ fn cure1_unknown_wrapper_option_fails_closed() {
     ]);
 }
 
+/// Asserts that each command is denied by its expected rule.
 fn assert_rules(rows: &[(&str, &str)]) {
     for (command, rule) in rows {
         match verdict(command, Hint::Tilth) {

@@ -23,6 +23,7 @@ struct Walker {
 }
 
 impl Walker {
+    /// Parses shell source and returns the first denial, including parse and depth failures.
     fn source(&mut self, src: &str) -> Option<Rule> {
         if self.depth > MAX_DEPTH {
             return Some(UNRESOLVED);
@@ -44,6 +45,7 @@ impl Walker {
         self.visit(root, src.as_bytes(), Ctx::default())
     }
 
+    /// Checks a syntax node while carrying pipeline and heredoc context.
     fn visit(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Option<Rule> {
         match node.kind() {
             "pipeline" => {
@@ -115,6 +117,7 @@ impl Walker {
         }
     }
 
+    /// Checks named children with fresh context and returns the first denial.
     fn children(&mut self, node: Node, src: &[u8]) -> Option<Rule> {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -139,6 +142,7 @@ impl Walker {
         None
     }
 
+    /// Checks a simple command and reparses any shell source it runs.
     fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Option<Rule> {
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
@@ -220,6 +224,7 @@ fn is_structure(kind: &str) -> bool {
         )
 }
 
+/// Recognizes heredoc and here-string redirect nodes.
 fn is_here(kind: &str) -> bool {
     matches!(kind, "heredoc_redirect" | "herestring_redirect")
 }
@@ -253,6 +258,7 @@ fn redirect(node: Node, src: &[u8]) -> Option<Rule> {
     }
 }
 
+/// Builds an argument with its unquoted text, literal status, and opacity.
 fn arg_of(node: Node, src: &[u8]) -> Arg {
     let (text, literal) = literal(node, src);
     Arg {
@@ -262,6 +268,7 @@ fn arg_of(node: Node, src: &[u8]) -> Arg {
     }
 }
 
+/// Classifies expansions and substitutions as opaque while allowing word and string nodes.
 fn opaque(node: Node) -> bool {
     match node.kind() {
         "command_name" => node.named_child(0).is_none_or(opaque),
@@ -312,6 +319,7 @@ fn literal(node: Node, src: &[u8]) -> (String, bool) {
     }
 }
 
+/// Removes backslash escapes from a bare word without evaluating shell expansions.
 fn unescape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();

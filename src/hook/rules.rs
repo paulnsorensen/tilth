@@ -30,6 +30,7 @@ pub(super) enum Outcome {
     Reparse(String),
 }
 
+/// Returns the final path component after stripping leading shell-escape backslashes.
 fn base(name: &str) -> &str {
     let name = name.trim_start_matches('\\');
     name.rsplit('/').next().unwrap_or(name)
@@ -53,6 +54,7 @@ fn normalize_path(text: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// Detects blocked device paths, including normalized paths and assignment values.
 pub(super) fn is_device(text: &str) -> bool {
     let is = |s: &str| {
         let s = normalize_path(s);
@@ -63,6 +65,7 @@ pub(super) fn is_device(text: &str) -> bool {
     is(text) || text.split_once('=').is_some_and(|(_, v)| is(v))
 }
 
+/// Applies device, wrapper, and command rules to one simple command.
 pub(super) fn check(cmd: &Cmd) -> Outcome {
     if cmd.words.iter().any(|a| is_device(&a.text)) {
         return Outcome::Deny(DEVICE_PATH);
@@ -111,6 +114,7 @@ pub(super) fn check(cmd: &Cmd) -> Outcome {
     }
 }
 
+/// Returns the static denial rule for `patch`, `dd`, or `truncate`.
 fn static_name(name: &str) -> Rule {
     match name {
         "patch" => "patch",
@@ -119,6 +123,7 @@ fn static_name(name: &str) -> Rule {
     }
 }
 
+/// Joins visible arguments as shell source, denying opaque expansions or substitutions.
 fn reparse(args: &[Arg]) -> Outcome {
     if args.iter().any(|a| a.opaque) {
         return Outcome::Deny(UNRESOLVED);
@@ -139,6 +144,7 @@ struct WrapOpts {
     long_flag: &'static [&'static str],
 }
 
+/// Returns the supported flag and value-option sets for a wrapper command.
 fn wrapper_opts(name: &str) -> WrapOpts {
     let (short_val, short_flag, long_val, long_flag): (_, _, &[&str], &[&str]) = match name {
         "env" => (
@@ -383,9 +389,11 @@ struct Parsed<'a> {
 }
 
 impl Parsed<'_> {
+    /// Reports whether the parsed options include the exact flag.
     fn has(&self, flag: &str) -> bool {
         self.flags.iter().any(|f| f == flag)
     }
+    /// Reports whether any supplied flag appears in the parsed options.
     fn has_any(&self, flags: &[&str]) -> bool {
         flags.iter().any(|f| self.has(f))
     }
@@ -446,6 +454,7 @@ struct Reader {
     script_flags: Option<&'static [&'static str]>,
 }
 
+/// Creates a reader specification with valued short options and no script operand.
 const fn reader(name: &'static str, valued_short: &'static str) -> Reader {
     Reader {
         name,
@@ -569,6 +578,7 @@ const READERS: &[Reader] = &[
     },
 ];
 
+/// Denies file operands, `xargs` operands, and supported in-place reader modes.
 fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
     let name = spec.name;
     let p = split(args, spec.valued_short, spec.valued_long);
@@ -603,6 +613,7 @@ fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
     }
 }
 
+/// Recognizes assignments whose names are ASCII shell identifiers.
 fn is_assignment(text: &str) -> bool {
     text.split_once('=').is_some_and(|(k, _)| {
         !k.is_empty()
@@ -611,6 +622,7 @@ fn is_assignment(text: &str) -> bool {
     })
 }
 
+/// Detects the attached or separate `-i inplace` awk option.
 fn awk_inplace(args: &[Arg]) -> bool {
     args.iter().enumerate().any(|(i, a)| {
         a.text == "-iinplace"
@@ -727,6 +739,7 @@ const ACK: Searcher = Searcher {
     listing: &["-f", "-g", "--help-types"],
 };
 
+/// Returns the option and recursion policy for a recognized search command.
 fn searcher(name: &str) -> Option<&'static Searcher> {
     match name {
         "grep" | "egrep" | "fgrep" => Some(&GREP),
@@ -737,6 +750,7 @@ fn searcher(name: &str) -> Option<&'static Searcher> {
     }
 }
 
+/// Returns the static denial rule for a recognized search command.
 fn searcher_rule(name: &str) -> Rule {
     match name {
         "egrep" => "egrep",
@@ -748,10 +762,12 @@ fn searcher_rule(name: &str) -> Rule {
     }
 }
 
+/// Checks whether `text` abbreviates `word` with at least `min` bytes.
 fn is_prefix_of(word: &str, text: &str, min: usize) -> bool {
     text.len() >= min && word.starts_with(text)
 }
 
+/// Recognizes nonempty, case-sensitive abbreviations of `recurse`.
 fn recurse_value(v: &str) -> bool {
     !v.is_empty() && "recurse".starts_with(v)
 }
@@ -786,6 +802,7 @@ fn directories_recurse(args: &[Arg]) -> bool {
     })
 }
 
+/// Allows listing and probe modes, then denies file operands or implicit repo searches.
 fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> Outcome {
     let rule = searcher_rule(name);
     let p = split(args, spec.valued_short, spec.valued_long);
@@ -821,6 +838,7 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
 // ---------------------------------------------------------------------------
 // Writers and other named commands
 
+/// Denies output operands other than `-` and `/dev/null`.
 fn tee(args: &[Arg]) -> Outcome {
     let p = split(args, "", &[]);
     if p.operands
@@ -833,6 +851,7 @@ fn tee(args: &[Arg]) -> Outcome {
     }
 }
 
+/// Denies `find` actions that execute commands, including interactive variants.
 fn find(args: &[Arg]) -> Outcome {
     for a in args {
         let rule = match a.text.as_str() {
@@ -847,6 +866,7 @@ fn find(args: &[Arg]) -> Outcome {
     Outcome::Allow
 }
 
+/// Skips global Git options and denies content reads, searches, and patch application.
 fn git(args: &[Arg]) -> Outcome {
     let mut i = 0;
     while let Some(arg) = args.get(i) {
@@ -879,6 +899,7 @@ fn git(args: &[Arg]) -> Outcome {
 // ---------------------------------------------------------------------------
 // Shells
 
+/// Reparses `-c` source and denies stdin scripts or unresolved script paths.
 fn shell(args: &[Arg]) -> Outcome {
     let mut c_mode = false;
     let mut informational = false;
@@ -927,6 +948,7 @@ struct Interp {
     valued_long: &'static [&'static str],
 }
 
+/// Maps interpreter names, including numeric version suffixes, to their rule family.
 fn interpreter_family(name: &str) -> Option<Rule> {
     let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     match stem {
@@ -941,6 +963,7 @@ fn interpreter_family(name: &str) -> Option<Rule> {
     }
 }
 
+/// Returns the inline-code and valued-option policy for an interpreter family.
 fn interp_spec(family: &str) -> Interp {
     let none = Interp {
         inline_short: "",
@@ -996,6 +1019,7 @@ fn interp_spec(family: &str) -> Interp {
     }
 }
 
+/// Checks interpreter arguments for inline code, stdin scripts, and file-reading JSON tools.
 fn interpreter(family: Rule, args: &[Arg], cmd: &Cmd) -> Outcome {
     if cmd.here {
         return Outcome::Deny(family);

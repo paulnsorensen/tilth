@@ -31,6 +31,19 @@ pub enum Host {
 impl FromStr for Host {
     type Err = String;
 
+    /// Parses a supported lowercase host name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error listing supported hosts when the name is unknown.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tilth::hook::Host;
+    ///
+    /// assert_eq!("claude".parse::<Host>(), Ok(Host::Claude));
+    /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "claude" => Ok(Self::Claude),
@@ -57,6 +70,19 @@ pub enum Hint {
 impl FromStr for Hint {
     type Err = String;
 
+    /// Parses `tilth` or `native` as a denial-hint style.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error listing supported hints when the name is unknown.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tilth::hook::Hint;
+    ///
+    /// assert_eq!("native".parse::<Hint>(), Ok(Hint::Native));
+    /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "tilth" => Ok(Self::Tilth),
@@ -90,6 +116,7 @@ pub fn verdict(command: &str, hint: Hint) -> Verdict {
     }
 }
 
+/// Evaluates a host event, denying malformed JSON or an invalid shell-event shape.
 fn event_verdict(host: Host, hint: Hint, input: &str) -> Verdict {
     let event: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
@@ -102,6 +129,7 @@ fn event_verdict(host: Host, hint: Hint, input: &str) -> Verdict {
     }
 }
 
+/// Builds a denial with the rule name and a reason in the selected hint style.
 fn deny(rule: &'static str, hint: Hint) -> Verdict {
     Verdict::Deny {
         rule,
