@@ -17,6 +17,8 @@ pub(super) struct Arg {
 pub(super) struct Cmd<'a> {
     /// Command name first, then arguments.
     pub words: &'a [Arg],
+    /// Leading `NAME=value` assignments before the command name.
+    pub assigns: &'a [Arg],
     /// The command reads the previous pipeline stage on stdin.
     pub piped: bool,
     /// A heredoc or here-string feeds the command.
@@ -109,7 +111,18 @@ pub(super) fn check(cmd: &Cmd) -> Outcome {
         "vi" | "vim" | "nvim" | "view" | "vimdiff" => vim(args),
         "find" => find(args),
         "fd" | "fdfind" => fd(args),
-        "git" => git(args),
+        "git" => {
+            let wrapped = &cmd.words[..cmd.words.len() - words.len()];
+            let env = cmd
+                .assigns
+                .iter()
+                .chain(wrapped.iter().filter(|a| is_assign_word(&a.text)));
+            if env.into_iter().any(|a| git_env_runs_command(&a.text)) {
+                return Outcome::Deny(GIT_CONFIG);
+            }
+            git(args)
+        }
+        "ast-grep" | "sg" => ast_grep(args, cmd, xargs),
         "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" | "tcsh" | "csh" => {
             shell(args, name == "fish")
         }
@@ -1018,7 +1031,7 @@ const ACK: Searcher = Searcher {
 fn searcher(name: &str) -> Option<&'static Searcher> {
     match name {
         "grep" | "egrep" | "fgrep" | "ugrep" | "ug" | "zgrep" | "zegrep" | "zfgrep" => Some(&GREP),
-        "rg" | "ast-grep" | "sg" => Some(&RG),
+        "rg" => Some(&RG),
         "ag" => Some(&AG),
         "ack" => Some(&ACK),
         _ => None,
@@ -1030,11 +1043,30 @@ fn searcher_rule(name: &str) -> Rule {
     match name {
         "egrep" => "egrep",
         "fgrep" => "fgrep",
-        "rg" | "ast-grep" | "sg" => "rg",
+        "rg" => "rg",
         "ag" => "ag",
         "ack" => "ack",
         _ => "grep",
     }
+}
+
+/// `ast-grep` and `sg` search the working tree unless `--stdin` feeds them; `-U` rewrites files.
+fn ast_grep(args: &[Arg], cmd: &Cmd, xargs: bool) -> Outcome {
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.text.as_str(), "--version" | "--help" | "-V" | "-h"))
+    {
+        return Outcome::Allow;
+    }
+    let updates = args.iter().any(|a| {
+        a.text == "--update-all"
+            || (a.text.starts_with('-') && !a.text.starts_with("--") && a.text.contains('U'))
+    });
+    let stdin_fed = (cmd.piped || cmd.here) && args.iter().any(|a| a.text == "--stdin");
+    if updates || xargs || !stdin_fed {
+        return Outcome::Deny("rg");
+    }
+    Outcome::Allow
 }
 
 /// Checks whether `text` abbreviates `word` with at least `min` bytes.
@@ -1353,6 +1385,24 @@ fn git(args: &[Arg]) -> Outcome {
     }
 }
 
+/// A leading `NAME=value` environment assignment that makes git run a command.
+fn git_env_runs_command(assign: &str) -> bool {
+    let Some((name, value)) = assign.split_once('=') else {
+        return false;
+    };
+    match name {
+        "GIT_CONFIG_PARAMETERS"
+        | "GIT_EXTERNAL_DIFF"
+        | "GIT_SSH_COMMAND"
+        | "GIT_SSH"
+        | "GIT_EDITOR"
+        | "GIT_SEQUENCE_EDITOR"
+        | "GIT_ASKPASS" => true,
+        "GIT_PAGER" | "PAGER" => !matches!(value, "cat" | "less"),
+        _ => name.starts_with("GIT_CONFIG_KEY_"),
+    }
+}
+
 /// A `git -c name=value` setting that makes git run a command.
 fn runs_command(setting: &str) -> bool {
     let key = setting
@@ -1363,9 +1413,19 @@ fn runs_command(setting: &str) -> bool {
     key.starts_with("alias.")
         || key.starts_with("pager.")
         || key.ends_with(".textconv")
+        || (key.starts_with("credential.") && key.ends_with(".helper"))
+        || (key.starts_with("gpg.") && key.ends_with(".program"))
+        || (key.starts_with("diff.") && key.ends_with(".command"))
+        || (key.starts_with("filter.")
+            && [".clean", ".smudge", ".process"]
+                .iter()
+                .any(|s| key.ends_with(s)))
         || matches!(
             key.as_str(),
             "core.pager"
+                | "credential.helper"
+                | "gpg.program"
+                | "core.hookspath"
                 | "core.editor"
                 | "core.sshcommand"
                 | "core.fsmonitor"
@@ -1379,26 +1439,43 @@ fn runs_command(setting: &str) -> bool {
 // Shells
 
 fn shell(args: &[Arg], fish: bool) -> Outcome {
-    let mut init = None;
+    let mut init: Option<Arg> = None;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         if arg.text == "--" {
             break;
         }
         if fish && matches!(arg.text.as_str(), "-C" | "--init-command") {
-            init = args.get(i + 1);
+            init = args.get(i + 1).map(|a| Arg {
+                text: a.text.clone(),
+                literal: a.literal,
+                opaque: a.opaque,
+            });
+        } else if let Some(v) = arg.text.strip_prefix("--init-command=").filter(|_| fish) {
+            init = Some(Arg {
+                text: v.to_string(),
+                literal: arg.literal,
+                opaque: arg.opaque,
+            });
         }
         i += 1;
     }
-    let outcome = shell_operand(args);
-    match (outcome, init) {
-        (Outcome::Allow, Some(command)) => reparse(std::slice::from_ref(command)),
-        (outcome, _) => outcome,
+    let outcome = shell_operand(args, fish);
+    let Some(command) = init else {
+        return outcome;
+    };
+    match outcome {
+        Outcome::Allow => reparse(std::slice::from_ref(&command)),
+        Outcome::Reparse(text) => match reparse(std::slice::from_ref(&command)) {
+            Outcome::Reparse(first) => Outcome::Reparse(format!("{first}\n{text}")),
+            other => other,
+        },
+        Outcome::Deny(rule) => Outcome::Deny(rule),
     }
 }
 
 /// Reparses `-c` source and denies stdin scripts or unresolved script paths.
-fn shell_operand(args: &[Arg]) -> Outcome {
+fn shell_operand(args: &[Arg], fish: bool) -> Outcome {
     let mut c_mode = false;
     let mut informational = false;
     let mut stdin_flag = false;
@@ -1415,7 +1492,9 @@ fn shell_operand(args: &[Arg]) -> Outcome {
             informational = true;
         } else if t == "--command" {
             c_mode = true;
-        } else if matches!(t, "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O") {
+        } else if (fish && matches!(t, "-C" | "--init-command"))
+            || matches!(t, "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O")
+        {
             i += 1;
         } else if t.len() > 1 && (t.starts_with('-') || t.starts_with('+')) {
             c_mode |= t.starts_with('-') && !t.starts_with("--") && t.contains('c');
@@ -1656,15 +1735,11 @@ const DENO_VALUED: &[&str] = &[
     "--config",
     "-c",
     "--import-map",
-    "--lock",
     "--cert",
     "--location",
     "--seed",
     "--v8-flags",
-    "--env-file",
     "--ext",
-    "--node-modules-dir",
-    "--reload",
 ];
 
 /// The word names stdin or a process substitution, so the shell reads a script nobody can see.

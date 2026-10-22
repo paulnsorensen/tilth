@@ -147,10 +147,12 @@ impl Walker {
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
         let mut here = ctx.here;
+        let mut assigns: Vec<Arg> = Vec::new();
         for child in node.named_children(&mut cursor) {
             match child.kind() {
                 "command_name" => words.insert(0, arg_of(child, src)),
-                "variable_assignment" | "comment" => {}
+                "variable_assignment" => assigns.push(assignment(child, src)),
+                "comment" => {}
                 "file_redirect" => words.extend(redirect_words(child, src)),
                 kind if is_here(kind) => {
                     here = true;
@@ -165,6 +167,7 @@ impl Walker {
         }
         let cmd = Cmd {
             words: &words,
+            assigns: &assigns,
             piped: ctx.piped,
             here,
         };
@@ -181,6 +184,20 @@ impl Walker {
             }
         }
         self.children(node, src)
+    }
+}
+
+/// A leading `NAME=value` word of a command, with the value unquoted.
+fn assignment(node: Node, src: &[u8]) -> Arg {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src).ok())
+        .unwrap_or_default();
+    let value = node.child_by_field_name("value").map(|v| arg_of(v, src));
+    Arg {
+        text: format!("{name}={}", value.as_ref().map_or("", |v| v.text.as_str())),
+        literal: value.as_ref().is_none_or(|v| v.literal),
+        opaque: false,
     }
 }
 

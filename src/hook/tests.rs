@@ -1161,7 +1161,7 @@ fn cure4_second_round_denies() {
         ("tar -cf - f", "tar"),
         ("tar -c f", "tar"),
         ("tar --create f", "tar"),
-        ("fish -C 'cat f'", "cat"),
+        ("fish -C 'cat f'", "shell stdin"),
         ("deno run --config x.json -", "deno"),
         ("deno run --import-map m.json -", "deno"),
         ("unexpand f", "unexpand"),
@@ -1170,6 +1170,42 @@ fn cure4_second_round_denies() {
         ("zcat f.gz", "zcat"),
     ]);
     assert_all_allow(&["tar -cf a.tar f", "tar -tf a.tar"]);
+}
+
+#[test]
+fn cure5_third_round_denies() {
+    assert_rules(&[
+        ("true | sg -p 'fn $F'", "rg"),
+        ("true | sg run -p a -r b -U", "rg"),
+        ("echo x | sg --stdin -p a --update-all", "rg"),
+        ("true | ast-grep -p a", "rg"),
+        (
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s GIT_CONFIG_VALUE_0='!cat f' git s",
+            "git -c",
+        ),
+        ("GIT_PAGER='cat f' git log", "git -c"),
+        ("GIT_EXTERNAL_DIFF=x git diff", "git -c"),
+        ("env GIT_PAGER='cat f' git log", "git -c"),
+        ("GIT_PAGER=less\\ -f git log", "git -c"),
+        ("git -c credential.helper=x log", "git -c"),
+        ("git -c gpg.ssh.program=x log", "git -c"),
+        ("git -c core.hooksPath=h log", "git -c"),
+        ("git -c filter.x.smudge=c log", "git -c"),
+        ("git -c diff.x.command=c log", "git -c"),
+        ("fish -C true -c 'cat f'", "cat"),
+        ("fish --init-command=true -c 'cat f'", "cat"),
+        ("fish -C 'cat f' -c true", "cat"),
+        ("deno run --reload -", "deno"),
+        ("deno run --env-file -", "deno"),
+        ("deno run --lock -", "deno"),
+    ]);
+    assert_all_allow(&[
+        "echo x | sg --stdin -p a -l rust",
+        "GIT_AUTHOR_NAME=x git commit -m m",
+        "GIT_PAGER=cat git log",
+        "fish -C true -c 'echo hi'",
+        "deno run --config x.json main.ts",
+    ]);
 }
 
 #[test]
