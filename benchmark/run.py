@@ -14,6 +14,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -623,6 +624,20 @@ _STRICT_SYSTEM_GUIDANCE = (
 _HOOK_BIN_PLACEHOLDER = "<hook-bin>"
 
 
+# Exec-form hooks and `onFailure: block` need this Claude CLI; older ones can run a bare `tilth` unguarded.
+_MIN_STRICT_CLAUDE = (2, 1, 295)
+
+
+def _require_strict_cli() -> None:
+    """Refuse a strict run on a Claude CLI too old to honor exec-form hooks with ``onFailure: block``."""
+    found = cli_version("claude")
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", found or "")
+    needed = ".".join(map(str, _MIN_STRICT_CLAUDE))
+    if match is None or tuple(map(int, match.groups())) < _MIN_STRICT_CLAUDE:
+        raise ValueError(
+            f"strict_file_tools needs Claude CLI >= {needed} (exec-form hooks, onFailure=block); found {found!r}")
+
+
 class HookLoosenedError(RuntimeError):
     """A strict cell ran a Bash call that the hook at ``hook_sha`` denies."""
 
@@ -646,29 +661,68 @@ def _strict_hook_spec(mode: ModeConfig, baseline_hook_binary: str | None) -> tup
     return binary, hint
 
 
+# Files outside src/hook that change the built hook: the dependency lock, the manifest, and the CLI entry.
+_HOOK_BUILD_INPUTS = ("Cargo.lock", "Cargo.toml", "src/main.rs")
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
 @functools.lru_cache(maxsize=None)
 def _hook_source_key_at(full_sha: str, repo: str) -> str:
     tree = _git("rev-parse", f"{full_sha}:src/hook", cwd=Path(repo)).strip()
-    lock = subprocess.run(["git", "show", f"{full_sha}:Cargo.lock"], cwd=repo, check=True, capture_output=True).stdout
-    return f"{tree}:{hashlib.sha256(lock).hexdigest()}"
+    digest = hashlib.sha256()
+    for name in _HOOK_BUILD_INPUTS:
+        blob = subprocess.run(["git", "show", f"{full_sha}:{name}"], cwd=repo, check=True, capture_output=True).stdout
+        digest.update(name.encode() + b"\0" + hashlib.sha256(blob).digest())
+    return f"{tree}:{digest.hexdigest()}"
 
 
 def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
-    """The git tree hash of ``src/hook`` plus the SHA-256 of ``Cargo.lock``, both at ``hook_sha``.
+    """The git tree hash of ``src/hook`` plus a digest of ``_HOOK_BUILD_INPUTS``, all at ``hook_sha``.
 
-    A full commit sha names immutable content, so the key is cached per (full sha, repo).
+    A full commit sha names immutable content, so the key is cached per (full sha, repo)
+    and a full sha skips the per-call ``rev-parse``.
     """
     repo = Path(repo or REPO_ROOT)
-    full = _git("rev-parse", "--verify", f"{hook_sha}^{{commit}}", cwd=repo).strip()
+    full = hook_sha if _FULL_SHA.fullmatch(hook_sha) else _git(
+        "rev-parse", "--verify", f"{hook_sha}^{{commit}}", cwd=repo).strip()
     return _hook_source_key_at(full, str(repo))
+
+
+def _run_hook(binary: str, hint: str, command: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    """Send one Bash pre-tool event to ``binary hook --hint <hint>``."""
+    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    return subprocess.run([binary, "hook", "--hint", hint], input=event, capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def run_hook(binary: str, hint: str, command: str, *, timeout: float = 30) -> subprocess.CompletedProcess:
+    return _run_hook(binary, hint, command, timeout)
+
+
+def probe_hook(binary: str, hint: str) -> None:
+    """Allow/deny-probe one hook binary in one hint mode; raises ``HookProbeFailed``."""
+    _probe_hook(binary, hint)
+
+
+def hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
+    return _hook_source_key(hook_sha, repo)
+
+
+def require_strict_cli() -> None:
+    """Raise ``ValueError`` when the Claude CLI cannot honor a strict run."""
+    _require_strict_cli()
+
+
+def build_failure_detail(error: BaseException) -> str:
+    """A build error's message with its captured stderr, for ``CandidateBuildFailed`` and refusals."""
+    detail = getattr(error, "stderr", None) or ""
+    return f"{error}\n{detail}".strip()
 
 
 def _hook_replay(hook_binary: str, command: str) -> bool:
     """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error."""
-    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     try:
-        result = subprocess.run([hook_binary, "hook", "--hint", "native"], input=event,
-                                capture_output=True, text=True, timeout=30)
+        result = _run_hook(hook_binary, "native", command)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"strict audit could not run the hook {hook_binary}: {error}") from error
     if result.returncode not in (0, 2):
@@ -684,10 +738,8 @@ _PROBE_HINT_TEXT = {"tilth": "tilth_read", "native": "Read tool"}
 
 def _probe_hook(binary: str, hint: str) -> None:
     for command, want_exit in ((_PROBE_ALLOW, 0), (_PROBE_DENY, 2)):
-        event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
         try:
-            result = subprocess.run([binary, "hook", "--hint", hint], input=event,
-                                    capture_output=True, text=True, timeout=30)
+            result = _run_hook(binary, hint, command)
         except (OSError, subprocess.SubprocessError) as error:
             raise HookProbeFailed(f"strict hook probe could not run {binary}: {error}") from error
         problem = None
@@ -1928,7 +1980,8 @@ def run_plan(
 
     Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, or ``hook_sha`` has no
     ``src/hook``; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
-    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell.
+    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell or a Claude CLI older than the
+    minimum for exec-form hooks.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
     Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
@@ -1940,19 +1993,19 @@ def run_plan(
         if any(RUNNERS[cell.model] != "claude" for cell in cells):
             raise ValueError("strict_file_tools requires Claude models")
         if not store_only:
-            try:
+            _require_strict_cli()
+        try:
+            _hook_source_key(hook_sha, repo)
+            if not store_only:
                 hook_binary = build_candidate(hook_sha, repo=repo).binary_path
-                _hook_source_key(hook_sha, repo)
-            except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-                detail = getattr(error, "stderr", None) or ""
-                raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            raise CandidateBuildFailed(build_failure_detail(error)) from error
     saved: dict[str, ModeConfig] = {}
     if candidate_sha is not None:
         try:
             build = build_candidate(candidate_sha, repo=repo)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            detail = getattr(error, "stderr", None) or ""
-            raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
+            raise CandidateBuildFailed(build_failure_detail(error)) from error
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)
@@ -2514,6 +2567,11 @@ Examples:
         modes, experiment = _select_arms(args, models, timestamp)
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    if args.strict_file_tools:
+        try:
+            _require_strict_cli()
+        except ValueError as error:
+            parser.error(str(error))
     if args.candidate_sha:
         if experiment is not None:
             parser.error("--candidate-sha builds the tilth arm itself; it cannot be combined with --experiment")
@@ -2525,15 +2583,16 @@ Examples:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
 
-    # Ad hoc, the hook is the one at the candidate sha, else this checkout's HEAD.
+    # Ad hoc, the baseline hook and the replay audit use this checkout's HEAD (the seed hook), even with
+    # --candidate-sha: a candidate hook is audited against the seed hook, never against itself.
     hook_sha = None
     if args.strict_file_tools:
         try:
-            hook_sha = _git("rev-parse", "--verify", f"{args.candidate_sha or 'HEAD'}^{{commit}}", cwd=REPO_ROOT).strip()
+            hook_sha = _git("rev-parse", "--verify", "HEAD^{commit}", cwd=REPO_ROOT).strip()
             _hook_source_key(hook_sha)
             hook_binary = build_candidate(hook_sha).binary_path
-        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            parser.error(f"cannot build the strict hook at {hook_sha or args.candidate_sha or 'HEAD'}: {error}")
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            parser.error(f"cannot build the strict hook at {hook_sha or 'HEAD'}: {error}")
 
     _verify_mcp_servers(modes, args.runner)
 

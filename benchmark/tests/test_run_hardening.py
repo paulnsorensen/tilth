@@ -1313,6 +1313,7 @@ def test_strict_timeout_row_retains_mode_metadata(
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(run, "reset_repo", lambda: None)
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.295")
     seen = []
     def timeout(*_args, **kwargs):
         seen.append(kwargs["strict_file_tools"])

@@ -21,6 +21,7 @@ pub(super) enum Shape {
     Deny(Rule),
 }
 
+/// Extracts the host command, allowing known non-shell events and denying invalid shapes.
 pub(super) fn read(host: Host, event: &Value) -> Shape {
     if !event.is_object() {
         return Shape::Deny(super::hints::MALFORMED_EVENT);

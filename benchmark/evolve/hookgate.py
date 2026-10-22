@@ -6,13 +6,19 @@ The seed preflight and the candidate hook gate share this check. A ``must_deny``
 
 import json
 import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import run
 
 CORPUS_PATH = Path(__file__).resolve().parent.parent / "hook_corpus.json"
 HINTS = ("tilth", "native")
 HOOK_TIMEOUT_S = 30
+OVERALL_DEADLINE_S = 300
 WORKERS = 4
+DEADLINE_MESSAGE = "could not run: the overall hook corpus deadline passed"
 
 
 class CorpusError(ValueError):
@@ -35,39 +41,58 @@ def _validate(corpus: object) -> dict:
 def load_corpus(path: Path | None = None) -> dict:
     path = path or CORPUS_PATH
     try:
-        return _validate(json.loads(path.read_text()))
+        corpus = json.loads(path.read_text())
     except (OSError, ValueError) as error:
-        if isinstance(error, CorpusError):
-            raise
         raise CorpusError(f"hook corpus {path} is unreadable: {error}") from error
+    return _validate(corpus)
 
 
-def _exit_code(binary: str, hint: str, command: str) -> int | str:
-    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+def _exit_code(binary: str, hint: str, command: str, timeout: float) -> int | str:
     try:
-        result = subprocess.run([binary, "hook", "--hint", hint], input=event, capture_output=True, text=True,
-                                timeout=HOOK_TIMEOUT_S)
+        return run.run_hook(binary, hint, command, timeout=timeout).returncode
     except (OSError, subprocess.SubprocessError) as error:
         return f"could not run: {error}"
-    return result.returncode
 
 
-def corpus_failures(binary: str, corpus: dict | None = None) -> list[str]:
-    """One line per corpus row the hook at ``binary`` gets wrong in either hint mode; empty when faithful."""
+def corpus_failures(binary: str, corpus: dict | None = None, *, deadline_s: float | None = None) -> list[str]:
+    """One line per corpus row the hook at ``binary`` gets wrong in either hint mode; empty when faithful.
+
+    A hook that cannot run (timeout, missing binary) or a run past the overall deadline stops the check at once,
+    so a hanging hook costs one timeout, not one per row.
+    """
     try:
         corpus = load_corpus() if corpus is None else _validate(corpus)
     except CorpusError as error:
         return [str(error)]
     checks = [(hint, row, 2) for hint in HINTS for row in corpus["must_deny"]]
     checks += [(hint, row, 0) for hint in HINTS for row in corpus["must_allow"]]
+    deadline = time.monotonic() + (OVERALL_DEADLINE_S if deadline_s is None else deadline_s)
+    stop = threading.Event()
+
+    def check(item: tuple[str, dict, int]) -> int | str | None:
+        if stop.is_set():
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stop.set()
+            return DEADLINE_MESSAGE
+        code = _exit_code(binary, item[0], item[1]["command"], min(HOOK_TIMEOUT_S, remaining))
+        if isinstance(code, str):
+            stop.set()
+            if time.monotonic() >= deadline:
+                return DEADLINE_MESSAGE
+        return code
+
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        codes = list(pool.map(lambda check: _exit_code(binary, check[0], check[1]["command"]), checks))
+        codes = list(pool.map(check, checks))
     failures = []
     for (hint, row, want), code in zip(checks, codes, strict=True):
-        if code == want:
+        if code is None or code == want:
             continue
         verdict = f"must deny ({row.get('rule', '?')})" if want == 2 else "must allow"
         failures.append(f"--hint {hint}: {verdict} but got {_describe(code)}: `{row['command']}`")
+    if skipped := codes.count(None):
+        failures.append(f"stopped early: {skipped} of {len(checks)} checks not run")
     return failures
 
 

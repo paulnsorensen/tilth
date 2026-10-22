@@ -95,14 +95,37 @@ enum Command {
     },
     /// Shell guard for agent hosts: read one pre-tool event on stdin, exit 2 to deny.
     Hook {
-        /// Event shape: claude, copilot, cursor, or windsurf.
-        #[arg(long, default_value = "claude")]
-        host: String,
+        /// Event shape: claude, copilot, cursor, or windsurf. Also accepts the install host
+        /// names claude-code, codex, droid, crush, and augment (family claude).
+        #[arg(long, value_enum, default_value = "claude")]
+        host: HookHost,
 
         /// Tool names the deny reason cites: tilth or native.
         #[arg(long, default_value = "tilth")]
         hint: String,
     },
+}
+
+/// Accepted `tilth hook --host` values: the four event families, plus the install host
+/// names that share a family.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HookHost {
+    #[value(aliases = ["claude-code", "codex", "droid", "crush", "augment"])]
+    Claude,
+    Copilot,
+    Cursor,
+    Windsurf,
+}
+
+impl HookHost {
+    fn family(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Cursor => "cursor",
+            Self::Windsurf => "windsurf",
+        }
+    }
 }
 
 fn main() {
@@ -129,8 +152,8 @@ fn main() {
                     process::exit(1);
                 }
             }
-            Command::Hook { ref host, ref hint } => {
-                process::exit(tilth::hook::run_cli(host, hint));
+            Command::Hook { host, ref hint } => {
+                process::exit(tilth::hook::run_cli(host.family(), hint));
             }
         }
         return;
@@ -414,14 +437,22 @@ mod tests {
         let cli = Cli::try_parse_from(["tilth", "hook"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Hook { ref host, ref hint }) if host == "claude" && hint == "tilth"
+            Some(Command::Hook { host, ref hint }) if host.family() == "claude" && hint == "tilth"
         ));
         let cli =
             Cli::try_parse_from(["tilth", "hook", "--host", "cursor", "--hint", "native"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Hook { ref host, ref hint }) if host == "cursor" && hint == "native"
+            Some(Command::Hook { host, ref hint }) if host.family() == "cursor" && hint == "native"
         ));
+        for alias in ["claude-code", "codex", "droid", "crush", "augment"] {
+            let cli = Cli::try_parse_from(["tilth", "hook", "--host", alias]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Hook { host, .. }) if host.family() == "claude"
+            ));
+        }
+        assert!(Cli::try_parse_from(["tilth", "hook", "--host", "bogus"]).is_err());
     }
 
     /// Pin the regression that 16212fc was authored to prevent: a piped

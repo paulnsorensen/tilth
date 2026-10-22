@@ -263,20 +263,24 @@ class Evolution:
     def _seed_hook_preflight(self) -> int | None:
         """Refuse a strict run, before any paid call, when the seed's own hook gets a corpus row wrong."""
         try:
+            run.require_strict_cli()
+        except ValueError as error:
+            return self.refuse(str(error))
+        try:
             binary = run.build_candidate(self.settings.seed_sha, repo=self.settings.repo).binary_path
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            detail = getattr(error, "stderr", None) or ""
-            return self.refuse("seed hook does not build: " + tail(f"{error}\n{detail}".strip()))
+            return self.refuse("seed hook does not build: " + tail(run.build_failure_detail(error)))
         failures = hookgate.corpus_failures(binary)
         if failures:
             return self.refuse("the seed hook fails the frozen hook corpus (strict runs need a faithful seed hook):\n"
                                + "\n".join(failures))
         try:
             for hint in ("native", "tilth"):
-                run._probe_hook(binary, hint)
-            run._hook_source_key(self.settings.seed_sha, self.settings.repo)
+                run.probe_hook(binary, hint)
+            run.hook_source_key(self.settings.seed_sha, self.settings.repo)
         except (run.CandidateBuildFailed, ValueError, subprocess.SubprocessError, OSError) as error:
             return self.refuse(f"seed hook probe failed: {tail(str(error))}")
+        self.new_cascade(self.seed).hook_ok = True  # the cascade must not rerun the corpus for the seed
         self.log("hook: seed hook passes the frozen corpus and the hint-text probe in both hint modes")
         return None
 
@@ -421,11 +425,10 @@ class Evolution:
         try:
             binary = run.build_candidate(result.sha, repo=self.settings.repo).binary_path
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            detail = getattr(error, "stderr", None) or ""
-            return self._fail(result, "build", tail(f"{error}\n{detail}".strip()))
+            return self._fail(result, "build", tail(run.build_failure_detail(error)))
         failures = hookgate.corpus_failures(binary)
         if failures:
-            shown = failures[:TAIL_LINES - 1]
+            shown = failures[:TAIL_LINES - 2]
             if len(failures) > len(shown):
                 shown.append(f"... and {len(failures) - len(shown)} more")
             return self._fail(result, "hook gate", "The candidate's Bash hook fails the frozen hook corpus:\n"

@@ -312,7 +312,7 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-fixture-token")
     monkeypatch.setattr(run, "RESULTS_DIR", results)
-    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.0")
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.300")
     monkeypatch.setattr(run, "env_fingerprint", lambda _task: world.env)
     monkeypatch.setattr(run, "run_single", world.fake_run_single)
     monkeypatch.setattr(run, "_build_candidate", world.fake_build)

@@ -8,6 +8,7 @@ import json
 import re
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import run
 from config import REPO_ROOT
-from evolve import cli, engine, hookgate
+from evolve import cli, engine, hookgate, loop
 from evolve.materialize import ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, TEST, build, child, evolve_args, git, log_text, make_world, mcp, scripted_engine, seed_candidate,
@@ -519,16 +520,41 @@ def test_an_empty_hook_corpus_does_not_pass_the_gate_vacuously(tmp_path: Path) -
 # --- hook gate bounds and missing subcommand ---
 
 
-def test_a_hanging_hook_is_bounded_and_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _hanging_hook(tmp_path: Path, seconds: float) -> Path:
     hang = tmp_path / "hang-hook"
-    hang.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+    hang.write_text(f"#!{sys.executable}\nimport time\ntime.sleep({seconds})\n")
     hang.chmod(hang.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setattr(hookgate, "HOOK_TIMEOUT_S", 0.2)
-    corpus = {"must_deny": CORPUS["must_deny"][:2], "must_allow": CORPUS["must_allow"][:2]}
+    return hang
 
-    failures = hookgate.corpus_failures(str(hang), corpus)
 
-    assert len(failures) == 2 * (2 + 2) and all("could not run" in line for line in failures)
+def test_a_hanging_hook_stops_at_the_first_timeout_on_the_real_corpus(monkeypatch: pytest.MonkeyPatch,
+                                                                    tmp_path: Path) -> None:
+    """The real corpus is 188 rows x 2 hints; one timeout per row on 4 workers would take about 47 minutes."""
+    hang = _hanging_hook(tmp_path, 60)
+    monkeypatch.setattr(hookgate, "HOOK_TIMEOUT_S", 0.5)
+    started = time.monotonic()
+
+    failures = hookgate.corpus_failures(str(hang))
+
+    assert time.monotonic() - started < 10
+    assert any("could not run" in line for line in failures)
+    assert any(line.startswith("stopped early") for line in failures)
+    assert len(failures) <= hookgate.WORKERS + 1
+
+
+def test_the_overall_deadline_stops_a_slow_but_answering_hook(monkeypatch: pytest.MonkeyPatch,
+                                                             tmp_path: Path) -> None:
+    slow = tmp_path / "slow-hook"
+    slow.write_text(f"#!{sys.executable}\nimport sys, time\ntime.sleep(0.2)\nsys.exit(0)\n")
+    slow.chmod(slow.stat().st_mode | stat.S_IXUSR)
+    started = time.monotonic()
+
+    failures = hookgate.corpus_failures(str(slow), deadline_s=1.0)
+
+    assert time.monotonic() - started < 10
+    assert any(hookgate.DEADLINE_MESSAGE in line for line in failures)
+    assert not any(str(tmp_path) in line for line in failures if "deadline" in line)
+    assert any(line.startswith("stopped early") for line in failures)
 
 
 @pytest.mark.parametrize("code", [0, 2, 1])
@@ -586,6 +612,45 @@ def test_the_hook_gate_runs_once_per_candidate(monkeypatch: pytest.MonkeyPatch, 
     evo.evaluate(candidate, "dev_b")
 
     assert runs.count(str(good)) == 1
+
+
+def test_the_seed_cascade_does_not_rerun_the_corpus_after_the_preflight(monkeypatch: pytest.MonkeyPatch,
+                                                                       tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path, hooks={"good": fake_hook(tmp_path, "good-candidate-hook")})
+    runs = []
+    original = hookgate.corpus_failures
+    monkeypatch.setattr(hookgate, "corpus_failures", lambda *a, **k: runs.append(a[0]) or original(*a, **k))
+    evo = ready(world)
+
+    evo.evaluate(winner("good"), "dev_a")
+
+    assert runs.count(str(world.seed_hook)) == 1
+
+
+def test_a_long_failure_list_fits_the_tail_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    probes = {run._PROBE_DENY, run._PROBE_ALLOW}
+    flipped = [row["command"] for row in CORPUS["must_deny"] if row["command"] not in probes][:60]
+    assert len(flipped) == 60
+    world = strict_world(monkeypatch, tmp_path, hooks={"loose": fake_hook(tmp_path, "loose-hook", flip={"native": flipped})})
+    evo = ready(world)
+
+    score, info = evo.evaluate(winner("loose"), "dev_a")
+
+    lines = info["tail"].splitlines()
+    assert score == 0 and info["stage"] == "hook gate"
+    assert len(lines) <= loop.TAIL_LINES and lines[-1].startswith("... and ")
+
+
+def test_a_strict_preflight_fails_closed_on_an_unreadable_claude_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                    capsys) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: None)
+
+    evo = build(world, strict=True)
+
+    assert evo.preflight() == 2
+    assert "Claude CLI" in capsys.readouterr().err
+    assert world.calls == [] and not world.stored()
 
 
 # --- strict is its own baseline slot ---

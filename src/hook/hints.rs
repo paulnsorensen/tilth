@@ -14,7 +14,7 @@ enum Kind {
 }
 
 pub(super) const PARSE_ERROR: Rule = "parse error";
-pub(super) const UNRESOLVED: Rule = "shell -c unresolved";
+pub(super) const UNRESOLVED: Rule = "unresolved";
 pub(super) const SHELL_STDIN: Rule = "shell stdin";
 pub(super) const DEVICE_PATH: Rule = "device path";
 pub(super) const INPUT_REDIRECT: Rule = "input redirect";
@@ -27,6 +27,8 @@ pub(super) const JSON_TOOL: Rule = "python -m json.tool";
 pub(super) const SED_I: Rule = "sed -i";
 pub(super) const PERL_I: Rule = "perl -i";
 pub(super) const AWK_INPLACE: Rule = "awk -i inplace";
+pub(super) const PYTHON_M: Rule = "python -m";
+pub(super) const GIT_CONFIG: Rule = "git -c";
 
 /// Host-event rules. They never come from a command string, so the corpus does not cover them.
 pub(super) const MALFORMED_EVENT: Rule = "malformed event";
@@ -60,6 +62,20 @@ const READ_RULES: &[Rule] = &[
     "base64",
     "jq",
     "yq",
+    "paste",
+    "rev",
+    "fold",
+    "pr",
+    "comm",
+    "column",
+    "expand",
+    "unexpand",
+    "fmt",
+    "join",
+    "zcat",
+    "iconv",
+    "tar",
+    PYTHON_M,
     INPUT_REDIRECT,
     "find -exec",
     "find -execdir",
@@ -83,6 +99,10 @@ const WRITE_RULES: &[Rule] = &[
     GIT_APPLY,
     "dd",
     "truncate",
+    "ed",
+    "ex",
+    "vim",
+    "sponge",
     "python",
     "perl",
     "ruby",
@@ -93,7 +113,7 @@ const WRITE_RULES: &[Rule] = &[
 ];
 
 #[cfg(test)]
-const OTHER_RULES: &[Rule] = &[PARSE_ERROR, UNRESOLVED, SHELL_STDIN];
+const OTHER_RULES: &[Rule] = &[PARSE_ERROR, UNRESOLVED, SHELL_STDIN, GIT_CONFIG];
 
 /// Every rule name the command rules can cite.
 #[cfg(test)]
@@ -101,6 +121,7 @@ pub(super) fn all_rules() -> Vec<Rule> {
     [READ_RULES, SEARCH_RULES, WRITE_RULES, OTHER_RULES].concat()
 }
 
+/// Classifies a rule as a read, search, write, or generic denial.
 fn kind(rule: &str) -> Kind {
     if READ_RULES.contains(&rule) {
         Kind::Read
@@ -113,6 +134,7 @@ fn kind(rule: &str) -> Kind {
     }
 }
 
+/// Formats a denial reason with the tool names selected by `hint`.
 pub(super) fn reason(rule: &str, hint: Hint) -> String {
     let kind = kind(rule);
     match hint {
@@ -121,6 +143,7 @@ pub(super) fn reason(rule: &str, hint: Hint) -> String {
     }
 }
 
+/// Formats a denial reason with tilth tool calls for the rule's kind.
 fn tilth_reason(rule: &str, kind: Kind) -> String {
     let read = "mcp__tilth__tilth_read(paths:[\"<path>\"], cwd:\"<checkout>\")";
     let search = "mcp__tilth__tilth_search(queries:[{query:\"<pattern>\"}], cwd:\"<checkout>\")";
@@ -149,6 +172,7 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
     }
 }
 
+/// Formats a denial reason with the host's native tool names.
 fn native_reason(rule: &str, kind: Kind) -> String {
     match kind {
         Kind::Read => format!(
