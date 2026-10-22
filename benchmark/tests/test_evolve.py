@@ -29,7 +29,7 @@ from evolve.gitops import GitError
 from evolve.loop import Cascade, EvolveError
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV, ApplyRejected, Materializer
 from evolve_support import (
-    CHEAP, DEV, SEED_MCP, TEST, build, cargo_available, child, copy_tilth, git, log_text,
+    CHEAP, DEV, SEED_MCP, TEST, EvolveTask, build, cargo_available, child, copy_tilth, git, log_text,
     main, make_world, mcp, quota_stream, result_stream, scripted_engine, seed_candidate, seed_files, with_last_line,
 )
 from judge import core as judge_core
@@ -1207,6 +1207,47 @@ def test_finish_no_pr_when_seed_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert "no improvement" in log_text(world)
 
 
+def three_test_task_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    tasks = ("test_a", "test_b", "test_c")
+    world = make_world(monkeypatch, tmp_path, seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1",
+                                                              test_a="0", test_b="0", test_c="0")))
+    for task in tasks[1:]:
+        monkeypatch.setitem(run.TASKS, task, EvolveTask(name=task))
+    members = tuple(panels.Member(id=task, family="local", language="rust", split=split)
+                    for split, names in (("cheap", CHEAP), ("dev", DEV), ("test", tasks)) for task in names)
+    world.panel = panels.Panel(name="evolve-fixture", cheap=CHEAP, dev=DEV, test=tasks,
+                               split_digest=panels.split_digest(members), members=members)
+    world.baseline.update({task: "0" for task in tasks})
+    return world
+
+
+def test_finish_rejects_gain_on_one_of_three_test_tasks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = three_test_task_world(monkeypatch, tmp_path)
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    accept(evo, child(evo.seed, test_a="11", test_b="00", test_c="00"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    assert evo.finish() is None
+
+    text = log_text(world)
+    assert world.pr.calls == [] and evo.finish_failure is None
+    assert "finish: paired test delta +0.333 (95% CI [0.000, " in text and ", 3 tasks)" in text
+    assert "finish: no improvement (the paired test-split interval does not exclude 0)" in text
+
+
+def test_finish_declares_winner_that_beats_seed_on_every_test_task(monkeypatch: pytest.MonkeyPatch,
+                                                                  tmp_path: Path) -> None:
+    world = three_test_task_world(monkeypatch, tmp_path)
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    winner = accept(evo, child(evo.seed, test_a="11", test_b="11", test_c="11"), {"dev_a": 0.9, "dev_b": 0.9})
+
+    assert evo.finish() is not None
+
+    assert world.pr.pushes == [(winner.sha, "evolve/run1-winner")]
+    assert "finish: paired test delta +1.000 (95% CI [1.000, 1.000], 3 tasks)" in log_text(world)
+
+
 def test_test_split_scored_once_at_finish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     world = weak_world(monkeypatch, tmp_path)
     use_engine(monkeypatch, [child(seed_candidate(), dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="c")])
@@ -2099,7 +2140,7 @@ def test_tie_with_the_seed_opens_no_draft(world) -> None:
     evo.finish()
 
     assert world.pr.pushes == [] and evo.finish_failure is None
-    assert "does not beat the seed's test-split mean" in log_text(world)
+    assert "the paired test-split interval does not exclude 0" in log_text(world)
 
 
 @pytest.mark.parametrize(("reason", "failed"), [("quota", True), ("ceiling", True), ("plateau", False)])

@@ -22,6 +22,7 @@ import external.data
 import paired
 import panels
 import run
+import stats
 from judge import core as judge
 from judge import store as judge_store
 from spend import SpendLedger
@@ -134,6 +135,20 @@ def correct(row: Mapping) -> bool:
         raise EvolveError(f"row {row.get('task')} rep {row.get('repetition')} (run key {row.get('run_key')}) "
                           "has no contaminated flag; refusing to score it")
     return bool(row.get("correct")) and row["contaminated"] is not True
+
+
+def _task_means(rows: Iterable[Mapping]) -> dict[str, float]:
+    by_task: dict[str, list[bool]] = {}
+    for row in rows:
+        by_task.setdefault(row["task"], []).append(correct(row))
+    return {task: mean(marks) for task, marks in by_task.items()}
+
+
+def _paired_task_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Mapping],
+                        tasks: Iterable[str]) -> list[float]:
+    """Winner minus seed correctness per task, each averaged over that task's reps; unpaired tasks are skipped."""
+    winner, seed = _task_means(winner_rows), _task_means(seed_rows)
+    return [winner[task] - seed[task] for task in tasks if task in winner and task in seed]
 
 
 class Evolution:
@@ -589,7 +604,8 @@ class Evolution:
         """Pick the best-dev non-seed candidate, confirm it against the seed on the test split, and open a draft PR.
 
         The dev mean selects the winner; the seed wins a tie. The test split scores only the seed and that
-        winner, and the winner needs a strictly higher test mean than the seed.
+        winner. The winner must beat the seed on the paired, task-level 95% bootstrap interval: the per-task
+        correctness differences (winner minus seed, reps averaged within a task) need a lower bound above 0.
         """
         self.ledger.reserve = 0.0
         no_spend = self.stop.reason in NO_SPEND_REASONS
@@ -639,8 +655,15 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
                                        f"{', '.join(unfinished)}); test-split means not compared: {scores}")
         self.log(f"finish: test-split means {scores}")
-        if test_means[winner.cid] <= test_means[seed.cid]:
-            self.log("finish: no improvement (the dev winner does not beat the seed's test-split mean)")
+        deltas = _paired_task_deltas(test_rows[winner.cid], test_rows[seed.cid], self.panel.test)
+        if not deltas:
+            self.log("finish: no improvement (no test task has paired winner and seed rows)")
+            return None
+        point = sum(deltas) / len(deltas)
+        low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
+        self.log(f"finish: paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)")
+        if not low > 0:
+            self.log("finish: no improvement (the paired test-split interval does not exclude 0)")
             return None
         if not winner.just_check_ok:
             return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "
