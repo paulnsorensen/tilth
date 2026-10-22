@@ -958,3 +958,21 @@ fn cure2_time_output_option_is_a_write() {
         "command time -o /dev/null make test",
     ]);
 }
+
+// The benchmark strict-cell probe (`benchmark/run.py` `_PROBE_*`, audited by `benchmark/tests/test_strict_hook.py`)
+// depends on this exact contract: allow exits 0, deny exits 2, and each hint's denial names its read tool.
+#[test]
+fn benchmark_probe_contract() {
+    let allow = "go test ./...";
+    let deny = "cat src/lib.rs";
+    for (hint, text) in [(Hint::Tilth, "tilth_read"), (Hint::Native, "Read tool")] {
+        let (code, err) = run(Host::Claude, hint, &claude_event(allow));
+        assert_eq!((code, err.as_str()), (0, ""), "allow {allow:?}");
+        let (code, err) = run(Host::Claude, hint, &claude_event(deny));
+        assert_eq!(code, 2, "deny {deny:?}");
+        assert!(
+            err.contains(text),
+            "denial for {deny:?} lacks {text:?}: {err}"
+        );
+    }
+}

@@ -57,6 +57,13 @@ def route_hook_to_real_process(monkeypatch: pytest.MonkeyPatch, fake_run) -> Non
     monkeypatch.setattr(run.subprocess, "run", routed)
 
 
+def _modern_cli(monkeypatch: pytest.MonkeyPatch, version: str | None = "2.1.295 (Claude Code)") -> None:
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: version)
+
+
+# CI's benchmark-tests job builds no tilth, so the "real" cases below skip there. The Rust test
+# `benchmark_probe_contract` in src/hook/tests.rs pins the same contract (exit 0 on `go test ./...`,
+# exit 2 on `cat src/lib.rs`, hint text "tilth_read" / "Read tool") that run.py's `_PROBE_*` rely on.
 def _real_tilth() -> Path | None:
     return next((path for path in (REPO_ROOT / "target" / "debug" / "tilth", REPO_ROOT / "target" / "release" / "tilth")
                  if path.is_file()), None)
@@ -228,6 +235,7 @@ def test_hook_source_key_names_the_tree_and_lock_hashes(hook_history: dict) -> N
 def _strict_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     world = make_world(monkeypatch, tmp_path, {**seed_files(), "src/hook/x.rs": "pub fn deny() {}\n"})
     install_fake_hook(monkeypatch, tmp_path)
+    _modern_cli(monkeypatch)
     return world
 
 
@@ -647,6 +655,7 @@ def test_main_refuses_a_strict_run_with_a_hookless_binary_before_any_cell_runs(
     monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: run.CandidateBuild(
         git_sha=sha, binary_path=old, binary_sha256="old"))
     monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+    _modern_cli(monkeypatch)
     synthetic = tmp_path / "synthetic"
     synthetic.mkdir()
     monkeypatch.setattr(run, "SYNTHETIC_REPO", synthetic)
@@ -699,9 +708,75 @@ def test_strict_plan_reports_a_hook_sha_without_src_hook_as_a_build_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     world = make_world(monkeypatch, tmp_path, seed_files())
+    _modern_cli(monkeypatch)
 
     with pytest.raises(run.CandidateBuildFailed):
         _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True, hook_sha=world.seed_sha)
+
+
+def test_store_only_plan_reports_a_hook_sha_without_src_hook_as_a_build_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    world = make_world(monkeypatch, tmp_path, seed_files())
+
+    with pytest.raises(run.CandidateBuildFailed):
+        _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True, hook_sha=world.seed_sha,
+              store_only=True)
+
+
+@pytest.mark.parametrize("version", ["2.1.294 (Claude Code)", "2.0.999", None])
+def test_strict_plan_refuses_a_claude_cli_older_than_exec_form_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str | None,
+) -> None:
+    world = _strict_world(monkeypatch, tmp_path)
+    _modern_cli(monkeypatch, version)
+    calls: list[str] = []
+    monkeypatch.setattr(run, "run_single", lambda *a, **kw: calls.append("ran"))
+
+    with pytest.raises(ValueError, match=r"Claude CLI >= 2\.1\.295"):
+        _plan(world, [run.CellSpec(DEV[0], "baseline", MODEL, 0)], strict_file_tools=True, hook_sha=world.seed_sha)
+
+    assert calls == []
+
+
+def test_main_refuses_a_strict_run_on_an_old_claude_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setitem(run.TASKS, "strict_cli_task", StoreTask(name="strict_cli_task"))
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    _modern_cli(monkeypatch, "2.1.100 (Claude Code)")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_cli_task", "--models", "sonnet5",
+                                      "--modes", "baseline", "--reps", "1", "--max-cells", "1",
+                                      "--strict-file-tools", "--max-usd", "100"])
+
+    with pytest.raises(SystemExit) as caught:
+        run.main()
+
+    assert caught.value.code == 2
+    assert "Claude CLI >= 2.1.295" in capsys.readouterr().err
+
+
+def test_ad_hoc_candidate_run_audits_through_the_head_hook_not_the_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    head = git("rev-parse", "HEAD", cwd=REPO_ROOT).strip()
+    old = _script(tmp_path / "old-tilth", _NO_HOOK_SUBCOMMAND)
+    built: list[str] = []
+    monkeypatch.setitem(run.TASKS, "strict_cand_task", StoreTask(name="strict_cand_task"))
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: (built.append(sha), run.CandidateBuild(
+        git_sha=sha, binary_path=old, binary_sha256="old"))[1])
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+    _modern_cli(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_cand_task", "--models", "sonnet5",
+                                      "--modes", "baseline", "--reps", "1", "--max-cells", "1",
+                                      "--strict-file-tools", "--max-usd", "100",
+                                      "--candidate-sha", "HEAD~1"])
+
+    with pytest.raises(SystemExit):
+        run.main()
+
+    assert built[-1] == head and built[0] != head
 
 
 def test_a_hook_loosened_cell_settles_as_an_error_row_and_the_plan_continues(
@@ -735,3 +810,29 @@ def test_hook_source_key_is_computed_once_per_full_sha(hook_history: dict, monke
 
     assert run._hook_source_key(full, hook_history["repo"]) == first
     assert [cmd for cmd in shows if cmd[:2] == ["git", "show"]] == []
+
+
+def _commit(repo: Path, name: str, text: str) -> str:
+    (repo / name).write_text(text)
+    git("add", "-A", cwd=repo)
+    git("commit", "-q", "-m", f"edit {name}", cwd=repo)
+    return git("rev-parse", "HEAD", cwd=repo).strip()
+
+
+@pytest.mark.parametrize("name", ["Cargo.toml", "src/main.rs"])
+def test_hook_source_key_follows_the_manifest_and_the_cli_entry(hook_history: dict, name: str) -> None:
+    repo = hook_history["repo"]
+    before = run._hook_source_key(hook_history["D"], repo)
+    after = run._hook_source_key(_commit(repo, name, "// changed\n"), repo)
+
+    assert after != before
+
+
+def test_a_full_sha_hook_key_spawns_no_rev_parse(hook_history: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    full = git("rev-parse", hook_history["A"], cwd=hook_history["repo"]).strip()
+    first = run._hook_source_key(full, hook_history["repo"])
+    calls: list[tuple] = []
+    monkeypatch.setattr(run, "_git", lambda *args, **kw: calls.append(args))
+
+    assert run._hook_source_key(full, hook_history["repo"]) == first
+    assert calls == []
