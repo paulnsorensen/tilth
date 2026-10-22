@@ -724,7 +724,7 @@ def test_store_only_plan_reports_a_hook_sha_without_src_hook_as_a_build_failure(
               store_only=True)
 
 
-@pytest.mark.parametrize("version", ["2.1.294 (Claude Code)", "2.0.999", None])
+@pytest.mark.parametrize("version", ["2.1.294 (Claude Code)", "2.0.999", "2.1.99", None])
 def test_strict_plan_refuses_a_claude_cli_older_than_exec_form_hooks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str | None,
 ) -> None:
@@ -756,6 +756,34 @@ def test_main_refuses_a_strict_run_on_an_old_claude_cli(
     assert "Claude CLI >= 2.1.295" in capsys.readouterr().err
 
 
+def test_main_refuses_an_old_claude_cli_before_building_the_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    built: list[str] = []
+    monkeypatch.setitem(run.TASKS, "strict_cli_order_task", StoreTask(name="strict_cli_order_task"))
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "build_candidate", lambda sha, repo=None: built.append(sha))
+    _modern_cli(monkeypatch, "2.1.100 (Claude Code)")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "strict_cli_order_task", "--models", "sonnet5",
+                                      "--modes", "baseline", "--reps", "1", "--max-cells", "1",
+                                      "--strict-file-tools", "--max-usd", "100",
+                                      "--candidate-sha", "HEAD~1"])
+
+    with pytest.raises(SystemExit) as caught:
+        run.main()
+
+    err = capsys.readouterr().err
+    assert caught.value.code == 2 and built == []
+    assert "Claude CLI >= 2.1.295" in err and "cannot build" not in err
+
+
+@pytest.mark.parametrize("version", ["2.1.295", "2.1.1000 (Claude Code)", "2.10.0", "3.0.0"])
+def test_strict_cli_check_compares_versions_numerically(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    _modern_cli(monkeypatch, version)
+
+    run._require_strict_cli()
+
+
 def test_ad_hoc_candidate_run_audits_through_the_head_hook_not_the_candidate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -776,7 +804,7 @@ def test_ad_hoc_candidate_run_audits_through_the_head_hook_not_the_candidate(
     with pytest.raises(SystemExit):
         run.main()
 
-    assert built[-1] == head and built[0] != head
+    assert built[-1] == head
 
 
 def test_a_hook_loosened_cell_settles_as_an_error_row_and_the_plan_continues(

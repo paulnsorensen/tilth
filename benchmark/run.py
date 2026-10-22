@@ -1955,7 +1955,8 @@ def run_plan(
 
     Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, or ``hook_sha`` has no
     ``src/hook``; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
-    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell.
+    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell or a Claude CLI older than the
+    minimum for exec-form hooks.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
     Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
@@ -2543,6 +2544,11 @@ Examples:
         modes, experiment = _select_arms(args, models, timestamp)
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    if args.strict_file_tools:
+        try:
+            _require_strict_cli()
+        except ValueError as error:
+            parser.error(str(error))
     if args.candidate_sha:
         if experiment is not None:
             parser.error("--candidate-sha builds the tilth arm itself; it cannot be combined with --experiment")
@@ -2559,7 +2565,6 @@ Examples:
     hook_sha = None
     if args.strict_file_tools:
         try:
-            _require_strict_cli()
             hook_sha = _git("rev-parse", "--verify", "HEAD^{commit}", cwd=REPO_ROOT).strip()
             _hook_source_key(hook_sha)
             hook_binary = build_candidate(hook_sha).binary_path
