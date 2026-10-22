@@ -11,6 +11,15 @@ use serde_json::{json, Value};
 
 const TILTH: &str = env!("CARGO_BIN_EXE_tilth");
 
+/// The path `install` writes: `current_exe()`, which resolves symlinks such as a symlinked
+/// `target/` directory.
+fn installed_tilth() -> String {
+    fs::canonicalize(TILTH)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 const LANDED: [&str; 7] = [
     "claude-code",
     "codex",
@@ -244,7 +253,7 @@ fn install_claude_code_hook_twice_leaves_one_entry() {
     assert_eq!(pre.len(), 1);
     assert_eq!(pre[0]["matcher"], "Bash");
     assert_eq!(pre[0]["hooks"][0]["type"], "command");
-    assert_eq!(pre[0]["hooks"][0]["command"], TILTH);
+    assert_eq!(pre[0]["hooks"][0]["command"], installed_tilth());
     assert_eq!(
         pre[0]["hooks"][0]["args"],
         json!(["hook", "--host", "claude"])
@@ -482,7 +491,7 @@ fn reinstall_keeps_a_customised_hint() {
     let cfg: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     let handlers = cfg["hooks"]["PreToolUse"][0]["hooks"].as_array().unwrap();
     assert_eq!(handlers.len(), 1, "{cfg}");
-    assert_eq!(handlers[0]["command"], TILTH, "{cfg}");
+    assert_eq!(handlers[0]["command"], installed_tilth(), "{cfg}");
     let args = handlers[0]["args"].as_array().expect("exec-form args");
     assert_eq!(
         args[args.len() - 4..],
