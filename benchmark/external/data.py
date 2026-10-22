@@ -38,8 +38,14 @@ REPO_LANGUAGES = {
     )},
     "gin-gonic/gin": "go",
     "prometheus/prometheus": "go",
+    "hashicorp/terraform": "go",
+    "caddyserver/caddy": "go",
     "sharkdp/bat": "rust",
     "tokio-rs/tokio": "rust",
+    "tokio-rs/axum": "rust",
+    "astral-sh/ruff": "rust",
+    "burntsushi/ripgrep": "rust",
+    "uutils/coreutils": "rust",
 }
 LANGUAGES = ("python", "go", "rust")
 
