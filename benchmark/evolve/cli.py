@@ -90,6 +90,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="estimate for a call with no stored or earlier cost (default: --cell-budget-usd)")
     parser.add_argument("--refreeze-baselines", action="store_true",
                         help="buy drifted baseline cells again under their new key")
+    parser.add_argument("--no-strict-file-tools", dest="strict_file_tools", action="store_false",
+                        help="run cells without the Bash file-tool hook (strict is the default: candidates run "
+                             "their own hook, the baseline runs the seed's)")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
@@ -162,6 +165,7 @@ def build(argv: list[str] | None = None, *,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
+        strict_file_tools=args.strict_file_tools,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,

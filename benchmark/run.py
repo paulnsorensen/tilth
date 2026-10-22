@@ -688,10 +688,35 @@ def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
     return _hook_source_key_at(full, str(repo))
 
 
-def _run_hook(binary: str, hint: str, command: str) -> subprocess.CompletedProcess:
+def _run_hook(binary: str, hint: str, command: str, timeout: float = 30) -> subprocess.CompletedProcess:
     """Send one Bash pre-tool event to ``binary hook --hint <hint>``."""
     event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
-    return subprocess.run([binary, "hook", "--hint", hint], input=event, capture_output=True, text=True, timeout=30)
+    return subprocess.run([binary, "hook", "--hint", hint], input=event, capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def run_hook(binary: str, hint: str, command: str, *, timeout: float = 30) -> subprocess.CompletedProcess:
+    return _run_hook(binary, hint, command, timeout)
+
+
+def probe_hook(binary: str, hint: str) -> None:
+    """Allow/deny-probe one hook binary in one hint mode; raises ``HookProbeFailed``."""
+    _probe_hook(binary, hint)
+
+
+def hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
+    return _hook_source_key(hook_sha, repo)
+
+
+def require_strict_cli() -> None:
+    """Raise ``ValueError`` when the Claude CLI cannot honor a strict run."""
+    _require_strict_cli()
+
+
+def build_failure_detail(error: BaseException) -> str:
+    """A build error's message with its captured stderr, for ``CandidateBuildFailed`` and refusals."""
+    detail = getattr(error, "stderr", None) or ""
+    return f"{error}\n{detail}".strip()
 
 
 def _hook_replay(hook_binary: str, command: str) -> bool:
@@ -1974,15 +1999,13 @@ def run_plan(
             if not store_only:
                 hook_binary = build_candidate(hook_sha, repo=repo).binary_path
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            detail = getattr(error, "stderr", None) or ""
-            raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
+            raise CandidateBuildFailed(build_failure_detail(error)) from error
     saved: dict[str, ModeConfig] = {}
     if candidate_sha is not None:
         try:
             build = build_candidate(candidate_sha, repo=repo)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            detail = getattr(error, "stderr", None) or ""
-            raise CandidateBuildFailed(f"{error}\n{detail}".strip()) from error
+            raise CandidateBuildFailed(build_failure_detail(error)) from error
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
             MODES[name] = candidate_mode(MODES[name], build)

@@ -35,6 +35,7 @@ TEST = ("test_a",)
 LONG_OUTPUT = "src/dispatch.rs walks every handler table entry AGENT_GT " * 4
 assert len(LONG_OUTPUT) > 80
 MODEL = "sonnet5"
+CLI_VERSION = "2.1.300"
 COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.com",
     "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.com",
@@ -312,7 +313,7 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-fixture-token")
     monkeypatch.setattr(run, "RESULTS_DIR", results)
-    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: "2.1.0")
+    monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: CLI_VERSION)
     monkeypatch.setattr(run, "env_fingerprint", lambda _task: world.env)
     monkeypatch.setattr(run, "run_single", world.fake_run_single)
     monkeypatch.setattr(run, "_build_candidate", world.fake_build)
@@ -333,8 +334,10 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     return world
 
 
-def evolve_args(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6") -> list[str]:
-    args = ["--panel", str(world.tmp / "panel.json"), "--seed-sha", world.seed_sha, "--repo", str(world.repo),
+def evolve_args(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6",
+                strict: bool = False) -> list[str]:
+    """Evolve argv; tests run non-strict unless ``strict``, because their fake binaries cannot answer a hook."""
+    args = ([] if strict else ["--no-strict-file-tools"]) + ["--panel", str(world.tmp / "panel.json"), "--seed-sha", world.seed_sha, "--repo", str(world.repo),
             "--max-metric-calls", calls, "--model", MODEL, "--run-id", "run1", "--cell-estimate-usd", "0.1",
             "--reruns", "1", "--plateau", "5"]
     if max_usd is not None:
@@ -408,14 +411,18 @@ def deps(world: World, **overrides: object) -> dict:
             **overrides}
 
 
-def build(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", **overrides: object):
+def build(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,
+          **overrides: object):
     from evolve import cli
-    return cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls), **deps(world, **overrides))
+    return cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
+                     **deps(world, **overrides))
 
 
-def main(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", **overrides: object) -> int:
+def main(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,
+         **overrides: object) -> int:
     from evolve import cli
-    return cli.main(evolve_args(world, *extra, max_usd=max_usd, calls=calls), **deps(world, **overrides))
+    return cli.main(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
+                    **deps(world, **overrides))
 
 
 def log_text(world: World, run_id: str = "run1") -> str:

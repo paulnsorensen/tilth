@@ -204,10 +204,10 @@ An external instance needs only a cached dataset row: the judge does not run adm
 `benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits.
 A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
 Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
-The commit passes `just check`, then a cheap tier, then the panel's dev split.
+The commit passes `just check`, then the hook gate (strict runs), then a cheap tier, then the panel's dev split.
 That `just check` sets `TILTH_EVOLVE_CANDIDATE=1`, so the Rust tests skip their phrase pins on `prompts/` text; CI does not set it, so the winner PR must re-pin them before it lands.
 The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. Reflection is told this cap and the current size, and a candidate prompt file over it is refused before its worktree and `just check`.
-The run log names the stage at which each candidate failed (apply, `just check`, build, or cheap tier), with the output tail.
+The run log names the stage at which each candidate failed (apply, `just check`, build, hook gate, or cheap tier), with the output tail.
 Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
 The score is grader correctness only, and contaminated rollouts count as incorrect.
 Reflection and the `src/` proposer are isolated `claude -p` calls.
@@ -233,7 +233,8 @@ The value must be a positive finite number; the run refuses any other value befo
 The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.
 A stronger model, such as `sonnet`, costs more per token, so give it a larger budget than `haiku`: at `$1` many external cells stop with `error_max_budget_usd`.
 `--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
-A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, and passed neither `--strict-file-tools` nor `--reasoning-effort`.
+Evolve runs strict by default (`--no-strict-file-tools` opts out); see [evolve/README.md](evolve/README.md) for the seed-hook preflight and the hook gate.
+A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, passed `--strict-file-tools` with its hook commit equal to the evolve `--seed-sha`, and did not pass `--reasoning-effort`.
 The evolve run refuses before any paid call unless `CLAUDE_CODE_OAUTH_TOKEN` is set and `claude auth status` reports `oauth_token`.
 A call whose init event shows an API key stops the run with the `auth` reason, and its cost stays on the ledger.
 The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
