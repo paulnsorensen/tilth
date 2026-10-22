@@ -1,4 +1,5 @@
-//! Fail-closed shell guard for coding-agent hosts.
+//! Shell guard for coding-agent hosts. It fails closed on parse and event errors, and applies a
+//! deny-list to commands.
 //!
 //! The guard reads one host pre-tool event, parses the shell command with `tree-sitter-bash`,
 //! and denies shell file reads, searches, and writes. It only denies; it never rewrites.

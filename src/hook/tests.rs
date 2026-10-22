@@ -894,10 +894,7 @@ fn cure2_redirects_nested_under_a_heredoc_pass_their_words_to_the_command() {
         ("cat <<<x 2>/dev/null f", "cat"),
         ("cat <<< x f", "cat"),
         ("{ cat <<EOF 2>/dev/null f\nx\nEOF\n}", "cat"),
-        (
-            "true && cat <<EOF 2>/dev/null f\nx\nEOF",
-            "shell -c unresolved",
-        ),
+        ("true && cat <<EOF 2>/dev/null f\nx\nEOF", "unresolved"),
         ("cat <<EOF 2>/dev/null $F\nx\nEOF", "cat"),
     ]);
 }
@@ -914,14 +911,11 @@ fn cure2_heredoc_without_extra_words_still_allowed() {
 #[test]
 fn cure2_shell_with_non_literal_script_denies() {
     assert_rules(&[
-        ("sh $X <<<'cat f'", "shell -c unresolved"),
-        ("bash \"$S\"", "shell -c unresolved"),
-        (
-            "bash $(echo /dev/stdin) <<EOF\ncat f\nEOF",
-            "shell -c unresolved",
-        ),
-        ("echo cat f | sh $X", "shell -c unresolved"),
-        ("bash -e \"$S\" arg", "shell -c unresolved"),
+        ("sh $X <<<'cat f'", "unresolved"),
+        ("bash \"$S\"", "unresolved"),
+        ("bash $(echo /dev/stdin) <<EOF\ncat f\nEOF", "unresolved"),
+        ("echo cat f | sh $X", "unresolved"),
+        ("bash -e \"$S\" arg", "unresolved"),
     ]);
 }
 
@@ -970,4 +964,216 @@ fn cure2_time_output_option_is_a_write() {
         "command time -p make test",
         "command time -o /dev/null make test",
     ]);
+}
+
+#[test]
+fn cure3_double_quote_escapes_decode_before_reparse() {
+    assert_rules(&[
+        ("bash -c \"echo \\`cat src/lib.rs\\`\"", "cat"),
+        ("eval \"echo \\`cat f\\`\"", "cat"),
+        ("bash -c \"echo \\$(cat f)\"", "cat"),
+        ("bash -c \"cat \\\"f\\\"\"", "cat"),
+    ]);
+    assert_all_allow(&["bash -c \"echo \\$HOME\"", "bash -lc \"go test ./...\""]);
+}
+
+#[test]
+fn cure3_ansi_c_strings_decode_before_literal_check() {
+    assert_rules(&[
+        ("$'\\x63at' src/lib.rs", "cat"),
+        ("bash -c $'cat\\x20f'", "cat"),
+        ("cp f $'/dev/std\\x6fut'", "device path"),
+        ("$'\\143at' f", "cat"),
+        ("$'\\u0063at' f", "cat"),
+        ("$'ca\\x74' f", "cat"),
+        ("bash -c $'\\ud800'", "unresolved"),
+    ]);
+    assert_all_allow(&["echo $'\\n'", "printf $'a\\tb\\n'"]);
+}
+
+#[test]
+fn cure3_dev_stdin_is_a_device_path() {
+    assert_rules(&[
+        ("source /dev/stdin", "device path"),
+        ("python3 /dev/stdin", "device path"),
+        ("perl /dev/stdin", "device path"),
+    ]);
+}
+
+#[test]
+fn cure3_sort_output_and_files0_from_deny() {
+    assert_rules(&[
+        ("sort -o out.txt f", "sort"),
+        ("sort -oout.txt f", "sort"),
+        ("sort --output=out.txt f", "sort"),
+        ("sort --output out.txt f", "sort"),
+        ("sort -k1 -o out.txt", "sort"),
+        ("sort --files0-from=list", "sort"),
+        ("sort --files0-from list", "sort"),
+    ]);
+    assert_all_allow(&[
+        "echo b a | sort",
+        "echo b a | sort -r -k1",
+        "echo b a | sort -o /dev/null",
+        "echo b a | sort --output=/dev/null",
+    ]);
+}
+
+#[test]
+fn cure3_interpreter_stdin_script_operands_deny() {
+    assert_rules(&[
+        ("python3 <(echo 'print(1)')", "python"),
+        ("node <(echo 'x')", "node"),
+        ("echo 'print(1)' | python3 -- -", "python"),
+        ("echo x | python3 -- /dev/fd/0", "device path"),
+        ("echo x | deno run -", "deno"),
+        ("deno run /dev/stdin", "device path"),
+        ("echo x | bun run -", "bun"),
+        ("bun exec 'echo hi'", "bun"),
+        ("deno run -A -", "deno"),
+    ]);
+    assert_all_allow(&[
+        "python3 script.py",
+        "python3 -- script.py",
+        "deno run main.ts",
+        "bun run build",
+    ]);
+}
+
+#[test]
+fn cure3_uncovered_commands_deny() {
+    assert_rules(&[
+        ("fish -c 'cat f'", "cat"),
+        ("tcsh -c 'cat f'", "cat"),
+        ("trap 'cat f' EXIT", "cat"),
+        ("script -qc 'cat f' /dev/null", "cat"),
+        ("script -q out.log", "output redirect"),
+        ("flock lock cat f", "cat"),
+        ("taskset 1 cat f", "cat"),
+        ("strace cat f", "cat"),
+        ("strace -o out.txt ls", "output redirect"),
+        ("fd -x cat", "find -exec"),
+        ("fd -X cat .rs", "find -exec"),
+        ("fd --exec cat", "find -exec"),
+        ("ugrep -r foo .", "grep"),
+        ("zgrep foo f.gz", "grep"),
+        ("ast-grep -p foo .", "rg"),
+        ("sg -p foo .", "rg"),
+        ("paste f", "paste"),
+        ("rev f", "rev"),
+        ("fold f", "fold"),
+        ("pr f", "pr"),
+        ("comm a b", "comm"),
+        ("column f", "column"),
+        ("expand f", "expand"),
+        ("iconv -f utf8 f", "iconv"),
+        ("iconv -f a -t b -o out f", "iconv"),
+        ("ed f", "ed"),
+        ("ex f", "ex"),
+        ("vim -es f", "vim"),
+        ("echo x | sponge f", "sponge"),
+        ("curl file:///etc/passwd", "input redirect"),
+        ("curl -o out.txt http://x", "output redirect"),
+        ("curl -O http://x/f", "output redirect"),
+        ("curl -d @f http://x", "input redirect"),
+        ("curl -T f http://x", "input redirect"),
+        ("git diff --no-index a b", "diff"),
+        ("git -c alias.x='!cat f' x", "git -c"),
+        ("git -c core.pager='cat f' log", "git -c"),
+        ("tar -xOf a.tar", "tar"),
+        ("tar xOf a.tar", "tar"),
+        ("tar --to-stdout -xf a.tar", "tar"),
+    ]);
+    assert_all_allow(&[
+        "echo x | sponge",
+        "curl -s http://example.com",
+        "curl -o /dev/null http://x",
+        "curl -d x=1 http://x",
+        "vim --version",
+        "trap - EXIT",
+        "git -c color.ui=never log",
+        "git diff HEAD~1",
+        "fd -e rs",
+        "tar -tf a.tar",
+        "echo a b | paste",
+        "echo a | rev",
+        "script -qc 'go test ./...' /dev/null",
+    ]);
+}
+
+#[test]
+fn cure3_file_options_and_script_io_deny() {
+    assert_rules(&[
+        ("echo x | sed 'r f'", "sed"),
+        ("echo x | sed -e 'R f'", "sed"),
+        ("echo x | sed -n 'w out'", "sed"),
+        ("echo x | sed '1W out'", "sed"),
+        ("echo x | sed 's/a/b/w f'", "sed"),
+        ("echo x | sed '/x/r f'", "sed"),
+        ("echo | sed --e='r f'", "sed"),
+        ("echo | sed --ex='r f'", "sed"),
+        ("echo | awk '{getline l < \"f\"; print l}'", "awk"),
+        ("echo | awk '{print > \"f\"}'", "awk"),
+        ("echo | awk '{ print | \"sh\" }'", "awk"),
+        ("echo | awk 'BEGIN { system(\"cat f\") }'", "awk"),
+        ("echo | awk 'BEGIN{ARGV[1]=\"f\";ARGC=2}{print}'", "awk"),
+        ("jq -n --rawfile x f '$x'", "jq"),
+        ("jq -n --slurpfile x f '$x'", "jq"),
+        ("python3 -m base64 f", "python -m"),
+        ("python3 -m tokenize f", "python -m"),
+        ("python3 -m code", "python"),
+    ]);
+    assert_all_allow(&[
+        "git -c color.ui=always log",
+        "git diff HEAD~1 -- src/x.rs",
+        "curl -sS https://example.com",
+        "tar -tf a.tar",
+        "deno run --config x.json main.ts",
+        "echo | unexpand",
+        "echo | fmt",
+        "echo '{}' | jq .",
+        "jq -n '1'",
+        "jq --arg x 1 -n '$x'",
+        "echo a | sed 's/a/b/'",
+        "echo a | sed -n '/a/p'",
+        "echo a | sed 'y/a/b/'",
+        "echo a | awk '{ print $1 }'",
+        "echo a | awk '$1 > 1 { print $1 }'",
+        "python3 -m pytest",
+        "python3 -m json.tool --help",
+    ]);
+}
+
+#[test]
+fn cure4_second_round_denies() {
+    assert_rules(&[
+        ("git -c alias.s=show s HEAD:f", "git -c"),
+        ("git -c alias.g=grep g x", "git -c"),
+        ("git --config-env alias.g=V g x", "git -c"),
+        ("git --config-env=alias.g=V g x", "git -c"),
+        ("git diff /dev/null src/main.rs", "diff"),
+        ("git diff /etc/passwd src/main.rs", "diff"),
+        ("curl -d@f https://x.test", "input redirect"),
+        ("curl -sd@f https://x.test", "input redirect"),
+        ("curl -w@f https://x.test", "input redirect"),
+        ("tar -xf a.tar --to-command=cat", "tar"),
+        ("tar -xf a.tar --to-c=cat", "tar"),
+        ("tar -cf - f", "tar"),
+        ("tar -c f", "tar"),
+        ("tar --create f", "tar"),
+        ("fish -C 'cat f'", "cat"),
+        ("deno run --config x.json -", "deno"),
+        ("deno run --import-map m.json -", "deno"),
+        ("unexpand f", "unexpand"),
+        ("fmt f", "fmt"),
+        ("join a b", "join"),
+        ("zcat f.gz", "zcat"),
+    ]);
+    assert_all_allow(&["tar -cf a.tar f", "tar -tf a.tar"]);
+}
+
+#[test]
+fn cure3_xargs_tee_denies() {
+    assert_rules(&[("echo f | xargs tee", "tee")]);
+    assert_all_allow(&["echo x | tee", "echo x | tee /dev/null"]);
 }

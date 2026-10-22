@@ -1,8 +1,8 @@
 //! The deny-list: one simple command in, an outcome out.
 
 use super::hints::{
-    Rule, AWK_INPLACE, DEVICE_PATH, GIT_APPLY, GIT_CAT_FILE, GIT_GREP, GIT_SHOW, INPUT_REDIRECT,
-    JSON_TOOL, OUTPUT_REDIRECT, PERL_I, SED_I, SHELL_STDIN, UNRESOLVED,
+    Rule, AWK_INPLACE, DEVICE_PATH, GIT_APPLY, GIT_CAT_FILE, GIT_CONFIG, GIT_GREP, GIT_SHOW,
+    INPUT_REDIRECT, JSON_TOOL, OUTPUT_REDIRECT, PERL_I, PYTHON_M, SED_I, SHELL_STDIN, UNRESOLVED,
 };
 
 /// One word of a simple command, with quotes removed.
@@ -58,8 +58,10 @@ fn normalize_path(text: &str) -> String {
 pub(super) fn is_device(text: &str) -> bool {
     let is = |s: &str| {
         let s = normalize_path(s);
-        matches!(s.as_str(), "/dev/stdout" | "/dev/stderr" | "/dev/tty")
-            || s.starts_with("/dev/fd/")
+        matches!(
+            s.as_str(),
+            "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+        ) || s.starts_with("/dev/fd/")
             || s.starts_with("/proc/self/fd/")
     };
     is(text) || text.split_once('=').is_some_and(|(_, v)| is(v))
@@ -101,11 +103,20 @@ pub(super) fn check(cmd: &Cmd) -> Outcome {
     }
     match name {
         "tr" => tr(args, xargs),
-        "tee" => tee(args),
-        "patch" | "dd" | "truncate" => Outcome::Deny(static_name(name)),
+        "tee" => writer(args, xargs, "tee"),
+        "sponge" => writer(args, xargs, "sponge"),
+        "patch" | "dd" | "truncate" | "ed" | "ex" => Outcome::Deny(static_name(name)),
+        "vi" | "vim" | "nvim" | "view" | "vimdiff" => vim(args),
         "find" => find(args),
+        "fd" | "fdfind" => fd(args),
         "git" => git(args),
-        "bash" | "sh" | "zsh" | "dash" | "ksh" => shell(args),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" | "tcsh" | "csh" => {
+            shell(args, name == "fish")
+        }
+        "trap" => trap(args),
+        "script" => script(args),
+        "curl" => curl(args),
+        "tar" => tar(args),
         "source" | "." => source(args),
         _ => match interpreter_family(name) {
             Some(family) => interpreter(family, args, cmd),
@@ -119,6 +130,8 @@ fn static_name(name: &str) -> Rule {
     match name {
         "patch" => "patch",
         "dd" => "dd",
+        "ed" => "ed",
+        "ex" => "ex",
         _ => "truncate",
     }
 }
@@ -214,6 +227,46 @@ fn wrapper_opts(name: &str) -> WrapOpts {
             &["--portability", "--append", "--verbose"],
         ),
         "exec" => ("a", "cl", &[], &[]),
+        "flock" => (
+            "wE",
+            "sxunoF",
+            &["--timeout", "--conflict-exit-code"],
+            &[
+                "--shared",
+                "--exclusive",
+                "--unlock",
+                "--nonblock",
+                "--nb",
+                "--no-fork",
+                "--close",
+                "--verbose",
+            ],
+        ),
+        "taskset" => ("", "capr", &[], &["--cpu-list", "--all-tasks", "--pid"]),
+        "strace" => (
+            "eopsuEPSaIOXb",
+            "cCdDfFhiknqrtTvVwxyzZ",
+            &[
+                "--output",
+                "--trace",
+                "--signal",
+                "--status",
+                "--inject",
+                "--fault",
+                "--env",
+                "--string-limit",
+                "--attach",
+                "--user",
+                "--columns",
+            ],
+            &[
+                "--follow-forks",
+                "--summary",
+                "--summary-only",
+                "--debug",
+                "--no-abbrev",
+            ],
+        ),
         "command" => ("", "pvV", &[], &[]),
         "xargs" => (
             "INPnLdEsaRS",
@@ -257,7 +310,7 @@ fn is_assign_word(t: &str) -> bool {
 
 /// Required positional words a wrapper takes before the wrapped command.
 fn wrapper_positionals(name: &str) -> usize {
-    usize::from(name == "timeout")
+    usize::from(matches!(name, "timeout" | "flock" | "taskset"))
 }
 
 /// Index of the first wrapped-command word, or `None` for an unknown option. One loop
@@ -312,7 +365,7 @@ fn skip_options(args: &[Arg], opts: &WrapOpts, mut positionals: usize) -> Option
 fn option_file_rule(name: &str, given: &[Arg], opts: &WrapOpts) -> Option<Rule> {
     let (short, long, rule) = match name {
         "xargs" => ('a', "--arg-file", INPUT_REDIRECT),
-        "time" => ('o', "--output", OUTPUT_REDIRECT),
+        "time" | "strace" => ('o', "--output", OUTPUT_REDIRECT),
         _ => return None,
     };
     let next = |i: usize| given.get(i).map(|a| a.text.as_str());
@@ -364,7 +417,8 @@ fn unwrap(mut words: &[Arg]) -> Result<(&[Arg], bool), Rule> {
         let rest = &words[1..];
         let i = match name {
             "env" | "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" | "stdbuf"
-            | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" => {
+            | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" | "flock" | "taskset"
+            | "strace" => {
                 xargs |= name == "xargs";
                 let opts = wrapper_opts(name);
                 let i = skip_options(rest, &opts, wrapper_positionals(name)).ok_or(UNRESOLVED)?;
@@ -552,9 +606,34 @@ const READERS: &[Reader] = &[
             ("--key", 1),
             ("--field-separator", 1),
             ("--output", 1),
+            ("--files0-from", 1),
             ("--buffer-size", 1),
         ],
         ..reader("sort", "ktTSo")
+    },
+    Reader {
+        valued_long: &[("--delimiters", 1)],
+        ..reader("paste", "d")
+    },
+    reader("rev", ""),
+    reader("unexpand", "t"),
+    reader("fmt", "wpg"),
+    reader("join", "12avejot"),
+    reader("zcat", ""),
+    Reader {
+        valued_long: &[("--width", 1)],
+        ..reader("fold", "w")
+    },
+    reader("pr", "hlwWNo"),
+    reader("comm", ""),
+    reader("column", "csoNTRHWL"),
+    Reader {
+        valued_long: &[("--tabs", 1)],
+        ..reader("expand", "t")
+    },
+    Reader {
+        valued_long: &[("--from-code", 1), ("--to-code", 1), ("--output", 1)],
+        ..reader("iconv", "fto")
     },
     reader("uniq", "fsw"),
     reader("cut", "dfcb"),
@@ -588,10 +667,25 @@ fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
     if name.ends_with("awk") && awk_inplace(args) {
         return Outcome::Deny(AWK_INPLACE);
     }
+    if (name == "sort" && sort_writes(args))
+        || (name == "jq" && jq_reads_file(args))
+        || (name == "iconv" && output_to_file(args, "fto", "o", &["--output"]))
+    {
+        return Outcome::Deny(spec.name);
+    }
+    let mut scripts: Vec<&str> = Vec::new();
+    if matches!(name, "sed" | "gsed") {
+        scripts = flag_values(args, "efl", "e", &["--expression"]);
+    } else if name.ends_with("awk") {
+        scripts = flag_values(args, "Fvfei", "e", &["--source"]);
+    }
     let mut operands = p.operands.iter().copied();
     if let Some(script_flags) = spec.script_flags {
         if !p.has_any(script_flags) {
             let first = operands.next();
+            if let Some(program) = first {
+                scripts.push(program.text.as_str());
+            }
             let yq_sub = name == "yq"
                 && first
                     .is_some_and(|a| matches!(a.text.as_str(), "e" | "ea" | "eval" | "eval-all"));
@@ -599,6 +693,16 @@ fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
                 operands.next();
             }
         }
+    }
+    let io = if matches!(name, "sed" | "gsed") {
+        scripts.iter().any(|s| sed_script_io(s))
+    } else if name.ends_with("awk") {
+        scripts.iter().any(|s| awk_program_io(s))
+    } else {
+        false
+    };
+    if io {
+        return Outcome::Deny(spec.name);
     }
     let files = operands.filter(|a| {
         let t = a.text.as_str();
@@ -611,6 +715,177 @@ fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
     } else {
         Outcome::Allow
     }
+}
+
+/// Values of the options in `want_short` and `want_long` (long names may be abbreviated to
+/// any prefix, as GNU getopt allows). `valued_short` lists every short flag of the command that takes a value.
+fn flag_values<'a>(
+    args: &'a [Arg],
+    valued_short: &str,
+    want_short: &str,
+    want_long: &[&str],
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i].text.as_str();
+        i += 1;
+        if t == "--" {
+            break;
+        }
+        let next = args.get(i).map(|a| a.text.as_str());
+        if let Some(long) = t.strip_prefix("--") {
+            let (key, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(k, v)| (k, Some(v)));
+            let wanted = !key.is_empty()
+                && want_long
+                    .iter()
+                    .any(|w| w.strip_prefix("--").is_some_and(|w| w.starts_with(key)));
+            if wanted {
+                out.extend(inline.or(next));
+            }
+        } else if let Some(cluster) = t.strip_prefix('-') {
+            for (k, ch) in cluster.char_indices() {
+                if !valued_short.contains(ch) {
+                    continue;
+                }
+                let rest = &cluster[k + ch.len_utf8()..];
+                if want_short.contains(ch) {
+                    out.extend(if rest.is_empty() { next } else { Some(rest) });
+                }
+                if rest.is_empty() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// An output option that names a file other than `/dev/null`.
+fn output_to_file(args: &[Arg], valued_short: &str, short: &str, long: &[&str]) -> bool {
+    flag_values(args, valued_short, short, long)
+        .iter()
+        .any(|v| *v != "/dev/null")
+}
+
+fn sort_writes(args: &[Arg]) -> bool {
+    output_to_file(args, "ktTSo", "o", &["--output"])
+        || !flag_values(args, "ktTSo", "", &["--files0-from"]).is_empty()
+}
+
+/// `jq --rawfile NAME FILE` and `--slurpfile NAME FILE` read FILE.
+fn jq_reads_file(args: &[Arg]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        matches!(a.text.as_str(), "--rawfile" | "--slurpfile")
+            && args.get(i + 2).is_some_and(|f| f.text != "/dev/null")
+    })
+}
+
+/// A sed script with a command that reads or writes a file or runs a command:
+/// `r`, `R`, `w`, `W`, `e`, and the `w` and `e` flags of `s`.
+fn sed_script_io(script: &str) -> bool {
+    let c: Vec<char> = script.chars().collect();
+    let skip_to = |mut i: usize, delim: char| {
+        while i < c.len() {
+            if c[i] == '\\' {
+                i += 2;
+            } else if c[i] == delim {
+                return i + 1;
+            } else {
+                i += 1;
+            }
+        }
+        c.len()
+    };
+    let mut i = 0;
+    while i < c.len() {
+        while i < c.len() && (c[i].is_whitespace() || matches!(c[i], ';' | '{' | '}')) {
+            i += 1;
+        }
+        loop {
+            match c.get(i) {
+                Some('/') => i = skip_to(i + 1, '/'),
+                Some('\\') => match c.get(i + 1) {
+                    Some(d) => i = skip_to(i + 2, *d),
+                    None => return false,
+                },
+                Some(ch)
+                    if ch.is_ascii_digit()
+                        || ch.is_whitespace()
+                        || matches!(ch, '$' | ',' | '~' | '+' | '!' | 'I' | 'M') =>
+                {
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        let Some(&cmd) = c.get(i) else { break };
+        i += 1;
+        match cmd {
+            'r' | 'R' | 'w' | 'W' | 'e' => return true,
+            's' | 'y' => {
+                let Some(&d) = c.get(i) else { break };
+                i = skip_to(skip_to(i + 1, d), d);
+                while cmd == 's' && i < c.len() && !matches!(c[i], ';' | '\n' | '}') {
+                    if matches!(c[i], 'w' | 'e') {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            'a' | 'i' | 'c' => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ':' | 'b' | 't' | 'T' => {
+                while i < c.len() && !matches!(c[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// An awk program that reads a file (`getline`), runs a command (`system`), or redirects or
+/// pipes `print` output.
+fn awk_program_io(prog: &str) -> bool {
+    if prog.contains("getline")
+        || prog.contains("ARGV[")
+        || prog
+            .split("system")
+            .skip(1)
+            .any(|rest| rest.trim_start().starts_with('('))
+    {
+        return true;
+    }
+    prog.match_indices("print").any(|(at, word)| {
+        let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+        for ch in prog[at + word.len()..].chars() {
+            if quoted {
+                match (escaped, ch) {
+                    (false, '\\') => escaped = true,
+                    (false, '"') => quoted = false,
+                    _ => escaped = false,
+                }
+                continue;
+            }
+            match ch {
+                '"' => quoted = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ';' | '}' | '\n' if depth == 0 => return false,
+                '>' | '|' if depth == 0 => return true,
+                _ => {}
+            }
+        }
+        false
+    })
 }
 
 /// Recognizes assignments whose names are ASCII shell identifiers.
@@ -742,8 +1017,8 @@ const ACK: Searcher = Searcher {
 /// Returns the option and recursion policy for a recognized search command.
 fn searcher(name: &str) -> Option<&'static Searcher> {
     match name {
-        "grep" | "egrep" | "fgrep" => Some(&GREP),
-        "rg" => Some(&RG),
+        "grep" | "egrep" | "fgrep" | "ugrep" | "ug" | "zgrep" | "zegrep" | "zfgrep" => Some(&GREP),
+        "rg" | "ast-grep" | "sg" => Some(&RG),
         "ag" => Some(&AG),
         "ack" => Some(&ACK),
         _ => None,
@@ -755,7 +1030,7 @@ fn searcher_rule(name: &str) -> Rule {
     match name {
         "egrep" => "egrep",
         "fgrep" => "fgrep",
-        "rg" => "rg",
+        "rg" | "ast-grep" | "sg" => "rg",
         "ag" => "ag",
         "ack" => "ack",
         _ => "grep",
@@ -838,17 +1113,178 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
 // ---------------------------------------------------------------------------
 // Writers and other named commands
 
+/// `tee` and `sponge` write their operands; `xargs` feeds them operands too.
 /// Denies output operands other than `-` and `/dev/null`.
-fn tee(args: &[Arg]) -> Outcome {
+fn writer(args: &[Arg], xargs: bool, rule: Rule) -> Outcome {
     let p = split(args, "", &[]);
-    if p.operands
-        .iter()
-        .any(|a| a.text != "-" && a.text != "/dev/null")
+    if xargs
+        || p.operands
+            .iter()
+            .any(|a| a.text != "-" && a.text != "/dev/null")
     {
-        Outcome::Deny("tee")
+        Outcome::Deny(rule)
     } else {
         Outcome::Allow
     }
+}
+
+/// A text editor in a tool call runs scripted edits (`vim -es`, `nvim --headless`).
+fn vim(args: &[Arg]) -> Outcome {
+    match args.first().map(|a| a.text.as_str()) {
+        Some("--version" | "--help") => Outcome::Allow,
+        _ => Outcome::Deny("vim"),
+    }
+}
+
+/// `fd -x` and `fd -X` run a command per match, like `find -exec`.
+fn fd(args: &[Arg]) -> Outcome {
+    let runs = args.iter().take_while(|a| a.text != "--").any(|a| {
+        let t = a.text.as_str();
+        match t.strip_prefix("--") {
+            Some(long) => matches!(long.split('=').next(), Some("exec" | "exec-batch")),
+            None => t.starts_with('-') && t.contains(['x', 'X']),
+        }
+    });
+    if runs {
+        Outcome::Deny("find -exec")
+    } else {
+        Outcome::Allow
+    }
+}
+
+/// `trap CODE SIGNAL...` runs CODE as shell source.
+fn trap(args: &[Arg]) -> Outcome {
+    let p = split(args, "", &[]);
+    match p.operands.as_slice() {
+        [code, _, ..] if code.text != "-" => Outcome::Reparse(code.text.clone()),
+        _ => Outcome::Allow,
+    }
+}
+
+/// `script` writes a typescript file and `-c` runs a shell command. Only `/dev/null` is a safe
+/// typescript.
+fn script(args: &[Arg]) -> Outcome {
+    let valued = "cIOBETmo";
+    let p = split(args, valued, &[("--command", 1)]);
+    let log = output_to_file(
+        args,
+        valued,
+        "IOBT",
+        &["--log-in", "--log-out", "--log-io", "--log-timing"],
+    );
+    if log || p.operands.is_empty() || p.operands.iter().any(|a| a.text != "/dev/null") {
+        return Outcome::Deny(OUTPUT_REDIRECT);
+    }
+    match flag_values(args, valued, "c", &["--command"]).first() {
+        Some(command) => Outcome::Reparse((*command).to_string()),
+        None => Outcome::Allow,
+    }
+}
+
+/// `curl` reads `file://` URLs and `@file` data, and writes with `-o`, `-O`, and similar.
+fn curl(args: &[Arg]) -> Outcome {
+    let harmless = |v: Option<&str>| v.is_some_and(|v| matches!(v, "/dev/null" | "-"));
+    for (i, a) in args.iter().enumerate() {
+        let t = a.text.as_str();
+        let next = args.get(i + 1).map(|n| n.text.as_str());
+        let file_data = (t.starts_with('@') && t != "@-")
+            || (!t.contains("://") && (t.contains("=@") || t.contains("=<")));
+        if t.to_ascii_lowercase().contains("file://") || file_data {
+            return Outcome::Deny(INPUT_REDIRECT);
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let (key, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(k, v)| (k, Some(v)));
+            let value = inline.or(next);
+            match key {
+                "output" | "dump-header" | "cookie-jar" | "trace" | "trace-ascii" | "stderr"
+                    if !harmless(value) =>
+                {
+                    return Outcome::Deny(OUTPUT_REDIRECT);
+                }
+                "remote-name" | "remote-name-all" => return Outcome::Deny(OUTPUT_REDIRECT),
+                "upload-file" | "config" if !harmless(value) => {
+                    return Outcome::Deny(INPUT_REDIRECT);
+                }
+                _ => {}
+            }
+        } else if let Some(cluster) = t.strip_prefix('-') {
+            for (k, ch) in cluster.char_indices() {
+                let rest = &cluster[k + ch.len_utf8()..];
+                let value = if rest.is_empty() { next } else { Some(rest) };
+                if (rest.starts_with('@') && rest != "@-") || rest.starts_with('<') {
+                    return Outcome::Deny(INPUT_REDIRECT);
+                }
+                match ch {
+                    'O' => return Outcome::Deny(OUTPUT_REDIRECT),
+                    'o' | 'D' | 'c' if !harmless(value) => return Outcome::Deny(OUTPUT_REDIRECT),
+                    'T' | 'K' if !harmless(value) => return Outcome::Deny(INPUT_REDIRECT),
+                    'o' | 'D' | 'c' | 'T' | 'K' => break,
+                    c if "ABCEFHPQUXYZbdehmrtuwxyz".contains(c) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Outcome::Allow
+}
+
+/// `tar -xO` and `tar --to-stdout` print archive members.
+fn tar(args: &[Arg]) -> Outcome {
+    if tar_runs_command(args) || tar_creates_to_stdout(args) {
+        return Outcome::Deny("tar");
+    }
+    let to_stdout = args.iter().enumerate().any(|(i, a)| {
+        let t = a.text.as_str();
+        t == "--to-stdout"
+            || (t.starts_with('-') && !t.starts_with("--") && t.contains('O'))
+            || (i == 0 && t.chars().all(|c| c.is_ascii_alphabetic()) && t.contains('O'))
+    });
+    if to_stdout {
+        Outcome::Deny("tar")
+    } else {
+        Outcome::Allow
+    }
+}
+
+/// `--to-command` (or a prefix of it) pipes each member into a command.
+fn tar_runs_command(args: &[Arg]) -> bool {
+    args.iter().any(|a| {
+        let key = a
+            .text
+            .strip_prefix("--")
+            .map(|l| l.split('=').next().unwrap_or(l));
+        key.is_some_and(|k| k.len() >= 4 && "to-command".starts_with(k))
+    })
+}
+
+/// `tar -c` with no `-f`, or `-f -`, writes the archive to stdout.
+fn tar_creates_to_stdout(args: &[Arg]) -> bool {
+    let mut create = false;
+    let mut file: Option<&str> = None;
+    for (i, a) in args.iter().enumerate() {
+        let t = a.text.as_str();
+        let next = args.get(i + 1).map(|n| n.text.as_str());
+        if t == "--create" {
+            create = true;
+        } else if let Some(v) = t.strip_prefix("--file=") {
+            file = Some(v);
+        } else if t == "--file" {
+            file = next;
+        } else if !t.starts_with("--") && (t.starts_with('-') || i == 0) {
+            let cluster = t.strip_prefix('-').unwrap_or(t);
+            if i == 0 && !cluster.chars().all(|c| c.is_ascii_alphabetic()) {
+                continue;
+            }
+            create |= cluster.contains('c');
+            if let Some(at) = cluster.find('f') {
+                let rest = &cluster[at + 1..];
+                file = if rest.is_empty() { next } else { Some(rest) };
+            }
+        }
+    }
+    create && file.is_none_or(|f| f == "-")
 }
 
 /// Denies `find` actions that execute commands, including interactive variants.
@@ -874,7 +1310,20 @@ fn git(args: &[Arg]) -> Outcome {
         if !t.starts_with('-') {
             break;
         }
-        let separate = matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace");
+        if t == "-c" && args.get(i + 1).is_some_and(|v| runs_command(&v.text)) {
+            return Outcome::Deny(GIT_CONFIG);
+        }
+        let config_env = t.strip_prefix("--config-env").and_then(|v| match v {
+            "" => args.get(i + 1).map(|a| a.text.as_str()),
+            _ => v.strip_prefix('='),
+        });
+        if config_env.is_some_and(runs_command) {
+            return Outcome::Deny(GIT_CONFIG);
+        }
+        let separate = matches!(
+            t,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        );
         i += 1 + usize::from(separate);
     }
     let Some(sub) = args.get(i) else {
@@ -885,6 +1334,14 @@ fn git(args: &[Arg]) -> Outcome {
         "grep" => Outcome::Deny(GIT_GREP),
         "apply" => Outcome::Deny(GIT_APPLY),
         "cat-file" => Outcome::Deny(GIT_CAT_FILE),
+        "diff" | "difftool"
+            if rest.iter().any(|a| {
+                (a.text.starts_with("--no-i") && "--no-index".starts_with(a.text.as_str()))
+                    || a.text.starts_with('/')
+            }) =>
+        {
+            Outcome::Deny("diff")
+        }
         "show"
             if rest
                 .iter()
@@ -896,11 +1353,52 @@ fn git(args: &[Arg]) -> Outcome {
     }
 }
 
+/// A `git -c name=value` setting that makes git run a command.
+fn runs_command(setting: &str) -> bool {
+    let key = setting
+        .split('=')
+        .next()
+        .unwrap_or(setting)
+        .to_ascii_lowercase();
+    key.starts_with("alias.")
+        || key.starts_with("pager.")
+        || key.ends_with(".textconv")
+        || matches!(
+            key.as_str(),
+            "core.pager"
+                | "core.editor"
+                | "core.sshcommand"
+                | "core.fsmonitor"
+                | "core.askpass"
+                | "diff.external"
+                | "sequence.editor"
+        )
+}
+
 // ---------------------------------------------------------------------------
 // Shells
 
+fn shell(args: &[Arg], fish: bool) -> Outcome {
+    let mut init = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if arg.text == "--" {
+            break;
+        }
+        if fish && matches!(arg.text.as_str(), "-C" | "--init-command") {
+            init = args.get(i + 1);
+        }
+        i += 1;
+    }
+    let outcome = shell_operand(args);
+    match (outcome, init) {
+        (Outcome::Allow, Some(command)) => reparse(std::slice::from_ref(command)),
+        (outcome, _) => outcome,
+    }
+}
+
 /// Reparses `-c` source and denies stdin scripts or unresolved script paths.
-fn shell(args: &[Arg]) -> Outcome {
+fn shell_operand(args: &[Arg]) -> Outcome {
     let mut c_mode = false;
     let mut informational = false;
     let mut stdin_flag = false;
@@ -915,6 +1413,8 @@ fn shell(args: &[Arg]) -> Outcome {
         }
         if matches!(t, "--version" | "--help") {
             informational = true;
+        } else if t == "--command" {
+            c_mode = true;
         } else if matches!(t, "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O") {
             i += 1;
         } else if t.len() > 1 && (t.starts_with('-') || t.starts_with('+')) {
@@ -1096,11 +1596,52 @@ fn interpreter(family: Rule, args: &[Arg], cmd: &Cmd) -> Outcome {
     if let Some(module) = module {
         let leftover = args.get(module_end..).unwrap_or(&[]);
         let reads_file = leftover.iter().any(|a| !a.text.starts_with('-'));
-        return if module == "json.tool" && reads_file {
-            Outcome::Deny(JSON_TOOL)
-        } else {
-            Outcome::Allow
+        return match module.as_str() {
+            "json.tool" if reads_file => Outcome::Deny(JSON_TOOL),
+            "base64" | "tokenize" | "ast" | "dis" | "pickle" | "pickletools" | "gzip"
+            | "quopri" | "uu" | "zipfile" | "tarfile" | "calendar" | "cProfile" | "profile"
+            | "trace" | "runpy" | "pydoc"
+                if reads_file =>
+            {
+                Outcome::Deny(PYTHON_M)
+            }
+            "code" | "pdb" | "sqlite3" | "timeit" | "idlelib" | "turtledemo" => {
+                Outcome::Deny(family)
+            }
+            _ => Outcome::Allow,
         };
+    }
+    if let Some(s) = script {
+        let word = Arg {
+            text: s.to_string(),
+            literal: true,
+            opaque: false,
+        };
+        if s == "-" || reads_stdin(&word) {
+            return Outcome::Deny(family);
+        }
+    }
+    if matches!(family, "deno" | "bun") {
+        let sub_at = args.iter().position(|a| Some(a.text.as_str()) == script);
+        let target = sub_at.and_then(|at| {
+            let mut rest = args[at + 1..].iter();
+            while let Some(a) = rest.next() {
+                if a.text == "-" || !a.text.starts_with('-') {
+                    return Some(a);
+                }
+                if DENO_VALUED.contains(&a.text.as_str()) {
+                    rest.next();
+                }
+            }
+            None
+        });
+        match (family, script) {
+            ("bun", Some("exec")) => return Outcome::Deny(family),
+            (_, Some("run")) if target.is_some_and(|a| a.text == "-" || reads_stdin(a)) => {
+                return Outcome::Deny(family);
+            }
+            _ => {}
+        }
     }
     match (family, script) {
         ("deno", Some("eval")) => Outcome::Deny(family),
@@ -1109,6 +1650,22 @@ fn interpreter(family: Rule, args: &[Arg], cmd: &Cmd) -> Outcome {
         _ => Outcome::Deny(family),
     }
 }
+
+/// `deno` and `bun` flags that take the next argument as their value.
+const DENO_VALUED: &[&str] = &[
+    "--config",
+    "-c",
+    "--import-map",
+    "--lock",
+    "--cert",
+    "--location",
+    "--seed",
+    "--v8-flags",
+    "--env-file",
+    "--ext",
+    "--node-modules-dir",
+    "--reload",
+];
 
 /// The word names stdin or a process substitution, so the shell reads a script nobody can see.
 fn reads_stdin(arg: &Arg) -> bool {
