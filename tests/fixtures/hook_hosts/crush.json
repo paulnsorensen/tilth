@@ -1,0 +1,12 @@
+{
+"host":"crush",
+"source_urls":[{"url":"https://raw.githubusercontent.com/charmbracelet/crush/main/docs/hooks/README.md","fetched":"2026-10-20"}],
+"config_path":"crush.json (project) and ~/.config/crush/crush.json (global); .crush.json also accepted",
+"scope":"user|project (project-level takes precedence)",
+"registration":{"format":"json","snippet":"{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"^bash$\",\n        \"command\": \"./no-haskell.sh\",\n      },\n    ],\n  },\n}","note":"jsonc with comments in source; global config needs absolute path or inline command"},
+"shell_tool_name":"bash",
+"stdin":{"snippet":"{\n  \"event\": \"PreToolUse\", // Hook event name\n  \"session_id\": \"313909e\", // Current session ID\n  \"cwd\": \"/home/user/project\", // Working directory\n  \"tool_name\": \"bash\", // The tool being called\n  \"tool_input\": { \"command\": \"rm -rf /\" }, // The tool's input\n}\nAlso env var: | `CRUSH_TOOL_INPUT_COMMAND` | For `bash` calls: the shell command being run. |","command_path":"tool_input.command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":true,"quote":"| 2 | **Block the tool.** Stderr is used as the deny reason (no JSON). | ... **Exit 2** blocks the current tool call. The agent sees the error and can try something else."},
+"verified":true,
+"gaps":["Source is the vendor's official GitHub repo docs (docs/hooks/README.md), not a hosted docs site"]
+}

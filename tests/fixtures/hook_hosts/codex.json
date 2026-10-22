@@ -1,0 +1,12 @@
+{
+"host":"codex",
+"source_urls":[{"url":"https://developers.openai.com/codex/hooks.md (redirects to https://learn.chatgpt.com/docs/hooks.md)","fetched":"2026-10-20"}],
+"config_path":"~/.codex/hooks.json (or inline [hooks] in ~/.codex/config.toml; <repo>/.codex/hooks.json and <repo>/.codex/config.toml)",
+"scope":"user (project-local loads only when the project .codex/ layer is trusted)",
+"registration":{"format":"json","snippet":"\"PreToolUse\": [\n  {\n    \"matcher\": \"Bash\",\n    \"hooks\": [\n      {\n        \"type\": \"command\",\n        \"command\": \"/usr/bin/python3 \\\"$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py\\\"\",\n        \"statusMessage\": \"Checking Bash command\"\n      }\n    ]\n  }\n],","toml_variant":"[[hooks.PreToolUse]]\nmatcher = \"^Bash$\"\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = '/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py\"'\ntimeout = 30\nstatusMessage = \"Checking Bash command\"","locations_quote":"In practice, the four most useful locations are: ~/.codex/hooks.json, ~/.codex/config.toml, <repo>/.codex/hooks.json, <repo>/.codex/config.toml"},
+"shell_tool_name":"Bash",
+"stdin":{"snippet":"Fields in addition to Common input fields: | `turn_id` | `string` | Codex-specific extension. Active Codex turn id | `tool_name` | `string` | Canonical hook tool name, such as `Bash`, `apply_patch`, or an MCP name like `mcp__fs__read` | `tool_use_id` | `string` | Tool-call id for this invocation | `tool_input` | `JSON value` | Tool-specific input. `Bash` and `apply_patch` use `tool_input.command`. MCP and other local function tools send their arguments.","command_path":"tool_input.command"},
+"deny":{"exit_code":2,"stderr_shown_to_model":null,"quote":"To deny a supported tool call, return this hook-specific shape: {\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Destructive command blocked by hook.\"}} ... You can also use exit code `2` and write the blocking reason to `stderr`."},
+"verified":true,
+"gaps":["No full example stdin JSON on page, only field table (command location stated in table)","Doc does not say explicitly that stderr text is model-visible","Page warns PreToolUse callback error, timeout, or malformed response can fail without blocking"]
+}

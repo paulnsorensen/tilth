@@ -214,6 +214,20 @@ tilth install pi               # ~/.pi/agent/mcp.json
 
 Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). The old `--edit` flag is still accepted and does nothing.
 
+#### Shell guard hook (opt-in)
+
+`tilth install <host> --hook` also registers `tilth hook`, a pre-tool guard that denies shell file reads, searches, and writes (`cat`, `grep`, `sed -i`, and similar) and points the agent at the tilth tools. It writes the MCP config as usual, then merges one tilth entry into the host's hook file. Re-running it replaces the entry and leaves your other hooks alone.
+
+Where a host documents an exec form, the entry stores the binary path unquoted in `command` and `hook --host <family>` in `args`, so no shell parses the path. Only `claude-code` documents one. Every other host gets a shell string with forward slashes. A path with other characters is single-quoted, and `windsurf` on Windows adds the PowerShell `&` call operator. The install refuses a binary path that contains `'`, `"`, `$`, a backtick, `%`, or a newline in shell form.
+
+Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json` when it exists, otherwise the `hooks` key of `~/.factory/settings.json`, so existing settings hooks keep running), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
+
+A host that fails open when the guard cannot run gets its documented fail-closed field: `onFailure: "block"` for `claude-code`. The other hosts document no compatible field, so a missing or moved binary there disables the guard; keep the installed binary path stable. Cursor's `failClosed` counts the guard's silent allow (exit 0, no output) as a failure, so `cursor` gets none and its guard fails open if the binary is missing.
+
+Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
+
+To remove the guard, delete the tilth entry (the handler whose command ends in `hook --host <family>`) from the host's hook file listed above, then restart the host. `tilth install` has no uninstall step. With `claude-code`, `onFailure: "block"` means a moved or missing binary (after `cargo clean`, or an npx cache miss) blocks every Bash call until you reinstall or remove the entry.
+
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
 ### Smaller models
