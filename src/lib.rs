@@ -9,6 +9,7 @@ pub(crate) mod classify;
 pub(crate) mod edit;
 pub mod error;
 pub(crate) mod format;
+pub mod hook;
 pub mod index;
 pub mod install;
 pub(crate) mod lang;
