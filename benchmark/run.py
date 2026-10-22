@@ -762,10 +762,19 @@ def probe_strict_hooks(mode_names, hook_binary: str) -> None:
         _probe_hook(binary, hint)
 
 
-def _carries_hook_denial(content: object) -> bool:
+def _result_text(content: object) -> str:
     if isinstance(content, list):
         content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return isinstance(content, str) and content.lstrip().startswith("PreToolUse:Bash hook")
+    return content.lstrip() if isinstance(content, str) else ""
+
+
+def _carries_hook_denial(content: object) -> bool:
+    return _result_text(content).startswith("PreToolUse:Bash hook")
+
+
+def _refused_before_running(content: object) -> bool:
+    """Claude Code rejected the call itself (input validation, such as its long-``sleep`` guard)."""
+    return _result_text(content).startswith("<tool_use_error>")
 
 
 def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str], hook_binary: str) -> int:
@@ -796,12 +805,15 @@ def _audit_strict_claude(raw: str, mode: ModeConfig, available_tools: list[str],
             elif block.get("type") == "tool_result" and block.get("is_error") is True and block.get("tool_use_id"):
                 results[block["tool_use_id"]] = block.get("content")
     # Replay through the hook at hook_sha, whichever hook the cell ran with: a call that ran and
-    # that hook denies means the cell's own hook let through what the seed denies. A call counts as
-    # hook-denied only when its error result text starts with Claude Code's `PreToolUse:Bash hook`
-    # prefix. Any other error text, or none, means the command ran.
+    # that hook denies means the cell's own hook let through what the seed denies. A call did not run
+    # when its error result text starts with Claude Code's `PreToolUse:Bash hook` prefix (a hook
+    # denial, counted) or with `<tool_use_error>` (Claude Code refused it, not counted). Any other
+    # error text, or none, means the command ran.
     denied = 0
     for call_id, command in calls.items():
         if not _hook_replay(hook_binary, command):
+            continue
+        if call_id in results and _refused_before_running(results[call_id]):
             continue
         if call_id not in results or not _carries_hook_denial(results[call_id]):
             raise HookLoosenedError(f"hook_loosened: strict cell ran a Bash command the hook denies: {command}")

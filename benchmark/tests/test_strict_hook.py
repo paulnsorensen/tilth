@@ -131,6 +131,37 @@ def test_denied_and_allowed_calls_pass_and_denials_are_counted(
     assert denied == 1  # c1 only: c3 failed but the hook allows it
 
 
+def _errored(call_id: str, command: str, content: str) -> str:
+    """stream-json lines: one Bash call whose error result carries ``content``."""
+    return "\n".join(map(json.dumps, [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": command}}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": call_id, "is_error": True, "content": content}]}},
+    ]))
+
+
+@pytest.mark.parametrize("mode_name,tools", _ARMS)
+def test_a_call_claude_code_refused_before_running_is_not_counted_as_run(
+    hook_binary: str, mode_name: str, tools: list[str],
+) -> None:
+    # Claude Code's own long-sleep guard rejects the call in validation, so no hook ever sees it.
+    raw = _errored("c1", "sleep 100; cat src/a.go",
+                   "<tool_use_error>Blocked: sleep 100 followed by: cat src/a.go.</tool_use_error>")
+
+    assert run._audit_strict_claude(raw, run.MODES[mode_name], tools, hook_binary) == 0
+
+
+@pytest.mark.parametrize("mode_name,tools", _ARMS)
+def test_a_denied_command_that_failed_after_running_still_counts_as_run(
+    hook_binary: str, mode_name: str, tools: list[str],
+) -> None:
+    raw = _errored("c1", "cat src/a.go", "Exit code 1\n<tool_use_error>cat: src/a.go: No such file</tool_use_error>")
+
+    with pytest.raises(run.HookLoosenedError, match="hook_loosened.*cat src/a.go"):
+        run._audit_strict_claude(raw, run.MODES[mode_name], tools, hook_binary)
+
+
 def test_a_missing_hook_binary_fails_the_audit_instead_of_allowing(tmp_path: Path) -> None:
     raw = _trajectory(("c1", "go test ./...", False))
 
