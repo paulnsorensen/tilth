@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -25,24 +24,7 @@ EXTRA_MODULES = (
 # pytest runs in one process, which is within the four-worker cap for graders.
 GRADE_TIMEOUT_S = 900
 TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
-PYTHON_ENV = "FASTAPI_BENCH_PYTHON"
-
-
-def _imports_fastapi_stack(python: str) -> bool:
-    probe = "import starlette, pydantic, httpx, pytest, annotated_doc, multipart"
-    try:
-        return subprocess.run([python, "-c", probe], capture_output=True, timeout=60).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def grading_python() -> str:
-    """Pick an interpreter that has the FastAPI test dependencies installed."""
-    candidates = [os.environ.get(PYTHON_ENV), sys.executable, shutil.which("python3"), "/usr/bin/python3"]
-    for candidate in candidates:
-        if candidate and _imports_fastapi_stack(candidate):
-            return candidate
-    raise RuntimeError(f"No interpreter with FastAPI test dependencies; set {PYTHON_ENV}")
+PYTEST_COMMAND = ["uv", "run", "pytest", "-q", "-p", "no:cacheprovider"]
 
 
 def affected_modules(root: Path) -> list[str]:
@@ -57,18 +39,13 @@ def auto_error_modules() -> list[str]:
 
 
 def _run(command: list[str], cwd: Path, timeout: int = GRADE_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
-    extra = os.environ.get("PYTHONPATH")
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.pathsep.join([str(cwd), extra] if extra else [str(cwd)]),
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _grade(directory: Path, label: str, modules: list[str]) -> str | None:
     """Run the affected modules; return a failure reason or None."""
-    command = [grading_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider", *modules]
+    command = [*PYTEST_COMMAND, *modules]
     try:
         result = _run(command, directory)
     except subprocess.TimeoutExpired:

@@ -28,14 +28,18 @@ pytest process (within the 4-worker cap). It runs the trusted tree, then the can
 
 ## Interpreter
 
-The system Python 3.14 lacks `python-multipart`. Put a copy on `PYTHONPATH`
-(the grader keeps an existing `PYTHONPATH`) or set `FASTAPI_BENCH_PYTHON`.
-The probe requires `multipart` to import.
+The grader runs `uv run pytest -q -p no:cacheprovider <modules>` in the trusted and
+candidate trees, like the sibling FastAPI tasks. `uv` resolves dependencies from the
+fixture's own `pyproject.toml` and `uv.lock`, which the fresh copy keeps (only `.git`
+and `__pycache__` are dropped). `uv` builds the project environment from its wheel
+cache, so a repeat grade installs 234 packages in about 100 ms without re-resolving.
+No interpreter probe, `PYTHONPATH`, or `FASTAPI_BENCH_PYTHON` is involved.
 
 ## Preflight
 
 Command, under `flock /tmp/tilth-gepa-v2-tests.lock`:
-`PYTHONPATH=/tmp/fa_deps /usr/bin/python3 benchmark/tasks/fastapi_security_migration_fixtures/preflight.py` (exit 0).
+`PATH=/tmp/tilth-bench-venv/bin:/usr/bin:/bin:<linuxbrew>:<uv> python3 benchmark/tasks/fastapi_security_migration_fixtures/preflight.py` (exit 0).
+No `PYTHONPATH` or `FASTAPI_BENCH_PYTHON` override. The bench venv has no FastAPI dependencies, so `uv` supplies them.
 
 ```
 original: rejected No source changes
@@ -55,5 +59,4 @@ default flipped to optional: rejected Trusted tests failed: pytest 41 modules
 
 Incomplete-migration controls: oauth2, openid, one class, one test module.
 Behavior-breaking controls: no `TypeError`, wrong `stacklevel`, no attribute alias, inverted default.
-The baseline (unchanged) tree passes the pinned tests but fails the held-out tests,
-so "No source changes" is rejected before any test runs.
+The unchanged tree is rejected by the "No source changes" guard before any test runs.

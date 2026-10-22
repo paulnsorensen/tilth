@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,14 +12,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from benchmark.tasks import TASKS
 from benchmark.tasks import fastapi_security_migration_tasks as module
 from benchmark.tasks.fastapi_security_migration_fixtures.preflight import main as preflight
-
-
-def _interpreter_ready() -> bool:
-    try:
-        module.grading_python()
-    except RuntimeError:
-        return False
-    return True
 
 
 def test_security_migration_task_contract():
@@ -52,8 +45,8 @@ def test_affected_modules_cover_every_auto_error_test():
 
 
 @pytest.mark.skipif(
-    not module.FIXTURE.is_dir() or not _interpreter_ready(),
-    reason="pinned FastAPI fixture or its Python dependencies are not installed",
+    not module.FIXTURE.is_dir() or shutil.which("uv") is None,
+    reason="pinned FastAPI fixture or uv is not installed",
 )
 def test_grader_reference_and_negative_controls():
     preflight()
@@ -65,18 +58,21 @@ def test_grader_timeout_is_inconclusive_not_a_test_failure(tmp_path, monkeypatch
     (candidate / "fastapi" / "security" / "base.py").write_text("")
     monkeypatch.setattr(module, "affected_modules", lambda root: [])
     monkeypatch.setattr(module, "_restore_tests", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "grading_python", lambda: "python")
     monkeypatch.setattr(module, "FIXTURE", tmp_path / "fixture")
     (tmp_path / "fixture" / "fastapi" / "security").mkdir(parents=True)
+
+    commands = []
 
     def fake_run(command, **kwargs):
         if command[0] == "git":
             return subprocess.CompletedProcess(command, 0, stdout=" M fastapi/security/base.py\n", stderr="")
+        commands.append(command)
         raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     ok, reason = module.FastAPISecurityMigrationTask().check_correctness("", str(candidate))
 
+    assert commands and commands[0][:3] == ["uv", "run", "pytest"]
     assert not ok
     assert reason.startswith(module.TIMEOUT_REASON), reason
     assert "tests failed" not in reason
