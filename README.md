@@ -226,6 +226,8 @@ A host that fails open when the guard cannot run gets its documented fail-closed
 
 Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
 
+To remove the guard, delete the tilth entry (the handler whose command ends in `hook --host <family>`) from the host's hook file listed above, then restart the host. `tilth install` has no uninstall step. With `claude-code`, `onFailure: "block"` means a moved or missing binary (after `cargo clean`, or an npx cache miss) blocks every Bash call until you reinstall or remove the entry.
+
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
 ### Smaller models
