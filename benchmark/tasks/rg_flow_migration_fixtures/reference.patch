@@ -1,0 +1,2004 @@
+diff --git a/crates/matcher/src/lib.rs b/crates/matcher/src/lib.rs
+index 25afb06..39d898e 100644
+--- a/crates/matcher/src/lib.rs
++++ b/crates/matcher/src/lib.rs
+@@ -71,6 +71,20 @@ pub struct Match {
+     end: usize,
+ }
+ 
++/// Whether an iteration that invokes a caller supplied callback should keep
++/// going.
++///
++/// Callbacks given to the matching and replacement routines on [`Matcher`]
++/// return this value to say whether the iteration should continue with the
++/// next match or stop right away.
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub enum Flow {
++    /// Keep iterating.
++    Continue,
++    /// Stop iterating.
++    Stop,
++}
++
+ impl Match {
+     /// Create a new match.
+     ///
+@@ -624,7 +638,7 @@ pub trait Matcher {
+ 
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack`. If no match exists, then the given function is never
+-    /// called. If the function returns `false`, then iteration stops.
++    /// called. If the function returns `Flow::Stop`, then iteration stops.
+     #[inline]
+     fn find_iter<F>(
+         &self,
+@@ -632,14 +646,14 @@ pub trait Matcher {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match) -> bool,
++        F: FnMut(Match) -> Flow,
+     {
+         self.find_iter_at(haystack, 0, matched)
+     }
+ 
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack`. If no match exists, then the given function is never
+-    /// called. If the function returns `false`, then iteration stops.
++    /// called. If the function returns `Flow::Stop`, then iteration stops.
+     ///
+     /// The significance of the starting point is that it takes the surrounding
+     /// context into consideration. For example, the `\A` anchor can only
+@@ -652,7 +666,7 @@ pub trait Matcher {
+         mut matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match) -> bool,
++        F: FnMut(Match) -> Flow,
+     {
+         self.try_find_iter_at(haystack, at, |m| Ok(matched(m)))
+             .map(|r: Result<(), ()>| r.unwrap())
+@@ -660,7 +674,7 @@ pub trait Matcher {
+ 
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack`. If no match exists, then the given function is never
+-    /// called. If the function returns `false`, then iteration stops.
++    /// called. If the function returns `Flow::Stop`, then iteration stops.
+     /// Similarly, if the function returns an error then iteration stops and
+     /// the error is yielded. If an error occurs while executing the search,
+     /// then it is converted to
+@@ -672,14 +686,14 @@ pub trait Matcher {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         self.try_find_iter_at(haystack, 0, matched)
+     }
+ 
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack`. If no match exists, then the given function is never
+-    /// called. If the function returns `false`, then iteration stops.
++    /// called. If the function returns `Flow::Stop`, then iteration stops.
+     /// Similarly, if the function returns an error then iteration stops and
+     /// the error is yielded. If an error occurs while executing the search,
+     /// then it is converted to
+@@ -696,7 +710,7 @@ pub trait Matcher {
+         mut matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         let mut last_end = at;
+         let mut last_match = None;
+@@ -724,8 +738,8 @@ pub trait Matcher {
+             }
+             last_match = Some(m.end);
+             match matched(m) {
+-                Ok(true) => continue,
+-                Ok(false) => return Ok(Ok(())),
++                Ok(Flow::Continue) => continue,
++                Ok(Flow::Stop) => return Ok(Ok(())),
+                 Err(err) => return Ok(Err(err)),
+             }
+         }
+@@ -748,7 +762,7 @@ pub trait Matcher {
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack` with capture groups extracted from each match. If no
+     /// match exists, then the given function is never called. If the function
+-    /// returns `false`, then iteration stops.
++    /// returns `Flow::Stop`, then iteration stops.
+     #[inline]
+     fn captures_iter<F>(
+         &self,
+@@ -757,7 +771,7 @@ pub trait Matcher {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> bool,
++        F: FnMut(&Self::Captures) -> Flow,
+     {
+         self.captures_iter_at(haystack, 0, caps, matched)
+     }
+@@ -765,7 +779,7 @@ pub trait Matcher {
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack` with capture groups extracted from each match. If no
+     /// match exists, then the given function is never called. If the function
+-    /// returns `false`, then iteration stops.
++    /// returns `Flow::Stop`, then iteration stops.
+     ///
+     /// The significance of the starting point is that it takes the surrounding
+     /// context into consideration. For example, the `\A` anchor can only
+@@ -779,7 +793,7 @@ pub trait Matcher {
+         mut matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> bool,
++        F: FnMut(&Self::Captures) -> Flow,
+     {
+         self.try_captures_iter_at(haystack, at, caps, |caps| Ok(matched(caps)))
+             .map(|r: Result<(), ()>| r.unwrap())
+@@ -788,7 +802,7 @@ pub trait Matcher {
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack` with capture groups extracted from each match. If no
+     /// match exists, then the given function is never called. If the function
+-    /// returns `false`, then iteration stops. Similarly, if the function
++    /// returns `Flow::Stop`, then iteration stops. Similarly, if the function
+     /// returns an error then iteration stops and the error is yielded. If
+     /// an error occurs while executing the search, then it is converted to
+     /// `E`.
+@@ -800,7 +814,7 @@ pub trait Matcher {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> Result<bool, E>,
++        F: FnMut(&Self::Captures) -> Result<Flow, E>,
+     {
+         self.try_captures_iter_at(haystack, 0, caps, matched)
+     }
+@@ -808,7 +822,7 @@ pub trait Matcher {
+     /// Executes the given function over successive non-overlapping matches
+     /// in `haystack` with capture groups extracted from each match. If no
+     /// match exists, then the given function is never called. If the function
+-    /// returns `false`, then iteration stops. Similarly, if the function
++    /// returns `Flow::Stop`, then iteration stops. Similarly, if the function
+     /// returns an error then iteration stops and the error is yielded. If
+     /// an error occurs while executing the search, then it is converted to
+     /// `E`.
+@@ -825,7 +839,7 @@ pub trait Matcher {
+         mut matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> Result<bool, E>,
++        F: FnMut(&Self::Captures) -> Result<Flow, E>,
+     {
+         let mut last_end = at;
+         let mut last_match = None;
+@@ -853,8 +867,8 @@ pub trait Matcher {
+             }
+             last_match = Some(m.end);
+             match matched(caps) {
+-                Ok(true) => continue,
+-                Ok(false) => return Ok(Ok(())),
++                Ok(Flow::Continue) => continue,
++                Ok(Flow::Stop) => return Ok(Ok(())),
+                 Err(err) => return Ok(Err(err)),
+             }
+         }
+@@ -897,7 +911,7 @@ pub trait Matcher {
+     /// `append`. `append` is given the start and end of a match, along with
+     /// a handle to the `dst` buffer provided.
+     ///
+-    /// If the given `append` function returns `false`, then replacement stops.
++    /// If the given `append` function returns `Flow::Stop`, then replacement stops.
+     #[inline]
+     fn replace<F>(
+         &self,
+@@ -906,7 +920,7 @@ pub trait Matcher {
+         mut append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match, &mut Vec<u8>) -> bool,
++        F: FnMut(Match, &mut Vec<u8>) -> Flow,
+     {
+         let mut last_match = 0;
+         self.find_iter(haystack, |m| {
+@@ -921,7 +935,7 @@ pub trait Matcher {
+     /// Replaces every match in the given haystack with the result of calling
+     /// `append` with the matching capture groups.
+     ///
+-    /// If the given `append` function returns `false`, then replacement stops.
++    /// If the given `append` function returns `Flow::Stop`, then replacement stops.
+     #[inline]
+     fn replace_with_captures<F>(
+         &self,
+@@ -931,7 +945,7 @@ pub trait Matcher {
+         append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool,
++        F: FnMut(&Self::Captures, &mut Vec<u8>) -> Flow,
+     {
+         self.replace_with_captures_at(haystack, 0, caps, dst, append)
+     }
+@@ -939,7 +953,7 @@ pub trait Matcher {
+     /// Replaces every match in the given haystack with the result of calling
+     /// `append` with the matching capture groups.
+     ///
+-    /// If the given `append` function returns `false`, then replacement stops.
++    /// If the given `append` function returns `Flow::Stop`, then replacement stops.
+     ///
+     /// The significance of the starting point is that it takes the surrounding
+     /// context into consideration. For example, the `\A` anchor can only
+@@ -954,7 +968,7 @@ pub trait Matcher {
+         mut append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool,
++        F: FnMut(&Self::Captures, &mut Vec<u8>) -> Flow,
+     {
+         let mut last_match = at;
+         self.captures_iter_at(haystack, at, caps, |caps| {
+@@ -1180,7 +1194,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match) -> bool,
++        F: FnMut(Match) -> Flow,
+     {
+         (*self).find_iter(haystack, matched)
+     }
+@@ -1193,7 +1207,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match) -> bool,
++        F: FnMut(Match) -> Flow,
+     {
+         (*self).find_iter_at(haystack, at, matched)
+     }
+@@ -1205,7 +1219,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         (*self).try_find_iter(haystack, matched)
+     }
+@@ -1218,7 +1232,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         (*self).try_find_iter_at(haystack, at, matched)
+     }
+@@ -1240,7 +1254,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> bool,
++        F: FnMut(&Self::Captures) -> Flow,
+     {
+         (*self).captures_iter(haystack, caps, matched)
+     }
+@@ -1254,7 +1268,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> bool,
++        F: FnMut(&Self::Captures) -> Flow,
+     {
+         (*self).captures_iter_at(haystack, at, caps, matched)
+     }
+@@ -1267,7 +1281,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> Result<bool, E>,
++        F: FnMut(&Self::Captures) -> Result<Flow, E>,
+     {
+         (*self).try_captures_iter(haystack, caps, matched)
+     }
+@@ -1281,7 +1295,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         matched: F,
+     ) -> Result<Result<(), E>, Self::Error>
+     where
+-        F: FnMut(&Self::Captures) -> Result<bool, E>,
++        F: FnMut(&Self::Captures) -> Result<Flow, E>,
+     {
+         (*self).try_captures_iter_at(haystack, at, caps, matched)
+     }
+@@ -1294,7 +1308,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(Match, &mut Vec<u8>) -> bool,
++        F: FnMut(Match, &mut Vec<u8>) -> Flow,
+     {
+         (*self).replace(haystack, dst, append)
+     }
+@@ -1308,7 +1322,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool,
++        F: FnMut(&Self::Captures, &mut Vec<u8>) -> Flow,
+     {
+         (*self).replace_with_captures(haystack, caps, dst, append)
+     }
+@@ -1323,7 +1337,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
+         append: F,
+     ) -> Result<(), Self::Error>
+     where
+-        F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool,
++        F: FnMut(&Self::Captures, &mut Vec<u8>) -> Flow,
+     {
+         (*self).replace_with_captures_at(haystack, at, caps, dst, append)
+     }
+diff --git a/crates/matcher/tests/test_matcher.rs b/crates/matcher/tests/test_matcher.rs
+index 14ab49b..7d9b326 100644
+--- a/crates/matcher/tests/test_matcher.rs
++++ b/crates/matcher/tests/test_matcher.rs
+@@ -1,5 +1,5 @@
+ use {
+-    grep_matcher::{Captures, Match, Matcher},
++    grep_matcher::{Captures, Flow, Match, Matcher},
+     regex::bytes::Regex,
+ };
+ 
+@@ -30,7 +30,7 @@ fn find_iter() {
+     matcher
+         .find_iter(b"aa bb cc dd", |m| {
+             matches.push(m);
+-            true
++            Flow::Continue
+         })
+         .unwrap();
+     assert_eq!(matches, vec![m(0, 5), m(6, 11)]);
+@@ -40,7 +40,7 @@ fn find_iter() {
+     matcher
+         .find_iter(b"aa bb cc dd", |m| {
+             matches.push(m);
+-            false
++            Flow::Stop
+         })
+         .unwrap();
+     assert_eq!(matches, vec![m(0, 5)]);
+@@ -57,7 +57,7 @@ fn try_find_iter() {
+         .try_find_iter(b"aa bb cc dd", |m| {
+             if matches.is_empty() {
+                 matches.push(m);
+-                Ok(true)
++                Ok(Flow::Continue)
+             } else {
+                 Err(MyError)
+             }
+@@ -103,7 +103,7 @@ fn captures_iter() {
+             matches.push(caps.get(0).unwrap());
+             matches.push(caps.get(1).unwrap());
+             matches.push(caps.get(2).unwrap());
+-            true
++            Flow::Continue
+         })
+         .unwrap();
+     assert_eq!(
+@@ -118,7 +118,7 @@ fn captures_iter() {
+             matches.push(caps.get(0).unwrap());
+             matches.push(caps.get(1).unwrap());
+             matches.push(caps.get(2).unwrap());
+-            false
++            Flow::Stop
+         })
+         .unwrap();
+     assert_eq!(matches, vec![m(0, 5), m(0, 2), m(3, 5),]);
+@@ -138,7 +138,7 @@ fn try_captures_iter() {
+                 matches.push(caps.get(0).unwrap());
+                 matches.push(caps.get(1).unwrap());
+                 matches.push(caps.get(2).unwrap());
+-                Ok(true)
++                Ok(Flow::Continue)
+             } else {
+                 Err(MyError)
+             }
+@@ -167,7 +167,7 @@ fn no_captures() {
+     matcher
+         .captures_iter(b"homer simpson", &mut caps, |_| {
+             called = true;
+-            true
++            Flow::Continue
+         })
+         .unwrap();
+     assert!(!called);
+@@ -180,7 +180,7 @@ fn replace() {
+     matcher
+         .replace(b"aa bb cc dd", &mut dst, |_, dst| {
+             dst.push(b'z');
+-            true
++            Flow::Continue
+         })
+         .unwrap();
+     assert_eq!(dst, b"z z");
+@@ -190,7 +190,7 @@ fn replace() {
+     matcher
+         .replace(b"aa bb cc dd", &mut dst, |_, dst| {
+             dst.push(b'z');
+-            false
++            Flow::Stop
+         })
+         .unwrap();
+     assert_eq!(dst, b"z cc dd");
+@@ -210,7 +210,7 @@ fn replace_with_captures() {
+                 b"$2 $1",
+                 dst,
+             );
+-            true
++            Flow::Continue
+         })
+         .unwrap();
+     assert_eq!(dst, b"bb aa dd cc");
+@@ -225,7 +225,7 @@ fn replace_with_captures() {
+                 b"$2 $1",
+                 dst,
+             );
+-            false
++            Flow::Stop
+         })
+         .unwrap();
+     assert_eq!(dst, b"bb aa cc dd");
+diff --git a/crates/pcre2/src/matcher.rs b/crates/pcre2/src/matcher.rs
+index 9a6710c..5c67403 100644
+--- a/crates/pcre2/src/matcher.rs
++++ b/crates/pcre2/src/matcher.rs
+@@ -1,7 +1,7 @@
+ use std::collections::HashMap;
+ 
+ use {
+-    grep_matcher::{Captures, Match, Matcher},
++    grep_matcher::{Captures, Flow, Match, Matcher},
+     pcre2::bytes::{CaptureLocations, Regex, RegexBuilder},
+ };
+ 
+@@ -346,13 +346,13 @@ impl Matcher for RegexMatcher {
+         mut matched: F,
+     ) -> Result<Result<(), E>, Error>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         for result in self.regex.find_iter(haystack) {
+             let m = result.map_err(Error::regex)?;
+             match matched(Match::new(m.start(), m.end())) {
+-                Ok(true) => continue,
+-                Ok(false) => return Ok(Ok(())),
++                Ok(Flow::Continue) => continue,
++                Ok(Flow::Stop) => return Ok(Ok(())),
+                 Err(err) => return Ok(Err(err)),
+             }
+         }
+diff --git a/crates/printer/src/json.rs b/crates/printer/src/json.rs
+index f2a42ba..cfb1fc8 100644
+--- a/crates/printer/src/json.rs
++++ b/crates/printer/src/json.rs
+@@ -6,7 +6,7 @@ use std::{
+ };
+ 
+ use {
+-    grep_matcher::{Match, Matcher},
++    grep_matcher::{Flow, Match, Matcher},
+     grep_searcher::{Searcher, Sink, SinkContext, SinkFinish, SinkMatch},
+     serde_json as json,
+ };
+@@ -666,7 +666,7 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
+             |m| {
+                 let (s, e) = (m.start() - range.start, m.end() - range.start);
+                 matches.push(Match::new(s, e));
+-                true
++                Flow::Continue
+             },
+         )?;
+         // Don't report empty matches appearing at the end of the bytes.
+@@ -723,7 +723,7 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
+         &mut self,
+         searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         self.match_count += 1;
+         self.write_begin_message()?;
+ 
+@@ -749,14 +749,14 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
+             submatches: submatches.as_slice(),
+         });
+         self.json.write_message(&msg)?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn context(
+         &mut self,
+         searcher: &Searcher,
+         ctx: &SinkContext<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         self.write_begin_message()?;
+         self.json.matches.clear();
+ 
+@@ -779,14 +779,14 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
+             submatches: submatches.as_slice(),
+         });
+         self.json.write_message(&msg)?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn binary_data(
+         &mut self,
+         searcher: &Searcher,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         if searcher.binary_detection().quit_byte().is_some() {
+             if let Some(ref path) = self.path {
+                 log::debug!(
+@@ -796,20 +796,20 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
+                 );
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+-    fn begin(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
++    fn begin(&mut self, _searcher: &Searcher) -> Result<Flow, io::Error> {
+         self.json.wtr.reset_count();
+         self.start_time = Instant::now();
+         self.match_count = 0;
+         self.binary_byte_offset = None;
+ 
+         if !self.json.config.always_begin_end {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+         self.write_begin_message()?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn finish(
+diff --git a/crates/printer/src/standard.rs b/crates/printer/src/standard.rs
+index 35c6e93..865b2df 100644
+--- a/crates/printer/src/standard.rs
++++ b/crates/printer/src/standard.rs
+@@ -9,7 +9,7 @@ use std::{
+ 
+ use {
+     bstr::ByteSlice,
+-    grep_matcher::{Match, Matcher},
++    grep_matcher::{Flow, Match, Matcher},
+     grep_searcher::{
+         LineStep, Searcher, Sink, SinkContext, SinkFinish, SinkMatch,
+     },
+@@ -721,7 +721,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
+             |m| {
+                 let (s, e) = (m.start() - range.start, m.end() - range.start);
+                 matches.push(Match::new(s, e));
+-                true
++                Flow::Continue
+             },
+         )?;
+         // Don't report empty matches appearing at the end of the bytes.
+@@ -767,7 +767,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
+         &mut self,
+         searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         self.match_count += 1;
+ 
+         self.record_matches(
+@@ -783,18 +783,18 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
+         }
+         if searcher.binary_detection().convert_byte().is_some() {
+             if self.binary_byte_offset.is_some() {
+-                return Ok(false);
++                return Ok(Flow::Stop);
+             }
+         }
+         StandardImpl::from_match(searcher, self, mat).sink()?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn context(
+         &mut self,
+         searcher: &Searcher,
+         ctx: &SinkContext<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         self.standard.matches.clear();
+         self.replacer.clear();
+ 
+@@ -804,27 +804,27 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
+         }
+         if searcher.binary_detection().convert_byte().is_some() {
+             if self.binary_byte_offset.is_some() {
+-                return Ok(false);
++                return Ok(Flow::Stop);
+             }
+         }
+ 
+         StandardImpl::from_context(searcher, self, ctx).sink()?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn context_break(
+         &mut self,
+         searcher: &Searcher,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         StandardImpl::new(searcher, self).write_context_separator()?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn binary_data(
+         &mut self,
+         searcher: &Searcher,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         if searcher.binary_detection().quit_byte().is_some() {
+             if let Some(ref path) = self.path {
+                 log::debug!(
+@@ -835,15 +835,15 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
+             }
+         }
+         self.binary_byte_offset = Some(binary_byte_offset);
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+-    fn begin(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
++    fn begin(&mut self, _searcher: &Searcher) -> Result<Flow, io::Error> {
+         self.standard.wtr.borrow_mut().reset_count();
+         self.start_time = Instant::now();
+         self.match_count = 0;
+         self.binary_byte_offset = None;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn finish(
+diff --git a/crates/printer/src/summary.rs b/crates/printer/src/summary.rs
+index e553f8d..f1dbae8 100644
+--- a/crates/printer/src/summary.rs
++++ b/crates/printer/src/summary.rs
+@@ -7,7 +7,7 @@ use std::{
+ };
+ 
+ use {
+-    grep_matcher::Matcher,
++    grep_matcher::{Flow, Matcher},
+     grep_searcher::{Searcher, Sink, SinkError, SinkFinish, SinkMatch},
+     termcolor::{ColorSpec, NoColor, WriteColor},
+ };
+@@ -634,7 +634,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
+         &mut self,
+         searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         let is_multi_line = self.multi_line(searcher);
+         let sink_match_count = if self.stats.is_none() && !is_multi_line {
+             1
+@@ -653,7 +653,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
+                 range,
+                 |_| {
+                     count += 1;
+-                    true
++                    Flow::Continue
+                 },
+             )?;
+             // Because of `find_iter_at_in_context` being a giant
+@@ -671,16 +671,16 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
+             stats.add_matches(sink_match_count);
+             stats.add_matched_lines(mat.lines().count() as u64);
+         } else if self.summary.config.kind.quit_early() {
+-            return Ok(false);
++            return Ok(Flow::Stop);
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn binary_data(
+         &mut self,
+         searcher: &Searcher,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         if searcher.binary_detection().quit_byte().is_some() {
+             if let Some(ref path) = self.path {
+                 log::debug!(
+@@ -690,10 +690,10 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
+                 );
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+-    fn begin(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
++    fn begin(&mut self, _searcher: &Searcher) -> Result<Flow, io::Error> {
+         if self.path.is_none() && self.summary.config.kind.requires_path() {
+             return Err(io::Error::error_message(format!(
+                 "output kind {:?} requires a file path",
+@@ -704,7 +704,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for SummarySink<'p, 's, M, W> {
+         self.start_time = Instant::now();
+         self.match_count = 0;
+         self.binary_byte_offset = None;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn finish(
+diff --git a/crates/printer/src/util.rs b/crates/printer/src/util.rs
+index 491a0b7..fc0e2ca 100644
+--- a/crates/printer/src/util.rs
++++ b/crates/printer/src/util.rs
+@@ -2,7 +2,7 @@ use std::{borrow::Cow, cell::OnceCell, fmt, io, path::Path, time};
+ 
+ use {
+     bstr::ByteVec,
+-    grep_matcher::{Captures, LineTerminator, Match, Matcher},
++    grep_matcher::{Captures, Flow, LineTerminator, Match, Matcher},
+     grep_searcher::{
+         LineIter, Searcher, SinkContext, SinkContextKind, SinkError, SinkMatch,
+     },
+@@ -100,7 +100,7 @@ impl<M: Matcher> Replacer<M> {
+                     );
+                     let end = dst.len();
+                     matches.push(Match::new(start, end));
+-                    true
++                    Flow::Continue
+                 },
+             )
+             .map_err(io::Error::error_message)?;
+@@ -479,7 +479,7 @@ pub(crate) fn find_iter_at_in_context<M, F>(
+ ) -> io::Result<()>
+ where
+     M: Matcher,
+-    F: FnMut(Match) -> bool,
++    F: FnMut(Match) -> Flow,
+ {
+     // This strange dance is to account for the possibility of look-ahead in
+     // the regex. The problem here is that mat.bytes() doesn't include the
+@@ -522,7 +522,7 @@ where
+     matcher
+         .find_iter_at(bytes, range.start, |m| {
+             if m.start() >= range.end {
+-                return false;
++                return Flow::Stop;
+             }
+             matched(m)
+         })
+@@ -565,13 +565,13 @@ fn replace_with_captures_in_context<M, F>(
+ ) -> Result<(), M::Error>
+ where
+     M: Matcher,
+-    F: FnMut(&M::Captures, &mut Vec<u8>) -> bool,
++    F: FnMut(&M::Captures, &mut Vec<u8>) -> Flow,
+ {
+     let mut last_match = range.start;
+     matcher.captures_iter_at(bytes, range.start, caps, |caps| {
+         let m = caps.get(0).unwrap();
+         if m.start() >= range.end {
+-            return false;
++            return Flow::Stop;
+         }
+         dst.extend(&bytes[last_match..m.start()]);
+         last_match = m.end();
+diff --git a/crates/regex/src/matcher.rs b/crates/regex/src/matcher.rs
+index 3bb70a8..fcee8a0 100644
+--- a/crates/regex/src/matcher.rs
++++ b/crates/regex/src/matcher.rs
+@@ -1,7 +1,7 @@
+ use {
+     grep_matcher::{
+-        ByteSet, Captures, LineMatchKind, LineTerminator, Match, Matcher,
+-        NoError,
++        ByteSet, Captures, Flow, LineMatchKind, LineTerminator, Match,
++        Matcher, NoError,
+     },
+     regex_automata::{
+         Input, PatternID, meta::Regex,
+@@ -442,12 +442,12 @@ impl Matcher for RegexMatcher {
+         mut matched: F,
+     ) -> Result<Result<(), E>, NoError>
+     where
+-        F: FnMut(Match) -> Result<bool, E>,
++        F: FnMut(Match) -> Result<Flow, E>,
+     {
+         for m in self.regex.find_iter(haystack) {
+             match matched(Match::new(m.start(), m.end())) {
+-                Ok(true) => continue,
+-                Ok(false) => return Ok(Ok(())),
++                Ok(Flow::Continue) => continue,
++                Ok(Flow::Stop) => return Ok(Ok(())),
+                 Err(err) => return Ok(Err(err)),
+             }
+         }
+diff --git a/crates/searcher/examples/search-stdin.rs b/crates/searcher/examples/search-stdin.rs
+index 659d7cf..2b554ce 100644
+--- a/crates/searcher/examples/search-stdin.rs
++++ b/crates/searcher/examples/search-stdin.rs
+@@ -3,6 +3,7 @@ use std::error::Error;
+ use std::io;
+ use std::process;
+ 
++use grep_matcher::Flow;
+ use grep_regex::RegexMatcher;
+ use grep_searcher::Searcher;
+ use grep_searcher::sinks::UTF8;
+@@ -27,7 +28,7 @@ fn example() -> Result<(), Box<dyn Error>> {
+         io::stdin(),
+         UTF8(|lnum, line| {
+             print!("{}:{}", lnum, line);
+-            Ok(true)
++            Ok(Flow::Continue)
+         }),
+     )?;
+     Ok(())
+diff --git a/crates/searcher/src/lib.rs b/crates/searcher/src/lib.rs
+index fb3bfe8..0e296da 100644
+--- a/crates/searcher/src/lib.rs
++++ b/crates/searcher/src/lib.rs
+@@ -39,7 +39,7 @@ using the [`UTF8`](sinks::UTF8) implementation of `Sink`.
+ 
+ ```
+ use {
+-    grep_matcher::Matcher,
++    grep_matcher::{Flow, Matcher},
+     grep_regex::RegexMatcher,
+     grep_searcher::Searcher,
+     grep_searcher::sinks::UTF8,
+@@ -60,7 +60,7 @@ Searcher::new().search_slice(&matcher, SHERLOCK, UTF8(|lnum, line| {
+     // We are guaranteed to find a match, so the unwrap is OK.
+     let mymatch = matcher.find(line.as_bytes())?.unwrap();
+     matches.push((lnum, line[mymatch].to_string()));
+-    Ok(true)
++    Ok(Flow::Continue)
+ }))?;
+ 
+ assert_eq!(matches.len(), 2);
+diff --git a/crates/searcher/src/searcher/core.rs b/crates/searcher/src/searcher/core.rs
+index e0693c0..02c5cde 100644
+--- a/crates/searcher/src/searcher/core.rs
++++ b/crates/searcher/src/searcher/core.rs
+@@ -1,6 +1,6 @@
+ use bstr::ByteSlice;
+ 
+-use grep_matcher::{LineMatchKind, Matcher};
++use grep_matcher::{Flow, LineMatchKind, Matcher};
+ 
+ use crate::{
+     line_buffer::BinaryDetection,
+@@ -100,14 +100,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         self.sink_matched(buf, range)
+     }
+ 
+     pub(crate) fn binary_data(
+         &mut self,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         self.sink.binary_data(&self.searcher, binary_byte_offset)
+     }
+ 
+@@ -152,7 +152,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         }
+     }
+ 
+-    pub(crate) fn begin(&mut self) -> Result<bool, S::Error> {
++    pub(crate) fn begin(&mut self) -> Result<Flow, S::Error> {
+         self.sink.begin(&self.searcher)
+     }
+ 
+@@ -170,12 +170,12 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+     pub(crate) fn match_by_line(
+         &mut self,
+         buf: &[u8],
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         if self.is_line_by_line_fast() {
+             match self.match_by_line_fast(buf)? {
+                 FastMatchResult::SwitchToSlow => self.match_by_line_slow(buf),
+-                FastMatchResult::Continue => Ok(true),
+-                FastMatchResult::Stop => Ok(false),
++                FastMatchResult::Continue => Ok(Flow::Continue),
++                FastMatchResult::Stop => Ok(Flow::Stop),
+             }
+         } else {
+             self.match_by_line_slow(buf)
+@@ -216,24 +216,29 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
++        let quit = if self.config.binary.quit_byte().is_some() {
++            Flow::Stop
++        } else {
++            Flow::Continue
++        };
+         if self.binary_byte_offset.is_some() {
+-            return Ok(self.config.binary.quit_byte().is_some());
++            return Ok(quit);
+         }
+         let binary_byte = match self.config.binary.0 {
+             BinaryDetection::Quit(b) => b,
+             BinaryDetection::Convert(b) => b,
+-            _ => return Ok(false),
++            _ => return Ok(Flow::Continue),
+         };
+         if let Some(i) = buf[*range].find_byte(binary_byte) {
+             let offset = range.start() + i;
+             self.binary_byte_offset = Some(offset);
+-            if !self.binary_data(offset as u64)? {
+-                return Ok(true);
++            if self.binary_data(offset as u64)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+-            Ok(self.config.binary.quit_byte().is_some())
++            Ok(quit)
+         } else {
+-            Ok(false)
++            Ok(Flow::Continue)
+         }
+     }
+ 
+@@ -241,13 +246,13 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         &mut self,
+         buf: &[u8],
+         upto: usize,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         if self.config.before_context == 0 {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+         let range = Range::new(self.last_line_visited, upto);
+         if range.is_empty() {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+         let before_context_start = range.start()
+             + lines::preceding(
+@@ -263,23 +268,23 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+             range.end(),
+         );
+         while let Some(line) = stepper.next_match(buf) {
+-            if !self.sink_break_context(line.start())? {
+-                return Ok(false);
++            if self.sink_break_context(line.start())? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+-            if !self.sink_before_context(buf, &line)? {
+-                return Ok(false);
++            if self.sink_before_context(buf, &line)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     pub(crate) fn after_context_by_line(
+         &mut self,
+         buf: &[u8],
+         upto: usize,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         if self.after_context_left == 0 {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+         let exceeded_match_limit = self.has_exceeded_match_limit();
+         let range = Range::new(self.last_line_visited, upto);
+@@ -294,25 +299,25 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+             {
+                 let after_context_left = self.after_context_left;
+                 self.set_pos(line.end());
+-                if !self.sink_matched(buf, &line)? {
+-                    return Ok(false);
++                if self.sink_matched(buf, &line)? == Flow::Stop {
++                    return Ok(Flow::Stop);
+                 }
+                 self.after_context_left = after_context_left - 1;
+-            } else if !self.sink_after_context(buf, &line)? {
+-                return Ok(false);
++            } else if self.sink_after_context(buf, &line)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+             if self.after_context_left == 0 {
+                 break;
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     pub(crate) fn other_context_by_line(
+         &mut self,
+         buf: &[u8],
+         upto: usize,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         let range = Range::new(self.last_line_visited, upto);
+         let mut stepper = LineStep::new(
+             self.config.line_term.as_byte(),
+@@ -320,14 +325,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+             range.end(),
+         );
+         while let Some(line) = stepper.next_match(buf) {
+-            if !self.sink_other_context(buf, &line)? {
+-                return Ok(false);
++            if self.sink_other_context(buf, &line)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+-    fn match_by_line_slow(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
++    fn match_by_line_slow(&mut self, buf: &[u8]) -> Result<Flow, S::Error> {
+         debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
+ 
+         let range = Range::new(self.pos(), buf.len());
+@@ -341,7 +346,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 && !self.config.passthru
+                 && self.after_context_left == 0
+             {
+-                return Ok(false);
++                return Ok(Flow::Stop);
+             }
+             let matched = {
+                 // Stripping the line terminator is necessary to prevent some
+@@ -360,26 +365,28 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+             if success {
+                 self.has_matched = true;
+                 self.increment_count();
+-                if !self.before_context_by_line(buf, line.start())? {
+-                    return Ok(false);
++                if self.before_context_by_line(buf, line.start())?
++                    == Flow::Stop
++                {
++                    return Ok(Flow::Stop);
+                 }
+-                if !self.sink_matched(buf, &line)? {
+-                    return Ok(false);
++                if self.sink_matched(buf, &line)? == Flow::Stop {
++                    return Ok(Flow::Stop);
+                 }
+             } else if self.after_context_left >= 1 {
+-                if !self.sink_after_context(buf, &line)? {
+-                    return Ok(false);
++                if self.sink_after_context(buf, &line)? == Flow::Stop {
++                    return Ok(Flow::Stop);
+                 }
+             } else if self.config.passthru {
+-                if !self.sink_other_context(buf, &line)? {
+-                    return Ok(false);
++                if self.sink_other_context(buf, &line)? == Flow::Stop {
++                    return Ok(Flow::Stop);
+                 }
+             }
+             if self.config.stop_on_nonmatch && !success && self.has_matched {
+-                return Ok(false);
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn match_by_line_fast(
+@@ -394,29 +401,33 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 return Ok(SwitchToSlow);
+             }
+             if self.config.invert_match {
+-                if !self.match_by_line_fast_invert(buf)? {
++                if self.match_by_line_fast_invert(buf)? == Flow::Stop {
+                     break;
+                 }
+             } else if let Some(line) = self.find_by_line_fast(buf)? {
+                 self.has_matched = true;
+                 self.increment_count();
+                 if self.config.max_context() > 0 {
+-                    if !self.after_context_by_line(buf, line.start())? {
++                    if self.after_context_by_line(buf, line.start())?
++                        == Flow::Stop
++                    {
+                         return Ok(Stop);
+                     }
+-                    if !self.before_context_by_line(buf, line.start())? {
++                    if self.before_context_by_line(buf, line.start())?
++                        == Flow::Stop
++                    {
+                         return Ok(Stop);
+                     }
+                 }
+                 self.set_pos(line.end());
+-                if !self.sink_matched(buf, &line)? {
++                if self.sink_matched(buf, &line)? == Flow::Stop {
+                     return Ok(Stop);
+                 }
+             } else {
+                 break;
+             }
+         }
+-        if !self.after_context_by_line(buf, buf.len())? {
++        if self.after_context_by_line(buf, buf.len())? == Flow::Stop {
+             return Ok(Stop);
+         }
+         if self.has_exceeded_match_limit() && self.after_context_left == 0 {
+@@ -430,7 +441,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+     fn match_by_line_fast_invert(
+         &mut self,
+         buf: &[u8],
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         assert!(self.config.invert_match);
+ 
+         let invert_match = match self.find_by_line_fast(buf)? {
+@@ -446,14 +457,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+             }
+         };
+         if invert_match.is_empty() {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+         self.has_matched = true;
+-        if !self.after_context_by_line(buf, invert_match.start())? {
+-            return Ok(false);
++        if self.after_context_by_line(buf, invert_match.start())? == Flow::Stop
++        {
++            return Ok(Flow::Stop);
+         }
+-        if !self.before_context_by_line(buf, invert_match.start())? {
+-            return Ok(false);
++        if self.before_context_by_line(buf, invert_match.start())?
++            == Flow::Stop
++        {
++            return Ok(Flow::Stop);
+         }
+         let mut stepper = LineStep::new(
+             self.config.line_term.as_byte(),
+@@ -462,14 +476,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         );
+         while let Some(line) = stepper.next_match(buf) {
+             self.increment_count();
+-            if !self.sink_matched(buf, &line)? {
+-                return Ok(false);
++            if self.sink_matched(buf, &line)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+             if self.has_exceeded_match_limit() {
+-                return Ok(false);
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     #[inline(always)]
+@@ -523,12 +537,12 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
+-        if self.binary && self.detect_binary(buf, range)? {
+-            return Ok(false);
++    ) -> Result<Flow, S::Error> {
++        if self.binary && self.detect_binary(buf, range)? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+-        if !self.sink_break_context(range.start())? {
+-            return Ok(false);
++        if self.sink_break_context(range.start())? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.count_lines(buf, range.start());
+         let offset = self.absolute_byte_offset + range.start() as u64;
+@@ -544,22 +558,22 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 bytes_range_in_buffer: range.start()..range.end(),
+             },
+         )?;
+-        if !keepgoing {
+-            return Ok(false);
++        if keepgoing == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.last_line_visited = range.end();
+         self.after_context_left = self.config.after_context;
+         self.has_sunk = true;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn sink_before_context(
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
+-        if self.binary && self.detect_binary(buf, range)? {
+-            return Ok(false);
++    ) -> Result<Flow, S::Error> {
++        if self.binary && self.detect_binary(buf, range)? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.count_lines(buf, range.start());
+         let offset = self.absolute_byte_offset + range.start() as u64;
+@@ -574,23 +588,23 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 line_number: self.line_number,
+             },
+         )?;
+-        if !keepgoing {
+-            return Ok(false);
++        if keepgoing == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.last_line_visited = range.end();
+         self.has_sunk = true;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn sink_after_context(
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         assert!(self.after_context_left >= 1);
+ 
+-        if self.binary && self.detect_binary(buf, range)? {
+-            return Ok(false);
++        if self.binary && self.detect_binary(buf, range)? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.count_lines(buf, range.start());
+         let offset = self.absolute_byte_offset + range.start() as u64;
+@@ -605,22 +619,22 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 line_number: self.line_number,
+             },
+         )?;
+-        if !keepgoing {
+-            return Ok(false);
++        if keepgoing == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.last_line_visited = range.end();
+         self.after_context_left -= 1;
+         self.has_sunk = true;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn sink_other_context(
+         &mut self,
+         buf: &[u8],
+         range: &Range,
+-    ) -> Result<bool, S::Error> {
+-        if self.binary && self.detect_binary(buf, range)? {
+-            return Ok(false);
++    ) -> Result<Flow, S::Error> {
++        if self.binary && self.detect_binary(buf, range)? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.count_lines(buf, range.start());
+         let offset = self.absolute_byte_offset + range.start() as u64;
+@@ -635,24 +649,24 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
+                 line_number: self.line_number,
+             },
+         )?;
+-        if !keepgoing {
+-            return Ok(false);
++        if keepgoing == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         self.last_line_visited = range.end();
+         self.has_sunk = true;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn sink_break_context(
+         &mut self,
+         start_of_line: usize,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         let is_gap = self.last_line_visited < start_of_line;
+         let any_context =
+             self.config.before_context > 0 || self.config.after_context > 0;
+ 
+         if !any_context || !self.has_sunk || !is_gap {
+-            Ok(true)
++            Ok(Flow::Continue)
+         } else {
+             self.sink.context_break(&self.searcher)
+         }
+diff --git a/crates/searcher/src/searcher/glue.rs b/crates/searcher/src/searcher/glue.rs
+index defb9c4..378393e 100644
+--- a/crates/searcher/src/searcher/glue.rs
++++ b/crates/searcher/src/searcher/glue.rs
+@@ -1,4 +1,4 @@
+-use grep_matcher::Matcher;
++use grep_matcher::{Flow, Matcher};
+ 
+ use crate::{
+     line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader},
+@@ -36,9 +36,9 @@ where
+     }
+ 
+     pub(crate) fn run(mut self) -> Result<(), S::Error> {
+-        if self.core.begin()? {
+-            while self.fill()? {
+-                if !self.core.match_by_line(self.rdr.buffer())? {
++        if self.core.begin()? == Flow::Continue {
++            while self.fill()? == Flow::Continue {
++                if self.core.match_by_line(self.rdr.buffer())? == Flow::Stop {
+                     self.consume_remaining();
+                     break;
+                 }
+@@ -55,7 +55,7 @@ where
+         self.rdr.consume(consumed);
+     }
+ 
+-    fn fill(&mut self) -> Result<bool, S::Error> {
++    fn fill(&mut self) -> Result<Flow, S::Error> {
+         assert!(self.rdr.buffer()[self.core.pos()..].is_empty());
+ 
+         let already_binary = self.rdr.binary_byte_offset().is_some();
+@@ -68,13 +68,13 @@ where
+         };
+         if !already_binary {
+             if let Some(offset) = self.rdr.binary_byte_offset() {
+-                if !self.core.binary_data(offset)? {
+-                    return Ok(false);
++                if self.core.binary_data(offset)? == Flow::Stop {
++                    return Ok(Flow::Stop);
+                 }
+             }
+         }
+         if !didread || self.should_binary_quit() {
+-            return Ok(false);
++            return Ok(Flow::Stop);
+         }
+         // If rolling the buffer didn't result in consuming anything and if
+         // re-filling the buffer didn't add any bytes, then the only thing in
+@@ -82,9 +82,9 @@ where
+         // is nothing left to search. So forcefully quit.
+         if consumed == 0 && old_buf_len == self.rdr.buffer().len() {
+             self.rdr.consume(old_buf_len);
+-            return Ok(false);
++            return Ok(Flow::Stop);
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn should_binary_quit(&self) -> bool {
+@@ -115,14 +115,17 @@ impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {
+     }
+ 
+     pub(crate) fn run(mut self) -> Result<(), S::Error> {
+-        if self.core.begin()? {
++        if self.core.begin()? == Flow::Continue {
+             let binary_upto =
+                 std::cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+             let binary_range = Range::new(0, binary_upto);
+-            if !self.core.detect_binary(self.slice, &binary_range)? {
++            if self.core.detect_binary(self.slice, &binary_range)?
++                == Flow::Continue
++            {
+                 while !self.slice[self.core.pos()..].is_empty()
+-                    && self.core.match_by_line(self.slice)?
+-                {}
++                    && self.core.match_by_line(self.slice)? == Flow::Continue
++                {
++                }
+             }
+         }
+         let byte_count = self.byte_count();
+@@ -164,28 +167,34 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+     }
+ 
+     pub(crate) fn run(mut self) -> Result<(), S::Error> {
+-        if self.core.begin()? {
++        if self.core.begin()? == Flow::Continue {
+             let binary_upto =
+                 std::cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+             let binary_range = Range::new(0, binary_upto);
+-            if !self.core.detect_binary(self.slice, &binary_range)? {
+-                let mut keepgoing = true;
+-                while !self.slice[self.core.pos()..].is_empty() && keepgoing {
++            if self.core.detect_binary(self.slice, &binary_range)?
++                == Flow::Continue
++            {
++                let mut keepgoing = Flow::Continue;
++                while !self.slice[self.core.pos()..].is_empty()
++                    && keepgoing == Flow::Continue
++                {
+                     keepgoing = self.sink()?;
+                 }
+-                if keepgoing {
++                if keepgoing == Flow::Continue {
+                     keepgoing = match self.last_match.take() {
+-                        None => true,
++                        None => Flow::Continue,
+                         Some(last_match) => {
+-                            if self.sink_context(&last_match)? {
++                            if self.sink_context(&last_match)?
++                                == Flow::Continue
++                            {
+                                 self.sink_matched(&last_match)?;
+                             }
+-                            true
++                            Flow::Continue
+                         }
+                     };
+                 }
+                 // Take care of any remaining context after the last match.
+-                if keepgoing {
++                if keepgoing == Flow::Continue {
+                     if self.config.passthru {
+                         self.core.other_context_by_line(
+                             self.slice,
+@@ -205,7 +214,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+         self.core.finish(byte_count, binary_byte_offset)
+     }
+ 
+-    fn sink(&mut self) -> Result<bool, S::Error> {
++    fn sink(&mut self) -> Result<Flow, S::Error> {
+         if self.config.invert_match {
+             return self.sink_matched_inverted();
+         }
+@@ -213,7 +222,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+             Some(range) => range,
+             None => {
+                 self.core.set_pos(self.slice.len());
+-                return Ok(true);
++                return Ok(Flow::Continue);
+             }
+         };
+         self.advance(&mat);
+@@ -227,7 +236,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+         match self.last_match.take() {
+             None => {
+                 self.last_match = Some(line);
+-                Ok(true)
++                Ok(Flow::Continue)
+             }
+             Some(last_match) => {
+                 // If the lines in the previous match overlap with the lines
+@@ -245,11 +254,11 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+                 // And also the associated commit fixing #1311.
+                 if last_match.end() >= line.start() {
+                     self.last_match = Some(last_match.with_end(line.end()));
+-                    Ok(true)
++                    Ok(Flow::Continue)
+                 } else {
+                     self.last_match = Some(line);
+-                    if !self.sink_context(&last_match)? {
+-                        return Ok(false);
++                    if self.sink_context(&last_match)? == Flow::Stop {
++                        return Ok(Flow::Stop);
+                     }
+                     self.sink_matched(&last_match)
+                 }
+@@ -257,7 +266,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+         }
+     }
+ 
+-    fn sink_matched_inverted(&mut self) -> Result<bool, S::Error> {
++    fn sink_matched_inverted(&mut self) -> Result<Flow, S::Error> {
+         assert!(self.config.invert_match);
+ 
+         let invert_match = match self.find()? {
+@@ -278,10 +287,10 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+             }
+         };
+         if invert_match.is_empty() {
+-            return Ok(true);
++            return Ok(Flow::Continue);
+         }
+-        if !self.sink_context(&invert_match)? {
+-            return Ok(false);
++        if self.sink_context(&invert_match)? == Flow::Stop {
++            return Ok(Flow::Stop);
+         }
+         let mut stepper = LineStep::new(
+             self.config.line_term.as_byte(),
+@@ -289,39 +298,45 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
+             invert_match.end(),
+         );
+         while let Some(line) = stepper.next_match(self.slice) {
+-            if !self.sink_matched(&line)? {
+-                return Ok(false);
++            if self.sink_matched(&line)? == Flow::Stop {
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+-    fn sink_matched(&mut self, range: &Range) -> Result<bool, S::Error> {
++    fn sink_matched(&mut self, range: &Range) -> Result<Flow, S::Error> {
+         if range.is_empty() {
+             // The only way we can produce an empty line for a match is if we
+             // match the position immediately following the last byte that we
+             // search, and where that last byte is also the line terminator. We
+             // never want to report that match, and we know we're done at that
+             // point anyway, so stop the search.
+-            return Ok(false);
++            return Ok(Flow::Stop);
+         }
+         self.core.matched(self.slice, range)
+     }
+ 
+-    fn sink_context(&mut self, range: &Range) -> Result<bool, S::Error> {
++    fn sink_context(&mut self, range: &Range) -> Result<Flow, S::Error> {
+         if self.config.passthru {
+-            if !self.core.other_context_by_line(self.slice, range.start())? {
+-                return Ok(false);
++            if self.core.other_context_by_line(self.slice, range.start())?
++                == Flow::Stop
++            {
++                return Ok(Flow::Stop);
+             }
+         } else {
+-            if !self.core.after_context_by_line(self.slice, range.start())? {
+-                return Ok(false);
++            if self.core.after_context_by_line(self.slice, range.start())?
++                == Flow::Stop
++            {
++                return Ok(Flow::Stop);
+             }
+-            if !self.core.before_context_by_line(self.slice, range.start())? {
+-                return Ok(false);
++            if self.core.before_context_by_line(self.slice, range.start())?
++                == Flow::Stop
++            {
++                return Ok(Flow::Stop);
+             }
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn find(&mut self) -> Result<Option<Range>, S::Error> {
+@@ -1514,7 +1529,7 @@ and exhibited clearly, with a label attached.\
+                 haystack,
+                 sinks::Lossy(|n, line| {
+                     print!("{}:{}", n, line);
+-                    Ok(true)
++                    Ok(Flow::Continue)
+                 }),
+             )
+             .unwrap();
+@@ -1540,7 +1555,7 @@ and exhibited clearly, with a label attached.\
+                 b"GATC\n",
+                 crate::sinks::UTF8(|_, _| {
+                     matched = true;
+-                    Ok(true)
++                    Ok(Flow::Continue)
+                 }),
+             )
+             .unwrap();
+diff --git a/crates/searcher/src/sink.rs b/crates/searcher/src/sink.rs
+index 67d6898..788f512 100644
+--- a/crates/searcher/src/sink.rs
++++ b/crates/searcher/src/sink.rs
+@@ -1,6 +1,6 @@
+ use std::io;
+ 
+-use grep_matcher::LineTerminator;
++use grep_matcher::{Flow, LineTerminator};
+ 
+ use crate::{
+     lines::LineIter,
+@@ -90,7 +90,7 @@ impl SinkError for Box<dyn std::error::Error> {
+ /// Callers must, at minimum, specify the behavior when an error occurs and
+ /// the behavior when a match occurs. The rest is optional. For each behavior,
+ /// callers may report an error (say, if writing the result to another
+-/// location failed) or simply return `false` if they want the search to stop
++/// location failed) or simply return `Flow::Stop` if they want the search to stop
+ /// (e.g., when implementing a cap on the number of search results to show).
+ ///
+ /// When errors are reported (whether in the searcher or in the implementation
+@@ -115,8 +115,9 @@ pub trait Sink {
+     /// line is disabled, then the match is guaranteed to span exactly one
+     /// non-empty line (where a single line is, at minimum, a line terminator).
+     ///
+-    /// If this returns `true`, then searching continues. If this returns
+-    /// `false`, then searching is stopped immediately and `finish` is called.
++    /// If this returns `Flow::Continue`, then searching continues. If this
++    /// returns `Flow::Stop`, then searching is stopped immediately and `finish`
++    /// is called.
+     ///
+     /// If this returns an error, then searching is stopped immediately,
+     /// `finish` is not called and the error is bubbled back up to the caller
+@@ -125,16 +126,17 @@ pub trait Sink {
+         &mut self,
+         _searcher: &Searcher,
+         _mat: &SinkMatch<'_>,
+-    ) -> Result<bool, Self::Error>;
++    ) -> Result<Flow, Self::Error>;
+ 
+     /// This method is called whenever a context line is found, and is optional
+-    /// to implement. By default, it does nothing and returns `true`.
++    /// to implement. By default, it does nothing and returns `Flow::Continue`.
+     ///
+     /// In all cases, the context given is guaranteed to span exactly one
+     /// non-empty line (where a single line is, at minimum, a line terminator).
+     ///
+-    /// If this returns `true`, then searching continues. If this returns
+-    /// `false`, then searching is stopped immediately and `finish` is called.
++    /// If this returns `Flow::Continue`, then searching continues. If this
++    /// returns `Flow::Stop`, then searching is stopped immediately and `finish`
++    /// is called.
+     ///
+     /// If this returns an error, then searching is stopped immediately,
+     /// `finish` is not called and the error is bubbled back up to the caller
+@@ -144,21 +146,22 @@ pub trait Sink {
+         &mut self,
+         _searcher: &Searcher,
+         _context: &SinkContext<'_>,
+-    ) -> Result<bool, Self::Error> {
+-        Ok(true)
++    ) -> Result<Flow, Self::Error> {
++        Ok(Flow::Continue)
+     }
+ 
+     /// This method is called whenever a break in contextual lines is found,
+     /// and is optional to implement. By default, it does nothing and returns
+-    /// `true`.
++    /// `Flow::Continue`.
+     ///
+     /// A break can only occur when context reporting is enabled (that is,
+     /// either or both of `before_context` or `after_context` are greater than
+     /// `0`). More precisely, a break occurs between non-contiguous groups of
+     /// lines.
+     ///
+-    /// If this returns `true`, then searching continues. If this returns
+-    /// `false`, then searching is stopped immediately and `finish` is called.
++    /// If this returns `Flow::Continue`, then searching continues. If this
++    /// returns `Flow::Stop`, then searching is stopped immediately and `finish`
++    /// is called.
+     ///
+     /// If this returns an error, then searching is stopped immediately,
+     /// `finish` is not called and the error is bubbled back up to the caller
+@@ -167,8 +170,8 @@ pub trait Sink {
+     fn context_break(
+         &mut self,
+         _searcher: &Searcher,
+-    ) -> Result<bool, Self::Error> {
+-        Ok(true)
++    ) -> Result<Flow, Self::Error> {
++        Ok(Flow::Continue)
+     }
+ 
+     /// This method is called whenever binary detection is enabled and binary
+@@ -176,35 +179,37 @@ pub trait Sink {
+     /// once for the first occurrence with the absolute byte offset at which
+     /// the binary data begins.
+     ///
+-    /// If this returns `true`, then searching continues. If this returns
+-    /// `false`, then searching is stopped immediately and `finish` is called.
++    /// If this returns `Flow::Continue`, then searching continues. If this
++    /// returns `Flow::Stop`, then searching is stopped immediately and `finish`
++    /// is called.
+     ///
+     /// If this returns an error, then searching is stopped immediately,
+     /// `finish` is not called and the error is bubbled back up to the caller
+     /// of the searcher.
+     ///
+-    /// By default, it does nothing and returns `true`.
++    /// By default, it does nothing and returns `Flow::Continue`.
+     #[inline]
+     fn binary_data(
+         &mut self,
+         _searcher: &Searcher,
+         _binary_byte_offset: u64,
+-    ) -> Result<bool, Self::Error> {
+-        Ok(true)
++    ) -> Result<Flow, Self::Error> {
++        Ok(Flow::Continue)
+     }
+ 
+     /// This method is called when a search has begun, before any search is
+     /// executed. By default, this does nothing.
+     ///
+-    /// If this returns `true`, then searching continues. If this returns
+-    /// `false`, then searching is stopped immediately and `finish` is called.
++    /// If this returns `Flow::Continue`, then searching continues. If this
++    /// returns `Flow::Stop`, then searching is stopped immediately and `finish`
++    /// is called.
+     ///
+     /// If this returns an error, then searching is stopped immediately,
+     /// `finish` is not called and the error is bubbled back up to the caller
+     /// of the searcher.
+     #[inline]
+-    fn begin(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+-        Ok(true)
++    fn begin(&mut self, _searcher: &Searcher) -> Result<Flow, Self::Error> {
++        Ok(Flow::Continue)
+     }
+ 
+     /// This method is called when a search has completed. By default, this
+@@ -230,7 +235,7 @@ impl<'a, S: Sink> Sink for &'a mut S {
+         &mut self,
+         searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).matched(searcher, mat)
+     }
+ 
+@@ -239,7 +244,7 @@ impl<'a, S: Sink> Sink for &'a mut S {
+         &mut self,
+         searcher: &Searcher,
+         context: &SinkContext<'_>,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).context(searcher, context)
+     }
+ 
+@@ -247,7 +252,7 @@ impl<'a, S: Sink> Sink for &'a mut S {
+     fn context_break(
+         &mut self,
+         searcher: &Searcher,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).context_break(searcher)
+     }
+ 
+@@ -256,12 +261,12 @@ impl<'a, S: Sink> Sink for &'a mut S {
+         &mut self,
+         searcher: &Searcher,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).binary_data(searcher, binary_byte_offset)
+     }
+ 
+     #[inline]
+-    fn begin(&mut self, searcher: &Searcher) -> Result<bool, S::Error> {
++    fn begin(&mut self, searcher: &Searcher) -> Result<Flow, S::Error> {
+         (**self).begin(searcher)
+     }
+ 
+@@ -283,7 +288,7 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
+         &mut self,
+         searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).matched(searcher, mat)
+     }
+ 
+@@ -292,7 +297,7 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
+         &mut self,
+         searcher: &Searcher,
+         context: &SinkContext<'_>,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).context(searcher, context)
+     }
+ 
+@@ -300,7 +305,7 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
+     fn context_break(
+         &mut self,
+         searcher: &Searcher,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).context_break(searcher)
+     }
+ 
+@@ -309,12 +314,12 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
+         &mut self,
+         searcher: &Searcher,
+         binary_byte_offset: u64,
+-    ) -> Result<bool, S::Error> {
++    ) -> Result<Flow, S::Error> {
+         (**self).binary_data(searcher, binary_byte_offset)
+     }
+ 
+     #[inline]
+-    fn begin(&mut self, searcher: &Searcher) -> Result<bool, S::Error> {
++    fn begin(&mut self, searcher: &Searcher) -> Result<Flow, S::Error> {
+         (**self).begin(searcher)
+     }
+ 
+@@ -519,6 +524,8 @@ pub mod sinks {
+ 
+     use crate::searcher::Searcher;
+ 
++    use grep_matcher::Flow;
++
+     use super::{Sink, SinkError, SinkMatch};
+ 
+     /// A sink that provides line numbers and matches as strings while ignoring
+@@ -531,19 +538,19 @@ pub mod sinks {
+     ///
+     /// The closure accepts two parameters: a line number and a UTF-8 string
+     /// containing the matched data. The closure returns a
+-    /// `Result<bool, std::io::Error>`. If the `bool` is `false`, then the
+-    /// search stops immediately. Otherwise, searching continues.
++    /// `Result<Flow, std::io::Error>`. If the `Flow` is `Flow::Stop`, then
++    /// the search stops immediately. Otherwise, searching continues.
+     ///
+     /// If multi line mode was enabled, the line number refers to the line
+     /// number of the first line in the match.
+     #[derive(Clone, Debug)]
+     pub struct UTF8<F>(pub F)
+     where
+-        F: FnMut(u64, &str) -> Result<bool, io::Error>;
++        F: FnMut(u64, &str) -> Result<Flow, io::Error>;
+ 
+     impl<F> Sink for UTF8<F>
+     where
+-        F: FnMut(u64, &str) -> Result<bool, io::Error>,
++        F: FnMut(u64, &str) -> Result<Flow, io::Error>,
+     {
+         type Error = io::Error;
+ 
+@@ -551,7 +558,7 @@ pub mod sinks {
+             &mut self,
+             _searcher: &Searcher,
+             mat: &SinkMatch<'_>,
+-        ) -> Result<bool, io::Error> {
++        ) -> Result<Flow, io::Error> {
+             let matched = match std::str::from_utf8(mat.bytes()) {
+                 Ok(matched) => matched,
+                 Err(err) => return Err(io::Error::error_message(err)),
+@@ -579,19 +586,19 @@ pub mod sinks {
+     ///
+     /// The closure accepts two parameters: a line number and a UTF-8 string
+     /// containing the matched data. The closure returns a
+-    /// `Result<bool, std::io::Error>`. If the `bool` is `false`, then the
+-    /// search stops immediately. Otherwise, searching continues.
++    /// `Result<Flow, std::io::Error>`. If the `Flow` is `Flow::Stop`, then
++    /// the search stops immediately. Otherwise, searching continues.
+     ///
+     /// If multi line mode was enabled, the line number refers to the line
+     /// number of the first line in the match.
+     #[derive(Clone, Debug)]
+     pub struct Lossy<F>(pub F)
+     where
+-        F: FnMut(u64, &str) -> Result<bool, io::Error>;
++        F: FnMut(u64, &str) -> Result<Flow, io::Error>;
+ 
+     impl<F> Sink for Lossy<F>
+     where
+-        F: FnMut(u64, &str) -> Result<bool, io::Error>,
++        F: FnMut(u64, &str) -> Result<Flow, io::Error>,
+     {
+         type Error = io::Error;
+ 
+@@ -599,7 +606,7 @@ pub mod sinks {
+             &mut self,
+             _searcher: &Searcher,
+             mat: &SinkMatch<'_>,
+-        ) -> Result<bool, io::Error> {
++        ) -> Result<Flow, io::Error> {
+             use std::borrow::Cow;
+ 
+             let matched = match std::str::from_utf8(mat.bytes()) {
+@@ -629,19 +636,19 @@ pub mod sinks {
+     ///
+     /// The closure accepts two parameters: a line number and a raw byte string
+     /// containing the matched data. The closure returns a
+-    /// `Result<bool, std::io::Error>`. If the `bool` is `false`, then the
+-    /// search stops immediately. Otherwise, searching continues.
++    /// `Result<Flow, std::io::Error>`. If the `Flow` is `Flow::Stop`, then
++    /// the search stops immediately. Otherwise, searching continues.
+     ///
+     /// If multi line mode was enabled, the line number refers to the line
+     /// number of the first line in the match.
+     #[derive(Clone, Debug)]
+     pub struct Bytes<F>(pub F)
+     where
+-        F: FnMut(u64, &[u8]) -> Result<bool, io::Error>;
++        F: FnMut(u64, &[u8]) -> Result<Flow, io::Error>;
+ 
+     impl<F> Sink for Bytes<F>
+     where
+-        F: FnMut(u64, &[u8]) -> Result<bool, io::Error>,
++        F: FnMut(u64, &[u8]) -> Result<Flow, io::Error>,
+     {
+         type Error = io::Error;
+ 
+@@ -649,7 +656,7 @@ pub mod sinks {
+             &mut self,
+             _searcher: &Searcher,
+             mat: &SinkMatch<'_>,
+-        ) -> Result<bool, io::Error> {
++        ) -> Result<Flow, io::Error> {
+             let line_number = match mat.line_number() {
+                 Some(line_number) => line_number,
+                 None => {
+diff --git a/crates/searcher/src/testutil.rs b/crates/searcher/src/testutil.rs
+index 99e297d..38ac331 100644
+--- a/crates/searcher/src/testutil.rs
++++ b/crates/searcher/src/testutil.rs
+@@ -3,7 +3,8 @@ use std::io::{self, Write};
+ use {
+     bstr::ByteSlice,
+     grep_matcher::{
+-        LineMatchKind, LineTerminator, Match, Matcher, NoCaptures, NoError,
++        Flow, LineMatchKind, LineTerminator, Match, Matcher, NoCaptures,
++        NoError,
+     },
+     regex::bytes::{Regex, RegexBuilder},
+ };
+@@ -132,7 +133,7 @@ impl Sink for KitchenSink {
+         &mut self,
+         _searcher: &Searcher,
+         mat: &SinkMatch<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         assert!(!mat.bytes().is_empty());
+         assert!(mat.lines().count() >= 1);
+ 
+@@ -148,14 +149,14 @@ impl Sink for KitchenSink {
+             byte_offset += line.len() as u64;
+             self.0.write_all(line)?;
+         }
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn context(
+         &mut self,
+         _searcher: &Searcher,
+         context: &SinkContext<'_>,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         assert!(!context.bytes().is_empty());
+         assert!(context.lines().count() == 1);
+ 
+@@ -164,15 +165,15 @@ impl Sink for KitchenSink {
+         }
+         write!(self.0, "{}-", context.absolute_byte_offset)?;
+         self.0.write_all(context.bytes())?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn context_break(
+         &mut self,
+         _searcher: &Searcher,
+-    ) -> Result<bool, io::Error> {
++    ) -> Result<Flow, io::Error> {
+         self.0.write_all(b"--\n")?;
+-        Ok(true)
++        Ok(Flow::Continue)
+     }
+ 
+     fn finish(

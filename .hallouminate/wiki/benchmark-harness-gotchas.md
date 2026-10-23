@@ -129,6 +129,16 @@ It extends these attachment and billing checks to that runner.
 Native FeatureBench has failure-denominator, best-attempt, and credential-metadata pitfalls.
 The page records the reporting rules and the native admission round trip. This page documents no FeatureBench run.
 
+## Local migration graders: the agent workspace has no installed dependencies
+
+`run._agent_repo` makes each cell's workspace with `git worktree add --detach`. That checkout holds tracked files only.
+Gitignored dependencies such as `node_modules/` or `.venv/` are absent, so a grader must not run a project tool from the workspace.
+PR #369 first ran `node_modules/.bin/mocha` in the workspace and crashed every real cell with `FileNotFoundError`.
+Its preflight hid the bug: the preflight clone symlinks the fixture's `node_modules`.
+Grade in a fresh fixture copy, as `express_edit_example_start` now does for both runs. Catch `OSError` as a failure, not a crash.
+
+A grader that shares one cargo target dir across grades must lock it from the mtime refresh through the last cargo command.
+Otherwise two parallel grades can build each other's sources. `rg_edit_flow_migration` holds `TARGET_DIR/.grade.lock` for the whole grade (PR #371).
 ## Related GEPA gotchas
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.
