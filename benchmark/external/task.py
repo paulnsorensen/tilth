@@ -33,15 +33,15 @@ from pathlib import Path, PurePosixPath
 import baselines
 from tasks.base import GroundTruth, Task, TaskSource
 
-from . import data, patches, proc
+from . import data, javascript, patches, proc
 
 # The external package; its grading modules key an external task's run.
 PACKAGE_DIR = Path(__file__).resolve().parent
 _NON_GRADING_MODULES = frozenset({"contamination.py", "download.py", "preflight.py"})
 # Paths the prepared workdir excludes from git; grading never copies them.
-EXCLUDED_PATHS = (".venv/", "target/")
+EXCLUDED_PATHS = (".venv/", "target/", "node_modules/")
 _SKIPPED_TOP = {".git", ".venv", "target"}
-_SKIPPED_ANYWHERE = {".git", "__pycache__", ".pytest_cache"}
+_SKIPPED_ANYWHERE = {".git", "__pycache__", ".pytest_cache", "node_modules"}
 _PREPARED_COMMIT_ENV = {
     "GIT_AUTHOR_NAME": "tilth-bench",
     "GIT_AUTHOR_EMAIL": "tilth-bench@localhost",
@@ -57,6 +57,7 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _COMMAND_PREFIXES = {"sudo", "exec", "command", "env", "nohup", "time"}
 _PYTHON_TIMEOUT_S = 1200
 _COMPILED_TIMEOUT_S = 1800
+_JAVASCRIPT_TIMEOUT_S = 1200
 # pytest reads these; grading resets every one to base_commit so the agent cannot change outcomes.
 _PYTEST_CONFIG_NAMES = frozenset({
     "conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini", "setup.cfg",
@@ -258,7 +259,7 @@ class ExternalTask(Task):
 
     @property
     def timeout_s(self) -> int:
-        return _PYTHON_TIMEOUT_S if self.language == "python" else _COMPILED_TIMEOUT_S
+        return {"python": _PYTHON_TIMEOUT_S, "javascript": _JAVASCRIPT_TIMEOUT_S}.get(self.language, _COMPILED_TIMEOUT_S)
 
     # --- instance data ---
 
@@ -343,6 +344,8 @@ class ExternalTask(Task):
         hashes = self.base_file_hashes(baselines.EXTERNAL_DEPENDENCY_FILES)
         if self.python_version:
             hashes["python_version"] = self.python_version
+        if self.language == "javascript":
+            hashes["node_version"] = javascript.NODE_VERSION
         return hashes
 
     def dependency_hashes(self) -> dict[str, str]:
@@ -366,12 +369,14 @@ class ExternalTask(Task):
                 for line in go_mod.splitlines():
                     if line.startswith("module "):
                         return line.split()[1]
+            elif self.language == "javascript":
+                return str(json.loads((self.base_file("package.json") or b"").decode())["name"])
             elif manifest := self.base_file(manifests[self.language][0]):
                 value = tomllib.loads(manifest.decode())
                 for key in manifests[self.language][1]:
                     value = value[key]
                 return str(value)
-        except (PrepareError, tomllib.TOMLDecodeError, KeyError, TypeError, UnicodeDecodeError):
+        except (PrepareError, tomllib.TOMLDecodeError, ValueError, KeyError, TypeError, UnicodeDecodeError):
             pass
         return self.upstream_repo.rsplit("/", 1)[-1]
 
@@ -423,6 +428,14 @@ class ExternalTask(Task):
         Steps run under ``proc.toolchain_env`` with a throwaway HOME.
         """
         venv = venv or workdir / ".venv"
+        if self.language == "javascript":
+            self.copy_seed(workdir)
+            exclude = workdir / ".git" / "info" / "exclude"
+            if exclude.is_file():  # the agent workdir: keep seeded build outputs out of git status
+                _, paths = self.js_seed()
+                with exclude.open("a") as handle:
+                    handle.writelines(f"/{path}\n" for path in paths)
+            return
         if self.language == "go":
             steps = [["go", "mod", "download"]]
         elif self.language == "rust":
@@ -472,6 +485,76 @@ class ExternalTask(Task):
                 self.build_env(root / "tree", venv)
                 (root / "ready").touch()
         return venv
+
+    def js_seed(self) -> tuple[Path, list[str]]:
+        """The prepared tree with dependencies installed, built once per (instance, env fingerprint).
+
+        Its ``node_modules`` directories and build outputs are copied into the agent workdir and into each
+        grading checkout. The install runs in the harness tree with harness-owned caches, never in an agent tree.
+        So packages the agent installs cannot steer grading.
+        """
+        from .preflight import env_fingerprint  # preflight imports this module
+
+        root = data.data_dir() / "envs" / self.data_rev / self.name / env_fingerprint(self) / "node"
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not (root / "ready").is_file():
+                shutil.rmtree(root / "tree", ignore_errors=True)
+                self.export_prepared(root / "tree")
+                self._install_node_modules(root / "tree")
+                copied = [*javascript.module_dirs(root / "tree"), *javascript.built_paths(root / "tree", self.base_paths)]
+                (root / "copy.json").write_text(json.dumps(copied))
+                (root / "ready").touch()
+            return root / "tree", json.loads((root / "copy.json").read_text())
+
+    def _install_node_modules(self, tree: Path) -> None:
+        # Dependencies the gold patch adds to package.json are installed too, so the held-out tests can load them.
+        overlay = "".join(text for path, text in patches.split_files(self.gold_patch)
+                          if PurePosixPath(path).name == "package.json")
+        if overlay and not apply_patch(tree, overlay):
+            raise EnvBuildError("the package.json part of the gold patch does not apply to the base tree")
+        with tempfile.TemporaryDirectory(prefix="tilth-external-home-", ignore_cleanup_errors=True) as home:
+            env = proc.toolchain_env(Path(home))
+            try:
+                javascript.package_env(env, data.data_dir() / "js-cache")
+            except OSError as error:
+                raise EnvBuildError(f"harness Node download failed: {error}") from error
+            for argv in (javascript.install_argv(tree, frozen=not overlay), javascript.build_argv(tree)):
+                if argv is None:
+                    continue
+                try:
+                    result = proc.run(argv, cwd=tree, env=env, timeout=_ENV_STEP_TIMEOUT_S)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    raise EnvBuildError(f"{shlex.join(argv)}: {error}") from error
+                if result.returncode:
+                    raise EnvBuildError(f"{shlex.join(argv)} exited {result.returncode}: "
+                                        f"{(result.stderr or result.stdout).strip()[-800:]}")
+
+    def copy_seed(self, dest: Path) -> None:
+        """Copy the seed's ``node_modules`` directories and build outputs into ``dest``, replacing what is there."""
+        tree, paths = self.js_seed()
+        for relative in paths:
+            target = checkout_path(dest, relative)  # drops an agent symlink on the way, so nothing escapes dest
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            else:
+                shutil.rmtree(target, ignore_errors=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copied = proc.run(["cp", "-a", str(tree / relative), str(target)])
+            if copied.returncode:
+                raise EnvBuildError(f"copying {relative} failed: {copied.stderr.strip()[-300:]}")
+
+    def restore_js_config(self, checkout: Path) -> None:
+        """Reset every runner configuration file to ``base_commit``, and the runner keys of each ``package.json``."""
+        for relative in sorted(_tree_files(checkout) | self.base_paths):
+            name = PurePosixPath(relative).name
+            if name == "package.json":
+                target = checkout_path(checkout, relative)
+                current = target.read_bytes() if target.is_file() else None
+                write_or_remove(checkout, relative, javascript.reset_package_json(current, self.base_file(relative)))
+            elif javascript.is_config(name):
+                write_or_remove(checkout, relative, self.base_file(relative))
 
     # --- grading ---
 
@@ -538,6 +621,8 @@ class ExternalTask(Task):
         env = proc.toolchain_env(home)
         proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language)
         env.update(proc.c_build_env(self.language))
+        if self.language == "javascript":
+            javascript.package_env(env, checkout.with_name(f"{checkout.name}-caches") / "js")
         return env
 
     def grading_env(self, checkout: Path) -> dict[str, str]:
@@ -574,6 +659,8 @@ class ExternalTask(Task):
                 if self.language == "python":
                     self.prune_added_top_level(checkout)
                     self.restore_test_config(checkout)
+                elif self.language == "javascript":
+                    self.restore_js_config(checkout)
                 self.restore_heldout(checkout)
             except (PrepareError, OSError) as error:
                 return False, f"Grading checkout failed: {error}"

@@ -46,8 +46,21 @@ REPO_LANGUAGES = {
     "astral-sh/ruff": "rust",
     "burntsushi/ripgrep": "rust",
     "uutils/coreutils": "rust",
+    # JavaScript covers TypeScript too: the test runners transpile it.
+    **{repo: "javascript" for repo in (
+        "axios/axios", "mrdoob/three.js", "vuejs/core", "facebook/docusaurus", "preactjs/preact",
+    )},
 }
-LANGUAGES = ("python", "go", "rust")
+# npm names each JavaScript repo publishes. A monorepo's root package.json names a private workspace, not these.
+# A trailing "/*" covers every package in the scope.
+NPM_PACKAGES = {
+    "axios/axios": ("axios",),
+    "mrdoob/three.js": ("three",),
+    "vuejs/core": ("vue", "@vue/*"),
+    "facebook/docusaurus": ("@docusaurus/*", "create-docusaurus"),
+    "preactjs/preact": ("preact",),
+}
+LANGUAGES = ("python", "go", "rust", "javascript")
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

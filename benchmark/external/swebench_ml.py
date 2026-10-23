@@ -18,7 +18,7 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import data, patches, proc
+from . import data, javascript, patches, proc
 from .featurebench import JUNIT_OPTIONS, junit_results
 from .task import ExternalTask, PrepareError, apply_patch, read_report, read_row, report_path, write_or_remove
 
@@ -33,7 +33,8 @@ _GO_VERDICTS = {"pass", "fail", "skip"}
 _CARGO_RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)")
 _PYTEST_PASSING = {"PASSED", "XFAIL", "XPASS"}
 
-# gepa-v2 candidates: Go and Rust instances whose gold patch changes at least two source files.
+# gepa-v2 candidates: Go, Rust, and JavaScript instances whose gold patch changes at least two source files.
+# preact-3689 is out: its tests run in Karma, and the harness runs no browser.
 GEPA_V2_CANDIDATES = (
     "prometheus__prometheus-9248", "hashicorp__terraform-35543", "sharkdp__bat-1892", "tokio-rs__axum-734",
     "tokio-rs__axum-1119", "tokio-rs__axum-682", "gin-gonic__gin-1957", "tokio-rs__axum-1730",
@@ -43,6 +44,8 @@ GEPA_V2_CANDIDATES = (
     "prometheus__prometheus-10633", "sharkdp__bat-2201", "sharkdp__bat-2260", "sharkdp__bat-2650",
     "sharkdp__bat-2835", "sharkdp__bat-562", "tokio-rs__axum-691", "tokio-rs__tokio-6551", "tokio-rs__tokio-6838",
     "uutils__coreutils-6377", "uutils__coreutils-6575",
+    "prometheus__prometheus-10720", "axios__axios-5316", "mrdoob__three.js-27395", "mrdoob__three.js-26589",
+    "vuejs__core-11739", "facebook__docusaurus-9183",
 )
 PROMPT_INSTRUCTION = (
     "Resolve the following issue by changing the code of the repository in the current checkout. "
@@ -101,6 +104,8 @@ def test_results(report: str, language: str) -> list[tuple[str, bool]]:
     if language == "go":
         return [(event["Test"], event["Action"] == "pass") for event in _go_events(report)
                 if event.get("Action") in _GO_VERDICTS and isinstance(event.get("Test"), str)]
+    if language == "javascript":
+        return javascript.parse(report)
     if language == "rust":
         return [(match[1], match[2] == "ok") for line in report.splitlines() if (match := _CARGO_RESULT.match(line))]
     return [(node, status in _PYTEST_PASSING) for status, node in junit_results(report)]
@@ -185,7 +190,28 @@ class SweBenchTask(ExternalTask):
                 (root / "ready").touch()
         return root / "target"
 
+    def javascript_output(self, checkout: Path, command: str) -> tuple[str, str]:
+        """Run the row's test command with its runner pointed at a JSON report; return the log and normalized report."""
+        try:
+            runner = javascript.runner_of(command)
+        except javascript.UnsupportedRunner as error:
+            raise PrepareError(str(error)) from error
+        self.copy_seed(checkout)
+        report = report_path(checkout, "js-report")
+        reporter = report_path(checkout, "qunit-reporter.cjs")
+        reporter.write_text(javascript.QUNIT_REPORTER)
+        command, extra = javascript.rewrite(command, runner, report, reporter)
+        env = {**self.grade_env(checkout), **extra}
+        result = proc.run(["bash", "-c", command], cwd=checkout, env=env, timeout=self.timeout_s)
+        try:
+            normalized = javascript.normalize(runner, read_report(report), checkout) if report.is_file() else "[]"
+        except (ValueError, KeyError, TypeError, AttributeError):  # a malformed report fails every test
+            normalized = "[]"
+        return result.stdout + result.stderr, normalized
+
     def test_output(self, checkout: Path) -> tuple[str, str]:
+        if self.language == "javascript":
+            return self.javascript_output(checkout, test_command(self.row["eval_script"]))
         env = self.grading_env(checkout) if self.language == "python" else self.grade_env(checkout)
         command = test_command(self.row["eval_script"])
         report = report_path(checkout, "pytest.xml")
