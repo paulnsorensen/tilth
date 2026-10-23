@@ -85,6 +85,40 @@ def test_classify_limits_changes_to_rust_sources(tmp_path, monkeypatch):
     assert _classify(candidate, "crates/ignore/src/lib.rs") is None
     assert _classify(candidate, "crates/matcher/../../etc.rs") is None
     assert _classify(candidate, "Cargo.lock") is None
+    # The rg binary crate has no src/: its sources sit directly under crates/core.
+    (candidate / "crates/core/flags").mkdir(parents=True)
+    (candidate / "crates/core/search.rs").write_text("")
+    (candidate / "crates/core/flags/defs.rs").write_text("")
+    (candidate / "crates/core/README.md").write_text("")
+    assert _classify(candidate, "crates/core/search.rs") == "source"
+    assert _classify(candidate, "crates/core/flags/defs.rs") == "source"
+    assert _classify(candidate, "crates/core/README.md") is None
+
+
+def test_a_grade_waits_for_the_shared_target_dir(tmp_path, monkeypatch):
+    import fcntl
+
+    candidate = _fake_roots(tmp_path, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + 600))
+    cargo = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout=" M crates/matcher/src/lib.rs\n", stderr="")
+        cargo.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    module.TARGET_DIR.mkdir(parents=True)
+    with open(module.TARGET_DIR / ".grade.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # another grade is building
+        ok, reason = module.RgFlowMigrationTask().check_correctness("", str(candidate))
+
+    assert not ok
+    assert reason.startswith(module.TIMEOUT_REASON) and "waiting" in reason, reason
+    assert cargo == [], "no build runs while another grade holds the target dir"
 
 
 # The preflight builds the workspace ten times, so it runs only on request: RG_FLOW_PREFLIGHT=1.
@@ -99,6 +133,7 @@ def test_grader_reference_and_negative_controls():
 def _fake_roots(tmp_path, monkeypatch):
     fixture = tmp_path / "fixture"
     candidate = tmp_path / "candidate"
+    monkeypatch.setattr(module, "TARGET_DIR", tmp_path / "target")
     for root in (fixture, candidate):
         (root / "crates/matcher/src").mkdir(parents=True)
         (root / "crates/matcher/src/lib.rs").write_text("")

@@ -1,10 +1,12 @@
 """Forward ripgrep control-flow migration (bool to Flow) with trusted, external grading tests."""
 
+import fcntl
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .base import GroundTruth, Task
@@ -86,18 +88,51 @@ def _refresh_sources(directory: Path) -> None:
                 pass
 
 
+@contextmanager
+def _target_lock(deadline: float):
+    """Hold the shared target dir for one whole grade; yield False when the deadline passes first.
+
+    Two grades that interleave could each build the other's sources: the newer refresh wins
+    cargo's mtime check for both.
+    """
+    TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TARGET_DIR / ".grade.lock", "w") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(1)
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _grade(directory: Path, label: str, deadline: float) -> str | None:
     """Run the graded commands; return a failure reason or None.
 
     A timeout says nothing about the code under test, so its reason starts with
     TIMEOUT_REASON and never reads as "tests failed".
     """
+    with _target_lock(deadline) as locked:
+        if not locked:
+            return f"{TIMEOUT_REASON}: {label} grade hit the grading deadline waiting for {TARGET_DIR}"
+        return _grade_locked(directory, label, deadline)
+
+
+def _grade_locked(directory: Path, label: str, deadline: float) -> str | None:
     _refresh_sources(directory)
     warm = _warm_command()
     try:
         result = _bounded(warm, directory, WARM_TIMEOUT_S, deadline)
     except subprocess.TimeoutExpired:
         return f"{TIMEOUT_REASON}: {label} build warm-up timed out or hit the grading deadline: {' '.join(warm)}"
+    except OSError as error:
+        return f"{label} build could not start: {error}"
     if result.returncode:
         return f"{label} tests failed: {' '.join(warm)}\n{(result.stderr + result.stdout)[-1200:]}"
     for command in _grade_commands():
@@ -124,11 +159,13 @@ def _classify(candidate: Path, relative: str) -> str | None:
     path = Path(relative)
     parts = path.parts
     entry = candidate / relative
-    if path.suffix != ".rs" or len(parts) < 4 or parts[0] != "crates" or ".." in parts:
+    if path.suffix != ".rs" or len(parts) < 3 or parts[0] != "crates" or ".." in parts:
         return None
-    if parts[1] not in SOURCE_CRATES or parts[2] not in SOURCE_DIRS:
+    if parts[1] not in SOURCE_CRATES or entry.is_symlink() or not entry.is_file():
         return None
-    if entry.is_symlink() or not entry.is_file():
+    if parts[1] == "core":  # the rg binary crate keeps its sources directly under crates/core
+        return "source"
+    if len(parts) < 4 or parts[2] not in SOURCE_DIRS:
         return None
     exists = (FIXTURE / relative).exists()
     if parts[2] == "tests":
