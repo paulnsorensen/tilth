@@ -33,6 +33,23 @@ _GO_VERDICTS = {"pass", "fail", "skip"}
 _CARGO_RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)")
 _PYTEST_PASSING = {"PASSED", "XFAIL", "XPASS"}
 
+# gepa-v2 candidates: Go and Rust instances whose gold patch changes at least two source files.
+GEPA_V2_CANDIDATES = (
+    "prometheus__prometheus-9248", "hashicorp__terraform-35543", "sharkdp__bat-1892", "tokio-rs__axum-734",
+    "tokio-rs__axum-1119", "tokio-rs__axum-682", "gin-gonic__gin-1957", "tokio-rs__axum-1730",
+    "tokio-rs__axum-1934", "caddyserver__caddy-5626", "hashicorp__terraform-34900", "sharkdp__bat-2393",
+    "sharkdp__bat-3108", "tokio-rs__axum-2096",
+    "astral-sh__ruff-15443", "burntsushi__ripgrep-2576", "caddyserver__caddy-4774", "caddyserver__caddy-6288",
+    "prometheus__prometheus-10633", "sharkdp__bat-2201", "sharkdp__bat-2260", "sharkdp__bat-2650",
+    "sharkdp__bat-2835", "sharkdp__bat-562", "tokio-rs__axum-691", "tokio-rs__tokio-6551", "tokio-rs__tokio-6838",
+    "uutils__coreutils-6377", "uutils__coreutils-6575",
+)
+PROMPT_INSTRUCTION = (
+    "Resolve the following issue by changing the code of the repository in the current checkout. "
+    "The issue text follows the line of dashes.\n\n"
+    "----------\n"
+)
+
 
 def candidates() -> list[str]:
     return [instance_id for picks in PICKS.values() for instance_id in picks]
@@ -113,6 +130,10 @@ def entry_verdicts(report: str, entries: Sequence[str], language: str) -> dict[s
 
 class SweBenchTask(ExternalTask):
     dataset = data.SWEBENCH_ML
+
+    @property
+    def prompt(self) -> str:
+        return PROMPT_INSTRUCTION + self.problem_statement
 
     @property
     def gold_patch(self) -> str:

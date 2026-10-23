@@ -4,6 +4,7 @@
 It also admits the per-language SWE-bench Multilingual picks.
 It tries a fallback pick only when the primary is refused.
 ``--panel PATH`` admits exactly the external members of a panel.
+``--ids a,b`` and ``--candidates gepa-v2`` admit an explicit list and exit nonzero only for a missing row.
 Both forms fetch uncached rows first.
 Both forms exit nonzero when a required family has no admitted instance.
 
@@ -286,8 +287,34 @@ def _panel(path: Path) -> int:
     return 1 if refused or not featurebench_admitted else 0
 
 
+def gepa_v2_ids() -> list[str]:
+    return [*featurebench.GEPA_V2_CANDIDATES, *swebench_ml.GEPA_V2_CANDIDATES]
+
+
+def _ids(instance_ids: list[str]) -> int:
+    """Admit each ID; a FeatureBench ID has dots, a SWE-bench Multilingual ID has none. Only a missing row fails."""
+    for dataset in _EXTERNAL_FAMILIES:
+        is_featurebench = dataset == data.FEATUREBENCH
+        if wanted := [i for i in instance_ids if ("." in i) == is_featurebench]:
+            _ensure_rows(dataset, wanted)
+    verdicts = [_admit_and_print(instance_id) for instance_id in instance_ids]
+    admitted = sum(verdict is not None and verdict.admitted for verdict in verdicts)
+    print(f"admitted: {admitted}/{len(instance_ids)}")
+    missing = [instance_id for instance_id, verdict in zip(instance_ids, verdicts) if verdict is None]
+    for instance_id in missing:
+        print(f"ERROR: {instance_id} has no row", file=sys.stderr)
+    return 1 if missing else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Admit external benchmark instances on this host")
     parser.add_argument("--panel", type=Path, help="Admit exactly this panel's external members")
+    parser.add_argument("--ids", help="Admit exactly these comma-separated instance IDs")
+    parser.add_argument("--candidates", choices=["gepa-v2"], help="Admit the named candidate list")
     args = parser.parse_args(argv)
+    if args.ids or args.candidates:
+        ids = [item.strip() for item in (args.ids or "").split(",") if item.strip()]
+        if args.candidates:
+            ids = [*gepa_v2_ids(), *(i for i in ids if i not in gepa_v2_ids())]
+        return _ids(ids)
     return _panel(args.panel) if args.panel else _candidates()
