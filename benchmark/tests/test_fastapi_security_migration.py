@@ -52,7 +52,7 @@ def test_grader_reference_and_negative_controls():
     preflight()
 
 
-def test_grader_timeout_is_inconclusive_not_a_test_failure(tmp_path, monkeypatch):
+def _stub_candidate(tmp_path, monkeypatch):
     candidate = tmp_path / "candidate"
     (candidate / "fastapi" / "security").mkdir(parents=True)
     (candidate / "fastapi" / "security" / "base.py").write_text("")
@@ -60,6 +60,32 @@ def test_grader_timeout_is_inconclusive_not_a_test_failure(tmp_path, monkeypatch
     monkeypatch.setattr(module, "_restore_tests", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "FIXTURE", tmp_path / "fixture")
     (tmp_path / "fixture" / "fastapi" / "security").mkdir(parents=True)
+    return candidate
+
+
+def test_grading_stops_at_one_total_deadline(tmp_path, monkeypatch):
+    candidate = _stub_candidate(tmp_path, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    timeouts = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout=" M fastapi/security/base.py\n", stderr="")
+        timeouts.append(kwargs["timeout"])
+        clock[0] += module.GRADE_DEADLINE_S  # passes, but uses the whole budget
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    ok, reason = module.FastAPISecurityMigrationTask().check_correctness("", str(candidate))
+
+    assert not ok
+    assert reason.startswith(module.TIMEOUT_REASON) and "deadline" in reason, reason
+    assert timeouts == [module.GRADE_TIMEOUT_S], "the candidate run never starts after the deadline"
+
+
+def test_grader_timeout_is_inconclusive_not_a_test_failure(tmp_path, monkeypatch):
+    candidate = _stub_candidate(tmp_path, monkeypatch)
 
     commands = []
 

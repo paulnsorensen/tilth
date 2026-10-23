@@ -24,7 +24,9 @@ The bar was at least 10 files and 40 sites.
 Rejects paths outside `fastapi/security/*.py` and the original affected tests.
 Copies the permitted source into a fresh copy of the fixture. Restores the pinned
 tests with a mechanical rename, injects the held-out tests, and runs 41 modules in one
-pytest process (within the 4-worker cap). It runs the trusted tree, then the candidate tree.
+pytest process (within the 4-worker cap). It runs the trusted tree, then the candidate tree,
+under one 30-minute deadline. The held-out file also checks that each documented scheme's
+`raise_on_missing` `Doc` names the new keyword.
 
 ## Interpreter
 
@@ -55,8 +57,9 @@ both keywords accepted: rejected Trusted tests failed: pytest 41 modules
 warning points inside FastAPI: rejected Trusted tests failed: pytest 41 modules
 auto_error attribute removed: rejected Trusted tests failed: pytest 41 modules
 default flipped to optional: rejected Trusted tests failed: pytest 41 modules
+api_key.py docs still name auto_error: rejected Trusted tests failed: pytest 41 modules
 ```
 
-Incomplete-migration controls: oauth2, openid, one class, one test module.
+Incomplete-migration controls: oauth2, openid, one class, one test module, stale parameter docs.
 Behavior-breaking controls: no `TypeError`, wrong `stacklevel`, no attribute alias, inverted default.
 The unchanged tree is rejected by the "No source changes" guard before any test runs.
