@@ -154,9 +154,16 @@ def main() -> None:
                 edit(t / "fastapi/security/base.py", "return True if raise_on_missing is None else raise_on_missing", "return False if raise_on_missing is None else raise_on_missing")
             return rejected("inverted-default", "default flipped to optional", mutate, "Trusted tests failed")
 
+        def stale_docs() -> str:
+            def mutate(t: Path) -> None:
+                path = t / "fastapi/security/api_key.py"
+                path.write_text(path.read_text().replace("`raise_on_missing` is set to `False`", "`auto_error` is set to `False`"))
+            return rejected("stale-docs", "api_key.py docs still name auto_error", mutate, "Trusted tests failed")
+
         controls = (
             original, reference, local_helper, unrelated_path, tests_unmigrated, oauth2_unmigrated,
             openid_unmigrated, one_class_unmigrated, no_type_error, wrong_stacklevel, no_alias, inverted_default,
+            stale_docs,
         )
         for control in controls:
             print(control(), flush=True)

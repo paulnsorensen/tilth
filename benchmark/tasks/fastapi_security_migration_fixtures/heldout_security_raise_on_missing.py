@@ -1,5 +1,7 @@
 """Held-out checks for the ``auto_error`` to ``raise_on_missing`` migration."""
 
+import inspect
+import typing
 import warnings
 
 import pytest
@@ -154,3 +156,14 @@ def test_openapi_security_schemes_are_unchanged():
         "Bear": {"type": "http", "scheme": "bearer"},
         "Key": {"type": "apiKey", "name": "k", "in": "query"},
     }
+
+
+# Every scheme but HTTPBase documented auto_error with a Doc annotation.
+@pytest.mark.parametrize("name", [name for name in NAMES if name != "HTTPBase"])
+def test_parameter_docs_use_the_new_name(name):
+    scheme = type(FACTORIES[name]())
+    annotation = inspect.signature(scheme.__init__).parameters["raise_on_missing"].annotation
+    docs = [item.documentation for item in typing.get_args(annotation)[1:] if hasattr(item, "documentation")]
+    assert docs, f"{name}.raise_on_missing has no Doc"
+    assert "`raise_on_missing` is set to `False`" in " ".join(docs[0].split())
+    assert "`auto_error` is set" not in " ".join(docs[0].split())

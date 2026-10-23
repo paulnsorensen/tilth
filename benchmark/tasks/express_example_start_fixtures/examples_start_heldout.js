@@ -10,6 +10,7 @@ const { spawn, spawnSync } = require('node:child_process')
 
 const ROOT = path.resolve(__dirname, '..')
 const EXAMPLES = path.join(ROOT, 'examples')
+const START = path.join(EXAMPLES, 'start.js')
 const STARTED = /Express started on port (\d+)/
 
 // Examples that start without external services, with one request each.
@@ -61,9 +62,12 @@ function request (port, pathname, headers) {
 }
 
 function launch (script, env) {
+  const childEnv = Object.assign({}, process.env, { NODE_ENV: '' }, env)
+  // An undefined value unsets the variable.
+  for (const key of Object.keys(childEnv)) if (childEnv[key] === undefined) delete childEnv[key]
   const child = spawn(process.execPath, [script], {
     cwd: ROOT,
-    env: Object.assign({}, process.env, { NODE_ENV: '' }, env)
+    env: childEnv
   })
   const run = { child, stdout: '', stderr: '' }
   child.stdout.setEncoding('utf8')
@@ -196,9 +200,7 @@ describe('HeldOut examples/start helper', function () {
     it('uses the default port argument when PORT is unset or invalid', async function () {
       for (const portEnv of [undefined, 'abc', '']) {
         const port = await freePort()
-        const env = { TEST_DEFAULT_PORT: String(port) }
-        if (portEnv !== undefined) env.PORT = portEnv
-        else env.PORT = ''
+        const env = { TEST_DEFAULT_PORT: String(port), PORT: portEnv }
         const run = launch(path.join(dir, 'app.js'), env)
         try {
           assert.strictEqual(await run.started, port)
@@ -404,14 +406,14 @@ describe('HeldOut examples/start helper', function () {
 
     it('only examples/start.js calls listen', function () {
       const offenders = exampleFiles(EXAMPLES).filter(function (file) {
-        return path.basename(file) !== 'start.js' && /\.listen\(/.test(fs.readFileSync(file, 'utf8'))
+        return file !== START && /\.listen\(/.test(fs.readFileSync(file, 'utf8'))
       })
       assert.deepStrictEqual(offenders.map(function (f) { return path.relative(ROOT, f) }), [])
     })
 
     it('only examples/start.js reads process.env.NODE_ENV in code', function () {
       const offenders = exampleFiles(EXAMPLES).filter(function (file) {
-        if (path.basename(file) === 'start.js') return false
+        if (file === START) return false
         return fs.readFileSync(file, 'utf8').split('\n').some(function (line) {
           return /process\.env\.NODE_ENV/.test(line) && !/^\s*(\/\/|\*)/.test(line)
         })

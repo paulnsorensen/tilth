@@ -27,6 +27,7 @@ def test_example_start_task_contract():
 def test_grader_commands_add_the_held_out_file_only_for_trusted_grading():
     assert _grade_commands(True) == [[*MOCHA, "test/acceptance/", HELD_OUT_TARGET]]
     assert _grade_commands(False) == [[*MOCHA, "test/acceptance/"]]
+    assert _grade_commands(False, ["test/start.js"]) == [[*MOCHA, "test/acceptance/", "test/start.js"]]
 
 
 def test_classify_allows_only_examples_and_new_top_level_tests(tmp_path, monkeypatch):
@@ -112,3 +113,39 @@ def test_grading_stops_at_one_total_deadline(tmp_path, monkeypatch):
     assert reason.startswith(module.TIMEOUT_REASON), reason
     assert "deadline" in reason
     assert all(0 < timeout <= remaining for timeout, remaining in timeouts), timeouts
+
+
+def test_candidate_grade_runs_in_a_fixture_copy_with_the_new_tests(tmp_path, monkeypatch):
+    module, candidate = _stub_candidate(tmp_path, monkeypatch)
+    (candidate / "test").mkdir()
+    (candidate / "test" / "start.js").write_text("")
+    runs = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout="?? examples/start.js\n?? test/start.js\n", stderr="")
+        runs.append((command[len(MOCHA):], Path(kwargs["cwd"])))
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    ok, reason = module.ExpressExampleStartTask().check_correctness("", str(candidate))
+
+    assert ok, reason
+    assert [targets for targets, _ in runs] == [["test/acceptance/", HELD_OUT_TARGET], ["test/acceptance/", "test/start.js"]]
+    # The agent workspace has no node_modules, so no grading run may use it.
+    assert all(cwd != candidate for _, cwd in runs)
+
+
+def test_a_missing_runner_is_a_failure_not_a_crash(tmp_path, monkeypatch):
+    module, candidate = _stub_candidate(tmp_path, monkeypatch)
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout="?? examples/start.js\n", stderr="")
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    ok, reason = module.ExpressExampleStartTask().check_correctness("", str(candidate))
+
+    assert not ok
+    assert "could not start" in reason

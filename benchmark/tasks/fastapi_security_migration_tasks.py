@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from .base import GroundTruth, Task
@@ -23,6 +24,8 @@ EXTRA_MODULES = (
 )
 # pytest runs in one process, which is within the four-worker cap for graders.
 GRADE_TIMEOUT_S = 900
+# One deadline covers the trusted and the candidate run.
+GRADE_DEADLINE_S = 1800
 TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 PYTEST_COMMAND = ["uv", "run", "pytest", "-q", "-p", "no:cacheprovider"]
 
@@ -43,13 +46,18 @@ def _run(command: list[str], cwd: Path, timeout: int = GRADE_TIMEOUT_S) -> subpr
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
 
 
-def _grade(directory: Path, label: str, modules: list[str]) -> str | None:
+def _grade(directory: Path, label: str, modules: list[str], deadline: float) -> str | None:
     """Run the affected modules; return a failure reason or None."""
     command = [*PYTEST_COMMAND, *modules]
+    remaining = deadline - time.monotonic()
     try:
-        result = _run(command, directory)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 0)
+        result = _run(command, directory, min(GRADE_TIMEOUT_S, remaining))
     except subprocess.TimeoutExpired:
-        return f"{TIMEOUT_REASON}: {label} tests timed out: pytest {len(modules)} modules"
+        return f"{TIMEOUT_REASON}: {label} tests timed out or hit the grading deadline: pytest {len(modules)} modules"
+    except OSError as error:
+        return f"{label} tests could not start: {error}"
     if result.returncode:
         detail = (result.stdout + result.stderr)[-1500:]
         return f"{label} tests failed: pytest {len(modules)} modules\n{detail}"
@@ -142,6 +150,7 @@ class FastAPISecurityMigrationTask(Task):
                 source_changes.add(relative)
         if not source_changes:
             return False, "No security scheme changes"
+        deadline = time.monotonic() + GRADE_DEADLINE_S
         with tempfile.TemporaryDirectory(prefix="fastapi-security-grade-") as temp:
             target = Path(temp)
             shutil.copytree(FIXTURE, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git", "__pycache__"))
@@ -149,10 +158,10 @@ class FastAPISecurityMigrationTask(Task):
                 shutil.copy2(candidate / relative, target / relative)
             _restore_tests(target)
             modules = [*affected_modules(target), HELD_OUT_TARGET]
-            failure = _grade(target, "Trusted", modules)
+            failure = _grade(target, "Trusted", modules, deadline)
             if failure:
                 return False, failure
-        failure = _grade(candidate, "Candidate", affected_modules(candidate))
+        failure = _grade(candidate, "Candidate", affected_modules(candidate), deadline)
         if failure:
             return False, failure
         return True, "Trusted and candidate tests pass"
