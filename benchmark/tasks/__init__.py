@@ -42,6 +42,7 @@ from .gin_multi_edit_tasks import GinMultiContextTask
 from .gin_render_cascade_tasks import GinRenderContractCascadeTask
 from .gin_render_runtime_tasks import GinRenderRuntimeCascadeTask
 from .gin_render_context_tasks import GinRenderContextTask
+from .express_example_start_tasks import ExpressExampleStartTask
 from .gin_route_logic_tasks import GinRouteCatchAllLogicTask
 from .gin_route_logic_nogit_tasks import GinRouteCatchAllNoGitTask
 from .express_tasks import (
@@ -124,6 +125,7 @@ TASKS = {
     "gin_edit_render_cascade": GinRenderContractCascadeTask(),
     "gin_edit_render_runtime": GinRenderRuntimeCascadeTask(),
     "gin_edit_render_context": GinRenderContextTask(),
+    "express_edit_example_start": ExpressExampleStartTask(),
     "gin_edit_route_catchall": GinRouteCatchAllLogicTask(),
     "gin_edit_route_catchall_nogit": GinRouteCatchAllNoGitTask(),
     # express (JavaScript)
