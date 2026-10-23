@@ -42,6 +42,7 @@ searcher example not migrated: rejected Trusted tests failed: cargo test -j4 --n
 quiet summary no longer stops: rejected Trusted tests failed: cargo test -j4 ...
 searcher ignores an after-context Stop: rejected Trusted tests failed: cargo test -j4 ...
 try_find_iter ignores Stop: rejected Trusted tests failed: cargo test -j4 ...
+reference then printers not migrated, same directory and target dir: rejected Trusted tests failed: cargo test -j4 --no-run ...
 preflight exit=0
 ```
 
@@ -49,6 +50,15 @@ preflight exit=0
 - Behavior-breaking controls (3): the quiet summary stops no more, the searcher ignores an after-context `Stop`, `try_find_iter` ignores `Stop`. Each compiles and fails a test.
 - An earlier `searcher_stop` control, on a rare match-limit path, was accepted. It was replaced by the after-context site.
 
+## Stale shared build
+
+The grader keeps one persistent `CARGO_TARGET_DIR`. Cargo judges a workspace crate fresh when no source is newer than its dep-info, and a copied tree keeps old mtimes.
+
+- In the normal flow the trusted copy lives in a random temp directory. The path is part of each crate's identity, so the preflight order (reference, then printers not migrated) never reused a build. The risk shows when the same directory path is graded twice.
+- Reproduction: the `stale_target` control grades the reference in one directory, then restores the old printer files (old mtimes) in the same directory and grades again. With `_refresh_sources` disabled, the second grade was wrongly accepted (`AssertionError: incomplete migration passed on a target dir warmed by the reference`).
+- Fix: `_grade` first calls `_refresh_sources`, which sets the mtime of every file outside `target/` and `.git/` to now. Every workspace crate rebuilds per grade. Third party crates stay cached. The helper is local, modelled on `refresh_sources` in `benchmark/external/swebench_ml.py`, to avoid importing that module.
+- With the fix, `stale_target` rejects the second grade (last result line above).
+- Offline test: `test_grade_makes_every_workspace_source_newer_than_the_shared_build_before_cargo_runs`.
 ## Known gap
 
 Most ripgrep tests are in-source `#[cfg(test)]` modules. The candidate controls them. Only the held-out integration tests and the trusted matcher test are protected. The grader also runs the candidate copy, so a candidate that breaks its own in-source tests fails.

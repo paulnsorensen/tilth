@@ -69,12 +69,30 @@ def _bounded(command: list[str], cwd: Path, per_command: int, deadline: float) -
     return _run(command, cwd, min(per_command, remaining))
 
 
+def _refresh_sources(directory: Path) -> None:
+    """Set the mtime of every file outside target/ and .git/ to now.
+
+    Cargo judges a workspace crate fresh when no source is newer than its dep-info in the shared
+    target dir. A copied tree keeps old mtimes, so without this a grade could reuse the compiled
+    crates of an earlier grade. Third party crates live in the registry and stay cached.
+    """
+    for current, names, files in os.walk(directory):
+        if Path(current) == directory:
+            names[:] = [name for name in names if name not in {"target", ".git"}]
+        for name in files:
+            try:
+                os.utime(Path(current, name), follow_symlinks=False)
+            except OSError:
+                pass
+
+
 def _grade(directory: Path, label: str, deadline: float) -> str | None:
     """Run the graded commands; return a failure reason or None.
 
     A timeout says nothing about the code under test, so its reason starts with
     TIMEOUT_REASON and never reads as "tests failed".
     """
+    _refresh_sources(directory)
     warm = _warm_command()
     try:
         result = _bounded(warm, directory, WARM_TIMEOUT_S, deadline)

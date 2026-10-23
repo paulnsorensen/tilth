@@ -165,3 +165,26 @@ def test_failed_command_is_a_test_failure(tmp_path, monkeypatch):
     assert not ok
     assert reason.startswith("Trusted tests failed"), reason
     assert not reason.startswith(module.TIMEOUT_REASON)
+
+
+def test_grade_makes_every_workspace_source_newer_than_the_shared_build_before_cargo_runs(tmp_path, monkeypatch):
+    source = tmp_path / "crates" / "printer" / "src" / "lib.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text("fn main() {}\n")
+    (tmp_path / ".git").mkdir()
+    git_file = tmp_path / ".git" / "HEAD"
+    git_file.write_text("ref\n")
+    old = 1_000_000_000
+    for path in (source, git_file):
+        os.utime(path, (old, old))
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(source.stat().st_mtime)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert module._grade(tmp_path, "Trusted", module.time.monotonic() + 3600) is None
+
+    assert seen and all(mtime > old + 1_000_000 for mtime in seen), seen
+    assert git_file.stat().st_mtime == old, "git metadata is left alone"

@@ -150,11 +150,30 @@ def main() -> None:
             assert_rejected(ok, reason)
             return f"try_find_iter ignores Stop: rejected {first_line(reason)}"
 
+        def stale_target() -> str:
+            """Grade the reference, then an incomplete copy in the same directory, on one target dir.
+
+            The printer files return with their old fixture mtimes, so a cargo build keyed on
+            source mtimes would reuse the migrated printer from the first grade.
+            """
+            target = candidate("stale-target")
+            module._inject_tests(target)
+            first = module._grade(target, "Trusted", time.monotonic() + module.GRADE_DEADLINE_S)
+            assert first is None, first
+            revert(target, PRINTER_FILES)
+            reason = module._grade(target, "Trusted", time.monotonic() + module.GRADE_DEADLINE_S)
+            assert reason, "incomplete migration passed on a target dir warmed by the reference"
+            assert_rejected(False, reason)
+            return f"reference then printers not migrated, same directory and target dir: rejected {first_line(reason)}"
+
         # One cargo build at a time: the controls share one target dir and the host limit is 4 jobs.
         controls = (original, original_with_held_out_tests, reference, unsafe_manifest, incomplete_printers,
-                    incomplete_matchers, incomplete_example, quiet_summary, searcher_stop, find_iter_stop)
+                    incomplete_matchers, incomplete_example, quiet_summary, searcher_stop, find_iter_stop,
+                    stale_target)
+        selected = set(sys.argv[1:])
         for control in controls:
-            print(control(), flush=True)
+            if not selected or control.__name__ in selected:
+                print(control(), flush=True)
 
 
 if __name__ == "__main__":
