@@ -26,6 +26,7 @@ from .fastapi_edit_tasks import (
     FastAPIEditScopeCacheTask,
 )
 from .fastapi_multi_edit_tasks import FastAPIMultiResponseTask
+from .fastapi_security_migration_tasks import FastAPISecurityMigrationTask
 from .gin_tasks import (
     GinRadixTreeTask,
     GinClientIPTask,
@@ -112,6 +113,7 @@ TASKS = {
     "fastapi_edit_dep_cache": FastAPIEditDepCacheTask(),
     "fastapi_edit_response_filter": FastAPIEditResponseFilterTask(),
     "fastapi_edit_scope_cache": FastAPIEditScopeCacheTask(),
+    "fastapi_edit_security_raise_on_missing": FastAPISecurityMigrationTask(),
     # gin (Go)
     "gin_radix_tree": GinRadixTreeTask(),
     "gin_client_ip": GinClientIPTask(),
