@@ -84,7 +84,7 @@ def test_qunit_reporter_appends_one_line_per_finished_test(tmp_path):
     script = ("let handler; globalThis.QUnit = {on: (_, fn) => { handler = fn; }};"
               f"require({json.dumps(str(reporter))});"
               "handler({fullName: ['M', 'a'], status: 'passed'}); handler({fullName: ['M', 'b'], status: 'failed'});")
-    subprocess.run(["node", "-e", script], check=True, env={"TILTH_QUNIT_REPORT": str(report), "PATH": "/usr/bin:/bin"})
+    subprocess.run([shutil.which("node"), "-e", script], check=True, env={"TILTH_QUNIT_REPORT": str(report), "PATH": "/usr/bin:/bin"})
     assert json.loads(javascript.normalize("qunit", report.read_text(), tmp_path)) == [["M > a", True], ["M > b", False]]
 
 
