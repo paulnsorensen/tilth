@@ -205,7 +205,7 @@ class SweBenchTask(ExternalTask):
         result = proc.run(["bash", "-c", command], cwd=checkout, env=env, timeout=self.timeout_s)
         try:
             normalized = javascript.normalize(runner, read_report(report), checkout) if report.is_file() else "[]"
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):  # a malformed report fails every test
             normalized = "[]"
         return result.stdout + result.stderr, normalized
 

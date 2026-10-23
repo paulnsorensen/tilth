@@ -430,6 +430,11 @@ class ExternalTask(Task):
         venv = venv or workdir / ".venv"
         if self.language == "javascript":
             self.copy_seed(workdir)
+            exclude = workdir / ".git" / "info" / "exclude"
+            if exclude.is_file():  # the agent workdir: keep seeded build outputs out of git status
+                _, paths = self.js_seed()
+                with exclude.open("a") as handle:
+                    handle.writelines(f"/{path}\n" for path in paths)
             return
         if self.language == "go":
             steps = [["go", "mod", "download"]]
@@ -530,7 +535,7 @@ class ExternalTask(Task):
         """Copy the seed's ``node_modules`` directories and build outputs into ``dest``, replacing what is there."""
         tree, paths = self.js_seed()
         for relative in paths:
-            target = dest / relative
+            target = checkout_path(dest, relative)  # drops an agent symlink on the way, so nothing escapes dest
             if target.is_symlink() or target.is_file():
                 target.unlink()
             else:

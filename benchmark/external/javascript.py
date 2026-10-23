@@ -100,7 +100,7 @@ def parse(report: str) -> list[tuple[str, bool]]:
 
 # Files the runners read. Grading resets each one to base_commit, so the agent cannot steer a run through them.
 CONFIG_PREFIXES = (
-    "jest.config", "jest.setup", "vitest.config", "vitest.workspace", "vite.config", "babel.config", "karma.conf",
+    "jest.config", "jest.setup", "vitest.", "vite.config", "babel.config", "karma.conf",
     ".mocharc", ".babelrc", ".npmrc", ".yarnrc", ".pnpmfile", ".qunitrc", "tsconfig",
 )
 # package.json keys that configure a runner or run commands.

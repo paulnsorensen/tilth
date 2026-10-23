@@ -99,9 +99,25 @@ def test_package_json_reset_keeps_dependency_edits_and_restores_scripts():
 
 
 def test_config_files_are_recognised():
-    for name in ("jest.config.js", "vitest.config.ts", ".mocharc.json", ".npmrc", "tsconfig.json", "babel.config.cjs"):
+    for name in ("jest.config.js", "vitest.config.ts", "vitest.unit.config.ts", "vitest.workspace.ts",
+                 ".mocharc.json", ".npmrc", "tsconfig.json", "babel.config.cjs"):
         assert javascript.is_config(name)
     assert not javascript.is_config("index.js")
+
+
+def test_copy_seed_never_writes_through_an_agent_symlink(tmp_path):
+    seed, checkout, outside = tmp_path / "seed", tmp_path / "checkout", tmp_path / "outside"
+    (seed / "pkg" / "src").mkdir(parents=True)
+    (seed / "pkg" / "src" / "gen.js").write_text("seed")
+    outside.mkdir()
+    (outside / "gen.js").write_text("victim")
+    (checkout / "pkg").mkdir(parents=True)
+    (checkout / "pkg" / "src").symlink_to(outside)
+    fake = type("Seeded", (), {"js_seed": lambda self: (seed, ["pkg/src/gen.js"])})()
+    task.ExternalTask.copy_seed(fake, checkout)
+    assert (outside / "gen.js").read_text() == "victim"
+    assert not (checkout / "pkg" / "src").is_symlink()
+    assert (checkout / "pkg" / "src" / "gen.js").read_text() == "seed"
 
 
 def test_install_follows_the_lockfile(tmp_path):

@@ -51,6 +51,15 @@ REPO_LANGUAGES = {
         "axios/axios", "mrdoob/three.js", "vuejs/core", "facebook/docusaurus", "preactjs/preact",
     )},
 }
+# npm names each JavaScript repo publishes. A monorepo's root package.json names a private workspace, not these.
+# A trailing "/*" covers every package in the scope.
+NPM_PACKAGES = {
+    "axios/axios": ("axios",),
+    "mrdoob/three.js": ("three",),
+    "vuejs/core": ("vue", "@vue/*"),
+    "facebook/docusaurus": ("@docusaurus/*", "create-docusaurus"),
+    "preactjs/preact": ("preact",),
+}
 LANGUAGES = ("python", "go", "rust", "javascript")
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
