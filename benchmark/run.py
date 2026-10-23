@@ -1918,6 +1918,18 @@ def build_candidate(sha: str, *, repo: Path | None = None) -> CandidateBuild:
     return _CANDIDATE_BUILDS[full]
 
 
+def discard_candidate_build(sha: str) -> None:
+    """Delete the kept binary and record of the full ``sha`` and forget its cache entry; the shared target stays.
+
+    A later ``build_candidate(sha)`` rebuilds. Only a 40-hex sha is accepted, so no argument can name
+    ``candidates/target`` or a path outside ``candidates/``.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError(f"discard_candidate_build needs a full 40-hex sha, got {sha!r}")
+    _CANDIDATE_BUILDS.pop(sha, None)
+    shutil.rmtree(RESULTS_DIR / "candidates" / sha, ignore_errors=True)
+
+
 def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
     return replace(mode, binary_path=build.binary_path, git_ref=build.git_sha, git_sha=build.git_sha,
                    binary_sha256=build.binary_sha256)
