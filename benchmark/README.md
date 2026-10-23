@@ -148,6 +148,7 @@ A row with no trajectory sidecar is `contaminated: true` with an `unscanned` hit
 A panel (`benchmark/panels/<name>.json`) is a fixed task set. The cheap tier holds the three local hard tasks: `rg_search_dispatch`, `rg_trait_implementors`, and `gin_servehttp_flow`.
 The panel also holds `gin_edit_render_context`, at least one FeatureBench Lite Level 1 instance, and one Go and one Rust SWE-bench Multilingual slot member. A slot member is the primary or its fallback: `gin-gonic__gin-3741` or `prometheus__prometheus-14861`, and `sharkdp__bat-2650` or `tokio-rs__tokio-6724`. A fallback names `fallback_for` and `fallback_reason`.
 `panels.stratify` splits the other members into dev and test. Within each source family, members sort by language and `sha256("<split_seed>:<id>")`. The split then alternates dev, test.
+A panel file may carry a top-level `"version": 2` (an integer; absent means version 1). A version 2 panel is a screened pool with no cheap tier: its members are only `dev` or `test`, a local member is any non-external task in `tasks.TASKS`, and a SWE-bench Multilingual member is a `GEPA_V2_CANDIDATES` or slot id with no `fallback_for` or `fallback_reason`. It needs at least one dev and one test member, and `panels.stratify` still fixes the split. `Panel.cheap` is empty, and `evolve` sends a candidate straight to the dev tier.
 
 ```bash
 python3 benchmark/run.py --panel benchmark/panels/gepa-v1.json --panel-split dev \

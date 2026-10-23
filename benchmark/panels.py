@@ -6,6 +6,12 @@ the required members, each member's language, the fallback rules, the tiers,
 the stratified split, external admission on this host, and the split lock. The
 lock is the first completed stored row stamped with the panel's name: after it,
 a changed split must be pre-registered under a new panel name.
+
+A panel with top-level ``"version": 2`` is a screened pool with no cheap tier:
+splits are only dev and test, a local member is any non-external task in
+``tasks.TASKS``, a SWE-bench Multilingual member comes from
+``external.swebench_ml.GEPA_V2_CANDIDATES`` or a slot (with no fallback keys),
+and ``Panel.cheap`` is empty. A panel with no ``version`` is version 1.
 """
 
 import hashlib
@@ -26,6 +32,7 @@ import tasks
 
 FAMILIES = ("local", "featurebench", "swebench_ml")
 SPLITS = ("cheap", "dev", "test")
+SPLITS_V2 = ("dev", "test")
 CHEAP = ("rg_search_dispatch", "rg_trait_implementors", "gin_servehttp_flow")
 LOCAL = (*CHEAP, "gin_edit_render_context")
 # Per-language SWE-bench Multilingual slots: (primary, fallback).
@@ -138,17 +145,21 @@ def split_digest(members: Iterable[Member]) -> str:
     return baselines.canonical_digest({split: sorted(ids) for split, ids in lists.items()})
 
 
-def _parse(path: Path) -> tuple[str, int, list[Member]]:
+def _parse(path: Path) -> tuple[str, int, list[Member], int]:
     try:
         data = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise PanelError(f"{path}: cannot read panel: {error}") from error
     if not isinstance(data, dict):
         raise PanelError(f"{path}: a panel is a JSON object")
-    if unknown := sorted(set(data) - _PANEL_KEYS):
+    if unknown := sorted(set(data) - _PANEL_KEYS - {"version"}):
         raise PanelError(f"{path}: unknown key(s) {', '.join(unknown)}")
     if missing := sorted(_PANEL_KEYS - set(data)):
         raise PanelError(f"{path}: missing key(s) {', '.join(missing)}")
+    version = data.get("version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version not in (1, 2):
+        raise PanelError(f"{path}: version must be the integer 2 (absent means 1)")
+    splits = SPLITS if version == 1 else SPLITS_V2
     name, seed, entries = data["name"], data["split_seed"], data["members"]
     if not isinstance(name, str) or not name.strip():
         raise PanelError(f"{path}: name must be a non-empty string")
@@ -161,7 +172,8 @@ def _parse(path: Path) -> tuple[str, int, list[Member]]:
         if not isinstance(entry, dict):
             raise PanelError(f"{path}: each member is a JSON object")
         member_id = entry.get("id")
-        allowed = _MEMBER_KEYS | (_FALLBACK_KEYS if entry.get("family") == "swebench_ml" else set())
+        fallbacks = _FALLBACK_KEYS if version == 1 and entry.get("family") == "swebench_ml" else set()
+        allowed = _MEMBER_KEYS | fallbacks
         if unknown := sorted(set(entry) - allowed):
             raise PanelError(f"{member_id}: unknown member key(s) {', '.join(unknown)}")
         if missing := sorted(_MEMBER_KEYS - set(entry)):
@@ -173,10 +185,10 @@ def _parse(path: Path) -> tuple[str, int, list[Member]]:
         seen.add(member_id)
         if entry["family"] not in FAMILIES:
             raise PanelError(f"{member_id}: unknown family {entry['family']!r} (expected one of {', '.join(FAMILIES)})")
-        if entry["split"] not in SPLITS:
-            raise PanelError(f"{member_id}: unknown split {entry['split']!r} (expected one of {', '.join(SPLITS)})")
+        if entry["split"] not in splits:
+            raise PanelError(f"{member_id}: unknown split {entry['split']!r} (expected one of {', '.join(splits)})")
         members.append(Member(**entry))
-    return name, seed, members
+    return name, seed, members, version
 
 
 def _check_members(members: list[Member]) -> None:
@@ -221,13 +233,39 @@ def _check_complete(members: list[Member]) -> None:
         raise PanelError(f"panel is incomplete; missing: {'; '.join(missing)}")
 
 
+def _check_members_v2(members: list[Member]) -> None:
+    """Version 2: any local task, a lv1 FeatureBench id, or a SWE-bench Multilingual pool or slot id."""
+    pool = {*external.swebench_ml.GEPA_V2_CANDIDATES, *_SLOT_LANGUAGE}
+    for member in members:
+        if member.id in CHEAP:
+            raise PanelError(f"{member.id}: a version 2 panel has no cheap tier")
+        if member.family == "local":
+            task = tasks.TASKS.get(member.id)
+            if task is None or isinstance(task, external.ExternalTask):
+                raise PanelError(f"{member.id}: not a local task in TASKS")
+        elif member.family == "featurebench":
+            if external.featurebench.level_of(member.id) != "lv1" or not external.data.is_safe_id(member.id):
+                raise PanelError(f"{member.id}: not a FeatureBench Lite Level 1 instance id")
+        elif member.id not in pool:
+            raise PanelError(f"{member.id}: not in the SWE-bench Multilingual gepa-v2 pool")
+
+
+def _check_complete_v2(members: list[Member]) -> None:
+    missing = [split for split in ("dev", "test") if not any(member.split == split for member in members)]
+    if missing:
+        raise PanelError(f"panel is incomplete; no member in the {' or '.join(missing)} split")
+
+
 def _check_languages(members: list[Member], row_source: Callable[[str], Mapping[str, Any] | None]) -> None:
     for member in members:
         if member.family == "local":
             expected = config.REPOS[tasks.TASKS[member.id].repo].language
             source = "its repo language"
         else:
-            required = "python" if member.family == "featurebench" else _SLOT_LANGUAGE[member.id]
+            if member.family == "featurebench":
+                required = "python"
+            else:
+                required = _SLOT_LANGUAGE.get(member.id, member.language)
             if member.language != required:
                 raise PanelError(f"{member.id}: a {member.family} member here declares {required!r}, "
                                  f"not {member.language!r}")
@@ -302,9 +340,13 @@ def load_panel(
     ``external.preflight.admit`` and ``row_source`` to the cached dataset rows in
     ``$TILTH_BENCH_DATA``; both are looked up when called.
     """
-    name, split_seed, members = _parse(path)
-    _check_members(members)
-    _check_complete(members)
+    name, split_seed, members, version = _parse(path)
+    if version == 1:
+        _check_members(members)
+        _check_complete(members)
+    else:
+        _check_members_v2(members)
+        _check_complete_v2(members)
     _check_languages(members, row_source or external.data.cached_row)
     _check_split(members, split_seed)
     digest = split_digest(members)
