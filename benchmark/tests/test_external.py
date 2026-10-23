@@ -428,12 +428,12 @@ def test_swebench_prompt_wraps_issue_and_changes_digest(external_bench, monkeypa
 def test_gepa_v2_candidates_resolve_languages() -> None:
     candidates = external.swebench_ml.GEPA_V2_CANDIDATES
 
-    assert len(candidates) == len(set(candidates)) == 29
+    assert len(candidates) == len(set(candidates)) == 35
     for instance_id in candidates:
         owner, _, rest = instance_id.partition("__")
         name = rest.rsplit("-", 1)[0]
         row = {"repo": f"{owner}/{name}"}
-        assert external.data.language_of(row) in {"go", "rust"}, instance_id
+        assert external.data.language_of(row) in {"go", "rust", "javascript"}, instance_id
     assert set(external.swebench_ml.PICKS) == {"go", "rust"}
     assert [external.featurebench.level_of(i) for i in external.featurebench.GEPA_V2_CANDIDATES] == ["lv1"]
     assert external.featurebench.repo_of(external.featurebench.GEPA_V2_CANDIDATES[0]) in external.data.REPO_LANGUAGES

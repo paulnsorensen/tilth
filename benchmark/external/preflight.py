@@ -292,10 +292,10 @@ def gepa_v2_ids() -> list[str]:
 
 
 def _ids(instance_ids: list[str]) -> int:
-    """Admit each ID; a FeatureBench ID has dots, a SWE-bench Multilingual ID has none. Only a missing row fails."""
+    """Admit each ID; a FeatureBench ID ends in `.lv1` or `.lv2`. Only a missing row fails."""
     for dataset in _EXTERNAL_FAMILIES:
         is_featurebench = dataset == data.FEATUREBENCH
-        if wanted := [i for i in instance_ids if ("." in i) == is_featurebench]:
+        if wanted := [i for i in instance_ids if (featurebench.level_of(i) is not None) == is_featurebench]:
             _ensure_rows(dataset, wanted)
     verdicts = [_admit_and_print(instance_id) for instance_id in instance_ids]
     admitted = sum(verdict is not None and verdict.admitted for verdict in verdicts)

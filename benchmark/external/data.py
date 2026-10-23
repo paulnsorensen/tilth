@@ -46,8 +46,12 @@ REPO_LANGUAGES = {
     "astral-sh/ruff": "rust",
     "burntsushi/ripgrep": "rust",
     "uutils/coreutils": "rust",
+    # JavaScript covers TypeScript too: the test runners transpile it.
+    **{repo: "javascript" for repo in (
+        "axios/axios", "mrdoob/three.js", "vuejs/core", "facebook/docusaurus", "preactjs/preact",
+    )},
 }
-LANGUAGES = ("python", "go", "rust")
+LANGUAGES = ("python", "go", "rust", "javascript")
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
