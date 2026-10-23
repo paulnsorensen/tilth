@@ -423,6 +423,42 @@ def test_preflight_panel_form(external_bench, monkeypatch: pytest.MonkeyPatch, t
     assert external.preflight.main(["--panel", str(panel)]) != 0
     assert "featurebench" in capsys.readouterr().err
 
+
+def test_preflight_ids_form(external_bench, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    cli = _Cli(external_bench, monkeypatch, refused={SWE_RS})
+
+    assert external.preflight.main(["--ids", f"{SWE_GO},{SWE_RS},{FB_LV1}"]) == 0
+    output = capsys.readouterr().out
+    assert cli.admitted == [SWE_GO, SWE_RS, FB_LV1]
+    for instance_id in (SWE_GO, SWE_RS, FB_LV1):
+        assert f"{instance_id}: " in output
+    assert "admitted: 2/3" in output
+
+    stub_admit = external.preflight.admit
+
+    def admit_or_miss(instance_id: str) -> external.preflight.PreflightVerdict:
+        if instance_id == "fixture__missing-1":
+            raise LookupError(instance_id)
+        return stub_admit(instance_id)
+
+    monkeypatch.setattr(external.preflight, "admit", admit_or_miss)
+    assert external.preflight.main(["--ids", f"{SWE_GO},fixture__missing-1"]) != 0
+    captured = capsys.readouterr()
+    assert "fixture__missing-1: not_found" in captured.out and "admitted: 1/2" in captured.out
+    assert "fixture__missing-1" in captured.err
+
+
+def test_preflight_candidates_gepa_v2(external_bench, monkeypatch: pytest.MonkeyPatch,
+                                      capsys: pytest.CaptureFixture[str]) -> None:
+    cli = _Cli(external_bench, monkeypatch)
+    monkeypatch.setattr(external.featurebench, "GEPA_V2_CANDIDATES", (FB_F2P_EDIT,))
+    monkeypatch.setattr(external.swebench_ml, "GEPA_V2_CANDIDATES", (SWE_GO, SWE_PY))
+
+    assert external.preflight.main(["--candidates", "gepa-v2"]) == 0
+    assert cli.admitted == [FB_F2P_EDIT, SWE_GO, SWE_PY]
+    assert "admitted: 3/3" in capsys.readouterr().out
+
+
 def test_cached_rows_with_a_missing_mirror_are_mirrored_for_the_panel(external_bench,
                                                                      monkeypatch: pytest.MonkeyPatch,
                                                                      tmp_path: Path) -> None:

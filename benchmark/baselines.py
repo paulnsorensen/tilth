@@ -127,7 +127,7 @@ LOCKFILES = (
 )
 # What an external instance's base tree contributes to its environment key.
 EXTERNAL_DEPENDENCY_FILES = (
-    "Cargo.toml", "go.mod", "pyproject.toml", "setup.py", "setup.cfg", *LOCKFILES,
+    "Cargo.toml", "go.mod", "package.json", "pyproject.toml", "setup.py", "setup.cfg", *LOCKFILES,
 )
 
 
