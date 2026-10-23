@@ -22,8 +22,8 @@ GRADE_DEADLINE_S = 1800
 TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 
 
-def _grade_commands(held_out: bool) -> list[list[str]]:
-    targets = ["test/acceptance/"] + ([HELD_OUT_TARGET] if held_out else [])
+def _grade_commands(held_out: bool, new_tests: list[str] | None = None) -> list[list[str]]:
+    targets = ["test/acceptance/"] + ([HELD_OUT_TARGET] if held_out else []) + (new_tests or [])
     return [[*MOCHA, *targets]]
 
 
@@ -38,17 +38,19 @@ def _bounded(command: list[str], cwd: Path, deadline: float) -> subprocess.Compl
     return _run(command, cwd, min(GRADE_TIMEOUT_S, remaining))
 
 
-def _grade(directory: Path, label: str, deadline: float, *, held_out: bool) -> str | None:
+def _grade(directory: Path, label: str, deadline: float, *, held_out: bool, new_tests: list[str] | None = None) -> str | None:
     """Run the graded commands; return a failure reason or None.
 
     A timeout says nothing about the code under test, so its reason starts with
     TIMEOUT_REASON and never reads as "tests failed".
     """
-    for command in _grade_commands(held_out):
+    for command in _grade_commands(held_out, new_tests):
         try:
             result = _bounded(command, directory, deadline)
         except subprocess.TimeoutExpired:
             return f"{TIMEOUT_REASON}: {label} tests timed out or hit the grading deadline: {' '.join(command)}"
+        except OSError as error:
+            return f"{label} tests could not start: {' '.join(command)}: {error}"
         if result.returncode:
             detail = (result.stdout + result.stderr)[-1500:]
             return f"{label} tests failed: {' '.join(command)}\n{detail}"
@@ -136,27 +138,29 @@ class ExpressExampleStartTask(Task):
         changes = [line[3:] for line in status.stdout.splitlines()]
         if not changes:
             return False, "No source changes"
-        source_changes = set()
+        source_changes, test_changes = set(), set()
         for relative in changes:
             kind = _classify(relative, candidate)
             if kind is None:
                 return False, f"Unsafe changed path: {relative}"
-            if kind == "source":
-                source_changes.add(relative)
+            (source_changes if kind == "source" else test_changes).add(relative)
         if START_FILE not in source_changes:
             return False, f"Missing {START_FILE}"
         deadline = time.monotonic() + GRADE_DEADLINE_S
-        with tempfile.TemporaryDirectory(prefix="express-start-grade-") as temp:
-            target = Path(temp)
-            _fresh_copy(target)
-            for relative in source_changes:
-                (target / relative).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(candidate / relative, target / relative)
-            _install_held_out(target)
-            failure = _grade(target, "Trusted", deadline, held_out=True)
+        # Both runs use a fresh fixture copy: the agent workspace holds tracked files only, so it has no node_modules.
+        # Trusted: the candidate sources with the held-out tests. Candidate: the same sources with the agent's new tests.
+        runs = (("Trusted", source_changes, True), ("Candidate", source_changes | test_changes, False))
+        for label, copied, held_out in runs:
+            with tempfile.TemporaryDirectory(prefix="express-start-grade-") as temp:
+                target = Path(temp)
+                _fresh_copy(target)
+                for relative in copied:
+                    (target / relative).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(candidate / relative, target / relative)
+                if held_out:
+                    _install_held_out(target)
+                failure = _grade(target, label, deadline, held_out=held_out,
+                                 new_tests=None if held_out else sorted(test_changes))
             if failure:
                 return False, failure
-        failure = _grade(candidate, "Candidate", deadline, held_out=False)
-        if failure:
-            return False, failure
         return True, "Trusted and candidate tests pass"
