@@ -85,8 +85,8 @@ def test_task_registry_has_expected_corpus_shape() -> None:
     names = set(TASKS)
     assert names - BASE_TASKS == ADDED_TASKS
     assert names == BASE_TASKS | ADDED_TASKS
-    assert len(TASKS) == 59
-    assert len(names) == 59
+    assert len(TASKS) == 60
+    assert len(names) == 60
     assert sum(bool(task.mutations) for task in TASKS.values()) == 22
     assert names.isdisjoint(PRUNED_TASKS)
 
