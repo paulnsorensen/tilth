@@ -1246,6 +1246,7 @@ def test_finish_declares_winner_that_beats_seed_on_every_test_task(monkeypatch: 
 
     assert world.pr.pushes == [(winner.sha, "evolve/run1-winner")]
     assert "finish: paired test delta +1.000 (95% CI [1.000, 1.000], 3 tasks)" in log_text(world)
+    assert "Winner minus seed, paired test delta +1.000 (95% CI [1.000, 1.000], 3 tasks)" in world.pr.creates[0]["body"]
 
 
 def test_test_split_scored_once_at_finish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

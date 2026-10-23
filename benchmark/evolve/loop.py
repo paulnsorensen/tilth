@@ -661,7 +661,8 @@ class Evolution:
             return None
         point = sum(deltas) / len(deltas)
         low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
-        self.log(f"finish: paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)")
+        paired_line = f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)"
+        self.log(f"finish: {paired_line}")
         if not low > 0:
             self.log("finish: no improvement (the paired test-split interval does not exclude 0)")
             return None
@@ -678,6 +679,7 @@ class Evolution:
         body = "\n".join([
             f"Evolve run `{self.settings.run_id}` winner `{winner.cid[:12]}` (commit {winner.sha}).", "",
             f"Test-split means: {scores}", "",
+            f"Winner minus seed, {paired_line}", "",
             "## Re-pin before landing", REPIN_NOTE, "",
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",
