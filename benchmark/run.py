@@ -294,6 +294,8 @@ def build_runner_env(
     env["DISABLE_AUTOUPDATER"] = "1"
     if language is not None:
         env.update(external.proc.c_build_env(language))
+    if language == "javascript":
+        env["PATH"] = str(external.javascript.node_bin()) + os.pathsep + env.get("PATH", "")
 
     selected_tilth_bin = TILTH_BIN if tilth_bin is _DEFAULT_TILTH_BIN else tilth_bin
     if isinstance(selected_tilth_bin, str):

@@ -24,6 +24,8 @@ _REDIRECTION = re.compile(r"\d*[<>]")
 _PIP_COMMAND = re.compile(r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+(?:download|install)\b([^;&|\n]*)")
 _UV_ADD = re.compile(r"\buv\s+add\b([^;&|\n]*)")
 _GO_COMMAND = re.compile(r"\bgo\s+(?:get|install|mod\s+download)\b([^;&|\n]*)")
+_NPM_COMMAND = re.compile(
+    r"\b(?:(?:npm|pnpm|yarn)\s+(?:install|i|add|view|v|info|show|pack|dlx)|npx)\b([^;&|\n]*)")
 _FETCH_COMMAND = re.compile(
     r"\b(?:git\s+(?:clone|fetch|pull|remote\s+add)|curl|wget|go\s+(?:get|install)|gh\s+(?:repo\s+clone|api))\b"
 )
@@ -56,6 +58,7 @@ class _Rules:
     upstream: "_Upstream | None"
     packages: tuple[str, ...]
     go_module: str | None
+    npm_package: str | None = None
 
 
 def _roots(path: Path) -> tuple[str, ...]:
@@ -67,10 +70,12 @@ def _normalize_package(name: str) -> str:
 
 
 def _rules(task: object) -> _Rules:
-    slug, packages, go_module = None, (), None
+    slug, packages, go_module, npm_package = None, (), None, None
     if isinstance(task, ExternalTask):
         slug = task.upstream_repo
-        if task.language == "go":
+        if task.language == "javascript":
+            npm_package = task.package_name.lower()
+        elif task.language == "go":
             go_module = task.package_name
         else:
             packages = (task.package_name,)
@@ -96,6 +101,7 @@ def _rules(task: object) -> _Rules:
         upstream=upstream,
         packages=tuple(_normalize_package(name) for name in packages),
         go_module=go_module,
+        npm_package=npm_package,
     )
 
 
@@ -209,7 +215,28 @@ def _names_package(arguments: str, packages: tuple[str, ...]) -> bool:
     return False
 
 
+def _names_npm_package(arguments: str, package: str) -> bool:
+    for token in arguments.split():
+        if token.startswith("-") or token in {".", ".."}:
+            continue
+        token = token.strip("'\"").removeprefix("npm:").lower()
+        end = token.find("@", 1)
+        if (token if end < 0 else token[:end]) == package:
+            return True
+    return False
+
+
+def _fetches_npm_package(text: str, package: str) -> bool:
+    if any(_names_npm_package(match[1], package) for match in _NPM_COMMAND.finditer(text)):
+        return True
+    name = re.escape(package).replace("/", "(?:/|%2f)")
+    registry = rf"(?:registry\.npmjs\.org|registry\.yarnpkg\.com|unpkg\.com|(?:cdn\.)?jsdelivr\.net/npm|esm\.sh)/{name}"
+    return re.search(registry + r"(?=$|[/@\s'\"?#])", text.lower()) is not None
+
+
 def _fetches_package(text: str, rules: _Rules) -> bool:
+    if rules.npm_package and _fetches_npm_package(text, rules.npm_package):
+        return True
     if rules.packages:
         for pattern in (_PIP_COMMAND, _UV_ADD):
             if any(_names_package(match[1], rules.packages) for match in pattern.finditer(text)):
