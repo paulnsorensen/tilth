@@ -24,6 +24,9 @@ _REDIRECTION = re.compile(r"\d*[<>]")
 _PIP_COMMAND = re.compile(r"\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+(?:download|install)\b([^;&|\n]*)")
 _UV_ADD = re.compile(r"\buv\s+add\b([^;&|\n]*)")
 _GO_COMMAND = re.compile(r"\bgo\s+(?:get|install|mod\s+download)\b([^;&|\n]*)")
+_NPM_COMMAND = re.compile(
+    r"\b((?:npm|pnpm|yarn)\s+(?:install|i|add|view|v|info|show|pack|dlx|exec)|npx)\b([^;&|\n]*)")
+_NPM_RUNNERS = re.compile(r"npx|\w+\s+(?:dlx|exec)")
 _FETCH_COMMAND = re.compile(
     r"\b(?:git\s+(?:clone|fetch|pull|remote\s+add)|curl|wget|go\s+(?:get|install)|gh\s+(?:repo\s+clone|api))\b"
 )
@@ -56,6 +59,8 @@ class _Rules:
     upstream: "_Upstream | None"
     packages: tuple[str, ...]
     go_module: str | None
+    # Published npm names; a trailing "/*" covers every package in that scope.
+    npm_packages: tuple[str, ...] = ()
 
 
 def _roots(path: Path) -> tuple[str, ...]:
@@ -67,10 +72,12 @@ def _normalize_package(name: str) -> str:
 
 
 def _rules(task: object) -> _Rules:
-    slug, packages, go_module = None, (), None
+    slug, packages, go_module, npm_packages = None, (), None, ()
     if isinstance(task, ExternalTask):
         slug = task.upstream_repo
-        if task.language == "go":
+        if task.language == "javascript":
+            npm_packages = data.NPM_PACKAGES.get(slug) or (task.package_name.lower(),)
+        elif task.language == "go":
             go_module = task.package_name
         else:
             packages = (task.package_name,)
@@ -96,6 +103,7 @@ def _rules(task: object) -> _Rules:
         upstream=upstream,
         packages=tuple(_normalize_package(name) for name in packages),
         go_module=go_module,
+        npm_packages=npm_packages,
     )
 
 
@@ -209,7 +217,54 @@ def _names_package(arguments: str, packages: tuple[str, ...]) -> bool:
     return False
 
 
+def _npm_name_matches(token: str, packages: tuple[str, ...]) -> bool:
+    token = token.strip("'\"").removeprefix("npm:").lower()
+    end = token.find("@", 1)
+    name = token if end < 0 else token[:end]
+    return any(name == package or (package.endswith("/*") and name.startswith(package[:-1]) and len(name) > len(package) - 1)
+               for package in packages)
+
+
+def _names_npm_package(verb: str, arguments: str, packages: tuple[str, ...]) -> bool:
+    tokens = arguments.split()
+    if not _NPM_RUNNERS.fullmatch(verb):
+        return any(_npm_name_matches(token, packages) for token in tokens
+                   if not token.startswith("-") and token not in {".", ".."})
+    # npx, dlx and exec run one package: --package/-p names it, else the first positional does.
+    # Later positionals are arguments to that package.
+    named = False
+    for index, token in enumerate(tokens):
+        if token in {"-p", "--package"}:
+            named = True
+            if index + 1 < len(tokens) and _npm_name_matches(tokens[index + 1], packages):
+                return True
+        elif token.startswith("--package="):
+            named = True
+            if _npm_name_matches(token.removeprefix("--package="), packages):
+                return True
+        elif not token.startswith("-") and (index == 0 or tokens[index - 1] not in {"-p", "--package"}):
+            return not named and _npm_name_matches(token, packages)
+    return False
+
+
+def _npm_url_name(package: str) -> str:
+    if package.endswith("/*"):
+        return re.escape(package[:-2]) + r"(?:/|%2f)[a-z0-9._~-]+"
+    return re.escape(package).replace("/", "(?:/|%2f)")
+
+
+def _fetches_npm_package(text: str, packages: tuple[str, ...]) -> bool:
+    if any(_names_npm_package(match[1], match[2], packages) for match in _NPM_COMMAND.finditer(text)):
+        return True
+    names = "|".join(_npm_url_name(package) for package in packages)
+    registry = rf"(?:registry\.npmjs\.org|registry\.yarnpkg\.com|unpkg\.com|(?:cdn\.)?jsdelivr\.net/npm|esm\.sh)/(?:{names})"
+    return re.search(registry + r"(?=$|[/@\s'\"?#])", text.lower()) is not None
+
+
 def _fetches_package(text: str, rules: _Rules) -> bool:
+    if rules.npm_packages and _fetches_npm_package(text, rules.npm_packages):
+        return True
+        return True
     if rules.packages:
         for pattern in (_PIP_COMMAND, _UV_ADD):
             if any(_names_package(match[1], rules.packages) for match in pattern.finditer(text)):

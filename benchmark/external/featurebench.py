@@ -33,6 +33,8 @@ PARETO12_IDS = (
     "pydata__xarray.97f3a746.test_backends_chunks.fa55f68a.lv1",
     "sympy__sympy.c1097516.test_nullspace.f14fc970.lv1",
 )
+# gepa-v2 FeatureBench candidates; PARETO12_IDS stays the gepa-v1 source.
+GEPA_V2_CANDIDATES = ("mwaskom__seaborn.7001ebe7.test_statistics.0f2ae277.lv1",)
 # Heavy-environment repositories the parent defers (bench-heavy-python-envs).
 DEFERRED_REPOS = frozenset({
     "pandas-dev/pandas", "astropy/astropy", "huggingface/transformers", "Lightning-AI/pytorch-lightning",

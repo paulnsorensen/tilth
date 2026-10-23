@@ -386,7 +386,11 @@ def test_loaders_build_tasks_from_pinned_rows(external_bench, tmp_path: Path, in
     assert task.name == instance_id
     assert task.repo == dataset
     assert row["repo"] in task.source.origin and task.source.commit_or_tag == row["base_commit"]
-    assert task.prompt == row["problem_statement"] == task.problem_statement
+    assert task.problem_statement == row["problem_statement"]
+    if dataset == "featurebench":
+        assert task.prompt == row["problem_statement"]
+    else:
+        assert task.prompt != row["problem_statement"] and row["problem_statement"] in task.prompt
     assert not any(entry in task.prompt for entry in (*row["FAIL_TO_PASS"], *row["PASS_TO_PASS"]))
     if dataset == "swebench_ml":
         assert task.gold_patch == row["patch"]
@@ -402,6 +406,37 @@ def test_loaders_build_tasks_from_pinned_rows(external_bench, tmp_path: Path, in
     external.data.row_path(dataset, external.data.REVISIONS[dataset], instance_id).unlink()
     with pytest.raises(LookupError):
         loader(instance_id, external.data.REVISIONS[dataset])
+
+
+def test_swebench_prompt_wraps_issue_and_changes_digest(external_bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    import run
+
+    external_bench.seed(SWE_PY)
+    task = load(SWE_PY)
+    issue = task.problem_statement
+    instruction = task.prompt.split(issue)[0]
+
+    assert task.prompt.endswith(issue) and instruction.strip()
+    assert len(re.findall(r"[.!?](?:\s|$)", instruction)) <= 3
+    assert not re.search(r"tilth|grep|test", instruction, re.IGNORECASE)
+    wrapped = run._cell_task_digest(task)
+    monkeypatch.setattr(external.swebench_ml, "PROMPT_INSTRUCTION", "")
+    assert task.prompt == issue
+    assert run._cell_task_digest(task) != wrapped
+
+
+def test_gepa_v2_candidates_resolve_languages() -> None:
+    candidates = external.swebench_ml.GEPA_V2_CANDIDATES
+
+    assert len(candidates) == len(set(candidates)) == 35
+    for instance_id in candidates:
+        owner, _, rest = instance_id.partition("__")
+        name = rest.rsplit("-", 1)[0]
+        row = {"repo": f"{owner}/{name}"}
+        assert external.data.language_of(row) in {"go", "rust", "javascript"}, instance_id
+    assert set(external.swebench_ml.PICKS) == {"go", "rust"}
+    assert [external.featurebench.level_of(i) for i in external.featurebench.GEPA_V2_CANDIDATES] == ["lv1"]
+    assert external.featurebench.repo_of(external.featurebench.GEPA_V2_CANDIDATES[0]) in external.data.REPO_LANGUAGES
 
 
 def _pin_fixture_parquet(monkeypatch: pytest.MonkeyPatch) -> None:
