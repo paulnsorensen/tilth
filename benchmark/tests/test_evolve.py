@@ -2516,3 +2516,130 @@ def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch:
     assert main(world, auth_spawn=_status_spawn(statuses)) == 2
 
     assert statuses == [] and world.spawned == [] and world.calls == []
+
+
+# --- a definitively rejected candidate's kept build is cleared ---
+
+
+def keep_builds(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake builds that leave a kept ``candidates/<sha>`` dir like the real build; ``BUILDFAIL`` text fails after it."""
+    real = world.fake_build
+
+    def build_candidate(sha: str, repo: Path | None = None) -> run.CandidateBuild:
+        keep(sha)
+        run.candidate_target_dir().mkdir(parents=True, exist_ok=True)
+        if "BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo):
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0308]")
+        return real(sha, repo)
+
+    monkeypatch.setattr(run, "_build_candidate", build_candidate)
+
+
+def keep(sha: str) -> None:
+    (run.RESULTS_DIR / "candidates" / sha).mkdir(parents=True, exist_ok=True)
+    (run.RESULTS_DIR / "candidates" / sha / "tilth").write_text("binary")
+
+
+def kept(sha: str) -> bool:
+    return (run.RESULTS_DIR / "candidates" / sha).exists()
+
+
+def test_cheap_tier_and_build_failures_clear_the_candidate_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    cheap = child(evo.seed, dev_a="1", dev_b="1", cheap_a="0")
+    broken = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1", tag="BUILDFAIL")
+
+    assert evo.evaluate(cheap, "dev_a")[1]["stage"] == "cheap tier"
+    assert evo.evaluate(broken, "dev_a")[1]["stage"] == "build"
+
+    for candidate in (cheap, broken):
+        assert not kept(evo.results[candidates.content_id(candidate)].sha)
+    assert kept(world.seed_sha) and run.candidate_target_dir().is_dir()
+
+
+def test_dominated_after_one_rollout_clears_the_candidate_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    dominated = child(evo.seed, dev_a="0", dev_b="1", cheap_a="1")
+    evo.evaluate(dominated, "dev_a")
+    result = evo.results[candidates.content_id(dominated)]
+
+    assert "dominated after one rollout" in log_text(world)
+    assert not kept(result.sha) and kept(world.seed_sha)
+
+
+def test_dominated_after_reruns_clears_the_candidate_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 0.5})
+    keep(member.sha)
+    candidate = child(evo.seed, dev_a="10", dev_b="10", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert "dominated after 2 rollouts" in log_text(world)
+    assert not kept(result.sha) and kept(member.sha) and kept(world.seed_sha)
+
+
+def test_evicted_frontier_member_clears_its_build_but_not_the_seed(monkeypatch: pytest.MonkeyPatch,
+                                                                tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 0.5, "dev_b": 0.5})
+    keep(member.sha)
+    winner = child(evo.seed, dev_a="11", dev_b="11", cheap_a="1")
+    evo.evaluate(winner, "dev_a")
+    result = evo.results[candidates.content_id(winner)]
+
+    assert result.accepted and member not in evo.frontier and evo.seed_id not in {m.cid for m in evo.frontier}
+    assert not kept(member.sha)
+    assert kept(world.seed_sha) and kept(result.sha)
+
+
+def test_rejection_never_clears_the_seed_or_a_frontier_members_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 1.0})
+    keep(member.sha)
+    keep(world.seed_sha)
+    twin = evo.new_cascade(child(evo.seed, tag="twin"))
+
+    twin.sha = world.seed_sha
+    evo._fail(twin, "build")
+    twin.sha = member.sha
+    evo._fail(twin, "build")
+
+    assert kept(world.seed_sha) and kept(member.sha)
+
+
+def test_clearing_a_build_fails_soft(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    monkeypatch.setattr(run, "discard_candidate_build", lambda _sha: (_ for _ in ()).throw(OSError("busy")))
+    twin = evo.new_cascade(child(evo.seed, tag="twin"))
+    twin.sha = "a" * 40
+
+    assert evo._fail(twin, "build").stage == "build"
+    assert "could not clear its build: busy" in log_text(world)
+
+
+def test_incomplete_rejections_keep_the_candidate_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    first = child(evo.seed, dev_a="E", dev_b="1", cheap_a="1")
+    rerun = child(evo.seed, dev_a="1E", dev_b="11", cheap_a="1")
+    evo.evaluate(first, "dev_a")
+    evo.evaluate(rerun, "dev_a")
+
+    assert "a first rollout did not complete" in log_text(world)
+    assert "a re-run did not complete" in log_text(world)
+    for candidate in (first, rerun):
+        assert kept(evo.results[candidates.content_id(candidate)].sha)

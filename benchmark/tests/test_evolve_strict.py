@@ -787,3 +787,22 @@ def test_a_candidate_gate_with_an_unusable_corpus_scores_zero(monkeypatch: pytes
     score, info = evo.evaluate(winner("later"), "dev_a")
 
     assert score == 0 and info["stage"] == "hook gate"
+
+
+def test_hook_gate_failure_clears_the_candidate_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bad = fake_hook(tmp_path, "bad-candidate-hook", flip={"tilth": [DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, hooks={"bad": bad})
+    evo = ready(world)
+    real = run.build_candidate
+
+    def keeping(sha: str, repo: Path | None = None) -> run.CandidateBuild:
+        (run.RESULTS_DIR / "candidates" / sha).mkdir(parents=True, exist_ok=True)
+        return real(sha, repo)
+
+    monkeypatch.setattr(run, "build_candidate", keeping)
+    candidate = winner("bad")
+    _score, info = evo.evaluate(candidate, "dev_a")
+    result = next(r for r in evo.results.values() if r.candidate == candidate)
+
+    assert info["stage"] == "hook gate"
+    assert not (run.RESULTS_DIR / "candidates" / result.sha).exists()

@@ -456,7 +456,20 @@ class Evolution:
         self.log(f"candidate {result.cid[:12]}: failed at {stage}")
         for line in output.splitlines():
             self.log(f"  {line}")
+        self._discard_build(result)
         return result.fail(stage, output)
+
+    def _discard_build(self, result: Cascade) -> None:
+        """Delete a definitively rejected candidate's kept build; never the seed's, a frontier member's, or the target."""
+        sha = result.sha
+        if sha is None or result.cid == self.seed_id or sha == self.settings.seed_sha:
+            return
+        if any(member.sha == sha for member in self.frontier if member is not result):
+            return
+        try:
+            run.discard_candidate_build(sha)
+        except (OSError, ValueError) as error:
+            self.log(f"candidate {result.cid[:12]}: could not clear its build: {error}")
 
     def _tiers(self, result: Cascade) -> Cascade:
         """The cheap (when the panel has one) and paid tiers; the first cell of either builds the candidate binary."""
@@ -536,6 +549,7 @@ class Evolution:
         if any(dominates(member.means, result.scores, dev) for member in members):
             result.admitted = True
             self.log(f"candidate {result.cid[:12]}: dominated after one rollout; not re-run")
+            self._discard_build(result)
             return
         reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(1, self.settings.reruns + 1)), result.sha)
         records = self._records(reruns)
@@ -550,9 +564,14 @@ class Evolution:
         result.means = means
         if any(dominates(member.means, means, dev) for member in members):
             self.log(f"candidate {result.cid[:12]}: dominated after {self.settings.reruns + 1} rollouts; not accepted")
+            self._discard_build(result)
             return
         result.accepted = True
-        self.frontier = [member for member in members if not dominates(means, member.means, dev)] + [result]
+        kept = [member for member in members if not dominates(means, member.means, dev)]
+        for evicted in members:
+            if evicted not in kept:
+                self._discard_build(evicted)
+        self.frontier = [*kept, result]
         self.log(f"candidate {result.cid[:12]}: accepted (dev mean {result.dev_mean:.3f}, "
                  f"frontier {len(self.frontier)})")
 

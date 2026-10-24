@@ -26,6 +26,16 @@ A candidate that cannot allow `go test ./...` or deny `cat src/lib.rs` with the 
 also fails at `hook gate`, through the harness probe. The corpus file itself stays outside the
 candidate allowlist (`src/`, `prompts/`).
 
+## Rejected-candidate cleanup
+
+Each built candidate keeps a copy of its binary in `results/candidates/<sha>/` (about 39 MiB). Evolve
+deletes that directory when the candidate is definitively rejected: it fails at `apply`, `just check`,
+`build`, `hook gate`, or `cheap tier`, is dominated after one rollout or after the re-runs, or is evicted from
+the frontier by a dominating candidate. It keeps the directory when a rollout did not complete, because a
+resumed run reuses stored rows keyed on the binary digest and a rebuild may differ byte for byte. It never
+deletes the seed's directory (the seed binary is the hook binary for every cell) or the shared
+`candidates/target` build cache. A deletion error is logged, not raised.
+
 ## Seed-hook replay floor
 
 Every strict cell replays each Bash call through the seed hook. A cell that ran a call the seed hook
