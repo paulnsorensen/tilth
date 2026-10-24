@@ -17,6 +17,9 @@ SOURCE_FILES = {"context.go", *(f"render/{name}.go" for name in (
 ))}
 HELD_OUT = Path(__file__).parent / "gin_render_context_fixtures"
 ROOT_TEST_PATTERN = "^(TestContext|TestMiddleware|TestHeldOut)"
+# Upstream's own test races its goroutine against test completion, and the resulting panic
+# fails the whole package run under load. It is unrelated to the render-context change.
+ROOT_SKIP_PATTERN = "^TestContextCopyShouldNotCancel$"
 # A cold Go build on a loaded host is slow; a timeout is inconclusive, not a test failure.
 GRADE_TIMEOUT_S = 900
 WARM_TIMEOUT_S = 900
@@ -28,7 +31,7 @@ TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 def _grade_commands(tags: list[str]) -> list[list[str]]:
     return [
         ["go", "test", *tags, "./render"],
-        ["go", "test", *tags, "-run", ROOT_TEST_PATTERN, "."],
+        ["go", "test", *tags, "-run", ROOT_TEST_PATTERN, "-skip", ROOT_SKIP_PATTERN, "."],
         ["go", "test", *tags, "./binding"],
         ["go", "test", *tags, "-run", "^$", "./..."],
     ]

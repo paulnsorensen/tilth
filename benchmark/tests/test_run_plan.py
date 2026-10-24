@@ -648,3 +648,32 @@ def test_candidate_build_env_is_allowlisted(candidate_repo, monkeypatch: pytest.
     assert env["PATH"] == os.environ["PATH"] and env["HOME"] == os.environ["HOME"]
     assert env["SCCACHE_DIR"] == "/tmp/sccache"
     assert env["CARGO_TARGET_DIR"] == str(run.candidate_target_dir())
+
+
+def test_discard_candidate_build_removes_the_dir_and_forces_a_rebuild(candidate_repo) -> None:
+    repo, candidate, builds = candidate_repo
+    first = run.build_candidate(candidate, repo=repo)
+    target = run.candidate_target_dir()
+    assert target.is_dir()
+
+    run.discard_candidate_build(candidate)
+
+    assert not Path(first.binary_path).parent.exists() and target.is_dir()
+    assert candidate not in run._CANDIDATE_BUILDS
+    again = run.build_candidate(candidate, repo=repo)
+    assert len(builds) == 2 and Path(again.binary_path).is_file()
+    run.discard_candidate_build("b" * 40)  # a sha with no build is a no-op
+
+
+@pytest.mark.parametrize("bad", ["target", "..", "", "abc123", "../" + "a" * 40, "A" * 40, "a" * 39])
+def test_discard_candidate_build_refuses_anything_but_a_full_sha(candidate_repo, bad: str) -> None:
+    repo, candidate, _builds = candidate_repo
+    run.build_candidate(candidate, repo=repo)
+    candidates_dir = run.RESULTS_DIR / "candidates"
+    before = sorted(path.relative_to(candidates_dir) for path in candidates_dir.rglob("*"))
+
+    with pytest.raises(ValueError, match="40-hex"):
+        run.discard_candidate_build(bad)
+
+    assert sorted(path.relative_to(candidates_dir) for path in candidates_dir.rglob("*")) == before
+    assert (candidates_dir / "target").is_dir() and (candidates_dir / candidate / "tilth").is_file()

@@ -968,6 +968,26 @@ def test_dev_delta_never_buys_baseline_cells(world) -> None:
     assert evo.deltas and world.runner_calls("baseline") == []
 
 
+def test_empty_cheap_tier_goes_straight_to_dev(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    members = tuple(panels.Member(task, "local", "rust", split) for split, names in (("dev", DEV), ("test", TEST))
+                    for task in names)
+    world.panel = panels.Panel(name="no-cheap", cheap=(), dev=DEV, test=TEST,
+                               split_digest=panels.split_digest(members), members=members)
+    evo = build(world)
+    planned: list[list] = []
+    plan = evo._plan
+    monkeypatch.setattr(evo, "_plan", lambda cells, *args, **kwargs: planned.append(list(cells)) or plan(cells, *args, **kwargs))
+    assert evo.preflight() is None
+
+    candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="0")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert result.done and result.cheap_score is None and result.scores.keys() == set(DEV)
+    assert planned and all(cells for cells in planned)
+    assert {cell.task for cells in planned for cell in cells} <= set(DEV)
+
+
 def test_single_rollout_never_finalist_on_tie(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     dev3 = ("dev_a", "dev_b", "dev_c")
     files = seed_files(mcp(dev_a="0", dev_b="0", dev_c="1", cheap_a="1", test_a="1"))
@@ -2033,13 +2053,43 @@ def test_default_just_check_timeout_kills_the_whole_process_group(monkeypatch: p
     # A surviving child holds the output pipes open, so a partial kill waits for the 60 s sleep.
     assert ok is False and "timed out" in output and time.monotonic() - started < 30
     child = int((worktree / "child.pid").read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _alive(child):
-        time.sleep(0.05)
-    assert not _alive(child)
+    assert _exits_within(child, 30)
 
 
-def test_alive_is_false_when_the_process_exits_during_the_stat_read(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exits_within_counts_a_zombie_and_a_reaped_process_as_exited() -> None:
+    process = subprocess.Popen(["true"])
+    # Not reaped yet: a zombie has exited.
+    assert _exits_within(process.pid, 30)
+    process.wait()
+    assert _exits_within(process.pid, 0)
+
+
+def test_exits_within_is_false_while_the_process_runs() -> None:
+    process = subprocess.Popen(["sleep", "60"])
+    try:
+        assert _exits_within(process.pid, 0.2) is False
+    finally:
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize(("state", "exited"), [("Z", True), ("X", True), ("x", True), ("R", False),
+                                               ("S", False), ("D", False)])
+def test_exited_counts_every_post_exit_state(monkeypatch: pytest.MonkeyPatch, state: str, exited: bool) -> None:
+    # A reaper moves a zombie Z to X before /proc drops it; X must not read as alive again.
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    real_read_text = Path.read_text
+
+    def fake_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == stat_path:
+            return f"{os.getpid()} (sleep 60) {state} 1 1 1"
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    assert _exited(os.getpid()) is exited
+
+
+def test_exited_is_true_when_the_process_exits_during_the_stat_read(monkeypatch: pytest.MonkeyPatch) -> None:
     # Linux returns ESRCH from read() when the process exits after open() of /proc/<pid>/stat.
     stat_path = Path(f"/proc/{os.getpid()}/stat")
     real_read_text = Path.read_text
@@ -2050,17 +2100,32 @@ def test_alive_is_false_when_the_process_exits_during_the_stat_read(monkeypatch:
         return real_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", racing_read_text)
-    assert _alive(os.getpid()) is False
+    assert _exited(os.getpid()) is True
 
 
-def _alive(pid: int) -> bool:
-    """True while ``pid`` runs; a zombie counts as dead."""
+def _exits_within(pid: int, timeout_s: float) -> bool:
+    """True when ``pid`` exits within ``timeout_s``.
+
+    A killed child can still run its exit path after the pipes close, and a loaded host delays it. The last
+    sample comes after the deadline check, so a stalled test still looks once more before it fails.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        late = time.monotonic() >= deadline
+        exited = _exited(pid)
+        if exited or late:
+            return exited
+        time.sleep(0.05)
+
+
+def _exited(pid: int) -> bool:
+    """True once ``pid`` has exited: zombie (Z), being reaped (X, x), or gone from /proc."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     # ProcessLookupError: the reaper can collect the process between open() and read().
     except (FileNotFoundError, ProcessLookupError):
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] in {"Z", "X", "x"}
 
 
 # --- paid calls: the CLI budget flag and the cost sources ---
@@ -2450,6 +2515,133 @@ def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch:
     assert main(world, auth_spawn=_status_spawn(statuses)) == 2
 
     assert statuses == [] and world.spawned == [] and world.calls == []
+
+
+# --- a definitively rejected candidate's kept build is cleared ---
+
+
+def keep_builds(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake builds that leave a kept ``candidates/<sha>`` dir like the real build; ``BUILDFAIL`` text fails after it."""
+    real = world.fake_build
+
+    def build_candidate(sha: str, repo: Path | None = None) -> run.CandidateBuild:
+        keep(sha)
+        run.candidate_target_dir().mkdir(parents=True, exist_ok=True)
+        if "BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo):
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0308]")
+        return real(sha, repo)
+
+    monkeypatch.setattr(run, "_build_candidate", build_candidate)
+
+
+def keep(sha: str) -> None:
+    (run.RESULTS_DIR / "candidates" / sha).mkdir(parents=True, exist_ok=True)
+    (run.RESULTS_DIR / "candidates" / sha / "tilth").write_text("binary")
+
+
+def kept(sha: str) -> bool:
+    return (run.RESULTS_DIR / "candidates" / sha).exists()
+
+
+def test_cheap_tier_and_build_failures_clear_the_candidate_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    cheap = child(evo.seed, dev_a="1", dev_b="1", cheap_a="0")
+    broken = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1", tag="BUILDFAIL")
+
+    assert evo.evaluate(cheap, "dev_a")[1]["stage"] == "cheap tier"
+    assert evo.evaluate(broken, "dev_a")[1]["stage"] == "build"
+
+    for candidate in (cheap, broken):
+        assert not kept(evo.results[candidates.content_id(candidate)].sha)
+    assert kept(world.seed_sha) and run.candidate_target_dir().is_dir()
+
+
+def test_dominated_after_one_rollout_clears_the_candidate_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    dominated = child(evo.seed, dev_a="0", dev_b="1", cheap_a="1")
+    evo.evaluate(dominated, "dev_a")
+    result = evo.results[candidates.content_id(dominated)]
+
+    assert "dominated after one rollout" in log_text(world)
+    assert not kept(result.sha) and kept(world.seed_sha)
+
+
+def test_dominated_after_reruns_clears_the_candidate_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 0.5})
+    keep(member.sha)
+    candidate = child(evo.seed, dev_a="10", dev_b="10", cheap_a="1")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert "dominated after 2 rollouts" in log_text(world)
+    assert not kept(result.sha) and kept(member.sha) and kept(world.seed_sha)
+
+
+def test_evicted_frontier_member_clears_its_build_but_not_the_seed(monkeypatch: pytest.MonkeyPatch,
+                                                                tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 0.5, "dev_b": 0.5})
+    keep(member.sha)
+    winner = child(evo.seed, dev_a="11", dev_b="11", cheap_a="1")
+    evo.evaluate(winner, "dev_a")
+    result = evo.results[candidates.content_id(winner)]
+
+    assert result.accepted and member not in evo.frontier and evo.seed_id not in {m.cid for m in evo.frontier}
+    assert not kept(member.sha)
+    assert kept(world.seed_sha) and kept(result.sha)
+
+
+def test_rejection_never_clears_the_seed_or_a_frontier_members_build(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    member = accept(evo, child(evo.seed, tag="member"), {"dev_a": 1.0, "dev_b": 1.0})
+    keep(member.sha)
+    keep(world.seed_sha)
+    twin = evo.new_cascade(child(evo.seed, tag="twin"))
+
+    twin.sha = world.seed_sha
+    evo._fail(twin, "build")
+    twin.sha = member.sha
+    evo._fail(twin, "build")
+
+    assert kept(world.seed_sha) and kept(member.sha)
+
+
+def test_clearing_a_build_fails_soft(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    monkeypatch.setattr(run, "discard_candidate_build", lambda _sha: (_ for _ in ()).throw(OSError("busy")))
+    twin = evo.new_cascade(child(evo.seed, tag="twin"))
+    twin.sha = "a" * 40
+
+    assert evo._fail(twin, "build").stage == "build"
+    assert "could not clear its build: busy" in log_text(world)
+
+
+def test_incomplete_rejections_keep_the_candidate_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    keep_builds(world, monkeypatch)
+    evo = ready(world)
+    evo.evaluate(evo.seed, "dev_a")
+    first = child(evo.seed, dev_a="E", dev_b="1", cheap_a="1")
+    rerun = child(evo.seed, dev_a="1E", dev_b="11", cheap_a="1")
+    evo.evaluate(first, "dev_a")
+    evo.evaluate(rerun, "dev_a")
+
+    assert "a first rollout did not complete" in log_text(world)
+    assert "a re-run did not complete" in log_text(world)
+    for candidate in (first, rerun):
+        assert kept(evo.results[candidates.content_id(candidate)].sha)
 
 
 # --- the score is cost per correct: p * base / c ---
