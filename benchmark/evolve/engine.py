@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
 
 from .calls import PaidCalls, StopState
-from .candidate import MAX_BYTES, SRC_PATCH
+from .candidate import MAX_BYTES, OBJECTIVE, SRC_PATCH
 
 __all__ = ["Dispatcher", "ReflectionClient", "StopState", "Stopper", "optimize", "reflection_prompt"]
 
@@ -22,10 +22,12 @@ REFLECTION_HEADER = (
     "You are revising one instruction file that the tilth MCP server sends to AI coding agents. "
     "Below are its current text and reflective records of agents' rollouts on benchmark tasks: each record "
     "holds the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
-    "applicability label and a critique. Rewrite the file so agents use tilth's tools more effectively on "
-    "tasks like these. Keep it concise. Reply with the complete new file text between <new_text> and "
-    "</new_text>, and nothing else."
+    f"applicability label and a critique. {OBJECTIVE} Rewrite the file so agents solve tasks like these at "
+    "lower cost without losing correctness. Keep it concise. Reply with the complete new file text between "
+    "<new_text> and </new_text>, and nothing else."
 )
+# The paid-tier side_info fields that make up the score; reflection sees them once per candidate.
+SCORE_FIELDS = ("task_scores", "pass_rate", "mean_cost", "baseline_cost")
 SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
              "the MCP field it fills, so remove at least as much text as you add; a longer file is refused "
              "and never scored.")
@@ -97,6 +99,14 @@ def _failure(entry: Mapping) -> list[dict]:
     return [{"stage": entry["stage"], "tail": entry["tail"]}] if entry.get("tail") else []
 
 
+def _cost(entry: Mapping) -> list[dict]:
+    """A paid entry's score inputs and its task's candidate/baseline cost pairs; nothing for other stages."""
+    if entry.get("stage") != "paid":
+        return []
+    scores = {"scores": {name: entry[name] for name in SCORE_FIELDS if name in entry}}
+    return [scores, {"cost_pairs": entry["cost_pairs"]}] if entry.get("cost_pairs") else [scores]
+
+
 class Dispatcher:
     """gepa ``custom_candidate_proposer``: text components to reflection, ``src_patch`` to the proposer.
 
@@ -116,10 +126,11 @@ class Dispatcher:
         proposal = {}
         for name in components_to_update:
             # gepa pads a minibatch with repeated examples; each distinct record goes into a prompt once.
-            # An apply, just check, or build failure contributes its stage and tail (tilth build output).
+            # An apply, just check, or build failure contributes its stage and tail (tilth build output);
+            # a paid entry contributes the score inputs and its task's cost pairs.
             unique = {json.dumps(record, sort_keys=True): record
                       for entry in reflective_dataset.get(name, ())
-                      for record in (*_failure(entry), *entry.get("records", ()))}
+                      for record in (*_failure(entry), *_cost(entry), *entry.get("records", ()))}
             records = list(unique.values())
             if self.stop.is_set:
                 break

@@ -19,6 +19,15 @@ COMPONENTS = (*TEXT_COMPONENTS, SRC_PATCH)
 # The MCP host truncates the instructions field and each tool description past 2048 bytes; the src/mcp tests
 # (server_instructions_fit_character_cap, tool_descriptions_fit_2kb) reject a longer prompt file.
 MAX_BYTES = {name: 2048 for name in TEXT_COMPONENTS}
+# What reflection and the src proposer optimize: the evolve score (``loop.task_score``), stated in both prompts.
+OBJECTIVE = (
+    "Each rollout uses only tilth's tools and is scored against the same task run with the host's built-in "
+    "tools. A task's score is its pass rate times the built-in run's mean cost divided by this candidate's "
+    "mean cost per rollout, so 1.0 is parity and a cheaper rollout at the same pass rate scores higher. "
+    "A `scores` record gives each task's pass_rate, mean_cost, and baseline_cost (USD). A `cost_pairs` record "
+    "pairs the candidate's and the built-in run's turns, tool calls, and input, output, and cache tokens for one "
+    "task. Cost grows with the context carried into each API call and with the number of calls."
+)
 
 
 class SeedError(ValueError):

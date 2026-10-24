@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import run
 from evolve.loop import COST_SUMMARY_FIELDS, EvolveError, _baseline_costs, _paired_score_deltas, dominates, row_cost, task_score, task_stats
-from evolve_support import DEV, build, child, log_text
+from evolve import candidate, engine, proposer
+from evolve_support import DEV, build, child, log_text, seed_candidate
 from test_evolve import accept, ready, three_test_task_world, tilth_calls, world  # noqa: F401  (world is a fixture)
 
 
@@ -290,6 +291,38 @@ def test_paid_side_info_pairs_candidate_and_baseline_cost_rows_for_the_task(worl
         # No trajectory and no grader output reach reflection through the pairs.
         assert not {"trajectory_path", "result_text", "correct", "correctness_reason"} & set(summary)
     assert {summary["repetition"] for summary in pairs["baseline"]} == set(evo._reps())
+
+
+def test_reflection_and_proposer_receive_the_score_inputs_and_each_tasks_cost_pairs(world) -> None:  # noqa: F811
+    evo = ready(world)
+    _score, dev_a = evo.evaluate(evo.seed, "dev_a")
+    _score, dev_b = evo.evaluate(evo.seed, "dev_b")
+    seen: dict[str, list[dict]] = {}
+    dispatcher = engine.Dispatcher(
+        engine.StopState(),
+        reflect=lambda name, text, records: seen.setdefault(name, records) and text,
+        propose=lambda _candidate, records: seen.setdefault("src_patch", records) and "patch",
+    )
+    names = ["prompts/mcp.md", "src_patch"]
+
+    dispatcher(seed_candidate(), {name: [dev_a, dev_b, dev_a] for name in names}, names)
+
+    expected_scores = {key: dev_a[key] for key in ("task_scores", "pass_rate", "mean_cost", "baseline_cost")}
+    for name in names:
+        records = seen[name]
+        assert [record["scores"] for record in records if "scores" in record] == [expected_scores]
+        pairs = [record["cost_pairs"] for record in records if "cost_pairs" in record]
+        assert [pair["task"] for pair in pairs] == ["dev_a", "dev_b"]
+        assert pairs[0]["baseline"] == dev_a["cost_pairs"]["baseline"] and pairs[0]["baseline"]
+        assert pairs[1]["candidate"] == dev_b["cost_pairs"]["candidate"] and pairs[1]["candidate"]
+
+
+def test_reflection_and_proposer_prompts_state_the_cost_objective() -> None:
+    assert candidate.OBJECTIVE in engine.reflection_prompt("", [])
+    assert candidate.OBJECTIVE in proposer.proposer_prompt([])
+    assert "lower cost" in engine.REFLECTION_HEADER and "lower cost" in proposer.PROPOSER_HEADER
+    assert "more effectively" not in engine.REFLECTION_HEADER
+    assert "correctly more often" not in proposer.PROPOSER_HEADER
 
 
 # --- buy_baselines / stop ---

@@ -210,7 +210,8 @@ That `just check` sets `TILTH_EVOLVE_CANDIDATE=1`, so the Rust tests skip their 
 The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. Reflection is told this cap and the current size, and a candidate prompt file over it is refused before its worktree and `just check`.
 The run log names the stage at which each candidate failed (apply, `just check`, build, hook gate, or cheap tier), with the output tail.
 Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
-The score is grader correctness only, and contaminated rollouts count as incorrect.
+A task's score is `p * base / c`: pass rate times the frozen baseline mean cost over the candidate's mean rollout cost; contaminated rollouts count as incorrect.
+See [evolve/README.md](evolve/README.md) for the finish rule.
 Reflection and the `src/` proposer are isolated `claude -p` calls.
 They see only the judge's stripped records, never grader text or test-split rollouts.
 The loop buys baseline cells once and answers them from the result store afterwards.

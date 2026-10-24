@@ -1,4 +1,4 @@
-"""The evolution loop: GEPA over tilth commits, scored by grader correctness against frozen baselines.
+"""The evolution loop: GEPA over tilth commits, scored by cost per correct against frozen baselines.
 
 Every paid call is a stub (cells, judge, reflection, proposer, PR client); the
 real pinned ``gepa.optimize_anything`` runs only over those stubs.
@@ -1855,7 +1855,7 @@ def test_dispatcher_passes_failure_tail_to_every_component() -> None:
     dispatcher(seed_candidate(), dataset, ["prompts/mcp.md", "src_patch"])
 
     for name in ("prompts/mcp.md", "src_patch"):
-        assert seen[name] == [failed, *paid["records"]]
+        assert seen[name] == [failed, {"scores": {"task_scores": {"dev_a": 1.0}}}, *paid["records"]]
 
 
 @pytest.mark.parametrize("glob", [{"pattern": "**/../../*"}, {"pattern": "src/*/../../../secret/*"},
