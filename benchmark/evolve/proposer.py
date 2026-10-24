@@ -14,7 +14,7 @@ from pathlib import Path
 from parse import extract_trajectory
 
 from .calls import PaidCalls
-from .candidate import SRC_PATCH, TEXT_COMPONENTS
+from .candidate import OBJECTIVE, SRC_PATCH, TEXT_COMPONENTS
 from .gitops import GitError, git, git_bytes
 
 EXPORT_PATHS = ("src", "prompts", "Cargo.toml", "Cargo.lock")
@@ -25,8 +25,9 @@ PROPOSER_HEADER = (
     "You are improving tilth, a Rust MCP server for code intelligence whose source is in the current "
     "directory. Below are reflective records of AI agents' rollouts with tilth on benchmark tasks: each holds "
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
-    "applicability label and a critique. Edit files under src/ so agents answer tasks like these correctly "
-    "more often. Edit nothing outside src/, keep the crate building, and do not touch #[cfg(test)] code."
+    f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
+    "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
+    "touch #[cfg(test)] code."
 )
 
 

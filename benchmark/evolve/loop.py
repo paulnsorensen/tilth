@@ -1,7 +1,7 @@
 """One evolve run: judge preflight, frozen baselines, the cascade, evolve's accepted frontier, and finish.
 
-A candidate's score is grader correctness only: the mean ``correct`` over its
-paid-tier dev rollouts. A contaminated rollout counts as incorrect.
+A candidate's score on a task is ``p * base / c`` (``task_score``): its pass rate over paid-tier dev
+rollouts times the frozen baseline mean cost over its mean rollout cost. A contaminated rollout counts as incorrect.
 Reflection and the proposer see only stripped records.
 Test-split rollouts appear only in ``finish``. Finish picks the winner on dev means, so the test split
 only confirms one pre-chosen candidate against the seed and never selects among candidates.
@@ -124,7 +124,8 @@ class Cascade:
                 "pass_rate": {name: stats[0] for name, stats in self.task_stats.items()},
                 "mean_cost": {name: stats[1] for name, stats in self.task_stats.items()},
                 "baseline_cost": dict(self.base_costs), "records": self.records.get(task, []),
-                "cost_pairs": {"candidate": [cost_summary(row) for row in self.rows if row["task"] == task],
+                "cost_pairs": {"task": task,
+                               "candidate": [cost_summary(row) for row in self.rows if row["task"] == task],
                                "baseline": list(self.base_rows.get(task, []))}}
 
 
@@ -197,8 +198,8 @@ COST_SUMMARY_FIELDS = (
 
 
 def cost_summary(row: Mapping) -> dict:
-    """The cost-explaining fields of one row, with no trajectory and no grader output."""
-    return {name: row[name] for name in COST_SUMMARY_FIELDS if name in row}
+    """The cost-explaining fields of one row and the cost its score used, with no trajectory and no grader output."""
+    return {**{name: row[name] for name in COST_SUMMARY_FIELDS if name in row}, "scored_cost_usd": row_cost(row)}
 
 
 def _baseline_costs(rows: Iterable[Mapping], tasks: Iterable[str]) -> dict[str, float]:

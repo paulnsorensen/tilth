@@ -20,6 +20,9 @@ the seed's.
 Paid-tier side info for reflection carries `cost_pairs` for the task: the candidate's rows and the frozen
 baseline rows, each cut to cost, turns, tokens, tool calls, tool sequence, and batch sizes. Reflection can
 so see why a candidate costs more than stock Claude. The pairs carry no trajectory and no grader output.
+The dispatcher sends reflection and the `src/` proposer one `scores` record per candidate (task scores, pass
+rates, mean costs, baseline costs) and one `cost_pairs` record per task. Both prompts state the score
+(`candidate.OBJECTIVE`) and ask for lower cost without lost correctness.
 
 ## Strict file tools (default)
 

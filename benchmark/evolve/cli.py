@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by grader correctness.
+"""Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by cost per correct.
 
     python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha SHA \\
         --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku]
