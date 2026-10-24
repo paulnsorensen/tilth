@@ -459,19 +459,20 @@ class Evolution:
         return result.fail(stage, output)
 
     def _tiers(self, result: Cascade) -> Cascade:
-        """The cheap and paid tiers; the first cell of either builds the candidate binary."""
-        if result.cheap_score is None:
-            rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
-            result.cheap_rows = rows
-            result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
-            result.cheap_score = mean(correct(row) for row in rows) if rows else 0.0
-        if result.cid != self.seed_id:
-            seed = self.results[self.seed_id]
-            if result.cheap_score < (seed.cheap_score or 0.0):
-                # Only a failing candidate shows its cheap-tier records to reflection; critiques cost money.
-                records = self._records(result.cheap_rows)
-                result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
-                return self._fail(result, "cheap tier")
+        """The cheap (when the panel has one) and paid tiers; the first cell of either builds the candidate binary."""
+        if self.panel.cheap:
+            if result.cheap_score is None:
+                rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
+                result.cheap_rows = rows
+                result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
+                result.cheap_score = mean(correct(row) for row in rows) if rows else 0.0
+            if result.cid != self.seed_id:
+                seed = self.results[self.seed_id]
+                if result.cheap_score < (seed.cheap_score or 0.0):
+                    # Only a failing candidate shows its cheap-tier records to reflection; critiques cost money.
+                    records = self._records(result.cheap_rows)
+                    result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
+                    return self._fail(result, "cheap tier")
         if not result.scores:
             rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
             records = self._records(rows)

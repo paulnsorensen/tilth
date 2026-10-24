@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import config
 import external
 import external.data
 import external.featurebench
@@ -583,3 +584,97 @@ def test_register_wraps_loader_errors(monkeypatch: pytest.MonkeyPatch, store: Pa
     monkeypatch.setattr(external.swebench_ml, "load", uncached)
     with pytest.raises(panels.PanelError, match=f"{GO_SLOT}.*no cached row"):
         load(COMPLETE, store).register(dict(run.TASKS))
+
+
+# --- gepa-v2: a screened pool with only dev and test ---
+
+V2_LOCAL = ("express_edit_example_start", "rg_edit_flow_migration")
+V2_SWE = (("tokio-rs__axum-734", "rust"), ("prometheus__prometheus-9248", "go"), (GO_SLOT, "go"))
+
+
+def _v2_data() -> dict:
+    members = [{"id": name, "family": "local", "language": config.REPOS[run.TASKS[name].repo].language, "split": "dev"}
+               for name in V2_LOCAL]
+    members += [{"id": name, "family": "featurebench", "language": "python", "split": "dev"}
+                for name in (FB_ALGORITHMS, FB_REGRESSION)]
+    members += [{"id": name, "family": "swebench_ml", "language": language, "split": "dev"} for name, language in V2_SWE]
+    return restratify({"version": 2, "name": "fixture-v2", "split_seed": 11, "members": members})
+
+
+def test_v2_loads_without_a_cheap_tier(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    panel = load(write(tmp_path, data), store)
+
+    assignment = panels.stratify(data["members"], data["split_seed"])
+    assert panel.cheap == ()
+    assert set(panel.dev) == {name for name, split in assignment.items() if split == "dev"}
+    assert set(panel.test) == {name for name, split in assignment.items() if split == "test"}
+    assert panel.dev and panel.test and len(panel.members) == 7
+
+
+def test_v2_refuses_a_cheap_member(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    data["members"].append({"id": CHEAP[0], "family": "local", "language": "rust", "split": "dev"})
+    with pytest.raises(panels.PanelError, match=CHEAP[0]):
+        load(write(tmp_path, data), store)
+
+    data = _v2_data()
+    member(data, V2_LOCAL[0])["split"] = "cheap"
+    with pytest.raises(panels.PanelError, match="cheap"):
+        load(write(tmp_path, data), store)
+
+
+def test_v2_refuses_an_id_outside_the_pools(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    data["members"].append({"id": "sharkdp__bat-1", "family": "swebench_ml", "language": "rust", "split": "dev"})
+    with pytest.raises(panels.PanelError, match="sharkdp__bat-1"):
+        load(write(tmp_path, restratify(data)), store)
+
+
+def test_v2_accepts_a_local_task_outside_the_v1_whitelist(tmp_path: Path, store: Path) -> None:
+    assert V2_LOCAL[0] not in panels.LOCAL
+    assert V2_LOCAL[0] in load(write(tmp_path, _v2_data()), store).members[0].id
+
+
+def test_v2_refuses_fallback_keys(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    member(data, GO_SLOT).update(fallback_for="x", fallback_reason="y")
+    with pytest.raises(panels.PanelError, match="fallback"):
+        load(write(tmp_path, data), store)
+
+
+def test_v2_refuses_a_missing_test_split(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    data["members"] = [entry for entry in data["members"] if entry["split"] == "dev"]
+    with pytest.raises(panels.PanelError, match="test"):
+        load(write(tmp_path, data), store)
+
+
+def test_v2_refuses_a_hand_picked_split(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    entry = member(data, V2_LOCAL[0])
+    entry["split"] = "test" if entry["split"] == "dev" else "dev"
+    with pytest.raises(panels.PanelError, match="differs from panels.stratify"):
+        load(write(tmp_path, data), store)
+
+
+def test_v2_refuses_a_wrong_language(tmp_path: Path, store: Path) -> None:
+    data = _v2_data()
+    member(data, "tokio-rs__axum-734")["language"] = "go"
+    with pytest.raises(panels.PanelError, match="tokio-rs__axum-734"):
+        load(write(tmp_path, restratify(data)), store)
+
+
+def test_a_non_integer_version_is_refused(tmp_path: Path, store: Path) -> None:
+    for version in ("2", 2.0, True, 3):
+        with pytest.raises(panels.PanelError, match="version"):
+            load(write(tmp_path, {**read(COMPLETE), "version": version}), store)
+
+
+def test_gepa_v1_split_digest_is_unchanged(store: Path) -> None:
+    data = read(COMMITTED_PANEL)
+    assert "version" not in data
+    panel = load(COMMITTED_PANEL, store, rows=_redacted_row)
+
+    assert panel.split_digest == stamp_digest(data)
+    assert set(panel.cheap) == set(CHEAP)

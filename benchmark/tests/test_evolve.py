@@ -968,6 +968,26 @@ def test_dev_delta_never_buys_baseline_cells(world) -> None:
     assert evo.deltas and world.runner_calls("baseline") == []
 
 
+def test_empty_cheap_tier_goes_straight_to_dev(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    members = tuple(panels.Member(task, "local", "rust", split) for split, names in (("dev", DEV), ("test", TEST))
+                    for task in names)
+    world.panel = panels.Panel(name="no-cheap", cheap=(), dev=DEV, test=TEST,
+                               split_digest=panels.split_digest(members), members=members)
+    evo = build(world)
+    planned: list[list] = []
+    plan = evo._plan
+    monkeypatch.setattr(evo, "_plan", lambda cells, *args, **kwargs: planned.append(list(cells)) or plan(cells, *args, **kwargs))
+    assert evo.preflight() is None
+
+    candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="0")
+    evo.evaluate(candidate, "dev_a")
+    result = evo.results[candidates.content_id(candidate)]
+
+    assert result.done and result.cheap_score is None and result.scores.keys() == set(DEV)
+    assert planned and all(cells for cells in planned)
+    assert {cell.task for cells in planned for cell in cells} <= set(DEV)
+
+
 def test_single_rollout_never_finalist_on_tie(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     dev3 = ("dev_a", "dev_b", "dev_c")
     files = seed_files(mcp(dev_a="0", dev_b="0", dev_c="1", cheap_a="1", test_a="1"))
