@@ -79,7 +79,7 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp.md");
 /// guarded by `cwd_guidance_spans_present` so an edit that drops or reworks the explicit-cwd directive fails the test rather than
 /// silently changing the model-facing cwd contract.
 #[cfg(test)]
-const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.";
+const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths anchor there (`..` refused); absolute paths pass through. The server cannot see your shell cwd.";
 
 /// True only in a build made while the evolve loop checks a candidate commit:
 /// its `just check` sets `TILTH_EVOLVE_CANDIDATE=1`. Tests then skip their
@@ -714,18 +714,66 @@ mod tests {
         }
     }
 
+    const WRITE_DESC: &str = include_str!("../../prompts/tools/write.md");
+    const SEARCH_DESC: &str = include_str!("../../prompts/tools/search.md");
+
     #[test]
-    fn instructions_teach_replace_text_before_line_ops() {
+    fn write_description_teaches_replace_text_before_line_ops() {
         if super::phrase_pins_exempt() {
             return;
         }
-        let rt = SERVER_INSTRUCTIONS
-            .find("`replace_text` swaps")
-            .expect("replace_text taught in edit instructions");
-        let line_ops = SERVER_INSTRUCTIONS
-            .find("line ops use copied integer")
-            .expect("line ops taught in edit instructions");
+        let rt = WRITE_DESC
+            .find("replace_text")
+            .expect("replace_text taught in tilth_write description");
+        let line_ops = WRITE_DESC
+            .find("{start,end}")
+            .expect("line ops taught in tilth_write description");
         assert!(rt < line_ops, "replace_text must lead the op teaching");
+    }
+
+    #[test]
+    fn write_description_carries_line_and_escaping_rules() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            WRITE_DESC.contains("integer lines"),
+            "copied integer line rule must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("{start,end}") && WRITE_DESC.contains("{line}"),
+            "line op arguments must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("\\t") && WRITE_DESC.contains("\\n"),
+            "tab/newline escaping rule must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("literal controls"),
+            "literal control characters must stay called out as failing"
+        );
+    }
+
+    #[test]
+    fn search_description_carries_pattern_entry_shape() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            SEARCH_DESC.contains("{pattern: \"Some($A)\", language"),
+            "structural search entry shape must stay advertised in the tilth_search description"
+        );
+    }
+
+    #[test]
+    fn instructions_name_shell_for_git_history() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            SERVER_INSTRUCTIONS.contains("Git review/history"),
+            "shell must stay named for Git history"
+        );
     }
 
     /// An errored dispatch of a different tool must break the streak — the
@@ -918,7 +966,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            2045,
+            1059,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -943,14 +991,6 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains(
             "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
         ));
-        assert!(
-            SERVER_INSTRUCTIONS.contains("line ops use copied integer"),
-            "op grammar pointer must remain in SERVER_INSTRUCTIONS"
-        );
-        assert!(
-            SERVER_INSTRUCTIONS.contains("must escape tabs/newlines"),
-            "control-char escape rule must remain in SERVER_INSTRUCTIONS"
-        );
         assert!(
             SERVER_INSTRUCTIONS
                 .contains("DO NOT use `mode: full` to edit; read the section you change."),
@@ -2495,11 +2535,7 @@ mod tests {
             return;
         }
         assert!(s.contains(CWD_PATHS_SPAN), "missing PATHS span");
-        assert!(
-            s.contains("{pattern: \"Some($A)\", language, glob?}"),
-            "structural search entry shape must stay advertised"
-        );
-        assert!(s.contains("shell `git diff` or `git log`"));
+        assert!(s.contains("Git review/history"));
         assert!(s.contains("directory browsing (ls/find)"));
         assert!(
             s.contains("DO NOT use shell for repo content reads"),
