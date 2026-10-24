@@ -23,6 +23,7 @@ from panel_support import (
     RUN_ARGS, refusing, restratify, row_source, stamp_digest, stub_loaders, stub_task, without, write,
 )
 
+GEPA_V2_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v2.json"
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 REDACTED_KEYS = {"instance_id", "repo", "base_commit", "language"}
 GRADER_KEYS = {"patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS", "problem_statement"}
@@ -678,3 +679,16 @@ def test_gepa_v1_split_digest_is_unchanged(store: Path) -> None:
 
     assert panel.split_digest == stamp_digest(data)
     assert set(panel.cheap) == set(CHEAP)
+
+
+def test_committed_gepa_v2_panel_loads(store: Path) -> None:
+    data = read(GEPA_V2_PANEL)
+    assert data["version"] == 2
+    languages = {entry["id"]: entry["language"] for entry in data["members"]}
+    panel = load(GEPA_V2_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
+
+    assert len(panel.members) == 30
+    assert panel.cheap == ()
+    assert panel.dev and panel.test
+    assignment = panels.stratify(data["members"], data["split_seed"])
+    assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
