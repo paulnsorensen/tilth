@@ -1231,3 +1231,107 @@ fn benchmark_probe_contract() {
         );
     }
 }
+
+// Tilth-mode hint text points at the cheapest correct tilth call.
+
+/// Returns the tilth-mode denial text for a command.
+fn tilth_reason_for(command: &str) -> String {
+    match verdict(command, Hint::Tilth) {
+        Verdict::Deny { reason, .. } => reason,
+        Verdict::Allow => panic!("allowed: {command:?}"),
+    }
+}
+
+#[test]
+fn hint_redirect_and_tee_lead_with_create_file_and_skip_the_read() {
+    for command in ["cat > f <<EOF\nx\nEOF", "echo x > f", "cmd | tee f"] {
+        let reason = tilth_reason_for(command);
+        assert!(reason.contains("create_file"), "{command:?}: {reason}");
+        assert!(reason.contains("New file: no read needed"), "{reason}");
+        assert!(reason.contains("Existing file"), "{reason}");
+        assert!(
+            !reason.contains("Read the file with tilth_read first"),
+            "{reason}"
+        );
+        let new_at = reason.find("create_file").expect("create_file");
+        let edit_at = reason.find("replace_text").expect("replace_text");
+        assert!(new_at < edit_at, "new-file call comes first: {reason}");
+    }
+}
+
+#[test]
+fn hint_write_kind_reuses_the_tag_the_agent_already_holds() {
+    for command in [
+        "sed -i s/a/b/ f.go",
+        "patch -p1 < x.diff",
+        "git apply x.diff",
+    ] {
+        let reason = tilth_reason_for(command);
+        assert!(
+            reason.contains("you already have from tilth_read or tilth_search"),
+            "{command:?}: {reason}"
+        );
+        assert!(reason.contains("only if you have none"), "{reason}");
+        assert!(
+            !reason.contains("Read the file with tilth_read first"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn hint_interpreters_cover_computing_and_writing() {
+    for command in [
+        "python3 - <<EOF\nprint(1)\nEOF",
+        "python -c 'print(1)'",
+        "perl -e 1",
+        "node -e 1",
+        "ruby -e 1",
+    ] {
+        let reason = tilth_reason_for(command);
+        assert!(
+            reason.contains("To compute or check"),
+            "{command:?}: {reason}"
+        );
+        assert!(
+            reason.contains("project's own test or build command"),
+            "{reason}"
+        );
+        assert!(reason.contains("tilth_search or tilth_read"), "{reason}");
+        assert!(reason.contains("create_file"), "{reason}");
+        assert!(reason.contains("replace_text"), "{reason}");
+    }
+}
+
+#[test]
+fn hint_wc_points_at_the_read_header_and_listings() {
+    let reason = tilth_reason_for("wc -l src/lib.rs");
+    assert!(reason.contains("header shows the line count"), "{reason}");
+    assert!(reason.contains("`ls` or `find`"), "{reason}");
+    assert!(reason.contains("tilth_read"), "{reason}");
+}
+
+#[test]
+fn hint_other_readers_and_search_keep_their_text() {
+    let cat = tilth_reason_for("cat f");
+    assert!(cat.contains("Append #start-end or #symbol"), "{cat}");
+    assert!(!cat.contains("line count"), "{cat}");
+    let grep = tilth_reason_for("grep -rn foo .");
+    assert!(grep.contains("searches files"), "{grep}");
+}
+
+#[test]
+fn hint_rewording_leaves_every_corpus_decision_and_rule_unchanged() {
+    for (command, rule) in rows("must_deny") {
+        let rule = rule.expect("must_deny row names a rule");
+        for hint in [Hint::Tilth, Hint::Native] {
+            match verdict(&command, hint) {
+                Verdict::Deny { rule: got, .. } => assert_eq!(got, rule, "{command:?}"),
+                Verdict::Allow => panic!("allowed: {command:?}"),
+            }
+        }
+    }
+    for command in all_allow_commands() {
+        assert!(!denies(&command), "denied but must allow: {command:?}");
+    }
+}
