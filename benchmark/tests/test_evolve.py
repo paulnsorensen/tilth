@@ -2054,13 +2054,43 @@ def test_default_just_check_timeout_kills_the_whole_process_group(monkeypatch: p
     # A surviving child holds the output pipes open, so a partial kill waits for the 60 s sleep.
     assert ok is False and "timed out" in output and time.monotonic() - started < 30
     child = int((worktree / "child.pid").read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _alive(child):
-        time.sleep(0.05)
-    assert not _alive(child)
+    assert _exits_within(child, 30)
 
 
-def test_alive_is_false_when_the_process_exits_during_the_stat_read(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exits_within_counts_a_zombie_and_a_reaped_process_as_exited() -> None:
+    process = subprocess.Popen(["true"])
+    # Not reaped yet: a zombie has exited.
+    assert _exits_within(process.pid, 30)
+    process.wait()
+    assert _exits_within(process.pid, 0)
+
+
+def test_exits_within_is_false_while_the_process_runs() -> None:
+    process = subprocess.Popen(["sleep", "60"])
+    try:
+        assert _exits_within(process.pid, 0.2) is False
+    finally:
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize(("state", "exited"), [("Z", True), ("X", True), ("x", True), ("R", False),
+                                               ("S", False), ("D", False)])
+def test_exited_counts_every_post_exit_state(monkeypatch: pytest.MonkeyPatch, state: str, exited: bool) -> None:
+    # A reaper moves a zombie Z to X before /proc drops it; X must not read as alive again.
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    real_read_text = Path.read_text
+
+    def fake_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == stat_path:
+            return f"{os.getpid()} (sleep 60) {state} 1 1 1"
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    assert _exited(os.getpid()) is exited
+
+
+def test_exited_is_true_when_the_process_exits_during_the_stat_read(monkeypatch: pytest.MonkeyPatch) -> None:
     # Linux returns ESRCH from read() when the process exits after open() of /proc/<pid>/stat.
     stat_path = Path(f"/proc/{os.getpid()}/stat")
     real_read_text = Path.read_text
@@ -2071,17 +2101,32 @@ def test_alive_is_false_when_the_process_exits_during_the_stat_read(monkeypatch:
         return real_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", racing_read_text)
-    assert _alive(os.getpid()) is False
+    assert _exited(os.getpid()) is True
 
 
-def _alive(pid: int) -> bool:
-    """True while ``pid`` runs; a zombie counts as dead."""
+def _exits_within(pid: int, timeout_s: float) -> bool:
+    """True when ``pid`` exits within ``timeout_s``.
+
+    A killed child can still run its exit path after the pipes close, and a loaded host delays it. The last
+    sample comes after the deadline check, so a stalled test still looks once more before it fails.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        late = time.monotonic() >= deadline
+        exited = _exited(pid)
+        if exited or late:
+            return exited
+        time.sleep(0.05)
+
+
+def _exited(pid: int) -> bool:
+    """True once ``pid`` has exited: zombie (Z), being reaped (X, x), or gone from /proc."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     # ProcessLookupError: the reaper can collect the process between open() and read().
     except (FileNotFoundError, ProcessLookupError):
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] in {"Z", "X", "x"}
 
 
 # --- paid calls: the CLI budget flag and the cost sources ---
