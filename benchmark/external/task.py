@@ -619,7 +619,7 @@ class ExternalTask(Task):
         home = checkout.with_name(f"{checkout.name}-home")
         home.mkdir(exist_ok=True)
         env = proc.toolchain_env(home)
-        proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language)
+        proc.isolate_caches(env, checkout.with_name(f"{checkout.name}-caches"), self.language, checkout)
         env.update(proc.c_build_env(self.language))
         if self.language == "javascript":
             javascript.package_env(env, checkout.with_name(f"{checkout.name}-caches") / "js")
@@ -651,7 +651,8 @@ class ExternalTask(Task):
         """Grade the agent's workdir against the held-out FAIL_TO_PASS and PASS_TO_PASS entries."""
         workdir = Path(repo_path)
         self._details = self._count({})
-        with tempfile.TemporaryDirectory(prefix="tilth-external-grade-") as temp:
+        # A SIGTERM unwinds the grade, so its scratch directory and test processes go with it.
+        with proc.unwind_on_sigterm(), tempfile.TemporaryDirectory(prefix="tilth-external-grade-") as temp:
             checkout = Path(temp) / "checkout"
             try:
                 self.export_prepared(checkout)

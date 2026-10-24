@@ -4,10 +4,15 @@ import os
 import shutil
 import signal
 import subprocess
-from collections.abc import Mapping, Sequence
+import threading
+import tomllib
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 _DRAIN_TIMEOUT_S = 5.0
+# The value of GOPROXY when nothing sets it.
+_GO_DEFAULT_PROXY = "https://proxy.golang.org,direct"
 
 # Harness variables that environment builds and grades keep: locale, terminal, network, index, and
 # toolchain selection. Credentials (tokens, agent sockets, SSH and GPG agents) are not in it.
@@ -63,27 +68,63 @@ def c_build_env(language: str) -> dict[str, str]:
     return {"CFLAGS": "-std=gnu17"} if language == "rust" else {}
 
 
-def isolate_caches(env: dict[str, str], root: Path, language: str) -> None:
-    """Give one grade private caches under ``root``.
+def isolate_caches(env: dict[str, str], root: Path, language: str, project: Path) -> None:
+    """Give one grade of the project at ``project`` private caches under ``root``.
 
-    The Cargo registry and git directories and the Go module cache are copies of the host caches,
-    so the grade needs no network. A copy-on-write copy keeps them cheap where the file system allows it.
-    Agent code that writes into a copy cannot reach a later grade. Credentials files stay behind.
+    No grade copies a whole host cache: on a file system without reflinks, that is gigabytes per grade.
+    The Go module cache starts empty. ``GOPROXY`` serves modules first from the host download cache
+    (``$GOMODCACHE/cache/download``) as a ``file://`` proxy. Go reads that proxy and never writes to it,
+    and it checks each module against ``go.sum``. So the grade extracts only the modules it uses, with no network.
+    The Cargo home gets copies of the registry index, the git checkouts, and ``config.toml``,
+    and only the crate archives that ``project``'s ``Cargo.lock`` pins. Cargo extracts their sources again.
+    Agent code that writes into a private cache cannot reach a later grade. Credentials files stay behind.
     The Go build cache starts empty, because it holds only build output and the build refills it.
     """
     if language == "rust":
-        cargo_home = root / "cargo"
+        host, cargo_home = Path(env["CARGO_HOME"]), root / "cargo"
         cargo_home.mkdir(parents=True)
-        for name in ("registry", "git", "config.toml"):
-            _seed(Path(env["CARGO_HOME"]) / name, cargo_home / name)
+        for name in ("registry/index", "git", "config.toml"):
+            _seed(host / name, cargo_home / name)
+        _seed_crates(host / "registry" / "cache", cargo_home / "registry" / "cache", project / "Cargo.lock")
         env["CARGO_HOME"] = str(cargo_home)
     elif language == "go":
-        _seed(Path(env["GOMODCACHE"]), root / "gomodcache")
-        env["GOMODCACHE"] = str(root / "gomodcache")
-        (root / "gocache").mkdir(parents=True)
-        env["GOCACHE"] = str(root / "gocache")
-        (root / "gopath").mkdir(parents=True, exist_ok=True)
-        env["GOPATH"] = str(root / "gopath")
+        downloads = Path(env["GOMODCACHE"]) / "cache" / "download"
+        for name in ("gomodcache", "gocache", "gopath"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        env.update(GOMODCACHE=str(root / "gomodcache"), GOCACHE=str(root / "gocache"), GOPATH=str(root / "gopath"))
+        if downloads.is_dir():
+            # A comma falls through to the next proxy only on "not found", the answer for a module the host lacks.
+            env["GOPROXY"] = f"{downloads.as_uri()},{env.get('GOPROXY') or _GO_DEFAULT_PROXY}"
+
+
+def _locked_crates(lockfile: Path) -> set[str] | None:
+    """The ``<name>-<version>.crate`` archive names of the registry packages in ``lockfile``; None without one."""
+    try:
+        lock = tomllib.loads(lockfile.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        return None
+    registries = ("registry+", "sparse+")
+    return {f"{package.get('name')}-{package.get('version')}.crate" for package in packages
+            if isinstance(package, dict) and str(package.get("source", "")).startswith(registries)}
+
+
+def _seed_crates(source: Path, target: Path, lockfile: Path) -> None:
+    """Copy the archives in each registry directory of ``source`` that ``lockfile`` pins; all of them without one."""
+    wanted = _locked_crates(lockfile)
+    if wanted is None:
+        _seed(source, target)
+        return
+    if not source.is_dir():
+        return
+    for registry in source.iterdir():
+        if registry.is_dir():
+            (target / registry.name).mkdir(parents=True, exist_ok=True)
+            for archive in registry.iterdir():
+                if archive.name in wanted and archive.is_file():
+                    shutil.copy2(archive, target / registry.name / archive.name)
 
 
 def _seed(source: Path, target: Path) -> None:
@@ -99,6 +140,29 @@ def _seed(source: Path, target: Path) -> None:
             shutil.copytree(source, target, symlinks=True)
         else:
             shutil.copy2(source, target)
+
+
+@contextmanager
+def unwind_on_sigterm() -> Iterator[None]:
+    """Turn SIGTERM into ``SystemExit(143)`` while the block runs, so ``with`` cleanups still run.
+
+    By default SIGTERM ends Python at once. Then a grade leaks its scratch directory and its test processes.
+    The exception unwinds the main thread: ``run`` kills the child process group and the temporary directories go.
+    A no-op off the main thread or when the process already handles SIGTERM. SIGKILL cannot be caught.
+    """
+    if threading.current_thread() is not threading.main_thread() or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL:
+        yield
+        return
+
+    def exit_now(signum: int, _frame) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, exit_now)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
 
 def run(
     argv: Sequence[str],

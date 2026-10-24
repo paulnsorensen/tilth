@@ -1,11 +1,13 @@
 """Grading and environment builds keep harness credentials and row paths contained."""
 
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ import external.data
 import external.proc
 import external.swebench_ml
 import external.task
-from external_support import SWE_PY, SWE_RS
+from external_support import SWE_PY, SWE_RS, write_tree
 
 
 def test_toolchain_env_drops_credentials_and_swaps_home(tmp_path: Path) -> None:
@@ -126,27 +128,121 @@ def test_grade_cannot_persist_into_the_shared_grade_venv(external_bench, tmp_pat
     assert not list(task.grade_venv().rglob("poison.pth"))
 
 
-def test_isolate_caches_copies_seeds_and_drops_credentials(tmp_path: Path) -> None:
-    cargo, gomod, gocache = tmp_path / "cargo", tmp_path / "gomod", tmp_path / "gocache"
-    (cargo / "registry").mkdir(parents=True)
-    (cargo / "registry" / "crate.txt").write_text("crate")
-    (cargo / "credentials.toml").write_text("token")
-    gomod.mkdir()
-    (gomod / "mod.txt").write_text("mod")
+_LOCKFILE = """version = 3
+
+[[package]]
+name = "app"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
+
+
+def _host_cargo_home(root: Path) -> Path:
+    write_tree(root, {"registry/index/idx/config.json": "{}", "registry/cache/idx/serde-1.0.0.crate": "serde",
+                      "registry/cache/idx/unused-9.9.9.crate": "unused", "registry/src/idx/serde-1.0.0/lib.rs": "src",
+                      "git/db/dep/HEAD": "ref", "config.toml": "[net]\n", "credentials.toml": "token"})
+    return root
+
+
+def _files(root: Path) -> list[str]:
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
+
+
+def test_isolate_caches_copies_only_the_locked_crates_and_drops_credentials(tmp_path: Path) -> None:
+    cargo = _host_cargo_home(tmp_path / "cargo")
+    project = tmp_path / "checkout"
+    write_tree(project, {"Cargo.lock": _LOCKFILE})
+    env = {"CARGO_HOME": str(cargo)}
+
+    external.proc.isolate_caches(env, tmp_path / "grade", "rust", project)
+    private = Path(env["CARGO_HOME"])
+    (private / "registry" / "cache" / "idx" / "serde-1.0.0.crate").write_text("poisoned")
+
+    assert private != cargo
+    assert _files(private) == ["config.toml", "git/db/dep/HEAD", "registry/cache/idx/serde-1.0.0.crate",
+                               "registry/index/idx/config.json"]
+    assert (cargo / "registry" / "cache" / "idx" / "serde-1.0.0.crate").read_text() == "serde"
+
+
+@pytest.mark.parametrize("lockfile", [None, "not [ toml"])
+def test_isolate_caches_copies_every_crate_archive_without_a_readable_lockfile(tmp_path: Path,
+                                                                              lockfile: str | None) -> None:
+    cargo = _host_cargo_home(tmp_path / "cargo")
+    project = tmp_path / "checkout"
+    write_tree(project, {} if lockfile is None else {"Cargo.lock": lockfile})
+    env = {"CARGO_HOME": str(cargo)}
+
+    external.proc.isolate_caches(env, tmp_path / "grade", "rust", project)
+
+    assert [name for name in _files(Path(env["CARGO_HOME"])) if name.startswith("registry/")] == [
+        "registry/cache/idx/serde-1.0.0.crate", "registry/cache/idx/unused-9.9.9.crate",
+        "registry/index/idx/config.json"]
+
+
+@pytest.mark.parametrize(("inherited", "fallback"), [(None, "https://proxy.golang.org,direct"), ("off", "off")])
+def test_isolate_caches_serves_go_modules_from_the_host_download_cache(tmp_path: Path, inherited: str | None,
+                                                                       fallback: str) -> None:
+    gomod, gocache = tmp_path / "gomod", tmp_path / "gocache"
+    write_tree(gomod, {"cache/download/example.com/dep/@v/v1.0.0.zip": "zip", "example.com/dep@v1.0.0/dep.go": "src"})
     gocache.mkdir()
+    env = {"GOMODCACHE": str(gomod), "GOCACHE": str(gocache), "GOPATH": str(tmp_path / "gopath")}
+    if inherited:
+        env["GOPROXY"] = inherited
 
-    rust_env = {"CARGO_HOME": str(cargo)}
-    external.proc.isolate_caches(rust_env, tmp_path / "rust-grade", "rust")
-    go_env = {"GOMODCACHE": str(gomod), "GOCACHE": str(gocache), "GOPATH": str(tmp_path / "gopath")}
-    external.proc.isolate_caches(go_env, tmp_path / "go-grade", "go")
-    (Path(rust_env["CARGO_HOME"]) / "registry" / "crate.txt").write_text("poisoned")
-    (Path(go_env["GOMODCACHE"]) / "mod.txt").write_text("poisoned")
+    external.proc.isolate_caches(env, tmp_path / "grade", "go", tmp_path / "checkout")
 
-    assert rust_env["CARGO_HOME"] != str(cargo) and go_env["GOMODCACHE"] != str(gomod)
-    assert not (Path(rust_env["CARGO_HOME"]) / "credentials.toml").exists()
-    assert (cargo / "registry" / "crate.txt").read_text() == "crate"
-    assert (gomod / "mod.txt").read_text() == "mod"
-    assert go_env["GOCACHE"] != str(gocache) and go_env["GOPATH"] != str(tmp_path / "gopath")
+    assert env["GOMODCACHE"] != str(gomod) and list(Path(env["GOMODCACHE"]).iterdir()) == []
+    assert env["GOPROXY"] == f"{(gomod / 'cache' / 'download').as_uri()},{fallback}"
+    assert env["GOCACHE"] != str(gocache) and env["GOPATH"] != str(tmp_path / "gopath")
+
+
+def test_isolate_caches_keeps_goproxy_when_the_host_has_no_download_cache(tmp_path: Path) -> None:
+    env = {"GOMODCACHE": str(tmp_path / "missing"), "GOCACHE": str(tmp_path / "gocache"), "GOPROXY": "off"}
+
+    external.proc.isolate_caches(env, tmp_path / "grade", "go", tmp_path / "checkout")
+
+    assert env["GOPROXY"] == "off"
+
+
+def _host_go_module(downloads: Path, module: str, version: str, files: dict[str, str]) -> None:
+    """Write ``module@version`` into a download cache in the layout that ``go mod download`` leaves."""
+    versions = downloads / module / "@v"
+    versions.mkdir(parents=True)
+    go_mod = f"module {module}\n\ngo 1.21\n"
+    (versions / f"{version}.mod").write_text(go_mod)
+    (versions / f"{version}.info").write_text(json.dumps({"Version": version, "Time": "2026-01-01T00:00:00Z"}))
+    with zipfile.ZipFile(versions / f"{version}.zip", "w") as archive:
+        for name, content in {"go.mod": go_mod, **files}.items():
+            archive.writestr(f"{module}@{version}/{name}", content)
+
+
+@pytest.mark.skipif(shutil.which("go") is None, reason="go is not on PATH")
+def test_a_go_grade_builds_offline_from_the_host_download_cache_and_leaves_it_alone(tmp_path: Path) -> None:
+    host = tmp_path / "host-gomod"
+    _host_go_module(host / "cache" / "download", "example.com/dep", "v1.0.0",
+                    {"dep.go": "package dep\n\nconst Answer = 42\n"})
+    before = _files(host)
+    project = tmp_path / "checkout"
+    write_tree(project, {"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire example.com/dep v1.0.0\n",
+                         "main.go": 'package main\n\nimport "example.com/dep"\n\nfunc main() { println(dep.Answer) }\n'})
+    (tmp_path / "home").mkdir()
+    base = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"), "GOMODCACHE": str(host), "GOPROXY": "off",
+            "GOSUMDB": "off", "GOFLAGS": "-mod=mod -buildvcs=false", "GOTOOLCHAIN": "local"}
+    control = {**base, "GOMODCACHE": str(tmp_path / "empty-gomod"), "GOCACHE": str(tmp_path / "control-gocache")}
+    env = dict(base)
+    external.proc.isolate_caches(env, tmp_path / "grade", "go", project)
+
+    without_proxy = subprocess.run(["go", "build", "./..."], cwd=project, env=control, capture_output=True, text=True)
+    built = subprocess.run(["go", "build", "./..."], cwd=project, env=env, capture_output=True, text=True)
+
+    assert without_proxy.returncode != 0 and "GOPROXY=off" in without_proxy.stderr
+    assert built.returncode == 0, built.stderr
+    assert (Path(env["GOMODCACHE"]) / "example.com" / "dep@v1.0.0" / "dep.go").is_file()
+    assert _files(host) == before
 
 
 def test_setsid_grandchild_holding_the_pipe_cannot_block_a_timeout(tmp_path: Path) -> None:
@@ -171,11 +267,66 @@ def test_isolate_caches_starts_the_go_build_cache_empty(tmp_path: Path) -> None:
     (gocache / "object").write_text("build output")
     env = {"GOMODCACHE": str(gomod), "GOCACHE": str(gocache), "GOPATH": str(tmp_path / "gopath")}
 
-    external.proc.isolate_caches(env, tmp_path / "grade", "go")
+    external.proc.isolate_caches(env, tmp_path / "grade", "go", tmp_path / "checkout")
 
     assert list(Path(env["GOCACHE"]).iterdir()) == []
     assert (gocache / "object").read_text() == "build output"
 
+
+_GRADE_UNTIL_SIGTERM = """
+import sys
+from pathlib import Path
+
+benchmark, upstream_url, instance_id, workdir, pidfile = sys.argv[1:]
+sys.path[:0] = [benchmark, f"{benchmark}/tests"]
+import external.data, external.proc, external.swebench_ml
+from external_support import REPO_LANGUAGES
+
+external.data.REPO_LANGUAGES.update(REPO_LANGUAGES)
+external.data.UPSTREAM_URL = upstream_url
+task = external.swebench_ml.load(instance_id, external.data.SWEBENCH_ML_REVISION)
+
+
+def test_output(checkout):
+    print(checkout.parent, flush=True)
+    external.proc.run(["bash", "-c", f"echo $$ > {pidfile}; exec sleep 60"])
+    return "", ""
+
+
+task.test_output = test_output
+task.check_correctness("", workdir)
+"""
+
+
+def test_sigterm_during_a_grade_removes_its_scratch_and_kills_its_tests(external_bench, tmp_path: Path) -> None:
+    external_bench.seed(SWE_PY)
+    task = external.swebench_ml.load(SWE_PY, external.data.SWEBENCH_ML_REVISION)
+    workdir, pidfile = tmp_path / "workdir", tmp_path / "tests.pid"
+    task.prepare(workdir)
+    benchmark = Path(__file__).resolve().parent.parent
+    grader = subprocess.Popen(
+        [sys.executable, "-c", _GRADE_UNTIL_SIGTERM, str(benchmark), f"file://{external_bench.upstream}/{{repo}}.git",
+         SWE_PY, str(workdir), str(pidfile)],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        grade_dir = Path(grader.stdout.readline().strip())
+        for _ in range(100):
+            if pidfile.is_file() and pidfile.read_text().strip():
+                break
+            time.sleep(0.1)
+        tests = int(pidfile.read_text())
+        assert grade_dir.name.startswith("tilth-external-grade-") and grade_dir.is_dir()
+
+        grader.send_signal(signal.SIGTERM)
+
+        assert grader.wait(timeout=30) == 128 + signal.SIGTERM
+    finally:
+        grader.kill()
+        grader.wait()
+        grader.stdout.close()
+    assert not grade_dir.exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(tests, 0)
 
 def test_build_env_runs_uv_in_copy_link_mode(external_bench, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     external_bench.seed(SWE_PY)
