@@ -574,10 +574,18 @@ fn unchanged_reread_stub(
         return None;
     }
     let tag = crate::read::unchanged_head_tag(session, path, spec)?;
+    let display = crate::format::display_path(path);
+    let target = match suffix {
+        PathSuffix::None => display.clone(),
+        PathSuffix::LineRange(a, b) => format!("{display}#{a}-{b}"),
+        PathSuffix::FromLine(n) => format!("{display}#{n}"),
+        PathSuffix::Heading(h) => format!("{display}#{h}"),
+        PathSuffix::Symbol(s) => format!("{display}#{s}"),
+    };
     Some(format!(
-        "[{}#{}] unchanged since your last read (mode: \"full\" re-sends the text)",
-        crate::format::display_path(path),
-        crate::edit::tag::format_tag(tag)
+        "[{display}#{}] unchanged since your last read. To re-send: tilth_read(paths: [{}], mode: \"full\")",
+        crate::edit::tag::format_tag(tag),
+        serde_json::Value::String(target)
     ))
 }
 

@@ -1,4 +1,5 @@
 """An unchanged re-read in one session returns a one-line stub, not the text."""
+import json
 import re
 import tempfile
 import unittest
@@ -12,7 +13,16 @@ def setUpModule():
 
 
 SOURCE = "".join(f"let value_{i} = {i};\n" for i in range(30))
-STUB = re.compile(r"^\[a\.rs#[0-9A-F]{4}\] unchanged since your last read \(mode: \"full\"")
+
+
+def stub(target):
+    return re.compile(
+        r"^\[a\.rs#[0-9A-F]{4}\] unchanged since your last read\. "
+        r"To re-send: tilth_read\(paths: \[\"" + re.escape(target) + r"\"\], mode: \"full\"\)(\n|$)")
+
+
+STUB = stub("a.rs")
+SECTION_STUB = stub("a.rs#3-4")
 
 
 class UnchangedReread(unittest.TestCase):
@@ -38,10 +48,23 @@ class UnchangedReread(unittest.TestCase):
         self.assertRegex(second, STUB)
         self.assertNotIn("value_29", second)
 
+    def test_section_stub_names_the_section_call(self):
+        _, second = self.reads({"paths": ["a.rs#2-5"]}, {"paths": ["a.rs#3-4"]})
+        self.assertRegex(second, SECTION_STUB)
+
+    def test_named_call_resends_only_the_section(self):
+        _, _, third = self.reads(
+            {"paths": ["a.rs#2-5"]},
+            {"paths": ["a.rs#3-4"]},
+            {"paths": ["a.rs#3-4"], "mode": "full"})
+        self.assertIn("value_3 = 3", third)
+        self.assertNotIn("value_29", third)
+        self.assertNotIn("unchanged since", third)
+
     def test_second_section_read_is_a_stub(self):
         first, second = self.reads({"paths": ["a.rs#2-5"]}, {"paths": ["a.rs#3-4"]})
         self.assertIn("value_2", first)
-        self.assertRegex(second, STUB)
+        self.assertRegex(second, SECTION_STUB)
 
     def test_unseen_lines_are_still_sent(self):
         _, second = self.reads({"paths": ["a.rs#2-5"]}, {"paths": ["a.rs#2-9"]})
@@ -80,6 +103,41 @@ class UnchangedReread(unittest.TestCase):
         self.assertIn("value_3 = 33", third)
         self.assertNotIn("unchanged since", third)
 
+
+class ClippedSearchThenRead(unittest.TestCase):
+    """A search that the budget clipped must not make a later read a stub."""
+
+    NAMES = [f"f{i:02d}" for i in range(30)]
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.cwd = self.directory.name
+        body = "".join(f'let value_{i} = "{"x" * 300}";\n' for i in range(70))
+        for name in self.NAMES:
+            (Path(self.cwd) / f"{name}.rs").write_text(body)
+
+    def run_calls(self, calls):
+        requests = [harness.initialize_request()]
+        for i, (tool, args) in enumerate(calls, start=2):
+            requests.append(harness.tools_call_request(
+                i, tool, {"cwd": self.cwd, **args}))
+        result = harness.run_mcp([], requests)
+        return [harness.tool_result_text(result.response_by_id(i))
+                for i in range(2, 2 + len(calls))]
+
+    def test_only_lines_the_clipped_search_showed_become_stubs(self):
+        search = ("tilth_search", {"queries": [{"query": "value_3"}], "budget": 380})
+        reads = [("tilth_read", {"paths": [f"{name}.rs#4-4"]}) for name in self.NAMES]
+        first, *texts = self.run_calls([search, *reads])
+        preview = json.loads(first)["results"][0]["preview"]
+        shown = {name for name in self.NAMES
+                 if re.search(rf"### {name}\.rs#[0-9A-F]{{4}}:4 \[usage\]\n-> \[4\]", preview)}
+        stubbed = {name for name, text in zip(self.NAMES, texts)
+                   if text.startswith(f"[{name}.rs#") and "unchanged since" in text[:120]}
+        self.assertTrue(shown, "the clipped search should still show some matches")
+        self.assertLess(len(shown), 10, "the budget should clip some of the 10 matches")
+        self.assertEqual(stubbed, shown)
 
 if __name__ == "__main__":
     unittest.main()
