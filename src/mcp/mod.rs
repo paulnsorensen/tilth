@@ -592,6 +592,7 @@ mod tests {
             );
         }
 
+        let services = Services::new();
         let read = dispatch_tool(
             "tilth_read",
             &serde_json::json!({ "paths": ["c.rs"], "cwd": cwd }),
@@ -1337,12 +1338,12 @@ mod tests {
         let source = format!("// {}\nfn byte_only() {{}}\n", dir.path().display());
         std::fs::write(dir.path().join("direct.rs"), &source).unwrap();
         let witness = crate::lang::treesitter::ParseWitness::new(&source);
-        let services = Services::new();
         for args in [
             serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs"], "mode": "full"}),
             serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs#2-2"]}),
             serde_json::json!({"cwd": dir.path(), "paths": ["direct.rs"]}),
         ] {
+            let services = Services::new();
             let response = dispatch_tool("tilth_read", &args, &services).unwrap();
             assert!(response.contains("fn byte_only() {}"));
         }

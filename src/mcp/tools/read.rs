@@ -223,6 +223,15 @@ fn tool_read_paths(
                 } else {
                     read_single_with_suffix(path, suffix, signature, force_stripped, cache)
                 };
+                if let Some(stub) = unchanged_reread_stub(
+                    session,
+                    path,
+                    suffix,
+                    (signature, force_stripped, force_full),
+                    &spec,
+                ) {
+                    return PerPath::Content(label, stub);
+                }
                 // Record the whole-file-tag snapshot so a follow-up tilth_write
                 // can verify the tag, using the seen-lines the view displayed.
                 if should_record_edit_snapshot(path, suffix, signature, force_stripped, force_full)
@@ -266,7 +275,13 @@ fn tool_read_paths(
         let complete =
             crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &combined);
         if crate::types::estimate_tokens(complete.len() as u64) <= budget_val {
+            for path in &paths {
+                session.set_read_clipped(path, false);
+            }
             return Ok(complete);
+        }
+        for path in &paths {
+            session.set_read_clipped(path, true);
         }
         let body_budget = response_body_budget(Some(now), &serde_json::Map::new(), budget_val);
         if !parts.is_empty() {
@@ -398,17 +413,28 @@ fn tool_read_paths(
     if !matches!(suffix, PathSuffix::None) {
         session.record_read(&path);
         let (body, spec) = read_single_with_suffix(&path, &suffix, force_signature, false, cache);
+        if let Some(stub) = unchanged_reread_stub(
+            session,
+            &path,
+            &suffix,
+            (force_signature, false, force_full),
+            &spec,
+        ) {
+            return Ok(finalize_response(
+                since.map(|_| now),
+                serde_json::Map::new(),
+                &stub,
+                budget,
+            ));
+        }
         if should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full) {
             crate::read::record_edit_snapshot(session, &path, &spec);
         }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
         // Cache token still rides along when if_modified_since was supplied.
-        return Ok(finalize_response(
-            since.map(|_| now),
-            serde_json::Map::new(),
-            &body,
-            budget,
-        ));
+        let response = finalize_response(since.map(|_| now), serde_json::Map::new(), &body, budget);
+        forget_if_truncated(session, &path, &response);
+        return Ok(response);
     }
 
     session.record_read(&path);
@@ -453,6 +479,20 @@ fn tool_read_paths(
 
     // Cold-path fuzzy resolution: scope the gitignore-aware tree walk to the
     // per-call `cwd`, not the server's own process directory.
+    if let Some(stub) = unchanged_reread_stub(
+        session,
+        &path,
+        &suffix,
+        (false, false, force_full),
+        &crate::read::SeenSpec::Whole,
+    ) {
+        return Ok(finalize_response(
+            None,
+            serde_json::Map::new(),
+            &stub,
+            budget,
+        ));
+    }
     let mut output = crate::read::read_file_resolving(&path, None, force_full, cache, true, cwd)
         .map_err(|e| e.to_string())?;
     // An outlined view emits no `[path#TAG]` and no numbered lines, so it
@@ -498,6 +538,7 @@ fn tool_read_paths(
     }
 
     let response = finalize_response(None, meta, &output, budget);
+    forget_if_truncated(session, &path, &response);
     // Credit savings vs the full file using the baseline captured before the read.
     if let Some(file_byte_len) = savings_baseline {
         session.record_savings(
@@ -506,6 +547,38 @@ fn tool_read_paths(
         );
     }
     Ok(response)
+}
+
+/// A budget-truncated reply did not display every line the snapshot counts as
+/// seen, so a later unchanged-stub would hide text the caller never received.
+fn forget_if_truncated(session: &Session, path: &Path, response: &str) {
+    let clipped = response.starts_with('{') && response.contains("\"truncated\":true");
+    session.set_read_clipped(path, clipped);
+}
+
+/// One-line reply for a read whose file tag is unchanged and whose lines an
+/// earlier read or search in this session already displayed. `mode: "full"`
+/// always re-sends the text. `shape` is `(signature, stripped, force_full)`.
+fn unchanged_reread_stub(
+    session: &Session,
+    path: &Path,
+    suffix: &PathSuffix,
+    shape: (bool, bool, bool),
+    spec: &crate::read::SeenSpec,
+) -> Option<String> {
+    let (signature, stripped, force_full) = shape;
+    if force_full || !should_record_edit_snapshot(path, suffix, signature, stripped, false) {
+        return None;
+    }
+    if session.read_was_clipped(path) {
+        return None;
+    }
+    let tag = crate::read::unchanged_head_tag(session, path, spec)?;
+    Some(format!(
+        "[{}#{}] unchanged since your last read (mode: \"full\" re-sends the text)",
+        crate::format::display_path(path),
+        crate::edit::tag::format_tag(tag)
+    ))
 }
 
 /// Resolve a single path+suffix to its read output plus the [`SeenSpec`] the

@@ -601,6 +601,40 @@ pub fn record_edit_snapshot(
     session.record_snapshot(path, &text, seen)
 }
 
+/// The tag of the session's newest snapshot of `path` when the live file still
+/// has that tag and a previous read or search already displayed every line of
+/// `spec`. `None` means the caller must send the text.
+pub fn unchanged_head_tag(
+    session: &crate::session::Session,
+    path: &Path,
+    spec: &SeenSpec,
+) -> Option<u16> {
+    let over_cap = fs::metadata(path)
+        .ok()
+        .is_none_or(|m| m.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP as u64);
+    if over_cap {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let head = session.snapshots().head(path)?;
+    if head.tag != crate::edit::tag::compute_file_hash(&text) {
+        return None;
+    }
+    let covered = match spec {
+        SeenSpec::Whole => {
+            let n = u32::try_from(text.split('\n').count()).unwrap_or(u32::MAX);
+            head.first_unseen_anchor(1..=n).is_none()
+        }
+        SeenSpec::Ranges(ranges) => {
+            !ranges.is_empty()
+                && head
+                    .first_unseen_anchor(ranges.iter().flat_map(|&(s, e)| s..=e.max(s)))
+                    .is_none()
+        }
+    };
+    covered.then_some(head.tag)
+}
+
 /// Resolve a markdown `#heading` anchor to its 1-based inclusive line span,
 /// for the seen-lines provenance of an edit-mode heading read. Returns `None`
 /// when the file is unreadable or the heading is absent (caller falls back).

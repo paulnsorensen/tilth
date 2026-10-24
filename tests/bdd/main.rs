@@ -223,9 +223,18 @@ fn content_match(
     assert_literal_preview(world, result, &path, line, &docstring(step));
 }
 
+#[when(expr = "I read {string} in full")]
+fn read_in_full(world: &mut TilthWorld, selector: String) {
+    read_with(world, selector, "full");
+}
+
 #[when(expr = "I read {string}")]
 fn read(world: &mut TilthWorld, selector: String) {
-    world.call("tilth_read", json!({"paths": [selector]}));
+    read_with(world, selector, "auto");
+}
+
+fn read_with(world: &mut TilthWorld, selector: String, mode: &str) {
+    world.call("tilth_read", json!({"paths": [selector], "mode": mode}));
     let path = selector
         .split_once('#')
         .map_or(selector.as_str(), |(path, _)| path);
