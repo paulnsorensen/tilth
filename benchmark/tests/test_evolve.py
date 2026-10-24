@@ -26,7 +26,7 @@ from evolve import candidate as candidates
 from evolve import engine
 from evolve.finish import REPIN_NOTE, GitHubPRClient
 from evolve.gitops import GitError
-from evolve.loop import Cascade, EvolveError
+from evolve.loop import Cascade, EvolveError, dominates, task_score
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV, ApplyRejected, Materializer
 from evolve_support import (
     CHEAP, DEV, SEED_MCP, TEST, EvolveTask, build, cargo_available, child, copy_tilth, git, log_text,
@@ -1114,13 +1114,11 @@ def test_stopped_search_without_a_dev_winner_fails_finish(world) -> None:
     assert "finish: incomplete (ceiling)" in log_text(world)
 
 
-@pytest.mark.parametrize("incomplete", ["winner", "seed", "baseline"])
+@pytest.mark.parametrize("incomplete", ["winner", "seed"])
 def test_finish_refuses_to_compare_incomplete_test_cells(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
                                                          incomplete: str) -> None:
     files = seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="E" if incomplete == "seed" else "0"))
     world = make_world(monkeypatch, tmp_path, files)
-    if incomplete == "baseline":
-        world.baseline["test_a"] = "E"
     evo = ready(world)
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
     accept(evo, child(evo.seed, test_a="E" if incomplete == "winner" else "1"), {"dev_a": 0.9, "dev_b": 0.9})
@@ -1207,10 +1205,10 @@ def test_finish_no_pr_when_seed_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert "no improvement" in log_text(world)
 
 
-def three_test_task_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def three_test_task_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, seed_test: str = "0"):
     tasks = ("test_a", "test_b", "test_c")
-    world = make_world(monkeypatch, tmp_path, seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1",
-                                                              test_a="0", test_b="0", test_c="0")))
+    world = make_world(monkeypatch, tmp_path, seed_files(mcp(dev_a="1", dev_b="1", cheap_a="1", test_a=seed_test,
+                                                              test_b=seed_test, test_c=seed_test)))
     for task in tasks[1:]:
         monkeypatch.setitem(run.TASKS, task, EvolveTask(name=task))
     members = tuple(panels.Member(id=task, family="local", language="rust", split=split)
@@ -1262,7 +1260,7 @@ def test_test_split_scored_once_at_finish(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     evo.finish = finish
     assert evo.run() == 0
-    assert all(call[0] != "test_a" for call in world.calls[:before_finish[0]])
+    assert all(call[0] != "test_a" or call[1] == "baseline" for call in world.calls[:before_finish[0]])
     test_cells = [call for call in world.calls if call[0] == "test_a"]
     assert test_cells and len(test_cells) == len(set(test_cells))
 
@@ -1494,7 +1492,8 @@ def test_finish_without_a_nonseed_candidate_buys_nothing(world) -> None:
     calls = len(world.calls)
 
     assert evo.finish() is None
-    assert len(world.calls) == calls and not [call for call in world.calls if call[0] == "test_a"]
+    assert len(world.calls) == calls
+    assert not [call for call in world.calls if call[0] == "test_a" and call[1] != "baseline"]
     assert world.pr.calls == [] and evo.finish_failure is None
     assert "finish: no improvement (no non-seed candidate on the frontier)" in log_text(world)
 
@@ -1601,7 +1600,7 @@ def test_search_critique_respects_reserve(world, monkeypatch: pytest.MonkeyPatch
                                          cost=0.0, cost_source="native")
 
     factory = lambda ledger, floor: judge_core.Judge(ledger, Client(), cell_estimate_usd=floor)
-    world.costs.update(dev_a=0.0, dev_b=0.0, cheap_a=0.0, test_a=0.1)
+    world.costs.update(dev_a=1e-6, dev_b=1e-6, cheap_a=1e-6, test_a=0.1)
     warm = build(world, "--reruns", "0", "--cell-estimate-usd", "0.2", judge_factory=factory)
     assert warm.preflight() is None and warm.buy_baselines() is None
     warm.evaluate(warm.seed, "dev_a")
@@ -1674,7 +1673,7 @@ def test_cli_change_mid_search_stops_the_run(world, monkeypatch: pytest.MonkeyPa
     assert evo.evaluate(child(evo.seed, dev_a="1", cheap_a="1"), "dev_a") == (0.0, {"stopped": "cli-version"})
     assert evo.stop.reason == "cli-version" and len(world.calls) == calls
     assert evo.finish() is None and world.pr.calls == []
-    assert "finish: incomplete (cli-version)" in log_text(world)
+    assert "finish: incomplete (baseline drift:" in log_text(world) and "cli_version" in log_text(world)
 
 
 def test_run_log_has_no_gate_verdict(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1689,7 +1688,7 @@ def test_run_log_has_no_gate_verdict(world, monkeypatch: pytest.MonkeyPatch) -> 
 def _ceiling_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn):
     """max 1.2, a 0.2 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
     world = weak_world(monkeypatch, tmp_path)
-    world.costs.update(dev_a=0.0, dev_b=0.0, cheap_a=0.0, test_a=0.1)
+    world.costs.update(dev_a=1e-6, dev_b=1e-6, cheap_a=1e-6, test_a=0.1)
     evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="2000", spawn=spawn)
     monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
     assert evo.preflight() is None
@@ -2451,3 +2450,201 @@ def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch:
     assert main(world, auth_spawn=_status_spawn(statuses)) == 2
 
     assert statuses == [] and world.spawned == [] and world.calls == []
+
+
+# --- the score is cost per correct: p * base / c ---
+
+
+def row(task: str, correct: bool, **fields) -> dict:
+    return {"task": task, "correct": correct, "contaminated": False, "repetition": 0, "run_key": "k", **fields}
+
+
+def test_task_score_is_pass_rate_times_baseline_over_mean_cost() -> None:
+    rows = [row("t", True, total_cost_usd=0.2), row("t", False, total_cost_usd=0.4), row("u", True, total_cost_usd=9.0)]
+
+    assert task_score(rows, "t", 0.15) == pytest.approx(0.5 * 0.15 / 0.3)
+
+
+def test_task_score_is_zero_when_never_solved_or_contaminated() -> None:
+    unsolved = [row("t", False, total_cost_usd=0.2)]
+    contaminated = [row("t", True, contaminated=True, total_cost_usd=0.2)]
+
+    assert task_score(unsolved, "t", 0.1) == 0.0 and task_score(contaminated, "t", 0.1) == 0.0
+    assert task_score([], "t", 0.1) == 0.0
+
+
+def test_task_score_costs_a_failed_cell_at_its_charged_usd() -> None:
+    rows = [row("t", True, total_cost_usd=0.1), row("t", False, charged_usd=0.3)]
+
+    assert task_score(rows, "t", 0.1) == pytest.approx(0.5 * 0.1 / 0.2)
+
+
+def test_task_score_stops_on_a_row_with_no_numeric_cost() -> None:
+    with pytest.raises(EvolveError, match="a finite, non-negative cost is required"):
+        task_score([row("t", False, total_cost_usd=None)], "t", 0.1)
+    with pytest.raises(EvolveError, match="a finite, non-negative cost is required"):
+        task_score([row("t", True, total_cost_usd="0.1")], "t", 0.1)
+
+
+def test_task_score_stops_on_a_solved_task_with_no_positive_cost() -> None:
+    with pytest.raises(EvolveError):
+        task_score([row("t", True, total_cost_usd=0.0)], "t", 0.1)
+
+
+def cascade_at_scale(world, evo, candidate: dict, scale: float) -> Cascade:
+    """Evaluate ``candidate`` whose cells cost ``scale`` times the baseline arm's."""
+    sha = evo.materializer.materialize(candidate)
+    evo.new_cascade(candidate).sha = sha
+    world.sha_scale[sha] = scale
+    return evo.cascade(candidate)
+
+
+SAME_PASS = dict(dev_a="1", dev_b="1", cheap_a="1", test_a="0")
+
+
+def test_cheaper_candidate_with_equal_pass_rates_dominates_the_seed(world) -> None:
+    evo = ready(world)
+    seed = evo.cascade(evo.seed)
+    cheaper = cascade_at_scale(world, evo, child(evo.seed, tag="cheaper", **SAME_PASS), 0.8)
+
+    assert dominates(cheaper.means, seed.means, DEV) and not dominates(seed.means, cheaper.means, DEV)
+    assert cheaper.accepted and evo.frontier == [cheaper]
+    assert all(seed.means[task] == pytest.approx(1.0) and cheaper.means[task] == pytest.approx(1.25) for task in DEV)
+
+
+def test_costlier_candidate_with_equal_pass_rates_scores_below_the_seed(world) -> None:
+    evo = ready(world)
+    seed = evo.cascade(evo.seed)
+    costlier = cascade_at_scale(world, evo, child(evo.seed, tag="costlier", **SAME_PASS), 1.5)
+
+    assert costlier.cheap_score == pytest.approx(1 / 1.5) and not costlier.accepted
+    assert evo.frontier == [seed] and seed.cheap_score == pytest.approx(1.0)
+
+
+def test_evaluator_returns_the_score_and_side_info_carries_the_cost_fields(world) -> None:
+    evo = ready(world)
+    evo.cascade(evo.seed)
+    cheaper = child(evo.seed, tag="cheaper", **SAME_PASS)
+    sha = evo.materializer.materialize(cheaper)
+    evo.new_cascade(cheaper).sha = sha
+    world.sha_scale[sha] = 0.8
+
+    score, info = evo.evaluate(cheaper, "dev_a")
+
+    assert score == pytest.approx(1.25)
+    assert info["task_scores"] == pytest.approx({"dev_a": 1.25, "dev_b": 1.25})
+    assert info["pass_rate"] == {"dev_a": 1.0, "dev_b": 1.0}
+    assert info["mean_cost"] == pytest.approx({"dev_a": 0.08, "dev_b": 0.08})
+    assert info["baseline_cost"] == pytest.approx({"dev_a": 0.1, "dev_b": 0.1})
+
+
+def test_cheap_score_is_the_mean_of_the_per_task_cheap_scores(world) -> None:
+    evo = ready(world)
+    evo.cascade(evo.seed)
+    cheaper = cascade_at_scale(world, evo, child(evo.seed, tag="cheaper", **SAME_PASS), 0.8)
+
+    assert cheaper.cheap_scores == pytest.approx({"cheap_a": 1.25})
+    assert cheaper.cheap_score == pytest.approx(1.25)
+
+
+def finish_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, winner_scale: float, winner_tests: tuple[str, ...]):
+    """Three test tasks, a seed passing all of them, and a winner at ``winner_scale`` of the seed's cost."""
+    world = three_test_task_world(monkeypatch, tmp_path, seed_test="1")
+    evo = ready(world)
+    accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
+    winner = accept(evo, child(evo.seed, test_a=winner_tests[0], test_b=winner_tests[1], test_c=winner_tests[2],
+                               tag="w"), {"dev_a": 0.9, "dev_b": 0.9})
+    world.sha_scale[winner.sha] = winner_scale
+    return world, evo, winner
+
+
+def test_finish_accepts_a_cheaper_winner_with_equal_test_pass_rate(monkeypatch: pytest.MonkeyPatch,
+                                                                  tmp_path: Path) -> None:
+    world, evo, winner = finish_world(monkeypatch, tmp_path, 0.8, ("11", "11", "11"))
+
+    assert evo.finish() is not None
+
+    assert world.pr.pushes == [(winner.sha, "evolve/run1-winner")]
+    body = world.pr.creates[0]["body"]
+    assert "Winner minus seed, paired test delta +0.250" in body
+    assert "Winner minus seed, test pass rate delta +0.000" in body
+
+
+def test_finish_refuses_a_costlier_winner_with_equal_test_pass_rate(monkeypatch: pytest.MonkeyPatch,
+                                                                   tmp_path: Path) -> None:
+    world, evo, _winner = finish_world(monkeypatch, tmp_path, 1.5, ("11", "11", "11"))
+
+    assert evo.finish() is None
+
+    assert world.pr.calls == [] and evo.finish_failure is None
+    assert "the paired test-split interval does not exclude 0" in log_text(world)
+
+
+def test_finish_refuses_a_cheaper_winner_with_a_lower_test_pass_rate(monkeypatch: pytest.MonkeyPatch,
+                                                                    tmp_path: Path) -> None:
+    world, evo, _winner = finish_world(monkeypatch, tmp_path, 0.1, ("11", "11", "10"))
+
+    assert evo.finish() is None
+
+    text = log_text(world)
+    assert world.pr.calls == [] and evo.finish_failure is None
+    assert "finish: paired test delta +" in text and "test pass rate delta -0.167" in text
+    assert "the paired test-split interval does not exclude 0" not in text
+    assert "finish: no improvement (the winner's test pass rate is below the seed's)" in text
+
+
+@pytest.mark.parametrize("fault", ["unsolved baseline cell", "zero cost", "missing cost"])
+def test_a_bad_baseline_row_stops_the_run_before_any_candidate_cell(world, monkeypatch: pytest.MonkeyPatch,
+                                                                  fault: str) -> None:
+    if fault == "unsolved baseline cell":
+        world.baseline["test_a"] = "E"
+    elif fault == "zero cost":
+        world.costs["dev_a"] = 0.0
+    else:
+        real_run_plan = run.run_plan
+
+        def stripped(*args, **kwargs):
+            rows = real_run_plan(*args, **kwargs)
+            for found in rows:
+                if found["mode"] == "baseline" and found["task"] == "dev_a":
+                    found.pop("total_cost_usd", None)
+            return rows
+
+        monkeypatch.setattr(run, "run_plan", stripped)
+    evo = build(world)
+    evo.base_cost = {}
+
+    assert evo.buy_baselines() is not None
+
+    assert tilth_calls(world) == [] and evo.base_cost == {}
+
+
+def test_a_candidate_row_with_no_numeric_cost_stops_scoring(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    real_run_plan = run.run_plan
+
+    def costless(*args, **kwargs):
+        rows = real_run_plan(*args, **kwargs)
+        for found in rows:
+            found.pop("total_cost_usd", None)
+            found.pop("charged_usd", None)
+        return rows
+
+    monkeypatch.setattr(run, "run_plan", costless)
+    with pytest.raises(EvolveError, match="a finite, non-negative cost is required"):
+        evo.evaluate(child(evo.seed, tag="fresh", **SAME_PASS), "dev_a")
+
+
+def test_a_candidate_row_without_total_cost_is_costed_at_charged_usd(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    evo = ready(world)
+    real_run_plan = run.run_plan
+
+    def charged(*args, **kwargs):
+        rows = real_run_plan(*args, **kwargs)
+        for found in rows:
+            found["charged_usd"] = found.pop("total_cost_usd") / 2
+        return rows
+
+    monkeypatch.setattr(run, "run_plan", charged)
+
+    assert evo.cascade(evo.seed).scores == pytest.approx({"dev_a": 2.0, "dev_b": 2.0})
