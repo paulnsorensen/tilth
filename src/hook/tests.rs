@@ -1306,9 +1306,13 @@ fn hint_interpreters_cover_computing_and_writing() {
 #[test]
 fn hint_wc_points_at_the_read_header_and_listings() {
     let reason = tilth_reason_for("wc -l src/lib.rs");
-    assert!(reason.contains("header shows the line count"), "{reason}");
+    assert!(
+        reason.contains("whole path shows its total line count in the header"),
+        "{reason}"
+    );
+    assert!(reason.contains("signature outline"), "{reason}");
     assert!(reason.contains("`ls` or `find`"), "{reason}");
-    assert!(reason.contains("tilth_read"), "{reason}");
+    assert!(!reason.contains("#1-1"), "{reason}");
 }
 
 #[test]

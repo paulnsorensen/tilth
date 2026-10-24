@@ -154,9 +154,9 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
     match kind {
         Kind::Read if rule == "wc" => format!(
             "Blocked: shell `{rule}` reads file content to count it. \
-             A tilth_read header shows the line count, so read only the first lines to get it.\n\n\
+             A tilth_read of the whole path shows its total line count in the header. \
+             A large file comes back as a signature outline, with the count still in the header.\n\n\
              Run instead:\n  {read}\n\n\
-             Append #1-1 to a path to get the header without the body. \
              Use `ls` or `find` for file listings. \
              Filters on command output (`git log | wc -l`) still run."
         ),
