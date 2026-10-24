@@ -2040,8 +2040,8 @@ fn outline_context_for_match(
         extract_line_range(line).is_some_and(|(s, e)| match_line >= s && match_line <= e)
     })?;
 
-    let start = match_idx.saturating_sub(2);
-    let end = (match_idx + 3).min(outline_lines.len());
+    let start = match_idx;
+    let end = match_idx + 1;
 
     let mut context = String::new();
     for (i, line) in outline_lines.iter().enumerate().take(end).skip(start) {
@@ -2199,6 +2199,22 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    #[test]
+    fn outline_context_shows_only_the_enclosing_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib.rs");
+        let template = "fn NAME() {\n    let x = 1;\n    let y = 2;\n}\n\n";
+        let src: String = ["alpha", "beta", "gamma", "delta", "epsilon"]
+            .iter()
+            .map(|name| template.replace("NAME", name))
+            .collect();
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let ctx = outline_context_for_match(&path, 12, &cache).unwrap();
+        assert!(ctx.contains("gamma"), "{ctx}");
+        assert_eq!(ctx.lines().filter(|l| !l.is_empty()).count(), 1, "{ctx}");
+    }
 
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {

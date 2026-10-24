@@ -20,7 +20,7 @@ Feature: Language matching regression history
       def run():
           return 1
       """
-    When I read "history/decorated.py#run"
+    When I read "history/decorated.py#run" in full
     Then the read returns exactly
       """
       @logged
@@ -62,7 +62,7 @@ Feature: Language matching regression history
           1
       }
       """
-    When I read "history/attributes.rs#attributed"
+    When I read "history/attributes.rs#attributed" in full
     Then the read returns exactly
       """
       #[inline]
@@ -108,7 +108,7 @@ Feature: Language matching regression history
       |            let value = 1;
       |        }
       """
-    When I read "history/deep.rs#target"
+    When I read "history/deep.rs#target" in full
     Then the read returns lines 3 through 5 exactly
       """
       |        fn target() {

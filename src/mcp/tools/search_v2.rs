@@ -285,7 +285,7 @@ fn run_search_v2(
     };
     let (mut output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
-    if !pending_seen.is_empty() {
+    if !pending_seen.is_empty() && output.len() <= super::read::HOST_VISIBLE_MAX {
         let response: Value = serde_json::from_str(&output)
             .map_err(|e| SearchFailure::new(e.to_string(), "budget_error"))?;
         record_returned_seen(&response, &pending_seen, session);
