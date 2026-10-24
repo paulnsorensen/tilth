@@ -198,8 +198,8 @@ COST_SUMMARY_FIELDS = (
 
 
 def cost_summary(row: Mapping) -> dict:
-    """The cost-explaining fields of one row, with no trajectory and no grader output."""
-    return {name: row[name] for name in COST_SUMMARY_FIELDS if name in row}
+    """The cost-explaining fields of one row and the cost its score used, with no trajectory and no grader output."""
+    return {**{name: row[name] for name in COST_SUMMARY_FIELDS if name in row}, "scored_cost_usd": row_cost(row)}
 
 
 def _baseline_costs(rows: Iterable[Mapping], tasks: Iterable[str]) -> dict[str, float]:

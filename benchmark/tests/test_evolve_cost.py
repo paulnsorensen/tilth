@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import run
-from evolve.loop import COST_SUMMARY_FIELDS, EvolveError, _baseline_costs, _paired_score_deltas, dominates, row_cost, task_score, task_stats
+from evolve.loop import COST_SUMMARY_FIELDS, EvolveError, cost_summary, _baseline_costs, _paired_score_deltas, dominates, row_cost, task_score, task_stats
 from evolve import candidate, engine, proposer
 from evolve_support import DEV, build, child, log_text, seed_candidate
 from test_evolve import accept, ready, three_test_task_world, tilth_calls, world  # noqa: F401  (world is a fixture)
@@ -287,10 +287,17 @@ def test_paid_side_info_pairs_candidate_and_baseline_cost_rows_for_the_task(worl
     assert pairs["candidate"] and pairs["baseline"]
     for summary in (*pairs["candidate"], *pairs["baseline"]):
         assert isinstance(summary["total_cost_usd"], float)
-        assert set(summary) <= set(COST_SUMMARY_FIELDS)
+        assert summary["scored_cost_usd"] == summary["total_cost_usd"]
+        assert set(summary) <= {*COST_SUMMARY_FIELDS, "scored_cost_usd"}
         # No trajectory and no grader output reach reflection through the pairs.
         assert not {"trajectory_path", "result_text", "correct", "correctness_reason"} & set(summary)
     assert {summary["repetition"] for summary in pairs["baseline"]} == set(evo._reps())
+
+
+def test_a_cost_summary_carries_the_charged_cost_of_a_failed_row_with_no_total() -> None:
+    summary = cost_summary(row("t", False, charged_usd=0.3))
+
+    assert summary["scored_cost_usd"] == 0.3 and "total_cost_usd" not in summary
 
 
 def test_reflection_and_proposer_receive_the_score_inputs_and_each_tasks_cost_pairs(world) -> None:  # noqa: F811
