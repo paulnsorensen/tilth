@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from benchmark.tasks import TASKS
-from benchmark.tasks.gin_render_context_tasks import FIXTURE, SOURCE_FILES, ROOT_TEST_PATTERN, _grade_commands
+from benchmark.tasks.gin_render_context_tasks import FIXTURE, SOURCE_FILES, ROOT_TEST_PATTERN, ROOT_TEST_SKIP, _grade_commands
 from benchmark.tasks.gin_render_context_fixtures.preflight import main as preflight
 
 
@@ -35,16 +35,21 @@ def test_grader_commands_keep_full_render_and_scoped_root():
     assert ROOT_TEST_PATTERN == "^(TestContext|TestMiddleware|TestHeldOut)"
     assert _grade_commands([]) == [
         ["go", "test", "./render"],
-        ["go", "test", "-run", ROOT_TEST_PATTERN, "."],
+        ["go", "test", "-run", ROOT_TEST_PATTERN, "-skip", ROOT_TEST_SKIP, "."],
         ["go", "test", "./binding"],
         ["go", "test", "-run", "^$", "./..."],
     ]
     assert _grade_commands(["-tags=nomsgpack"]) == [
         ["go", "test", "-tags=nomsgpack", "./render"],
-        ["go", "test", "-tags=nomsgpack", "-run", ROOT_TEST_PATTERN, "."],
+        ["go", "test", "-tags=nomsgpack", "-run", ROOT_TEST_PATTERN, "-skip", ROOT_TEST_SKIP, "."],
         ["go", "test", "-tags=nomsgpack", "./binding"],
         ["go", "test", "-tags=nomsgpack", "-run", "^$", "./..."],
     ]
+
+def test_grader_skips_only_the_racy_upstream_test():
+    assert ROOT_TEST_SKIP == "^TestContextCopyShouldNotCancel$"
+    assert ROOT_TEST_SKIP != ROOT_TEST_PATTERN
+
 
 @pytest.mark.skipif(not FIXTURE.is_dir(), reason="pinned Gin fixture is not installed")
 def test_grader_reference_and_negative_controls():
