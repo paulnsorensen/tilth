@@ -67,8 +67,9 @@ def write_tree(root: Path, files: Mapping[str, str]) -> None:
 def empty_dependency_caches(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     """Point the host Cargo home and Go module cache at empty directories under ``root``.
 
-    Each grade copies these host caches (``proc.isolate_caches``). The fixture projects have no
-    dependencies, so a copy of a developer's real caches, often gigabytes, adds only time.
+    A Rust grade copies the host registry index and git checkouts, and a Go grade reads the host
+    module downloads (``proc.isolate_caches``). The fixture projects have no dependencies,
+    so a developer's real caches add only time.
     """
     for name in ("CARGO_HOME", "GOMODCACHE"):
         path = root / "host-caches" / name.lower()
