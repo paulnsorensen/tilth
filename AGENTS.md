@@ -13,7 +13,7 @@ BATCH related work; array parameters never accept singular values:
 
 SEE BEFORE WRITE: Only source text carries `[path#TAG]` and line numbers. Read structural ranges before `rewrite`. Copy shown TAGs and line numbers; never invent them. Section reads carry file TAGs. Edit only shown lines. DO NOT use `mode: full` to edit; read the section you change. `tilth_write` takes `{path, tag?, ops}`: `replace_text` swaps exact `old` (`all: true` replaces all; `count: N` requires N); `rewrite` swaps outermost non-overlapping ast-grep matches (`count: N` requires N); `create_file` seeds a new path; line ops use copied integer `start`/`end`. Omit `tag` only for new/untaggable files. Drift merges or rejects per section; re-read conflicts.
 
-Pair `tilth_write` with the next `tilth_read`.
+Reuse a write's tag and lines; skip re-reads.
 
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 

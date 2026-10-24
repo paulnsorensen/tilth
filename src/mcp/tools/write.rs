@@ -211,10 +211,9 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
-    let first_changed = first_changed_line(&live, &new_text);
-    let (numbered, seen_lines, reread_hint) = render_changed_window(
+    let (numbered, seen_lines, reread_hint) = render_changed_windows(
+        &live,
         &new_text,
-        first_changed,
         path,
         ctx.section_budget
             .saturating_sub(if ctx.show_diff { WRITE_DIFF_BUDGET } else { 0 }),
@@ -303,7 +302,20 @@ fn resolve_edit(
             }) {
                 // Naming only the requirement sent agents into a full re-read.
                 // A section read carries the whole-file tag, so the cheap route
-                // has to be part of the rejection.
+                // has to be part of the rejection. When this session already
+                // displayed the live content, hand back its tag and shown lines.
+                if let Some(snap) = session.snapshots().by_tag(&key, live_tag) {
+                    if snap.text == live {
+                        return Err(TilthError::EditRejected(format!(
+                            "replace_text/rewrite needs a tag; this session already displayed {}. \
+                             Retry with tag \"{live_tag:04X}\" and edit only displayed lines ({}); \
+                             for other lines read {}#START-END first.",
+                            format_header(&crate::format::display_path(path), live_tag),
+                            crate::edit::mismatch::format_ranges(&snap.seen_ranges(), 1),
+                            crate::format::display_path(path),
+                        )));
+                    }
+                }
                 return Err(TilthError::EditRejected(
                     "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search \
                      result; a search match header or a section read (path#12-40) carries the \
@@ -538,119 +550,92 @@ const WRITE_RESPONSE_BUDGET: u64 = 6_000;
 const WRITE_DIFF_BUDGET: u64 = 80;
 const WRITE_CONTEXT_LINES: u32 = 2;
 
-fn first_changed_line(before: &str, after: &str) -> Option<u32> {
-    let mut before_rows = before.split('\n');
-    let mut after_rows = after.split('\n');
-    let mut line = 1u32;
-    loop {
-        match (before_rows.next(), after_rows.next()) {
-            (Some(before_row), Some(after_row)) if before_row == after_row => {
-                line = line.saturating_add(1);
+/// New-file line numbers (1-based, sorted, deduplicated) that `before` -> `after`
+/// changed. A pure deletion marks the line now sitting at the deletion point.
+fn changed_lines(before: &str, after: &str) -> Vec<u32> {
+    let patch = diffy::create_patch(before, after);
+    let mut marked: Vec<u32> = Vec::new();
+    for hunk in patch.hunks() {
+        let mut cur = u32::try_from(hunk.new_range().start())
+            .unwrap_or(u32::MAX)
+            .max(1);
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(_) => cur = cur.saturating_add(1),
+                diffy::Line::Insert(_) => {
+                    marked.push(cur);
+                    cur = cur.saturating_add(1);
+                }
+                diffy::Line::Delete(_) => marked.push(cur),
             }
-            (None, None) => return None,
-            _ => return Some(line),
         }
     }
+    marked.sort_unstable();
+    marked.dedup();
+    marked
 }
 
-fn render_changed_window(
-    text: &str,
-    first_changed: Option<u32>,
+/// Render every changed range of `after` (each padded by `WRITE_CONTEXT_LINES`,
+/// overlapping ranges merged) as numbered lines. Returns the rendered rows, the
+/// line numbers shown, and a re-read hint naming only lines the budget omitted.
+fn render_changed_windows(
+    before: &str,
+    after: &str,
     path: &Path,
     content_budget: u64,
 ) -> (String, Vec<u32>, Option<String>) {
-    let row_count = text.split('\n').count();
-    let total_rows = row_count.saturating_sub(usize::from(text.ends_with('\n')));
+    let row_count = after.split('\n').count();
+    let total_rows = row_count.saturating_sub(usize::from(after.ends_with('\n')));
     let total = u32::try_from(total_rows).unwrap_or(u32::MAX);
-    let Some(first) = first_changed else {
-        return (String::new(), Vec::new(), None);
-    };
     if total == 0 {
         return (String::new(), Vec::new(), None);
     }
-    let lo = first.saturating_sub(WRITE_CONTEXT_LINES).max(1).min(total);
-    let hi = first.saturating_add(WRITE_CONTEXT_LINES).min(total).max(lo);
-    let focus = first.clamp(lo, hi);
-    let mut window_rows: Vec<(u32, &str)> = Vec::new();
-    for (index, row) in text.split('\n').enumerate() {
-        let line = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        if line > total {
-            break;
-        }
-        if line >= lo && line <= hi {
-            window_rows.push((line, row));
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for line in changed_lines(before, after) {
+        let lo = line.saturating_sub(WRITE_CONTEXT_LINES).max(1).min(total);
+        let hi = line.saturating_add(WRITE_CONTEXT_LINES).min(total).max(lo);
+        match ranges.last_mut() {
+            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => *last_hi = (*last_hi).max(hi),
+            _ => ranges.push((lo, hi)),
         }
     }
 
-    let mut candidates = Vec::new();
-    candidates.push(focus);
-    let mut line = lo;
-    loop {
-        if line != focus {
-            candidates.push(line);
-        }
-        if line == hi || line == u32::MAX {
-            break;
-        }
-        line += 1;
-    }
-
-    let mut rendered_rows: Vec<(u32, String)> = Vec::new();
+    let mut rendered = String::new();
     let mut seen = Vec::new();
-    for line in candidates {
-        let mut row = None;
-        for (window_line, window_row) in &window_rows {
-            if *window_line == line {
-                row = Some(*window_row);
-                break;
+    let mut omitted: Option<(u32, u32)> = None;
+    let mut used_len = 0usize;
+    let rows: Vec<&str> = after.split('\n').collect();
+    for (lo, hi) in ranges {
+        for line in lo..=hi {
+            let Some(row) = rows.get(line as usize - 1) else {
+                continue;
+            };
+            // The slice ends in '\n' and rows are joined with '\n' below; drop it
+            // here so consecutive receipt rows have no blank line between them.
+            let mut numbered = render_numbered_slice(row, line)
+                .trim_end_matches('\n')
+                .to_string();
+            if numbered.is_empty() {
+                numbered = format!("{line}:");
+            }
+            let combined_len = used_len.saturating_add(numbered.len() + 1);
+            if crate::types::estimate_tokens(combined_len as u64) <= content_budget {
+                if !rendered.is_empty() {
+                    rendered.push('\n');
+                }
+                rendered.push_str(&numbered);
+                used_len = combined_len;
+                seen.push(line);
+            } else {
+                omitted = Some(omitted.map_or((line, line), |(first, _)| (first, line)));
             }
         }
-        let Some(row) = row else {
-            continue;
-        };
-        // The slice ends in '\n' and rows are joined with '\n' below; drop it
-        // here so consecutive receipt rows have no blank line between them.
-        let mut numbered = render_numbered_slice(row, line)
-            .trim_end_matches('\n')
-            .to_string();
-        if numbered.is_empty() {
-            numbered = format!("{line}:");
-        }
-        let mut combined_len = numbered.len().saturating_add(rendered_rows.len());
-        for (_, part) in &rendered_rows {
-            combined_len = combined_len.saturating_add(part.len());
-        }
-        if crate::types::estimate_tokens(combined_len as u64) <= content_budget {
-            rendered_rows.push((line, numbered));
-            seen.push(line);
-        }
     }
-    rendered_rows.sort_unstable_by_key(|(line, _)| *line);
-    let mut rendered = String::new();
-    for (_, row) in rendered_rows {
-        if !rendered.is_empty() {
-            rendered.push('\n');
-        }
-        rendered.push_str(&row);
-    }
-    let window_size = hi.saturating_sub(lo).saturating_add(1);
-    let omitted_window = seen.len() < window_size as usize;
-    let hint = (omitted_window || lo > 1 || hi < total).then(|| {
-        let reread_lo = if omitted_window {
-            lo
-        } else if lo > 1 {
-            1
-        } else {
-            hi + 1
-        };
-        let reread_hi = reread_lo.saturating_add(59).min(total);
+    let hint = omitted.map(|(first, last)| {
         format!(
-            "... omitted lines {}-{}; re-read {}#{}-{}",
-            reread_lo,
-            total,
+            "... omitted lines {first}-{last}; re-read {}#{first}-{}",
             crate::format::display_path(path),
-            reread_lo,
-            reread_hi
+            last.min(first.saturating_add(59))
         )
     });
     (rendered, seen, hint)
@@ -701,7 +686,12 @@ mod tests {
     #[test]
     fn receipt_rows_have_no_blank_line_between_them() {
         let text = "one\ntwo\nthree\nfour\nfive\n";
-        let (rendered, seen, _) = render_changed_window(text, Some(3), Path::new("a.txt"), 1_000);
+        let (rendered, seen, _) = render_changed_windows(
+            "one\ntwo\nold\nfour\nfive\n",
+            text,
+            Path::new("a.txt"),
+            1_000,
+        );
         assert_eq!(seen.len(), 5);
         assert!(
             !rendered.contains("\n\n"),
@@ -2055,7 +2045,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "## {}\nerror: text to replace matched at least 2 times; add context so it matches once",
+                "## {}\nerror: text to replace matched at least 2 times; add neighboring lines to old so it matches once, or pass all:true to replace every match",
                 rel(&p)
             )
         );
@@ -2991,8 +2981,12 @@ mod tests {
 
     #[test]
     fn blank_changed_row_is_rendered_and_authorized() {
-        let (rendered, seen, _) =
-            render_changed_window("before\n\nafter", Some(2), Path::new("file"), 80);
+        let (rendered, seen, _) = render_changed_windows(
+            "before\nold\nafter",
+            "before\n\nafter",
+            Path::new("file"),
+            80,
+        );
         let rendered_lines: Vec<u32> = rendered
             .lines()
             .filter_map(|line| line.split_once(':'))
@@ -3586,3 +3580,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod receipt_tests;
