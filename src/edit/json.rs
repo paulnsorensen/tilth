@@ -348,7 +348,7 @@ pub fn lower_edits(edits: &Value) -> Result<Vec<Section>, String> {
     // section — an oversized array is rejected without paying to lower it.
     if arr.len() > 20 {
         return Err(format!(
-            "batch write limited to 20 sections (got {})",
+            "batch write limited to 20 sections (got {}); split into calls of at most 20 sections",
             arr.len()
         ));
     }
@@ -391,6 +391,53 @@ pub fn teaching_error_for_string(s: &str) -> String {
         _ => "`edits` must be a JSON array of {path, tag?, ops} section objects, not a string."
             .to_string(),
     }
+}
+
+/// Explain a JSON-RPC parse failure. When a raw control character sits inside
+/// a string, name the field and the character, and the escape to write instead.
+pub fn describe_json_parse_error(line: &str, err: &serde_json::Error) -> String {
+    let base = format!("parse error: {err}");
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let mut last_string: Option<&str> = None;
+    let mut key: Option<&str> = None;
+    for (i, b) in line.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+                last_string = Some(&line[start..i]);
+            } else if b < 0x20 {
+                let (name, escape) = match b {
+                    b'\t' => ("TAB".to_string(), "\\t".to_string()),
+                    b'\n' => ("newline".to_string(), "\\n".to_string()),
+                    b'\r' => ("carriage-return".to_string(), "\\r".to_string()),
+                    _ => (
+                        format!("control character U+{b:04X}"),
+                        format!("\\u{b:04X}"),
+                    ),
+                };
+                let field = key.unwrap_or("?");
+                return format!(
+                    "{base}. A literal {name} character (byte {i}) is inside the JSON string for field \"{field}\". Write it as {escape} inside JSON strings; never type the raw character."
+                );
+            }
+        } else if b == b'"' {
+            in_string = true;
+            start = i + 1;
+        } else if b == b':' {
+            if let Some(s) = last_string.take() {
+                key = Some(s);
+            }
+        } else if !b.is_ascii_whitespace() {
+            last_string = None;
+        }
+    }
+    base
 }
 
 /// Render lowered [`Section`]s back into the JSON `edits` shape. Error-path only

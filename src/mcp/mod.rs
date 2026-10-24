@@ -186,7 +186,8 @@ fn serve(reader: impl BufRead, mut writer: impl Write, services: &Services) -> i
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_error(&mut writer, None, -32700, &format!("parse error: {e}"))?;
+                let message = crate::edit::json::describe_json_parse_error(&line, &e);
+                write_error(&mut writer, None, -32700, &message)?;
                 continue;
             }
         };
@@ -966,7 +967,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1059,
+            1073,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(

@@ -82,7 +82,7 @@ pub struct ApplyResult {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
     /// Two ranged ops touch overlapping lines.
-    #[error("overlapping edit ranges: {}.={} and {}.={}", a.0, a.1, b.0, b.1)]
+    #[error("overlapping edit ranges: lines {}-{} and {}-{}; line numbers refer to the version you read, so merge them into one op or make the ranges disjoint", a.0, a.1, b.0, b.1)]
     Overlap { a: (u32, u32), b: (u32, u32) },
     /// A line anchor is outside `1..=total`.
     #[error("line {line} out of bounds (file has {total} lines)")]
@@ -100,7 +100,7 @@ pub enum ApplyError {
     TextUnmatched { preview: String },
     /// The requested text occurred more than once in the source. `count` is a
     /// lower bound — the search stops once ambiguity is established.
-    #[error("text to replace matched at least {count} times; add context so it matches once")]
+    #[error("text to replace matched at least {count} times; add neighboring lines to old so it matches once, or pass all:true to replace every match")]
     TextAmbiguous { count: usize },
     /// `old` was empty; a match-once anchor cannot be empty.
     #[error("replace_text \"old\" must not be empty")]

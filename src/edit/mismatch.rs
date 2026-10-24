@@ -10,7 +10,7 @@
 /// Render displayed ranges as `A-B, C-D` (a single-line range as `N`),
 /// nearest the `anchor` line first, capped to 4 entries plus a `… +K more`
 /// tail when more were displayed.
-pub(super) fn format_ranges(ranges: &[(u32, u32)], anchor: u32) -> String {
+pub(crate) fn format_ranges(ranges: &[(u32, u32)], anchor: u32) -> String {
     const CAP: usize = 4;
     let mut sorted: Vec<(u32, u32)> = ranges.to_vec();
     sorted.sort_by_key(|(lo, hi)| {
