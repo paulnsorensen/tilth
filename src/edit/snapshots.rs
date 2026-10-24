@@ -54,7 +54,7 @@ impl Snapshot {
     /// The displayed lines as sorted, coalesced inclusive `(lo, hi)` ranges —
     /// the shape the unseen-anchor rejection names so the model can see exactly
     /// which regions it read. Empty when nothing was displayed.
-    pub(super) fn seen_ranges(&self) -> Vec<(u32, u32)> {
+    pub(crate) fn seen_ranges(&self) -> Vec<(u32, u32)> {
         let mut lines: Vec<u32> = self.seen_lines.iter().copied().collect();
         lines.sort_unstable();
         let mut ranges: Vec<(u32, u32)> = Vec::new();
