@@ -78,18 +78,21 @@ class EditReadySearch(unittest.TestCase):
         expected = source.replace("    return last_line", "    return done").encode()
         self.assertEqual(target.read_bytes(), expected)
 
-    def test_press_top_level_glob_is_rejected_with_a_hint_and_other_keys_stay_generic(self):
+    def test_top_level_glob_filters_queries_and_other_keys_stay_rejected(self):
+        (self.root / "zz_keep.py").write_text("# zebra_token\n")
+        (self.root / "zz_drop.txt").write_text("# zebra_token\n")
         glob = harness.tools_call_request(
-            2, "tilth_search", {"cwd": self.cwd, "glob": "*.py", "queries": [{"query": "x"}]})
+            2, "tilth_search", {"cwd": self.cwd, "glob": "zz_*.py", "queries": [{"query": "zebra_token"}]})
         other = harness.tools_call_request(
             3, "tilth_search", {"cwd": self.cwd, "scope": "s", "queries": [{"query": "x"}]})
         run = harness.run_mcp([], [harness.initialize_request(), glob, other])
         first = run.response_by_id(2)
         second = run.response_by_id(3)
-        self.assertTrue(harness.tool_is_error(first))
-        self.assertIn("glob goes inside each query entry", harness.tool_result_text(first))
+        self.assertFalse(harness.tool_is_error(first), harness.tool_result_text(first))
+        self.assertIn("zz_keep.py", harness.tool_result_text(first))
+        self.assertNotIn("zz_drop.txt", harness.tool_result_text(first))
         self.assertTrue(harness.tool_is_error(second))
-        self.assertNotIn("glob", harness.tool_result_text(second))
+        self.assertIn("search accepts only", harness.tool_result_text(second))
 
 
 if __name__ == "__main__":
