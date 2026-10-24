@@ -713,6 +713,68 @@ mod tests {
         }
     }
 
+    const WRITE_DESC: &str = include_str!("../../prompts/tools/write.md");
+    const SEARCH_DESC: &str = include_str!("../../prompts/tools/search.md");
+
+    #[test]
+    fn write_description_teaches_replace_text_before_line_ops() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        let rt = WRITE_DESC
+            .find("replace_text")
+            .expect("replace_text taught in tilth_write description");
+        let line_ops = WRITE_DESC
+            .find("{start,end}")
+            .expect("line ops taught in tilth_write description");
+        assert!(rt < line_ops, "replace_text must lead the op teaching");
+    }
+
+    #[test]
+    fn write_description_carries_line_and_escaping_rules() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            WRITE_DESC.contains("integer lines"),
+            "copied integer line rule must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("{start,end}") && WRITE_DESC.contains("{line}"),
+            "line op arguments must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("\\t") && WRITE_DESC.contains("\\n"),
+            "tab/newline escaping rule must remain in the tilth_write description"
+        );
+        assert!(
+            WRITE_DESC.contains("literal controls"),
+            "literal control characters must stay called out as failing"
+        );
+    }
+
+    #[test]
+    fn search_description_carries_pattern_entry_shape() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            SEARCH_DESC.contains("{pattern: \"Some($A)\", language"),
+            "structural search entry shape must stay advertised in the tilth_search description"
+        );
+    }
+
+    #[test]
+    fn instructions_name_shell_for_git_history() {
+        if super::phrase_pins_exempt() {
+            return;
+        }
+        assert!(
+            SERVER_INSTRUCTIONS.contains("Git review/history"),
+            "shell must stay named for Git history"
+        );
+    }
+
     /// An errored dispatch of a different tool must break the streak — the
     /// old `result.map` shortcut skipped observation entirely and let the
     /// tip claim a consecutive pair that never happened.
