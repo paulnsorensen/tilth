@@ -276,7 +276,7 @@ fn tool_read_paths(
             crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &combined);
         if crate::types::estimate_tokens(complete.len() as u64) <= budget_val {
             for path in &paths {
-                session.set_read_clipped(path, false);
+                session.set_read_clipped(path, complete.len() > HOST_VISIBLE_MAX);
             }
             return Ok(complete);
         }
@@ -549,11 +549,20 @@ fn tool_read_paths(
     Ok(response)
 }
 
-/// A budget-truncated reply did not display every line the snapshot counts as
-/// seen, so a later unchanged-stub would hide text the caller never received.
+/// Largest response a host is known to show the model in full. Claude Code
+/// replaces bigger tool results with a `<persisted-output>` preview. Local
+/// trajectories (benchmark/results/streams/plan/*.trajectory.jsonl, 511
+/// files) hold 23 persisted `tilth_read` results, the smallest 51.6KB, and
+/// 3,441 non-persisted tilth results, the largest 45,535 bytes. 40,000 sits
+/// below both, so text past it is never treated as seen.
+pub(in crate::mcp) const HOST_VISIBLE_MAX: usize = 40_000;
+
+/// A budget-truncated or host-hidden reply did not display every line the
+/// snapshot counts as seen, so a later unchanged-stub would hide text the
+/// caller never received.
 fn forget_if_truncated(session: &Session, path: &Path, response: &str) {
-    let clipped = response.starts_with('{') && response.contains("\"truncated\":true");
-    session.set_read_clipped(path, clipped);
+    let truncated = response.starts_with('{') && response.contains("\"truncated\":true");
+    session.set_read_clipped(path, truncated || response.len() > HOST_VISIBLE_MAX);
 }
 
 /// One-line reply for a read whose file tag is unchanged and whose lines an

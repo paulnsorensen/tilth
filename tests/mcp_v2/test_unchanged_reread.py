@@ -103,6 +103,17 @@ class UnchangedReread(unittest.TestCase):
         self.assertIn("value_3 = 33", third)
         self.assertNotIn("unchanged since", third)
 
+    def test_oversized_read_is_not_a_stub_later(self):
+        big = Path(self.cwd) / "big.rs"
+        big.write_text("".join(f"let value_{i} = {i};\n" for i in range(2500)))
+        first, second = self.reads(
+            {"paths": ["big.rs"], "mode": "full", "budget": 100000},
+            {"paths": ["big.rs#10-20"]})
+        self.assertGreater(len(first), 40000)
+        self.assertNotIn("truncated", first[:200])
+        self.assertIn("value_10 = 10", second)
+        self.assertNotIn("unchanged since", second)
+
 
 class ClippedSearchThenRead(unittest.TestCase):
     """A search that the budget clipped must not make a later read a stub."""
