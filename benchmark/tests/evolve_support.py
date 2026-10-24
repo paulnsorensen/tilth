@@ -223,6 +223,7 @@ class World:
     check_output: tuple[bool, str] = (True, "just check: ok")
     cost: float = 0.1
     costs: dict[str, float] = field(default_factory=dict)
+    sha_scale: dict[str, float] = field(default_factory=dict)
     env: str = "env-fingerprint-a"
     spawned: list[dict] = field(default_factory=list)
 
@@ -270,7 +271,8 @@ class World:
             "correctness_reason": "expected answer" if correct else "Missing: SECRET_GT",
             "result_text": f"The dispatcher is AGENT_GT for {task_name}.", "num_turns": 2,
             "num_tool_calls": 1, "tool_calls": {"Grep": 1}, "context_tokens": 1, "output_tokens": 1,
-            "duration_ms": 1, "total_cost_usd": self.costs.get(task_name, self.cost), "cost_source": "native",
+            "duration_ms": 1, "cost_source": "native",
+            "total_cost_usd": self.costs.get(task_name, self.cost) * self.sha_scale.get(sha, 1.0),
             "trajectory_path": str(sidecar),
         }
         if mark == "C":
@@ -414,8 +416,12 @@ def deps(world: World, **overrides: object) -> dict:
 def build(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,
           **overrides: object):
     from evolve import cli
-    return cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
-                     **deps(world, **overrides))
+    evo = cli.build(evolve_args(world, *extra, max_usd=max_usd, calls=calls, strict=strict),
+                    **deps(world, **overrides))
+    # Tests that drive the loop without buy_baselines get the cost the fake baseline cells would freeze.
+    if not isinstance(evo, int):
+        evo.base_cost = {task: world.costs.get(task, world.cost) for task in (*CHEAP, *DEV, *TEST)}
+    return evo
 
 
 def main(world: World, *extra: str, max_usd: str | None = "100", calls: str = "6", strict: bool = False,

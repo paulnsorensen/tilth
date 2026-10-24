@@ -8,6 +8,7 @@ only confirms one pre-chosen candidate against the seed and never selects among 
 """
 
 import json
+import math
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -98,6 +99,9 @@ class Cascade:
     counted: bool = False
     done: bool = False
     delta: dict | None = None
+    task_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
+    base_costs: dict[str, float] = field(default_factory=dict)
+    base_rows: dict[str, list[dict]] = field(default_factory=dict)
 
     @property
     def dev_mean(self) -> float:
@@ -117,7 +121,11 @@ class Cascade:
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
         return {"stage": "paid", "task_scores": {name: self.score(name) for name in self.scores},
-                "records": self.records.get(task, [])}
+                "pass_rate": {name: stats[0] for name, stats in self.task_stats.items()},
+                "mean_cost": {name: stats[1] for name, stats in self.task_stats.items()},
+                "baseline_cost": dict(self.base_costs), "records": self.records.get(task, []),
+                "cost_pairs": {"candidate": [cost_summary(row) for row in self.rows if row["task"] == task],
+                               "baseline": list(self.base_rows.get(task, []))}}
 
 
 def tail(output: str) -> str:
@@ -137,18 +145,88 @@ def correct(row: Mapping) -> bool:
     return bool(row.get("correct")) and row["contaminated"] is not True
 
 
-def _task_means(rows: Iterable[Mapping]) -> dict[str, float]:
-    by_task: dict[str, list[bool]] = {}
-    for row in rows:
-        by_task.setdefault(row["task"], []).append(correct(row))
-    return {task: mean(marks) for task, marks in by_task.items()}
+def _cost_value(value: object) -> bool:
+    """True for a finite, non-negative int or float that is not a bool."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
 
 
-def _paired_task_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Mapping],
-                        tasks: Iterable[str]) -> list[float]:
-    """Winner minus seed correctness per task, each averaged over that task's reps; unpaired tasks are skipped."""
-    winner, seed = _task_means(winner_rows), _task_means(seed_rows)
-    return [winner[task] - seed[task] for task in tasks if task in winner and task in seed]
+def row_cost(row: Mapping) -> float:
+    """A row's cost: ``total_cost_usd``, else ``charged_usd`` when a failed cell reports no total; else a stop.
+
+    Only an absent or null ``total_cost_usd`` falls back. A present but malformed, negative, or non-finite
+    value is corrupt data and stops the run.
+    """
+    key = "total_cost_usd" if row.get("total_cost_usd") is not None else "charged_usd"
+    value = row.get(key)
+    if _cost_value(value):
+        return float(value)
+    raise EvolveError(f"row {row.get('task')} rep {row.get('repetition')} (run key {row.get('run_key')}) "
+                      f"has {key} {value!r}; a finite, non-negative cost is required to score it")
+
+
+def task_stats(rows: Iterable[Mapping], task: str) -> tuple[float, float] | None:
+    """Pass rate and mean row cost over ``task``'s rows; None when there are none."""
+    mine = [row for row in rows if row["task"] == task]
+    if not mine:
+        return None
+    return mean(correct(row) for row in mine), mean(row_cost(row) for row in mine)
+
+
+def task_score(rows: Iterable[Mapping], task: str, base_cost: float) -> float:
+    """``p * base / c``: pass rate times the frozen baseline mean cost over the candidate's mean row cost.
+
+    1.0 is baseline parity at equal pass rate; a task never solved scores 0.
+    """
+    stats = task_stats(rows, task)
+    if stats is None:
+        return 0.0
+    passed, cost = stats
+    if passed == 0:
+        return 0.0
+    if not cost > 0:
+        raise EvolveError(f"task {task} is solved but its mean candidate cost is {cost}; refusing to score it")
+    return passed * base_cost / cost
+
+
+# Row fields that explain a cost difference; reflection compares them per task, candidate against baseline.
+COST_SUMMARY_FIELDS = (
+    "repetition", "total_cost_usd", "num_turns", "num_tool_calls", "tool_calls", "tool_sequence", "batch_sizes",
+    "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "context_tokens",
+)
+
+
+def cost_summary(row: Mapping) -> dict:
+    """The cost-explaining fields of one row, with no trajectory and no grader output."""
+    return {name: row[name] for name in COST_SUMMARY_FIELDS if name in row}
+
+
+def _baseline_costs(rows: Iterable[Mapping], tasks: Iterable[str]) -> dict[str, float]:
+    """Mean ``total_cost_usd`` of each task's completed baseline rows; a missing or non-positive cost is a stop."""
+    rows = [row for row in rows if baselines.is_completed(row)]
+    costs = {}
+    for task in tasks:
+        mine = [row for row in rows if row["task"] == task]
+        if not mine:
+            raise EvolveError(f"task {task} has no completed baseline row; refusing to score against it")
+        for row in mine:
+            value = row.get("total_cost_usd")
+            if not _cost_value(value) or not value > 0:
+                raise EvolveError(f"baseline row {task} rep {row.get('repetition')} has total_cost_usd {value!r}; "
+                                  "a finite, positive cost is required")
+        costs[task] = mean(row["total_cost_usd"] for row in mine)
+    return costs
+
+
+def _paired_score_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Mapping], tasks: Iterable[str],
+                         base_cost: Mapping[str, float]) -> list[float]:
+    """Winner minus seed score per task over each task's reps; a task missing rows on either side is skipped."""
+    winner_rows, seed_rows = list(winner_rows), list(seed_rows)
+    deltas = []
+    for task in tasks:
+        if task_stats(winner_rows, task) is not None and task_stats(seed_rows, task) is not None:
+            deltas.append(task_score(winner_rows, task, base_cost[task]) - task_score(seed_rows, task, base_cost[task]))
+    return deltas
 
 
 class Evolution:
@@ -183,6 +261,8 @@ class Evolution:
         self.released: dict[str, str] = {}
         self.calibrated = False
         self.dev_baseline_rows: list[dict] | None = None
+        self.base_cost: dict[str, float] = {}
+        self.base_rows: dict[str, list[dict]] = {}
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
@@ -373,14 +453,22 @@ class Evolution:
         return None
 
     def buy_baselines(self) -> int | None:
-        """Buy each dev and cheap baseline cell once; later runs answer them from the store."""
-        cells = self._cells((*self.panel.cheap, *self.panel.dev), BASELINE_MODE, self._reps())
+        """Buy each cheap, dev, and test baseline cell once; later runs answer them from the store.
+
+        The baseline arm's mean cost per task is frozen here as the score's reference.
+        """
+        tasks = (*self.panel.cheap, *self.panel.dev, *self.panel.test)
         try:
-            self._plan(cells, None)
+            rows = self._plan(self._cells(tasks, BASELINE_MODE, self._reps()), None)
+            self.base_cost = _baseline_costs(rows, tasks)
+            self.base_rows = {task: [cost_summary(row) for row in rows
+                                     if row["task"] == task and baselines.is_completed(row)] for task in tasks}
         except run.BaselineDrift as error:
             return self.refuse(str(error))
         except run.CandidateBuildFailed as error:
             return self.refuse(f"baselines: {tail(str(error))}")
+        except EvolveError as error:
+            return self.refuse(f"baselines: {error}")
         except _Stopped:
             pass
         return None
@@ -404,6 +492,9 @@ class Evolution:
             return 0.0, {"stopped": self.stop.reason}
         if result.stage is not None:
             return 0.0, result.side_info(example)
+        result.task_stats = {task: stats for task in self.panel.dev if (stats := task_stats(result.rows, task))}
+        result.base_costs = {task: self._base(task) for task in result.task_stats}
+        result.base_rows = {task: self.base_rows.get(task, []) for task in result.task_stats}
         return result.score(example), result.side_info(example)
 
     def cascade(self, candidate: Mapping[str, str]) -> Cascade:
@@ -478,7 +569,7 @@ class Evolution:
                 rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
                 result.cheap_rows = rows
                 result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
-                result.cheap_score = mean(correct(row) for row in rows) if rows else 0.0
+                result.cheap_score = mean(result.cheap_scores.values()) if result.cheap_scores else 0.0
             if result.cid != self.seed_id:
                 seed = self.results[self.seed_id]
                 if result.cheap_score < (seed.cheap_score or 0.0):
@@ -502,8 +593,12 @@ class Evolution:
         return result
 
     def _task_mean(self, rows: list[dict], task: str) -> float:
-        scored = [correct(row) for row in rows if row["task"] == task]
-        return mean(scored) if scored else 0.0
+        return task_score(rows, task, self._base(task))
+
+    def _base(self, task: str) -> float:
+        if task not in self.base_cost:
+            raise EvolveError(f"no frozen baseline cost for task {task}; refusing to score it")
+        return self.base_cost[task]
 
     def _records(self, rows: list[dict]) -> dict[str, list[dict]]:
         """One stripped record per uncontaminated rollout, plus ``label`` and ``critique`` when calibrated."""
@@ -625,7 +720,8 @@ class Evolution:
 
         The dev mean selects the winner; the seed wins a tie. The test split scores only the seed and that
         winner. The winner must beat the seed on the paired, task-level 95% bootstrap interval: the per-task
-        correctness differences (winner minus seed, reps averaged within a task) need a lower bound above 0.
+        score differences (winner minus seed, over each task's reps) need a lower bound above 0, and the
+        winner's aggregate test pass rate must not fall below the seed's.
         """
         self.ledger.reserve = 0.0
         no_spend = self.stop.reason in NO_SPEND_REASONS
@@ -675,16 +771,22 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
                                        f"{', '.join(unfinished)}); test-split means not compared: {scores}")
         self.log(f"finish: test-split means {scores}")
-        deltas = _paired_task_deltas(test_rows[winner.cid], test_rows[seed.cid], self.panel.test)
+        test_base = _baseline_costs(baseline_rows, self.panel.test)
+        deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], self.panel.test, test_base)
         if not deltas:
             self.log("finish: no improvement (no test task has paired winner and seed rows)")
             return None
         point = sum(deltas) / len(deltas)
         low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
+        pass_delta = test_means[winner.cid] - test_means[seed.cid]
         paired_line = f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)"
-        self.log(f"finish: {paired_line}")
+        pass_line = f"test pass rate delta {pass_delta:+.3f}"
+        self.log(f"finish: {paired_line}; {pass_line}")
         if not low > 0:
             self.log("finish: no improvement (the paired test-split interval does not exclude 0)")
+            return None
+        if test_means[winner.cid] < test_means[seed.cid]:
+            self.log("finish: no improvement (the winner's test pass rate is below the seed's)")
             return None
         if not winner.just_check_ok:
             return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "
@@ -700,6 +802,7 @@ class Evolution:
             f"Evolve run `{self.settings.run_id}` winner `{winner.cid[:12]}` (commit {winner.sha}).", "",
             f"Test-split means: {scores}", "",
             f"Winner minus seed, {paired_line}", "",
+            f"Winner minus seed, {pass_line}", "",
             "## Re-pin before landing", REPIN_NOTE, "",
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",

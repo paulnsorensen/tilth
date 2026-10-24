@@ -1,6 +1,25 @@
 # Evolve
 
-GEPA search over tilth commits. A candidate's score is grader correctness over its paid dev rollouts.
+GEPA search over tilth commits. A candidate scores each task as `p * base / c` (cost per correct).
+
+## Score and finish rule
+
+`p` is the candidate pass rate on the task. `c` is the candidate mean row cost (`total_cost_usd`, else
+`charged_usd`). `base` is the frozen baseline-arm mean `total_cost_usd` for the task. A score of 1.0 means
+baseline parity. A task never solved scores 0. The ratio has no cap. Only an absent or null `total_cost_usd`
+falls back to `charged_usd`. A negative, non-finite, or malformed cost, or a solved task with a mean cost of 0,
+stops the run.
+
+`buy_baselines` buys the cheap, dev and test baselines before any candidate cell. A task with no completed
+baseline row, or a baseline cost that is not a number above 0, refuses the run (exit 2).
+
+Finish opens a PR only if both hold: the lower bound of the paired test-split bootstrap interval of the
+per-task score delta (winner minus seed) is above 0, and the winner's aggregate test pass rate is at least
+the seed's.
+
+Paid-tier side info for reflection carries `cost_pairs` for the task: the candidate's rows and the frozen
+baseline rows, each cut to cost, turns, tokens, tool calls, tool sequence, and batch sizes. Reflection can
+so see why a candidate costs more than stock Claude. The pairs carry no trajectory and no grader output.
 
 ## Strict file tools (default)
 
