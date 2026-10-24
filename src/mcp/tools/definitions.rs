@@ -14,6 +14,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "required": ["queries", "cwd"],
                 "properties": {
+                    "glob": { "type": "string", "description": "Glob for every query without its own glob." },
                     "queries": {
                         "type": "array",
                         "items": {
@@ -400,6 +401,10 @@ mod tests {
         assert!(!compiled.is_valid(&serde_json::json!({"query": "x"})));
         assert!(!compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})));
         assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}], "cwd": "/abs"})));
+        assert_eq!(schema["properties"]["glob"]["type"], "string");
+        assert!(compiled.is_valid(
+            &serde_json::json!({"queries": [{"query": "x"}], "cwd": "/abs", "glob": "*.rs"})
+        ));
         assert!(compiled.is_valid(
             &serde_json::json!({"queries": [{"follow": {"kind": "fetch_tests", "target": {
                 "path": "x.rs", "line": 1, "name": "x", "scope": "/abs", "glob": null

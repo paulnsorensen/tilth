@@ -118,17 +118,20 @@ fn run_search_v2(
     let cwd = require_cwd(args).map_err(|e| SearchFailure::new(e, "bad_cwd"))?;
     if object
         .keys()
-        .any(|k| !matches!(k.as_str(), "queries" | "cwd" | "budget"))
+        .any(|k| !matches!(k.as_str(), "queries" | "cwd" | "budget" | "glob"))
     {
-        let hint = if object.contains_key("glob") {
-            "; glob goes inside each query entry: queries: [{query, glob}]"
-        } else {
-            ""
-        };
         return Err(SearchFailure::new(
-            format!("search accepts only queries, cwd, and budget{hint}"),
+            "search accepts only queries, cwd, and budget",
             "unknown_keys",
         ));
+    }
+    let top_glob = match object.get("glob") {
+        None => None,
+        Some(Value::String(glob)) => Some(glob.as_str()),
+        Some(_) => return Err(SearchFailure::new("glob must be a string", "bad_glob")),
+    };
+    if top_glob.is_some() {
+        validate_entry_glob(object, cwd, "bad_glob")?;
     }
     let entries = args
         .get("queries")
@@ -224,7 +227,7 @@ fn run_search_v2(
                 language,
                 pattern,
                 cwd,
-                entry.get("glob").and_then(Value::as_str),
+                entry.get("glob").and_then(Value::as_str).or(top_glob),
                 cache,
             );
             counts = file_counts;
@@ -237,7 +240,7 @@ fn run_search_v2(
             let query = entry["query"].as_str().unwrap();
             match route_query(
                 query,
-                entry.get("glob").and_then(Value::as_str),
+                entry.get("glob").and_then(Value::as_str).or(top_glob),
                 cwd,
                 cache,
                 session,
@@ -3114,18 +3117,35 @@ mod tests {
     }
 
     #[test]
-    fn top_level_glob_rejection_says_where_glob_goes() {
+    fn top_level_glob_filters_every_query_without_its_own_glob() {
         let tmp = tempfile::tempdir().unwrap();
-        let error = call(&json!({
+        std::fs::write(tmp.path().join("a.rs"), "// zebra_token\n").unwrap();
+        std::fs::write(tmp.path().join("b.go"), "// zebra_token\n").unwrap();
+        let result = call(&json!({
             "cwd": tmp.path(),
             "glob": "*.go",
-            "queries": [{"query": "root"}]
+            "queries": [{"query": "zebra_token"}]
         }))
-        .expect_err("top-level glob stays rejected");
-        assert!(
-            error.contains("glob goes inside each query entry"),
-            "{error}"
-        );
+        .expect("top-level glob accepted")
+        .to_string();
+        assert!(result.contains("b.go"), "{result}");
+        assert!(!result.contains("a.rs"), "{result}");
+    }
+
+    #[test]
+    fn per_query_glob_overrides_the_top_level_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "// zebra_token\n").unwrap();
+        std::fs::write(tmp.path().join("b.go"), "// zebra_token\n").unwrap();
+        let result = call(&json!({
+            "cwd": tmp.path(),
+            "glob": "*.go",
+            "queries": [{"query": "zebra_token", "glob": "*.rs"}]
+        }))
+        .expect("per-query glob accepted")
+        .to_string();
+        assert!(result.contains("a.rs"), "{result}");
+        assert!(!result.contains("b.go"), "{result}");
     }
 
     // ---- press attack: request-cuts adversarial ----
@@ -3280,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_top_level_keys_keep_the_generic_message_without_the_glob_hint() {
+    fn extra_top_level_keys_keep_the_generic_message() {
         let tmp = tempfile::tempdir().unwrap();
         let h = Harness::new();
         let error = search_with(
@@ -3292,21 +3312,17 @@ mod tests {
             error.contains("search accepts only queries, cwd, and budget"),
             "{error}"
         );
-        assert!(!error.contains("glob"), "{error}");
     }
 
     #[test]
-    fn top_level_null_glob_is_still_rejected_with_the_hint() {
+    fn top_level_non_string_glob_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let h = Harness::new();
         let error = search_with(
             &h,
             &json!({"cwd": tmp.path(), "queries": [{"query": "root"}], "glob": null}),
         )
-        .expect_err("top-level glob rejected even when null");
-        assert!(
-            error.contains("glob goes inside each query entry"),
-            "{error}"
-        );
+        .expect_err("non-string top-level glob rejected");
+        assert!(error.contains("glob must be a string"), "{error}");
     }
 }
