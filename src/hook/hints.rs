@@ -112,6 +112,9 @@ const WRITE_RULES: &[Rule] = &[
     "php",
 ];
 
+/// Rules that run inline code, whether to compute or to write.
+const INTERPRETER_RULES: &[Rule] = &["python", "perl", "ruby", "node", "deno", "bun", "php"];
+
 #[cfg(test)]
 const OTHER_RULES: &[Rule] = &[PARSE_ERROR, UNRESOLVED, SHELL_STDIN, GIT_CONFIG];
 
@@ -149,6 +152,14 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
     let search = "mcp__tilth__tilth_search(queries:[{query:\"<pattern>\"}], cwd:\"<checkout>\")";
     let write = "mcp__tilth__tilth_write(edits:[{path:\"<path>\", tag:\"<TAG>\", ops:[{op:\"replace_text\", old:\"...\", new:\"...\"}]}], cwd:\"<checkout>\")";
     match kind {
+        Kind::Read if rule == "wc" => format!(
+            "Blocked: shell `{rule}` reads file content to count it. \
+             A tilth_read of the whole path shows its total line count in the header. \
+             A large file comes back as a signature outline, with the count still in the header.\n\n\
+             Run instead:\n  {read}\n\n\
+             Use `ls` or `find` for file listings. \
+             Filters on command output (`git log | wc -l`) still run."
+        ),
         Kind::Read => format!(
             "Blocked: shell `{rule}` reads file content. Use tilth_read, not a shell reader.\n\n\
              Run instead:\n  {read}\n\n\
@@ -160,15 +171,40 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
              Run instead:\n  {search}\n\n\
              Filters on command output (`git log | grep fix`) still run."
         ),
-        Kind::Write => format!(
-            "Blocked: shell `{rule}` writes files or runs inline code. Use tilth_write.\n\n\
-             Read the file with tilth_read first to get its [path#TAG], then:\n  {write}\n\n\
-             For a new file, omit the tag and use op create_file."
-        ),
+        Kind::Write => write_reason(rule, write),
         Kind::Generic => format!(
             "Blocked: the hook cannot allow this command (`{rule}`). \
              Read files with tilth_read, search with tilth_search, and write with tilth_write."
         ),
+    }
+}
+
+/// Formats a write denial, choosing the cheapest tilth call for the rule.
+fn write_reason(rule: &str, write: &str) -> String {
+    let create = "mcp__tilth__tilth_write(edits:[{path:\"<path>\", ops:[{op:\"create_file\", content:\"...\"}]}], cwd:\"<checkout>\")";
+    if INTERPRETER_RULES.contains(&rule) {
+        format!(
+            "Blocked: shell `{rule}` runs inline code. Pick by purpose.\n\n\
+             To compute or check something: run the project's own test or build command, \
+             or inspect with tilth_search or tilth_read. Do not script it.\n\
+             To write a new file:\n  {create}\n\
+             To change an existing file, use the [path#TAG] you already have from tilth_read \
+             or tilth_search (read only if you have none):\n  {write}"
+        )
+    } else if rule == OUTPUT_REDIRECT || rule == "tee" {
+        format!(
+            "Blocked: shell `{rule}` writes files. Use tilth_write.\n\n\
+             New file: no read needed, create it directly:\n  {create}\n\n\
+             Existing file: use the [path#TAG] you already have from tilth_read or tilth_search \
+             (read only if you have none), then:\n  {write}"
+        )
+    } else {
+        format!(
+            "Blocked: shell `{rule}` writes files. Use tilth_write.\n\n\
+             Use the [path#TAG] you already have from tilth_read or tilth_search; \
+             read the file only if you have none. Then:\n  {write}\n\n\
+             For a new file, omit the tag and use op create_file."
+        )
     }
 }
 
