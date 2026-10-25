@@ -16,7 +16,7 @@ def _entry(path: str, symbol: str, role: str) -> dict:
 SOURCE_MAP: dict[str, list[dict]] = {
     "tilth_write_receipt": [
         _entry("src/mcp/tools/write.rs", "commit_section", "commits one edit section and builds its receipt"),
-        _entry("src/mcp/tools/write.rs", "render_changed_windows", "renders the changed numbered lines in the receipt"),
+        _entry("src/mcp/tools/write.rs", "summarize_changes", "renders the slim changed/deleted-at receipt line"),
         _entry("src/mcp/tools/write.rs", "resolve_edit", "resolves tag and ops into new text"),
     ],
     "tilth_read_full_mode": [
