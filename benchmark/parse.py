@@ -719,12 +719,31 @@ def detect_quota_rejection(raw: str) -> Optional[str]:
     return None
 
 
+def output_chars(output: object) -> int:
+    """Length of a tool result's plain text: a string as is, a content list's ``text`` blocks only."""
+    if output is None:
+        return 0
+    if isinstance(output, str):
+        return len(output)
+    if isinstance(output, dict) and isinstance(output.get("content"), list):
+        output = output["content"]
+    if isinstance(output, list):
+        return sum(len(block["text"]) for block in output
+                   if isinstance(block, dict) and isinstance(block.get("text"), str))
+    return len(json.dumps(output, ensure_ascii=False, default=str))
+
+
 def _claude_trajectory(events: list[dict]) -> list[dict]:
     calls: dict[str, dict] = {}
+    turns: dict[str, int] = {}
     for event in events:
         message = event.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("content"), list):
             continue
+        turn = None
+        if event.get("type") == "assistant" or message.get("role") == "assistant":
+            key = message.get("id") or f"event-{len(turns)}"
+            turn = turns.setdefault(key, len(turns))
         for block in message["content"]:
             if not isinstance(block, dict):
                 continue
@@ -732,11 +751,13 @@ def _claude_trajectory(events: list[dict]) -> list[dict]:
                 calls[block.get("id")] = {
                     "tool_use_id": block.get("id"), "name": block.get("name"),
                     "input": block.get("input"), "output": None, "is_error": None,
+                    "api_turn": turn, "result_chars": 0,
                 }
             elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
                 call = calls[block["tool_use_id"]]
                 call["output"] = block.get("content")
                 call["is_error"] = block.get("is_error") is True
+                call["result_chars"] = output_chars(block.get("content"))
     return list(calls.values())
 
 
@@ -770,6 +791,7 @@ def _codex_trajectory(events: list[dict]) -> list[dict]:
         records.append({
             "tool_use_id": item.get("id"), "name": name,
             "input": tool_input, "output": output, "is_error": is_error,
+            "api_turn": None, "result_chars": output_chars(output),
         })
     return records
 
