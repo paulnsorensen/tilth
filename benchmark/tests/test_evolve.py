@@ -1777,7 +1777,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
     evo.ledger.max_usd = 100.0
     after_stop = count_evaluations_after_stop(evo)
     evo.search()
-    assert paid in (["proposer"], ["reflection", "proposer"])
+    assert paid == ["proposer"]
     assert evo.stop.reason == "quota"
     assert after_stop == []
     accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
@@ -1785,7 +1785,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert evo.finish() is None
     assert len(world.calls) == calls
-    assert paid in (["proposer"], ["reflection", "proposer"])
+    assert paid == ["proposer"]
     assert world.pr.calls == []
     text = log_text(world)
     assert "infra:quota" in text and "finish: incomplete (quota)" in text

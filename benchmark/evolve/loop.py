@@ -266,7 +266,6 @@ class Evolution:
         self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log)
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
                                             hypotheses=self.hypotheses, extra_records=self._extra_records)
-        self.last_replay: list[dict] | None = None
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
@@ -737,11 +736,10 @@ class Evolution:
         return summary["dominant"] if summary else None
 
     def _extra_records(self, candidate: Mapping[str, str]) -> list[dict]:
-        """Run-level records for a reflection or proposer call: past hypothesis outcomes and a replay diff."""
+        """Run-level records for a reflection or proposer call: past hypothesis outcomes and the candidate's own replay."""
         records = self.hypotheses.feedback()
         own = self.results.get(content_id(candidate))
-        cells = own.replay if own and own.replay else self.last_replay
-        return [*records, {"replay": cells}] if cells else records
+        return [*records, {"replay": own.replay}] if own and own.replay else records
 
     def _diagnose(self, result: Cascade) -> None:
         """Attribute a candidate's paid dev rows once per content id; replay its src change when asked."""
@@ -784,7 +782,6 @@ class Evolution:
         except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
             self.log(f"replay {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
         if result.replay:
-            self.last_replay = result.replay
             self.log(f"replay {result.cid[:12]}: {json.dumps(result.replay, sort_keys=True)}")
 
     # --- finish ---

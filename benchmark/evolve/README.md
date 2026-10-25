@@ -33,8 +33,10 @@ skipped. The side info for the candidate carries a compact `attribution` view un
 The dispatcher sends it, with a `source_map` record for the leading causes, to reflection and the proposer.
 
 `diagnosis.WeightedSelector` is the gepa `module_selector`. It weights each component by the parent's
-`dominant` hints, picks `src_patch` within the first 2 proposals, and leaves no component out for more than 5
-proposals in a row. Each pick goes to `log.txt` with its evidence and reason.
+`dominant` hints (the hinted component takes about 44% of the picks, against 20% for a uniform choice), picks
+`src_patch` within the first 2 proposals, and leaves no component out for more than 10 proposals in a row. The
+bound is `MAX_UNSELECTED`. Each pick goes to `log.txt` with its evidence and reason. A reflection or proposer call
+receives a `replay` record only from its own candidate, never from another one.
 
 Reflection and the proposer end a reply with one `<hypothesis>` block (`metric`, `scope`, `direction`,
 `tolerance`, `invariants`). `hypotheses.jsonl` in the run directory holds it, keyed by parent and child content

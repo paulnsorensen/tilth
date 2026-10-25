@@ -135,7 +135,8 @@ def test_selector_picks_src_patch_within_two_proposals_whatever_the_hints(hint: 
         assert SRC in picks[:diagnosis.SRC_PATCH_BY_PROPOSAL], (seed, picks)
 
 
-def test_selector_never_leaves_a_component_out_for_more_than_five_proposals() -> None:
+def test_selector_never_leaves_a_component_out_for_more_than_ten_proposals() -> None:
+    assert diagnosis.MAX_UNSELECTED == 10
     names = list(seed_candidate())
     for seed in range(20):
         picks, _logs = run_selector(seed, READ_MD, 80)
@@ -147,10 +148,14 @@ def test_selector_never_leaves_a_component_out_for_more_than_five_proposals() ->
 
 
 def test_selector_favours_the_hinted_component() -> None:
-    hinted, _logs = run_selector(1, READ_MD, 300)
-    other, _logs = run_selector(1, "prompts/mcp.md", 300)
-    # The starvation bound keeps the weights modest; the hinted component still gains turns.
-    assert hinted.count(READ_MD) > other.count(READ_MD) + 15
+    # Measured over seeds 0-19 with 300 proposals each: the hinted component takes 44% of the turns,
+    # the same component unhinted takes 14%, and a uniform choice among five would give 20%.
+    def share(hint: str) -> float:
+        picks = [pick for seed in range(20) for pick in run_selector(seed, hint, 300)[0]]
+        return picks.count(READ_MD) / len(picks)
+
+    assert share(READ_MD) >= 0.40
+    assert share("prompts/mcp.md") <= 0.16
 
 
 def test_selector_without_attribution_still_returns_one_component() -> None:
@@ -416,6 +421,24 @@ def test_replay_diagnostic_logs_and_records_without_rejecting(world, monkeypatch
     assert f"replay {result.cid[:12]}: " in log_text(world)
     assert {"replay": result.replay} in evo._extra_records(changed)
     assert not any(row["mode"] == "replay" for row in world.stored())
+
+
+def test_a_candidate_never_receives_another_candidates_replay(world, monkeypatch) -> None:  # noqa: F811
+    calls: list[tuple[str, str]] = []
+    stub_replay(monkeypatch, calls)
+    evo = ready(world, "--replay-diagnostic", "1")
+    for task in DEV:
+        evo.evaluate(evo.seed, task)
+    changed = src_child(world)
+    for task in DEV:
+        evo.evaluate(changed, task)
+    other = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1", test_a="1", tag="b")
+    for task in DEV:
+        evo.evaluate(other, task)
+
+    assert {"replay": evo.results[candidates.content_id(changed)].replay} in evo._extra_records(changed)
+    assert not [r for r in evo._extra_records(other) if "replay" in r]
+    assert not [r for r in evo._extra_records(evo.seed) if "replay" in r]
 
 
 def test_replay_diagnostic_skips_a_prompt_only_candidate(world, monkeypatch) -> None:  # noqa: F811
