@@ -15,6 +15,7 @@ from parse import extract_trajectory
 
 from .calls import PaidCalls
 from .candidate import OBJECTIVE, SRC_PATCH, TEXT_COMPONENTS
+from .diagnosis import DIAGNOSIS_NOTE, PROPOSER_HYPOTHESIS, HypothesisBook
 from .gitops import GitError, git, git_bytes
 
 EXPORT_PATHS = ("src", "prompts", "Cargo.toml", "Cargo.lock")
@@ -27,7 +28,7 @@ PROPOSER_HEADER = (
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    "touch #[cfg(test)] code."
+    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 
 
@@ -55,7 +56,8 @@ class Proposer:
     """
 
     def __init__(self, repo: Path, seed_sha: str, paid: PaidCalls, model: str, *, forbidden: list[str],
-                 log: Callable[[str], None]) -> None:
+                 log: Callable[[str], None], hypotheses: HypothesisBook | None = None) -> None:
+        self.hypotheses = hypotheses
         self.repo = Path(repo)
         self.seed_sha = seed_sha
         self.paid = paid
@@ -101,6 +103,8 @@ class Proposer:
         if reason is not None:
             self.log(f"proposer: rejected ({reason}); keeping the parent's src_patch")
             return parent
+        if self.hypotheses is not None:
+            self.hypotheses.offer(SRC_PATCH, outcome.text)
         after = _snapshot(root)
         dropped = sorted(path for path in {*before, *after} if before.get(path) != after.get(path))
         if dropped:

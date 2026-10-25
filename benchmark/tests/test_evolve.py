@@ -681,7 +681,7 @@ def test_failed_candidate_build_is_a_cascade_stage(monkeypatch: pytest.MonkeyPat
     real_build = world.fake_build
 
     def build_candidate(sha: str, repo: Path | None = None) -> run.CandidateBuild:
-        if "BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo):
+        if any("BUILDFAIL" in git("show", f"{sha}:{name}", cwd=world.repo) for name in TEXTS):
             raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0308]: mismatched types")
         return real_build(sha, repo)
 
@@ -694,13 +694,14 @@ def test_failed_candidate_build_is_a_cascade_stage(monkeypatch: pytest.MonkeyPat
     evo = build(world, calls="12", spawn=spawn)
     assert evo.run() == 0
 
-    [failed] = [result for result in evo.results.values() if "BUILDFAIL" in result.candidate["prompts/mcp.md"]]
+    [failed] = [result for result in evo.results.values()
+                if any("BUILDFAIL" in result.candidate[name] for name in TEXTS)]
     assert failed.stage == "build" and "error[E0308]: mismatched types" in failed.tail
     assert f"candidate {failed.cid[:12]}: failed at build" in log_text(world)
     assert "error[E0308]: mismatched types" in log_text(world)
     assert "finish: " in log_text(world)
-    assert not any("BUILDFAIL" in git("show", f"{sha}:prompts/mcp.md", cwd=world.repo)
-                   for _task, mode, _rep, sha in world.calls if mode == "tilth_forced")
+    assert not any("BUILDFAIL" in git("show", f"{sha}:{name}", cwd=world.repo)
+                   for _task, mode, _rep, sha in world.calls if mode == "tilth_forced" for name in TEXTS)
 
 
 def test_build_failure_side_info_names_stage(world, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1776,7 +1777,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
     evo.ledger.max_usd = 100.0
     after_stop = count_evaluations_after_stop(evo)
     evo.search()
-    assert paid == ["reflection"] * 4 + ["proposer"]
+    assert paid in (["proposer"], ["reflection", "proposer"])
     assert evo.stop.reason == "quota"
     assert after_stop == []
     accept(evo, child(evo.seed, test_a="1"), {"dev_a": 0.9, "dev_b": 0.9})
@@ -1784,7 +1785,7 @@ def test_real_gepa_quota_in_proposer_stops(monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert evo.finish() is None
     assert len(world.calls) == calls
-    assert paid == ["reflection"] * 4 + ["proposer"]
+    assert paid in (["proposer"], ["reflection", "proposer"])
     assert world.pr.calls == []
     text = log_text(world)
     assert "infra:quota" in text and "finish: incomplete (quota)" in text
@@ -1821,7 +1822,7 @@ def test_engine_receives_seed_candidate(world, monkeypatch: pytest.MonkeyPatch) 
     assert any(isinstance(stop, engine.Stopper) for stop in config.stop_callbacks)
     assert config.reflection.custom_candidate_proposer is evo.dispatcher
     assert config.reflection.reflection_lm is None
-    assert config.reflection.module_selector == "round_robin"
+    assert config.reflection.module_selector is evo.selector
 
 
 def test_dispatcher_routes_components_without_litellm(world) -> None:

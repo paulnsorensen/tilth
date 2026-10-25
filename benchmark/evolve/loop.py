@@ -11,6 +11,7 @@ import json
 import math
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -28,9 +29,10 @@ from judge import core as judge
 from judge import store as judge_store
 from spend import SpendLedger
 
-from . import engine, hookgate
+from . import attribution as cost_attribution
+from . import diagnosis, engine, hookgate, replay
 from .calls import PaidCalls, StopState
-from .candidate import content_id
+from .candidate import SRC_PATCH, content_id
 from .finish import REPIN_NOTE, PRClient, outside_allowlist
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
@@ -72,6 +74,8 @@ class Settings:
     helper_model: str = "sonnet"
     # Strict cells guard Bash with the hook: candidates run their own hook, the baseline runs the seed's.
     strict_file_tools: bool = True
+    # Seed cells that the replay diagnostic re-sends to the seed and candidate binaries; 0 turns it off.
+    replay_diagnostic: int = 0
 
 
 @dataclass(eq=False)
@@ -102,6 +106,9 @@ class Cascade:
     task_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
     base_costs: dict[str, float] = field(default_factory=dict)
     base_rows: dict[str, list[dict]] = field(default_factory=dict)
+    # Diagnostics only: neither feeds a score, a gate, or the finish rule.
+    attribution: dict | None = None
+    replay: list[dict] | None = None
 
     @property
     def dev_mean(self) -> float:
@@ -120,13 +127,16 @@ class Cascade:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
-        return {"stage": "paid", "task_scores": {name: self.score(name) for name in self.scores},
+        info = {"stage": "paid", "task_scores": {name: self.score(name) for name in self.scores},
                 "pass_rate": {name: stats[0] for name, stats in self.task_stats.items()},
                 "mean_cost": {name: stats[1] for name, stats in self.task_stats.items()},
                 "baseline_cost": dict(self.base_costs), "records": self.records.get(task, []),
                 "cost_pairs": {"task": task,
                                "candidate": [cost_summary(row) for row in self.rows if row["task"] == task],
                                "baseline": list(self.base_rows.get(task, []))}}
+        if self.attribution:
+            info["attribution"] = diagnosis.compact(self.attribution)
+        return info
 
 
 def tail(output: str) -> str:
@@ -249,10 +259,15 @@ class Evolution:
         self.stop = StopState()
         self.stop.listeners.append(self._on_stop)
         self.paid = PaidCalls(ledger, self.stop, settings.cell_estimate_usd, spawn=spawn, log=self.log)
-        self.reflect = engine.ReflectionClient(self.paid, settings.helper_model)
+        self.hypotheses = diagnosis.HypothesisBook(self.run_dir / "hypotheses.jsonl", self.log)
+        self.reflect = engine.ReflectionClient(self.paid, settings.helper_model, self.hypotheses)
         self.proposer = Proposer(settings.repo, settings.seed_sha, self.paid, settings.helper_model, log=self.log,
-                                 forbidden=self._forbidden_terms())
-        self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch)
+                                 forbidden=self._forbidden_terms(), hypotheses=self.hypotheses)
+        self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log)
+        self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
+                                            hypotheses=self.hypotheses, extra_records=self._extra_records)
+        self.last_replay: list[dict] | None = None
+        self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
         self.results: dict[str, Cascade] = {}
@@ -479,7 +494,7 @@ class Evolution:
     def search(self):
         found = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
                                 max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
-                                proposer=self.dispatcher)
+                                proposer=self.dispatcher, selector=self.selector)
         self.log(f"search: ended ({self.stop.reason or 'metric-call budget'})")
         return found
 
@@ -491,6 +506,7 @@ class Evolution:
             result = self.cascade(candidate)
         except _Stopped:
             return 0.0, {"stopped": self.stop.reason}
+        self.hypotheses.settle(result.cid, self._summary_of)
         if result.stage is not None:
             return 0.0, result.side_info(example)
         result.task_stats = {task: stats for task in self.panel.dev if (stats := task_stats(result.rows, task))}
@@ -587,6 +603,7 @@ class Evolution:
         self._admit(result)
         if result.delta is None:
             result.delta = self._dev_delta(result)
+        self._diagnose(result)
         if not result.counted:
             result.counted = True
             self._count_plateau()
@@ -708,6 +725,67 @@ class Evolution:
             self.dev_baseline_rows = self._plan(self._cells(self.panel.dev, BASELINE_MODE, self._reps()), None,
                                                 store_only=True)
         return self._delta_report(result, "dev", result.rows, self.dev_baseline_rows)
+
+    # --- diagnosis: read-only views of dev rows; none of it scores or rejects a candidate ---
+
+    def _summary_of(self, cid: str) -> dict | None:
+        result = self.results.get(cid)
+        return result.attribution if result else None
+
+    def _dominant_of(self, candidate: Mapping[str, str]) -> list[dict] | None:
+        summary = self._summary_of(content_id(candidate))
+        return summary["dominant"] if summary else None
+
+    def _extra_records(self, candidate: Mapping[str, str]) -> list[dict]:
+        """Run-level records for a reflection or proposer call: past hypothesis outcomes and a replay diff."""
+        records = self.hypotheses.feedback()
+        own = self.results.get(content_id(candidate))
+        cells = own.replay if own and own.replay else self.last_replay
+        return [*records, {"replay": cells}] if cells else records
+
+    def _diagnose(self, result: Cascade) -> None:
+        """Attribute a candidate's paid dev rows once per content id; replay its src change when asked."""
+        if result.attribution is None:
+            try:
+                result.attribution = cost_attribution.summarize(result.rows, self.dev_baseline_rows or [],
+                                                                self.panel.dev)
+            except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
+                self.log(f"attribution {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
+            else:
+                self.log(f"attribution {result.cid[:12]}: "
+                         f"{json.dumps(diagnosis.compact(result.attribution), sort_keys=True)}")
+        if self.settings.replay_diagnostic > 0 and result.replay is None:
+            self._replay_diagnostic(result)
+
+    def _replay_diagnostic(self, result: Cascade) -> None:
+        """Re-send the first seed dev cells to the seed and candidate binaries, in task and repetition order."""
+        result.replay = []
+        if result.candidate[SRC_PATCH] == self.seed[SRC_PATCH]:
+            return
+        seed = self.results.get(self.seed_id)
+        cells = sorted((row for row in (seed.rows if seed else ())
+                        if row.get("mode") == CANDIDATE_MODE and row.get("trajectory_path")
+                        and Path(row["trajectory_path"]).is_file()),
+                       key=lambda row: (row["task"], row.get("repetition", 0)))[:self.settings.replay_diagnostic]
+        if not cells:
+            self.log(f"replay {result.cid[:12]}: no seed dev cell has a readable trajectory")
+            return
+        try:
+            seed_binary = run.build_candidate(self.settings.seed_sha, repo=self.settings.repo).binary_path
+            candidate_binary = run.build_candidate(result.sha, repo=self.settings.repo).binary_path
+            for row in cells:
+                key = (row["task"], row.get("repetition", 0))
+                with tempfile.TemporaryDirectory(prefix="tilth-evolve-replay-") as scratch:
+                    if key not in self.seed_replays:
+                        self.seed_replays[key] = replay.replay_cell(row, seed_binary, workdir=Path(scratch) / "seed")
+                    other = replay.replay_cell(row, candidate_binary, workdir=Path(scratch) / "candidate")
+                result.replay.append({"task": key[0], "repetition": key[1],
+                                      **replay.compare(self.seed_replays[key], other)})
+        except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
+            self.log(f"replay {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
+        if result.replay:
+            self.last_replay = result.replay
+            self.log(f"replay {result.cid[:12]}: {json.dumps(result.replay, sort_keys=True)}")
 
     # --- finish ---
 
