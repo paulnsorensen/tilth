@@ -124,6 +124,7 @@ The check passes when any single removal fails the held-out tests, and the verdi
 The harness caches verdicts by instance ID, data revision, and environment fingerprint.
 Delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
 The harness recomputes a verdict from an older admission version or another tamper bound.
+`external/long_pool_candidates.json` lists admitted SWE-bench Multilingual instances with large gold patches, as candidates for a long-task panel screen.
 `run.py --tasks <instance_id>` runs an admitted instance.
 Its workdir is the `base_commit` tree as the single commit of a fresh repository.
 FeatureBench workdirs also apply the mask and delete the FAIL_TO_PASS tests.
