@@ -77,6 +77,20 @@ def empty_dependency_caches(monkeypatch: pytest.MonkeyPatch, root: Path) -> None
         monkeypatch.setenv(name, str(path))
 
 
+def stub_runner_on_path(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Put a stub `claude` first on the host PATH.
+
+    A Python cell resolves its runner on the host PATH before the launch (``run._host_runner_argv``).
+    The replay fake then intercepts the launch, so the stub never runs.
+    """
+    directory = root / "host-runner-bin"
+    directory.mkdir(parents=True, exist_ok=True)
+    stub = directory / "claude"
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 def build_upstream(repo: str, files: Mapping[str, str], root: Path) -> tuple[Path, str]:
     """Build a bare upstream at ``root/<repo>.git``: an initial commit, then the base commit."""
     work = root / "work" / repo

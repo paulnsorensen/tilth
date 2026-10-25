@@ -2,7 +2,6 @@
 
 import io
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -23,7 +22,7 @@ import external.swebench_ml
 import external.task
 import run
 from conftest import STREAMS, StoreTask
-from external_support import FB_LV1, SWE_GO, SWE_PY, SWE_RS, git, rows
+from external_support import FB_LV1, SWE_GO, SWE_PY, SWE_RS, git, rows, stub_runner_on_path
 
 _ARGS = ("--models", "sonnet5", "--modes", "plain", "--reps", "1", "--max-usd", "5")
 
@@ -63,12 +62,7 @@ def run_cell(monkeypatch: pytest.MonkeyPatch, task_name: str, workdir: Path, tmp
         # Only the agent CLI is replayed; grading subprocesses run for real.
         return _Replay(stream or claude_stream()) if Path(cmd[0]).name == "claude" else real_popen(cmd, *args, **kwargs)
 
-    # A Python cell resolves the runner on the host PATH, so a stub must exist there.
-    host_bin = tmp_path / "host-bin"
-    host_bin.mkdir(exist_ok=True)
-    (host_bin / "claude").write_text("#!/bin/sh\nexit 1\n")
-    (host_bin / "claude").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{host_bin}{os.pathsep}{os.environ['PATH']}")
+    stub_runner_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr(run.subprocess, "Popen", popen)
     return run._run_single_in_repo(task_name, "plain", "sonnet5", 0, workdir,
                                    stream_log_path=tmp_path / "streams" / "cell.jsonl")

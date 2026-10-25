@@ -17,6 +17,7 @@ from conftest import STREAMS, link_suite_site
 from evolve import candidate as evolve_candidate
 from evolve import engine as evolve_engine
 from evolve.finish import GitHubPRClient
+from external_support import stub_runner_on_path
 from judge import core as judge_core
 from judge import store as judge_store
 from panel_support import (
@@ -88,6 +89,7 @@ def _program_names(argv: list[str]) -> set[str]:
 def test_external_cell_never_invokes_container(bench, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     hermetic_repos(monkeypatch, tmp_path)
     seed_synthetic_data(monkeypatch, tmp_path)
+    stub_runner_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr(run, "TASKS", dict(run.TASKS))
     monkeypatch.setattr(external.preflight, "admit", admit_all)
     stream = (STREAMS / "claude_native_cost.jsonl").read_text()
