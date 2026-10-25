@@ -99,7 +99,8 @@ class UnchangedReread(unittest.TestCase):
         requests.append(harness.tools_call_request(3, "tilth_write", edit))
         requests.append(harness.tools_call_request(
             4, "tilth_read", {"cwd": self.cwd, "paths": ["a.rs"]}))
-        third = harness.tool_result_text(harness.run_mcp([], requests).response_by_id(4))
+        responses = harness.run_mcp([], requests)
+        third = harness.tool_result_text(responses.response_by_id(4))
         self.assertIn("value_3 = 33", third)
         self.assertNotIn("unchanged since", third)
 

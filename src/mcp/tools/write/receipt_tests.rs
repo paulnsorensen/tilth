@@ -50,61 +50,179 @@ fn write(session: &Session, root: &Path, tag: Option<&str>, ops: Value) -> Resul
 }
 
 fn fixture(count: u32) -> (tempfile::TempDir, Session, String) {
+    fixture_shown(count, count)
+}
+
+/// A `total`-line file of which the session displayed only lines `1..=shown`.
+fn fixture_shown(total: u32, shown: u32) -> (tempfile::TempDir, Session, String) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("f.txt"), rows(count)).unwrap();
+    std::fs::write(dir.path().join("f.txt"), rows(total)).unwrap();
     let session = Session::new();
-    let tag = tag_of(&read(&session, dir.path(), "f.txt#1-100"));
+    let tag = tag_of(&read(&session, dir.path(), &format!("f.txt#1-{shown}")));
     (dir, session, tag)
 }
 
 #[test]
-fn receipt_shows_every_changed_range_and_authorizes_a_second_write() {
+fn receipt_is_slim_and_names_the_changed_line() {
+    let (dir, session, tag) = fixture(200);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
+    )
+    .expect("write");
+    assert!(receipt.contains("[f.txt#"), "{receipt}");
+    assert!(receipt.contains("changed 100"), "{receipt}");
+    assert!(
+        !receipt.contains("WRITTEN-TEXT"),
+        "echoed content: {receipt}"
+    );
+    assert!(!receipt.contains("100:"), "numbered row: {receipt}");
+    assert!(receipt.len() < 300, "{} chars: {receipt}", receipt.len());
+}
+
+#[test]
+fn receipt_merges_adjacent_lines_into_ranges() {
     let (dir, session, tag) = fixture(100);
     let receipt = write(
         &session,
         dir.path(),
         Some(&tag),
         json!([
-            {"op": "replace_text", "old": "row-010", "new": "ROW-010"},
+            {"op": "replace", "start": 10, "end": 12, "content": "a\nb\nc"},
             {"op": "replace_text", "old": "row-080", "new": "ROW-080"},
         ]),
     )
-    .expect("first write");
-    assert!(receipt.contains("10:ROW-010"), "{receipt}");
-    assert!(
-        receipt.contains("80:ROW-080"),
-        "every changed range, not the first only: {receipt}"
-    );
+    .expect("write");
+    assert!(receipt.contains("changed 10-12, 80"), "{receipt}");
+}
 
+#[test]
+fn authored_line_is_editable_from_the_receipt_tag_without_a_read() {
+    let (dir, session, tag) = fixture(200);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
+    )
+    .expect("first write");
     let second = write(
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([
-            {"op": "replace_text", "old": "ROW-080", "new": "again-080"},
-            {"op": "replace_text", "old": "row-011", "new": "again-011"},
-        ]),
+        json!([{"op": "replace_text", "old": "WRITTEN-TEXT", "new": "again"}]),
     )
-    .expect("second write from the receipt alone");
+    .expect("authored line needs no read");
     assert!(second.contains("applied"), "{second}");
     let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
-    assert!(text.contains("ROW-010") && text.contains("again-080") && text.contains("again-011"));
+    assert!(text.contains("again") && !text.contains("WRITTEN-TEXT"));
 }
 
 #[test]
-fn follow_up_hint_never_points_at_an_unrelated_range() {
-    let (dir, session, tag) = fixture(100);
+fn unshown_neighbour_is_refused_from_the_receipt_tag() {
+    let (dir, session, tag) = fixture_shown(200, 100);
     let receipt = write(
         &session,
         dir.path(),
         Some(&tag),
-        json!([{"op": "replace_text", "old": "row-050", "new": "ROW-050"}]),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
     )
-    .expect("write");
-    assert!(
-        !receipt.contains("re-read") && !receipt.contains("omitted"),
-        "nothing was omitted, so no hint: {receipt}"
-    );
+    .expect("first write");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
+    )
+    .expect_err("the neighbour was never displayed in this version");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn pure_deletion_reports_the_deletion_point_and_marks_nothing_seen() {
+    let (dir, session, tag) = fixture_shown(200, 100);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "delete", "start": 100, "end": 100}]),
+    )
+    .expect("delete");
+    assert!(receipt.contains("deleted at 100"), "{receipt}");
+    assert!(!receipt.contains("changed"), "{receipt}");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
+    )
+    .expect_err("the line at the deletion point was not shown");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn lines_read_before_the_write_stay_editable_at_their_new_number() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]),
+    )
+    .expect("insert");
+    assert!(receipt.contains("changed 31-32"), "{receipt}");
+    let new_tag = tag_of(&receipt);
+    let second = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace_text", "old": "row-050", "new": "moved-050"}]),
+    )
+    .expect("old line 50 (now 52) was read and is unchanged");
+    assert!(second.contains("applied"), "{second}");
+}
+
+#[test]
+fn lines_never_shown_before_the_write_stay_refused() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]),
+    )
+    .expect("insert");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-150", "new": "X"}]),
+    )
+    .expect_err("row-150 was never displayed");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn lines_after_a_deletion_shift_up_and_stay_editable() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "delete", "start": 20, "end": 21}]),
+    )
+    .expect("delete");
+    assert!(receipt.contains("deleted at 20"), "{receipt}");
+    let second = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-040", "new": "X"}]),
+    )
+    .expect("row-040 (now line 38) was read and is unchanged");
+    assert!(second.contains("applied"), "{second}");
 }
 
 #[test]
@@ -192,4 +310,101 @@ fn ambiguous_and_overlap_errors_say_how_to_fix_the_call() {
     )
     .expect_err("overlap");
     assert!(overlap.contains("lines 5-7 and 6-8"), "{overlap}");
+}
+
+#[test]
+fn reread_after_a_write_sends_text_and_only_a_later_read_may_stub() {
+    // `rows` ends in a newline, so the whole file spans 21 lines.
+    let (dir, session, tag) = fixture_shown(20, 21);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace", "start": 2, "end": 2, "content": "changed-row"}]),
+    )
+    .unwrap();
+    let new_tag = tag_of(&receipt);
+
+    let after_write = read(&session, dir.path(), "f.txt");
+    assert!(
+        after_write.contains(&format!("f.txt#{new_tag}")) && after_write.contains("changed-row"),
+        "a reread after a write must send the text under the new tag: {after_write}"
+    );
+    assert!(!after_write.contains("unchanged since"), "{after_write}");
+
+    let again = read(&session, dir.path(), "f.txt");
+    assert!(
+        again.contains(&format!("f.txt#{new_tag}")) && again.contains("unchanged since"),
+        "a reread after a read may stub: {again}"
+    );
+}
+
+/// A one-file session that displayed only line 1 of `body`.
+fn fixture_body(body: &str) -> (tempfile::TempDir, Session, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), body).unwrap();
+    let session = Session::new();
+    let tag = tag_of(&read(&session, dir.path(), "f.txt#1-1"));
+    (dir, session, tag)
+}
+
+#[test]
+fn moved_line_is_not_authored_where_a_diff_would_place_it() {
+    // The file becomes "c\na\n": the agent wrote line 2 and never saw "c".
+    let (dir, session, tag) = fixture_body("a\nc\n");
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([
+            {"op": "delete", "start": 1, "end": 1},
+            {"op": "append", "content": "a"},
+        ]),
+    )
+    .expect("write");
+    let new_tag = tag_of(&receipt);
+    let refused = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 1, "end": 1, "content": "X"}]),
+    )
+    .expect_err("line 1 was never displayed");
+    assert!(refused.contains("never displayed"), "{refused}");
+    write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 2, "end": 2, "content": "Y"}]),
+    )
+    .expect("the authored line stays editable");
+}
+
+#[test]
+fn duplicate_insert_marks_its_own_line_not_an_unseen_twin() {
+    // The agent inserts line 1; old line 2 (unseen) now sits at line 3.
+    let (dir, session, tag) = fixture_body("same\nsame\nother\n");
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_before", "line": 1, "content": "same"}]),
+    )
+    .expect("write");
+    let new_tag = tag_of(&receipt);
+    let refused = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 3, "end": 3, "content": "X"}]),
+    )
+    .expect_err("line 3 was never displayed");
+    assert!(refused.contains("never displayed"), "{refused}");
+    write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 1, "end": 1, "content": "Y"}]),
+    )
+    .expect("the authored line stays editable");
 }

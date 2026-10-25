@@ -576,7 +576,29 @@ def test_claude_trajectory_pairs_untruncated_inputs_and_outputs():
         "input": tool_use["input"],
         "output": tool_result["content"],
         "is_error": False,
+        "api_turn": 0,
+        "result_chars": len(tool_result["content"]),
     }]
+
+
+def test_claude_trajectory_api_turn_groups_parallel_calls_and_counts_text_blocks():
+    from parse import extract_trajectory
+
+    def use(msg, tid):
+        return {"type": "assistant", "message": {"id": msg, "role": "assistant", "content": [
+            {"type": "tool_use", "id": tid, "name": "mcp__tilth__tilth_read", "input": {}}]}}
+
+    def result(tid, content):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": content}]}}
+
+    events = [use("m1", "a"), use("m1", "b"), result("a", [{"type": "text", "text": "x" * 7}]),
+              result("b", "yy"), use("m2", "c"), result("c", [{"type": "text", "text": "z"}, {"type": "image"}])]
+
+    trajectory = extract_trajectory("\n".join(map(json.dumps, events)), "claude")
+
+    assert [(c["tool_use_id"], c["api_turn"], c["result_chars"]) for c in trajectory] == [
+        ("a", 0, 7), ("b", 0, 2), ("c", 1, 1)]
 
 
 def test_codex_trajectory_records_commands_and_mcp_calls():
@@ -600,9 +622,10 @@ def test_codex_trajectory_records_commands_and_mcp_calls():
 
     assert trajectory == [
         {"tool_use_id": "item_1", "name": "command_execution", "input": {"command": "go test ./..."},
-         "output": long_output, "is_error": True},
+         "output": long_output, "is_error": True, "api_turn": None, "result_chars": 500},
         {"tool_use_id": "item_2", "name": "mcp__tilth__tilth_read", "input": {"paths": ["a.go"]},
-         "output": {"content": [{"type": "text", "text": long_output}]}, "is_error": False},
+         "output": {"content": [{"type": "text", "text": long_output}]}, "is_error": False,
+         "api_turn": None, "result_chars": 500},
     ]
 
 
