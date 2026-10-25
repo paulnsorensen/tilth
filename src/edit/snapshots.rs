@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -88,6 +88,9 @@ pub struct SnapshotStore {
     max_versions: usize,
     per_file_cap: usize,
     seq: u64,
+    /// Per path key: the `recorded_at` of the head a write committed. Any later
+    /// record bumps `recorded_at`, so a read supersedes it without bookkeeping.
+    write_marks: HashMap<String, u64>,
 }
 
 impl Default for SnapshotStore {
@@ -120,7 +123,31 @@ impl SnapshotStore {
             max_versions,
             per_file_cap,
             seq: 0,
+            write_marks: HashMap::new(),
         }
+    }
+
+    /// `record` for a version a write committed; see `head_recorded_by_write`.
+    pub fn record_by_write(
+        &mut self,
+        path: impl AsRef<Path>,
+        full_text: &str,
+        seen_lines: impl IntoIterator<Item = u32>,
+    ) -> Option<u16> {
+        let tag = self.record(path.as_ref(), full_text, seen_lines)?;
+        let key = crate::edit::normalize_path_key(path.as_ref());
+        self.write_marks.insert(key, self.seq);
+        Some(tag)
+    }
+
+    /// True when the head of `path` was last recorded by a write and no read or
+    /// search has recorded it since.
+    pub fn head_recorded_by_write(&self, path: impl AsRef<Path>) -> bool {
+        let key = crate::edit::normalize_path_key(path.as_ref());
+        let Some(head) = self.versions.peek(&key).and_then(|h| h.first()) else {
+            return false;
+        };
+        self.write_marks.get(&key) == Some(&head.recorded_at)
     }
 
     /// Record `full_text` for `path` and return its content tag. Returns `None`

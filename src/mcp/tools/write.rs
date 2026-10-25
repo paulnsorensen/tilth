@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::cache::OutlineCache;
-use crate::edit::apply::{ApplyError, FileOp};
+use crate::edit::apply::{ApplyError, FileOp, Written};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
@@ -26,7 +26,7 @@ use crate::edit::recovery::{
     check_seen_lines, current_match_ranges, gated_apply, try_recover, EditError,
 };
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
-use crate::edit::tag::{compute_file_hash, format_header, render_numbered_slice};
+use crate::edit::tag::{compute_file_hash, format_header};
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
@@ -72,18 +72,11 @@ pub(crate) fn tool_write(
     let (sections, cwd, show_diff) = parse_write_args(args)?;
     let _display_base = crate::format::set_display_base(cwd);
 
-    let section_count = sections.len() as u64;
-    let metadata_reserve = section_count.saturating_mul(80);
-    let section_budget = WRITE_RESPONSE_BUDGET
-        .saturating_sub(metadata_reserve)
-        .checked_div(section_count.max(1))
-        .unwrap_or(0);
     let ctx = SectionCtx {
         cwd,
         session,
         cache,
         show_diff,
-        section_budget,
     };
     let mut results: Vec<String> = Vec::with_capacity(sections.len());
     let mut seen_paths: HashSet<String> = HashSet::new();
@@ -115,7 +108,6 @@ struct SectionCtx<'a> {
     session: &'a Session,
     cache: &'a OutlineCache,
     show_diff: bool,
-    section_budget: u64,
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
@@ -185,7 +177,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     };
 
-    let (new_text, file_op, normalized) = resolve_edit(section, path, session, &live)?;
+    let (new_text, file_op, normalized, written) = resolve_edit(section, path, session, &live)?;
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
@@ -211,14 +203,9 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
-    let (numbered, seen_lines, reread_hint) = render_changed_windows(
-        &live,
-        &new_text,
-        path,
-        ctx.section_budget
-            .saturating_sub(if ctx.show_diff { WRITE_DIFF_BUDGET } else { 0 }),
-    );
-    let new_tag = session.record_snapshot(path, &new_text, seen_lines);
+    let (summary, mut seen_lines) = summarize_changes(&live, &new_text, written.as_ref());
+    seen_lines.extend(carried_seen_lines(section, path, session, &live, &new_text));
+    let new_tag = session.record_write_snapshot(path, &new_text, seen_lines);
 
     // Decision 5: when the exact `old` failed and the whitespace-normalized
     // fallback landed the swap, say so on the status line so the model knows its
@@ -233,11 +220,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         Some(tag) => {
             let header = format_header(&crate::format::display_path(path), tag);
             let _ = write!(block, "\n{header}");
-            if !numbered.is_empty() {
-                let _ = write!(block, "\n{numbered}");
-            }
-            if let Some(hint) = reread_hint {
-                let _ = write!(block, "\n{hint}");
+            if !summary.is_empty() {
+                let _ = write!(block, "\n{summary}");
             }
         }
         // Over the per-file snapshot cap: no tag minted. Mirror the read side's
@@ -277,17 +261,21 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     e.into()
 }
 
-/// Verify the section's tag against live content and produce the edited text,
-/// any file op, and whether a `replace_text` resolved through whitespace
-/// normalization. On a matched tag with intact content, the seen-lines-gated
-/// apply runs; on a drifted (or tag-collided) tag, [`recover_edit`] runs; a
-/// tagless section seeds/edits against live with synthetic empty provenance.
+/// The edited text, any file op, whether a `replace_text` resolved through
+/// whitespace normalization, and the lines the apply wrote. The last is `None`
+/// after a 3-way merge, which cannot say where this section's lines landed.
+type Resolved = (String, Option<FileOp>, bool, Option<Written>);
+
+/// Verify the section's tag against live content and produce the edit. On a
+/// matched tag with intact content, the seen-lines-gated apply runs; on a
+/// drifted (or tag-collided) tag, [`recover_edit`] runs; a tagless section
+/// seeds/edits against live with synthetic empty provenance.
 fn resolve_edit(
     section: &Section,
     path: &Path,
     session: &Session,
     live: &str,
-) -> Result<(String, Option<FileOp>, bool), TilthError> {
+) -> Result<Resolved, TilthError> {
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
 
@@ -327,7 +315,7 @@ fn resolve_edit(
             }
             let snap = synthetic_snapshot(&key, live, live_tag);
             let r = gated_apply(&snap, path, &section.ops)?;
-            Ok((r.text, r.file_op, r.normalized_swap))
+            Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
         }
         // Tag matches live → no drift (or a 16-bit tag collision). Run the
         // seen-lines gate over the recorded snapshot and apply — but only when
@@ -340,7 +328,7 @@ fn resolve_edit(
                 if snap.text == live {
                     let r = gated_apply(&snap, path, &section.ops)
                         .map_err(|e| map_edit_error(e, path, tag))?;
-                    return Ok((r.text, r.file_op, r.normalized_swap));
+                    return Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)));
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
             }
@@ -349,7 +337,7 @@ fn resolve_edit(
             let snap = synthetic_snapshot(&key, live, tag);
             let r =
                 gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
-            Ok((r.text, r.file_op, r.normalized_swap))
+            Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
         }
         // Tag ≠ live → the file drifted since the read. Recover via 3-way merge.
         Some(tag) => {
@@ -363,6 +351,10 @@ fn resolve_edit(
 /// live content. Honor the seen-lines gate against the recorded snapshot, carry
 /// a pure file op (`REM`/`MV`) through regardless of content drift, and
 /// otherwise 3-way-merge the content edit onto live.
+///
+/// It reports no written lines: the merge moves this section's lines by the
+/// drift, and only exact positions may mark a line authored. The agent re-reads
+/// a merged range before it edits there.
 fn recover_edit(
     store: &SnapshotStore,
     section: &Section,
@@ -370,7 +362,7 @@ fn recover_edit(
     key: &str,
     tag: u16,
     live: &str,
-) -> Result<(String, Option<FileOp>, bool), TilthError> {
+) -> Result<Resolved, TilthError> {
     // Provenance gate: if the read's snapshot survives, an edit anchored on a
     // never-displayed line is rejected here exactly as on the no-drift path. A
     // missing snapshot means the tag was never recorded this session (fabricated,
@@ -405,7 +397,7 @@ fn recover_edit(
     // tag. An unknown/fabricated tag falls through to try_recover, which rejects
     // it as Fabricated rather than silently deleting/moving on unverified intent.
     if snapshot.is_some() && file_op.is_some() && !has_content {
-        return Ok((live.to_string(), file_op, false));
+        return Ok((live.to_string(), file_op, false, None));
     }
     let (text, normalized) = match try_recover(store, path, tag, &section.ops, live) {
         Ok(t) => t,
@@ -421,7 +413,7 @@ fn recover_edit(
         }
         Err(e) => return Err(e.into()),
     };
-    Ok((text, file_op, normalized))
+    Ok((text, file_op, normalized, None))
 }
 
 fn create_target_exists_error(path: &Path) -> TilthError {
@@ -471,7 +463,7 @@ fn commit_file_op(
                 .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
             let authored_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
-            let new_tag = session.record_snapshot(path, content, 1..=authored_lines);
+            let new_tag = session.record_write_snapshot(path, content, 1..=authored_lines);
             let mut block = format!("## {}\ncreated{suffix}", crate::format::display_path(path));
             if let Some(tag) = new_tag {
                 let header = format_header(&crate::format::display_path(path), tag);
@@ -546,15 +538,93 @@ fn commit_file_op(
     }
 }
 
+/// Lines of `new_text` the agent already saw in the version this edit applied
+/// against and the edit left untouched, at their new line numbers.
+///
+/// Carries only when the section's tag names a recorded snapshot whose text is
+/// exactly `live` (no drift). A 3-way-merge recovery, a tagless section, or an
+/// evicted snapshot carries nothing: the agent did not see the merge base, so
+/// the safe answer is to require a re-read.
+fn carried_seen_lines(
+    section: &Section,
+    path: &Path,
+    session: &Session,
+    live: &str,
+    new_text: &str,
+) -> Vec<u32> {
+    let Some(tag) = section.tag else {
+        return Vec::new();
+    };
+    let key = crate::edit::normalize_path_key(path);
+    let base = session.snapshots().by_tag(&key, tag);
+    match base {
+        Some(snap) if snap.text == live => carry_forward(live, new_text, &snap.seen_lines),
+        _ => Vec::new(),
+    }
+}
+
+/// Remap `seen` line numbers of `before` onto `after` through a diffy patch:
+/// context and untouched lines keep their line (shifted); deleted lines drop.
+fn carry_forward(before: &str, after: &str, seen: &HashSet<u32>) -> Vec<u32> {
+    let Some(max_seen) = seen.iter().copied().max() else {
+        return Vec::new();
+    };
+    let patch = diffy::create_patch(before, after);
+    let mut carried = Vec::new();
+    let (mut old, mut new) = (1u32, 1u32);
+    let start = |range: &diffy::HunkRange| {
+        let s = u32::try_from(range.start()).unwrap_or(u32::MAX);
+        if range.is_empty() {
+            s.saturating_add(1)
+        } else {
+            s
+        }
+    };
+    for hunk in patch.hunks() {
+        let (hunk_old, hunk_new) = (start(&hunk.old_range()), start(&hunk.new_range()));
+        while old < hunk_old && old <= max_seen {
+            if seen.contains(&old) {
+                carried.push(new);
+            }
+            old += 1;
+            new += 1;
+        }
+        old = old.max(hunk_old);
+        new = new.max(hunk_new);
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(_) => {
+                    if seen.contains(&old) {
+                        carried.push(new);
+                    }
+                    old += 1;
+                    new += 1;
+                }
+                diffy::Line::Delete(_) => old += 1,
+                diffy::Line::Insert(_) => new += 1,
+            }
+        }
+    }
+    while old <= max_seen {
+        if seen.contains(&old) {
+            carried.push(new);
+        }
+        old += 1;
+        new += 1;
+    }
+    carried
+}
 const WRITE_RESPONSE_BUDGET: u64 = 6_000;
 const WRITE_DIFF_BUDGET: u64 = 80;
-const WRITE_CONTEXT_LINES: u32 = 2;
 
-/// New-file line numbers (1-based, sorted, deduplicated) that `before` -> `after`
-/// changed. A pure deletion marks the line now sitting at the deletion point.
-fn changed_lines(before: &str, after: &str) -> Vec<u32> {
+/// Line numbers (1-based, sorted, deduplicated) in `after` that `before` -> `after`
+/// changed: the lines a diff calls inserted, and the line now sitting at each
+/// deletion point. Only the receipt of a 3-way merge uses it, to name where the
+/// file changed; it never marks a line authored.
+fn diff_lines(before: &str, after: &str) -> (Vec<u32>, Vec<u32>) {
     let patch = diffy::create_patch(before, after);
-    let mut marked: Vec<u32> = Vec::new();
+    let mut inserted: Vec<u32> = Vec::new();
+    let mut deleted_at: Vec<u32> = Vec::new();
     for hunk in patch.hunks() {
         let mut cur = u32::try_from(hunk.new_range().start())
             .unwrap_or(u32::MAX)
@@ -563,82 +633,77 @@ fn changed_lines(before: &str, after: &str) -> Vec<u32> {
             match line {
                 diffy::Line::Context(_) => cur = cur.saturating_add(1),
                 diffy::Line::Insert(_) => {
-                    marked.push(cur);
+                    inserted.push(cur);
                     cur = cur.saturating_add(1);
                 }
-                diffy::Line::Delete(_) => marked.push(cur),
+                diffy::Line::Delete(_) => deleted_at.push(cur),
             }
         }
     }
-    marked.sort_unstable();
-    marked.dedup();
-    marked
+    inserted.sort_unstable();
+    inserted.dedup();
+    deleted_at.sort_unstable();
+    deleted_at.dedup();
+    (inserted, deleted_at)
 }
 
-/// Render every changed range of `after` (each padded by `WRITE_CONTEXT_LINES`,
-/// overlapping ranges merged) as numbered lines. Returns the rendered rows, the
-/// line numbers shown, and a re-read hint naming only lines the budget omitted.
-fn render_changed_windows(
-    before: &str,
-    after: &str,
-    path: &Path,
-    content_budget: u64,
-) -> (String, Vec<u32>, Option<String>) {
+/// Join sorted line numbers into `12-18, 40` ranges.
+fn format_line_ranges(lines: &[u32]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut iter = lines.iter().copied();
+    let Some(mut lo) = iter.next() else {
+        return String::new();
+    };
+    let mut hi = lo;
+    for line in iter {
+        if line == hi.saturating_add(1) {
+            hi = line;
+        } else {
+            out.push(if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            });
+            lo = line;
+            hi = line;
+        }
+    }
+    out.push(if lo == hi {
+        lo.to_string()
+    } else {
+        format!("{lo}-{hi}")
+    });
+    out.join(", ")
+}
+
+/// The slim receipt for an in-place write: where the change landed in the new
+/// file, plus the lines the edit authored (the only ones marked seen). With no
+/// `written` (a 3-way merge), a diff names the change and nothing is authored.
+fn summarize_changes(before: &str, after: &str, written: Option<&Written>) -> (String, Vec<u32>) {
     let row_count = after.split('\n').count();
     let total_rows = row_count.saturating_sub(usize::from(after.ends_with('\n')));
-    let total = u32::try_from(total_rows).unwrap_or(u32::MAX);
-    if total == 0 {
-        return (String::new(), Vec::new(), None);
-    }
-    let mut ranges: Vec<(u32, u32)> = Vec::new();
-    for line in changed_lines(before, after) {
-        let lo = line.saturating_sub(WRITE_CONTEXT_LINES).max(1).min(total);
-        let hi = line.saturating_add(WRITE_CONTEXT_LINES).min(total).max(lo);
-        match ranges.last_mut() {
-            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => *last_hi = (*last_hi).max(hi),
-            _ => ranges.push((lo, hi)),
+    let total = u32::try_from(total_rows).unwrap_or(u32::MAX).max(1);
+    let (changed, deleted_at, authored) = if let Some(w) = written {
+        (w.authored.clone(), w.deleted_at.clone(), w.authored.clone())
+    } else {
+        let (changed, deleted_at) = diff_lines(before, after);
+        (changed, deleted_at, Vec::new())
+    };
+    let deleted_at: Vec<u32> = deleted_at.into_iter().map(|l| l.min(total)).collect();
+    let summary = if changed.is_empty() {
+        if deleted_at.is_empty() {
+            String::new()
+        } else {
+            format!("deleted at {}", format_line_ranges(&deleted_at))
         }
-    }
-
-    let mut rendered = String::new();
-    let mut seen = Vec::new();
-    let mut omitted: Option<(u32, u32)> = None;
-    let mut used_len = 0usize;
-    let rows: Vec<&str> = after.split('\n').collect();
-    for (lo, hi) in ranges {
-        for line in lo..=hi {
-            let Some(row) = rows.get(line as usize - 1) else {
-                continue;
-            };
-            // The slice ends in '\n' and rows are joined with '\n' below; drop it
-            // here so consecutive receipt rows have no blank line between them.
-            let mut numbered = render_numbered_slice(row, line)
-                .trim_end_matches('\n')
-                .to_string();
-            if numbered.is_empty() {
-                numbered = format!("{line}:");
-            }
-            let combined_len = used_len.saturating_add(numbered.len() + 1);
-            if crate::types::estimate_tokens(combined_len as u64) <= content_budget {
-                if !rendered.is_empty() {
-                    rendered.push('\n');
-                }
-                rendered.push_str(&numbered);
-                used_len = combined_len;
-                seen.push(line);
-            } else {
-                omitted = Some(omitted.map_or((line, line), |(first, _)| (first, line)));
-            }
-        }
-    }
-    let hint = omitted.map(|(first, last)| {
-        format!(
-            "... omitted lines {first}-{last}; re-read {}#{first}-{}",
-            crate::format::display_path(path),
-            last.min(first.saturating_add(59))
-        )
-    });
-    (rendered, seen, hint)
+    } else {
+        let mut all = changed;
+        all.extend(deleted_at);
+        all.sort_unstable();
+        all.dedup();
+        format!("changed {}", format_line_ranges(&all))
+    };
+    (summary, authored)
 }
 
 fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
@@ -684,20 +749,21 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn receipt_rows_have_no_blank_line_between_them() {
-        let text = "one\ntwo\nthree\nfour\nfive\n";
-        let (rendered, seen, _) = render_changed_windows(
-            "one\ntwo\nold\nfour\nfive\n",
-            text,
-            Path::new("a.txt"),
-            1_000,
+    fn summarize_changes_marks_only_written_lines_seen() {
+        let (before, after) = ("one\ntwo\nold\nfour\n", "one\ntwo\nthree\nfour\n");
+        let written = Written {
+            authored: vec![3],
+            deleted_at: Vec::new(),
+        };
+        assert_eq!(
+            summarize_changes(before, after, Some(&written)),
+            ("changed 3".to_string(), vec![3])
         );
-        assert_eq!(seen.len(), 5);
-        assert!(
-            !rendered.contains("\n\n"),
-            "blank row in receipt: {rendered:?}"
+        // A 3-way merge names the change but authors nothing.
+        assert_eq!(
+            summarize_changes(before, after, None),
+            ("changed 3".to_string(), Vec::new())
         );
-        assert_eq!(rendered.lines().count(), 5, "{rendered:?}");
     }
 
     #[test]
@@ -790,7 +856,10 @@ mod tests {
                     "t.inner.Render(context.Background(), q.Z())"
                 )
         );
-        assert!(out.contains("context.Background(), p"), "{out}");
+        assert!(
+            out.contains("changed ") && !out.contains("context.Background()"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -2910,19 +2979,10 @@ mod tests {
         .expect("write ok");
         assert!(out.contains("applied"), "expected applied, got:\n{out}");
         assert!(
-            out.contains("1:changed"),
-            "changed line must remain visible: {out}"
+            out.contains("changed 1") && !out.contains("1:changed"),
+            "receipt must name the changed line without echoing it: {out}"
         );
-        assert!(
-            !out.contains("1031:line 1031"),
-            "write output must not echo the whole file: {} bytes",
-            out.len()
-        );
-        assert!(
-            out.len() < 20_000,
-            "bounded output grew to {} bytes",
-            out.len()
-        );
+        assert!(out.len() < 300, "slim receipt grew to {} bytes", out.len());
     }
 
     /// The label a write/read prints for a file directly under `cwd`.
@@ -2980,30 +3040,25 @@ mod tests {
     }
 
     #[test]
-    fn blank_changed_row_is_rendered_and_authorized() {
-        let (rendered, seen, _) = render_changed_windows(
-            "before\nold\nafter",
-            "before\n\nafter",
-            Path::new("file"),
-            80,
-        );
-        let rendered_lines: Vec<u32> = rendered
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .filter_map(|(line, _)| line.parse().ok())
-            .collect();
-        assert!(
-            rendered.lines().any(|line| line == "2:"),
-            "blank changed row must be explicit in the response: {rendered:?}"
-        );
-        let mut seen = seen;
-        let mut rendered_lines = rendered_lines;
-        seen.sort_unstable();
-        rendered_lines.sort_unstable();
-        assert_eq!(
-            seen, rendered_lines,
-            "authorized lines must match response lines"
-        );
+    fn blank_changed_row_is_reported_and_authorized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.txt");
+        std::fs::write(&path, "before\nold\nafter").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let read = json!({"cwd": dir.path(), "paths": ["b.txt"]});
+        let out = crate::mcp::tools::read::tool_read(&read, &cache, &session).unwrap();
+        let tag = &out[out.find("b.txt#").unwrap() + 6..][..4];
+        let edit = |tag: &str, start: u32, content: &str| {
+            let args = json!({"cwd": dir.path(), "edits": [{"path": "b.txt", "tag": tag,
+                "ops": [{"op": "replace", "start": start, "end": start, "content": content}]}]});
+            tool_write(&args, &session, &bloom, &cache)
+        };
+        // Content "\n" is one blank row; "" would delete the line.
+        let receipt = edit(tag, 2, "\n").unwrap();
+        assert!(receipt.contains("changed 2"), "{receipt}");
+        let new_tag = &receipt[receipt.find("b.txt#").unwrap() + 6..][..4];
+        edit(new_tag, 2, "again").expect("the authored blank line must be editable");
     }
 
     #[test]
@@ -3036,13 +3091,13 @@ mod tests {
         .expect("write without diff");
 
         assert!(
-            out.contains(&format!("1:{replacement_line}")),
-            "the changed source line must use the full no-diff budget"
+            out.contains("changed 1") && !out.contains(&replacement_line),
+            "the receipt must name the changed line without echoing it"
         );
         assert_eq!(
             session.snapshots().head(&p).unwrap().seen_lines,
             HashSet::from([1, 2]),
-            "all rendered source lines must remain authorized"
+            "the authored line and the unchanged line seen before it stay authorized"
         );
     }
 
@@ -3074,7 +3129,10 @@ mod tests {
             .join("\n");
         std::fs::write(&p, &original).unwrap();
         let (session, bloom) = services();
-        let initial_tag = read_for_tag(&session, &p);
+        let initial_tag = session
+            .record_snapshot(&p, &original, 1..=10)
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
         let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(
@@ -3264,8 +3322,8 @@ mod tests {
         )
         .expect("huge line write");
         assert!(
-            out.contains("1:changed"),
-            "changed line must remain visible: {out}"
+            out.contains("changed 1") && !out.contains("1:changed"),
+            "receipt must name the changed line without echoing it: {out}"
         );
         assert!(
             !out.contains(&original[..1024]),
@@ -3337,15 +3395,14 @@ mod tests {
                 block.contains("── diff ──"),
                 "missing diff for {p:?}: {block}"
             );
-            let displayed: HashSet<u32> = block
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .filter_map(|(line, _)| line.parse().ok())
-                .collect();
+            assert!(
+                block.contains("\nchanged 1\n"),
+                "missing changed-line receipt for {p:?}: {block}"
+            );
             assert_eq!(
                 session.snapshots().head(&p).unwrap().seen_lines,
-                displayed,
-                "seen lines must equal displayed lines for {p:?}"
+                HashSet::from([1]),
+                "seen lines must equal the authored line for {p:?}"
             );
         }
     }
@@ -3429,8 +3486,8 @@ mod tests {
             "write tag must match recovered full source"
         );
         assert!(
-            out.contains("updated"),
-            "recovered output lost status/content: {out}"
+            out.contains("applied") && out.contains("changed 3"),
+            "recovered output lost status/changed line: {out}"
         );
         let err = tool_write_cold_cache(
             &json!({

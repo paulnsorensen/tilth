@@ -196,6 +196,17 @@ impl Session {
         self.snapshots().record(path, text, seen_lines)
     }
 
+    /// Like `record_snapshot`, for a version a write committed. A write shows
+    /// no text, so the unchanged-reread stub must not fire on it.
+    pub fn record_write_snapshot(
+        &self,
+        path: &Path,
+        text: &str,
+        seen_lines: impl IntoIterator<Item = u32>,
+    ) -> Option<u16> {
+        self.snapshots().record_by_write(path, text, seen_lines)
+    }
+
     /// Drop the snapshot history for `path` (a removed file).
     pub fn invalidate_snapshot(&self, path: &Path) {
         self.snapshots().invalidate(path);
