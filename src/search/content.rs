@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use super::{accept_walk_entry, file_metadata};
 
@@ -54,101 +53,70 @@ pub fn search(
         (m, None)
     };
 
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let total_found = AtomicUsize::new(0);
     let files_unreadable = AtomicUsize::new(0);
 
-    let walker = super::walker(scope, glob)?;
+    // Files are scanned in sorted path order and the cap is applied between
+    // batches, so the surviving matches never depend on thread timing.
+    let mut all_matches = super::ordered_walk::walk_ordered(scope, glob, early_quit, |entry| {
+        let Some((path, file_size, _)) = accept_walk_entry(Ok(entry)) else {
+            return Vec::new();
+        };
+        let path = path.as_path();
 
-    walker.run(|| {
-        let matcher = &matcher;
-        let matches = &matches;
-        let total_found = &total_found;
-        let files_unreadable = &files_unreadable;
+        // Read the file once. Use `search_slice` instead of `search_path`
+        // so the minified-check (when triggered) and the actual search
+        // share a single kernel read — no double I/O, no TOCTOU window
+        // between the heuristic and the search.
+        let Ok(bytes) = std::fs::read(path) else {
+            files_unreadable.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        };
 
-        Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                return ignore::WalkState::Quit;
-            }
+        // Catch unmarked minified bundles in the 100KB–500KB range.
+        if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+            && crate::lang::detection::is_minified_by_content(&bytes)
+        {
+            return Vec::new();
+        }
 
-            let Some((path, file_size, _)) = accept_walk_entry(entry) else {
-                return ignore::WalkState::Continue;
-            };
-            let path = path.as_path();
+        let (file_lines, mtime) = file_metadata(path);
 
-            // Read the file once. Use `search_slice` instead of `search_path`
-            // so the minified-check (when triggered) and the actual search
-            // share a single kernel read — no double I/O, no TOCTOU window
-            // between the heuristic and the search.
-            let Ok(bytes) = std::fs::read(path) else {
-                files_unreadable.fetch_add(1, Ordering::Relaxed);
-                return ignore::WalkState::Continue;
-            };
+        let mut file_matches = Vec::new();
+        let mut searcher = Searcher::new();
 
-            // Catch unmarked minified bundles in the 100KB–500KB range.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(&bytes)
-            {
-                return ignore::WalkState::Continue;
-            }
+        // A matching line with invalid UTF-8 makes the `UTF8` sink error
+        // and drops the match. Count the file as unreadable (unless it is a
+        // binary blob) so the completeness signal stays honest.
+        let search_ok = searcher
+            .search_slice(
+                &matcher,
+                &bytes,
+                UTF8(|line_num, line| {
+                    file_matches.push(Match {
+                        path: path.to_path_buf(),
+                        line: line_num as u32,
+                        text: line.trim_end().to_string(),
+                        is_definition: false,
+                        exact: false,
+                        file_lines,
+                        mtime,
+                        def_range: None,
+                        def_byte_range: None,
+                        def_name: None,
+                        def_weight: 0,
+                        impl_target: None,
+                    });
+                    Ok(true)
+                }),
+            )
+            .is_ok();
+        if !search_ok && !crate::lang::detection::is_binary(&bytes) {
+            files_unreadable.fetch_add(1, Ordering::Relaxed);
+        }
+        file_matches
+    })?;
 
-            let (file_lines, mtime) = file_metadata(path);
-
-            let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
-
-            // A matching line with invalid UTF-8 makes the `UTF8` sink error
-            // and drops the match. Count the file as unreadable (unless it is a
-            // binary blob) so the completeness signal stays honest.
-            let search_ok = searcher
-                .search_slice(
-                    matcher,
-                    &bytes,
-                    UTF8(|line_num, line| {
-                        file_matches.push(Match {
-                            path: path.to_path_buf(),
-                            line: line_num as u32,
-                            text: line.trim_end().to_string(),
-                            is_definition: false,
-                            exact: false,
-                            file_lines,
-                            mtime,
-                            def_range: None,
-                            def_byte_range: None,
-                            def_name: None,
-                            def_weight: 0,
-                            impl_target: None,
-                        });
-                        Ok(true)
-                    }),
-                )
-                .is_ok();
-            if !search_ok && !crate::lang::detection::is_binary(&bytes) {
-                files_unreadable.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if !file_matches.is_empty() {
-                total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
-            }
-
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                ignore::WalkState::Quit
-            } else {
-                ignore::WalkState::Continue
-            }
-        })
-    });
-
-    let total = total_found.load(Ordering::Relaxed);
-    let mut all_matches = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = all_matches.len();
 
     rank::sort(&mut all_matches, pattern, scope, context);
     all_matches.truncate(max_matches);

@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::accept_walk_entry;
@@ -178,145 +177,109 @@ fn find_definitions(
     early_quit_threshold: usize,
     cache: &crate::cache::OutlineCache,
 ) -> Result<(Vec<Match>, usize), TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let found_count = AtomicUsize::new(0);
     let files_unreadable = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
-    let walker = super::walker(scope, glob)?;
+    let matches = super::ordered_walk::walk_ordered(scope, glob, early_quit_threshold, |entry| {
+        let Some((path, file_size, meta)) = accept_walk_entry(Ok(entry)) else {
+            return Vec::new();
+        };
+        let path = path.as_path();
 
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-        let files_unreadable = &files_unreadable;
-
-        Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
-            let Some((path, file_size, meta)) = accept_walk_entry(entry) else {
-                return ignore::WalkState::Continue;
-            };
-            let path = path.as_path();
-
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(bytes) = fs::read(path) else {
-                files_unreadable.fetch_add(1, Ordering::Relaxed);
-                return ignore::WalkState::Continue;
-            };
-            let content = match String::from_utf8(bytes) {
-                Ok(content) => content,
-                Err(err) => {
-                    // Undecodable source is a lost result; a binary blob is not.
-                    if !crate::lang::detection::is_binary(err.as_bytes()) {
-                        files_unreadable.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return ignore::WalkState::Continue;
+        // Single read: read file once, use buffer for both check and parse
+        let Ok(bytes) = fs::read(path) else {
+            files_unreadable.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(err) => {
+                // Undecodable source is a lost result; a binary blob is not.
+                if !crate::lang::detection::is_binary(err.as_bytes()) {
+                    files_unreadable.fetch_add(1, Ordering::Relaxed);
                 }
+                return Vec::new();
+            }
+        };
+
+        // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
+        if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+            return Vec::new();
+        }
+
+        // Catch unmarked minified bundles that slipped past the filename check.
+        if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+            && crate::lang::detection::is_minified_by_content(content.as_bytes())
+        {
+            return Vec::new();
+        }
+
+        // Get file metadata once per file
+        let (file_lines, mtime) = file_metadata(path);
+
+        // Try tree-sitter structural detection
+        let file_type = detect_file_type(path);
+        let lang = match file_type {
+            FileType::Code(l) => Some(l),
+            _ => None,
+        };
+
+        let ts_language = lang.and_then(outline_language);
+
+        let mut file_defs = if let Some(ref ts_lang) = ts_language {
+            // `meta` predates the read, so a stale publish fails its recheck.
+            let revision = meta.as_ref().and_then(|m| {
+                crate::util::FileRevision::from_metadata_and_bytes(m, content.as_bytes())
+            });
+            cache
+                .parse_with_revision(path, &content, revision)
+                .map_or_else(
+                    || {
+                        find_defs_treesitter(
+                            path, query, ts_lang, lang, &content, file_lines, mtime,
+                        )
+                    },
+                    |parsed| {
+                        find_defs_in_document(path, query, lang, file_lines, mtime, parsed.ast())
+                    },
+                )
+        } else {
+            Vec::new()
+        };
+
+        // Per-file-type fallback dispatch. The semantics of "definition"
+        // differ by file kind, so handle them separately:
+        //
+        // * Code without a tree-sitter grammar: keyword heuristic (looks
+        //   for lines starting with `function`/`const`/`class`/etc.).
+        // * Markdown / RST: heading-as-definition. A heading whose text
+        //   contains the query (`## parseCitations` in a doc) marks that
+        //   section AS being about the symbol — that is the documentation
+        //   analogue of a code definition. Quoted code blocks inside
+        //   docs are NOT treated as definitions; they're usages, because
+        //   the keyword heuristic would false-positive on every snippet
+        //   that quotes the real source. Heading defs carry a lower
+        //   `def_weight` (30) than code definitions (60-80) so the real
+        //   source still ranks first.
+        // * Structured data / tabular / log / other: no fallback.
+        //   Mentions are config values, data, or noise — not definitions.
+        //   (A future patch could treat top-level config keys matching
+        //   the query as soft definitions, but that's ambiguous enough
+        //   to skip for now.)
+        if file_defs.is_empty() && ts_language.is_none() {
+            file_defs = match file_type {
+                FileType::Code(_) => {
+                    find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
+                }
+                FileType::Markdown => {
+                    find_defs_markdown_buf(path, query, &content, file_lines, mtime)
+                }
+                _ => Vec::new(),
             };
+        }
 
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
-                return ignore::WalkState::Continue;
-            }
-
-            // Catch unmarked minified bundles that slipped past the filename check.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(content.as_bytes())
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Get file metadata once per file
-            let (file_lines, mtime) = file_metadata(path);
-
-            // Try tree-sitter structural detection
-            let file_type = detect_file_type(path);
-            let lang = match file_type {
-                FileType::Code(l) => Some(l),
-                _ => None,
-            };
-
-            let ts_language = lang.and_then(outline_language);
-
-            let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                // `meta` predates the read, so a stale publish fails its recheck.
-                let revision = meta.as_ref().and_then(|m| {
-                    crate::util::FileRevision::from_metadata_and_bytes(m, content.as_bytes())
-                });
-                cache
-                    .parse_with_revision(path, &content, revision)
-                    .map_or_else(
-                        || {
-                            find_defs_treesitter(
-                                path, query, ts_lang, lang, &content, file_lines, mtime,
-                            )
-                        },
-                        |parsed| {
-                            find_defs_in_document(
-                                path,
-                                query,
-                                lang,
-                                file_lines,
-                                mtime,
-                                parsed.ast(),
-                            )
-                        },
-                    )
-            } else {
-                Vec::new()
-            };
-
-            // Per-file-type fallback dispatch. The semantics of "definition"
-            // differ by file kind, so handle them separately:
-            //
-            // * Code without a tree-sitter grammar: keyword heuristic (looks
-            //   for lines starting with `function`/`const`/`class`/etc.).
-            // * Markdown / RST: heading-as-definition. A heading whose text
-            //   contains the query (`## parseCitations` in a doc) marks that
-            //   section AS being about the symbol — that is the documentation
-            //   analogue of a code definition. Quoted code blocks inside
-            //   docs are NOT treated as definitions; they're usages, because
-            //   the keyword heuristic would false-positive on every snippet
-            //   that quotes the real source. Heading defs carry a lower
-            //   `def_weight` (30) than code definitions (60-80) so the real
-            //   source still ranks first.
-            // * Structured data / tabular / log / other: no fallback.
-            //   Mentions are config values, data, or noise — not definitions.
-            //   (A future patch could treat top-level config keys matching
-            //   the query as soft definitions, but that's ambiguous enough
-            //   to skip for now.)
-            if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = match file_type {
-                    FileType::Code(_) => {
-                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
-                    }
-                    FileType::Markdown => {
-                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
-                    }
-                    _ => Vec::new(),
-                };
-            }
-
-            if !file_defs.is_empty() {
-                found_count.fetch_add(file_defs.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_defs);
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    let matches = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file_defs
+    })?;
     Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 
@@ -485,94 +448,66 @@ fn find_usages(
     glob: Option<&str>,
     early_quit_threshold: usize,
 ) -> Result<(Vec<Match>, usize), TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
-    let found_count = AtomicUsize::new(0);
     let files_unreadable = AtomicUsize::new(0);
 
-    let walker = super::walker(scope, glob)?;
+    let matches = super::ordered_walk::walk_ordered(scope, glob, early_quit_threshold, |entry| {
+        let Some((path, file_size, _)) = accept_walk_entry(Ok(entry)) else {
+            return Vec::new();
+        };
+        let path = path.as_path();
 
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-        let files_unreadable = &files_unreadable;
+        // Read once and dispatch via `search_slice` so the minified
+        // heuristic and the search share a single kernel read.
+        let Ok(bytes) = std::fs::read(path) else {
+            files_unreadable.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        };
 
-        Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
+        // Catch unmarked minified bundles between 100KB and 500KB — they
+        // were not skipped by the filename check or the size cap above.
+        if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+            && crate::lang::detection::is_minified_by_content(&bytes)
+        {
+            return Vec::new();
+        }
 
-            let Some((path, file_size, _)) = accept_walk_entry(entry) else {
-                return ignore::WalkState::Continue;
-            };
-            let path = path.as_path();
+        let (file_lines, mtime) = file_metadata(path);
 
-            // Read once and dispatch via `search_slice` so the minified
-            // heuristic and the search share a single kernel read.
-            let Ok(bytes) = std::fs::read(path) else {
-                files_unreadable.fetch_add(1, Ordering::Relaxed);
-                return ignore::WalkState::Continue;
-            };
+        let mut file_matches = Vec::new();
+        let mut searcher = Searcher::new();
 
-            // Catch unmarked minified bundles between 100KB and 500KB — they
-            // were not skipped by the filename check or the size cap above.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(&bytes)
-            {
-                return ignore::WalkState::Continue;
-            }
+        // A matching line with invalid UTF-8 makes the `UTF8` sink error
+        // and drops the match. Count the file as unreadable (unless it is a
+        // binary blob) so the completeness signal stays honest.
+        let search_ok = searcher
+            .search_slice(
+                matcher,
+                &bytes,
+                UTF8(|line_num, line| {
+                    file_matches.push(Match {
+                        path: path.to_path_buf(),
+                        line: line_num as u32,
+                        text: line.trim_end().to_string(),
+                        is_definition: false,
+                        exact: line.contains(query),
+                        file_lines,
+                        mtime,
+                        def_range: None,
+                        def_byte_range: None,
+                        def_name: None,
+                        def_weight: 0,
+                        impl_target: None,
+                    });
+                    Ok(true)
+                }),
+            )
+            .is_ok();
+        if !search_ok && !crate::lang::detection::is_binary(&bytes) {
+            files_unreadable.fetch_add(1, Ordering::Relaxed);
+        }
 
-            let (file_lines, mtime) = file_metadata(path);
-
-            let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
-
-            // A matching line with invalid UTF-8 makes the `UTF8` sink error
-            // and drops the match. Count the file as unreadable (unless it is a
-            // binary blob) so the completeness signal stays honest.
-            let search_ok = searcher
-                .search_slice(
-                    matcher,
-                    &bytes,
-                    UTF8(|line_num, line| {
-                        file_matches.push(Match {
-                            path: path.to_path_buf(),
-                            line: line_num as u32,
-                            text: line.trim_end().to_string(),
-                            is_definition: false,
-                            exact: line.contains(query),
-                            file_lines,
-                            mtime,
-                            def_range: None,
-                            def_byte_range: None,
-                            def_name: None,
-                            def_weight: 0,
-                            impl_target: None,
-                        });
-                        Ok(true)
-                    }),
-                )
-                .is_ok();
-            if !search_ok && !crate::lang::detection::is_binary(&bytes) {
-                files_unreadable.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if !file_matches.is_empty() {
-                found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    let matches = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file_matches
+    })?;
     Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 
