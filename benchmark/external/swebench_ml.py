@@ -138,7 +138,7 @@ class SweBenchTask(ExternalTask):
 
     @property
     def prompt(self) -> str:
-        return PROMPT_INSTRUCTION + self.problem_statement
+        return f"{PROMPT_INSTRUCTION}{self.problem_statement}\n\n{self.test_instruction}"
 
     @property
     def gold_patch(self) -> str:
