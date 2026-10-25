@@ -24,6 +24,30 @@ The dispatcher sends reflection and the `src/` proposer one `scores` record per 
 rates, mean costs, baseline costs) and one `cost_pairs` record per task. Both prompts state the score
 (`candidate.OBJECTIVE`) and ask for lower cost without lost correctness.
 
+## Diagnosis records
+
+After a candidate's paid dev tier, `attribution.summarize` runs once per content id on the candidate's dev
+rows and the frozen baseline dev rows. It never reads test-split rows or grader text. A failure is logged and
+skipped. The side info for the candidate carries a compact `attribution` view under its own key (never under
+`scores`), at most about 4k characters: coverage, the leading causes with evidence, `call_shapes` and `errors`.
+The dispatcher sends it, with a `source_map` record for the leading causes, to reflection and the proposer.
+
+`diagnosis.WeightedSelector` is the gepa `module_selector`. It weights each component by the parent's
+`dominant` hints (the hinted component takes about 44% of the picks, against 20% for a uniform choice), picks
+`src_patch` within the first 2 proposals, and leaves no component out for more than 10 proposals in a row. The
+bound is `MAX_UNSELECTED`. Each pick goes to `log.txt` with its evidence and reason. A reflection or proposer call
+receives a `replay` record only from its own candidate, never from another one.
+
+Reflection and the proposer end a reply with one `<hypothesis>` block (`metric`, `scope`, `direction`,
+`tolerance`, `invariants`). `hypotheses.jsonl` in the run directory holds it, keyed by parent and child content
+id, and then the outcome (`met`, `unmet`, `unmeasurable`) after the child's paid dev tier. Later calls get the
+last outcomes as a `hypothesis_feedback` record. A hypothesis is soft: it never rejects a candidate.
+
+`--replay-diagnostic N` (default 0, off) replays the first N seed dev cells (by task, then repetition) against
+the seed binary and the candidate binary when the candidate changes `src_patch`. The `replay.compare` result goes
+to `log.txt` and to later calls as a `replay` record. It reuses the loop's build directory, writes no result
+rows, and never rejects a candidate.
+
 ## Strict file tools (default)
 
 Every cell runs with Bash guarded by the tilth hook (`tilth hook`). The tilth arm runs the candidate

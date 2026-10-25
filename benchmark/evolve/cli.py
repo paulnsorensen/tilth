@@ -2,7 +2,7 @@
 """Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by cost per correct.
 
     python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha SHA \\
-        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku]
+        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku] [--replay-diagnostic N]
 
 Every candidate is a local commit on the seed; the winner, when it is not the
 seed, is pushed as one branch and opened as one draft PR. Nothing is merged.
@@ -93,6 +93,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-strict-file-tools", dest="strict_file_tools", action="store_false",
                         help="run cells without the Bash file-tool hook (strict is the default: candidates run "
                              "their own hook, the baseline runs the seed's)")
+    parser.add_argument("--replay-diagnostic", type=int, default=0, metavar="N",
+                        help="for a candidate that changes src_patch, replay N seed dev cells against the seed and "
+                             "candidate binaries and show the diff to later reflection (no model call; never "
+                             "rejects; default 0 = off)")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
@@ -129,8 +133,9 @@ def build(argv: list[str] | None = None, *,
                         ("--cell-estimate-usd", args.cell_estimate_usd)):
         if not math.isfinite(value) or value <= 0:
             return _error(f"{flag} must be a positive finite number")
-    if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1:
-        return _error("--max-metric-calls and --plateau must be at least 1, --reruns at least 0")
+    if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1 or args.replay_diagnostic < 0:
+        return _error("--max-metric-calls and --plateau must be at least 1, --reruns and --replay-diagnostic "
+                      "at least 0")
     try:
         auth.refuse_env(os.environ)
     except auth.ClaudeAuthError as error:
@@ -165,7 +170,7 @@ def build(argv: list[str] | None = None, *,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
-        strict_file_tools=args.strict_file_tools,
+        strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
