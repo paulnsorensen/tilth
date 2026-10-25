@@ -60,7 +60,7 @@ def run_cell(monkeypatch: pytest.MonkeyPatch, task_name: str, workdir: Path, tmp
 
     def popen(cmd, *args, **kwargs):
         # Only the agent CLI is replayed; grading subprocesses run for real.
-        return _Replay(stream or claude_stream()) if cmd[0] == "claude" else real_popen(cmd, *args, **kwargs)
+        return _Replay(stream or claude_stream()) if Path(cmd[0]).name == "claude" else real_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(run.subprocess, "Popen", popen)
     return run._run_single_in_repo(task_name, "plain", "sonnet5", 0, workdir,

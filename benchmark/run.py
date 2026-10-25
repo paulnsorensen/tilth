@@ -274,6 +274,15 @@ def _agent_venv(task: object, workdir: Path) -> Path | None:
     return None
 
 
+def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
+    """Resolve the runner on PATH without the agent venv, so a task-installed console script cannot replace it."""
+    if agent_venv is None:
+        return cmd
+    venv_bin = str(agent_venv / "bin")
+    host_path = os.pathsep.join(entry for entry in env.get("PATH", "").split(os.pathsep) if entry != venv_bin)
+    return [shutil.which(cmd[0], path=host_path) or cmd[0], *cmd[1:]]
+
+
 def build_runner_env(
     runner: str,
     *,
@@ -1421,14 +1430,16 @@ def _run_single_in_repo(
 
     # Build a fresh allowlist for every runner subprocess. Runner-specific
     # config is added only by the lane that consumes it.
+    agent_venv = _agent_venv(task, repo_path)
     env = build_runner_env(
         runner,
         opencode_config=opencode_config,
         bare=bare,
         tilth_bin=mode.binary_path,
         language=task.language,
-        agent_venv=_agent_venv(task, repo_path),
+        agent_venv=agent_venv,
     )
+    cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
     start_time = time.time()

@@ -1,6 +1,7 @@
 """External edit tasks tell the agent to build and test, and a Python agent cell runs with its own venv first."""
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -62,6 +63,27 @@ def test_python_cell_env_puts_the_workdir_venv_first(external_bench, tmp_path: P
     assert env["VIRTUAL_ENV"] == str(workdir / ".venv")
     assert env["PATH"].split(os.pathsep)[0] == str(workdir / ".venv" / "bin")
     assert (workdir / ".venv" / "bin" / "python").exists()
+
+
+def fake_runner(directory: Path, label: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "claude"
+    script.write_text(f"#!/bin/sh\necho {label}\n")
+    script.chmod(0o755)
+
+
+def test_task_venv_console_script_does_not_replace_the_runner(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    venv = tmp_path / "workdir" / ".venv"
+    fake_runner(host, "host")
+    fake_runner(venv / "bin", "venv")
+    env = {"PATH": os.pathsep.join([str(venv / "bin"), str(host), "/usr/bin", "/bin"])}
+
+    argv = run._host_runner_argv(["claude", "-p"], env, venv)
+
+    assert argv == [str(host / "claude"), "-p"]
+    assert subprocess.run(argv[:1], env=env, capture_output=True, text=True, check=True).stdout == "host\n"
+    assert run._host_runner_argv(["claude", "-p"], env, None) == ["claude", "-p"]
 
 
 def test_grading_venv_stays_separate_from_the_agent_tree(external_bench, tmp_path: Path) -> None:
