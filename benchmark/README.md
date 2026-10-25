@@ -611,3 +611,24 @@ Good tasks have unambiguous correct answers that can be verified by string match
 | v0.5.0 | MCP instruction overhaul (top-weighted DO NOT rules, search-first guidance), scope fallback with warning, Gemini CLI install | **-44%** (Sonnet), **-39%** (Opus), **-38%** (Haiku) |
 
 v0.4.5 focus: bumped `TOKEN_THRESHOLD` from 3500 to 6000 estimated tokens (~24KB). Files in the 14–24KB range now return full content instead of an outline, eliminating multi-read spirals where agents read the entire file via 5–7 sequential `--section` calls. Key fixes: `gin_radix_tree` flipped from +35% regression to ~tie, `rg_search_dispatch` flipped from +90% regression to -26% win (Sonnet now 100% accuracy). Sonnet achieves 100% accuracy across all 52 tilth runs.
+
+## Chained cells
+
+A chained cell runs several tasks back to back as turns of one `claude -p` conversation. A real main thread makes about 93 API calls at about 105k context tokens each. A single task makes 5-6 calls. A chain of 5-7 tasks reaches a realistic length, so the per-result size of tilth is weighed against the built-in tools at that length.
+
+Chains live in `chains.py`. Pass `--tasks chain:<id>`, or list `chain:<id>` as a panel member with family `chain`. `--tasks all` never includes a chain.
+
+- The first turn is a normal `claude -p`. Every later turn runs `claude -p --resume <session id>` in the same workspace, with the same mode and model. Only chain turns keep the session on disk, in the cell's throwaway `CLAUDE_CONFIG_DIR`. Single cells still pass `--no-session-persistence`.
+- Each member is prepared, run, and graded by its own task code, right after its turn. A wrong sub-task does not stop the next turn. A crashed turn stops the chain.
+- The members must share one repo. Read tasks come first. At most one task that grades the whole workspace (an edit task) is allowed, and it goes last. Mutation files must not overlap. `chains.parse_chain` refuses anything else.
+- The chain budget is the per-cell budget times the number of members. Each turn is capped at what the earlier turns left.
+- The chain row carries `sub_tasks`, `api_calls`, the summed token and cost fields, and the concatenated `per_turn_context_tokens`. `correct` is true when every sub-task is correct. `pass_rate` is the fraction that are. The existing score path reads `correct`, so `p` for a chain is the mean of a 0/1 value over repetitions; `task_score` does not read `pass_rate`.
+- A chain has its own run key. The key covers the chain id and the digest of every member.
+
+Preview a plan without any model call or `--max-usd`:
+
+```bash
+python3 benchmark/run.py --tasks chain:gin-edit-7 --modes baseline --models sonnet --reps 1 --dry-run
+```
+
+The committed chains are `gin-edit-7`, `fastapi-edit-5`, and `rg-edit-7`. Their API call counts (about 40-60) are estimates, not measurements.

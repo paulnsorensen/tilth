@@ -11,6 +11,7 @@ A panel with top-level ``"version": 2`` is a screened pool with no cheap tier:
 splits are only dev and test, a local member is any non-external task in
 ``tasks.TASKS``, a SWE-bench Multilingual member comes from
 ``external.swebench_ml.GEPA_V2_CANDIDATES`` or a slot (with no fallback keys),
+a chain member is a ``chain:<id>`` id from ``chains.CHAINS`` (family ``chain``),
 and ``Panel.cheap`` is empty. A panel with no ``version`` is version 1.
 """
 
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import baselines
+import chains
 import config
 import external
 import external.data
@@ -30,7 +32,7 @@ import external.preflight
 import external.swebench_ml
 import tasks
 
-FAMILIES = ("local", "featurebench", "swebench_ml")
+FAMILIES = ("local", "featurebench", "swebench_ml", "chain")
 SPLITS = ("cheap", "dev", "test")
 SPLITS_V2 = ("dev", "test")
 CHEAP = ("rg_search_dispatch", "rg_trait_implementors", "gin_servehttp_flow")
@@ -96,6 +98,12 @@ class Panel:
 
         for member in self.members:
             if member.family == "local":
+                continue
+            if member.family == "chain":
+                try:
+                    chains.register(tasks_by_name, member.id, digest=_cell_task_digest)
+                except chains.ChainError as error:
+                    raise PanelError(f"{member.id}: {error}") from error
                 continue
             loader = external.featurebench.load if member.family == "featurebench" else external.swebench_ml.load
             dataset = external.data.FEATUREBENCH if member.family == "featurebench" else external.data.SWEBENCH_ML
@@ -243,11 +251,24 @@ def _check_members_v2(members: list[Member]) -> None:
             task = tasks.TASKS.get(member.id)
             if task is None or isinstance(task, external.ExternalTask):
                 raise PanelError(f"{member.id}: not a local task in TASKS")
+        elif member.family == "chain":
+            _chain_members(member)
         elif member.family == "featurebench":
             if external.featurebench.level_of(member.id) != "lv1" or not external.data.is_safe_id(member.id):
                 raise PanelError(f"{member.id}: not a FeatureBench Lite Level 1 instance id")
         elif member.id not in pool:
             raise PanelError(f"{member.id}: not in the SWE-bench Multilingual gepa-v2 pool")
+
+
+def _chain_members(member: Member) -> list:
+    """The validated member tasks of a ``chain:<id>`` panel member."""
+    chain = chains.CHAINS.get(member.id[len(chains.PREFIX):]) if member.id.startswith(chains.PREFIX) else None
+    if chain is None:
+        raise PanelError(f"{member.id}: not a chain in chains.CHAINS ({', '.join(sorted(chains.CHAINS))})")
+    try:
+        return chains.parse_chain(chain.id, chain.members, tasks.TASKS)
+    except chains.ChainError as error:
+        raise PanelError(f"{member.id}: {error}") from error
 
 
 def _check_complete_v2(members: list[Member]) -> None:
@@ -260,6 +281,9 @@ def _check_languages(members: list[Member], row_source: Callable[[str], Mapping[
     for member in members:
         if member.family == "local":
             expected = config.REPOS[tasks.TASKS[member.id].repo].language
+            source = "its repo language"
+        elif member.family == "chain":
+            expected = config.REPOS[_chain_members(member)[0].repo].language
             source = "its repo language"
         else:
             if member.family == "featurebench":
@@ -299,7 +323,7 @@ def _check_split(members: list[Member], split_seed: int) -> None:
 def _check_admitted(members: list[Member], admit: Callable[[str], Any]) -> None:
     refused = []
     for member in members:
-        if member.family == "local":
+        if member.family in ("local", "chain"):
             continue
         try:
             verdict = admit(member.id)
