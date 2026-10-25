@@ -338,3 +338,73 @@ fn reread_after_a_write_sends_text_and_only_a_later_read_may_stub() {
         "a reread after a read may stub: {again}"
     );
 }
+
+/// A one-file session that displayed only line 1 of `body`.
+fn fixture_body(body: &str) -> (tempfile::TempDir, Session, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), body).unwrap();
+    let session = Session::new();
+    let tag = tag_of(&read(&session, dir.path(), "f.txt#1-1"));
+    (dir, session, tag)
+}
+
+#[test]
+fn moved_line_is_not_authored_where_a_diff_would_place_it() {
+    // The file becomes "c\na\n": the agent wrote line 2 and never saw "c".
+    let (dir, session, tag) = fixture_body("a\nc\n");
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([
+            {"op": "delete", "start": 1, "end": 1},
+            {"op": "append", "content": "a"},
+        ]),
+    )
+    .expect("write");
+    let new_tag = tag_of(&receipt);
+    let refused = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 1, "end": 1, "content": "X"}]),
+    )
+    .expect_err("line 1 was never displayed");
+    assert!(refused.contains("never displayed"), "{refused}");
+    write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 2, "end": 2, "content": "Y"}]),
+    )
+    .expect("the authored line stays editable");
+}
+
+#[test]
+fn duplicate_insert_marks_its_own_line_not_an_unseen_twin() {
+    // The agent inserts line 1; old line 2 (unseen) now sits at line 3.
+    let (dir, session, tag) = fixture_body("same\nsame\nother\n");
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_before", "line": 1, "content": "same"}]),
+    )
+    .expect("write");
+    let new_tag = tag_of(&receipt);
+    let refused = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 3, "end": 3, "content": "X"}]),
+    )
+    .expect_err("line 3 was never displayed");
+    assert!(refused.contains("never displayed"), "{refused}");
+    write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 1, "end": 1, "content": "Y"}]),
+    )
+    .expect("the authored line stays editable");
+}

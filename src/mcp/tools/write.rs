@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::cache::OutlineCache;
-use crate::edit::apply::{ApplyError, FileOp};
+use crate::edit::apply::{ApplyError, FileOp, Written};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
@@ -177,7 +177,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     };
 
-    let (new_text, file_op, normalized) = resolve_edit(section, path, session, &live)?;
+    let (new_text, file_op, normalized, written) = resolve_edit(section, path, session, &live)?;
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
@@ -203,7 +203,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
-    let (summary, mut seen_lines) = summarize_changes(&live, &new_text);
+    let (summary, mut seen_lines) = summarize_changes(&live, &new_text, written.as_ref());
     seen_lines.extend(carried_seen_lines(section, path, session, &live, &new_text));
     let new_tag = session.record_write_snapshot(path, &new_text, seen_lines);
 
@@ -261,17 +261,21 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     e.into()
 }
 
-/// Verify the section's tag against live content and produce the edited text,
-/// any file op, and whether a `replace_text` resolved through whitespace
-/// normalization. On a matched tag with intact content, the seen-lines-gated
-/// apply runs; on a drifted (or tag-collided) tag, [`recover_edit`] runs; a
-/// tagless section seeds/edits against live with synthetic empty provenance.
+/// The edited text, any file op, whether a `replace_text` resolved through
+/// whitespace normalization, and the lines the apply wrote. The last is `None`
+/// after a 3-way merge, which cannot say where this section's lines landed.
+type Resolved = (String, Option<FileOp>, bool, Option<Written>);
+
+/// Verify the section's tag against live content and produce the edit. On a
+/// matched tag with intact content, the seen-lines-gated apply runs; on a
+/// drifted (or tag-collided) tag, [`recover_edit`] runs; a tagless section
+/// seeds/edits against live with synthetic empty provenance.
 fn resolve_edit(
     section: &Section,
     path: &Path,
     session: &Session,
     live: &str,
-) -> Result<(String, Option<FileOp>, bool), TilthError> {
+) -> Result<Resolved, TilthError> {
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
 
@@ -311,7 +315,7 @@ fn resolve_edit(
             }
             let snap = synthetic_snapshot(&key, live, live_tag);
             let r = gated_apply(&snap, path, &section.ops)?;
-            Ok((r.text, r.file_op, r.normalized_swap))
+            Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
         }
         // Tag matches live → no drift (or a 16-bit tag collision). Run the
         // seen-lines gate over the recorded snapshot and apply — but only when
@@ -324,7 +328,7 @@ fn resolve_edit(
                 if snap.text == live {
                     let r = gated_apply(&snap, path, &section.ops)
                         .map_err(|e| map_edit_error(e, path, tag))?;
-                    return Ok((r.text, r.file_op, r.normalized_swap));
+                    return Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)));
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
             }
@@ -333,7 +337,7 @@ fn resolve_edit(
             let snap = synthetic_snapshot(&key, live, tag);
             let r =
                 gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
-            Ok((r.text, r.file_op, r.normalized_swap))
+            Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
         }
         // Tag ≠ live → the file drifted since the read. Recover via 3-way merge.
         Some(tag) => {
@@ -347,6 +351,10 @@ fn resolve_edit(
 /// live content. Honor the seen-lines gate against the recorded snapshot, carry
 /// a pure file op (`REM`/`MV`) through regardless of content drift, and
 /// otherwise 3-way-merge the content edit onto live.
+///
+/// It reports no written lines: the merge moves this section's lines by the
+/// drift, and only exact positions may mark a line authored. The agent re-reads
+/// a merged range before it edits there.
 fn recover_edit(
     store: &SnapshotStore,
     section: &Section,
@@ -354,7 +362,7 @@ fn recover_edit(
     key: &str,
     tag: u16,
     live: &str,
-) -> Result<(String, Option<FileOp>, bool), TilthError> {
+) -> Result<Resolved, TilthError> {
     // Provenance gate: if the read's snapshot survives, an edit anchored on a
     // never-displayed line is rejected here exactly as on the no-drift path. A
     // missing snapshot means the tag was never recorded this session (fabricated,
@@ -389,7 +397,7 @@ fn recover_edit(
     // tag. An unknown/fabricated tag falls through to try_recover, which rejects
     // it as Fabricated rather than silently deleting/moving on unverified intent.
     if snapshot.is_some() && file_op.is_some() && !has_content {
-        return Ok((live.to_string(), file_op, false));
+        return Ok((live.to_string(), file_op, false, None));
     }
     let (text, normalized) = match try_recover(store, path, tag, &section.ops, live) {
         Ok(t) => t,
@@ -405,7 +413,7 @@ fn recover_edit(
         }
         Err(e) => return Err(e.into()),
     };
-    Ok((text, file_op, normalized))
+    Ok((text, file_op, normalized, None))
 }
 
 fn create_target_exists_error(path: &Path) -> TilthError {
@@ -610,8 +618,9 @@ const WRITE_RESPONSE_BUDGET: u64 = 6_000;
 const WRITE_DIFF_BUDGET: u64 = 80;
 
 /// Line numbers (1-based, sorted, deduplicated) in `after` that `before` -> `after`
-/// changed: the lines the edit inserted, and the line now sitting at each
-/// deletion point. Only inserted lines were authored by the caller.
+/// changed: the lines a diff calls inserted, and the line now sitting at each
+/// deletion point. Only the receipt of a 3-way merge uses it, to name where the
+/// file changed; it never marks a line authored.
 fn diff_lines(before: &str, after: &str) -> (Vec<u32>, Vec<u32>) {
     let patch = diffy::create_patch(before, after);
     let mut inserted: Vec<u32> = Vec::new();
@@ -668,27 +677,33 @@ fn format_line_ranges(lines: &[u32]) -> String {
 }
 
 /// The slim receipt for an in-place write: where the change landed in the new
-/// file, plus the lines the edit authored (the only ones marked seen).
-fn summarize_changes(before: &str, after: &str) -> (String, Vec<u32>) {
+/// file, plus the lines the edit authored (the only ones marked seen). With no
+/// `written` (a 3-way merge), a diff names the change and nothing is authored.
+fn summarize_changes(before: &str, after: &str, written: Option<&Written>) -> (String, Vec<u32>) {
     let row_count = after.split('\n').count();
     let total_rows = row_count.saturating_sub(usize::from(after.ends_with('\n')));
     let total = u32::try_from(total_rows).unwrap_or(u32::MAX).max(1);
-    let (inserted, deleted_at) = diff_lines(before, after);
+    let (changed, deleted_at, authored) = if let Some(w) = written {
+        (w.authored.clone(), w.deleted_at.clone(), w.authored.clone())
+    } else {
+        let (changed, deleted_at) = diff_lines(before, after);
+        (changed, deleted_at, Vec::new())
+    };
     let deleted_at: Vec<u32> = deleted_at.into_iter().map(|l| l.min(total)).collect();
-    let summary = if inserted.is_empty() {
+    let summary = if changed.is_empty() {
         if deleted_at.is_empty() {
             String::new()
         } else {
             format!("deleted at {}", format_line_ranges(&deleted_at))
         }
     } else {
-        let mut all = inserted.clone();
+        let mut all = changed;
         all.extend(deleted_at);
         all.sort_unstable();
         all.dedup();
         format!("changed {}", format_line_ranges(&all))
     };
-    (summary, inserted)
+    (summary, authored)
 }
 
 fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
@@ -734,13 +749,21 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn summarize_changes_marks_only_inserted_lines_seen() {
-        let (summary, seen) = summarize_changes(
-            "one\ntwo\nold\nfour\nfive\n",
-            "one\ntwo\nthree\nfour\nfive\n",
+    fn summarize_changes_marks_only_written_lines_seen() {
+        let (before, after) = ("one\ntwo\nold\nfour\n", "one\ntwo\nthree\nfour\n");
+        let written = Written {
+            authored: vec![3],
+            deleted_at: Vec::new(),
+        };
+        assert_eq!(
+            summarize_changes(before, after, Some(&written)),
+            ("changed 3".to_string(), vec![3])
         );
-        assert_eq!(summary, "changed 3");
-        assert_eq!(seen, vec![3]);
+        // A 3-way merge names the change but authors nothing.
+        assert_eq!(
+            summarize_changes(before, after, None),
+            ("changed 3".to_string(), Vec::new())
+        );
     }
 
     #[test]
@@ -3018,9 +3041,24 @@ mod tests {
 
     #[test]
     fn blank_changed_row_is_reported_and_authorized() {
-        let (summary, seen) = summarize_changes("before\nold\nafter", "before\n\nafter");
-        assert_eq!(summary, "changed 2");
-        assert_eq!(seen, vec![2], "the authored blank line must be editable");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.txt");
+        std::fs::write(&path, "before\nold\nafter").unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let read = json!({"cwd": dir.path(), "paths": ["b.txt"]});
+        let out = crate::mcp::tools::read::tool_read(&read, &cache, &session).unwrap();
+        let tag = &out[out.find("b.txt#").unwrap() + 6..][..4];
+        let edit = |tag: &str, start: u32, content: &str| {
+            let args = json!({"cwd": dir.path(), "edits": [{"path": "b.txt", "tag": tag,
+                "ops": [{"op": "replace", "start": start, "end": start, "content": content}]}]});
+            tool_write(&args, &session, &bloom, &cache)
+        };
+        // Content "\n" is one blank row; "" would delete the line.
+        let receipt = edit(tag, 2, "\n").unwrap();
+        assert!(receipt.contains("changed 2"), "{receipt}");
+        let new_tag = &receipt[receipt.find("b.txt#").unwrap() + 6..][..4];
+        edit(new_tag, 2, "again").expect("the authored blank line must be editable");
     }
 
     #[test]
