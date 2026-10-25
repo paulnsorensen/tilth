@@ -76,6 +76,17 @@ pub struct ApplyResult {
     /// notes this on the section status line so the model knows its `old` did
     /// not match byte-for-byte.
     pub normalized_swap: bool,
+    /// The new-text lines this apply wrote, from the splices themselves.
+    pub written: Written,
+}
+
+/// Where an apply wrote in the new text (1-based, sorted, deduplicated).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Written {
+    /// Lines that hold an op's payload: the only lines the caller authored.
+    pub authored: Vec<u32>,
+    /// The line now at each point where an op removed lines and wrote none.
+    pub deleted_at: Vec<u32>,
 }
 
 /// Why an apply failed.
@@ -783,6 +794,7 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
     }
 
     reject_overlaps(&splices)?;
+    let written = written_lines(&splices);
 
     let first_changed_line = splices.iter().map(|s| s.idx + 1).min();
 
@@ -826,7 +838,33 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
         first_changed_line,
         file_op: None,
         normalized_swap: false,
+        written,
     })
+}
+
+/// The new-text lines `splices` write, walked in final row order. At one index
+/// the inserts land in author order before a ranged splice (see the apply order
+/// in [`apply_line_ops`]). Positions come from the splices, never from a diff,
+/// so a moved or duplicated line cannot pass as authored.
+fn written_lines(splices: &[Splice]) -> Written {
+    let mut order: Vec<usize> = (0..splices.len()).collect();
+    order.sort_by_key(|&i| (splices[i].idx, usize::from(splices[i].range.is_some()), i));
+    let line = |at: usize| u32::try_from(at + 1).unwrap_or(u32::MAX);
+    let mut written = Written::default();
+    // Non-overlapping splices in row order: every removed row sits before `idx`.
+    let (mut added, mut removed) = (0usize, 0usize);
+    for i in order {
+        let s = &splices[i];
+        let at = s.idx + added - removed;
+        written.authored.extend((at..at + s.new.len()).map(line));
+        if s.new.is_empty() && s.len > 0 {
+            written.deleted_at.push(line(at));
+        }
+        added += s.new.len();
+        removed += s.len;
+    }
+    written.deleted_at.dedup();
+    written
 }
 
 fn check_bounds(line: u32, total: usize) -> Result<(), ApplyError> {
@@ -874,6 +912,48 @@ mod tests {
 
     fn apply(text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
         apply_ops(&p(), text, ops)
+    }
+
+    #[test]
+    fn written_names_the_rows_each_op_wrote() {
+        let r = apply(
+            "a\nb\nc\nd\n",
+            &[
+                Op::Ins {
+                    cursor: Cursor::Pre(2),
+                    payload: vec!["p".into()],
+                },
+                Op::Swap {
+                    start: 2,
+                    end: 3,
+                    payload: vec!["X".into()],
+                },
+                Op::Del { start: 4, end: 4 },
+                Op::Ins {
+                    cursor: Cursor::Tail,
+                    payload: vec!["t".into()],
+                },
+                Op::Ins {
+                    cursor: Cursor::Head,
+                    payload: vec![String::new()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.text, "\na\np\nX\nt\n");
+        assert_eq!(r.written.authored, vec![1, 3, 4, 5]);
+        assert_eq!(r.written.deleted_at, vec![5]);
+
+        let all = apply(
+            "foo\nbar\nfoo\n",
+            &[Op::TextSwapAll {
+                old: "foo".into(),
+                new: "x".into(),
+                count: Some(2),
+            }],
+        )
+        .unwrap();
+        assert_eq!(all.written.authored, vec![1, 3]);
     }
 
     #[test]
