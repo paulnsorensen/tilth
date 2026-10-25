@@ -53,58 +53,108 @@ fn fixture(count: u32) -> (tempfile::TempDir, Session, String) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), rows(count)).unwrap();
     let session = Session::new();
-    let tag = tag_of(&read(&session, dir.path(), "f.txt#1-100"));
+    let tag = tag_of(&read(&session, dir.path(), &format!("f.txt#1-{count}")));
     (dir, session, tag)
 }
 
 #[test]
-fn receipt_shows_every_changed_range_and_authorizes_a_second_write() {
+fn receipt_is_slim_and_names_the_changed_line() {
+    let (dir, session, tag) = fixture(200);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
+    )
+    .expect("write");
+    assert!(receipt.contains("[f.txt#"), "{receipt}");
+    assert!(receipt.contains("changed 100"), "{receipt}");
+    assert!(
+        !receipt.contains("WRITTEN-TEXT"),
+        "echoed content: {receipt}"
+    );
+    assert!(!receipt.contains("100:"), "numbered row: {receipt}");
+    assert!(receipt.len() < 300, "{} chars: {receipt}", receipt.len());
+}
+
+#[test]
+fn receipt_merges_adjacent_lines_into_ranges() {
     let (dir, session, tag) = fixture(100);
     let receipt = write(
         &session,
         dir.path(),
         Some(&tag),
         json!([
-            {"op": "replace_text", "old": "row-010", "new": "ROW-010"},
+            {"op": "replace", "start": 10, "end": 12, "content": "a\nb\nc"},
             {"op": "replace_text", "old": "row-080", "new": "ROW-080"},
         ]),
     )
-    .expect("first write");
-    assert!(receipt.contains("10:ROW-010"), "{receipt}");
-    assert!(
-        receipt.contains("80:ROW-080"),
-        "every changed range, not the first only: {receipt}"
-    );
+    .expect("write");
+    assert!(receipt.contains("changed 10-12, 80"), "{receipt}");
+}
 
+#[test]
+fn authored_line_is_editable_from_the_receipt_tag_without_a_read() {
+    let (dir, session, tag) = fixture(200);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
+    )
+    .expect("first write");
     let second = write(
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([
-            {"op": "replace_text", "old": "ROW-080", "new": "again-080"},
-            {"op": "replace_text", "old": "row-011", "new": "again-011"},
-        ]),
+        json!([{"op": "replace_text", "old": "WRITTEN-TEXT", "new": "again"}]),
     )
-    .expect("second write from the receipt alone");
+    .expect("authored line needs no read");
     assert!(second.contains("applied"), "{second}");
     let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
-    assert!(text.contains("ROW-010") && text.contains("again-080") && text.contains("again-011"));
+    assert!(text.contains("again") && !text.contains("WRITTEN-TEXT"));
 }
 
 #[test]
-fn follow_up_hint_never_points_at_an_unrelated_range() {
-    let (dir, session, tag) = fixture(100);
+fn unshown_neighbour_is_refused_from_the_receipt_tag() {
+    let (dir, session, tag) = fixture(200);
     let receipt = write(
         &session,
         dir.path(),
         Some(&tag),
-        json!([{"op": "replace_text", "old": "row-050", "new": "ROW-050"}]),
+        json!([{"op": "replace_text", "old": "row-100", "new": "WRITTEN-TEXT"}]),
     )
-    .expect("write");
-    assert!(
-        !receipt.contains("re-read") && !receipt.contains("omitted"),
-        "nothing was omitted, so no hint: {receipt}"
-    );
+    .expect("first write");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
+    )
+    .expect_err("the neighbour was never displayed in this version");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn pure_deletion_reports_the_deletion_point_and_marks_nothing_seen() {
+    let (dir, session, tag) = fixture(200);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "delete", "start": 50, "end": 50}]),
+    )
+    .expect("delete");
+    assert!(receipt.contains("deleted at 50"), "{receipt}");
+    assert!(!receipt.contains("changed"), "{receipt}");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-051", "new": "X"}]),
+    )
+    .expect_err("the line at the deletion point was not shown");
+    assert!(err.contains("never displayed"), "{err}");
 }
 
 #[test]

@@ -69,25 +69,36 @@ class WriteReceipts(unittest.TestCase):
             section["tag"] = tag
         return self.live.call("tilth_write", {"cwd": self.cwd, "edits": [section]})
 
-    def test_second_write_uses_only_the_first_receipt(self):
+    def test_receipt_is_slim_and_authored_line_is_editable_without_a_read(self):
         tag = self.read_tag()
-        first = self.write(tag, [
-            {"op": "replace_text", "old": "row-010", "new": "ROW-010"},
-            {"op": "replace_text", "old": "row-080", "new": "ROW-080"},
-        ])
+        first = self.write(tag, [{"op": "replace_text", "old": "row-050", "new": "WRITTEN-TEXT"}])
         receipt = harness.tool_result_text(first)
         self.assertFalse(harness.tool_is_error(first), receipt)
-        self.assertIn("10:ROW-010", receipt)
-        self.assertIn("80:ROW-080", receipt, "receipt must show every changed range")
-        self.assertNotRegex(receipt, r"re-read f\.txt#1-")
-        second = self.write(TAG.search(receipt).group(1), [
-            {"op": "replace_text", "old": "ROW-080", "new": "again-080"},
-            {"op": "replace_text", "old": "row-011", "new": "again-011"},
-        ])
+        self.assertIn("changed 50", receipt)
+        self.assertNotIn("WRITTEN-TEXT", receipt)
+        self.assertNotRegex(receipt, r"(?m)^\d+:")
+        self.assertLess(len(receipt), 300, receipt)
+        new_tag = TAG.search(receipt).group(1)
+        second = self.write(new_tag, [{"op": "replace_text", "old": "WRITTEN-TEXT", "new": "again"}])
         self.assertFalse(harness.tool_is_error(second), harness.tool_result_text(second))
-        text = self.target.read_text()
-        self.assertIn("again-080", text)
-        self.assertIn("again-011", text)
+        self.assertIn("again", self.target.read_text())
+
+    def test_unshown_neighbour_is_refused_from_the_receipt_tag(self):
+        tag = self.read_tag()
+        receipt = harness.tool_result_text(
+            self.write(tag, [{"op": "replace_text", "old": "row-050", "new": "WRITTEN-TEXT"}]))
+        rejected = self.write(TAG.search(receipt).group(1), [
+            {"op": "replace_text", "old": "row-051", "new": "X"}])
+        self.assertTrue(harness.tool_is_error(rejected))
+        self.assertIn("never displayed", harness.tool_result_text(rejected))
+        self.assertNotIn("X\n", self.target.read_text())
+
+    def test_pure_deletion_reports_deleted_at(self):
+        tag = self.read_tag()
+        receipt = harness.tool_result_text(
+            self.write(tag, [{"op": "delete", "start": 50, "end": 50}]))
+        self.assertIn("deleted at 50", receipt)
+        self.assertNotIn("changed", receipt)
 
     def test_missing_tag_error_states_current_tag(self):
         tag = self.read_tag()
