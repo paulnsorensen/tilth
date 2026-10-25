@@ -621,7 +621,7 @@ Chains live in `chains.py`. Pass `--tasks chain:<id>`, or list `chain:<id>` as a
 - The first turn is a normal `claude -p`. Every later turn runs `claude -p --resume <session id>` in the same workspace, with the same mode and model. Only chain turns keep the session on disk, in the cell's throwaway `CLAUDE_CONFIG_DIR`. Single cells still pass `--no-session-persistence`.
 - Each member is prepared, run, and graded by its own task code, right after its turn. A wrong sub-task does not stop the next turn. A crashed turn stops the chain.
 - The members must share one repo. Read tasks come first. At most one task that grades the whole workspace (an edit task) is allowed, and it goes last. Mutation files must not overlap. `chains.parse_chain` refuses anything else.
-- The chain budget is the per-cell budget times the number of members. Each turn is capped at what the earlier turns left.
+- The chain budget is the per-cell budget times the number of members. Each turn is capped at what the earlier turns left. If `--max-usd` is below the planned chain budget ($1 times the member count), the run refuses up front.
 - The chain row carries `sub_tasks`, `api_calls`, the summed token and cost fields, and the concatenated `per_turn_context_tokens`. `correct` is true when every sub-task is correct. `pass_rate` is the fraction that are. The existing score path reads `correct`, so `p` for a chain is the mean of a 0/1 value over repetitions; `task_score` does not read `pass_rate`.
 - A chain has its own run key. The key covers the chain id and the digest of every member.
 
@@ -631,4 +631,4 @@ Preview a plan without any model call or `--max-usd`:
 python3 benchmark/run.py --tasks chain:gin-edit-7 --modes baseline --models sonnet --reps 1 --dry-run
 ```
 
-The committed chains are `gin-edit-7`, `fastapi-edit-5`, and `rg-edit-7`. Their API call counts (about 40-60) are estimates, not measurements.
+The committed chains are `gin-edit-7`, `fastapi-edit-5`, and `rg-edit-7`. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.
