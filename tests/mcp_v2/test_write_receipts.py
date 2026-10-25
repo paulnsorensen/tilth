@@ -59,8 +59,8 @@ class WriteReceipts(unittest.TestCase):
         self.live = Live()
         self.addCleanup(self.live.close)
 
-    def read_tag(self):
-        shown = self.live.call("tilth_read", {"cwd": self.cwd, "paths": ["f.txt#1-100"]})
+    def read_tag(self, upto=100):
+        shown = self.live.call("tilth_read", {"cwd": self.cwd, "paths": [f"f.txt#1-{upto}"]})
         return TAG.search(harness.tool_result_text(shown)).group(1)
 
     def write(self, tag, ops):
@@ -84,7 +84,7 @@ class WriteReceipts(unittest.TestCase):
         self.assertIn("again", self.target.read_text())
 
     def test_unshown_neighbour_is_refused_from_the_receipt_tag(self):
-        tag = self.read_tag()
+        tag = self.read_tag(50)
         receipt = harness.tool_result_text(
             self.write(tag, [{"op": "replace_text", "old": "row-050", "new": "WRITTEN-TEXT"}]))
         rejected = self.write(TAG.search(receipt).group(1), [
@@ -92,6 +92,18 @@ class WriteReceipts(unittest.TestCase):
         self.assertTrue(harness.tool_is_error(rejected))
         self.assertIn("never displayed", harness.tool_result_text(rejected))
         self.assertNotIn("X\n", self.target.read_text())
+
+    def test_lines_read_before_a_write_stay_editable_and_unread_ones_do_not(self):
+        tag = self.read_tag(60)
+        receipt = harness.tool_result_text(
+            self.write(tag, [{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]))
+        new_tag = TAG.search(receipt).group(1)
+        refused = self.write(new_tag, [{"op": "replace_text", "old": "row-090", "new": "X"}])
+        self.assertTrue(harness.tool_is_error(refused))
+        self.assertIn("never displayed", harness.tool_result_text(refused))
+        moved = self.write(new_tag, [{"op": "replace_text", "old": "row-050", "new": "moved-050"}])
+        self.assertFalse(harness.tool_is_error(moved), harness.tool_result_text(moved))
+        self.assertIn("moved-050", self.target.read_text())
 
     def test_pure_deletion_reports_deleted_at(self):
         tag = self.read_tag()

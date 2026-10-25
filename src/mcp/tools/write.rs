@@ -203,7 +203,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
 
-    let (summary, seen_lines) = summarize_changes(&live, &new_text);
+    let (summary, mut seen_lines) = summarize_changes(&live, &new_text);
+    seen_lines.extend(carried_seen_lines(section, path, session, &live, &new_text));
     let new_tag = session.record_snapshot(path, &new_text, seen_lines);
 
     // Decision 5: when the exact `old` failed and the whitespace-normalized
@@ -529,6 +530,82 @@ fn commit_file_op(
     }
 }
 
+/// Lines of `new_text` the agent already saw in the version this edit applied
+/// against and the edit left untouched, at their new line numbers.
+///
+/// Carries only when the section's tag names a recorded snapshot whose text is
+/// exactly `live` (no drift). A 3-way-merge recovery, a tagless section, or an
+/// evicted snapshot carries nothing: the agent did not see the merge base, so
+/// the safe answer is to require a re-read.
+fn carried_seen_lines(
+    section: &Section,
+    path: &Path,
+    session: &Session,
+    live: &str,
+    new_text: &str,
+) -> Vec<u32> {
+    let Some(tag) = section.tag else {
+        return Vec::new();
+    };
+    let key = crate::edit::normalize_path_key(path);
+    let base = session.snapshots().by_tag(&key, tag);
+    match base {
+        Some(snap) if snap.text == live => carry_forward(live, new_text, &snap.seen_lines),
+        _ => Vec::new(),
+    }
+}
+
+/// Remap `seen` line numbers of `before` onto `after` through a diffy patch:
+/// context and untouched lines keep their line (shifted); deleted lines drop.
+fn carry_forward(before: &str, after: &str, seen: &HashSet<u32>) -> Vec<u32> {
+    let Some(max_seen) = seen.iter().copied().max() else {
+        return Vec::new();
+    };
+    let patch = diffy::create_patch(before, after);
+    let mut carried = Vec::new();
+    let (mut old, mut new) = (1u32, 1u32);
+    let start = |range: &diffy::HunkRange| {
+        let s = u32::try_from(range.start()).unwrap_or(u32::MAX);
+        if range.is_empty() {
+            s.saturating_add(1)
+        } else {
+            s
+        }
+    };
+    for hunk in patch.hunks() {
+        let (hunk_old, hunk_new) = (start(&hunk.old_range()), start(&hunk.new_range()));
+        while old < hunk_old && old <= max_seen {
+            if seen.contains(&old) {
+                carried.push(new);
+            }
+            old += 1;
+            new += 1;
+        }
+        old = old.max(hunk_old);
+        new = new.max(hunk_new);
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Context(_) => {
+                    if seen.contains(&old) {
+                        carried.push(new);
+                    }
+                    old += 1;
+                    new += 1;
+                }
+                diffy::Line::Delete(_) => old += 1,
+                diffy::Line::Insert(_) => new += 1,
+            }
+        }
+    }
+    while old <= max_seen {
+        if seen.contains(&old) {
+            carried.push(new);
+        }
+        old += 1;
+        new += 1;
+    }
+    carried
+}
 const WRITE_RESPONSE_BUDGET: u64 = 6_000;
 const WRITE_DIFF_BUDGET: u64 = 80;
 
@@ -2981,8 +3058,8 @@ mod tests {
         );
         assert_eq!(
             session.snapshots().head(&p).unwrap().seen_lines,
-            HashSet::from([1]),
-            "only the authored line is authorized, not context"
+            HashSet::from([1, 2]),
+            "the authored line and the unchanged line seen before it stay authorized"
         );
     }
 
@@ -3014,7 +3091,10 @@ mod tests {
             .join("\n");
         std::fs::write(&p, &original).unwrap();
         let (session, bloom) = services();
-        let initial_tag = read_for_tag(&session, &p);
+        let initial_tag = session
+            .record_snapshot(&p, &original, 1..=10)
+            .map(|tag| format!("{tag:04X}"))
+            .unwrap();
         let out = tool_write_cold_cache(
             &json!({
                 "edits": edits(

@@ -50,10 +50,15 @@ fn write(session: &Session, root: &Path, tag: Option<&str>, ops: Value) -> Resul
 }
 
 fn fixture(count: u32) -> (tempfile::TempDir, Session, String) {
+    fixture_shown(count, count)
+}
+
+/// A `total`-line file of which the session displayed only lines `1..=shown`.
+fn fixture_shown(total: u32, shown: u32) -> (tempfile::TempDir, Session, String) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("f.txt"), rows(count)).unwrap();
+    std::fs::write(dir.path().join("f.txt"), rows(total)).unwrap();
     let session = Session::new();
-    let tag = tag_of(&read(&session, dir.path(), &format!("f.txt#1-{count}")));
+    let tag = tag_of(&read(&session, dir.path(), &format!("f.txt#1-{shown}")));
     (dir, session, tag)
 }
 
@@ -117,7 +122,7 @@ fn authored_line_is_editable_from_the_receipt_tag_without_a_read() {
 
 #[test]
 fn unshown_neighbour_is_refused_from_the_receipt_tag() {
-    let (dir, session, tag) = fixture(200);
+    let (dir, session, tag) = fixture_shown(200, 100);
     let receipt = write(
         &session,
         dir.path(),
@@ -137,24 +142,87 @@ fn unshown_neighbour_is_refused_from_the_receipt_tag() {
 
 #[test]
 fn pure_deletion_reports_the_deletion_point_and_marks_nothing_seen() {
-    let (dir, session, tag) = fixture(200);
+    let (dir, session, tag) = fixture_shown(200, 100);
     let receipt = write(
         &session,
         dir.path(),
         Some(&tag),
-        json!([{"op": "delete", "start": 50, "end": 50}]),
+        json!([{"op": "delete", "start": 100, "end": 100}]),
     )
     .expect("delete");
-    assert!(receipt.contains("deleted at 50"), "{receipt}");
+    assert!(receipt.contains("deleted at 100"), "{receipt}");
     assert!(!receipt.contains("changed"), "{receipt}");
     let err = write(
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "row-051", "new": "X"}]),
+        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
     )
     .expect_err("the line at the deletion point was not shown");
     assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn lines_read_before_the_write_stay_editable_at_their_new_number() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]),
+    )
+    .expect("insert");
+    assert!(receipt.contains("changed 31-32"), "{receipt}");
+    let new_tag = tag_of(&receipt);
+    let second = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace_text", "old": "row-050", "new": "moved-050"}]),
+    )
+    .expect("old line 50 (now 52) was read and is unchanged");
+    assert!(second.contains("applied"), "{second}");
+}
+
+#[test]
+fn lines_never_shown_before_the_write_stay_refused() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]),
+    )
+    .expect("insert");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-150", "new": "X"}]),
+    )
+    .expect_err("row-150 was never displayed");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn lines_after_a_deletion_shift_up_and_stay_editable() {
+    let (dir, session, tag) = fixture_shown(200, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "delete", "start": 20, "end": 21}]),
+    )
+    .expect("delete");
+    assert!(receipt.contains("deleted at 20"), "{receipt}");
+    let second = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace_text", "old": "row-040", "new": "X"}]),
+    )
+    .expect("row-040 (now line 38) was read and is unchanged");
+    assert!(second.contains("applied"), "{second}");
 }
 
 #[test]
