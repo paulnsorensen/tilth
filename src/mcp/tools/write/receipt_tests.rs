@@ -311,3 +311,30 @@ fn ambiguous_and_overlap_errors_say_how_to_fix_the_call() {
     .expect_err("overlap");
     assert!(overlap.contains("lines 5-7 and 6-8"), "{overlap}");
 }
+
+#[test]
+fn reread_after_a_write_sends_text_and_only_a_later_read_may_stub() {
+    // `rows` ends in a newline, so the whole file spans 21 lines.
+    let (dir, session, tag) = fixture_shown(20, 21);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace", "start": 2, "end": 2, "content": "changed-row"}]),
+    )
+    .unwrap();
+    let new_tag = tag_of(&receipt);
+
+    let after_write = read(&session, dir.path(), "f.txt");
+    assert!(
+        after_write.contains(&format!("f.txt#{new_tag}")) && after_write.contains("changed-row"),
+        "a reread after a write must send the text under the new tag: {after_write}"
+    );
+    assert!(!after_write.contains("unchanged since"), "{after_write}");
+
+    let again = read(&session, dir.path(), "f.txt");
+    assert!(
+        again.contains(&format!("f.txt#{new_tag}")) && again.contains("unchanged since"),
+        "a reread after a read may stub: {again}"
+    );
+}

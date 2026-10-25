@@ -617,6 +617,10 @@ pub fn unchanged_head_tag(
     }
     let text = fs::read_to_string(path).ok()?;
     let head = session.snapshots().head(path)?;
+    // A write receipt shows no text, so only a read or search display can stub.
+    if session.snapshots().head_recorded_by_write(path) {
+        return None;
+    }
     if head.tag != crate::edit::tag::compute_file_hash(&text) {
         return None;
     }

@@ -87,7 +87,7 @@ class UnchangedReread(unittest.TestCase):
         self.assertIn("value_29", second)
         self.assertNotIn("unchanged since", second)
 
-    def test_reread_after_own_write_stubs_under_the_new_tag(self):
+    def test_changed_file_sends_the_text(self):
         requests = [
             harness.initialize_request(),
             harness.tools_call_request(2, "tilth_read", {"cwd": self.cwd, "paths": ["a.rs"]}),
@@ -100,13 +100,9 @@ class UnchangedReread(unittest.TestCase):
         requests.append(harness.tools_call_request(
             4, "tilth_read", {"cwd": self.cwd, "paths": ["a.rs"]}))
         responses = harness.run_mcp([], requests)
-        receipt = harness.tool_result_text(responses.response_by_id(3))
-        new_tag = re.search(r"#([0-9A-F]{4})\]", receipt).group(1)
-        self.assertNotEqual(new_tag, tag)
         third = harness.tool_result_text(responses.response_by_id(4))
-        # Every line was read or authored by the agent, so the carried seen
-        # set covers the whole file and the reread is the stub under the new tag.
-        self.assertIn(f"[a.rs#{new_tag}] unchanged since", third)
+        self.assertIn("value_3 = 33", third)
+        self.assertNotIn("unchanged since", third)
 
     def test_oversized_read_is_not_a_stub_later(self):
         big = Path(self.cwd) / "big.rs"

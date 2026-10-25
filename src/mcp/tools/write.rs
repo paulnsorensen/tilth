@@ -205,7 +205,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
 
     let (summary, mut seen_lines) = summarize_changes(&live, &new_text);
     seen_lines.extend(carried_seen_lines(section, path, session, &live, &new_text));
-    let new_tag = session.record_snapshot(path, &new_text, seen_lines);
+    let new_tag = session.record_write_snapshot(path, &new_text, seen_lines);
 
     // Decision 5: when the exact `old` failed and the whitespace-normalized
     // fallback landed the swap, say so on the status line so the model knows its
@@ -455,7 +455,7 @@ fn commit_file_op(
                 .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
             let authored_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
-            let new_tag = session.record_snapshot(path, content, 1..=authored_lines);
+            let new_tag = session.record_write_snapshot(path, content, 1..=authored_lines);
             let mut block = format!("## {}\ncreated{suffix}", crate::format::display_path(path));
             if let Some(tag) = new_tag {
                 let header = format_header(&crate::format::display_path(path), tag);
