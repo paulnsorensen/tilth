@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
@@ -90,99 +90,62 @@ pub(crate) fn find_callers_batch_cached(
     early_quit_threshold: usize,
     cache: &crate::cache::OutlineCache,
 ) -> Result<(Vec<(String, CallerMatch)>, usize), TilthError> {
-    let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
-    let found_count = AtomicUsize::new(0);
     let files_unreadable = AtomicUsize::new(0);
 
-    let walker = super::walker(scope, glob)?;
+    let matches = super::ordered_walk::walk_ordered(scope, glob, early_quit_threshold, |entry| {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            return Vec::new();
+        }
 
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-        let files_unreadable = &files_unreadable;
+        let path = entry.path();
 
-        Box::new(move |entry| {
-            // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
+        // Only process files with tree-sitter grammars
+        let file_type = detect_file_type(path);
+        let FileType::Code(lang) = file_type else {
+            return Vec::new();
+        };
+
+        let Some(ts_lang) = outline_language(lang) else {
+            return Vec::new();
+        };
+
+        // Read + size-gate + bloom prefilter in one shared step.
+        let (content, meta) = match super::bloom_walk::read_with_bloom_check(
+            path,
+            targets,
+            bloom,
+            super::bloom_walk::MAX_FILE_SIZE,
+        ) {
+            super::bloom_walk::BloomRead::Hit { content, meta } => (content, meta),
+            super::bloom_walk::BloomRead::Skip => return Vec::new(),
+            super::bloom_walk::BloomRead::Unreadable => {
+                files_unreadable.fetch_add(1, Ordering::Relaxed);
+                return Vec::new();
             }
+        };
 
-            let Ok(entry) = entry else {
-                return ignore::WalkState::Continue;
-            };
+        // Fast byte check via memchr::memmem (SIMD) — cheap second pass that
+        // eliminates bloom false positives before tree-sitter parses.
+        if !targets
+            .iter()
+            .any(|t| memchr::memmem::find(content.as_bytes(), t.as_bytes()).is_some())
+        {
+            return Vec::new();
+        }
 
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
+        let Some(parsed) = cache.parse_with_revision(
+            path,
+            &content,
+            // `meta` predates the read, so a stale publish fails its recheck.
+            crate::util::FileRevision::from_metadata_and_bytes(&meta, content.as_bytes()),
+        ) else {
+            return Vec::new();
+        };
+        let file_callers =
+            find_callers_treesitter_batch(path, targets, &ts_lang, &parsed, lang, parsed.tree());
 
-            let path = entry.path();
-
-            // Only process files with tree-sitter grammars
-            let file_type = detect_file_type(path);
-            let FileType::Code(lang) = file_type else {
-                return ignore::WalkState::Continue;
-            };
-
-            let Some(ts_lang) = outline_language(lang) else {
-                return ignore::WalkState::Continue;
-            };
-
-            // Read + size-gate + bloom prefilter in one shared step.
-            let (content, meta) = match super::bloom_walk::read_with_bloom_check(
-                path,
-                targets,
-                bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
-            ) {
-                super::bloom_walk::BloomRead::Hit { content, meta } => (content, meta),
-                super::bloom_walk::BloomRead::Skip => return ignore::WalkState::Continue,
-                super::bloom_walk::BloomRead::Unreadable => {
-                    files_unreadable.fetch_add(1, Ordering::Relaxed);
-                    return ignore::WalkState::Continue;
-                }
-            };
-
-            // Fast byte check via memchr::memmem (SIMD) — cheap second pass that
-            // eliminates bloom false positives before tree-sitter parses.
-            if !targets
-                .iter()
-                .any(|t| memchr::memmem::find(content.as_bytes(), t.as_bytes()).is_some())
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            let Some(parsed) = cache.parse_with_revision(
-                path,
-                &content,
-                // `meta` predates the read, so a stale publish fails its recheck.
-                crate::util::FileRevision::from_metadata_and_bytes(&meta, content.as_bytes()),
-            ) else {
-                return ignore::WalkState::Continue;
-            };
-            let file_callers = find_callers_treesitter_batch(
-                path,
-                targets,
-                &ts_lang,
-                &parsed,
-                lang,
-                parsed.tree(),
-            );
-
-            if !file_callers.is_empty() {
-                found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_callers);
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    let matches = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file_callers
+    })?;
     Ok((matches, files_unreadable.load(Ordering::Relaxed)))
 }
 

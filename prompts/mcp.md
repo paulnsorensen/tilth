@@ -11,7 +11,7 @@ BATCH related work; array parameters never accept singular values:
 
 DO NOT use `mode: full` to edit; read the section you change. Read structural ranges before `rewrite`.
 
-Reuse a `tilth_write` result's tag and lines; skip re-reads.
+A `tilth_write` result returns the new tag and changed line ranges; lines you wrote are editable from it with no read; read a range for any other line.
 
 ROUTE: find/explore → `tilth_search`; read → `tilth_read` (omit `mode`).
 DO NOT re-read expanded search content.

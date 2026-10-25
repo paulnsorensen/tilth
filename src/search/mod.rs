@@ -4,6 +4,7 @@ pub mod callers;
 pub mod content;
 pub mod facets;
 pub mod glob;
+mod ordered_walk;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
@@ -170,12 +171,7 @@ fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
 /// When `glob` names one exact file, the walker prunes unrelated directories.
 /// Other globs use an override pattern.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
-    let threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
+    let threads = walker_threads();
 
     let exact_target = exact_glob_target(scope, glob);
     let has_exact_target = exact_target.is_some();
@@ -199,6 +195,16 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     }
 
     Ok(builder.build_parallel())
+}
+
+/// Worker thread count for walks and batch scans. `TILTH_THREADS` overrides it.
+pub(crate) fn walker_threads() -> usize {
+    std::env::var("TILTH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+        })
 }
 
 fn exact_glob_target(scope: &Path, glob: Option<&str>) -> Option<PathBuf> {
