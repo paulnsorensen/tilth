@@ -200,6 +200,15 @@ def read_row(dataset: str, data_rev: str, instance_id: str) -> dict:
     return json.loads(path.read_text())
 
 
+TEST_INSTRUCTION = "Before you finish, build the code and run the existing tests that cover your change."
+TEST_HINTS = {
+    "python": "Dependencies are installed in `.venv`; run tests with `.venv/bin/python -m pytest`.",
+    "rust": "Run tests with `cargo test`.",
+    "go": "Run tests with `go test ./<pkg>/...` for the packages you change.",
+    "javascript": "Run tests with the repository's test script.",
+}
+
+
 class ExternalTask(Task):
     """An external benchmark instance; subclasses supply the mask, held-out restore, and matcher."""
 
@@ -222,7 +231,12 @@ class ExternalTask(Task):
 
     @property
     def prompt(self) -> str:
-        return self.problem_statement
+        return f"{self.problem_statement}\n\n{self.test_instruction}"
+
+    @property
+    def test_instruction(self) -> str:
+        """The closing line that tells the agent to build and test; it names no held-out test or grader command."""
+        return f"{TEST_INSTRUCTION} {TEST_HINTS[self._language]}".strip()
 
     @property
     def problem_statement(self) -> str:

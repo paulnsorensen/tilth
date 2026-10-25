@@ -22,7 +22,7 @@ import external.swebench_ml
 import external.task
 import run
 from conftest import STREAMS, StoreTask
-from external_support import FB_LV1, SWE_GO, SWE_PY, SWE_RS, git, rows
+from external_support import FB_LV1, SWE_GO, SWE_PY, SWE_RS, git, rows, stub_runner_on_path
 
 _ARGS = ("--models", "sonnet5", "--modes", "plain", "--reps", "1", "--max-usd", "5")
 
@@ -60,8 +60,9 @@ def run_cell(monkeypatch: pytest.MonkeyPatch, task_name: str, workdir: Path, tmp
 
     def popen(cmd, *args, **kwargs):
         # Only the agent CLI is replayed; grading subprocesses run for real.
-        return _Replay(stream or claude_stream()) if cmd[0] == "claude" else real_popen(cmd, *args, **kwargs)
+        return _Replay(stream or claude_stream()) if Path(cmd[0]).name == "claude" else real_popen(cmd, *args, **kwargs)
 
+    stub_runner_on_path(monkeypatch, tmp_path)
     monkeypatch.setattr(run.subprocess, "Popen", popen)
     return run._run_single_in_repo(task_name, "plain", "sonnet5", 0, workdir,
                                    stream_log_path=tmp_path / "streams" / "cell.jsonl")

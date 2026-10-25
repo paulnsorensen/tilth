@@ -265,6 +265,27 @@ def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | Non
     return estimate, "estimate"
 
 
+def _agent_venv(task: object, workdir: Path) -> Path | None:
+    """The workdir's venv for an external Python task; never the separate grading venv."""
+    if isinstance(task, external.ExternalTask) and task.language == "python":
+        venv = workdir / ".venv"
+        if (venv / "bin").is_dir():
+            return venv
+    return None
+
+
+def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
+    """Resolve the runner on PATH without the agent venv, so a task-installed console script cannot replace it."""
+    if agent_venv is None:
+        return cmd
+    venv_bin = str(agent_venv / "bin")
+    host_path = os.pathsep.join(entry for entry in env.get("PATH", "").split(os.pathsep) if entry != venv_bin)
+    host_runner = shutil.which(cmd[0], path=host_path)
+    if host_runner is None:
+        raise FileNotFoundError(f"runner not found on the host PATH: {cmd[0]}")
+    return [host_runner, *cmd[1:]]
+
+
 def build_runner_env(
     runner: str,
     *,
@@ -273,10 +294,12 @@ def build_runner_env(
     ambient: Optional[Mapping[str, str]] = None,
     tilth_bin: object = _DEFAULT_TILTH_BIN,
     language: str | None = None,
+    agent_venv: Path | None = None,
 ) -> dict[str, str]:
     """Build a minimal environment for one runner subprocess.
 
     ``language`` is the task's language. The agent's own builds then get the C settings its grade uses.
+    ``agent_venv`` is the agent workdir's venv; its ``bin`` goes first on PATH so the agent finds its dependencies.
     """
     source = os.environ if ambient is None else ambient
     if runner == "claude":
@@ -302,6 +325,10 @@ def build_runner_env(
         tilth_dir = os.path.dirname(selected_tilth_bin)
         if tilth_dir:
             env["PATH"] = tilth_dir + os.pathsep + env.get("PATH", "")
+
+    if agent_venv is not None:
+        env["VIRTUAL_ENV"] = str(agent_venv)
+        env["PATH"] = str(agent_venv / "bin") + os.pathsep + env.get("PATH", "")
 
     if runner == "codex" and "CODEX_HOME" in source:
         env["CODEX_HOME"] = source["CODEX_HOME"]
@@ -1406,13 +1433,16 @@ def _run_single_in_repo(
 
     # Build a fresh allowlist for every runner subprocess. Runner-specific
     # config is added only by the lane that consumes it.
+    agent_venv = _agent_venv(task, repo_path)
     env = build_runner_env(
         runner,
         opencode_config=opencode_config,
         bare=bare,
         tilth_bin=mode.binary_path,
         language=task.language,
+        agent_venv=agent_venv,
     )
+    cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
     start_time = time.time()

@@ -388,7 +388,7 @@ def test_loaders_build_tasks_from_pinned_rows(external_bench, tmp_path: Path, in
     assert row["repo"] in task.source.origin and task.source.commit_or_tag == row["base_commit"]
     assert task.problem_statement == row["problem_statement"]
     if dataset == "featurebench":
-        assert task.prompt == row["problem_statement"]
+        assert task.prompt == f"{row['problem_statement']}\n\n{task.test_instruction}"
     else:
         assert task.prompt != row["problem_statement"] and row["problem_statement"] in task.prompt
     assert not any(entry in task.prompt for entry in (*row["FAIL_TO_PASS"], *row["PASS_TO_PASS"]))
@@ -416,12 +416,12 @@ def test_swebench_prompt_wraps_issue_and_changes_digest(external_bench, monkeypa
     issue = task.problem_statement
     instruction = task.prompt.split(issue)[0]
 
-    assert task.prompt.endswith(issue) and instruction.strip()
+    assert task.prompt.endswith(f"{issue}\n\n{task.test_instruction}") and instruction.strip()
     assert len(re.findall(r"[.!?](?:\s|$)", instruction)) <= 3
     assert not re.search(r"tilth|grep|test", instruction, re.IGNORECASE)
     wrapped = run._cell_task_digest(task)
     monkeypatch.setattr(external.swebench_ml, "PROMPT_INSTRUCTION", "")
-    assert task.prompt == issue
+    assert task.prompt == f"{issue}\n\n{task.test_instruction}"
     assert run._cell_task_digest(task) != wrapped
 
 
