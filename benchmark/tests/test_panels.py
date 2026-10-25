@@ -24,6 +24,7 @@ from panel_support import (
 )
 
 GEPA_V2_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v2.json"
+GEPA_V3_LONG_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long.json"
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 REDACTED_KEYS = {"instance_id", "repo", "base_commit", "language"}
 GRADER_KEYS = {"patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS", "problem_statement"}
@@ -692,3 +693,18 @@ def test_committed_gepa_v2_panel_loads(store: Path) -> None:
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
     assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
+
+
+def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
+    data = read(GEPA_V3_LONG_PANEL)
+    assert data["version"] == 2
+    languages = {entry["id"]: entry["language"] for entry in data["members"]}
+    panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
+
+    assert len(panel.members) == 9
+    assert panel.cheap == ()
+    assert panel.dev and panel.test
+    assignment = panels.stratify(data["members"], data["split_seed"])
+    assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
+    assert set(panel.dev) == {i for i, s in assignment.items() if s == "dev"}
+    assert set(panel.test) == {i for i, s in assignment.items() if s == "test"}
