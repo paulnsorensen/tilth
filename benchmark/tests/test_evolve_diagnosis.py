@@ -15,7 +15,7 @@ from evolve import attribution as cost_attribution
 from evolve import candidate as candidates
 from evolve import cli, diagnosis, engine, proposer, replay
 from evolve_support import CHEAP, DEV, TEST, build, child, log_text, main, result_stream, seed_candidate
-from test_evolve import patch_for, ready, world  # noqa: F401  (world is a fixture)
+from test_evolve import keep_builds, kept, patch_for, ready, world  # noqa: F401  (world is a fixture)
 
 READ_MD = "prompts/tools/read.md"
 SRC = candidates.SRC_PATCH
@@ -421,6 +421,24 @@ def test_replay_diagnostic_logs_and_records_without_rejecting(world, monkeypatch
     assert f"replay {result.cid[:12]}: " in log_text(world)
     assert {"replay": result.replay} in evo._extra_records(changed)
     assert not any(row["mode"] == "replay" for row in world.stored())
+
+
+def test_replay_clears_the_rebuilt_build_of_a_dominated_candidate(world, monkeypatch) -> None:  # noqa: F811
+    calls: list[tuple[str, str]] = []
+    stub_replay(monkeypatch, calls)
+    keep_builds(world, monkeypatch)
+    evo = ready(world, "--replay-diagnostic", "1")
+    for task in DEV:
+        evo.evaluate(evo.seed, task)
+    dominated = {**child(evo.seed, dev_a="0", dev_b="1", cheap_a="1"),
+                 "src_patch": patch_for(world, {"src/lib.rs": "pub fn evolved() {}\n"})}
+    evo.evaluate(dominated, "dev_a")
+    result = evo.results[candidates.content_id(dominated)]
+
+    assert "dominated after one rollout" in log_text(world)
+    assert result.replay and calls
+    assert result not in evo.frontier
+    assert not kept(result.sha) and kept(world.seed_sha)
 
 
 def test_a_candidate_never_receives_another_candidates_replay(world, monkeypatch) -> None:  # noqa: F811

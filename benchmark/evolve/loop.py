@@ -756,7 +756,11 @@ class Evolution:
             self._replay_diagnostic(result)
 
     def _replay_diagnostic(self, result: Cascade) -> None:
-        """Re-send the first seed dev cells to the seed and candidate binaries, in task and repetition order."""
+        """Re-send the first seed dev cells to the seed and candidate binaries, in task and repetition order.
+
+        The replay can rebuild a build that admission cleared, so it clears the build of a candidate
+        off the frontier when it finishes.
+        """
         result.replay = []
         if result.candidate[SRC_PATCH] == self.seed[SRC_PATCH]:
             return
@@ -781,6 +785,8 @@ class Evolution:
                                       **replay.compare(self.seed_replays[key], other)})
         except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
             self.log(f"replay {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
+        if result not in self.frontier:
+            self._discard_build(result)
         if result.replay:
             self.log(f"replay {result.cid[:12]}: {json.dumps(result.replay, sort_keys=True)}")
 
