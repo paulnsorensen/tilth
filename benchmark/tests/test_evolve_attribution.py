@@ -130,10 +130,43 @@ def test_exposure_weights_chars_by_later_api_turns(summary) -> None:
     assert summary["exposure"]["baseline"][key] == 50 * 4 + 150 * 3 + 20 * 2 + 30
 
 
-def test_exposure_without_api_turn_treats_each_call_as_a_turn(tmp_path) -> None:
-    calls = [{k: v for k, v in c.items() if k != "api_turn"} for c in baseline_calls()]
-    result = summarize([write_cell(tmp_path, "c", calls)], [write_cell(tmp_path, "b", calls)], [TASK])
-    assert result["exposure"]["baseline"]["result_chars_times_remaining_api_turns_per_cell"] == 720
+def stream_event(kind: str, msg_id: str | None, blocks: list[dict]) -> str:
+    return json.dumps({"type": kind, "message": {"id": msg_id, "role": kind, "content": blocks}})
+
+
+def write_stream(tmp_path: Path, name: str) -> None:
+    """Raw stream beside ``name.trajectory.jsonl``: turn 0 has two parallel calls, turn 1 has one."""
+    use = lambda i: {"type": "tool_use", "id": i, "name": "Read", "input": {}}
+    result = lambda i, n: {"type": "tool_result", "tool_use_id": i, "content": "r" * n}
+    lines = [stream_event("assistant", "m0", [use("u1"), use("u2")]),
+             stream_event("user", None, [result("u1", 10), result("u2", 20)]),
+             stream_event("assistant", "m1", [use("u3")]),
+             stream_event("user", None, [result("u3", 30)])]
+    (tmp_path / f"{name}.jsonl").write_text("\n".join(lines))
+
+
+def bare_calls() -> list[dict]:
+    return [{"tool_use_id": i, "name": "Read", "input": {}, "output": "r" * n, "is_error": False}
+            for i, n in (("u1", 10), ("u2", 20), ("u3", 30))]
+
+
+def test_exposure_without_api_turn_is_derived_from_the_adjacent_stream(tmp_path) -> None:
+    write_stream(tmp_path, "c")
+    write_stream(tmp_path, "b")
+    rows = [write_cell(tmp_path, "c", bare_calls())], [write_cell(tmp_path, "b", bare_calls())]
+    result = summarize(*rows, [TASK])
+    assert result["exposure"]["candidate"]["result_chars_times_remaining_api_turns_per_cell"] == (10 + 20) * 2 + 30
+    assert result["coverage"]["exposure_cells"] == {"candidate": 1, "baseline": 1}
+    assert result["coverage"]["stream_turn_cells"] == {"candidate": 1, "baseline": 1}
+
+
+def test_exposure_is_null_when_neither_sidecar_nor_stream_gives_turns(tmp_path) -> None:
+    rows = [write_cell(tmp_path, "c", bare_calls())], [write_cell(tmp_path, "b", bare_calls())]
+    result = summarize(*rows, [TASK])
+    key = "result_chars_times_remaining_api_turns_per_cell"
+    assert result["exposure"] == {"candidate": {key: None}, "baseline": {key: None}}
+    assert result["coverage"]["exposure_cells"] == {"candidate": 0, "baseline": 0}
+    assert result["coverage"]["stream_turn_cells"] == {"candidate": 0, "baseline": 0}
 
 
 def test_dominant_is_ranked_by_candidate_minus_baseline_excess(summary) -> None:
@@ -172,7 +205,9 @@ def test_grader_fields_contamination_and_other_tasks_are_excluded(tmp_path) -> N
     tainted = write_cell(tmp_path, "c1", huge, contaminated=True)
     other = write_cell(tmp_path, "c2", huge, task="elsewhere")
     result = summarize([good, tainted, other], [Guarded(write_cell(tmp_path, "b0", baseline_calls(), **grader))], [TASK])
-    assert result["coverage"] == {"candidate_cells": 1, "baseline_cells": 1, "matched_tasks": 1, "missing_trajectories": 0}
+    assert {k: v for k, v in result["coverage"].items() if not k.endswith("_turn_cells") and k != "exposure_cells"} == {
+        "candidate_cells": 1, "baseline_cells": 1, "matched_tasks": 1, "missing_trajectories": 0}
+    assert result["coverage"]["exposure_cells"] == {"candidate": 1, "baseline": 1}
     assert by(result["per_tool"], tool="tilth_search", arm="candidate")["result_chars_per_cell"] == 200
 
 
@@ -181,7 +216,8 @@ def test_missing_trajectory_is_counted_and_skipped(tmp_path) -> None:
     nopath = {"task": TASK, "contaminated": False}
     cand = [write_cell(tmp_path, "c0", candidate_calls()), gone, nopath]
     result = summarize(cand, [write_cell(tmp_path, "b0", baseline_calls())], [TASK])
-    assert result["coverage"] == {"candidate_cells": 1, "baseline_cells": 1, "matched_tasks": 1, "missing_trajectories": 2}
+    assert {k: result["coverage"][k] for k in ("candidate_cells", "baseline_cells", "matched_tasks", "missing_trajectories")} == {
+        "candidate_cells": 1, "baseline_cells": 1, "matched_tasks": 1, "missing_trajectories": 2}
 
 
 def test_only_tasks_present_in_both_arms_are_summarized(tmp_path) -> None:

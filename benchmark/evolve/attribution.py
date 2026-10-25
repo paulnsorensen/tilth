@@ -5,8 +5,9 @@
 task's cells, then the mean over matched tasks, so an arm with more repetitions does not outweigh another.
 
 Two figures are proxies. ``exposure`` is result characters times the API turns that follow the call in its
-cell, a context-cost proxy (cache reads re-pay a result every later turn). A sidecar without ``api_turn`` falls
-back to the call's position, as if each call were its own turn. ``read_breadth`` excess prices each extra
+cell, a context-cost proxy (cache reads re-pay a result every later turn). A sidecar without ``api_turn`` is
+re-derived from the raw stream beside its sidecar; when that is missing too the cell's exposure is None and
+the cell is left out of the exposure mean (``coverage.exposure_cells`` counts the cells that have one). ``read_breadth`` excess prices each extra
 distinct file at the candidate's mean read-result size.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from parse import output_chars
+from parse import extract_trajectory, output_chars
 
 VERSION = 1
 ARMS = ("candidate", "baseline")
@@ -62,7 +63,17 @@ def _norm(path: object, cwd: object = None) -> str:
     return _BENCH_ROOT.sub("", path).removeprefix("./")
 
 
-def _load(path: object) -> list[dict] | None:
+def _stream_turns(path: str) -> dict[str, int]:
+    """``api_turn`` by tool_use id, re-parsed from the raw stream beside a ``.trajectory.jsonl`` sidecar."""
+    stream = Path(path.removesuffix(".trajectory.jsonl") + ".jsonl")
+    if path == str(stream) or not stream.is_file():
+        return {}
+    return {c["tool_use_id"]: c["api_turn"] for c in extract_trajectory(stream.read_text(), "claude")
+            if isinstance(c.get("api_turn"), int)}
+
+
+def _load(path: object) -> tuple[list[dict], bool] | None:
+    """A cell's calls and whether their turns came from the raw stream; None when there is no sidecar."""
     if not isinstance(path, str) or not Path(path).is_file():
         return None
     calls = []
@@ -73,7 +84,12 @@ def _load(path: object) -> list[dict] | None:
             continue
         if isinstance(record, dict) and isinstance(record.get("name"), str):
             calls.append(record)
-    return calls
+    if all(isinstance(c.get("api_turn"), int) for c in calls):
+        return calls, False
+    turns = _stream_turns(path)
+    if not all(c.get("tool_use_id") in turns for c in calls):
+        return calls, False
+    return [{**c, "api_turn": turns[c["tool_use_id"]]} for c in calls], True
 
 
 def _shapes(tool: str, args: Mapping) -> list[str]:
@@ -106,11 +122,19 @@ def _edits(tool: str, args: Mapping) -> list[str]:
             and not any(isinstance(o, dict) and o.get("op") == "create_file" for o in e.get("ops") or [])]
 
 
-def _cell_stats(calls: list[dict], arm: str, examples: dict) -> Counter:
-    """One cell's additive figures, keyed by tuples such as ``("chars", tool)``."""
-    turns = [c.get("api_turn") if isinstance(c.get("api_turn"), int) else i for i, c in enumerate(calls)]
-    last = max(turns, default=-1)
+def _cell_stats(cell: tuple[list[dict], bool], arm: str, examples: dict) -> Counter:
+    """One cell's additive figures, keyed by tuples such as ``("chars", tool)``.
+
+    ``("exposure",)`` is set only when every call has a real API turn; otherwise it is absent, never guessed.
+    """
+    calls, from_stream = cell
+    turns = [c.get("api_turn") for c in calls]
+    known = all(isinstance(t, int) for t in turns)
+    last = max((t for t in turns if known), default=-1)
     out: Counter = Counter()
+    if known:
+        out[("exposure",)] = 0
+        out[("stream_cells",)] = int(from_stream)
     read: set[str] = set()
     unread: set[str] = set()
     for call, turn in zip(calls, turns):
@@ -121,7 +145,8 @@ def _cell_stats(calls: list[dict], arm: str, examples: dict) -> Counter:
         failed = call.get("is_error") is True or (tool == "tilth_write" and bool(_SECTION_ERROR.search(text)))
         out[("calls", tool)] += 1
         out[("chars", tool)] += chars
-        out[("exposure",)] += chars * (last + 1 - turn)
+        if known:
+            out[("exposure",)] += chars * (last + 1 - turn)
         if failed:
             kind = _classify(text)
             out[("err", tool)] += 1
@@ -149,17 +174,17 @@ def _balanced(cells_by_task: Mapping[str, list[Counter]]) -> dict:
     return {key: value / (len(cells_by_task) or 1) for key, value in totals.items()}
 
 
-def _gather(rows: Iterable[Mapping], tasks: set[str]) -> tuple[dict[str, list[list[dict]]], int]:
-    cells: dict[str, list[list[dict]]] = {}
+def _gather(rows: Iterable[Mapping], tasks: set[str]) -> tuple[dict[str, list[tuple[list[dict], bool]]], int]:
+    cells: dict[str, list[tuple[list[dict], bool]]] = {}
     missing = 0
     for row in rows:
         if row.get("contaminated") is True or row.get("task") not in tasks:
             continue
-        calls = _load(row.get("trajectory_path"))
-        if calls is None:
+        cell = _load(row.get("trajectory_path"))
+        if cell is None:
             missing += 1
         else:
-            cells.setdefault(row["task"], []).append(calls)
+            cells.setdefault(row["task"], []).append(cell)
     return cells, missing
 
 
@@ -201,6 +226,11 @@ def summarize(candidate_rows: Iterable[Mapping], baseline_rows: Iterable[Mapping
     examples: dict = {}
     cells = {arm: {t: [_cell_stats(c, arm, examples) for c in gathered[arm][0][t]] for t in matched} for arm in ARMS}
     stats = {arm: _balanced(cells[arm]) for arm in ARMS}
+    with_turns = {arm: {t: [c for c in cs if ("exposure",) in c] for t, cs in cells[arm].items()} for arm in ARMS}
+    exposure = {arm: _balanced({t: cs for t, cs in with_turns[arm].items() if cs}).get(("exposure",)) for arm in ARMS}
+    counts = {name: {arm: sum(c.get(key, 0) for cs in cells[arm].values() for c in cs) for arm in ARMS}
+              for name, key in (("exposure_cells", ("exposure",)), ("stream_turn_cells", ("stream_cells",)))}
+    counts["exposure_cells"] = {arm: sum(len(cs) for cs in with_turns[arm].values()) for arm in ARMS}
     per_tool, call_shapes, errors, seen_shapes = [], [], [], set()
     for arm in ARMS:
         s = stats[arm]
@@ -225,13 +255,14 @@ def summarize(candidate_rows: Iterable[Mapping], baseline_rows: Iterable[Mapping
         "coverage": {"candidate_cells": sum(len(v) for v in cells["candidate"].values()),
                      "baseline_cells": sum(len(v) for v in cells["baseline"].values()),
                      "matched_tasks": len(matched),
-                     "missing_trajectories": gathered["candidate"][1] + gathered["baseline"][1]},
+                     "missing_trajectories": gathered["candidate"][1] + gathered["baseline"][1],
+                     "exposure_cells": counts["exposure_cells"], "stream_turn_cells": counts["stream_turn_cells"]},
         "per_tool": per_tool,
         "call_shapes": call_shapes,
         "errors": errors,
         "breadth": {arm: {"distinct_files_read_per_cell": stats[arm].get(("files",), 0.0),
                           "edits_on_unread_files_per_cell": stats[arm].get(("unread_edits",), 0.0)} for arm in ARMS},
-        "exposure": {arm: {"result_chars_times_remaining_api_turns_per_cell": stats[arm].get(("exposure",), 0.0)}
+        "exposure": {arm: {"result_chars_times_remaining_api_turns_per_cell": exposure[arm]}
                      for arm in ARMS},
         "dominant": _dominant(stats["candidate"], stats["baseline"]),
     }
