@@ -280,7 +280,10 @@ def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path |
         return cmd
     venv_bin = str(agent_venv / "bin")
     host_path = os.pathsep.join(entry for entry in env.get("PATH", "").split(os.pathsep) if entry != venv_bin)
-    return [shutil.which(cmd[0], path=host_path) or cmd[0], *cmd[1:]]
+    host_runner = shutil.which(cmd[0], path=host_path)
+    if host_runner is None:
+        raise FileNotFoundError(f"runner not found on the host PATH: {cmd[0]}")
+    return [host_runner, *cmd[1:]]
 
 
 def build_runner_env(

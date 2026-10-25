@@ -86,6 +86,15 @@ def test_task_venv_console_script_does_not_replace_the_runner(tmp_path: Path) ->
     assert run._host_runner_argv(["claude", "-p"], env, None) == ["claude", "-p"]
 
 
+def test_runner_only_in_the_task_venv_fails_closed(tmp_path: Path) -> None:
+    venv = tmp_path / "workdir" / ".venv"
+    fake_runner(venv / "bin", "venv")
+    env = {"PATH": os.pathsep.join([str(venv / "bin"), str(tmp_path / "empty")])}
+
+    with pytest.raises(FileNotFoundError, match="claude"):
+        run._host_runner_argv(["claude", "-p"], env, venv)
+
+
 def test_grading_venv_stays_separate_from_the_agent_tree(external_bench, tmp_path: Path) -> None:
     external_bench.seed(SWE_PY)
     task = load(SWE_PY)
