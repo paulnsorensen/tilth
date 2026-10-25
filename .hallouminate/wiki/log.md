@@ -112,3 +112,5 @@
 2026-10-15 · mmc-t-2-rebase · merged+new-page · benchmark-task-inventory.md; benchmark-selection-and-rigor.md; benchmark-gin-render-context.md; featurebench-integration.md; benchmark-cost-planning.md; sources/benchmark-research.md; sources/featurebench.md; sources/sonnet-5-5.md; sources/index.md; benchmark-harness-gotchas.md; mcp-cost-model-sonnet5.md; index.md · Rebase the benchmark research pages onto main after the GEPA overhaul. Re-derive task counts, retire the Phase 4 gate, and describe the native FeatureBench runner.
 
 2026-10-16 · small-followups-kind-hints · merged · adr/tilth-search-v2-roadmap-002.md; specs/fuzzy-suggest-only.md; specs/tilth-search-revival.md; specs/tilth-api-adoption.md · Point footnote 4 at PR #309 instead of an untracked spec. Record the removed kind hints and the fuzzy_path doc fix. Record #175 as closed.
+
+2026-10-25 · wiki-harvest-auto/tilth-20261025 · merged · benchmark-task-inventory.md · Raise the registry count from 58 to 61 at 50f3e46. Add the three migration tasks (#369, #370, #371) as held-out replays and update the per-repo, capability, and grading counts.
