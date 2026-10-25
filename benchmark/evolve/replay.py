@@ -122,11 +122,12 @@ def remap(value: object, old: str, new: str, key: str = "") -> object:
 
 
 def unremapped(value: object, new: str, key: str = "") -> list[str]:
-    """Absolute paths in path fields that sit outside the new workspace; these were not remapped."""
+    """Absolute paths in path fields that sit outside the new workspace, ``..`` resolved; these were not remapped."""
     found: list[str] = []
     if isinstance(value, str):
         absolute = value.startswith("/") and not value.startswith("//")
-        if (key in PATH_KEYS or key == "paths") and absolute and not (value == new or value.startswith(new + "/")):
+        resolved = os.path.normpath(value) if absolute else value
+        if (key in PATH_KEYS or key == "paths") and absolute and not (resolved == new or resolved.startswith(new + "/")):
             found.append(value)
     elif isinstance(value, list):
         for item in value:
@@ -314,9 +315,14 @@ def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
             arguments = call.get("input") or {}
             if old_root:
                 arguments = remap(arguments, old_root, new_root)
-            report["unremapped_paths"] += unremapped(arguments, new_root)
+            outside = unremapped(arguments, new_root)
+            report["unremapped_paths"] += outside
             recorded_error = bool(call.get("is_error")) or (tool == "tilth_write" and _section_failed(_text(call.get("output"))))
             if tool == "tilth_write":
+                if outside:
+                    # The server trusts absolute paths, so this write would land outside the temp workspace.
+                    report["stopped_at"] = {"index": index, "reason": "write names a path outside the workspace"}
+                    break
                 if call.get("output") is None:
                     report["stopped_at"] = {"index": index, "reason": "recorded write has no result"}
                     break

@@ -147,6 +147,29 @@ def test_remap_touches_path_fields_only() -> None:
     assert result["edits"][0]["ops"][0]["content"] == f"# see {OLD_ROOT}\n"
 
 
+@needs_binary
+def test_a_write_outside_the_workspace_stops_the_replay_before_it_lands(fixture_repo, tmp_path) -> None:
+    outside = tmp_path / "outside"
+    shutil.copytree(fixture_repo, outside)
+    tag = file_tag(fixture_repo, tmp_path)
+    target = str(outside / "app.py")
+    edits = [{"path": target, "tag": tag, "ops": [{"op": "replace_text", "old": "x = 1", "new": "x = 2"}]}]
+    calls = [read_call(target), tilth_call("tilth_write", {"edits": edits, "cwd": OLD_ROOT}), read_call()]
+
+    report = run_replay(tmp_path, calls)
+
+    assert report["stopped_at"] == {"index": 1, "reason": "write names a path outside the workspace"}
+    assert (outside / "app.py").read_text() == ORIGINAL, "replay must never write outside its temp workspace"
+    assert target in report["unremapped_paths"]
+
+
+def test_unremapped_resolves_dotdot_before_the_containment_check() -> None:
+    escape = "/new/proj/../../etc/x"
+
+    assert replay.unremapped({"path": escape, "cwd": "/new/proj"}, "/new/proj") == [escape]
+    assert replay.unremapped({"path": "/new/proj/a/../b.py"}, "/new/proj") == []
+
+
 def test_recorded_root_is_the_most_common_workspace_prefix() -> None:
     calls = [read_call(cwd=OLD_ROOT), read_call(cwd=OLD_ROOT), read_call(cwd="/tmp/tilth-benchmark-zzz/other")]
 
