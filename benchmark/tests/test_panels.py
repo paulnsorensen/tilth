@@ -1,6 +1,7 @@
 """Pre-registered panels: schema, completeness, admission, tiers, stratified split, stamp, lock, registration."""
 
 import json
+import shutil
 import socket
 import sys
 from pathlib import Path
@@ -721,3 +722,20 @@ def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> 
     assert 5 <= len(members) <= 7
     assert members[-1].capability == "fix"
     assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
+
+
+def test_long_pool_ids_hold_the_controls_and_stay_out_of_the_package_digest(tmp_path: Path, monkeypatch) -> None:
+    controls = {"tokio-rs__tokio-4867", "burntsushi__ripgrep-2209", "caddyserver__caddy-6350",
+                "hashicorp__terraform-35611", "axios__axios-5085", "uutils__coreutils-6682"}
+    assert controls <= panels.long_pool_ids()
+    assert not controls & set(external.swebench_ml.GEPA_V2_CANDIDATES)
+    assert panels.LONG_POOL_FILE.suffix != ".py"
+
+    package = tmp_path / "external"
+    shutil.copytree(external.task.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    before = external.task.package_digest()
+    pool_file = package / "long_pool_candidates.json"
+    pool_file.write_text(pool_file.read_text().replace("tokio-rs__tokio-4867", "tokio-rs__tokio-0000"))
+    assert external.task.package_digest() == before
+    assert panels.long_pool_ids(pool_file) != panels.long_pool_ids()

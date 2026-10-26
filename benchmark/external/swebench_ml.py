@@ -46,9 +46,6 @@ GEPA_V2_CANDIDATES = (
     "uutils__coreutils-6377", "uutils__coreutils-6575",
     "prometheus__prometheus-10720", "axios__axios-5316", "mrdoob__three.js-27395", "mrdoob__three.js-26589",
     "vuejs__core-11739", "facebook__docusaurus-9183",
-    # Short controls for the gepa-v3-long panel.
-    "tokio-rs__tokio-4867", "burntsushi__ripgrep-2209", "caddyserver__caddy-6350", "hashicorp__terraform-35611",
-    "axios__axios-5085", "uutils__coreutils-6682",
 )
 PROMPT_INSTRUCTION = (
     "Resolve the following issue by changing the code of the repository in the current checkout. "
