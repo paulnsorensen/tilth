@@ -40,16 +40,16 @@ pub struct ResolvedTarget {
 
 /// Resolve a path/line target by its stable source-byte occurrence identity.
 /// The identity prevents same-line declarations from being re-resolved by line alone.
-/// The rescan uses the hint's glob, so a follow never resolves outside its glob.
+/// The rescan covers only `path`, so a repo-wide hit cap never drops the target;
+/// the caller checks the hint's glob.
 pub(crate) fn resolve_by_path_line_occurrence(
     path: &Path,
     line: u32,
     name: &str,
     occurrence: (usize, usize),
-    (scope, glob): (&Path, Option<&str>),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let result = super::search_symbol_raw_cached(name, scope, glob, cache)?;
+    let result = search_symbol_in_file(path, name, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
@@ -73,6 +73,27 @@ pub(crate) fn resolve_by_path_line_occurrence(
         candidate.def_range.map(|(_, end)| end),
         name.to_string(),
         false,
+        cache,
+    )
+}
+
+/// Symbol search limited to the one file `path`.
+pub(crate) fn search_symbol_in_file(
+    path: &Path,
+    name: &str,
+    cache: &OutlineCache,
+) -> Result<crate::types::SearchResult, TilthError> {
+    let file = path
+        .file_name()
+        .and_then(|file| file.to_str())
+        .ok_or_else(|| TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: None,
+        })?;
+    super::search_symbol_raw_cached(
+        name,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        Some(&globset::escape(file)),
         cache,
     )
 }
@@ -244,27 +265,15 @@ pub(crate) fn resolve_candidate_with_source_exact(
         cache,
     )?;
     let canonical = path.canonicalize().ok();
-    let valid = path
-        .file_name()
-        .and_then(|file| file.to_str())
-        .and_then(|file| {
-            super::search_symbol_raw_cached(
-                name,
-                path.parent().unwrap_or_else(|| Path::new(".")),
-                Some(&globset::escape(file)),
-                cache,
-            )
-            .ok()
+    let valid = search_symbol_in_file(path, name, cache).is_ok_and(|result| {
+        result.matches.iter().any(|candidate| {
+            candidate.is_definition
+                && candidate.path.canonicalize().ok() == canonical
+                && candidate.line == start_line
+                && candidate.def_name.as_deref() == Some(name)
+                && candidate.def_byte_range == Some(occurrence)
         })
-        .is_some_and(|result| {
-            result.matches.iter().any(|candidate| {
-                candidate.is_definition
-                    && candidate.path.canonicalize().ok() == canonical
-                    && candidate.line == start_line
-                    && candidate.def_name.as_deref() == Some(name)
-                    && candidate.def_byte_range == Some(occurrence)
-            })
-        });
+    });
     if !valid || target.name != name {
         return Err(TilthError::NotFound {
             path: path.to_path_buf(),

@@ -81,6 +81,70 @@ class GoSignatureQuery(SearchFixture):
         self.assertEqual(payload["diagnostics"].get("normalizations", []), [])
 
 
+class GoReceiverScope(SearchFixture):
+    def setUp(self):
+        super().setUp()
+        for index, receiver in enumerate(("MatchExpression", "MatchHost", "MatchPath")):
+            (self.root / f"match_{index}.go").write_text(
+                f"package caddy\n\ntype {receiver} struct{{}}\n\n"
+                f"func (m *{receiver}) UnmarshalCaddyfile(d *Dispenser) error {{\n"
+                f"\treturn nil // {receiver}\n}}\n")
+
+    def test_receiver_selects_its_own_method(self):
+        query = "func (m *MatchHost) UnmarshalCaddyfile(d *Dispenser) error {"
+        result = self.search([{"query": query}])["results"][0]
+        self.assertEqual(result["resolved_as"], "symbol", result)
+        self.assertIn("return nil // MatchHost", result["core"])
+
+    def test_unknown_receiver_searches_the_signature_literally(self):
+        query = "func (m *MatchNothing) UnmarshalCaddyfile(d *Dispenser) error {"
+        result = self.search([{"query": query}])["results"][0]
+        self.assertEqual(result["resolved_as"], "miss", result)
+
+    def test_receiverless_method_name_stays_ambiguous(self):
+        result = self.search([{"query": "func UnmarshalCaddyfile"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+
+
+class ContainerHitIsNotReturnedWhole(SearchFixture):
+    def test_large_class_is_cut_with_a_continuation(self):
+        methods = "".join(
+            f"    def method_{i}(self):\n        return compute({i}, 'padding padding')\n\n"
+            for i in range(450))
+        (self.root / "big.py").write_text(f"class BigClass:\n{methods}")
+        result = self.search([{"query": "BigClass"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "symbol", result)
+        shown = len(result["core"].splitlines())
+        self.assertLessEqual(shown, 60, shown)
+        self.assertEqual(result["completeness"], "partial", result)
+        self.assertEqual(result["continue"], f"big.py#{shown + 1}-{result['core_end']}")
+        self.assertGreater(result["core_end"], 1000, result)
+
+
+class CandidateFollowBeyondTen(SearchFixture):
+    def test_fifteenth_candidate_follows_without_glob(self):
+        for index in range(30):
+            (self.root / f"r{index:02}.go").write_text(
+                f"package p{index}\n\nfunc Render() int {{\n\treturn {index}\n}}\n")
+        result = self.search([{"query": "Render"}], budget=24000)["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+        candidates = result["candidates"]
+        self.assertEqual(len(candidates), 30)
+        candidate = candidates[14]
+        hint = {"kind": "fetch_callers", "target": {
+            "path": candidate["path"], "scope": ".", "line": candidate["line"],
+            "name": candidate["def_name"], "occurrence": candidate["occurrence"]}}
+        request = harness.tools_call_request(
+            2, "tilth_search", {"cwd": self.cwd, "queries": [{"follow": hint}]})
+        run = harness.run_mcp([], [harness.initialize_request(), request])
+        response = run.response_by_id(2)
+        self.assertFalse(harness.tool_is_error(response), harness.tool_result_text(response))
+        followed = json.loads(harness.tool_result_text(response))["results"][0]
+        self.assertEqual(followed["resolved_as"], "fetch_callers", followed)
+        self.assertEqual(followed["target"]["path"], candidate["path"], followed)
+        self.assertEqual(followed["status"], "no_match", followed)
+
+
 def long_function(name, body_lines):
     body = "".join(f"    step_{i} = compute({i}, 'padding padding')\n" for i in range(body_lines))
     return f"def {name}():\n{body}    return step_last\n"

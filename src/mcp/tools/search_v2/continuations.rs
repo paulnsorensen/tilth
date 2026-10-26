@@ -111,40 +111,30 @@ impl Target {
         }
         if let Some(line) = self.line {
             let (target, _, _) = match (self.name.as_deref(), self.occurrence) {
-                (Some(name), Some(occurrence)) => target::resolve_by_path_line_occurrence(
-                    &full,
-                    line,
-                    name,
-                    occurrence,
-                    (cwd, self.glob.as_deref()),
-                    cache,
-                ),
+                (Some(name), Some(occurrence)) => {
+                    target::resolve_by_path_line_occurrence(&full, line, name, occurrence, cache)
+                }
                 _ => target::resolve_by_path_line(&full, line, cache),
             }
             .map_err(|e| e.to_string())?;
             if target.start_line != line || Some(&target.name) != self.name.as_ref() {
                 return Err("follow target identity changed; search again".into());
             }
-            self.validate_occurrence(&full, cwd, cache)?;
+            self.validate_occurrence(&full, cache)?;
         }
         Ok(())
     }
 
-    fn validate_occurrence(
-        &self,
-        full: &Path,
-        cwd: &Path,
-        cache: &OutlineCache,
-    ) -> Result<(), String> {
+    fn validate_occurrence(&self, full: &Path, cache: &OutlineCache) -> Result<(), String> {
         let Some(occurrence) = self.occurrence else {
             return Ok(());
         };
         let Some(name) = self.name.as_deref() else {
             return Err("follow occurrence requires a symbol target".into());
         };
-        let result =
-            crate::search::search_symbol_raw_cached(name, cwd, self.glob.as_deref(), cache)
-                .map_err(|e| e.to_string())?;
+        // Scan only the target file: a repo-wide scan keeps the top few hits
+        // and would drop a candidate the search listed.
+        let result = target::search_symbol_in_file(full, name, cache).map_err(|e| e.to_string())?;
         let canonical = full.canonicalize().map_err(|e| e.to_string())?;
         let matches = result.matches.iter().filter(|candidate| {
             candidate.is_definition
@@ -217,18 +207,13 @@ impl Follow {
         let full = cwd.join(&self.target.path);
         let line = self.target.line.unwrap();
         let (target, content, lang) = match (self.target.name.as_deref(), self.target.occurrence) {
-            (Some(name), Some(occurrence)) => target::resolve_by_path_line_occurrence(
-                &full,
-                line,
-                name,
-                occurrence,
-                (cwd, self.target.glob.as_deref()),
-                cache,
-            ),
+            (Some(name), Some(occurrence)) => {
+                target::resolve_by_path_line_occurrence(&full, line, name, occurrence, cache)
+            }
             _ => target::resolve_by_path_line(&full, line, cache),
         }
         .map_err(|e| e.to_string())?;
-        self.target.validate_occurrence(&full, cwd, cache)?;
+        self.target.validate_occurrence(&full, cache)?;
         let parsed = cache.parse_source(&full, &content);
         let mut partial = false;
         let mut items = Vec::new();

@@ -38,7 +38,7 @@ fn cap_with_file_coverage(ranked: Vec<Match>, cap: usize) -> Vec<Match> {
         if count == cap {
             break;
         }
-        if files.insert(m.path.clone()) {
+        if files.insert(m.path.as_path()) {
             picked[index] = true;
             count += 1;
         }

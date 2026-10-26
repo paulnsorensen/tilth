@@ -486,11 +486,12 @@ fn reduce_response(
                     && counts[index].as_ref().is_some_and(|c| !c.is_empty())
             });
 
-    for (index, owner, field, size) in plain {
+    for (index, owner, field, _) in plain {
         if crate::types::estimate_tokens(len as u64) <= budget {
             break;
         }
         let result = &mut response["results"][index];
+        let before = result.to_string().len();
         let removed = match owner {
             None => result.as_object_mut().and_then(|o| o.remove(field)),
             Some(key) => result[key].as_object_mut().and_then(|o| o.remove(field)),
@@ -498,10 +499,14 @@ fn reduce_response(
         if removed.is_none() {
             continue;
         }
-        len -= size;
-        // The trim markers below add bytes back; measure the record around them
-        // so `len` stays exact and the final serialization needs no re-check.
-        let before = result.to_string().len();
+        // `continue` and `core_end` point past the dropped lines; without
+        // `core` they would hide the lines before them.
+        if owner.is_none() && field == "core" {
+            if let Some(object) = result.as_object_mut() {
+                object.remove("continue");
+                object.remove("core_end");
+            }
+        }
         if let Some(key) = owner {
             result[key]["coverage"] = json!("partial");
         }
@@ -834,10 +839,25 @@ fn route_query(
     // 1b. Go declaration signature — `func (r *T) Name(...)` carries `(`, `*`
     // and `)`, which would route to regex and miss. Resolve it to the symbol
     // and report the rewrite in the diagnostics.
+    // A receiver narrows the symbol to that type's method; when it does not
+    // single one out, the signature text is searched literally instead.
     if let Some(signature) = go_signature(query) {
-        let (mut result, route, hints) =
-            route_identifier(signature.name, glob, cwd, cache, session, budget)?;
+        let receiver_scope = signature
+            .receiver
+            .map(|receiver| (go_receiver_type(receiver), query));
+        let (mut result, route, hints) = route_identifier(
+            signature.name,
+            receiver_scope,
+            glob,
+            cwd,
+            cache,
+            session,
+            budget,
+        )?;
         result["query"] = json!(query);
+        if signature.receiver.is_some() && route != "symbol" {
+            return Ok((result, route, hints, None));
+        }
         let mut diag = json!({
             "query": query,
             "normalized_to": signature.name,
@@ -868,7 +888,7 @@ fn route_query(
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
             let (mut result, route, hints) =
-                route_identifier(ident, glob, cwd, cache, session, budget)?;
+                route_identifier(ident, None, glob, cwd, cache, session, budget)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -904,7 +924,8 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session, budget)?;
+        let (result, route, hints) =
+            route_identifier(query, None, glob, cwd, cache, session, budget)?;
         return Ok((result, route, hints, None));
     }
 
@@ -916,9 +937,13 @@ fn route_query(
 /// Route a bare identifier through the definitions-first symbol cascade:
 /// unique code definition -> ambiguous multi-definition -> usage/literal
 /// fallback -> miss. Shared by the plain identifier route and the
-/// signature-prefix-normalized route.
+/// signature-prefix-normalized route. `receiver_scope` is a Go receiver type
+/// plus the full signature text: only that type's methods count as
+/// definitions, and any other outcome than one hit searches the signature
+/// text literally.
 fn route_identifier(
     query: &str,
+    receiver_scope: Option<(&str, &str)>,
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
@@ -967,6 +992,18 @@ fn route_identifier(
             false
         }
     });
+    if let Some((receiver_type, signature_text)) = receiver_scope {
+        code_defs.retain(|m| {
+            go_func_head(m.text.trim())
+                .and_then(|(receiver, _)| receiver)
+                .is_some_and(|receiver| go_receiver_type(receiver) == receiver_type)
+        });
+        if code_defs.len() != 1 {
+            let (result, route) =
+                content_route(signature_text, glob, cwd, cache, session, None, budget)?;
+            return Ok((result, route, Vec::new()));
+        }
+    }
     if code_defs.len() == 1 {
         let target = &code_defs[0];
         let (mut result, hints) = unique_hit(
@@ -1055,7 +1092,6 @@ fn content_route(
 fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     const KEYWORDS: &[&str] = &[
         "fn",
-        "func",
         "function",
         "def",
         "class",
@@ -1088,19 +1124,7 @@ struct GoSignature<'a> {
 /// `func (T) Name` or `func (m *T) Name(args) ret`. Anything with regex
 /// escapes or wildcards in the receiver or parameter list stays a regex.
 fn go_signature(query: &str) -> Option<GoSignature<'_>> {
-    let rest = query.trim().strip_prefix("func")?;
-    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
-    let (receiver, rest) = match rest.strip_prefix('(') {
-        Some(inner) => {
-            let close = inner.find(')')?;
-            let receiver = inner[..close].trim();
-            if !is_go_receiver(receiver) {
-                return None;
-            }
-            (Some(receiver), inner[close + 1..].trim_start())
-        }
-        None => (None, rest),
-    };
+    let (receiver, rest) = go_func_head(query)?;
     let name_end = rest
         .find(|c: char| c != '_' && !c.is_ascii_alphanumeric())
         .unwrap_or(rest.len());
@@ -1108,11 +1132,82 @@ fn go_signature(query: &str) -> Option<GoSignature<'_>> {
     if !is_identifier(name) {
         return None;
     }
-    let regex_tail = tail.contains('\\') || tail.contains(".*") || tail.contains(".+");
-    if !(tail.is_empty() || tail.starts_with('(') || tail.starts_with('[')) || regex_tail {
+    if !is_go_signature_tail(tail) {
         return None;
     }
     Some(GoSignature { receiver, name })
+}
+
+/// Split `func`, an optional receiver, and the rest of a Go declaration.
+fn go_func_head(query: &str) -> Option<(Option<&str>, &str)> {
+    let rest = query.trim().strip_prefix("func")?;
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+    match rest.strip_prefix('(') {
+        Some(inner) => {
+            let close = inner.find(')')?;
+            let receiver = inner[..close].trim();
+            if !is_go_receiver(receiver) {
+                return None;
+            }
+            Some((Some(receiver), inner[close + 1..].trim_start()))
+        }
+        None => Some((None, rest)),
+    }
+}
+
+/// What follows the declared name: nothing, a parameter list, or a type
+/// parameter list (`[T any]`). Regex operators or a character class mean the
+/// query is a pattern. A final `{` is the body opener of a pasted declaration.
+fn is_go_signature_tail(tail: &str) -> bool {
+    let tail = tail.trim_end();
+    let tail = match tail.strip_suffix('{') {
+        Some(before) => before.trim_end(),
+        None => tail,
+    };
+    if tail.is_empty() {
+        return true;
+    }
+    // `{}` is an empty struct or interface type, not a repetition operator.
+    let probe = tail.replace("{}", "");
+    for marker in ['\\', '|', '?', '+', '^', '$', '{'] {
+        if probe.contains(marker) {
+            return false;
+        }
+    }
+    if tail.contains(".*") {
+        return false;
+    }
+    match tail.strip_prefix('[') {
+        Some(inner) => {
+            let Some(close) = inner.find(']') else {
+                return false;
+            };
+            let after = inner[close + 1..].trim_start();
+            is_go_type_params(&inner[..close]) && (after.is_empty() || after.starts_with('('))
+        }
+        None => tail.starts_with('('),
+    }
+}
+
+/// `T any`, `K comparable, V any`: each part is an identifier and a constraint.
+fn is_go_type_params(params: &str) -> bool {
+    for part in params.split(',') {
+        let mut tokens = part.split_whitespace();
+        let Some(name) = tokens.next() else {
+            return false;
+        };
+        if !is_identifier(name) || tokens.next().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The type name of a Go receiver: `m *T[K]` -> `T`.
+fn go_receiver_type(receiver: &str) -> &str {
+    let type_token = receiver.split_whitespace().last().unwrap_or(receiver);
+    let type_name = type_token.trim_start_matches('*');
+    type_name.split('[').next().unwrap_or(type_name)
 }
 
 /// `T`, `*T`, `m T`, `m *T`, optionally with type parameters (`T[K]`).
@@ -1133,9 +1228,7 @@ fn is_go_receiver(receiver: &str) -> bool {
     if tokens.next().is_some() {
         return false;
     }
-    let type_name = type_token.trim_start_matches('*');
-    let type_name = type_name.split('[').next().unwrap_or(type_name);
-    is_identifier(type_name)
+    is_identifier(go_receiver_type(type_token))
 }
 
 fn raw_result(query: &str, route: &str, raw: &crate::types::SearchResult) -> Value {
@@ -1248,7 +1341,11 @@ fn unique_hit(
             };
             let span_start = target.span_start_line;
             let end = target.end_line;
-            let shown_lines = construct_line_cap(&content, span_start, end, budget);
+            let shown_lines = if target.kind == crate::types::OutlineKind::Function {
+                construct_line_cap(&content, span_start, end, budget)
+            } else {
+                MIN_CORE_LINES.min(end - span_start + 1)
+            };
             let body = content
                 .lines()
                 .skip(span_start.saturating_sub(1) as usize)
@@ -1295,11 +1392,15 @@ fn unique_hit(
     Ok((result, hints))
 }
 
-/// Lines of a `span_start..=end` construct to print: all of them when the
-/// construct fits half the response budget, else the longest prefix that fits.
-/// Never fewer than `MIN_CORE_LINES`, so a tiny budget keeps the old preview.
+/// Lines of a function or method printed even when the budget is tiny; every
+/// other kind (class, struct, module, interface, ...) is cut here with a
+/// continuation, so a container query never returns a whole file.
+const MIN_CORE_LINES: u32 = 60;
+
+/// Lines of a `span_start..=end` function to print: all of them when it fits
+/// half the response budget, else the longest prefix that fits. Never fewer
+/// than `MIN_CORE_LINES`, so a tiny budget keeps the old preview.
 fn construct_line_cap(content: &str, span_start: u32, end: u32, budget: u64) -> u32 {
-    const MIN_CORE_LINES: u32 = 60;
     let allowed_bytes = budget.saturating_mul(2);
     let total = end - span_start + 1;
     let mut used: u64 = 0;
@@ -1520,7 +1621,7 @@ mod tests {
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let (cache, session, _bloom) = components();
         let (result, route, hints) =
-            route_identifier("root", None, tmp.path(), &cache, &session, 24_000).unwrap();
+            route_identifier("root", None, None, tmp.path(), &cache, &session, 24_000).unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -1595,8 +1696,12 @@ mod tests {
             assert_eq!(result["results"][0]["status"], "ambiguous");
             assert_eq!(result["results"][0]["completeness"], "partial");
             let shown = result["results"][0]["candidates"].as_array().unwrap().len();
-            assert!(shown <= definitions.min(100), "{shown}");
-            assert!(definitions < 100 || shown < definitions, "{shown}");
+            assert_eq!(
+                shown,
+                definitions.min(crate::search::content::match_cap_for_budget(
+                    crate::budget::DEFAULT_BUDGET
+                ))
+            );
             let record: Value = serde_json::from_str(
                 std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
                     .unwrap()
@@ -2333,7 +2438,12 @@ mod tests {
         assert_eq!(result["resolved_as"], "path");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
-        assert!(result["total_found"].as_u64().unwrap() > 10);
+        let preview = result["preview"].as_str().unwrap();
+        let shown = (0..120)
+            .filter(|index| preview.contains(&format!("reference-{index}.txt")))
+            .count();
+        assert!(shown > 0, "{preview}");
+        assert!(result["total_found"].as_u64().unwrap() > shown as u64);
     }
 
     #[test]
@@ -2918,10 +3028,67 @@ mod tests {
         assert_eq!(response["results"][0]["status"], "partial");
         let mut small_args = args.clone();
         small_args["budget"] = json!(450);
-        let small = call(&small_args);
-        if let Ok(small) = small {
-            assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 450);
-            assert_eq!(small["results"][0]["status"], "partial");
+        let small = call(&small_args).unwrap();
+        assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 450);
+        assert_eq!(small["results"][0]["status"], "partial");
+        assert!(small["results"][0].get("core").is_none());
+        assert!(small["results"][0].get("continue").is_none());
+        assert!(small["results"][0].get("core_end").is_none());
+    }
+
+    #[test]
+    fn dropping_core_drops_its_continuation_hints() {
+        let response = json!({"results": [{
+            "query": "root", "resolved_as": "symbol", "status": "partial",
+            "completeness": "partial", "core": "let _value = 1;\n".repeat(400),
+            "core_end": 3002, "continue": "root.rs#61-3002",
+        }], "hints": [], "diagnostics": {}});
+        let (output, limited) = reduce(&response, 100).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert!(limited);
+        let result = &parsed["results"][0];
+        assert!(result.get("core").is_none());
+        assert!(result.get("continue").is_none(), "{result}");
+        assert!(result.get("core_end").is_none(), "{result}");
+    }
+
+    #[test]
+    fn go_signature_tail_rejects_regex_operators() {
+        for query in [
+            "func Get(User|Order)",
+            "func New[A-Z]",
+            "func New[A-Z](x int)",
+            "func Get(a)?",
+            "func Get(a+)",
+            "func Get(^a)",
+            "func Get(a$)",
+            "func Get(a{2})",
+        ] {
+            assert!(go_signature(query).is_none(), "{query}");
+        }
+        for query in [
+            "func Get(a int) int",
+            "func Map[T any, U any](a T) U",
+            "func (m *M) Name(d *D) error {",
+            "func Do(a interface{}) {",
+            "func Name",
+        ] {
+            assert!(go_signature(query).is_some(), "{query}");
+        }
+    }
+
+    #[test]
+    fn go_regex_lookalike_queries_stay_regex() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.go"),
+            "package a\n\nfunc NewA() {}\nfunc GetUser() {}\n",
+        )
+        .unwrap();
+        for query in ["func New[A-Z]", "func Get(User|Order)"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            assert_eq!(response["results"][0]["resolved_as"], "regex", "{query}");
         }
     }
 

@@ -101,9 +101,10 @@ pub(crate) fn search_cached_for_budget(
     budget: u64,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = super::content::match_cap_for_budget(budget);
+    // The walk must outrun the hit cap, or an early quit looks like a complete result.
     let limits = (
         max_matches,
-        EARLY_QUIT_THRESHOLD_DEFINITIONS,
+        EARLY_QUIT_THRESHOLD_DEFINITIONS.max(max_matches * 2),
         max_matches * 3,
     );
     search_with_limits(query, scope, None, glob, cache, limits)
@@ -751,6 +752,27 @@ mod tests {
         .iter()
         .filter(|found| found.is_definition)
         .count()
+    }
+
+    #[test]
+    fn budget_walk_does_not_quit_before_its_hit_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The ordered walk checks the quit threshold per 128-file batch: the
+        // first batch holds 55 definitions, a later batch holds 20 more.
+        for (prefix, count, body) in [
+            ("a", 55, "fn root() {}\n"),
+            ("b", 200, "fn other() {}\n"),
+            ("z", 20, "fn root() {}\n"),
+        ] {
+            for index in 0..count {
+                std::fs::write(tmp.path().join(format!("{prefix}{index:03}.rs")), body).unwrap();
+            }
+        }
+        let cache = crate::cache::OutlineCache::new();
+        let result = search_cached_for_budget("root", tmp.path(), None, &cache, 24_000).unwrap();
+        let shown = result.matches.iter().filter(|m| m.is_definition).count();
+        assert_eq!(shown, 60);
+        assert_eq!(result.definitions, 75);
     }
 
     #[test]
