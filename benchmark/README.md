@@ -629,7 +629,7 @@ Chains live in `chains.py`. Pass `--tasks chain:<id>`, or list `chain:<id>` as a
 Preview a plan without any model call or `--max-usd`:
 
 ```bash
-python3 benchmark/run.py --tasks chain:gin-edit-7 --modes baseline --models sonnet --reps 1 --dry-run
+python3 benchmark/run.py --tasks chain:gin-edit-5 --modes baseline --models sonnet --reps 1 --dry-run
 ```
 
-The committed chains are `gin-edit-7`, `fastapi-edit-5`, and `rg-edit-7`. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.
+The committed chains are `gin-edit-5`, `fastapi-edit-5`, `rg-edit-7`, and `express-edit-6`. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.

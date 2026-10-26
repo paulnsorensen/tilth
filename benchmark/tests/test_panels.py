@@ -705,7 +705,8 @@ def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
     languages = {entry["id"]: entry["language"] for entry in data["members"]}
     panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
 
-    assert len(panel.members) == 19
+    assert len(panel.members) == 18
+    assert not {"sharkdp__bat-1892", "chain:gin-edit-7"} & {member.id for member in panel.members}
     assert panel.cheap == ()
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
