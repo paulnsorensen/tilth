@@ -964,9 +964,15 @@ def _task_source_files(task: object) -> dict[str, str]:
     These hold the grader (`check_correctness`, `required_matches`, module
     helpers), so a grading edit changes the task digest. Keys are relative to the
     benchmark directory, or a bare file name outside it, so they match across hosts.
+
+    ``chains.ChainTask`` is skipped: ``chains.py`` holds every chain definition, so
+    hashing it would move each chain's key when another chain changes. A chain keys
+    on its members' digests and ``chains.CHAIN_PROTOCOL`` instead.
     """
     sources = {}
     for cls in type(task).__mro__:
+        if cls is chains.ChainTask:
+            continue
         try:
             source_file = inspect.getsourcefile(cls)
         except TypeError:
