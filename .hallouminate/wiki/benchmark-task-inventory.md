@@ -4,28 +4,28 @@ Keep the local suite as a tool regression suite. Strengthen its graders before t
 
 ## Snapshot and count correction
 
-The built-in registry holds **58 tasks** at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5` (main after #313 to #319).[^1]
-Registry introspection at that SHA gives the same sorted set of 58 task IDs as at `9fa37b51fb655294f6718ff4da1a00ba52a68a53` (the #280 merge), so #313 to #319 add no built-in task.
-The opening inventory held **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`; #280 added `gin_edit_render_context`.
-`CLAUDE.md` states 58 tasks and matches the registry.
+The built-in registry holds **61 tasks** at `50f3e46e109c60eda785cd71ca78c998275799c8` (main after #392).[^1]
+The opening inventory held **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`. #280 added `gin_edit_render_context`. #313 to #319 added no task.
+Three migration tasks then raised the count to 61: `express_edit_example_start` (#369), `fastapi_edit_security_raise_on_missing` (#370), and `rg_edit_flow_migration` (#371).
+`CLAUDE.md` still states 58 tasks, so it lags the registry. Trust the registry.
 FeatureBench and SWE-bench Multilingual instances are external tasks. They are not in this registry (see [FeatureBench integration](featurebench-integration.md)).
 
 | Repository | Original tasks | Current tasks | Read/navigation | Edit |
 | --- | ---: | ---: | ---: | ---: |
 | Synthetic | 11 | 11 | 10 | 1 |
-| ripgrep / Rust | 10 | 10 | 6 | 4 |
-| FastAPI / Python | 10 | 10 | 5 | 5 |
+| ripgrep / Rust | 10 | 11 | 6 | 5 |
+| FastAPI / Python | 10 | 11 | 5 | 6 |
 | Gin / Go | 17 | 18 | 9 | 9 |
-| Express / JavaScript | 9 | 9 | 5 | 4 |
-| **Total** | **57** | **58** | **35** | **23** |
+| Express / JavaScript | 9 | 10 | 5 | 5 |
+| **Total** | **57** | **61** | **35** | **26** |
 
 “Read/navigation” groups the literal `read` and `navigate` task types.
-Current capability labels count 12 locate, 18 trace, 20 fix, four debug, and four control tasks.
+Current capability labels count 12 locate, 18 trace, 23 fix, four debug, and four control tasks.
 These are registry labels, not measured difficulty ratings.
 
 ## All registered items
 
-The table comes from registry-object introspection at the SHA above.
+The table comes from registry-object introspection. The three migration rows were added after checking their task names, types, and graders at the SHA of the first footnote.
 Response strings check answer substrings, not executable behavior.
 Workspace tests run inside the candidate workspace.
 The base grader only selects that test route for edit tasks with mutations and a test command.[^2]
@@ -54,6 +54,7 @@ The base grader only selects that test route for edit tasks with mutations and a
 | `rg_edit_line_count` | ripgrep | fix | workspace tests |
 | `rg_edit_line_locate` | ripgrep | fix | workspace tests |
 | `rg_edit_preceding` | ripgrep | fix | workspace tests |
+| `rg_edit_flow_migration` | ripgrep | fix | held-out replay |
 | `fastapi_edit_multi_response` | fastapi | fix | workspace tests |
 | `fastapi_dependency_resolution` | fastapi | trace | response strings |
 | `fastapi_request_validation` | fastapi | trace | response strings |
@@ -61,6 +62,7 @@ The base grader only selects that test route for edit tasks with mutations and a
 | `fastapi_edit_dep_cache` | fastapi | fix | workspace tests |
 | `fastapi_edit_response_filter` | fastapi | fix | workspace tests |
 | `fastapi_edit_scope_cache` | fastapi | fix | workspace tests |
+| `fastapi_edit_security_raise_on_missing` | fastapi | fix | held-out replay |
 | `gin_radix_tree` | gin | trace | response strings |
 | `gin_client_ip` | gin | locate | response strings |
 | `gin_middleware_chain` | gin | trace | response strings |
@@ -83,6 +85,7 @@ The base grader only selects that test route for edit tasks with mutations and a
 | `express_edit_json_type` | express | fix | workspace tests |
 | `express_edit_cookie_prefix` | express | fix | workspace tests |
 | `express_edit_send_type` | express | fix | workspace tests |
+| `express_edit_example_start` | express | fix | held-out replay |
 | `express_diff_multi_mutation` | express | debug | workspace tests |
 | `fastapi_diff_which_commit` | fastapi | debug | workspace tests |
 | `rg_diff_misdirected_error` | ripgrep | debug | workspace tests |
@@ -93,8 +96,9 @@ The base grader only selects that test route for edit tasks with mutations and a
 
 ## Keep and strengthen
 
-The current grading mix is 35 response-string checks, 21 workspace-test checks, one diff-pattern check, and one held-out replay.
-The opening snapshot has the same mix without the held-out replay task.
+The current grading mix is 35 response-string checks, 21 workspace-test checks, one diff-pattern check, and four held-out replays.
+The opening snapshot has the same mix without the held-out replay tasks.
+Each held-out replay copies the candidate source changes into a fresh fixture, injects tests the agent cannot edit, and then runs the candidate tests too.
 
 <speculative> These changes are proposals. No gate blocks task growth, and every paid run needs `--max-usd`.
 
@@ -124,8 +128,8 @@ The `analyze.py` power readout is informational only; it gates nothing.
 This inventory does not approve execution.
 See [benchmark selection and rigor](benchmark-selection-and-rigor.md) and [Gin render-context benchmark](benchmark-gin-render-context.md).
 
-[^1]: Registry introspection of `benchmark/tasks/__init__.py` at `1cbebb313dccce0166d8cfc82856dbe5a7c737a5`: 58 tasks; task types edit 23, read 20, navigate 15; repositories gin 18, synthetic 11, fastapi 10, ripgrep 10, express 9. PR #280 added the 58th task.
-[^2]: `Task.check_correctness` in `benchmark/tasks/base.py`, at the SHA above. The test route needs task type `edit`, mutations, and a test command, so `gin_diff_comprehension` (type `read`) uses response strings.
-[^3]: `benchmark/tasks/gin_render_context_tasks.py`, at the SHA above.
+[^1]: Registry introspection of `benchmark/tasks/__init__.py` at `50f3e46e109c60eda785cd71ca78c998275799c8`: 61 tasks; task types edit 26, read 20, navigate 15; repositories gin 18, synthetic 11, fastapi 11, ripgrep 11, express 10. PR #280 added the 58th task. PRs #369, #370, and #371 added the last three.
+[^2]: `Task.check_correctness` in `benchmark/tasks/base.py`. The test route needs task type `edit`, mutations, and a test command, so `gin_diff_comprehension` (type `read`) uses response strings.
+[^3]: `benchmark/tasks/gin_render_context_tasks.py`. The three migration tasks grade in `express_example_start_tasks.py`, `fastapi_security_migration_tasks.py`, and `rg_flow_migration_tasks.py` under `benchmark/tasks/`.
 
-_Source: Registry introspection and grader inspection at 1cbebb313dccce0166d8cfc82856dbe5a7c737a5 · Updated: 2026-10-15 · Supersedes: The opening 57-task count for current-main use only._
+_Source: Registry introspection and grader inspection at 50f3e46e109c60eda785cd71ca78c998275799c8 · Updated: 2026-10-25 · Supersedes: The 58-task count at 1cbebb313dccce0166d8cfc82856dbe5a7c737a5 for current-main use._
