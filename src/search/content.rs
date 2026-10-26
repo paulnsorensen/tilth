@@ -11,9 +11,55 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
-const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+const EARLY_QUIT_FACTOR: usize = 3;
+/// Response tokens one content hit costs on average; sizes the hit cap from a budget.
+const TOKENS_PER_HIT: u64 = 400;
+
+/// Content hits to keep for a response budget in tokens: the fixed floor for
+/// small budgets, growing with the budget up to the full-search ceiling.
+#[must_use]
+pub fn match_cap_for_budget(budget: u64) -> usize {
+    let cap = usize::try_from(budget / TOKENS_PER_HIT).unwrap_or(FULL_MAX_MATCHES);
+    cap.clamp(MAX_MATCHES, FULL_MAX_MATCHES)
+}
+
+/// Keep `cap` ranked matches, taking the best match of each distinct file
+/// before a second match of any file, so one noisy file cannot hide the rest.
+/// Survivors keep their rank order.
+fn cap_with_file_coverage(ranked: Vec<Match>, cap: usize) -> Vec<Match> {
+    if ranked.len() <= cap {
+        return ranked;
+    }
+    let mut picked = vec![false; ranked.len()];
+    let mut files = std::collections::HashSet::new();
+    let mut count = 0;
+    for (index, m) in ranked.iter().enumerate() {
+        if count == cap {
+            break;
+        }
+        if files.insert(m.path.clone()) {
+            picked[index] = true;
+            count += 1;
+        }
+    }
+    for flag in &mut picked {
+        if count == cap {
+            break;
+        }
+        if !*flag {
+            *flag = true;
+            count += 1;
+        }
+    }
+    let mut kept = Vec::with_capacity(cap);
+    for (m, flag) in ranked.into_iter().zip(picked) {
+        if flag {
+            kept.push(m);
+        }
+    }
+    kept
+}
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 /// Returns the result plus, when a regex pattern failed to compile and was
@@ -27,11 +73,20 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<(SearchResult, Option<String>), TilthError> {
-    let (max_matches, early_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
-    } else {
-        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    search_capped(pattern, scope, is_regex, context, glob, max_matches)
+}
+
+/// Like `search`, keeping at most `max_matches` hits.
+pub fn search_capped(
+    pattern: &str,
+    scope: &Path,
+    is_regex: bool,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    max_matches: usize,
+) -> Result<(SearchResult, Option<String>), TilthError> {
+    let early_quit = max_matches * EARLY_QUIT_FACTOR;
     let invalid_query = |reason: String| TilthError::InvalidQuery {
         query: pattern.to_string(),
         reason,
@@ -119,7 +174,7 @@ pub fn search(
     let total = all_matches.len();
 
     rank::sort(&mut all_matches, pattern, scope, context);
-    all_matches.truncate(max_matches);
+    let all_matches = cap_with_file_coverage(all_matches, max_matches);
 
     Ok((
         SearchResult {
@@ -134,4 +189,56 @@ pub fn search(
         },
         fallback_reason,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn hit(path: &str, line: u32) -> Match {
+        Match {
+            path: PathBuf::from(path),
+            line,
+            text: String::new(),
+            is_definition: false,
+            exact: false,
+            file_lines: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            def_range: None,
+            def_byte_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        }
+    }
+
+    #[test]
+    fn cap_grows_with_budget_between_the_floor_and_ceiling() {
+        assert_eq!(match_cap_for_budget(1), MAX_MATCHES);
+        assert_eq!(match_cap_for_budget(8_000), 20);
+        assert_eq!(match_cap_for_budget(24_000), 60);
+        assert_eq!(match_cap_for_budget(10_000_000), FULL_MAX_MATCHES);
+    }
+
+    #[test]
+    fn cap_covers_distinct_files_before_repeating_one() {
+        let mut ranked: Vec<Match> = (1..=6).map(|line| hit("noisy.rs", line)).collect();
+        ranked.push(hit("b.rs", 1));
+        ranked.push(hit("c.rs", 1));
+        let kept = cap_with_file_coverage(ranked, 4);
+        let labels: Vec<(String, u32)> = kept
+            .iter()
+            .map(|m| (m.path.to_string_lossy().into_owned(), m.line))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("noisy.rs".to_string(), 1),
+                ("noisy.rs".to_string(), 2),
+                ("b.rs".to_string(), 1),
+                ("c.rs".to_string(), 1),
+            ]
+        );
+    }
 }

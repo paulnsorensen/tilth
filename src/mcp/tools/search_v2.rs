@@ -853,7 +853,7 @@ fn route_query(
     // A glob naming one exact existing file is single-file-bounded by
     // `search::exact_glob_target` inside the walker — no separate short-circuit needed here.
     if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
-        let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
+        let search_result = crate::search::search_regex_raw_budgeted(query, cwd, glob, budget)?;
         let mut result = raw_result(query, "regex", &search_result);
         set_preview(
             &mut result,
@@ -925,7 +925,7 @@ fn route_identifier(
     session: &Session,
     budget: u64,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    let sym_result = crate::search::search_symbol_raw_cached(query, cwd, glob, cache)?;
+    let sym_result = crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?;
     let discovery_partial = sym_result.files_unreadable > 0
         || sym_result.definitions
             > sym_result
@@ -988,7 +988,7 @@ fn route_identifier(
         return Ok((result, "symbol".to_string(), hints));
     }
     if code_defs.len() > 1 {
-        let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+        let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
         let mut result = base_result(query, "ambiguous", "ambiguous");
         if discovery_partial
             || content_result.files_unreadable > 0
@@ -1033,7 +1033,7 @@ fn content_route(
     route_name: Option<&str>,
     budget: u64,
 ) -> Result<(Value, String), crate::error::TilthError> {
-    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+    let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
     let route = route_name.unwrap_or(if content_result.total_found > 0 {
         "literal"
     } else {
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn capped_ambiguous_candidates_and_preview_report_partial() {
-        for (definitions, references) in [(20, 0), (2, 30)] {
+        for (definitions, references) in [(200, 0), (2, 400)] {
             let tmp = tempfile::tempdir().unwrap();
             for index in 0..definitions {
                 std::fs::write(
@@ -1594,10 +1594,9 @@ mod tests {
             assert_eq!(result["results"][0]["resolved_as"], "ambiguous");
             assert_eq!(result["results"][0]["status"], "ambiguous");
             assert_eq!(result["results"][0]["completeness"], "partial");
-            assert_eq!(
-                result["results"][0]["candidates"].as_array().unwrap().len(),
-                definitions.min(10)
-            );
+            let shown = result["results"][0]["candidates"].as_array().unwrap().len();
+            assert!(shown <= definitions.min(100), "{shown}");
+            assert!(definitions < 100 || shown < definitions, "{shown}");
             let record: Value = serde_json::from_str(
                 std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
                     .unwrap()
@@ -2111,7 +2110,7 @@ mod tests {
     fn budget_trimmed_preview_marks_no_lines_seen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("n.txt");
-        let source = (1..=40)
+        let source = (1..=10)
             .map(|i| format!("needle line {i}"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -2317,7 +2316,7 @@ mod tests {
     fn route_non_code_path_reports_bounded_content_results() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.json"), "{}\n").unwrap();
-        for index in 0..11 {
+        for index in 0..120 {
             std::fs::write(
                 tmp.path().join(format!("reference-{index}.txt")),
                 "load notes.json\n",

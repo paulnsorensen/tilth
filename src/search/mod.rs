@@ -632,6 +632,17 @@ pub(crate) fn search_symbol_raw_cached(
     symbol::search_cached(query, scope, None, glob, false, cache)
 }
 
+/// Symbol search for a query route: keeps as many matches as `budget` tokens allow.
+pub(crate) fn search_symbol_raw_for_budget(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached_for_budget(query, scope, glob, cache, budget)
+}
+
 /// Raw content search — returns structured result for programmatic inspection.
 pub fn search_content_raw(
     query: &str,
@@ -649,6 +660,29 @@ pub fn search_regex_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     content::search(pattern, scope, true, None, glob, false).map(|(result, _)| result)
+}
+
+/// Like `search_content_raw`, keeping as many hits as `budget` tokens allow.
+pub fn search_content_raw_budgeted(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let (pattern, is_regex) = parse_pattern(query);
+    let cap = content::match_cap_for_budget(budget);
+    content::search_capped(pattern, scope, is_regex, None, glob, cap).map(|(result, _)| result)
+}
+
+/// Like `search_regex_raw`, keeping as many hits as `budget` tokens allow.
+pub fn search_regex_raw_budgeted(
+    pattern: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let cap = content::match_cap_for_budget(budget);
+    content::search_capped(pattern, scope, true, None, glob, cap).map(|(result, _)| result)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1758,15 +1792,24 @@ fn format_search_result_seen(
                 "\n\n## Tests ({})",
                 count_label(faceted.tests.len(), totals.tests)
             );
-            // Compact test format — one line per match, no expand budget consumed
+            // One tagged block per file, printing only the matched lines. No
+            // expand budget is consumed.
+            let mut test_files: Vec<(&Path, Vec<&Match>)> = Vec::new();
             for m in &faceted.tests {
-                let _ = write!(
-                    out,
-                    "\n  {}:{} — {}",
-                    rel(&m.path, &result.scope),
-                    m.line,
-                    m.text.trim()
-                );
+                match test_files.iter_mut().find(|(path, _)| *path == m.path) {
+                    Some((_, group)) => group.push(m),
+                    None => test_files.push((m.path.as_path(), vec![m])),
+                }
+            }
+            for (_, group) in &test_files {
+                let start = out.len();
+                format_grouped_usages(group, &result.scope, cache, session, &mut out, &mut seen);
+                let value = group
+                    .iter()
+                    .map(|m| i64::from(m.def_weight))
+                    .max()
+                    .unwrap_or(0);
+                segments.push((value, start, out.len()));
             }
             write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
         }

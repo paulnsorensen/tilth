@@ -76,7 +76,7 @@ pub(crate) fn search_cached(
     full: bool,
     cache: &crate::cache::OutlineCache,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
+    let limits = if full {
         (
             FULL_MAX_MATCHES,
             FULL_EARLY_QUIT_DEFINITIONS,
@@ -89,6 +89,36 @@ pub(crate) fn search_cached(
             EARLY_QUIT_THRESHOLD_USAGES,
         )
     };
+    search_with_limits(query, scope, context, glob, cache, limits)
+}
+
+/// Like `search_cached`, keeping as many matches as `budget` tokens allow.
+pub(crate) fn search_cached_for_budget(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let max_matches = super::content::match_cap_for_budget(budget);
+    let limits = (
+        max_matches,
+        EARLY_QUIT_THRESHOLD_DEFINITIONS,
+        max_matches * 3,
+    );
+    search_with_limits(query, scope, None, glob, cache, limits)
+}
+
+/// `limits` is `(max_matches, definition early-quit, usage early-quit)`.
+fn search_with_limits(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+    limits: (usize, usize, usize),
+) -> Result<SearchResult, TilthError> {
+    let (max_matches, def_threshold, usage_threshold) = limits;
 
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
