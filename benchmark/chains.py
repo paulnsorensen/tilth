@@ -52,12 +52,10 @@ CHAINS: dict[str, Chain] = {
     chain.id: chain
     for chain in (
         Chain(
-            "gin-edit-7",
-            (
-                "gin_client_ip", "gin_context_next", "gin_middleware_chain", "gin_servehttp_flow",
-                "grok_gin_new", "grok_context_next", "gin_edit_render_context",
-            ),
-            "Six gin read tasks, then the render-context edit. Estimated 50-60 API calls.",
+            "gin-edit-5",
+            ("gin_client_ip", "gin_middleware_chain", "gin_servehttp_flow", "grok_gin_new", "gin_edit_render_context"),
+            "Four gin read tasks, then the render-context edit. gin_context_next and grok_context_next are left out: "
+            "in a chain the agent answers them without the required HandlersChain string. Estimated 30-40 API calls.",
         ),
         Chain(
             "fastapi-edit-5",
