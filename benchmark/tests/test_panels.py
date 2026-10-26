@@ -4,6 +4,7 @@ import json
 import shutil
 import socket
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -704,7 +705,7 @@ def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
     languages = {entry["id"]: entry["language"] for entry in data["members"]}
     panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
 
-    assert len(panel.members) == 20
+    assert len(panel.members) == 19
     assert panel.cheap == ()
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
@@ -713,7 +714,7 @@ def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
     assert set(panel.test) == {i for i, s in assignment.items() if s == "test"}
 
 
-@pytest.mark.parametrize("chain_id", ["express-edit-6", "gin-route-5"])
+@pytest.mark.parametrize("chain_id", ["express-edit-6"])
 def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> None:
     chain = chains.CHAINS[chain_id]
 
@@ -722,6 +723,17 @@ def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> 
     assert 5 <= len(members) <= 7
     assert members[-1].capability == "fix"
     assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
+
+
+def test_a_task_in_a_dev_chain_and_in_test_is_refused() -> None:
+    leaking = [
+        panels.Member("chain:express-edit-6", "chain", "javascript", "dev"),
+        panels.Member("express_edit_example_start", "local", "javascript", "test"),
+    ]
+
+    with pytest.raises(panels.PanelError, match="express_edit_example_start"):
+        panels._check_no_shared_task(leaking)
+    panels._check_no_shared_task([replace(entry, split="test") for entry in leaking])
 
 
 def test_long_pool_ids_hold_the_controls_and_stay_out_of_the_package_digest(tmp_path: Path, monkeypatch) -> None:

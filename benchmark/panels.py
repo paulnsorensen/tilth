@@ -328,6 +328,21 @@ def _check_split(members: list[Member], split_seed: int) -> None:
                  for member in members if member.id in assignment and member.split != assignment[member.id]]
     if differing:
         raise PanelError(f"recorded split differs from panels.stratify(seed={split_seed}): {'; '.join(differing)}")
+    _check_no_shared_task(members)
+
+
+def _check_no_shared_task(members: list[Member]) -> None:
+    """Refuse a task that reaches both dev and test, directly or as a chain sub-task."""
+    splits: dict[str, set[str]] = {}
+    for member in members:
+        if member.split not in ("dev", "test"):
+            continue
+        chain = chains.CHAINS.get(member.id[len(chains.PREFIX):]) if member.family == "chain" else None
+        for task_name in chain.members if chain else (member.id,):
+            splits.setdefault(task_name, set()).add(member.split)
+    shared = sorted(name for name, seen in splits.items() if len(seen) > 1)
+    if shared:
+        raise PanelError(f"tasks reach both dev and test (directly or through a chain): {', '.join(shared)}")
 
 
 def _check_admitted(members: list[Member], admit: Callable[[str], Any]) -> None:

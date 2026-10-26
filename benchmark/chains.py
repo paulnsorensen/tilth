@@ -83,11 +83,6 @@ CHAINS: dict[str, Chain] = {
             ),
             "Five express read tasks, then the example-start migration edit. Estimated 45-55 API calls.",
         ),
-        Chain(
-            "gin-route-5",
-            ("gin_deps_target", "gin_radix_tree", "gin_client_ip", "gin_context_next", "gin_edit_route_catchall"),
-            "Four gin read tasks, then the catch-all route fix. Estimated 40-50 API calls.",
-        ),
     )
 }
 
