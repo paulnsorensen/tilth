@@ -11,6 +11,17 @@
     {"id": "rg_edit_flow_migration", "family": "local", "language": "rust", "split": "test"},
     {"id": "sharkdp__bat-1892", "family": "swebench_ml", "language": "rust", "split": "dev"},
     {"id": "tokio-rs__axum-1119", "family": "swebench_ml", "language": "rust", "split": "test"},
-    {"id": "vuejs__core-11739", "family": "swebench_ml", "language": "javascript", "split": "test"}
+    {"id": "vuejs__core-11739", "family": "swebench_ml", "language": "javascript", "split": "test"},
+    {"id": "tokio-rs__tokio-4867", "family": "swebench_ml", "language": "rust", "split": "dev"},
+    {"id": "burntsushi__ripgrep-2209", "family": "swebench_ml", "language": "rust", "split": "test"},
+    {"id": "caddyserver__caddy-6350", "family": "swebench_ml", "language": "go", "split": "test"},
+    {"id": "hashicorp__terraform-35611", "family": "swebench_ml", "language": "go", "split": "dev"},
+    {"id": "axios__axios-5085", "family": "swebench_ml", "language": "javascript", "split": "dev"},
+    {"id": "uutils__coreutils-6682", "family": "swebench_ml", "language": "rust", "split": "test"},
+    {"id": "chain:gin-edit-7", "family": "chain", "language": "go", "split": "dev"},
+    {"id": "chain:fastapi-edit-5", "family": "chain", "language": "python", "split": "test"},
+    {"id": "chain:rg-edit-7", "family": "chain", "language": "rust", "split": "dev"},
+    {"id": "chain:express-edit-6", "family": "chain", "language": "javascript", "split": "dev"},
+    {"id": "chain:gin-route-5", "family": "chain", "language": "go", "split": "test"}
   ]
 }

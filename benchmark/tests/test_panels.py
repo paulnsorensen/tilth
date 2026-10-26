@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import chains
 import config
 import external
 import external.data
@@ -17,6 +18,7 @@ import external.featurebench
 import external.swebench_ml
 import panels
 import run
+import tasks
 from panel_support import (
     CHEAP, COMMITTED_PANEL, COMPLETE, EXPECTED_DEV, EXPECTED_TEST, FALLBACKS, FB_ALGORITHMS, FB_IDS, FB_NULLSPACE,
     FB_REGRESSION, GEPA_ROWS, GO_FALLBACK, GO_SLOT, RENDER, RUST_FALLBACK, RUST_SLOT, load, member, panel_run, read,
@@ -701,10 +703,21 @@ def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
     languages = {entry["id"]: entry["language"] for entry in data["members"]}
     panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
 
-    assert len(panel.members) == 9
+    assert len(panel.members) == 20
     assert panel.cheap == ()
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
     assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
     assert set(panel.dev) == {i for i, s in assignment.items() if s == "dev"}
     assert set(panel.test) == {i for i, s in assignment.items() if s == "test"}
+
+
+@pytest.mark.parametrize("chain_id", ["express-edit-6", "gin-route-5"])
+def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> None:
+    chain = chains.CHAINS[chain_id]
+
+    members = chains.parse_chain(chain.id, chain.members, tasks.TASKS)
+
+    assert 5 <= len(members) <= 7
+    assert members[-1].capability == "fix"
+    assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
