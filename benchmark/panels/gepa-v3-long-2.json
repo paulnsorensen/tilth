@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "name": "gepa-v3-long",
+  "name": "gepa-v3-long-2",
   "split_seed": 20261025,
   "members": [
     {"id": "Netflix__metaflow.b390a8d4.test_stub_generator.7bf08c98.lv1", "family": "featurebench", "language": "python", "split": "dev"},
