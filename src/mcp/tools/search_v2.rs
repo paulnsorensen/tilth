@@ -818,6 +818,7 @@ fn route_query(
                     glob,
                     cache,
                     session,
+                    budget,
                 )?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
@@ -828,6 +829,24 @@ fn route_query(
         }
         let result = base_result(query, "path", "ok");
         return Ok((result, "path".to_string(), Vec::new(), None));
+    }
+
+    // 1b. Go declaration signature — `func (r *T) Name(...)` carries `(`, `*`
+    // and `)`, which would route to regex and miss. Resolve it to the symbol
+    // and report the rewrite in the diagnostics.
+    if let Some(signature) = go_signature(query) {
+        let (mut result, route, hints) =
+            route_identifier(signature.name, glob, cwd, cache, session, budget)?;
+        result["query"] = json!(query);
+        let mut diag = json!({
+            "query": query,
+            "normalized_to": signature.name,
+            "stripped_keyword": "func",
+        });
+        if let Some(receiver) = signature.receiver {
+            diag["receiver"] = json!(receiver);
+        }
+        return Ok((result, route, hints, Some(diag)));
     }
 
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
@@ -961,6 +980,7 @@ fn route_identifier(
             glob,
             cache,
             session,
+            budget,
         )?;
         if discovery_partial {
             mark_partial(&mut result);
@@ -1059,6 +1079,65 @@ fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     }
 }
 
+struct GoSignature<'a> {
+    receiver: Option<&'a str>,
+    name: &'a str,
+}
+
+/// Parse a pasted Go declaration: `func Name`, `func Name(args) ret`,
+/// `func (T) Name` or `func (m *T) Name(args) ret`. Anything with regex
+/// escapes or wildcards in the receiver or parameter list stays a regex.
+fn go_signature(query: &str) -> Option<GoSignature<'_>> {
+    let rest = query.trim().strip_prefix("func")?;
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+    let (receiver, rest) = match rest.strip_prefix('(') {
+        Some(inner) => {
+            let close = inner.find(')')?;
+            let receiver = inner[..close].trim();
+            if !is_go_receiver(receiver) {
+                return None;
+            }
+            (Some(receiver), inner[close + 1..].trim_start())
+        }
+        None => (None, rest),
+    };
+    let name_end = rest
+        .find(|c: char| c != '_' && !c.is_ascii_alphanumeric())
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_end);
+    if !is_identifier(name) {
+        return None;
+    }
+    let regex_tail = tail.contains('\\') || tail.contains(".*") || tail.contains(".+");
+    if !(tail.is_empty() || tail.starts_with('(') || tail.starts_with('[')) || regex_tail {
+        return None;
+    }
+    Some(GoSignature { receiver, name })
+}
+
+/// `T`, `*T`, `m T`, `m *T`, optionally with type parameters (`T[K]`).
+fn is_go_receiver(receiver: &str) -> bool {
+    let mut tokens = receiver.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let type_token = match tokens.next() {
+        Some(second) => {
+            if !is_identifier(first) {
+                return false;
+            }
+            second
+        }
+        None => first,
+    };
+    if tokens.next().is_some() {
+        return false;
+    }
+    let type_name = type_token.trim_start_matches('*');
+    let type_name = type_name.split('[').next().unwrap_or(type_name);
+    is_identifier(type_name)
+}
+
 fn raw_result(query: &str, route: &str, raw: &crate::types::SearchResult) -> Value {
     let mut result = base_result(
         query,
@@ -1125,62 +1204,68 @@ fn unique_hit(
     glob: Option<&str>,
     cache: &OutlineCache,
     session: &Session,
+    budget: u64,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let (source_path, line, name, body, core_partial, shown, content) = if resolved_as == "path" {
-        let content = std::fs::read_to_string(target_path).map_err(|source| {
-            crate::error::TilthError::IoError {
-                path: target_path.to_path_buf(),
-                source,
-            }
-        })?;
-        let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
-        let core_partial = content.lines().count() > 60;
-        let shown_count = u32::try_from(content.lines().take(60).count()).unwrap_or(60);
-        (
-            target_path.to_path_buf(),
-            None,
-            None,
-            body,
-            core_partial,
-            (1, shown_count),
-            content,
-        )
-    } else {
-        let (target, content, _) = match occurrence {
-            Some(occurrence) => crate::search::target::resolve_candidate_with_source_exact(
-                target_path,
-                target_line,
-                semantic_end,
-                query,
-                occurrence,
-                cache,
-            )?,
-            None => crate::search::target::resolve_candidate_with_source(
-                target_path,
-                target_line,
-                semantic_end,
-                query,
-                cache,
-            )?,
+    let (source_path, line, name, body, core_partial, shown, content, construct_end) =
+        if resolved_as == "path" {
+            let content = std::fs::read_to_string(target_path).map_err(|source| {
+                crate::error::TilthError::IoError {
+                    path: target_path.to_path_buf(),
+                    source,
+                }
+            })?;
+            let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
+            let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+            let core_partial = total_lines > 60;
+            let shown_count = u32::try_from(content.lines().take(60).count()).unwrap_or(60);
+            (
+                target_path.to_path_buf(),
+                None,
+                None,
+                body,
+                core_partial,
+                (1, shown_count),
+                content,
+                total_lines,
+            )
+        } else {
+            let (target, content, _) = match occurrence {
+                Some(occurrence) => crate::search::target::resolve_candidate_with_source_exact(
+                    target_path,
+                    target_line,
+                    semantic_end,
+                    query,
+                    occurrence,
+                    cache,
+                )?,
+                None => crate::search::target::resolve_candidate_with_source(
+                    target_path,
+                    target_line,
+                    semantic_end,
+                    query,
+                    cache,
+                )?,
+            };
+            let span_start = target.span_start_line;
+            let end = target.end_line;
+            let shown_lines = construct_line_cap(&content, span_start, end, budget);
+            let body = content
+                .lines()
+                .skip(span_start.saturating_sub(1) as usize)
+                .take(shown_lines as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                target.path,
+                Some(target.start_line),
+                Some(target.name),
+                body,
+                end - span_start + 1 > shown_lines,
+                (span_start, span_start + shown_lines.saturating_sub(1)),
+                content.to_string(),
+                end,
+            )
         };
-        let span_start = target.span_start_line;
-        let end = target.end_line;
-        let body = content
-            .lines()
-            .skip(span_start.saturating_sub(1) as usize)
-            .take((end - span_start + 1).min(60) as usize)
-            .collect::<Vec<_>>()
-            .join("\n");
-        (
-            target.path,
-            Some(target.start_line),
-            Some(target.name),
-            body,
-            end - span_start + 1 > 60,
-            (span_start, span_start + (end - span_start).min(59)),
-            content.to_string(),
-        )
-    };
     let target = Target {
         path: display_rel(&source_path, cwd),
         line,
@@ -1203,9 +1288,34 @@ fn unique_hit(
     }
     if core_partial {
         mark_partial(&mut result);
+        result["core_end"] = json!(construct_end);
+        result["continue"] = json!(format!("{}#{}-{}", target.path, shown.1 + 1, construct_end));
     }
     let hints = target.hints();
     Ok((result, hints))
+}
+
+/// Lines of a `span_start..=end` construct to print: all of them when the
+/// construct fits half the response budget, else the longest prefix that fits.
+/// Never fewer than `MIN_CORE_LINES`, so a tiny budget keeps the old preview.
+fn construct_line_cap(content: &str, span_start: u32, end: u32, budget: u64) -> u32 {
+    const MIN_CORE_LINES: u32 = 60;
+    let allowed_bytes = budget.saturating_mul(2);
+    let total = end - span_start + 1;
+    let mut used: u64 = 0;
+    let mut fitting: u32 = 0;
+    for line in content
+        .lines()
+        .skip(span_start.saturating_sub(1) as usize)
+        .take(total as usize)
+    {
+        used += line.len() as u64 + 1;
+        if used > allowed_bytes {
+            break;
+        }
+        fitting += 1;
+    }
+    fitting.max(MIN_CORE_LINES).min(total)
 }
 
 fn is_identifier(query: &str) -> bool {
@@ -1435,6 +1545,7 @@ mod tests {
             None,
             &OutlineCache::new(),
             &Session::new(),
+            crate::budget::DEFAULT_BUDGET,
         )
         .expect("fresh symbol resolution must replace the stale candidate line");
 
@@ -2797,7 +2908,7 @@ mod tests {
     #[test]
     fn budget_never_claims_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        let body = "    let _value = 1;\n".repeat(300);
+        let body = "    let _value = 1;\n".repeat(3000);
         std::fs::write(
             tmp.path().join("root.rs"),
             format!("fn root() {{\n{body}}}\n"),
