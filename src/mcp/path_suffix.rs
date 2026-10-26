@@ -70,13 +70,78 @@ pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
     }
 
     // Heuristic split between heading and symbol:
+    //  * a declaration form such as `fn name` in a non-markdown file → symbol
     //  * a non-empty suffix with internal whitespace → heading text
     //  * otherwise → symbol name
+    if !is_prose_path(&path) {
+        if let Some(name) = declaration_name(suffix_raw) {
+            return (path, PathSuffix::Symbol(name.to_string()));
+        }
+    }
     if suffix_raw.contains(' ') {
         // Reinject a `# ` so it looks like an ATX heading to the resolver.
         return (path, PathSuffix::Heading(format!("# {suffix_raw}")));
     }
     (path, PathSuffix::Symbol(suffix_raw.to_string()))
+}
+
+/// Whether `path` names a prose file, where `#word word` is a heading.
+fn is_prose_path(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc"
+    )
+}
+
+/// The symbol name in a declaration form such as `fn name` or `pub async fn
+/// name`: one or more declaration keywords, then one identifier.
+fn declaration_name(suffix: &str) -> Option<&str> {
+    const KEYWORDS: [&str; 22] = [
+        "pub",
+        "async",
+        "unsafe",
+        "const",
+        "static",
+        "fn",
+        "struct",
+        "enum",
+        "trait",
+        "impl",
+        "type",
+        "mod",
+        "class",
+        "interface",
+        "def",
+        "func",
+        "function",
+        "abstract",
+        "final",
+        "export",
+        "public",
+        "private",
+    ];
+    let mut tokens = suffix.split_whitespace();
+    let mut seen_keyword = false;
+    let mut name = None;
+    for token in &mut tokens {
+        if KEYWORDS.contains(&token) {
+            seen_keyword = true;
+            continue;
+        }
+        name = Some(token);
+        break;
+    }
+    let name = name?;
+    if !seen_keyword || tokens.next().is_some() {
+        return None;
+    }
+    let is_identifier = name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | ':' | '.'));
+    is_identifier.then_some(name)
 }
 
 /// Try to split a trailing colon line address off `spec`: `path:n-m` →
@@ -170,6 +235,29 @@ mod tests {
             PathSuffix::Symbol(_) | PathSuffix::Heading(_) => {}
             other => panic!("invalid range must not produce LineRange, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_declaration_form_is_a_symbol() {
+        for spec in ["a.rs#fn recv_ref", "a.rs#pub async fn recv_ref"] {
+            let (_, s) = parse_path_with_suffix(spec);
+            assert!(
+                matches!(&s, PathSuffix::Symbol(name) if name == "recv_ref"),
+                "{spec} -> {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_declaration_form_in_markdown_stays_a_heading() {
+        let (_, s) = parse_path_with_suffix("README.md#fn recv_ref");
+        assert!(matches!(s, PathSuffix::Heading(_)), "{s:?}");
+    }
+
+    #[test]
+    fn parse_prose_words_in_code_file_stay_a_heading() {
+        let (_, s) = parse_path_with_suffix("a.rs#fn recv ref");
+        assert!(matches!(s, PathSuffix::Heading(_)), "{s:?}");
     }
 
     #[test]
