@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import REPOS
@@ -164,6 +166,59 @@ def test_observed_semantic_equivalents_are_not_literal_false_negatives() -> None
     for name, result_text in examples.items():
         correct, reason = TASKS[name].check_correctness(result_text, ".")
         assert (correct, reason) == (True, "All checks passed")
+
+_VALIDATION_REST = (
+    "get_request_handler calls solve_dependencies and raises RequestValidationError. "
+)
+
+
+@pytest.mark.parametrize(
+    "handler_phrase",
+    [
+        # Verbatim from fastapi-edit-5 chain streams (backticks stripped by the grader).
+        "It returns the async closure `app(request)`, which handles every request to that route.",
+        "It captures the route's config in a closure and returns the inner coroutine "
+        "`app(request) -> Response`, which handles every request.",
+        # The four original alternatives.
+        "It defines an async def app(request) inside.",
+        "It returns an async function app that handles requests.",
+        "It returns the inner async function app.",
+        "It returns an async app(request) handler.",
+    ],
+)
+def test_fastapi_request_validation_accepts_handler_descriptions(
+    handler_phrase: str,
+) -> None:
+    correct, reason = TASKS["fastapi_request_validation"].check_correctness(
+        _VALIDATION_REST + handler_phrase, "."
+    )
+    assert (correct, reason) == (True, "All checks passed")
+
+
+@pytest.mark.parametrize(
+    "handler_phrase",
+    [
+        "It returns a closure named get_route_handler that serves requests.",
+        "The FastAPI application object app handles the request via ASGI.",
+        "It returns a decorator that wraps the endpoint.",
+    ],
+)
+def test_fastapi_request_validation_rejects_wrong_handler_descriptions(
+    handler_phrase: str,
+) -> None:
+    correct, _ = TASKS["fastapi_request_validation"].check_correctness(
+        _VALIDATION_REST + handler_phrase, "."
+    )
+    assert correct is False
+
+
+def test_fastapi_request_validation_still_requires_the_other_facts() -> None:
+    correct, _ = TASKS["fastapi_request_validation"].check_correctness(
+        "It returns the async closure app(request) and raises RequestValidationError.",
+        ".",
+    )
+    assert correct is False
+
 
 
 def test_new_lookup_and_control_tasks_require_fixture_specific_facts() -> None:
