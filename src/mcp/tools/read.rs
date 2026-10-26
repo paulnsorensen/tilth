@@ -72,11 +72,12 @@ pub(in crate::mcp) fn tool_read(
     }
 }
 
-fn tool_read_paths(
+fn render_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     note_tokens: u64,
+    record: &RecordQueue,
 ) -> Result<String, String> {
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
     // `apply_budget` used by the other tools — an uncapped `mode=full` or
@@ -232,11 +233,13 @@ fn tool_read_paths(
                 ) {
                     return PerPath::Content(label, stub);
                 }
-                // Record the whole-file-tag snapshot so a follow-up tilth_write
-                // can verify the tag, using the seen-lines the view displayed.
+                // Queue the path; the wrapper records the lines the final
+                // response shows, so a follow-up tilth_write can verify the tag.
                 if should_record_edit_snapshot(path, suffix, signature, force_stripped, force_full)
                 {
-                    crate::read::record_edit_snapshot(session, path, &spec);
+                    if let Ok(mut queue) = record.lock() {
+                        queue.push(path.clone());
+                    }
                 }
                 PerPath::Content(label, body)
             })
@@ -275,13 +278,7 @@ fn tool_read_paths(
         let complete =
             crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &combined);
         if crate::types::estimate_tokens(complete.len() as u64) <= budget_val {
-            for path in &paths {
-                session.set_read_clipped(path, complete.len() > HOST_VISIBLE_MAX);
-            }
             return Ok(complete);
-        }
-        for path in &paths {
-            session.set_read_clipped(path, true);
         }
         let body_budget = response_body_budget(Some(now), &serde_json::Map::new(), budget_val);
         if !parts.is_empty() {
@@ -428,13 +425,18 @@ fn tool_read_paths(
             ));
         }
         if should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full) {
-            crate::read::record_edit_snapshot(session, &path, &spec);
+            if let Ok(mut queue) = record.lock() {
+                queue.push(path.clone());
+            }
         }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
         // Cache token still rides along when if_modified_since was supplied.
-        let response = finalize_response(since.map(|_| now), serde_json::Map::new(), &body, budget);
-        forget_if_truncated(session, &path, &response);
-        return Ok(response);
+        return Ok(finalize_response(
+            since.map(|_| now),
+            serde_json::Map::new(),
+            &body,
+            budget,
+        ));
     }
 
     session.record_read(&path);
@@ -500,7 +502,9 @@ fn tool_read_paths(
     // seenLines here would poison the snapshot for a later range read of the
     // same content and defeat the unseen-anchor gate. Record nothing.
     if should_record_edit_snapshot(&path, &suffix, false, false, force_full) {
-        crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
+        if let Ok(mut queue) = record.lock() {
+            queue.push(path.clone());
+        }
     }
 
     // Append related-file hint for outlined code files.
@@ -538,7 +542,6 @@ fn tool_read_paths(
     }
 
     let response = finalize_response(None, meta, &output, budget);
-    forget_if_truncated(session, &path, &response);
     // Credit savings vs the full file using the baseline captured before the read.
     if let Some(file_byte_len) = savings_baseline {
         session.record_savings(
@@ -560,9 +563,169 @@ pub(in crate::mcp) const HOST_VISIBLE_MAX: usize = 40_000;
 /// A budget-truncated or host-hidden reply did not display every line the
 /// snapshot counts as seen, so a later unchanged-stub would hide text the
 /// caller never received.
-fn forget_if_truncated(session: &Session, path: &Path, response: &str) {
-    let truncated = response.starts_with('{') && response.contains("\"truncated\":true");
-    session.set_read_clipped(path, truncated || response.len() > HOST_VISIBLE_MAX);
+/// Paths whose reads may show numbered lines. The wrapper records only the
+/// lines the final response shows, so an unchanged-stub never hides text the
+/// caller did not receive.
+type RecordQueue = std::sync::Mutex<Vec<PathBuf>>;
+
+/// Bytes kept free under [`HOST_VISIBLE_MAX`] for text added after the read:
+/// the nudge tip and the batching note.
+const HOST_CAP_RESERVE: usize = 1_500;
+
+/// Bytes kept free for the continuation line that ends a cut response.
+const CUT_NOTE_RESERVE: usize = 600;
+
+/// Bytes `finalize_response` leaves for the JSON header line it prepends.
+const HEADER_RESERVE: usize = 400;
+
+/// Render the read, cap the response to the host limit, then record as seen
+/// exactly the numbered lines the capped response shows. An error, an outline,
+/// a stub, or a cut-off tail shows no line, so it marks no line seen.
+fn tool_read_paths(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    note_tokens: u64,
+) -> Result<String, String> {
+    let queue = RecordQueue::default();
+    let rendered = render_read(args, cache, session, note_tokens, &queue)?;
+    let response = cap_text(rendered, HOST_VISIBLE_MAX - HOST_CAP_RESERVE);
+    let cwd = super::require_cwd(args)?;
+    let _display_base = crate::format::set_display_base(Path::new(cwd));
+    let paths = queue.into_inner().unwrap_or_default();
+    for path in paths {
+        let ranges = shown_ranges(&response, &crate::format::display_path(&path));
+        if ranges.is_empty() {
+            continue;
+        }
+        crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Ranges(ranges));
+    }
+    Ok(response)
+}
+
+/// Length of `text` once JSON-escaped, without the surrounding quotes.
+fn escaped_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(text.len(), |s| s.len().saturating_sub(2))
+}
+
+/// The path of a `[path#TAG]` header line, or `None` for any other line.
+fn tagged_header_path(line: &str) -> Option<&str> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let (path, tag) = inner.rsplit_once('#')?;
+    if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// The line number of an `N:content` row, or `None` for any other line.
+fn numbered_line(line: &str) -> Option<u32> {
+    let (digits, _) = line.split_once(':')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The 1-based inclusive line ranges that `text` shows under the `[display#TAG]`
+/// header of one file.
+fn shown_ranges(text: &str, display: &str) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut active = false;
+    for line in text.lines() {
+        if let Some(path) = tagged_header_path(line) {
+            active = path == display;
+            continue;
+        }
+        if !active {
+            continue;
+        }
+        let Some(n) = numbered_line(line) else {
+            continue;
+        };
+        match ranges.last_mut() {
+            Some(last) if n == last.1.saturating_add(1) => last.1 = n,
+            _ => ranges.push((n, n)),
+        }
+    }
+    ranges
+}
+
+/// Cut `response` at a line boundary so its JSON-escaped size stays within
+/// `ceiling`. A cut response ends with the exact `tilth_read` call that
+/// continues it. `finalize_response` caps the body first, so the byte budget
+/// never clips a numbered body down to its header.
+fn cap_text(response: String, ceiling: usize) -> String {
+    if escaped_len(&response) <= ceiling {
+        return response;
+    }
+    let limit = ceiling - CUT_NOTE_RESERVE;
+    let mut kept_end = 0;
+    let mut used = 0;
+    for line in response.split_inclusive('\n') {
+        let cost = escaped_len(line);
+        if used + cost > limit {
+            break;
+        }
+        used += cost;
+        kept_end += line.len();
+    }
+    let (kept, hidden) = response.split_at(kept_end);
+    let note = cut_note(kept, hidden);
+    if kept.is_empty() || kept.ends_with('\n') {
+        format!("{kept}{note}")
+    } else {
+        format!("{kept}\n{note}")
+    }
+}
+
+/// The continuation line for a response cut between `kept` and `hidden`.
+fn cut_note(kept: &str, hidden: &str) -> String {
+    let mut current: Option<&str> = None;
+    let mut last_line: Option<u32> = None;
+    for line in kept.lines() {
+        if let Some(path) = tagged_header_path(line) {
+            current = Some(path);
+            last_line = None;
+            continue;
+        }
+        if let Some(n) = numbered_line(line) {
+            last_line = Some(n);
+        }
+    }
+
+    let mut more_in_current = false;
+    let mut other: Vec<&str> = Vec::new();
+    let mut active = current;
+    for line in hidden.lines() {
+        if let Some(path) = tagged_header_path(line) {
+            if Some(path) != current && !other.contains(&path) {
+                other.push(path);
+            }
+            active = Some(path);
+            continue;
+        }
+        if active.is_some() && active == current && numbered_line(line).is_some() {
+            more_in_current = true;
+        }
+    }
+
+    let mut calls: Vec<String> = Vec::new();
+    if let (true, Some(path)) = (more_in_current, current) {
+        match last_line {
+            Some(n) => calls.push(format!("{path}#{}", n.saturating_add(1))),
+            None => calls.push(path.to_string()),
+        }
+    }
+    for path in other {
+        calls.push(path.to_string());
+    }
+    if calls.is_empty() {
+        return "... cut at the host display limit. Read a smaller section with tilth_read using a path#N-M range.".to_string();
+    }
+    let list = Value::Array(calls.into_iter().map(Value::String).collect());
+    format!("... cut at the host display limit. Next: tilth_read(paths: {list})")
 }
 
 /// One-line reply for a read whose file tag is unchanged and whose lines an
@@ -577,9 +740,6 @@ fn unchanged_reread_stub(
 ) -> Option<String> {
     let (signature, stripped, force_full) = shape;
     if force_full || !should_record_edit_snapshot(path, suffix, signature, stripped, false) {
-        return None;
-    }
-    if session.read_was_clipped(path) {
         return None;
     }
     let tag = crate::read::unchanged_head_tag(session, path, spec)?;
@@ -619,54 +779,47 @@ pub(crate) fn read_single_with_suffix(
     let render_err = |e: crate::error::TilthError| {
         format!("# {}\nerror: {}", crate::format::display_path(path), e)
     };
-    match suffix {
-        PathSuffix::LineRange(s, e) => {
-            let range = format!("{s}-{e}");
-            let body =
-                crate::read::read_ranges(path, &[range.as_str()], true).unwrap_or_else(render_err);
-            (body, SeenSpec::Ranges(vec![(cast(*s), cast(*e))]))
+    // An error shows no line, so its spec is an empty range list: it never
+    // stubs and never marks a line seen.
+    let read_span = |s: u32, e: u32| {
+        let range = format!("{s}-{e}");
+        match crate::read::read_ranges(path, &[range.as_str()], true) {
+            Ok(body) => (body, SeenSpec::Ranges(vec![(s, e)])),
+            Err(err) => (render_err(err), SeenSpec::Ranges(Vec::new())),
         }
+    };
+    match suffix {
+        PathSuffix::LineRange(s, e) => read_span(cast(*s), cast(*e)),
         PathSuffix::FromLine(n) => {
             // Resolve total lines via metadata + count; cheap & avoids full read.
             let total = count_lines(path).map_or(*n, |t| t as usize);
-            let end = total.max(*n);
-            let range = format!("{n}-{end}");
-            let body =
-                crate::read::read_ranges(path, &[range.as_str()], true).unwrap_or_else(render_err);
-            (body, SeenSpec::Ranges(vec![(cast(*n), cast(end))]))
+            read_span(cast(*n), cast(total.max(*n)))
         }
         PathSuffix::Heading(h) => {
             // Resolve the heading span once (like the symbol path) so the read
-            // and the seen-lines spec share a single resolution. Absent heading →
-            // read the raw anchor to surface the error and fall back to Whole.
+            // and the seen-lines spec share a single resolution. An absent
+            // heading reads the raw anchor to surface the error.
             if let Some((s, e)) = crate::read::resolve_heading_span(path, h) {
-                let range = format!("{s}-{e}");
-                let body = crate::read::read_ranges(path, &[range.as_str()], true)
-                    .unwrap_or_else(render_err);
-                (body, SeenSpec::Ranges(vec![(s, e)]))
+                read_span(s, e)
             } else {
                 let body =
                     crate::read::read_ranges(path, &[h.as_str()], true).unwrap_or_else(render_err);
-                (body, SeenSpec::Whole)
+                (body, SeenSpec::Ranges(Vec::new()))
             }
         }
         PathSuffix::Symbol(name) => {
-            // Resolve symbol via outline → range once, reused for read + spec.
-            match resolve_symbol_range(path, name, cache) {
-                Some((s, e)) => {
-                    let range = format!("{s}-{e}");
-                    let body = crate::read::read_ranges(path, &[range.as_str()], true)
-                        .unwrap_or_else(render_err);
-                    (body, SeenSpec::Ranges(vec![(cast(s), cast(e))]))
-                }
-                None => (
+            // Resolve symbol via outline -> range once, reused for read + spec.
+            if let Some((s, e)) = resolve_symbol_range(path, name, cache) {
+                read_span(cast(s), cast(e))
+            } else {
+                (
                     format!(
                         "# {}\nerror: symbol '{}' not found in outline",
                         crate::format::display_path(path),
                         name
                     ),
-                    SeenSpec::Whole,
-                ),
+                    SeenSpec::Ranges(Vec::new()),
+                )
             }
         }
         PathSuffix::None => {
@@ -675,7 +828,7 @@ pub(crate) fn read_single_with_suffix(
                 "signature and stripped are mutually exclusive view modes"
             );
             if signature {
-                // Multi-file batch path: discard the line count — view-meta is
+                // Multi-file batch path: discard the line count; view-meta is
                 // not emitted for multi-file responses.
                 let body =
                     read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
@@ -686,9 +839,10 @@ pub(crate) fn read_single_with_suffix(
                     read_stripped_file(path, cache).map_or_else(render_err, |(body, _, _)| body);
                 return (body, SeenSpec::Whole);
             }
-            let body =
-                crate::read::read_file(path, None, false, cache, true).unwrap_or_else(render_err);
-            (body, SeenSpec::Whole)
+            match crate::read::read_file(path, None, false, cache, true) {
+                Ok(body) => (body, SeenSpec::Whole),
+                Err(err) => (render_err(err), SeenSpec::Ranges(Vec::new())),
+            }
         }
     }
 }
@@ -865,6 +1019,11 @@ fn finalize_response(
     body: &str,
     budget: Option<u64>,
 ) -> String {
+    let capped = cap_text(
+        body.to_string(),
+        HOST_VISIBLE_MAX - HOST_CAP_RESERVE - HEADER_RESERVE,
+    );
+    let body = capped.as_str();
     let Some(total_budget) = budget else {
         return crate::mcp::iso::with_meta_header(now, meta, body);
     };
@@ -2008,5 +2167,157 @@ mod tests {
             saved, expected_saved,
             "booked savings must account for the batching note actually delivered to the caller"
         );
+    }
+
+    fn numbered_source(lines: usize) -> String {
+        let mut out = String::new();
+        for i in 1..=lines {
+            let _ = writeln!(out, "let value_{i} = \"{}\";", "x".repeat(30));
+        }
+        out
+    }
+
+    fn read_paths(session: &Session, cache: &OutlineCache, dir: &Path, paths: &[&str]) -> String {
+        let args = serde_json::json!({"paths": paths, "cwd": dir.to_str().unwrap()});
+        tool_read(&args, cache, session).expect("read must succeed")
+    }
+
+    fn is_stub(out: &str) -> bool {
+        out.contains("unchanged since your last read")
+    }
+
+    fn last_shown_line(out: &str) -> u32 {
+        out.lines()
+            .filter_map(|l| l.split_once(':').and_then(|(n, _)| n.parse::<u32>().ok()))
+            .next_back()
+            .expect("response shows numbered lines")
+    }
+
+    #[test]
+    fn error_read_leaves_lines_unseen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), numbered_source(30)).unwrap();
+        let (session, cache) = services();
+
+        let missing = read_paths(&session, &cache, dir.path(), &["a.rs#nope"]);
+        assert!(missing.contains("not found"), "{missing}");
+        let next = read_paths(&session, &cache, dir.path(), &["a.rs"]);
+        assert!(!is_stub(&next), "an error response showed no lines: {next}");
+        assert!(next.contains("value_30"), "{next}");
+    }
+
+    #[test]
+    fn error_read_after_full_read_is_an_error_not_a_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), numbered_source(30)).unwrap();
+        let (session, cache) = services();
+        read_paths(&session, &cache, dir.path(), &["a.rs"]);
+
+        for spec in ["a.rs#nope", "a.rs### Missing"] {
+            let out = read_paths(&session, &cache, dir.path(), &[spec]);
+            assert!(!is_stub(&out), "{spec} must report its error: {out}");
+            assert!(out.contains("error"), "{spec}: {out}");
+        }
+    }
+
+    #[test]
+    fn clipped_read_records_only_emitted_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.rs");
+        std::fs::write(&path, numbered_source(3000)).unwrap();
+        let (session, cache) = services();
+
+        let out = read_paths(&session, &cache, dir.path(), &["big.rs#1-3000"]);
+        let shown = last_shown_line(&out);
+        assert!(
+            (100..3000).contains(&shown),
+            "cap must clip mid-file: {shown}"
+        );
+        assert!(
+            out.contains(&format!("big.rs#{}", shown + 1)),
+            "exact continuation call expected: {}",
+            &out[out.len().saturating_sub(400)..]
+        );
+        let head = session.snapshots().head(&path).expect("snapshot recorded");
+        assert_eq!(head.first_unseen_anchor(1..=3000), Some(shown + 1));
+    }
+
+    #[test]
+    fn small_read_after_clipped_one_does_not_mark_hidden_lines_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.rs"), numbered_source(3000)).unwrap();
+        let (session, cache) = services();
+
+        let clipped = read_paths(&session, &cache, dir.path(), &["big.rs#1-3000"]);
+        let shown = last_shown_line(&clipped);
+        let small = read_paths(&session, &cache, dir.path(), &["big.rs#2-4"]);
+        assert!(small.contains("value_3 =") || is_stub(&small), "{small}");
+        let tail = format!("big.rs#{}-{}", shown + 1, shown + 5);
+        let out = read_paths(&session, &cache, dir.path(), &[tail.as_str()]);
+        assert!(!is_stub(&out), "hidden lines were never shown: {out}");
+        assert!(out.contains(&format!("value_{} =", shown + 1)), "{out}");
+    }
+
+    #[test]
+    fn batch_records_only_emitted_source_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("one.rs"), numbered_source(600)).unwrap();
+        let two = dir.path().join("two.rs");
+        std::fs::write(&two, numbered_source(600)).unwrap();
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": ["one.rs", "two.rs"],
+            "mode": "full",
+            "cwd": dir.path().to_str().unwrap()
+        });
+        let out = tool_read(&args, &cache, &session).unwrap();
+        assert!(escaped_len(&out) <= HOST_VISIBLE_MAX, "{}", out.len());
+        let shown = last_shown_line(&out);
+        assert!(
+            (1..600).contains(&shown),
+            "second file must be clipped: {shown}"
+        );
+        assert!(out.contains(&format!("two.rs#{}", shown + 1)));
+
+        let head = session.snapshots().head(&two).unwrap();
+        assert_eq!(head.first_unseen_anchor(1..=600), Some(shown + 1));
+        let again = read_paths(&session, &cache, dir.path(), &["one.rs#1-600"]);
+        assert!(is_stub(&again), "fully shown file stays a stub: {again}");
+        let tail = format!("two.rs#{}-{}", shown + 1, shown + 3);
+        let rest = read_paths(&session, &cache, dir.path(), &[tail.as_str()]);
+        assert!(!is_stub(&rest), "{rest}");
+    }
+
+    #[test]
+    fn serialized_response_stays_under_the_host_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = String::new();
+        let quotes = '"'.to_string().repeat(50);
+        for i in 0..1000 {
+            let _ = writeln!(source, "{i} {quotes}");
+        }
+        std::fs::write(dir.path().join("esc.txt"), source).unwrap();
+        let (session, cache) = services();
+        let out = read_paths(&session, &cache, dir.path(), &["esc.txt#1-1000"]);
+        assert!(
+            escaped_len(&out) <= HOST_VISIBLE_MAX,
+            "escaped size {} exceeds the host cap",
+            escaped_len(&out)
+        );
+        assert!(out.contains("esc.txt#"), "continuation expected");
+    }
+
+    #[test]
+    fn declaration_prefixed_symbol_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn other() {}\n\nfn recv_ref() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
+        let (session, cache) = services();
+        let out = read_paths(&session, &cache, dir.path(), &["a.rs#fn recv_ref"]);
+        assert!(out.contains("let x = 1;"), "{out}");
+        assert!(!out.contains("error"), "{out}");
     }
 }

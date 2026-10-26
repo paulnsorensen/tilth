@@ -1593,7 +1593,7 @@ mod tests {
         let p2 = dir.path().join("b.rs");
         let large = format!(
             "fn only_signature() {{}}\n{}",
-            "// padding padding padding padding\n".repeat(1000)
+            "// padding padding padding padding\n".repeat(800)
         );
         std::fs::write(&p1, &large).unwrap();
         std::fs::write(&p2, "fn small() {}\n").unwrap();
