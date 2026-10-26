@@ -28,7 +28,7 @@ from panel_support import (
 )
 
 GEPA_V2_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v2.json"
-GEPA_V3_LONG_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long.json"
+GEPA_V3_LONG_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long-2.json"
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 REDACTED_KEYS = {"instance_id", "repo", "base_commit", "language"}
 GRADER_KEYS = {"patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS", "problem_statement"}
