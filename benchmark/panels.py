@@ -10,7 +10,9 @@ a changed split must be pre-registered under a new panel name.
 A panel with top-level ``"version": 2`` is a screened pool with no cheap tier:
 splits are only dev and test, a local member is any non-external task in
 ``tasks.TASKS``, a SWE-bench Multilingual member comes from
-``external.swebench_ml.GEPA_V2_CANDIDATES`` or a slot (with no fallback keys),
+``external.swebench_ml.GEPA_V2_CANDIDATES``, an admitted id in
+``external/long_pool_candidates.json`` (read by ``long_pool_ids``), or a slot
+(with no fallback keys),
 a chain member is a ``chain:<id>`` id from ``chains.CHAINS`` (family ``chain``),
 and ``Panel.cheap`` is empty. A panel with no ``version`` is version 1.
 """
@@ -241,9 +243,17 @@ def _check_complete(members: list[Member]) -> None:
         raise PanelError(f"panel is incomplete; missing: {'; '.join(missing)}")
 
 
+LONG_POOL_FILE = Path(__file__).parent / "external" / "long_pool_candidates.json"
+
+
+def long_pool_ids(path: Path = LONG_POOL_FILE) -> frozenset[str]:
+    """Ids the long-pool data file marks admitted. The file is JSON so ``external.task.package_digest`` ignores it."""
+    return frozenset(entry["id"] for entry in json.loads(path.read_text()) if entry.get("admitted") is True)
+
+
 def _check_members_v2(members: list[Member]) -> None:
     """Version 2: any local task, a lv1 FeatureBench id, or a SWE-bench Multilingual pool or slot id."""
-    pool = {*external.swebench_ml.GEPA_V2_CANDIDATES, *_SLOT_LANGUAGE}
+    pool = {*external.swebench_ml.GEPA_V2_CANDIDATES, *long_pool_ids(), *_SLOT_LANGUAGE}
     for member in members:
         if member.id in CHEAP:
             raise PanelError(f"{member.id}: a version 2 panel has no cheap tier")
@@ -318,6 +328,21 @@ def _check_split(members: list[Member], split_seed: int) -> None:
                  for member in members if member.id in assignment and member.split != assignment[member.id]]
     if differing:
         raise PanelError(f"recorded split differs from panels.stratify(seed={split_seed}): {'; '.join(differing)}")
+    _check_no_shared_task(members)
+
+
+def _check_no_shared_task(members: list[Member]) -> None:
+    """Refuse a task that reaches both dev and test, directly or as a chain sub-task."""
+    splits: dict[str, set[str]] = {}
+    for member in members:
+        if member.split not in ("dev", "test"):
+            continue
+        chain = chains.CHAINS.get(member.id[len(chains.PREFIX):]) if member.family == "chain" else None
+        for task_name in chain.members if chain else (member.id,):
+            splits.setdefault(task_name, set()).add(member.split)
+    shared = sorted(name for name, seen in splits.items() if len(seen) > 1)
+    if shared:
+        raise PanelError(f"tasks reach both dev and test (directly or through a chain): {', '.join(shared)}")
 
 
 def _check_admitted(members: list[Member], admit: Callable[[str], Any]) -> None:

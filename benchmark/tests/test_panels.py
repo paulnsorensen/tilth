@@ -1,8 +1,10 @@
 """Pre-registered panels: schema, completeness, admission, tiers, stratified split, stamp, lock, registration."""
 
 import json
+import shutil
 import socket
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import chains
 import config
 import external
 import external.data
@@ -17,6 +20,7 @@ import external.featurebench
 import external.swebench_ml
 import panels
 import run
+import tasks
 from panel_support import (
     CHEAP, COMMITTED_PANEL, COMPLETE, EXPECTED_DEV, EXPECTED_TEST, FALLBACKS, FB_ALGORITHMS, FB_IDS, FB_NULLSPACE,
     FB_REGRESSION, GEPA_ROWS, GO_FALLBACK, GO_SLOT, RENDER, RUST_FALLBACK, RUST_SLOT, load, member, panel_run, read,
@@ -701,10 +705,49 @@ def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
     languages = {entry["id"]: entry["language"] for entry in data["members"]}
     panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
 
-    assert len(panel.members) == 9
+    assert len(panel.members) == 19
     assert panel.cheap == ()
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
     assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
     assert set(panel.dev) == {i for i, s in assignment.items() if s == "dev"}
     assert set(panel.test) == {i for i, s in assignment.items() if s == "test"}
+
+
+@pytest.mark.parametrize("chain_id", ["express-edit-6"])
+def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> None:
+    chain = chains.CHAINS[chain_id]
+
+    members = chains.parse_chain(chain.id, chain.members, tasks.TASKS)
+
+    assert 5 <= len(members) <= 7
+    assert members[-1].capability == "fix"
+    assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
+
+
+def test_a_task_in_a_dev_chain_and_in_test_is_refused() -> None:
+    leaking = [
+        panels.Member("chain:express-edit-6", "chain", "javascript", "dev"),
+        panels.Member("express_edit_example_start", "local", "javascript", "test"),
+    ]
+
+    with pytest.raises(panels.PanelError, match="express_edit_example_start"):
+        panels._check_no_shared_task(leaking)
+    panels._check_no_shared_task([replace(entry, split="test") for entry in leaking])
+
+
+def test_long_pool_ids_hold_the_controls_and_stay_out_of_the_package_digest(tmp_path: Path, monkeypatch) -> None:
+    controls = {"tokio-rs__tokio-4867", "burntsushi__ripgrep-2209", "caddyserver__caddy-6350",
+                "hashicorp__terraform-35611", "axios__axios-5085", "uutils__coreutils-6682"}
+    assert controls <= panels.long_pool_ids()
+    assert not controls & set(external.swebench_ml.GEPA_V2_CANDIDATES)
+    assert panels.LONG_POOL_FILE.suffix != ".py"
+
+    package = tmp_path / "external"
+    shutil.copytree(external.task.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    before = external.task.package_digest()
+    pool_file = package / "long_pool_candidates.json"
+    pool_file.write_text(pool_file.read_text().replace("tokio-rs__tokio-4867", "tokio-rs__tokio-0000"))
+    assert external.task.package_digest() == before
+    assert panels.long_pool_ids(pool_file) != panels.long_pool_ids()
