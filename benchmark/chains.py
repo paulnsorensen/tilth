@@ -26,6 +26,8 @@ from typing import Callable, MutableMapping, Sequence
 from tasks.base import GroundTruth, Task
 
 PREFIX = "chain:"
+# Chain keys do not hash this file (run._task_source_files skips ChainTask), so a
+# change to how a chain is driven or graded (chain_row, run._run_chain) must bump this.
 CHAIN_PROTOCOL = 1
 
 _SUM_FIELDS = (

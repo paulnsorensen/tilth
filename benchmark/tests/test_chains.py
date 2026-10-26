@@ -256,6 +256,23 @@ def test_a_member_key_does_not_depend_on_chains(world) -> None:
     assert key("c_one") == before
 
 
+def test_editing_chains_py_leaves_a_chain_key_alone(world, monkeypatch) -> None:
+    run.select_tasks("chain:t2")
+    before = key("chain:t2")
+    real = run._file_sha256
+    monkeypatch.setattr(run, "_file_sha256", lambda path: "edited" if Path(path).name == "chains.py" else real(path))
+
+    assert key("chain:t2") == before
+
+
+def test_bumping_the_chain_protocol_changes_the_chain_key(world, monkeypatch) -> None:
+    run.select_tasks("chain:t2")
+    before = key("chain:t2")
+    monkeypatch.setattr(chains, "CHAIN_PROTOCOL", chains.CHAIN_PROTOCOL + 1)
+
+    assert key("chain:t2") != before
+
+
 # --- one session, graded turn by turn ---
 
 
