@@ -9,7 +9,7 @@ stop callback.
 import json
 import re
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
 
@@ -140,7 +140,12 @@ class Dispatcher:
                  extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None,
                  directives=None,
                  check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
+                 failing_tests: Callable[[Mapping[str, str]], list[str]] | None = None,
+                 test_scope: dict[str, frozenset[str]] | None = None,
                  log: Callable[[str], None] | None = None) -> None:
+        self.failing_tests = failing_tests
+        # Content id -> tests that candidate may change; the materializer reads the same dict.
+        self.test_scope = test_scope if test_scope is not None else {}
         self.directives = directives
         self.check = check
         self.log = log or (lambda _line: None)
@@ -179,6 +184,8 @@ class Dispatcher:
             if directive is not None and directive.component == name and directive.hypothesis \
                     and self.hypotheses is not None:
                 self.hypotheses.default(name, directive.hypothesis)
+        if SRC_PATCH in proposal and not self.stop.is_set:
+            self._inherit_tests(candidate, proposal)
         if SRC_PATCH in proposal and self.check is not None and not self.stop.is_set:
             proposal[SRC_PATCH] = self._repaired(candidate, proposal, patch_records)
         if self.stop.is_set:
@@ -193,6 +200,9 @@ class Dispatcher:
         The repair is the proposer's only second call: it sees the failed patch applied and the real error.
         Whatever it returns is the child; the cascade then checks that child (the check is memoized) and fails
         it for good if it still fails. The same directive and hypothesis stay on the final child.
+
+        When ``just check`` failed on Rust tests, the repair record names them and sets ``may_update_tests``.
+        The final child may then change exactly those tests, and so may its descendants.
         """
         if proposal[SRC_PATCH] == candidate[SRC_PATCH]:
             return proposal[SRC_PATCH]  # no change: the parent was checked when it was evaluated
@@ -202,6 +212,10 @@ class Dispatcher:
             return proposal[SRC_PATCH]
         stage, error = failure
         repair = {"stage": stage, "error": error, "instruction": REPAIR_INSTRUCTION}
+        failing = self.failing_tests(child) if stage == "just check" and self.failing_tests is not None else []
+        if failing:
+            repair["failing_tests"] = failing
+            repair["may_update_tests"] = True
         if stage == "apply":
             # The failed patch cannot be applied to an export, so the proposer gets it as text.
             repair["failed_diff"] = proposal[SRC_PATCH]
@@ -209,11 +223,25 @@ class Dispatcher:
         else:
             base = child
         try:
-            return self.propose(base, [*records, {"repair": repair}])
+            patch = self.propose(base, [*records, {"repair": repair}])
         except (OSError, RuntimeError, ValueError) as error:
             # A failed repair leaves the failed child; stop and auth signals are not caught here.
             self.log(f"repair: proposer failed ({type(error).__name__}: {error}); keeping the failed patch")
             return proposal[SRC_PATCH]
+        if failing:
+            self._grant_tests({**candidate, **proposal, SRC_PATCH: patch}, failing)
+        return patch
+
+    def _grant_tests(self, child: Mapping[str, str], names: Iterable[str]) -> None:
+        """Let ``child``, and so its materialization, change the named tests; earlier grants stay."""
+        cid = content_id(child)
+        self.test_scope[cid] = self.test_scope.get(cid, frozenset()) | frozenset(names)
+
+    def _inherit_tests(self, candidate: Mapping[str, str], proposal: Mapping[str, str]) -> None:
+        """A child's cumulative patch keeps its parent's test edits, so it keeps the parent's grant too."""
+        granted = self.test_scope.get(content_id(candidate))
+        if granted:
+            self._grant_tests({**candidate, **proposal}, granted)
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,

@@ -31,11 +31,11 @@ from judge import store as judge_store
 from spend import SpendLedger
 
 from . import attribution as cost_attribution
-from . import deepdiag, diagnosis, directives, engine, hookgate, replay
+from . import deepdiag, diagnosis, directives, engine, hookgate, replay, rust
 from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
-from .finish import REPIN_NOTE, PRClient, outside_allowlist
+from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
 from .proposer import Proposer
@@ -111,6 +111,10 @@ class Cascade:
     stage: str | None = None
     tail: str = ""
     just_check_ok: bool | None = None
+    # The Rust tests `just check` failed, as cargo prints them; a repair may update exactly these.
+    failing_tests: list[str] = field(default_factory=list)
+    # The cumulative patch changes #[cfg(test)] code (a repair updated pinned tests); finish lists them for review.
+    tests_changed: bool = False
     hook_ok: bool | None = None
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
@@ -324,10 +328,12 @@ class Evolution:
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
                                             hypotheses=self.hypotheses, extra_records=self._extra_records,
                                             directives=self.directives,
-                                            check=self.precheck if settings.repair else None, log=self.log)
+                                            check=self.precheck if settings.repair else None,
+                                            failing_tests=self._failing_tests_of, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
+        self.dispatcher.test_scope = self.materializer.test_scope
         self.results: dict[str, Cascade] = {}
         self.frontier: list[Cascade] = []
         self.deltas: list[dict] = []
@@ -597,13 +603,23 @@ class Evolution:
                 result.sha = self.materializer.materialize(result.candidate)
             except ApplyRejected as rejected:
                 return self._fail(result, "apply", tail(rejected.tail))
+            if changed := self.materializer.test_diffs.get(result.cid):
+                result.tests_changed = True
+                self.log(f"candidate {result.cid[:12]}: changes tests for review: {', '.join(sorted(changed))}")
         if result.just_check_ok is None:
             ok, output = self.just_check(self.materializer.worktree(result.sha))
             result.just_check_ok = ok
             self.materializer.release(result.sha)
             if not ok:
+                # The full output, before `tail` cuts it, holds cargo's whole `failures:` list.
+                result.failing_tests = rust.failing_tests(output)
                 return self._fail(result, "just check", tail(output))
         return None
+
+    def _failing_tests_of(self, candidate: Mapping[str, str]) -> list[str]:
+        """The Rust tests that ``candidate`` failed in `just check`; empty when it failed for another reason."""
+        result = self.results.get(content_id(candidate))
+        return list(result.failing_tests) if result is not None and result.stage == "just check" else []
 
     def precheck(self, candidate: Mapping[str, str]) -> tuple[str, str] | None:
         """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply or ``just check``, else None.
@@ -987,10 +1003,14 @@ class Evolution:
             f"Winner minus seed, {paired_line}", "",
             f"Winner minus seed, {pass_line}", "",
             "## Re-pin before landing", REPIN_NOTE, "",
+            *changed_tests_section(self.materializer.test_diffs.get(winner.cid, {})),
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",
         ])
         self.log(f"finish: {REPIN_NOTE}")
+        if winner.tests_changed:
+            self.log(f"finish: winner {winner.cid[:12]} changes tests for review: "
+                     f"{', '.join(sorted(self.materializer.test_diffs.get(winner.cid, {})))}")
         try:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:

@@ -13,6 +13,8 @@ from .materialize import PHRASE_PIN_EXEMPT_ENV
 REPIN_NOTE = (f"Phrase pins were exempt during the search: each candidate's `just check` set {PHRASE_PIN_EXEMPT_ENV}=1, "
               "so the Rust tests skipped their exact-phrase asserts on prompts/ text. CI does not set it. "
               "Re-pin those asserts to this PR's prompt text before it lands.")
+TEST_REVIEW_NOTE = ("A repair updated pinned Rust tests whose old asserts the intended behavior change made obsolete. "
+                    "Check that each test below asserts the new behavior and is not deleted or weakened.")
 ALLOWED_WINNER_PREFIXES = ("src/", "prompts/")
 ALLOWED_WINNER_FILES = ("AGENTS.md",)
 _GITHUB_URL = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?")
@@ -27,6 +29,16 @@ class PRClient(Protocol):
 def outside_allowlist(paths: list[str]) -> list[str]:
     return [path for path in paths if not path.startswith(ALLOWED_WINNER_PREFIXES) and path not in ALLOWED_WINNER_FILES]
 
+
+
+def changed_tests_section(changes: dict[str, str]) -> list[str]:
+    """PR body lines for the tests the winner changes, each with its diff; nothing when it changes none."""
+    if not changes:
+        return []
+    lines = ["## Test changes for review", TEST_REVIEW_NOTE, ""]
+    for name, diff in sorted(changes.items()):
+        lines += [f"### `{name}`", "```diff", diff, "```", ""]
+    return lines
 
 class GitHubPRClient:
     """Pushes the winner commit as a branch with git and opens a draft PR with ``gh``."""
