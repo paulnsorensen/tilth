@@ -70,10 +70,10 @@ pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
     }
 
     // Heuristic split between heading and symbol:
-    //  * a declaration form such as `fn name` in a non-markdown file → symbol
+    //  * a declaration form such as `fn name` in a code file → symbol
     //  * a non-empty suffix with internal whitespace → heading text
     //  * otherwise → symbol name
-    if !is_prose_path(&path) {
+    if is_code_path(&path) {
         if let Some(name) = declaration_name(suffix_raw) {
             return (path, PathSuffix::Symbol(name.to_string()));
         }
@@ -85,21 +85,21 @@ pub fn parse_path_with_suffix(spec: &str) -> (PathBuf, PathSuffix) {
     (path, PathSuffix::Symbol(suffix_raw.to_string()))
 }
 
-/// Whether `path` names a prose file, where `#word word` is a heading.
-fn is_prose_path(path: &std::path::Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
+/// Whether `path` names a code file with a grammar, where `#fn name` is a
+/// symbol. In every other file `#word word` stays a heading.
+fn is_code_path(path: &std::path::Path) -> bool {
     matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc"
+        crate::lang::detect_file_type(path),
+        crate::types::FileType::Code(_)
     )
 }
 
 /// The symbol name in a declaration form such as `fn name` or `pub async fn
 /// name`: one or more declaration keywords, then one identifier.
 fn declaration_name(suffix: &str) -> Option<&str> {
-    const KEYWORDS: [&str; 22] = [
+    // `impl` is absent on purpose: `impl Foo` names an impl block, which the
+    // symbol `Foo` (a struct) is not.
+    const KEYWORDS: [&str; 21] = [
         "pub",
         "async",
         "unsafe",
@@ -109,7 +109,6 @@ fn declaration_name(suffix: &str) -> Option<&str> {
         "struct",
         "enum",
         "trait",
-        "impl",
         "type",
         "mod",
         "class",
@@ -258,6 +257,22 @@ mod tests {
     fn parse_prose_words_in_code_file_stay_a_heading() {
         let (_, s) = parse_path_with_suffix("a.rs#fn recv ref");
         assert!(matches!(s, PathSuffix::Heading(_)), "{s:?}");
+    }
+
+    #[test]
+    fn parse_impl_form_is_not_the_type_symbol() {
+        for spec in ["a.rs#impl Foo", "a.rs#impl Trait for Foo"] {
+            let (_, s) = parse_path_with_suffix(spec);
+            assert!(matches!(s, PathSuffix::Heading(_)), "{spec} -> {s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_declaration_words_in_structured_file_stay_a_heading() {
+        for spec in ["c.yaml#type Settings", "c.toml#fn run", "c.json#class Foo"] {
+            let (_, s) = parse_path_with_suffix(spec);
+            assert!(matches!(s, PathSuffix::Heading(_)), "{spec} -> {s:?}");
+        }
     }
 
     #[test]
