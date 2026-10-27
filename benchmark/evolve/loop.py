@@ -32,6 +32,7 @@ from spend import SpendLedger
 from . import attribution as cost_attribution
 from . import deepdiag, diagnosis, directives, engine, hookgate, replay
 from .calls import PaidCalls, StopState
+from .directives import Directive
 from .candidate import SRC_PATCH, content_id
 from .finish import REPIN_NOTE, PRClient, outside_allowlist
 from .gitops import GitError, git
@@ -77,7 +78,8 @@ class Settings:
     # Seed cells that the replay diagnostic re-sends to the seed and candidate binaries; 0 turns it off.
     replay_diagnostic: int = 0
     # Seeded proposals, tried in order before the selector picks a component itself.
-    directives: tuple[directives.Directive, ...] = ()
+    # The bare `Directive` name: `directives.Directive` here would resolve against this field on Python < 3.14.
+    directives: tuple[Directive, ...] = ()
     # A Codex run before each proposal; off by default. Its spend is not on the Anthropic ledger.
     deep_diagnosis: bool = False
     deep_diagnosis_model: str = deepdiag.DEFAULT_MODEL
