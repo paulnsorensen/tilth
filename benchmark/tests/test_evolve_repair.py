@@ -142,6 +142,23 @@ def test_a_failing_first_attempt_gets_one_repair_call_with_the_error(world) -> N
     assert proposal == {SRC: fixed}
 
 
+def test_the_repair_error_names_no_worktree_path_or_forbidden_term(world) -> None:  # noqa: F811
+    harness = Harness(world, patches=[broken_patch(world), fixed_patch(world)])
+
+    def leaky_check(worktree: Path) -> tuple[bool, str]:
+        harness.checked.append(worktree)
+        if "BROKEN" in (worktree / "src" / "lib.rs").read_text():
+            return False, f"error: this `map_or` can be simplified\n   --> {worktree}/src/lib.rs:2:5\nsee benchmark/results"
+        return True, "just check: ok"
+
+    harness.evo.just_check = leaky_check
+    harness.dispatch()
+
+    [record] = repair_records(harness)
+    error = record["repair"]["error"]
+    assert "--> src/lib.rs:2:5" in error, error
+    assert "/worktrees/" not in error and "benchmark/" not in error, error
+
 def test_the_repaired_child_is_evaluated_in_place_of_the_broken_one_without_a_second_check(world) -> None:  # noqa: F811
     harness = Harness(world, patches=[broken_patch(world), fixed_patch(world)])
     proposal = harness.dispatch()

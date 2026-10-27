@@ -614,8 +614,17 @@ class Evolution:
         if not result.done and not self.stop.is_set:
             self._static_checks(result)
         if result.stage in {"apply", "just check"}:
-            return result.stage, result.tail
+            return result.stage, self._redact(result.tail or "")
         return None
+
+    def _redact(self, text: str) -> str:
+        """A failure tail fit for the proposer: worktree prefixes cut to repo-relative paths, forbidden terms masked."""
+        text = re.sub(re.escape(str(self.run_dir / "worktrees")) + r"/[^/\s]+/", "", text)
+        text = text.replace(str(self.settings.repo) + "/", "")
+        for term in sorted(self._forbidden_terms(), key=len, reverse=True):
+            if term:
+                text = text.replace(term, "<redacted>")
+        return text
 
     def _hook_gate(self, result: Cascade) -> Cascade | None:
         """Run the corpus through the candidate's hook before any cell; the failed cascade, or None when it passes."""
