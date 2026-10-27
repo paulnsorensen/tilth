@@ -77,23 +77,40 @@ pub(crate) fn resolve_by_path_line_occurrence(
     )
 }
 
-/// Symbol search limited to the one file `path`.
+/// Symbol search limited to the one file `path`, keeping every definition.
+/// The glob is anchored on the parent directory name so the walker takes its
+/// exact-file path instead of walking the subtree.
 pub(crate) fn search_symbol_in_file(
     path: &Path,
     name: &str,
     cache: &OutlineCache,
 ) -> Result<crate::types::SearchResult, TilthError> {
+    let not_found = || TilthError::NotFound {
+        path: path.to_path_buf(),
+        suggestion: None,
+    };
     let file = path
         .file_name()
         .and_then(|file| file.to_str())
-        .ok_or_else(|| TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        })?;
-    super::search_symbol_raw_cached(
+        .ok_or_else(not_found)?;
+    let parent = path.parent().ok_or_else(not_found)?;
+    let dir = parent
+        .file_name()
+        .and_then(|dir| dir.to_str())
+        .zip(parent.parent())
+        .filter(|(_, grandparent)| !grandparent.as_os_str().is_empty());
+    let Some((dir_name, scope)) = dir else {
+        return super::search_symbol_raw_all_definitions(
+            name,
+            parent,
+            Some(&globset::escape(file)),
+            cache,
+        );
+    };
+    super::search_symbol_raw_all_definitions(
         name,
-        path.parent().unwrap_or_else(|| Path::new(".")),
-        Some(&globset::escape(file)),
+        scope,
+        Some(&format!("{dir_name}/{file}")),
         cache,
     )
 }

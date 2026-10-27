@@ -623,15 +623,6 @@ pub fn search_symbol_raw(
     symbol::search(query, scope, None, glob, false)
 }
 
-pub(crate) fn search_symbol_raw_cached(
-    query: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    cache: &OutlineCache,
-) -> Result<SearchResult, TilthError> {
-    symbol::search_cached(query, scope, None, glob, false, cache)
-}
-
 /// Symbol search for a query route: keeps as many matches as `budget` tokens allow.
 pub(crate) fn search_symbol_raw_for_budget(
     query: &str,
@@ -641,6 +632,16 @@ pub(crate) fn search_symbol_raw_for_budget(
     budget: u64,
 ) -> Result<SearchResult, TilthError> {
     symbol::search_cached_for_budget(query, scope, glob, cache, budget)
+}
+
+/// Symbol search that keeps every definition, for callers that filter definitions themselves.
+pub(crate) fn search_symbol_raw_all_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached_all_definitions(query, scope, glob, cache)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.

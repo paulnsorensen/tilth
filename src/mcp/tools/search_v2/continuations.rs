@@ -561,7 +561,7 @@ mod tests {
             "package gin\n\nfunc Render() { helper() }\n\nfunc helper() {}\n",
         )
         .unwrap();
-        let found = crate::search::search_symbol_raw_cached(
+        let found = crate::search::search_symbol_raw_all_definitions(
             "Render",
             tmp.path(),
             Some("context.go"),

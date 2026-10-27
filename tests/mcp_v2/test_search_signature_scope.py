@@ -232,5 +232,112 @@ class TestFacetEditable(SearchFixture):
         self.assertEqual(target.read_text(), original.replace("marker(1)", "marker(9)"))
 
 
+class GoReceiverBeyondHitCap(SearchFixture):
+    def setUp(self):
+        super().setUp()
+        for index in range(70):
+            (self.root / f"m{index:02}.go").write_text(
+                f"package caddy\n\ntype T{index:02} struct{{}}\n\n"
+                f"func (m *T{index:02}) UnmarshalCaddyfile(d *D) error {{\n"
+                f"\treturn nil // T{index:02}\n}}\n")
+
+    def test_receiver_past_the_definition_cap_resolves(self):
+        for query in ("func (T65) UnmarshalCaddyfile",
+                      "func (m *T65) UnmarshalCaddyfile(d *D) error {"):
+            result = self.search([{"query": query}])["results"][0]
+            self.assertEqual(result["resolved_as"], "symbol", result)
+            self.assertIn("return nil // T65", result["core"])
+
+    def test_unknown_receiver_is_a_complete_miss_only_after_a_full_scan(self):
+        result = self.search([{"query": "func (T99) UnmarshalCaddyfile"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "miss", result)
+
+
+class GoReceiverStaysAmbiguous(SearchFixture):
+    def test_two_methods_on_same_receiver_name_are_returned_as_candidates(self):
+        for directory in ("a", "b"):
+            (self.root / directory).mkdir()
+            (self.root / directory / "h.go").write_text(
+                f"package {directory}\n\ntype Handler struct{{}}\n\n"
+                "func (h *Handler) ServeHTTP(w int) {\n\t_ = w\n}\n")
+        result = self.search([{"query": "func (Handler) ServeHTTP"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+        self.assertEqual(len(result["candidates"]), 2, result)
+
+
+class GoGenericReceiver(SearchFixture):
+    def setUp(self):
+        super().setUp()
+        (self.root / "g.go").write_text(
+            "package g\n\ntype Set[T comparable] struct{}\n\n"
+            "func (s *Set[T]) Add(v T) {\n\t_ = v // set\n}\n\n"
+            "type Map[K comparable, V any] struct{}\n\n"
+            "func (m *Map[K, V]) Add(k K, v V) {\n\t_ = k // map\n}\n")
+
+    def test_map_receiver_with_and_without_type_params_resolves(self):
+        for query in ("func (m *Map) Add", "func (m *Map[K, V]) Add(k K, v V)"):
+            result = self.search([{"query": query}])["results"][0]
+            self.assertEqual(result["resolved_as"], "symbol", result)
+            self.assertIn("// map", result["core"])
+
+
+class GoSignatureShapes(SearchFixture):
+    def setUp(self):
+        super().setUp()
+        (self.root / "s.go").write_text(
+            "package s\n\nfunc F(a interface{ M() }) int {\n\treturn 1 // plain\n}\n\n"
+            "func Map[S ~[]E, E any](s S) int {\n\treturn 2 // generic\n}\n")
+
+    def test_interface_literal_param_resolves(self):
+        result = self.search([{"query": "func F(a interface{ M() }) int"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "symbol", result)
+        self.assertIn("// plain", result["core"])
+
+    def test_nested_bracket_type_params_resolve(self):
+        result = self.search([{"query": "func Map[S ~[]E, E any](s S) int"}])["results"][0]
+        self.assertEqual(result["resolved_as"], "symbol", result)
+        self.assertIn("// generic", result["core"])
+
+    def test_regex_shapes_stay_regex(self):
+        for query in ("func Get(User|Order)", "func New[A-Z]"):
+            result = self.search([{"query": query}])["results"][0]
+            self.assertEqual(result["resolved_as"], "regex", result)
+
+
+class GoReceiverMissKeepsNormalization(SearchFixture):
+    def test_literal_and_miss_paths_report_the_rewrite(self):
+        (self.root / "m.go").write_text(
+            "package m\n\nfunc (m *Real) Run() {\n\t_ = 1\n}\n")
+        query = "func (x *Nothing) Run()"
+        payload = self.search([{"query": query}])
+        self.assertEqual(payload["results"][0]["resolved_as"], "miss", payload)
+        normalizations = payload["diagnostics"]["normalizations"]
+        self.assertTrue(any(n["query"] == query for n in normalizations), normalizations)
+
+
+class SameNameDefinitionsInOneFile(SearchFixture):
+    def test_every_occurrence_in_one_file_follows(self):
+        source = "package p\n\n" + "".join(
+            f"type T{i:02} struct{{}}\n\nfunc (T{i:02}) String() string {{\n\treturn \"{i}\"\n}}\n\n"
+            for i in range(15))
+        (self.root / "s.go").write_text(source)
+        result = self.search([{"query": "String"}], budget=24000)["results"][0]
+        candidates = result["candidates"]
+        self.assertEqual(len(candidates), 15, result)
+        for index in (10, 12, 14):
+            candidate = candidates[index]
+            hint = {"kind": "fetch_callers", "target": {
+                "path": candidate["path"], "scope": ".", "line": candidate["line"],
+                "name": candidate["def_name"], "occurrence": candidate["occurrence"]}}
+            request = harness.tools_call_request(
+                2, "tilth_search", {"cwd": self.cwd, "queries": [{"follow": hint}]})
+            run = harness.run_mcp([], [harness.initialize_request(), request])
+            response = run.response_by_id(2)
+            self.assertFalse(harness.tool_is_error(response), harness.tool_result_text(response))
+            followed = json.loads(harness.tool_result_text(response))["results"][0]
+            self.assertEqual(followed["resolved_as"], "fetch_callers", followed)
+            self.assertEqual(followed["target"]["line"], candidate["line"], followed)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,18 @@ pub(crate) fn search_cached_for_budget(
     search_with_limits(query, scope, None, glob, cache, limits)
 }
 
+/// Like `search_cached`, keeping every definition the walk finds. Usages stay
+/// bounded: callers filter definitions after the walk and read no usages.
+pub(crate) fn search_cached_all_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+) -> Result<SearchResult, TilthError> {
+    let limits = (usize::MAX, usize::MAX, EARLY_QUIT_THRESHOLD_USAGES);
+    search_with_limits(query, scope, None, glob, cache, limits)
+}
+
 /// `limits` is `(max_matches, definition early-quit, usage early-quit)`.
 fn search_with_limits(
     query: &str,

@@ -839,8 +839,8 @@ fn route_query(
     // 1b. Go declaration signature — `func (r *T) Name(...)` carries `(`, `*`
     // and `)`, which would route to regex and miss. Resolve it to the symbol
     // and report the rewrite in the diagnostics.
-    // A receiver narrows the symbol to that type's method; when it does not
-    // single one out, the signature text is searched literally instead.
+    // A receiver narrows the symbol to that type's methods; when it leaves
+    // none, the signature text is searched literally instead.
     if let Some(signature) = go_signature(query) {
         let receiver_scope = signature
             .receiver
@@ -855,9 +855,6 @@ fn route_query(
             budget,
         )?;
         result["query"] = json!(query);
-        if signature.receiver.is_some() && route != "symbol" {
-            return Ok((result, route, hints, None));
-        }
         let mut diag = json!({
             "query": query,
             "normalized_to": signature.name,
@@ -939,8 +936,7 @@ fn route_query(
 /// fallback -> miss. Shared by the plain identifier route and the
 /// signature-prefix-normalized route. `receiver_scope` is a Go receiver type
 /// plus the full signature text: only that type's methods count as
-/// definitions, and any other outcome than one hit searches the signature
-/// text literally.
+/// definitions; with none left the signature text is searched literally.
 fn route_identifier(
     query: &str,
     receiver_scope: Option<(&str, &str)>,
@@ -950,7 +946,13 @@ fn route_identifier(
     session: &Session,
     budget: u64,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    let sym_result = crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?;
+    // A receiver filter runs after the walk, so the walk must keep every
+    // definition: a hit cap would drop the one method that carries the receiver.
+    let sym_result = if receiver_scope.is_some() {
+        crate::search::search_symbol_raw_all_definitions(query, cwd, glob, cache)?
+    } else {
+        crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?
+    };
     let discovery_partial = sym_result.files_unreadable > 0
         || sym_result.definitions
             > sym_result
@@ -998,9 +1000,12 @@ fn route_identifier(
                 .and_then(|(receiver, _)| receiver)
                 .is_some_and(|receiver| go_receiver_type(receiver) == receiver_type)
         });
-        if code_defs.len() != 1 {
-            let (result, route) =
+        if code_defs.is_empty() {
+            let (mut result, route) =
                 content_route(signature_text, glob, cwd, cache, session, None, budget)?;
+            if discovery_partial {
+                mark_partial(&mut result);
+            }
             return Ok((result, route, Vec::new()));
         }
     }
@@ -1144,7 +1149,7 @@ fn go_func_head(query: &str) -> Option<(Option<&str>, &str)> {
     let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
     match rest.strip_prefix('(') {
         Some(inner) => {
-            let close = inner.find(')')?;
+            let close = matching_close(inner, '(', ')')?;
             let receiver = inner[..close].trim();
             if !is_go_receiver(receiver) {
                 return None;
@@ -1167,8 +1172,7 @@ fn is_go_signature_tail(tail: &str) -> bool {
     if tail.is_empty() {
         return true;
     }
-    // `{}` is an empty struct or interface type, not a repetition operator.
-    let probe = tail.replace("{}", "");
+    let probe = without_type_braces(tail);
     for marker in ['\\', '|', '?', '+', '^', '$', '{'] {
         if probe.contains(marker) {
             return false;
@@ -1179,7 +1183,7 @@ fn is_go_signature_tail(tail: &str) -> bool {
     }
     match tail.strip_prefix('[') {
         Some(inner) => {
-            let Some(close) = inner.find(']') else {
+            let Some(close) = matching_close(inner, '[', ']') else {
                 return false;
             };
             let after = inner[close + 1..].trim_start();
@@ -1189,9 +1193,62 @@ fn is_go_signature_tail(tail: &str) -> bool {
     }
 }
 
+/// Index of the delimiter that closes a group whose opener precedes `s`.
+fn matching_close(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    for (index, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Drop balanced `{...}` groups, which are struct or interface types. A group
+/// holding only digits and commas is a regex repetition (`a{2,3}`) and stays.
+fn without_type_braces(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let inner = &rest[open + 1..];
+        let Some(close) = matching_close(inner, '{', '}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let body = &inner[..close];
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit() || c == ',') {
+            out.push_str(&rest[open..open + close + 2]);
+        }
+        rest = &inner[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `T any`, `K comparable, V any`: each part is an identifier and a constraint.
 fn is_go_type_params(params: &str) -> bool {
-    for part in params.split(',') {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, c) in params.char_indices() {
+        match c {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&params[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&params[start..]);
+    for part in parts {
         let mut tokens = part.split_whitespace();
         let Some(name) = tokens.next() else {
             return false;
@@ -1203,16 +1260,38 @@ fn is_go_type_params(params: &str) -> bool {
     true
 }
 
-/// The type name of a Go receiver: `m *T[K]` -> `T`.
-fn go_receiver_type(receiver: &str) -> &str {
-    let type_token = receiver.split_whitespace().last().unwrap_or(receiver);
-    let type_name = type_token.trim_start_matches('*');
-    type_name.split('[').next().unwrap_or(type_name)
+/// A receiver without its trailing type-parameter list: `m *Map[K, V]` -> `m *Map`.
+fn strip_type_params(receiver: &str) -> Option<&str> {
+    let Some(body) = receiver.strip_suffix(']') else {
+        return Some(receiver);
+    };
+    let mut depth = 1usize;
+    for (index, c) in body.char_indices().rev() {
+        if c == ']' {
+            depth += 1;
+        } else if c == '[' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body[..index].trim_end());
+            }
+        }
+    }
+    None
 }
 
-/// `T`, `*T`, `m T`, `m *T`, optionally with type parameters (`T[K]`).
+/// The type name of a Go receiver: `m *T[K]` -> `T`.
+fn go_receiver_type(receiver: &str) -> &str {
+    let head = strip_type_params(receiver).unwrap_or(receiver);
+    let type_token = head.split_whitespace().last().unwrap_or(head);
+    type_token.trim_start_matches('*')
+}
+
+/// `T`, `*T`, `m T`, `m *T`, optionally with type parameters (`T[K]`, `Map[K, V]`).
 fn is_go_receiver(receiver: &str) -> bool {
-    let mut tokens = receiver.split_whitespace();
+    let Some(head) = strip_type_params(receiver) else {
+        return false;
+    };
+    let mut tokens = head.split_whitespace();
     let Some(first) = tokens.next() else {
         return false;
     };
@@ -1228,7 +1307,7 @@ fn is_go_receiver(receiver: &str) -> bool {
     if tokens.next().is_some() {
         return false;
     }
-    is_identifier(go_receiver_type(type_token))
+    is_identifier(type_token.trim_start_matches('*'))
 }
 
 fn raw_result(query: &str, route: &str, raw: &crate::types::SearchResult) -> Value {
