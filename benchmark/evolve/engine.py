@@ -15,7 +15,7 @@ from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, o
 
 from .calls import PaidCalls, StopState
 from .candidate import MAX_BYTES, OBJECTIVE, SRC_PATCH, content_id
-from .diagnosis import DIAGNOSIS_NOTE, REFLECTION_HYPOTHESIS, HypothesisBook
+from .diagnosis import DIAGNOSIS_NOTE, DIRECTIVE_NOTE, REFLECTION_HYPOTHESIS, HypothesisBook
 from .source_map import entries_for
 
 __all__ = ["Dispatcher", "ReflectionClient", "StopState", "Stopper", "optimize", "reflection_prompt"]
@@ -26,7 +26,7 @@ REFLECTION_HEADER = (
     "holds the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Rewrite the file so agents solve tasks like these at "
     "lower cost without losing correctness. Keep it concise. "
-    f"{DIAGNOSIS_NOTE} Reply with the complete new file text between <new_text> and </new_text>. "
+    f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} Reply with the complete new file text between <new_text> and </new_text>. "
     f"{REFLECTION_HYPOTHESIS}"
 )
 # The paid-tier side_info fields that make up the score; reflection sees them once per candidate.
@@ -136,7 +136,9 @@ class Dispatcher:
     def __init__(self, stop: StopState, *, reflect: Callable[[str, str, list[dict]], str],
                  propose: Callable[[Mapping[str, str], list[dict]], str],
                  hypotheses: HypothesisBook | None = None,
-                 extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None) -> None:
+                 extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None,
+                 directives=None) -> None:
+        self.directives = directives
         self.stop = stop
         self.reflect = reflect
         self.propose = propose
@@ -146,6 +148,7 @@ class Dispatcher:
     def __call__(self, candidate: dict[str, str], reflective_dataset: Mapping[str, Sequence[Mapping]],
                  components_to_update: list[str]) -> dict[str, str]:
         proposal = {}
+        directive = self.directives.claim() if self.directives is not None else None
         if self.hypotheses is not None:
             self.hypotheses.discard()
         for name in components_to_update:
@@ -157,6 +160,8 @@ class Dispatcher:
                       for record in (*_failure(entry), *_cost(entry), *_diagnosis(entry), *entry.get("records", ()))}
             if self.extra_records is not None:
                 unique.update({json.dumps(record, sort_keys=True): record for record in self.extra_records(candidate)})
+            if directive is not None and directive.component == name:
+                unique[json.dumps(directive.record(), sort_keys=True)] = directive.record()
             records = list(unique.values())
             if self.stop.is_set:
                 break
@@ -164,6 +169,9 @@ class Dispatcher:
                 proposal[name] = self.propose(candidate, records)
             else:
                 proposal[name] = self.reflect(name, candidate[name], records)
+            if directive is not None and directive.component == name and directive.hypothesis \
+                    and self.hypotheses is not None:
+                self.hypotheses.default(name, directive.hypothesis)
         if self.stop.is_set:
             return {}
         if self.hypotheses is not None:

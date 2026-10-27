@@ -30,8 +30,9 @@ from judge import store as judge_store
 from spend import SpendLedger
 
 from . import attribution as cost_attribution
-from . import diagnosis, engine, hookgate, replay
+from . import deepdiag, diagnosis, directives, engine, hookgate, replay
 from .calls import PaidCalls, StopState
+from .directives import Directive
 from .candidate import SRC_PATCH, content_id
 from .finish import REPIN_NOTE, PRClient, outside_allowlist
 from .gitops import GitError, git
@@ -76,6 +77,21 @@ class Settings:
     strict_file_tools: bool = True
     # Seed cells that the replay diagnostic re-sends to the seed and candidate binaries; 0 turns it off.
     replay_diagnostic: int = 0
+    # Seeded proposals, tried in order before the selector picks a component itself.
+    # The bare `Directive` name: `directives.Directive` here would resolve against this field on Python < 3.14.
+    directives: tuple[Directive, ...] = ()
+    # A Codex run before each proposal; off by default. Its spend is not on the Anthropic ledger.
+    deep_diagnosis: bool = False
+    deep_diagnosis_model: str = deepdiag.DEFAULT_MODEL
+    deep_diagnosis_effort: str = deepdiag.DEFAULT_EFFORT
+    deep_diagnosis_max: int = deepdiag.DEFAULT_MAX_RUNS
+    deep_diagnosis_timeout: float = deepdiag.DEFAULT_TIMEOUT_S
+
+
+def forbidden_terms(panel_path: Path) -> list[str]:
+    """The isolation list: what no proposer trajectory, directive brief, or deep-diagnosis record may name."""
+    panel = Path(panel_path)
+    return ["benchmark/", str(panel), str(panel.resolve()), panel.name, str(external.data.data_dir())]
 
 
 @dataclass(eq=False)
@@ -243,7 +259,7 @@ def _paired_score_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Map
 class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
-                 spawn: Callable) -> None:
+                 spawn: Callable, deep_runner: deepdiag.Runner | None = None) -> None:
         self.settings = settings
         self.panel = panel
         self.ledger = ledger
@@ -263,9 +279,20 @@ class Evolution:
         self.reflect = engine.ReflectionClient(self.paid, settings.helper_model, self.hypotheses)
         self.proposer = Proposer(settings.repo, settings.seed_sha, self.paid, settings.helper_model, log=self.log,
                                  forbidden=self._forbidden_terms(), hypotheses=self.hypotheses)
-        self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log)
+        self.directives = directives.DirectiveQueue(settings.directives, self.log)
+        self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log, directives=self.directives)
+        # The scratch dir lives outside the repo so Codex's -C path never names benchmark/ or the run dir.
+        deep_root = Path(tempfile.gettempdir()) / f"tilth-deepdiag-{settings.run_id}"
+        self.deep = (deepdiag.DeepDiagnosis(deep_root, dev_tasks=panel.dev,
+                                            forbidden=self._forbidden_terms(), log=self.log,
+                                            model=settings.deep_diagnosis_model,
+                                            effort=settings.deep_diagnosis_effort,
+                                            max_runs=settings.deep_diagnosis_max,
+                                            timeout=settings.deep_diagnosis_timeout, runner=deep_runner)
+                     if settings.deep_diagnosis else None)
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
-                                            hypotheses=self.hypotheses, extra_records=self._extra_records)
+                                            hypotheses=self.hypotheses, extra_records=self._extra_records,
+                                            directives=self.directives)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
@@ -296,9 +323,7 @@ class Evolution:
             self.log("infra:quota: a usage limit rejected a call; stored rows stay reusable")
 
     def _forbidden_terms(self) -> list[str]:
-        panel = Path(self.settings.panel_path)
-        data = external.data.data_dir()
-        return ["benchmark/", str(panel), str(panel.resolve()), panel.name, str(data)]
+        return forbidden_terms(self.settings.panel_path)
 
     @contextmanager
     def _spending(self, kind: str) -> Iterator[None]:
@@ -739,7 +764,24 @@ class Evolution:
         """Run-level records for a reflection or proposer call: past hypothesis outcomes and the candidate's own replay."""
         records = self.hypotheses.feedback()
         own = self.results.get(content_id(candidate))
-        return [*records, {"replay": own.replay}] if own and own.replay else records
+        if own and own.replay:
+            records = [*records, {"replay": own.replay}]
+        return [*records, *self._deep_records(own)]
+
+    def _deep_records(self, own: Cascade | None) -> list[dict]:
+        """The parent's deep-diagnosis record: its dev rows against the baseline's, one Codex run per parent."""
+        if self.deep is None or own is None:
+            return []
+        if not own.rows:
+            self.log(f"deep diagnosis {own.cid[:12]}: skipped, the parent has no dev rows")
+            return []
+        # Only the dev baseline plan's rows carry trajectory paths; cost-summary rows cannot stage a comparison.
+        baseline = self.dev_baseline_rows
+        if not baseline:
+            self.log(f"deep diagnosis {own.cid[:12]}: skipped, no dev baseline rows yet")
+            return []
+        return self.deep.records(own.cid, [{**row, "correct": correct(row)} for row in own.rows],
+                                 [{**row, "correct": correct(row)} for row in baseline])
 
     def _diagnose(self, result: Cascade) -> None:
         """Attribute a candidate's paid dev rows once per content id; replay its src change when asked."""

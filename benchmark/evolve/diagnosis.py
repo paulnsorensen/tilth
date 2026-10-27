@@ -31,7 +31,11 @@ EXPOSURE_KEY = "result_chars_times_remaining_api_turns_per_cell"
 
 DIAGNOSIS_NOTE = (
     "An `attribution` record and a `source_map` record, when present, name where the extra tokens come from "
-    "and which source renders them."
+    "and which source renders them. A `deep_diagnosis` record, when present, lists ranked causes from an "
+    "independent turn-by-turn comparison of rollouts with and without tilth."
+)
+DIRECTIVE_NOTE = (
+    "A `directive` record, when present, names the change to make: implement exactly that change."
 )
 HYPOTHESIS_BODY = (
     "add one <hypothesis>{json}</hypothesis> block that predicts the effect of your change. "
@@ -176,6 +180,10 @@ class HypothesisBook:
     def discard(self) -> None:
         self.pending.clear()
 
+    def default(self, component: str, hypothesis: dict) -> None:
+        """Hold a seeded hypothesis unless the model's reply already offered one for ``component``."""
+        self.pending.setdefault(component, dict(hypothesis))
+
     def attach(self, parent: str, child: str) -> None:
         """Key the held hypotheses by ``parent`` and ``child`` content id."""
         held, self.pending = self.pending, {}
@@ -225,9 +233,10 @@ class WeightedSelector:
     """
 
     def __init__(self, dominant_of: Callable[[dict], list[dict] | None], log: Callable[[str], None],
-                 rng: random.Random | None = None):
+                 rng: random.Random | None = None, directives=None):
         self.dominant_of = dominant_of
         self.log = log
+        self.directives = directives
         self.rng = rng or random.Random(0)
         self.count = 0
         self.deadline: dict[str, int] = {}
@@ -252,6 +261,14 @@ class WeightedSelector:
             self.deadline.setdefault(name, MAX_UNSELECTED + 1)
         if SRC_PATCH in names and self.deadline[SRC_PATCH] > SRC_PATCH_BY_PROPOSAL and self.count == 1:
             self.deadline[SRC_PATCH] = SRC_PATCH_BY_PROPOSAL
+        if self.directives is not None and self.directives.pending:
+            directive = self.directives.take(self.count)
+            if directive.component in names:
+                self.deadline[directive.component] = self.count + MAX_UNSELECTED + 1
+                self.log(f"selector: proposal {self.count} parent {short_id(candidate)} -> {directive.component}: "
+                         f"directive override {directive.id}")
+                return [directive.component]
+            self.log(f"selector: directive {directive.id} dropped: the candidate has no {directive.component}")
         feasible = []
         for name in names:
             after = {**self.deadline, name: self.count + MAX_UNSELECTED + 1}

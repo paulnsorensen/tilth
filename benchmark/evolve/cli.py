@@ -29,10 +29,11 @@ import baselines  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
+from evolve import deepdiag, directives  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
-from evolve.loop import Evolution, EvolveError, Settings  # noqa: E402
+from evolve.loop import Evolution, EvolveError, Settings, forbidden_terms  # noqa: E402
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV  # noqa: E402
 from judge import core as judge  # noqa: E402
 from spend import SpendLedger  # noqa: E402
@@ -97,6 +98,20 @@ def _parser() -> argparse.ArgumentParser:
                         help="for a candidate that changes src_patch, replay N seed dev cells against the seed and "
                              "candidate binaries and show the diff to later reflection (no model call; never "
                              "rejects; default 0 = off)")
+    parser.add_argument("--directives", type=Path, metavar="PATH",
+                        help="JSON list of {id, component, brief, hypothesis?}: seeded proposals, tried in order "
+                             "before the selector picks a component itself (default: none)")
+    parser.add_argument("--deep-diagnosis", action="store_true",
+                        help="before each proposal, run Codex once per parent over its dev trajectories and show "
+                             "its ranked causes to the proposer (off by default; Codex spend is not on the ledger)")
+    parser.add_argument("--deep-diagnosis-model", default=deepdiag.DEFAULT_MODEL,
+                        help=f"Codex model (default {deepdiag.DEFAULT_MODEL})")
+    parser.add_argument("--deep-diagnosis-effort", default=deepdiag.DEFAULT_EFFORT,
+                        help=f"Codex reasoning effort (default {deepdiag.DEFAULT_EFFORT})")
+    parser.add_argument("--deep-diagnosis-max", type=int, default=deepdiag.DEFAULT_MAX_RUNS,
+                        help=f"Codex runs per evolve run (default {deepdiag.DEFAULT_MAX_RUNS})")
+    parser.add_argument("--deep-diagnosis-timeout", type=float, default=deepdiag.DEFAULT_TIMEOUT_S,
+                        help=f"seconds before a Codex run is killed (default {deepdiag.DEFAULT_TIMEOUT_S})")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
@@ -122,7 +137,8 @@ def _base_ref(repo: Path, branch: str) -> str:
 def build(argv: list[str] | None = None, *,
           judge_factory: Callable[[SpendLedger, float], judge.Judge] | None = None,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
-          spawn: Callable | None = None, auth_spawn: Callable | None = None) -> Evolution | int:
+          spawn: Callable | None = None, auth_spawn: Callable | None = None,
+          deep_runner: deepdiag.Runner | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -140,6 +156,9 @@ def build(argv: list[str] | None = None, *,
         auth.refuse_env(os.environ)
     except auth.ClaudeAuthError as error:
         return _error(str(error))
+    if args.deep_diagnosis_max < 0 or not math.isfinite(args.deep_diagnosis_timeout) \
+            or args.deep_diagnosis_timeout <= 0:
+        return _error("--deep-diagnosis-max must be at least 0 and --deep-diagnosis-timeout positive")
     repo = args.repo.resolve()
     try:
         seed_sha = git("rev-parse", "--verify", f"{args.seed_sha}^{{commit}}", cwd=repo).strip()
@@ -156,6 +175,12 @@ def build(argv: list[str] | None = None, *,
         panel.register(run.TASKS)
     except panels.PanelError as error:
         return _error(str(error))
+    queue: list[directives.Directive] = []
+    if args.directives is not None:
+        try:
+            queue = directives.load(args.directives, seed, forbidden_terms(args.panel))
+        except directives.DirectiveError as error:
+            return _error(str(error))
     cells = [(task, "baseline", args.model) for task in [*panel.cheap, *panel.dev, *panel.test]]
     try:
         auth.preflight_claude_auth([run.isolated_call_target(), *run.claude_auth_targets(cells, bare=True)],
@@ -171,10 +196,13 @@ def build(argv: list[str] | None = None, *,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
         strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
+        directives=tuple(queue), deep_diagnosis=args.deep_diagnosis,
+        deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,
+        deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
-                     spawn=spawn or subprocess.run)
+                     spawn=spawn or subprocess.run, deep_runner=deep_runner)
 
 
 def main(argv: list[str] | None = None, **deps) -> int:

@@ -15,7 +15,7 @@ from parse import extract_trajectory
 
 from .calls import PaidCalls
 from .candidate import OBJECTIVE, SRC_PATCH, TEXT_COMPONENTS
-from .diagnosis import DIAGNOSIS_NOTE, PROPOSER_HYPOTHESIS, HypothesisBook
+from .diagnosis import DIAGNOSIS_NOTE, DIRECTIVE_NOTE, PROPOSER_HYPOTHESIS, HypothesisBook
 from .gitops import GitError, git, git_bytes
 
 EXPORT_PATHS = ("src", "prompts", "Cargo.toml", "Cargo.lock")
@@ -28,7 +28,7 @@ PROPOSER_HEADER = (
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {PROPOSER_HYPOTHESIS}"
+    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 
 
