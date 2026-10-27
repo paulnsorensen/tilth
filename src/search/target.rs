@@ -40,16 +40,16 @@ pub struct ResolvedTarget {
 
 /// Resolve a path/line target by its stable source-byte occurrence identity.
 /// The identity prevents same-line declarations from being re-resolved by line alone.
-/// The rescan uses the hint's glob, so a follow never resolves outside its glob.
+/// The rescan covers only `path`, so a repo-wide hit cap never drops the target;
+/// the caller checks the hint's glob.
 pub(crate) fn resolve_by_path_line_occurrence(
     path: &Path,
     line: u32,
     name: &str,
     occurrence: (usize, usize),
-    (scope, glob): (&Path, Option<&str>),
     cache: &OutlineCache,
 ) -> Result<(ResolvedTarget, SourceSnapshot, Lang), TilthError> {
-    let result = super::search_symbol_raw_cached(name, scope, glob, cache)?;
+    let result = search_symbol_in_file(path, name, cache)?;
     let canonical = path.canonicalize().map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
@@ -73,6 +73,48 @@ pub(crate) fn resolve_by_path_line_occurrence(
         candidate.def_range.map(|(_, end)| end),
         name.to_string(),
         false,
+        cache,
+    )
+}
+
+/// Symbol search limited to the one file `path`, keeping every definition.
+/// The glob is anchored on the parent directory name so the walker takes its
+/// exact-file path instead of walking the subtree.
+pub(crate) fn search_symbol_in_file(
+    path: &Path,
+    name: &str,
+    cache: &OutlineCache,
+) -> Result<crate::types::SearchResult, TilthError> {
+    let not_found = || TilthError::NotFound {
+        path: path.to_path_buf(),
+        suggestion: None,
+    };
+    let file = path
+        .file_name()
+        .and_then(|file| file.to_str())
+        .ok_or_else(not_found)?;
+    let parent = path.parent().ok_or_else(not_found)?;
+    let dir = parent
+        .file_name()
+        .and_then(|dir| dir.to_str())
+        .zip(parent.parent())
+        .filter(|(_, grandparent)| !grandparent.as_os_str().is_empty());
+    let Some((dir_name, scope)) = dir else {
+        return super::search_symbol_raw_all_definitions(
+            name,
+            parent,
+            Some(&globset::escape(file)),
+            cache,
+        );
+    };
+    super::search_symbol_raw_all_definitions(
+        name,
+        scope,
+        Some(&format!(
+            "{}/{}",
+            globset::escape(dir_name),
+            globset::escape(file)
+        )),
         cache,
     )
 }
@@ -244,27 +286,15 @@ pub(crate) fn resolve_candidate_with_source_exact(
         cache,
     )?;
     let canonical = path.canonicalize().ok();
-    let valid = path
-        .file_name()
-        .and_then(|file| file.to_str())
-        .and_then(|file| {
-            super::search_symbol_raw_cached(
-                name,
-                path.parent().unwrap_or_else(|| Path::new(".")),
-                Some(&globset::escape(file)),
-                cache,
-            )
-            .ok()
+    let valid = search_symbol_in_file(path, name, cache).is_ok_and(|result| {
+        result.matches.iter().any(|candidate| {
+            candidate.is_definition
+                && candidate.path.canonicalize().ok() == canonical
+                && candidate.line == start_line
+                && candidate.def_name.as_deref() == Some(name)
+                && candidate.def_byte_range == Some(occurrence)
         })
-        .is_some_and(|result| {
-            result.matches.iter().any(|candidate| {
-                candidate.is_definition
-                    && candidate.path.canonicalize().ok() == canonical
-                    && candidate.line == start_line
-                    && candidate.def_name.as_deref() == Some(name)
-                    && candidate.def_byte_range == Some(occurrence)
-            })
-        });
+    });
     if !valid || target.name != name {
         return Err(TilthError::NotFound {
             path: path.to_path_buf(),
@@ -393,6 +423,39 @@ pub(crate) fn collect_siblings(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn search_symbol_in_file_enters_skipped_directory_for_exact_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join("vendor");
+        fs::create_dir(&vendor).unwrap();
+        let file = vendor.join("lib.rs");
+        fs::write(&file, "pub fn vendored_probe() {}\n").unwrap();
+        let cache = OutlineCache::new();
+
+        let result = search_symbol_in_file(&file, "vendored_probe", &cache).unwrap();
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.is_definition && m.path == file),
+            "target inside a skipped directory must resolve: {:?}",
+            result.matches
+        );
+
+        let broad = crate::search::search_symbol_raw_all_definitions(
+            "vendored_probe",
+            tmp.path(),
+            None,
+            &cache,
+        )
+        .unwrap();
+        assert!(
+            broad.matches.is_empty(),
+            "a normal search must still skip vendor/: {:?}",
+            broad.matches
+        );
+    }
 
     fn make_entry(kind: OutlineKind, name: &str, start: u32, end: u32) -> OutlineEntry {
         OutlineEntry {
@@ -918,5 +981,16 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["fn", "var"], "functions sort first");
+    }
+
+    #[test]
+    fn search_in_file_escapes_glob_characters_in_the_directory_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join(".pkg[1]");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let file = dir.join("f[a].rs");
+        std::fs::write(&file, "fn target() {}\n").expect("write");
+        let result = search_symbol_in_file(&file, "target", &OutlineCache::new()).expect("search");
+        assert_eq!(result.definitions, 1);
     }
 }

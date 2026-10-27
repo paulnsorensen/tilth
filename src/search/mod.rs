@@ -148,7 +148,11 @@ fn walk_builder(scope: &Path, exact_target: Option<PathBuf>) -> WalkBuilder {
         .parents(false)
         .add_custom_ignore_filename(TILTHIGNORE_FILE)
         .filter_entry(move |entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir())
+            let targets_inside = exact_target
+                .as_ref()
+                .is_some_and(|target| target.starts_with(entry.path()));
+            if !targets_inside
+                && entry.file_type().is_some_and(|ft| ft.is_dir())
                 && entry
                     .file_name()
                     .to_str()
@@ -623,13 +627,40 @@ pub fn search_symbol_raw(
     symbol::search(query, scope, None, glob, false)
 }
 
-pub(crate) fn search_symbol_raw_cached(
+/// Symbol search for a query route: keeps as many matches as `budget` tokens allow.
+pub(crate) fn search_symbol_raw_for_budget(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached_for_budget(query, scope, glob, cache, budget)
+}
+
+pub(crate) use symbol::DefinitionFilter;
+
+/// Symbol search that keeps every definition, for callers that filter definitions themselves.
+pub(crate) fn search_symbol_raw_all_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
     cache: &OutlineCache,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search_cached(query, scope, None, glob, false, cache)
+    symbol::search_cached_all_definitions(query, scope, glob, cache)
+}
+
+/// Symbol search that parses only files holding `filter.required_text` and
+/// counts only definitions `filter.keep` accepts, up to the `budget` cap.
+pub(crate) fn search_symbol_raw_filtered(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    budget: u64,
+    filter: &DefinitionFilter<'_>,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached_filtered_definitions(query, scope, glob, cache, budget, filter)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -649,6 +680,29 @@ pub fn search_regex_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     content::search(pattern, scope, true, None, glob, false).map(|(result, _)| result)
+}
+
+/// Like `search_content_raw`, keeping as many hits as `budget` tokens allow.
+pub fn search_content_raw_budgeted(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let (pattern, is_regex) = parse_pattern(query);
+    let cap = content::match_cap_for_budget(budget);
+    content::search_capped(pattern, scope, is_regex, None, glob, cap).map(|(result, _)| result)
+}
+
+/// Like `search_regex_raw`, keeping as many hits as `budget` tokens allow.
+pub fn search_regex_raw_budgeted(
+    pattern: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let cap = content::match_cap_for_budget(budget);
+    content::search_capped(pattern, scope, true, None, glob, cap).map(|(result, _)| result)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1758,15 +1812,28 @@ fn format_search_result_seen(
                 "\n\n## Tests ({})",
                 count_label(faceted.tests.len(), totals.tests)
             );
-            // Compact test format — one line per match, no expand budget consumed
+            // One tagged block per file and enclosing scope, printing only the matched lines. No
+            // expand budget is consumed.
+            let mut test_files: Vec<(&Path, Option<String>, Vec<&Match>)> = Vec::new();
             for m in &faceted.tests {
-                let _ = write!(
-                    out,
-                    "\n  {}:{} — {}",
-                    rel(&m.path, &result.scope),
-                    m.line,
-                    m.text.trim()
-                );
+                let label = enclosing_scope_label(&m.path, m.line, cache);
+                match test_files
+                    .iter_mut()
+                    .find(|(path, scope, _)| *path == m.path && *scope == label)
+                {
+                    Some((_, _, group)) => group.push(m),
+                    None => test_files.push((m.path.as_path(), label, vec![m])),
+                }
+            }
+            for (_, _, group) in &test_files {
+                let start = out.len();
+                format_grouped_usages(group, &result.scope, cache, session, &mut out, &mut seen);
+                let value = group
+                    .iter()
+                    .map(|m| i64::from(m.def_weight))
+                    .max()
+                    .unwrap_or(0);
+                segments.push((value, start, out.len()));
             }
             write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
         }
@@ -4082,6 +4149,46 @@ mod tests {
             .head(tmp.path().join(dropped))
             .expect("tag was minted before the fit");
         assert!(head.seen_lines.is_empty());
+    }
+
+    /// A test file with hits in two functions must print one block per
+    /// enclosing scope, each labelled with its own function.
+    #[test]
+    fn tests_facet_splits_blocks_by_enclosing_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.js"),
+            "function scope_probe_target() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("probe_test.js"),
+            "function test_a() {\n  scope_probe_target();\n  scope_probe_target();\n  scope_probe_target();\n}\n\nfunction test_b() {\n  scope_probe_target();\n  scope_probe_target();\n  scope_probe_target();\n}\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::new();
+        let out = search_symbol_expanded(
+            "scope_probe_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("## Tests"), "{out}");
+        assert!(
+            out.contains("probe_test.js") && out.contains("in function test_a"),
+            "{out}"
+        );
+        assert!(out.contains("in function test_b"), "{out}");
+        assert_eq!(out.matches("probe_test.js").count(), 2, "{out}");
     }
 
     /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must

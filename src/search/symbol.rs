@@ -76,7 +76,7 @@ pub(crate) fn search_cached(
     full: bool,
     cache: &crate::cache::OutlineCache,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
+    let limits = if full {
         (
             FULL_MAX_MATCHES,
             FULL_EARLY_QUIT_DEFINITIONS,
@@ -89,6 +89,75 @@ pub(crate) fn search_cached(
             EARLY_QUIT_THRESHOLD_USAGES,
         )
     };
+    search_with_limits(query, scope, context, glob, cache, limits, None)
+}
+
+/// Like `search_cached`, keeping as many matches as `budget` tokens allow.
+pub(crate) fn search_cached_for_budget(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+    budget: u64,
+) -> Result<SearchResult, TilthError> {
+    let max_matches = super::content::match_cap_for_budget(budget);
+    // The walk must outrun the hit cap, or an early quit looks like a complete result.
+    let limits = (
+        max_matches,
+        EARLY_QUIT_THRESHOLD_DEFINITIONS.max(max_matches * 2),
+        max_matches * 3,
+    );
+    search_with_limits(query, scope, None, glob, cache, limits, None)
+}
+
+/// Like `search_cached`, keeping every definition the walk finds. Usages stay
+/// bounded: callers filter definitions after the walk and read no usages.
+pub(crate) fn search_cached_all_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+) -> Result<SearchResult, TilthError> {
+    let limits = (usize::MAX, usize::MAX, EARLY_QUIT_THRESHOLD_USAGES);
+    search_with_limits(query, scope, None, glob, cache, limits, None)
+}
+
+/// A definition filter that runs inside the walk. `required_text` must appear
+/// in a file for the file to be parsed; `keep` then selects definitions.
+/// Pick `required_text` so that every file with a kept definition contains it.
+pub(crate) struct DefinitionFilter<'a> {
+    pub required_text: &'a str,
+    pub keep: &'a (dyn Fn(&Match) -> bool + Sync),
+}
+
+/// Like `search_cached_for_budget`, counting only definitions `filter` keeps.
+/// The walk stops one kept definition past the budget cap, so
+/// `SearchResult::definitions` exceeds the returned definitions exactly when
+/// the walk quit early.
+pub(crate) fn search_cached_filtered_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+    budget: u64,
+    filter: &DefinitionFilter<'_>,
+) -> Result<SearchResult, TilthError> {
+    let max_matches = super::content::match_cap_for_budget(budget);
+    let limits = (max_matches, max_matches + 1, EARLY_QUIT_THRESHOLD_USAGES);
+    search_with_limits(query, scope, None, glob, cache, limits, Some(filter))
+}
+
+/// `limits` is `(max_matches, definition early-quit, usage early-quit)`.
+fn search_with_limits(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    cache: &crate::cache::OutlineCache,
+    limits: (usize, usize, usize),
+    filter: Option<&DefinitionFilter<'_>>,
+) -> Result<SearchResult, TilthError> {
+    let (max_matches, def_threshold, usage_threshold) = limits;
 
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -98,7 +167,7 @@ pub(crate) fn search_cached(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold, cache),
+        || find_definitions(query, scope, glob, def_threshold, cache, filter),
         || find_usages(query, &matcher, scope, glob, usage_threshold),
     );
 
@@ -176,9 +245,11 @@ fn find_definitions(
     glob: Option<&str>,
     early_quit_threshold: usize,
     cache: &crate::cache::OutlineCache,
+    filter: Option<&DefinitionFilter<'_>>,
 ) -> Result<(Vec<Match>, usize), TilthError> {
     let files_unreadable = AtomicUsize::new(0);
     let needle = query.as_bytes();
+    let required = filter.map(|f| f.required_text.as_bytes());
 
     let matches = super::ordered_walk::walk_ordered(scope, glob, early_quit_threshold, |entry| {
         let Some((path, file_size, meta)) = accept_walk_entry(Ok(entry)) else {
@@ -205,6 +276,11 @@ fn find_definitions(
         // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
         if memchr::memmem::find(content.as_bytes(), needle).is_none() {
             return Vec::new();
+        }
+        if let Some(required) = required {
+            if memchr::memmem::find(content.as_bytes(), required).is_none() {
+                return Vec::new();
+            }
         }
 
         // Catch unmarked minified bundles that slipped past the filename check.
@@ -278,6 +354,9 @@ fn find_definitions(
             };
         }
 
+        if let Some(filter) = filter {
+            file_defs.retain(|m| (filter.keep)(m));
+        }
         file_defs
     })?;
     Ok((matches, files_unreadable.load(Ordering::Relaxed)))
@@ -721,6 +800,27 @@ mod tests {
         .iter()
         .filter(|found| found.is_definition)
         .count()
+    }
+
+    #[test]
+    fn budget_walk_does_not_quit_before_its_hit_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The ordered walk checks the quit threshold per 128-file batch: the
+        // first batch holds 55 definitions, a later batch holds 20 more.
+        for (prefix, count, body) in [
+            ("a", 55, "fn root() {}\n"),
+            ("b", 200, "fn other() {}\n"),
+            ("z", 20, "fn root() {}\n"),
+        ] {
+            for index in 0..count {
+                std::fs::write(tmp.path().join(format!("{prefix}{index:03}.rs")), body).unwrap();
+            }
+        }
+        let cache = crate::cache::OutlineCache::new();
+        let result = search_cached_for_budget("root", tmp.path(), None, &cache, 24_000).unwrap();
+        let shown = result.matches.iter().filter(|m| m.is_definition).count();
+        assert_eq!(shown, 60);
+        assert_eq!(result.definitions, 75);
     }
 
     #[test]
@@ -1521,6 +1621,69 @@ Body to end.
         assert_eq!(
             result_default.total_found, result_full.total_found,
             "total_found must be the same regardless of full flag"
+        );
+    }
+
+    #[test]
+    fn filtered_definitions_skip_files_without_the_required_text_and_quit_at_the_cap() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for index in 0..40 {
+            std::fs::write(
+                root.path().join(format!("other{index:02}.go")),
+                format!(
+                    "package p\n\nfunc (a *Other{index}) Validate() error {{\n\treturn nil\n}}\n"
+                ),
+            )
+            .expect("write");
+        }
+        for index in 0..30 {
+            std::fs::write(
+                root.path().join(format!("opt{index:02}.go")),
+                "package p\n\nfunc (o *Options) Validate() error {\n\treturn nil\n}\n",
+            )
+            .expect("write");
+        }
+        let inspected = AtomicUsize::new(0);
+        let keep = |m: &Match| {
+            inspected.fetch_add(1, Ordering::Relaxed);
+            m.text.contains("*Options)")
+        };
+        let filter = DefinitionFilter {
+            required_text: "Options",
+            keep: &keep,
+        };
+        let cache = crate::cache::OutlineCache::new();
+        let result =
+            search_cached_filtered_definitions("Validate", root.path(), None, &cache, 1, &filter)
+                .expect("search");
+        let returned = result.matches.iter().filter(|m| m.is_definition).count();
+        assert_eq!(returned, 10, "cap is 10 at the smallest budget");
+        assert!(
+            result.definitions > returned,
+            "early quit must show as partial"
+        );
+        assert!(result
+            .matches
+            .iter()
+            .all(|m| m.text.contains("*Options)") || !m.is_definition));
+        assert!(
+            inspected.load(Ordering::Relaxed) <= 30,
+            "files without the receiver type must not be parsed"
+        );
+
+        let complete = search_cached_filtered_definitions(
+            "Validate",
+            root.path(),
+            None,
+            &cache,
+            40_000,
+            &filter,
+        )
+        .expect("search");
+        assert_eq!(complete.definitions, 30);
+        assert_eq!(
+            complete.matches.iter().filter(|m| m.is_definition).count(),
+            30
         );
     }
 }
