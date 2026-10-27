@@ -159,6 +159,22 @@ def test_the_repair_error_names_no_worktree_path_or_forbidden_term(world) -> Non
     assert "--> src/lib.rs:2:5" in error, error
     assert "/worktrees/" not in error and "benchmark/" not in error, error
 
+def test_a_repair_call_that_raises_keeps_the_failed_patch_and_the_run_going(world) -> None:  # noqa: F811
+    broken = broken_patch(world)
+    harness = Harness(world, patches=[broken])
+
+    def propose(candidate, records):
+        harness.calls.append((dict(candidate), records))
+        if any("repair" in record for record in records):
+            raise RuntimeError("proposer crashed")
+        return broken
+
+    harness.evo.dispatcher.propose = propose
+    proposal = harness.dispatch()
+
+    assert proposal == {SRC: broken}
+    assert len(harness.calls) == 2
+
 def test_the_repaired_child_is_evaluated_in_place_of_the_broken_one_without_a_second_check(world) -> None:  # noqa: F811
     harness = Harness(world, patches=[broken_patch(world), fixed_patch(world)])
     proposal = harness.dispatch()

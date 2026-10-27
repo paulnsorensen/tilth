@@ -324,7 +324,7 @@ class Evolution:
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
                                             hypotheses=self.hypotheses, extra_records=self._extra_records,
                                             directives=self.directives,
-                                            check=self.precheck if settings.repair else None)
+                                            check=self.precheck if settings.repair else None, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())

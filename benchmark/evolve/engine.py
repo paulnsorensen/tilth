@@ -139,9 +139,11 @@ class Dispatcher:
                  hypotheses: HypothesisBook | None = None,
                  extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None,
                  directives=None,
-                 check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None) -> None:
+                 check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
+                 log: Callable[[str], None] | None = None) -> None:
         self.directives = directives
         self.check = check
+        self.log = log or (lambda _line: None)
         self.stop = stop
         self.reflect = reflect
         self.propose = propose
@@ -206,7 +208,12 @@ class Dispatcher:
             base = candidate
         else:
             base = child
-        return self.propose(base, [*records, {"repair": repair}])
+        try:
+            return self.propose(base, [*records, {"repair": repair}])
+        except (OSError, RuntimeError, ValueError) as error:
+            # A failed repair leaves the failed child; stop and auth signals are not caught here.
+            self.log(f"repair: proposer failed ({type(error).__name__}: {error}); keeping the failed patch")
+            return proposal[SRC_PATCH]
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,
