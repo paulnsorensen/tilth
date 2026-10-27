@@ -72,6 +72,20 @@ A candidate that cannot allow `go test ./...` or deny `cat src/lib.rs` with the 
 also fails at `hook gate`, through the harness probe. The corpus file itself stays outside the
 candidate allowlist (`src/`, `prompts/`).
 
+## Proposer repair
+
+The proposer has no Bash, so it cannot compile. When a `src_patch` proposal's child fails `apply` or
+`just check`, the dispatcher calls the proposer once more on the same parent, with the failed patch applied and a
+`repair` record: `stage`, `error` (the failure tail), and the instruction to fix only that failure. The repaired
+patch replaces the first one, so the content id names the final patch and GEPA never sees the broken child. The
+check is the cascade's own memoized apply and `just check` stage, so a passing child is not checked twice. A
+repair that also fails is a failed candidate; the log shows both attempts. The directive is claimed once and the
+hypothesis stays on the final child. The second call is billed as `proposer` spend. Text components are never
+repaired. `--no-repair` turns the repair off.
+
+A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
+`build failed` lines, plus the last ten lines.
+
 ## Rejected-candidate cleanup
 
 Each built candidate keeps a copy of its binary in `results/candidates/<sha>/` (about 39 MiB). Evolve
