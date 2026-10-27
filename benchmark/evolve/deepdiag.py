@@ -147,10 +147,10 @@ class DeepDiagnosis:
             return []
         self.runs += 1
         scratch = self.scratch_root / tag
-        shutil.rmtree(scratch, ignore_errors=True)
-        scratch.mkdir(parents=True)
         started = self.clock()
         try:
+            shutil.rmtree(scratch, ignore_errors=True)
+            scratch.mkdir(parents=True)
             summary = self._stage(scratch, tilth_rows, baseline_rows)
             (scratch / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
             code = self.runner(self.argv(scratch), self.timeout)

@@ -250,6 +250,25 @@ def test_a_parent_without_dev_rows_skips_the_run_and_says_so(world) -> None:  # 
     assert stub.calls == []
 
 
+def test_no_dev_baseline_rows_skips_the_run_and_says_so(world) -> None:  # noqa: F811
+    stub = Stub()
+    evo = build(world, '--deep-diagnosis', deep_runner=stub)
+    evo.dev_baseline_rows = None
+    parent = parent_with_rows(evo, rows_for(DEV[0]))
+
+    assert not any('deep_diagnosis' in r for r in evo._extra_records(parent))
+    assert stub.calls == []
+
+
+def test_a_scratch_dir_that_cannot_be_made_costs_only_the_record(tmp_path) -> None:
+    (tmp_path / 'deep').write_text('a file where the scratch root should be')
+    logs: list[str] = []
+    stub = Stub()
+
+    assert make(tmp_path, stub, logs).records('d' * 64, [row('dev_a')], [row('dev_a')]) == []
+    assert stub.calls == []
+    assert any('continuing without it' in line for line in logs), logs
+
 def test_the_note_tells_the_model_about_the_deep_record() -> None:
     assert 'deep_diagnosis' in diagnosis.DIAGNOSIS_NOTE
 

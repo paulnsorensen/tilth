@@ -775,7 +775,11 @@ class Evolution:
         if not own.rows:
             self.log(f"deep diagnosis {own.cid[:12]}: skipped, the parent has no dev rows")
             return []
-        baseline = self.dev_baseline_rows or [row for rows in own.base_rows.values() for row in rows]
+        # Only the dev baseline plan's rows carry trajectory paths; cost-summary rows cannot stage a comparison.
+        baseline = self.dev_baseline_rows
+        if not baseline:
+            self.log(f"deep diagnosis {own.cid[:12]}: skipped, no dev baseline rows yet")
+            return []
         return self.deep.records(own.cid, [{**row, "correct": correct(row)} for row in own.rows],
                                  [{**row, "correct": correct(row)} for row in baseline])
 
