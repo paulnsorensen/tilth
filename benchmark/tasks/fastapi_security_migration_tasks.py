@@ -28,6 +28,10 @@ GRADE_TIMEOUT_S = 900
 GRADE_DEADLINE_S = 1800
 TIMEOUT_REASON = "Grader timeout (inconclusive, not a test failure)"
 PYTEST_COMMAND = ["uv", "run", "pytest", "-q", "-p", "no:cacheprovider"]
+# The agent venv: locked versions of the tests group plus the extras the security tests need
+# (python-multipart, argon2 through pwdlib). uv's wheel cache keeps a rebuild to seconds.
+VENV_SYNC_COMMAND = ["uv", "sync", "--frozen", "--no-dev", "--group", "tests", "--extra", "all"]
+VENV_BUILD_TIMEOUT_S = 900
 
 
 def affected_modules(root: Path) -> list[str]:
@@ -76,8 +80,46 @@ def _restore_tests(target: Path, *, held_out: bool = True) -> None:
         shutil.copy2(HELD_OUT_SOURCE, target / HELD_OUT_TARGET)
 
 
+def _exclude_venv(workdir: Path) -> None:
+    """Keep ``.venv/`` out of ``git status``, so the grader does not count it as an agent change."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "info/exclude"],
+        cwd=workdir, capture_output=True, text=True,
+    )
+    if result.returncode:
+        return
+    exclude = workdir / result.stdout.strip()
+    existing = exclude.read_text() if exclude.is_file() else ""
+    if ".venv/" in existing.splitlines():
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as handle:
+        handle.write(("\n" if existing and not existing.endswith("\n") else "") + ".venv/\n")
+
+
+def build_agent_venv(workdir: Path) -> None:
+    """Create ``<workdir>/.venv`` with fastapi editable and the locked test dependencies."""
+    venv = workdir / ".venv"
+    if (venv / "bin").is_dir():
+        return
+    # uv hardlinks venv files to its cache by default, so copy: an in-place edit must not reach other venvs.
+    env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv), "UV_LINK_MODE": "copy"}
+    env.pop("VIRTUAL_ENV", None)
+    result = subprocess.run(
+        VENV_SYNC_COMMAND, cwd=workdir, env=env, capture_output=True, text=True, timeout=VENV_BUILD_TIMEOUT_S,
+    )
+    if result.returncode:
+        shutil.rmtree(venv, ignore_errors=True)
+        raise RuntimeError(f"agent venv build failed ({result.returncode}): {(result.stderr or result.stdout)[-800:]}")
+
+
 class FastAPISecurityMigrationTask(Task):
     capability = "fix"
+
+    def prepare(self, workdir: Path) -> None:
+        super().prepare(workdir)
+        _exclude_venv(workdir)
+        build_agent_venv(workdir)
 
     @property
     def name(self) -> str:
