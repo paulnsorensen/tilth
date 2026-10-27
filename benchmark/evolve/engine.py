@@ -30,6 +30,7 @@ REFLECTION_HEADER = (
     f"{REFLECTION_HYPOTHESIS}"
 )
 # The paid-tier side_info fields that make up the score; reflection sees them once per candidate.
+REPAIR_INSTRUCTION = "Fix only this failure; keep the intended change."
 SCORE_FIELDS = ("task_scores", "pass_rate", "mean_cost", "baseline_cost")
 SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
              "the MCP field it fills, so remove at least as much text as you add; a longer file is refused "
@@ -137,8 +138,12 @@ class Dispatcher:
                  propose: Callable[[Mapping[str, str], list[dict]], str],
                  hypotheses: HypothesisBook | None = None,
                  extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None,
-                 directives=None) -> None:
+                 directives=None,
+                 check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
+                 log: Callable[[str], None] | None = None) -> None:
         self.directives = directives
+        self.check = check
+        self.log = log or (lambda _line: None)
         self.stop = stop
         self.reflect = reflect
         self.propose = propose
@@ -148,6 +153,7 @@ class Dispatcher:
     def __call__(self, candidate: dict[str, str], reflective_dataset: Mapping[str, Sequence[Mapping]],
                  components_to_update: list[str]) -> dict[str, str]:
         proposal = {}
+        patch_records: list[dict] = []
         directive = self.directives.claim() if self.directives is not None else None
         if self.hypotheses is not None:
             self.hypotheses.discard()
@@ -166,17 +172,48 @@ class Dispatcher:
             if self.stop.is_set:
                 break
             if name == SRC_PATCH:
+                patch_records = records
                 proposal[name] = self.propose(candidate, records)
             else:
                 proposal[name] = self.reflect(name, candidate[name], records)
             if directive is not None and directive.component == name and directive.hypothesis \
                     and self.hypotheses is not None:
                 self.hypotheses.default(name, directive.hypothesis)
+        if SRC_PATCH in proposal and self.check is not None and not self.stop.is_set:
+            proposal[SRC_PATCH] = self._repaired(candidate, proposal, patch_records)
         if self.stop.is_set:
             return {}
         if self.hypotheses is not None:
             self.hypotheses.attach(content_id(candidate), content_id({**candidate, **proposal}))
         return proposal
+
+    def _repaired(self, candidate: Mapping[str, str], proposal: Mapping[str, str], records: list[dict]) -> str:
+        """The proposed ``src_patch``, or one repair of it when its child fails apply or ``just check``.
+
+        The repair is the proposer's only second call: it sees the failed patch applied and the real error.
+        Whatever it returns is the child; the cascade then checks that child (the check is memoized) and fails
+        it for good if it still fails. The same directive and hypothesis stay on the final child.
+        """
+        if proposal[SRC_PATCH] == candidate[SRC_PATCH]:
+            return proposal[SRC_PATCH]  # no change: the parent was checked when it was evaluated
+        child = {**candidate, **proposal}
+        failure = self.check(child)
+        if failure is None:
+            return proposal[SRC_PATCH]
+        stage, error = failure
+        repair = {"stage": stage, "error": error, "instruction": REPAIR_INSTRUCTION}
+        if stage == "apply":
+            # The failed patch cannot be applied to an export, so the proposer gets it as text.
+            repair["failed_diff"] = proposal[SRC_PATCH]
+            base = candidate
+        else:
+            base = child
+        try:
+            return self.propose(base, [*records, {"repair": repair}])
+        except (OSError, RuntimeError, ValueError) as error:
+            # A failed repair leaves the failed child; stop and auth signals are not caught here.
+            self.log(f"repair: proposer failed ({type(error).__name__}: {error}); keeping the failed patch")
+            return proposal[SRC_PATCH]
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,

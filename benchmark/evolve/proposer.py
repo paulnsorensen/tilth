@@ -22,13 +22,17 @@ EXPORT_PATHS = ("src", "prompts", "Cargo.toml", "Cargo.lock")
 TOOLS = "Read,Edit,Write,Glob,Grep"
 DISALLOWED = "Bash,WebFetch,WebSearch,Agent,Task"
 PATH_KEYS = ("file_path", "path", "notebook_path")
+REPAIR_NOTE = ("A record with a `repair` key means your earlier change failed. When its `stage` is `just check`, "
+               "that change is already applied here and `error` holds the compiler or lint output. When its `stage` "
+               "is `apply`, the tree is the parent's and `failed_diff` holds the change that did not apply. Fix only "
+               "that failure and keep the intended change.")
 PROPOSER_HEADER = (
     "You are improving tilth, a Rust MCP server for code intelligence whose source is in the current "
     "directory. Below are reflective records of AI agents' rollouts with tilth on benchmark tasks: each holds "
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {PROPOSER_HYPOTHESIS}"
+    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 
 

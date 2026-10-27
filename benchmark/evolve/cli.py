@@ -101,6 +101,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--directives", type=Path, metavar="PATH",
                         help="JSON list of {id, component, brief, hypothesis?}: seeded proposals, tried in order "
                              "before the selector picks a component itself (default: none)")
+    parser.add_argument("--no-repair", dest="repair", action="store_false",
+                        help="do not re-call the proposer once when its src_patch child fails apply or just check "
+                             "(repair is the default)")
     parser.add_argument("--deep-diagnosis", action="store_true",
                         help="before each proposal, run Codex once per parent over its dev trajectories and show "
                              "its ranked causes to the proposer (off by default; Codex spend is not on the ledger)")
@@ -196,7 +199,7 @@ def build(argv: list[str] | None = None, *,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
         strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
-        directives=tuple(queue), deep_diagnosis=args.deep_diagnosis,
+        directives=tuple(queue), repair=args.repair, deep_diagnosis=args.deep_diagnosis,
         deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,
         deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
     )

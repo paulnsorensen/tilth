@@ -9,6 +9,7 @@ only confirms one pre-chosen candidate against the seed and never selects among 
 
 import json
 import math
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,9 @@ from .proposer import Proposer
 CANDIDATE_MODE = "tilth_forced"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
+TAIL_SUMMARY_LINES = 10  # the last lines a long failure keeps whole
+ERROR_BLOCK_LINES = 14  # one error block: its message, ``-->`` location, source lines and help
+ERROR_START = re.compile(r"^(error(\[\w+\])?:|---- .* ----$|Diff in |thread '.*' panicked|failures:$)")
 NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell", "auth"})
 FINISH_CELL_SETS = 2  # finish scores two candidates on the test split: the dev winner and the seed
 
@@ -86,6 +90,8 @@ class Settings:
     deep_diagnosis_effort: str = deepdiag.DEFAULT_EFFORT
     deep_diagnosis_max: int = deepdiag.DEFAULT_MAX_RUNS
     deep_diagnosis_timeout: float = deepdiag.DEFAULT_TIMEOUT_S
+    # One repair call for a src_patch proposal whose child fails apply or `just check`.
+    repair: bool = True
 
 
 def forbidden_terms(panel_path: Path) -> list[str]:
@@ -156,7 +162,32 @@ class Cascade:
 
 
 def tail(output: str) -> str:
-    return "\n".join(output.rstrip().splitlines()[-TAIL_LINES:])
+    """``output`` cut to ``TAIL_LINES``: its last lines plus, when it is longer, the error blocks cargo printed earlier.
+
+    A cargo failure ends with ``warning: build failed`` and ``error: recipe failed`` lines; the compiler, clippy,
+    test, or fmt block that explains it comes before them and a plain last-lines cut loses it.
+    """
+    lines = output.rstrip().splitlines()
+    if len(lines) <= TAIL_LINES:
+        return "\n".join(lines)
+    summary_start = len(lines) - TAIL_SUMMARY_LINES
+    blocks: list[tuple[int, int]] = []
+    for index, line in enumerate(lines[:summary_start]):
+        if ERROR_START.match(line) and not (blocks and index < blocks[-1][1]):
+            end = index + 1
+            while end < min(index + ERROR_BLOCK_LINES, summary_start) and lines[end].strip():
+                end += 1
+            blocks.append((index, end))
+    if not blocks:
+        return "\n".join(lines[-TAIL_LINES:])
+    room = TAIL_LINES - TAIL_SUMMARY_LINES - 1  # one line for the marker before the summary
+    kept: list[str] = []
+    for start, end in blocks:
+        if len(kept) + 1 >= room:
+            break
+        kept.append("[...]")
+        kept.extend(lines[start:end][:room - len(kept)])
+    return "\n".join([*kept, "[...]", *lines[summary_start:]])
 
 
 def dominates(left: Mapping[str, float], right: Mapping[str, float], tasks: Iterable[str]) -> bool:
@@ -292,7 +323,8 @@ class Evolution:
                      if settings.deep_diagnosis else None)
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
                                             hypotheses=self.hypotheses, extra_records=self._extra_records,
-                                            directives=self.directives)
+                                            directives=self.directives,
+                                            check=self.precheck if settings.repair else None, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
@@ -546,17 +578,8 @@ class Evolution:
         if result.cid != self.seed_id and not self.cascade(self.seed).accepted:
             raise EvolveError("the seed is not on the accepted frontier (its dev run failed or did not complete); "
                               "refusing to buy candidate rollouts")
-        if result.sha is None:
-            try:
-                result.sha = self.materializer.materialize(candidate)
-            except ApplyRejected as rejected:
-                return self._fail(result, "apply", tail(rejected.tail))
-        if result.just_check_ok is None:
-            ok, output = self.just_check(self.materializer.worktree(result.sha))
-            result.just_check_ok = ok
-            self.materializer.release(result.sha)
-            if not ok:
-                return self._fail(result, "just check", tail(output))
+        if (failed := self._static_checks(result)) is not None:
+            return failed
         if self.settings.strict_file_tools and not result.hook_ok:
             if (failed := self._hook_gate(result)) is not None:
                 return failed
@@ -566,6 +589,42 @@ class Evolution:
             return self._fail(result, "hook gate", tail(str(failed)))
         except run.CandidateBuildFailed as failed:
             return self._fail(result, "build", tail(str(failed)))
+
+    def _static_checks(self, result: Cascade) -> Cascade | None:
+        """Materialize and run ``just check``, each once per content id; the failed cascade, or None when both pass."""
+        if result.sha is None:
+            try:
+                result.sha = self.materializer.materialize(result.candidate)
+            except ApplyRejected as rejected:
+                return self._fail(result, "apply", tail(rejected.tail))
+        if result.just_check_ok is None:
+            ok, output = self.just_check(self.materializer.worktree(result.sha))
+            result.just_check_ok = ok
+            self.materializer.release(result.sha)
+            if not ok:
+                return self._fail(result, "just check", tail(output))
+        return None
+
+    def precheck(self, candidate: Mapping[str, str]) -> tuple[str, str] | None:
+        """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply or ``just check``, else None.
+
+        It runs the cascade's own memoized stages, so a child that passes is not checked again when GEPA evaluates it.
+        """
+        result = self.new_cascade(candidate)
+        if not result.done and not self.stop.is_set:
+            self._static_checks(result)
+        if result.stage in {"apply", "just check"}:
+            return result.stage, self._redact(result.tail or "")
+        return None
+
+    def _redact(self, text: str) -> str:
+        """A failure tail fit for the proposer: worktree prefixes cut to repo-relative paths, forbidden terms masked."""
+        text = re.sub(re.escape(str(self.run_dir / "worktrees")) + r"/[^/\s]+/", "", text)
+        text = text.replace(str(self.settings.repo) + "/", "")
+        for term in sorted(self._forbidden_terms(), key=len, reverse=True):
+            if term:
+                text = text.replace(term, "<redacted>")
+        return text
 
     def _hook_gate(self, result: Cascade) -> Cascade | None:
         """Run the corpus through the candidate's hook before any cell; the failed cascade, or None when it passes."""
