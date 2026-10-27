@@ -922,7 +922,12 @@ fn cut_note(text: &str, kept_end: usize, parts: &[Part], ctx: &CutCtx, limit: us
             }
             (_, Some(_), None) => {}
             _ => {
-                if shown_any {
+                // Re-send the whole request only when this response showed none of the
+                // part and the part fits alone; a partly shown part that cannot fit would
+                // come back as a near-copy of what the caller already has.
+                let part_fits =
+                    escaped_len(text.get(part.start..part.end).unwrap_or("")) <= fits_alone;
+                if shown_any && seen.is_empty() && part_fits {
                     next.push(request.to_string());
                     whole_request = true;
                 } else {
@@ -2620,6 +2625,31 @@ mod tests {
         let again = read_paths(&session, &cache, dir.path(), &["a.rs#43-43"]);
         assert!(!is_stub(&again), "line 43 was never shown: {again}");
         assert!(again.contains("value_43 ="), "{again}");
+    }
+
+    #[test]
+    fn partly_shown_oversize_part_is_not_resent_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), numbered_source(60)).unwrap();
+        let mut fns = String::new();
+        for i in 0..3000 {
+            let _ = writeln!(fns, "fn function_with_a_long_name_{i}() {{}}");
+        }
+        std::fs::write(dir.path().join("big.rs"), fns).unwrap();
+        let (session, cache) = services();
+
+        let out = read_paths(&session, &cache, dir.path(), &["a.rs#10-20", "big.rs"]);
+        assert!(out.contains("cut at the host display limit"), "{out}");
+        assert!(
+            !out.contains("Next: tilth_read(paths: [\"big.rs\"]"),
+            "a partly shown part must not be re-sent whole: {}",
+            &out[out.len().saturating_sub(400)..]
+        );
+        assert!(
+            out.contains("big.rs does not fit the host display limit"),
+            "{}",
+            &out[out.len().saturating_sub(400)..]
+        );
     }
 
     #[test]
