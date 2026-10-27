@@ -304,6 +304,67 @@ class GoSignatureShapes(SearchFixture):
             self.assertEqual(result["resolved_as"], "regex", result)
 
 
+class GoSignatureFormsStayStructural(SearchFixture):
+    def setUp(self):
+        super().setUp()
+        (self.root / "f.go").write_text(
+            "package f\n\n"
+            "func Sum[T int | float64](xs []T) T {\n\treturn xs[0] // union\n}\n\n"
+            "func Pair[K, V any](k K, v V) int {\n\treturn 0 // grouped\n}\n\n"
+            "func (c *Client) Do(opts ...*Option) error {\n\treturn nil // variadic\n}\n")
+
+    def test_union_grouped_and_variadic_forms_resolve(self):
+        cases = (
+            ("func Sum[T int | float64](xs []T) T", "// union"),
+            ("func Pair[K, V any](k K, v V)", "// grouped"),
+            ("func (c *Client) Do(opts ...*Option)", "// variadic"),
+        )
+        for query, marker in cases:
+            result = self.search([{"query": query}])["results"][0]
+            self.assertEqual(result["resolved_as"], "symbol", result)
+            self.assertIn(marker, result["core"])
+
+    def test_pipe_in_params_and_class_in_type_params_stay_regex(self):
+        for query in ("func Get(User|Order)", "func New[A-Z]", "func Do(a, b .*)"):
+            result = self.search([{"query": query}])["results"][0]
+            self.assertEqual(result["resolved_as"], "regex", result)
+
+
+class GoReceiverManyDefinitions(SearchFixture):
+    def write_methods(self, receiver, count, prefix):
+        for index in range(count):
+            (self.root / f"{prefix}{index:03}.go").write_text(
+                f"package p{index}\n\ntype {receiver} struct{{}}\n\n"
+                f"func (o *{receiver}) Validate() error {{\n\treturn nil\n}}\n")
+
+    def test_receiver_candidates_are_capped_and_partial(self):
+        self.write_methods("Options", 200, "opt")
+        result = self.search([{"query": "func (o *Options) Validate"}], budget=3000)["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+        self.assertEqual(len(result["candidates"]), 10, result)
+        self.assertEqual(result["completeness"], "partial", result)
+
+    def test_methods_on_other_receivers_do_not_crowd_out_the_scoped_ones(self):
+        for index in range(150):
+            self.write_methods(f"Other{index:03}", 1, f"other{index:03}_")
+        self.write_methods("Options", 3, "opt")
+        result = self.search([{"query": "func (o *Options) Validate"}], budget=3000)["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+        self.assertEqual(len(result["candidates"]), 3, result)
+        self.assertEqual(result["completeness"], "complete", result)
+        for candidate in result["candidates"]:
+            self.assertTrue(candidate["path"].startswith("opt"), candidate)
+
+    def test_all_receiver_candidates_within_the_cap_are_complete(self):
+        self.write_methods("Options", 80, "opt")
+        calls = "".join(f"\tx{i}.Validate()\n" for i in range(150))
+        (self.root / "calls.go").write_text(f"package calls\n\nfunc run() {{\n{calls}}}\n")
+        result = self.search([{"query": "func (o *Options) Validate"}], budget=40000)["results"][0]
+        self.assertEqual(result["resolved_as"], "ambiguous", result)
+        self.assertEqual(len(result["candidates"]), 80, result)
+        self.assertEqual(result["completeness"], "complete", result)
+
+
 class GoReceiverMissKeepsNormalization(SearchFixture):
     def test_literal_and_miss_paths_report_the_rewrite(self):
         (self.root / "m.go").write_text(

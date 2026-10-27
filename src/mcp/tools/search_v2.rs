@@ -946,12 +946,19 @@ fn route_identifier(
     session: &Session,
     budget: u64,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    // A receiver filter runs after the walk, so the walk must keep every
-    // definition: a hit cap would drop the one method that carries the receiver.
-    let sym_result = if receiver_scope.is_some() {
-        crate::search::search_symbol_raw_all_definitions(query, cwd, glob, cache)?
-    } else {
-        crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?
+    // The receiver filter runs inside the walk, so the hit cap counts only the
+    // scoped methods. A file defining the method on that receiver names the
+    // receiver type, so files without it are never parsed.
+    let sym_result = match receiver_scope {
+        Some((receiver_type, _)) => {
+            let keep = |m: &Match| is_method_on(m, receiver_type);
+            let filter = crate::search::DefinitionFilter {
+                required_text: receiver_type,
+                keep: &keep,
+            };
+            crate::search::search_symbol_raw_filtered(query, cwd, glob, cache, budget, &filter)?
+        }
+        None => crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?,
     };
     let discovery_partial = sym_result.files_unreadable > 0
         || sym_result.definitions
@@ -994,12 +1001,7 @@ fn route_identifier(
             false
         }
     });
-    if let Some((receiver_type, signature_text)) = receiver_scope {
-        code_defs.retain(|m| {
-            go_func_head(m.text.trim())
-                .and_then(|(receiver, _)| receiver)
-                .is_some_and(|receiver| go_receiver_type(receiver) == receiver_type)
-        });
+    if let Some((_, signature_text)) = receiver_scope {
         if code_defs.is_empty() {
             let (mut result, route) =
                 content_route(signature_text, glob, cwd, cache, session, None, budget)?;
@@ -1030,15 +1032,23 @@ fn route_identifier(
         return Ok((result, "symbol".to_string(), hints));
     }
     if code_defs.len() > 1 {
-        let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
         let mut result = base_result(query, "ambiguous", "ambiguous");
+        result["candidates"] = json!(candidates(&code_defs, cwd));
+        // A receiver-scoped result lists only the scoped methods, so the bare-name
+        // content search would preview unrelated lines and skew completeness.
+        if receiver_scope.is_some() {
+            if discovery_partial {
+                mark_partial(&mut result);
+            }
+            return Ok((result, "ambiguous".to_string(), Vec::new()));
+        }
+        let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
         if discovery_partial
             || content_result.files_unreadable > 0
             || content_result.total_found > content_result.matches.len()
         {
             mark_partial(&mut result);
         }
-        result["candidates"] = json!(candidates(&code_defs, cwd));
         if content_result.total_found > 0 {
             set_preview(
                 &mut result,
@@ -1173,24 +1183,36 @@ fn is_go_signature_tail(tail: &str) -> bool {
         return true;
     }
     let probe = without_type_braces(tail);
-    for marker in ['\\', '|', '?', '+', '^', '$', '{'] {
+    for marker in ['\\', '?', '+', '^', '$', '{'] {
         if probe.contains(marker) {
             return false;
         }
     }
-    if tail.contains(".*") {
+    // `...` is variadic, so `...*T` is not a wildcard.
+    if tail.replace("...", "").contains(".*") {
         return false;
     }
+    // `|` joins constraint terms in a type parameter list; elsewhere it is alternation.
     match tail.strip_prefix('[') {
         Some(inner) => {
             let Some(close) = matching_close(inner, '[', ']') else {
                 return false;
             };
             let after = inner[close + 1..].trim_start();
-            is_go_type_params(&inner[..close]) && (after.is_empty() || after.starts_with('('))
+            is_go_type_params(&inner[..close])
+                && (after.is_empty() || after.starts_with('('))
+                && !without_type_braces(after).contains('|')
         }
-        None => tail.starts_with('('),
+        None => tail.starts_with('(') && !probe.contains('|'),
     }
+}
+
+/// A Go method declaration whose receiver type is `receiver_type`.
+fn is_method_on(m: &Match, receiver_type: &str) -> bool {
+    let Some((Some(receiver), _)) = go_func_head(m.text.trim()) else {
+        return false;
+    };
+    go_receiver_type(receiver) == receiver_type
 }
 
 /// Index of the delimiter that closes a group whose opener precedes `s`.
@@ -1231,7 +1253,8 @@ fn without_type_braces(text: &str) -> String {
     out
 }
 
-/// `T any`, `K comparable, V any`: each part is an identifier and a constraint.
+/// `T any`, `K comparable, V any`, `K, V any`: each part starts with an
+/// identifier, and the last part carries the constraint.
 fn is_go_type_params(params: &str) -> bool {
     let mut depth = 0usize;
     let mut start = 0usize;
@@ -1248,12 +1271,16 @@ fn is_go_type_params(params: &str) -> bool {
         }
     }
     parts.push(&params[start..]);
-    for part in parts {
+    let last = parts.len() - 1;
+    for (index, part) in parts.into_iter().enumerate() {
         let mut tokens = part.split_whitespace();
         let Some(name) = tokens.next() else {
             return false;
         };
-        if !is_identifier(name) || tokens.next().is_none() {
+        if !is_identifier(name) {
+            return false;
+        }
+        if index == last && tokens.next().is_none() {
             return false;
         }
     }

@@ -110,7 +110,11 @@ pub(crate) fn search_symbol_in_file(
     super::search_symbol_raw_all_definitions(
         name,
         scope,
-        Some(&format!("{dir_name}/{file}")),
+        Some(&format!(
+            "{}/{}",
+            globset::escape(dir_name),
+            globset::escape(file)
+        )),
         cache,
     )
 }
@@ -944,5 +948,16 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["fn", "var"], "functions sort first");
+    }
+
+    #[test]
+    fn search_in_file_escapes_glob_characters_in_the_directory_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join(".pkg[1]");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let file = dir.join("f[a].rs");
+        std::fs::write(&file, "fn target() {}\n").expect("write");
+        let result = search_symbol_in_file(&file, "target", &OutlineCache::new()).expect("search");
+        assert_eq!(result.definitions, 1);
     }
 }

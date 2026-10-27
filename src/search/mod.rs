@@ -634,6 +634,8 @@ pub(crate) fn search_symbol_raw_for_budget(
     symbol::search_cached_for_budget(query, scope, glob, cache, budget)
 }
 
+pub(crate) use symbol::DefinitionFilter;
+
 /// Symbol search that keeps every definition, for callers that filter definitions themselves.
 pub(crate) fn search_symbol_raw_all_definitions(
     query: &str,
@@ -642,6 +644,19 @@ pub(crate) fn search_symbol_raw_all_definitions(
     cache: &OutlineCache,
 ) -> Result<SearchResult, TilthError> {
     symbol::search_cached_all_definitions(query, scope, glob, cache)
+}
+
+/// Symbol search that parses only files holding `filter.required_text` and
+/// counts only definitions `filter.keep` accepts, up to the `budget` cap.
+pub(crate) fn search_symbol_raw_filtered(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    budget: u64,
+    filter: &DefinitionFilter<'_>,
+) -> Result<SearchResult, TilthError> {
+    symbol::search_cached_filtered_definitions(query, scope, glob, cache, budget, filter)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
