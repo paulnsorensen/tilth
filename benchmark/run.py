@@ -267,12 +267,9 @@ def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | Non
 
 
 def _agent_venv(task: object, workdir: Path) -> Path | None:
-    """The workdir's venv for an external Python task; never the separate grading venv."""
-    if isinstance(task, external.ExternalTask) and task.language == "python":
-        venv = workdir / ".venv"
-        if (venv / "bin").is_dir():
-            return venv
-    return None
+    """The workdir's venv when the task prepared one; never the separate grading venv."""
+    venv = workdir / ".venv"
+    return venv if (venv / "bin").is_dir() else None
 
 
 def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:

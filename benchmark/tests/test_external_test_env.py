@@ -117,7 +117,7 @@ def test_other_cells_keep_their_env(external_bench, tmp_path: Path) -> None:
     external_bench.seed(SWE_GO)
     task = load(SWE_GO)
     workdir = tmp_path / "workdir"
-    (workdir / ".venv" / "bin").mkdir(parents=True)
+    workdir.mkdir()
 
     assert run._agent_venv(task, workdir) is None
     assert cell_env(task, workdir) == run.build_runner_env(
@@ -125,5 +125,8 @@ def test_other_cells_keep_their_env(external_bench, tmp_path: Path) -> None:
 
     local = next(task for task in run.TASKS.values() if not isinstance(task, external.ExternalTask))
     assert run._agent_venv(local, workdir) is None
-    env = run.build_runner_env("claude", ambient=AMBIENT, tilth_bin=None, language=local.language)
-    assert "VIRTUAL_ENV" not in env and ".venv" not in env["PATH"]
+    (workdir / ".venv" / "bin").mkdir(parents=True)
+    assert run._agent_venv(local, workdir) == workdir / ".venv"
+    env = cell_env(local, workdir)
+    assert env["VIRTUAL_ENV"] == str(workdir / ".venv")
+    assert env["PATH"].startswith(str(workdir / ".venv" / "bin") + os.pathsep)
