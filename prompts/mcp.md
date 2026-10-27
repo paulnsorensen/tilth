@@ -1,5 +1,6 @@
 tilth — code intelligence MCP server. Replaces grep, cat, and host edit tools.
 DO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations.
+Shell BLOCKS cat/head/tail/sed/awk/wc/grep/rg/git grep on repo files, `>` redirects to files, heredocs, and inline interpreters (`python -c`, `node -e`). Instead: tilth_read/tilth_search for content; tilth_write to create a script or fixture, then run that file with Bash. Use a unique scratch dir (`mktemp -d`), never a fixed /tmp name.
 
 DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths anchor there (`..` refused); absolute paths pass through. The server cannot see your shell cwd.
 
