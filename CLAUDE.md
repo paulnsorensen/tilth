@@ -177,4 +177,4 @@ Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to
 - Framing ("DO NOT" works better than "IMPORTANT:" for weaker models)
 - Concrete examples (tool call patterns, not abstract descriptions)
 
-Test instruction changes with haiku benchmarks on hard tasks (`rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`).
+Test hand-written instruction changes with haiku benchmarks on hard tasks (`rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`). Instruction changes that come from an evolve run (`benchmark/evolve/`) are exempt: the evolve panel score is their evidence.

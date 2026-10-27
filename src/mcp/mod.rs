@@ -967,7 +967,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1502,
+            1684,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -989,9 +989,12 @@ mod tests {
         if super::phrase_pins_exempt() {
             return;
         }
-        assert!(SERVER_INSTRUCTIONS.contains(
-            "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
-        ));
+        assert!(
+            SERVER_INSTRUCTIONS.contains(
+                "tilth_write(edits:[{path:\"a.rs\",tag:\"1A2B\",ops:[...]},{path:\"b.rs\""
+            ),
+            "instructions must show a multi-file edits batch"
+        );
         assert!(
             SERVER_INSTRUCTIONS
                 .contains("DO NOT use `mode: full` to edit; read the section you change."),
