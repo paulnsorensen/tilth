@@ -424,6 +424,39 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn search_symbol_in_file_enters_skipped_directory_for_exact_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join("vendor");
+        fs::create_dir(&vendor).unwrap();
+        let file = vendor.join("lib.rs");
+        fs::write(&file, "pub fn vendored_probe() {}\n").unwrap();
+        let cache = OutlineCache::new();
+
+        let result = search_symbol_in_file(&file, "vendored_probe", &cache).unwrap();
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.is_definition && m.path == file),
+            "target inside a skipped directory must resolve: {:?}",
+            result.matches
+        );
+
+        let broad = crate::search::search_symbol_raw_all_definitions(
+            "vendored_probe",
+            tmp.path(),
+            None,
+            &cache,
+        )
+        .unwrap();
+        assert!(
+            broad.matches.is_empty(),
+            "a normal search must still skip vendor/: {:?}",
+            broad.matches
+        );
+    }
+
     fn make_entry(kind: OutlineKind, name: &str, start: u32, end: u32) -> OutlineEntry {
         OutlineEntry {
             kind,
