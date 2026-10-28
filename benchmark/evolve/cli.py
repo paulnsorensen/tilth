@@ -115,6 +115,9 @@ def _parser() -> argparse.ArgumentParser:
                         help=f"Codex runs per evolve run (default {deepdiag.DEFAULT_MAX_RUNS})")
     parser.add_argument("--deep-diagnosis-timeout", type=float, default=deepdiag.DEFAULT_TIMEOUT_S,
                         help=f"seconds before a Codex run is killed (default {deepdiag.DEFAULT_TIMEOUT_S})")
+    parser.add_argument("--allow-cli-drift", action="store_true",
+                        help="run with a Claude CLI that is not the version in benchmark/claude-cli.version; "
+                             "every stored cell's run key then drifts and is bought again")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
@@ -158,6 +161,10 @@ def build(argv: list[str] | None = None, *,
     try:
         auth.refuse_env(os.environ)
     except auth.ClaudeAuthError as error:
+        return _error(str(error))
+    try:
+        print(run.require_pinned_cli(allow_drift=args.allow_cli_drift))
+    except run.CliPinError as error:
         return _error(str(error))
     if args.deep_diagnosis_max < 0 or not math.isfinite(args.deep_diagnosis_timeout) \
             or args.deep_diagnosis_timeout <= 0:

@@ -864,7 +864,60 @@ def cli_version(runner: str, *, fresh: bool = False) -> str | None:
     ``fresh`` bypasses the per-run cache; the scheduler re-probes before each paid
     cell so a mid-run CLI update cannot mix versions under one planned key.
     """
-    return (_run_probe if fresh else _probe_version)((runner, "--version"))
+    binary = resolve_claude_binary() if runner == "claude" else runner
+    return (_run_probe if fresh else _probe_version)((binary, "--version"))
+
+
+CLAUDE_PIN_FILE = BENCHMARK_DIR / "claude-cli.version"
+CLAUDE_BINARY_ENV = "TILTH_BENCH_CLAUDE"
+MISE_CLAUDE_ROOT = Path.home() / ".local" / "share" / "mise" / "installs" / "aqua-anthropics-claude-code"
+
+
+class CliPinError(ValueError):
+    """The Claude CLI a run would use is not the pinned version."""
+
+
+def claude_cli_pin() -> str:
+    return CLAUDE_PIN_FILE.read_text().strip()
+
+
+def resolve_claude_binary() -> str:
+    """The Claude CLI a run spawns: $TILTH_BENCH_CLAUDE, else the pinned mise install, else ``claude`` on PATH.
+
+    A path-form override is made absolute, because a cell runs from a disposable workspace. mise names version
+    directories with or without a ``v`` prefix, so both are tried.
+    """
+    override = os.environ.get(CLAUDE_BINARY_ENV)
+    if override:
+        return str(Path(override).resolve()) if os.sep in override else override
+    pin = claude_cli_pin()
+    for name in (f"v{pin}", pin):
+        pinned = MISE_CLAUDE_ROOT / name / "claude"
+        if pinned.is_file():
+            return str(pinned)
+    return "claude"
+
+
+def require_pinned_cli(*, allow_drift: bool = False) -> str:
+    """Refuse to plan a paid cell when the resolved Claude CLI is not the pinned version; return its description.
+
+    ``--version`` needs no model call. The version is part of every cell's run key, so a drifted CLI would buy
+    every stored cell again.
+    """
+    pin = claude_cli_pin()
+    binary = resolve_claude_binary()
+    found = cli_version("claude")
+    match = re.match(r"\d+\.\d+\.\d+", found or "")
+    version = match.group() if match else None
+    line = f"claude CLI: {binary} -> {found!r} (pin {pin})"
+    if version == pin:
+        return line
+    if allow_drift:
+        return f"{line}; --allow-cli-drift: the run keys do not match the stored cells"
+    raise CliPinError(
+        f"{binary} reports {found!r}, but benchmark/claude-cli.version pins {pin}, so every stored cell's run key "
+        f"would drift. Install {pin} (mise install aqua:anthropics/claude-code@{pin}), point {CLAUDE_BINARY_ENV} at "
+        f"that binary, or pass --allow-cli-drift to run anyway and buy the cells again.")
 
 
 _file_sha256 = baselines.file_sha256
@@ -1543,6 +1596,8 @@ def _run_single_in_repo(
         language=task.language,
         agent_venv=agent_venv,
     )
+    if runner == "claude":
+        cmd = [resolve_claude_binary(), *cmd[1:]]
     cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -2605,6 +2660,11 @@ Examples:
         help="Abort before model calls when the expanded schedule exceeds this count",
     )
     parser.add_argument(
+        "--allow-cli-drift", action="store_true",
+        help="Run with a Claude CLI that is not the version in benchmark/claude-cli.version; every stored cell's "
+             "run key then drifts and is bought again",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print the planned cells and which would call a model, then exit; no model call, no --max-usd needed",
     )
@@ -2759,6 +2819,12 @@ Examples:
         for mode_name in modes:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
+
+    if any(RUNNERS[name] == "claude" for name in models):
+        try:
+            print(require_pinned_cli(allow_drift=args.allow_cli_drift))
+        except CliPinError as error:
+            parser.error(str(error))
 
     # Ad hoc, the baseline hook and the replay audit use this checkout's HEAD (the seed hook), even with
     # --candidate-sha: a candidate hook is audited against the seed hook, never against itself.
