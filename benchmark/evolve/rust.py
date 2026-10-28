@@ -20,6 +20,10 @@ _MODIFIERS = re.compile(r"(?:\b(?:pub(?:\s*\([^)]*\))?|async|const|unsafe)\s+)*$
 _ATTRIBUTES = re.compile(r"(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+$")
 _TEST_ATTR = re.compile(r"\btest\b")
 _FAILED_NAME = re.compile(r"\s{4}(\S+)")
+_ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
+_TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
+_GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
+_ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!|\?")
 _RAW = re.compile(r'r(#*)"')
 _STRING = r'("(?:[^"\\]|\\.)*")'
 _COUNT = re.compile(r"SERVER_INSTRUCTIONS\.len\(\),\s*(\d+)")
@@ -174,8 +178,9 @@ def test_functions(path: str, text: str) -> list[tuple[str, int, int]]:
 def failing_tests(output: str) -> list[str]:
     """The test names in cargo's ``failures:`` lists, in order and without repeats.
 
-    The list is the indented names that follow a ``failures:`` line. A ``failures:`` line that opens the
-    ``---- name stdout ----`` blocks has no names after it. Doc tests print a name with spaces and are skipped.
+    The list is the indented names that follow a ``failures:`` line, up to a blank line or the ``test result:``
+    line. A ``failures:`` line that opens the ``---- name stdout ----`` blocks has no names after it.
+    A doc test prints a name with spaces (``src/x.rs - foo (line 3)``); it is skipped and the list goes on.
     """
     names: list[str] = []
     lines = output.splitlines()
@@ -183,12 +188,48 @@ def failing_tests(output: str) -> list[str]:
         if line.strip() != "failures:":
             continue
         for follower in lines[index + 1:]:
-            listed = _FAILED_NAME.fullmatch(follower)
-            if listed is None:
+            if not follower.strip() or follower.startswith("test result:"):
                 break
-            if listed[1] not in names:
+            listed = _FAILED_NAME.fullmatch(follower)
+            if listed is not None and listed[1] not in names:
                 names.append(listed[1])
     return names
+
+
+def test_weakening(old: str, new: str) -> str | None:
+    """Why the edited test fn ``new`` is weaker than ``old``, or None. Both texts run from the first attribute
+    to the closing brace.
+
+    ``new`` must carry exactly one test attribute (``#[test]``, ``#[tokio::test]``, ``#[<path>::test(..)]``), and
+    no ``ignore``, ``should_panic``, ``cfg``, or ``cfg_attr`` attribute that ``old`` lacked. When ``old``'s body
+    has an ``assert!``, ``assert_eq!``, ``assert_ne!``, ``panic!``, or ``?``, so must ``new``'s. The body check is
+    deliberately coarse: it catches a gutted body, not one that moves its asserts into a helper.
+    """
+    def parts(text: str) -> tuple[list[str], str] | None:
+        mask = _code_mask(text)
+        found = _FN.search(mask)
+        terminator = mask.find("{", found.end()) if found else -1
+        if found is None or terminator < 0:
+            return None
+        head = mask[:found.start()]
+        head = head[:_MODIFIERS.search(head).start()]
+        return [re.sub(r"\s+", "", match[1]) for match in _ATTRIBUTE.finditer(head)], mask[terminator:]
+
+    before, after = parts(old), parts(new)
+    if after is None:
+        return "the test fn cannot be read"
+    attributes, body = after
+    if sum(bool(_TEST_ATTRIBUTE.fullmatch(attribute)) for attribute in attributes) != 1:
+        return "it must carry exactly one test attribute"
+    kept = list(before[0]) if before else []
+    for attribute in attributes:
+        if attribute in kept:
+            kept.remove(attribute)
+        elif _GUARD_ATTRIBUTE.match(attribute):
+            return f"it adds #[{attribute}], which can disable or invert the test"
+    if before and _ASSERTION.search(before[1]) and not _ASSERTION.search(body):
+        return "its body no longer asserts anything"
+    return None
 
 
 def include_invocations(text: str) -> list[tuple[int, int, str, str]]:

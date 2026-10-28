@@ -30,7 +30,6 @@ def outside_allowlist(paths: list[str]) -> list[str]:
     return [path for path in paths if not path.startswith(ALLOWED_WINNER_PREFIXES) and path not in ALLOWED_WINNER_FILES]
 
 
-
 def changed_tests_section(changes: dict[str, str]) -> list[str]:
     """PR body lines for the tests the winner changes, each with its diff; nothing when it changes none."""
     if not changes:
@@ -39,6 +38,7 @@ def changed_tests_section(changes: dict[str, str]) -> list[str]:
     for name, diff in sorted(changes.items()):
         lines += [f"### `{name}`", "```diff", diff, "```", ""]
     return lines
+
 
 class GitHubPRClient:
     """Pushes the winner commit as a branch with git and opens a draft PR with ``gh``."""

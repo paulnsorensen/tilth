@@ -9,7 +9,7 @@ stop callback.
 import json
 import re
 import tempfile
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
 
@@ -142,10 +142,13 @@ class Dispatcher:
                  check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
                  failing_tests: Callable[[Mapping[str, str]], list[str]] | None = None,
                  test_scope: dict[str, frozenset[str]] | None = None,
+                 test_keep: dict[str, tuple[str, frozenset[str]]] | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.failing_tests = failing_tests
-        # Content id -> tests that candidate may change; the materializer reads the same dict.
+        # ``src_patch`` text -> tests that patch may change; the materializer reads the same dicts. ``test_keep``
+        # maps a patch to (parent patch, tests it inherits and must leave as the parent had them).
         self.test_scope = test_scope if test_scope is not None else {}
+        self.test_keep = test_keep if test_keep is not None else {}
         self.directives = directives
         self.check = check
         self.log = log or (lambda _line: None)
@@ -202,8 +205,10 @@ class Dispatcher:
         it for good if it still fails. The same directive and hypothesis stay on the final child.
 
         When ``just check`` failed on Rust tests, the repair record names them and sets ``may_update_tests``.
-        The final child may then change exactly those tests, and so may its descendants.
+        The final child may then change exactly those tests. It may also change the tests its parent's grant
+        covers: a repair that names failing tests is the one call that may. Any other child keeps them as they are.
         """
+        inherited = self._granted(candidate)
         if proposal[SRC_PATCH] == candidate[SRC_PATCH]:
             return proposal[SRC_PATCH]  # no change: the parent was checked when it was evaluated
         child = {**candidate, **proposal}
@@ -229,19 +234,26 @@ class Dispatcher:
             self.log(f"repair: proposer failed ({type(error).__name__}: {error}); keeping the failed patch")
             return proposal[SRC_PATCH]
         if failing:
-            self._grant_tests({**candidate, **proposal, SRC_PATCH: patch}, failing)
+            self.test_scope[patch] = self.test_scope.get(patch, frozenset()) | inherited | frozenset(failing)
+            if patch != candidate[SRC_PATCH]:
+                self.test_keep.pop(patch, None)
+        else:
+            self._inherit_tests(candidate, {SRC_PATCH: patch})
         return patch
 
-    def _grant_tests(self, child: Mapping[str, str], names: Iterable[str]) -> None:
-        """Let ``child``, and so its materialization, change the named tests; earlier grants stay."""
-        cid = content_id(child)
-        self.test_scope[cid] = self.test_scope.get(cid, frozenset()) | frozenset(names)
+    def _granted(self, candidate: Mapping[str, str]) -> frozenset[str]:
+        """The tests the candidate's patch may change or inherited from its parent."""
+        patch = candidate[SRC_PATCH]
+        return self.test_scope.get(patch, frozenset()) | self.test_keep.get(patch, ("", frozenset()))[1]
 
     def _inherit_tests(self, candidate: Mapping[str, str], proposal: Mapping[str, str]) -> None:
-        """A child's cumulative patch keeps its parent's test edits, so it keeps the parent's grant too."""
-        granted = self.test_scope.get(content_id(candidate))
-        if granted:
-            self._grant_tests({**candidate, **proposal}, granted)
+        """A child's cumulative patch carries its parent's test edits. The child keeps them read-only: a repair,
+        not a plain proposal, may change them. A child with the parent's patch needs no entry; it has the grant."""
+        parent, patch = candidate[SRC_PATCH], proposal[SRC_PATCH]
+        if patch == parent or not (granted := self._granted(candidate)):
+            return
+        before = self.test_keep.get(patch)
+        self.test_keep[patch] = (parent, granted | before[1] if before and before[0] == parent else granted)
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,

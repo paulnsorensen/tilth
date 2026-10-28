@@ -153,7 +153,9 @@ class Proposer:
         The export is rustfmt-formatted first, so the diff, its content id, and the next proposal's base are all
         formatted code.
         """
-        self.fmt(root)
+        if self.fmt(root) is False:
+            # `cargo fmt` exits non-zero on a parse error; the patch then stays unformatted and `just check` says why.
+            self.log("proposer: cargo fmt failed on the export; the diff stays unformatted")
         common = Path(git("rev-parse", "--git-common-dir", cwd=self.repo).strip())
         git_dir = common if common.is_absolute() else self.repo / common
         with tempfile.TemporaryDirectory(prefix="tilth-evolve-index-") as index_dir:

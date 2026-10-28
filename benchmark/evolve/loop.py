@@ -334,6 +334,7 @@ class Evolution:
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
         self.dispatcher.test_scope = self.materializer.test_scope
+        self.dispatcher.test_keep = self.materializer.test_keep
         self.results: dict[str, Cascade] = {}
         self.frontier: list[Cascade] = []
         self.deltas: list[dict] = []

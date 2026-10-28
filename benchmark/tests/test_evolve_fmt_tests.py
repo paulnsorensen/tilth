@@ -18,7 +18,8 @@ from evolve.finish import TEST_REVIEW_NOTE, GitHubPRClient, changed_tests_sectio
 from evolve.materialize import ApplyRejected, Materializer
 from evolve.proposer import PROPOSER_HEADER, REPAIR_NOTE, Proposer
 from evolve.rustfmt import format_tree
-from evolve_support import cargo_available, child, git, log_text, make_world, seed_candidate, seed_files
+from evolve_support import (cargo_available, child, git, log_text, make_world, mcp, seed_candidate, seed_files,
+                            with_last_line)
 from test_evolve import _remote, accept, patch_for, ready, refs, world  # noqa: F401  (world is a fixture)
 
 SRC = candidates.SRC_PATCH
@@ -157,12 +158,43 @@ def test_the_proposers_cumulative_diff_is_formatted_so_the_content_id_is_too(wor
         {**seed_candidate(), SRC: lib_patch(world)})
 
 
+def test_a_failing_formatter_in_the_proposer_is_logged(world) -> None:  # noqa: F811
+    lines: list[str] = []
+    prop = Proposer(world.repo, world.seed_sha, None, "model", forbidden=[], log=lines.append, fmt=lambda root: False)
+    with prop.export(seed_candidate()) as root:
+        prop.cumulative_diff(root)
+
+    assert any("cargo fmt failed" in line for line in lines)
+
+
+@fmt_needed
+def test_a_long_last_prompt_line_leaves_no_fmt_diff_after_the_byte_lock_rewrite(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    clean = {name: rustfmt_clean(text) if name.endswith(".rs") else text for name, text in seed_files().items()}
+    world = make_world(monkeypatch, tmp_path, clean)
+    mat = materializer(world, fmt=format_tree)
+    # Long enough that rustfmt wraps the rewritten `ends_with` assert, short enough to fit once wrapped.
+    longer = with_last_line(clean["prompts/mcp.md"], "x" * 54)
+    sha = mat.materialize({**seed_candidate(), "prompts/mcp.md": longer})
+
+    assert "x" * 54 in git("show", f"{sha}:src/mcp/mod.rs", cwd=world.repo)
+    checked = subprocess.run(["cargo", "fmt", "--check"], cwd=mat.worktree(sha), capture_output=True, text=True)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+
+
 # --- rust.py ---
 
 
 def test_failing_tests_reads_the_failures_list_not_the_stdout_headers() -> None:
     assert rust.failing_tests(FAILURE) == [EDITS_APPLY]
     assert rust.failing_tests("error: this `map_or` can be simplified\n") == []
+
+
+def test_a_doc_test_name_does_not_end_the_failures_list() -> None:
+    output = ("failures:\n    src/x.rs - foo (line 3)\n    edit::a\n    src/y.rs - bar (line 9)\n    edit::b\n\n"
+              "test result: FAILED. 0 passed; 4 failed\n    not::a_name\n")
+
+    assert rust.failing_tests(output) == ["edit::a", "edit::b"]
 
 
 def test_test_functions_name_the_module_path_and_span_each_test() -> None:
@@ -186,7 +218,7 @@ def test_a_non_repair_proposal_may_not_touch_a_test(world) -> None:  # noqa: F81
 
 
 def granted(mat: Materializer, candidate: dict, *names: str) -> dict:
-    mat.test_scope[candidates.content_id(candidate)] = frozenset(names)
+    mat.test_scope[candidate[SRC]] = frozenset(names)
     return candidate
 
 
@@ -211,6 +243,37 @@ def test_a_different_test_than_the_granted_one_is_refused(two_tests) -> None:
     with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
         mat.materialize(child)
     assert refs(two_tests) == []
+
+
+WEAKENED = {
+    "cfg-not-test": "#[cfg(not(test))]\nfn edits_apply() {\n    assert_eq!(2, 2);\n}\n",
+    "cfg-any": "#[test]\n#[cfg(any())]\nfn edits_apply() {\n    assert_eq!(2, 2);\n}\n",
+    "ignore": "#[test]\n#[ignore]\nfn edits_apply() {\n    assert_eq!(2, 2);\n}\n",
+    "should-panic": "#[test]\n#[should_panic]\nfn edits_apply() {\n    assert_eq!(2, 2);\n}\n",
+    "two-test-attributes": "#[test]\n#[test]\nfn edits_apply() {\n    assert_eq!(2, 2);\n}\n",
+    "empty-body": "#[test]\nfn edits_apply() {}\n",
+    "no-assert": "#[test]\nfn edits_apply() {\n    let _unused = 2;\n}\n",
+}
+
+
+@pytest.mark.parametrize("form", sorted(WEAKENED))
+def test_a_granted_test_may_not_be_disabled_or_gutted(two_tests, form: str) -> None:
+    mat = materializer(two_tests, fmt=lambda root: True)
+    text = WEAKENED[form] + "\n" + TWO_TESTS.split("\n\n", 1)[1]
+    child = granted(mat, {**seed_candidate(), SRC: patch_for(two_tests, {TESTS: text})}, EDITS_APPLY)
+
+    with pytest.raises(ApplyRejected, match="weakens the test"):
+        mat.materialize(child)
+    assert refs(two_tests) == []
+
+
+@pytest.mark.parametrize("head", ["#[test]", "#[tokio::test]", "#[tokio::test(flavor = \"multi_thread\")]"])
+def test_a_granted_test_may_keep_a_test_attribute_of_any_path(two_tests, head: str) -> None:
+    mat = materializer(two_tests, fmt=lambda root: True)
+    text = NEW_BEHAVIOR.replace("#[test]\nfn edits_apply", f"{head}\nfn edits_apply")
+    child = granted(mat, {**seed_candidate(), SRC: patch_for(two_tests, {TESTS: text})}, EDITS_APPLY)
+
+    assert mat.materialize(child)
 
 
 def test_a_new_test_beside_the_granted_one_is_refused(two_tests) -> None:
@@ -324,6 +387,7 @@ def test_a_descendant_keeps_the_parents_test_grant(two_tests) -> None:
     updated = patch_for(two_tests, {"src/lib.rs": FORMATTED, TESTS: NEW_BEHAVIOR})
     run = Repair(two_tests, [behavior, updated])
     parent = {**seed_candidate(), **run.dispatch()}
+    assert run.evo.precheck(parent) is None
     child_patch = patch_for(two_tests, {"src/lib.rs": FORMATTED + "\npub fn more() {}\n", TESTS: NEW_BEHAVIOR})
     run.patches.append(child_patch)
 
@@ -333,6 +397,65 @@ def test_a_descendant_keeps_the_parents_test_grant(two_tests) -> None:
     assert proposal == {SRC: child_patch}
     assert run.evo.precheck(child) is None
     assert list(run.evo.materializer.test_diffs[candidates.content_id(child)]) == [EDITS_APPLY]
+
+
+def granted_parent(two_tests) -> tuple[Repair, dict[str, str]]:
+    """A run whose parent candidate won a repair grant for EDITS_APPLY, and the parent, already materialized."""
+    behavior = patch_for(two_tests, {"src/lib.rs": FORMATTED})
+    updated = patch_for(two_tests, {"src/lib.rs": FORMATTED, TESTS: NEW_BEHAVIOR})
+    run = Repair(two_tests, [behavior, updated])
+    parent = {**seed_candidate(), **run.dispatch()}
+    assert run.evo.precheck(parent) is None
+    return run, parent
+
+
+def test_a_text_only_child_of_a_granted_parent_keeps_the_grant(two_tests) -> None:
+    run, parent = granted_parent(two_tests)
+    child = {**parent, "prompts/mcp.md": mcp(dev_a="1", dev_b="1", cheap_a="1", test_a="1")}
+
+    assert run.evo.precheck(child) is None
+    assert list(run.evo.materializer.test_diffs[candidates.content_id(child)]) == [EDITS_APPLY]
+
+
+def test_a_repair_of_a_descendant_keeps_the_inherited_grant_and_adds_the_new_failure(two_tests) -> None:
+    run, parent = granted_parent(two_tests)
+    broken = patch_for(two_tests, {"src/lib.rs": FORMATTED + "\npub fn broken() {}\n", TESTS: NEW_BEHAVIOR})
+    both = NEW_BEHAVIOR.replace("assert_eq!(2, 2)", "assert_eq!(2, 3 - 1)").replace("assert_eq!(3, 3)", "assert_eq!(4, 4)")
+    repaired = patch_for(two_tests, {"src/lib.rs": FORMATTED, TESTS: both})
+    run.patches[:] = [broken, repaired]
+    other_failure = FAILURE.replace(EDITS_APPLY, OTHER)
+    run.evo.just_check = lambda worktree: (
+        (False, other_failure) if "broken" in (worktree / "src" / "lib.rs").read_text() else (True, "ok"))
+
+    proposal = run.dispatch(parent)
+    final = {**parent, **proposal}
+
+    assert proposal == {SRC: repaired}
+    assert run.records()[-1]["failing_tests"] == [OTHER]
+    assert run.evo.precheck(final) is None
+    assert set(run.evo.materializer.test_diffs[candidates.content_id(final)]) == {EDITS_APPLY, OTHER}
+
+
+def test_a_descendant_without_a_repair_may_not_change_an_inherited_test(two_tests) -> None:
+    run, parent = granted_parent(two_tests)
+    bad = patch_for(two_tests, {"src/lib.rs": FORMATTED, TESTS: NEW_BEHAVIOR.replace("(2, 2)", "(7, 7)")})
+    run.patches[:] = [bad, bad]  # a repair of an apply failure gets no test grant either
+
+    failure = run.evo.precheck({**parent, **run.dispatch(parent)})
+
+    assert failure is not None and failure[0] == "apply"
+    assert "inherited test" in failure[1] and EDITS_APPLY in failure[1]
+
+
+def test_a_descendant_may_not_revert_an_inherited_test(two_tests) -> None:
+    run, parent = granted_parent(two_tests)
+    bad = patch_for(two_tests, {"src/lib.rs": FORMATTED + "\npub fn more() {}\n"})
+    run.patches[:] = [bad, bad]
+
+    failure = run.evo.precheck({**parent, **run.dispatch(parent)})
+
+    assert failure is not None and failure[0] == "apply"
+    assert "no longer carries" in failure[1]
 
 
 def test_a_check_failure_that_is_not_a_test_gets_no_test_grant(world) -> None:  # noqa: F811
@@ -379,7 +502,7 @@ def test_the_winner_pr_body_lists_the_test_diffs_for_review(two_tests) -> None:
     accept(evo, evo.seed, {"dev_a": 0.0, "dev_b": 0.0})
     winner = {**child(evo.seed, test_a="1", tag="winner"),
               SRC: patch_for(two_tests, {"src/lib.rs": FORMATTED, TESTS: NEW_BEHAVIOR})}
-    evo.materializer.test_scope[candidates.content_id(winner)] = frozenset({EDITS_APPLY})
+    evo.materializer.test_scope[winner[SRC]] = frozenset({EDITS_APPLY})
     result = accept(evo, winner, {"dev_a": 0.9, "dev_b": 0.9})
     result.tests_changed = True
 

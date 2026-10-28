@@ -90,19 +90,24 @@ A long failure tail keeps the compiler, clippy, test, or fmt error blocks that c
 
 A proposer cannot touch `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
 old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record
-also carries `failing_tests` and `may_update_tests: true`. The repaired child, and its descendants, may then change
-exactly those `#[test]` fns (matched by module path). The prompt allows this only when the intended change makes a
-pinned test obsolete; the test must assert the new behavior and is never deleted or weakened. The materializer still
-refuses any other cfg(test) change, a deleted granted test, and any file outside `src/` and `prompts/`. A candidate
-that changes tests is `tests_changed`, and the log names the tests. If it wins, the draft PR body lists each changed
-test with its diff under "Test changes for review". Nothing merges automatically.
+also carries `failing_tests` and `may_update_tests: true`. The repaired child may then change exactly those `#[test]`
+fns (matched by module path), plus any test its parent already changed. The grant is keyed by the candidate's
+`src_patch`. A child that is not a repair inherits the parent's changed tests read-only, so their text must stay
+byte-equal to the parent's. A text-only child keeps the grant. The prompt allows a change only when the intended change
+makes a pinned test obsolete; the test must assert the new behavior. The materializer refuses any other cfg(test)
+change, a deleted or reverted granted test, and any file outside `src/` and `prompts/`. It also refuses a weakened
+granted test: it needs exactly one test attribute, no added `ignore`, `should_panic`, `cfg` or `cfg_attr`, and an
+assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or `?`) when the old body had one. A candidate that changes
+tests is `tests_changed`, and the log names the tests. If it wins, the draft PR body lists each changed test with its
+diff under "Test changes for review". Nothing merges automatically.
 
 ## Auto-format
 
 The proposer's export is `cargo fmt`-formatted before its cumulative diff is taken, so the content id and every later
 proposal build on formatted code. The materializer runs `cargo fmt` on the applied tree before it commits, so
-`just check`'s fmt gate cannot fail on formatting alone. A `cargo fmt` error (such as a parse error) leaves the tree
-as it is, and `just check` reports the real error.
+as it is, and `just check` reports the real error. A proposer `cargo fmt` failure is logged, and the diff stays
+unformatted. The materializer rewrites the byte-lock literals after the first format, so it formats the tree again
+when the rewrite changes it.
 
 ## Rejected-candidate cleanup
 
