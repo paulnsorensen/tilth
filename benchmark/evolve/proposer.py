@@ -25,7 +25,9 @@ DISALLOWED = "Bash,WebFetch,WebSearch,Agent,Task"
 PATH_KEYS = ("file_path", "path", "notebook_path")
 REPAIR_NOTE = ("A record with a `repair` key means your earlier change failed. When its `stage` is `just check`, "
                "that change is already applied here and `error` holds the compiler or lint output. When its `stage` "
-               "is `apply`, the tree is the parent's and `failed_diff` holds the change that did not apply. Fix only "
+               "is `apply`, the tree is the parent's and `failed_diff` holds the change that did not apply. When its "
+               "`stage` is `integrity`, the seed's existing tests ran against your production code, exactly as the seed "
+               "wrote them, and failed or went missing; fix the production code and do not edit those tests. Fix only "
                "that failure and keep the intended change. When the repair record has `may_update_tests`, the "
                "`just check` failure includes the unit tests in `failing_tests`, and you may change only those test "
                "fns, and only when your intended behavior change makes a pinned test obsolete. Update each such test "
@@ -37,7 +39,11 @@ PROPOSER_HEADER = (
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    "touch #[cfg(test)] code, except as the repair record allows. "
+    "change or remove existing #[cfg(test)] code or seed #[test] fns, except as the repair record allows. You may "
+    "add new #[test] fns that test your new behavior; each needs a test attribute and no `ignore`, and a person "
+    "reviews every one. After `just check` passes, the seed's own tests also run against your production code, "
+    "exactly as the seed wrote them, in a tree without your test code. All of them must still exist and pass, so "
+    "do not rely on a helper, macro, or `use` that you add to test code. "
     f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 

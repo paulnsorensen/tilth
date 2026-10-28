@@ -181,20 +181,19 @@ def test_the_repaired_child_is_evaluated_in_place_of_the_broken_one_without_a_se
     evo = harness.evo
     child = {**seed_candidate(), **proposal}
 
+    runs = len(harness.checked)  # the broken child and the repaired child, each once
     cascade = evo.new_cascade(child)
-    assert cascade.just_check_ok is None
     assert evo.precheck(child) is None
     assert cascade.just_check_ok is True
-    runs = len(harness.checked)
     assert evo.precheck(child) is None
 
-    assert len(harness.checked) == runs
+    assert runs == 2 and len(harness.checked) == runs
     assert candidates.content_id(child) in evo.results
 
 
 def test_a_repair_that_also_fails_counts_as_failed_with_both_attempts_logged(world) -> None:  # noqa: F811
-    still_broken = patch_for(world, {"src/lib.rs": "pub fn lib_marker() -> u8 {\n    BROKEN2\n}\n"})
-    harness = Harness(world, patches=[broken_patch(world), still_broken])
+    still_broken = patch_for(world, {"src/lib.rs": "pub fn lib_marker() -> u8 {\n    STILL_WRONG\n}\n"})
+    harness = Staged(world, {"BROKEN": cargo_output(), "STILL_WRONG": TEST_FAILURE}, [broken_patch(world), still_broken])
 
     proposal = harness.dispatch()
     final = {**seed_candidate(), **proposal}
@@ -203,7 +202,7 @@ def test_a_repair_that_also_fails_counts_as_failed_with_both_attempts_logged(wor
     assert len(harness.calls) == 2
     assert failure is not None and failure[0] == "just check"
     log = log_text(world)
-    assert log.count("failed at just check") == 2
+    assert log.count(": failed at just check") == 2
     assert harness.evo.results[candidates.content_id(final)].stage == "just check"
     assert "error: this `map_or` can be simplified" in log
 
@@ -317,3 +316,127 @@ def test_an_unchanged_patch_is_not_checked_again(world) -> None:  # noqa: F811
     assert harness.dispatch() == {SRC: ""}
     assert harness.checked == []
     assert len(harness.calls) == 1
+
+
+# --- a second repair for lint-only and fmt-only failures ---
+
+TEST_FAILURE = """\
+running 1 test
+test edit::a ... FAILED
+
+failures:
+
+---- edit::a stdout ----
+thread 'edit::a' panicked at src/edit/a.rs:3:5:
+assertion `left == right` failed
+
+failures:
+    edit::a
+
+test result: FAILED. 0 passed; 1 failed
+error: Recipe `check` failed on line 12 with exit code 101
+"""
+FMT_DIFF = "Diff in src/lib.rs:4:\n-pub fn lib_marker()->u8{\n+pub fn lib_marker() -> u8 {\nerror: Recipe `check` failed on line 3 with exit code 1\n"
+COMPILE_ERROR = "error[E0425]: cannot find value `x` in this scope\n --> src/lib.rs:2:5\n  |\n2 |     x\n  |     ^ not found\n"
+
+
+def marked_patch(world, marker: str) -> str:
+    return patch_for(world, {"src/lib.rs": f"pub fn lib_marker() -> u8 {{\n    {marker}\n}}\n"})
+
+
+class Staged(Harness):
+    """A harness whose ``just check`` output depends on the marker word in lib.rs."""
+
+    def __init__(self, world, outputs: dict[str, str], patches: list[str], *extra: str) -> None:
+        super().__init__(world, *extra, patches=patches)
+        self.outputs = outputs
+
+    def just_check(self, worktree: Path) -> tuple[bool, str]:
+        self.checked.append(worktree)
+        lib = (worktree / "src" / "lib.rs").read_text()
+        for marker, output in self.outputs.items():
+            if marker in lib:
+                return False, output
+        return True, "just check: ok"
+
+
+@pytest.mark.parametrize("output", [cargo_output(), FMT_DIFF], ids=["clippy", "fmt"])
+def test_a_lint_only_repair_failure_gets_a_second_repair_that_is_evaluated(world, output: str) -> None:  # noqa: F811
+    first, second, fixed = marked_patch(world, "AAA"), marked_patch(world, "BBB"), fixed_patch(world)
+    harness = Staged(world, {"AAA": CLIPPY_ERROR, "BBB": output}, [first, second, fixed])
+
+    proposal = harness.dispatch()
+
+    assert proposal == {SRC: fixed}
+    assert len(harness.calls) == 3
+    base, records = harness.calls[2]
+    assert base[SRC] == second
+    [record] = [record for record in records if "repair" in record]
+    assert record["repair"]["stage"] == "just check"
+    assert ("Diff in src/lib.rs:4" if output == FMT_DIFF else "error: this `map_or` can be simplified") \
+        in record["repair"]["error"]
+    final = {**seed_candidate(), **proposal}
+    assert harness.evo.precheck(final) is None
+    log = log_text(world)
+    assert "repair 1/2" in log and "repair 2/2" in log
+
+
+@pytest.mark.parametrize("output", [TEST_FAILURE, COMPILE_ERROR, cargo_output(CLIPPY_ERROR + COMPILE_ERROR)],
+                         ids=["test-failure", "compile-error", "lint-and-compile-error"])
+def test_a_repair_that_fails_on_more_than_lint_gets_no_second_repair(world, output: str) -> None:  # noqa: F811
+    first, second = marked_patch(world, "AAA"), marked_patch(world, "BBB")
+    harness = Staged(world, {"AAA": CLIPPY_ERROR, "BBB": output}, [first, second])
+
+    proposal = harness.dispatch()
+
+    assert proposal == {SRC: second}
+    assert len(harness.calls) == 2
+
+
+def test_a_dispatch_makes_at_most_three_proposer_calls(world) -> None:  # noqa: F811
+    patches = [marked_patch(world, marker) for marker in ("AAA", "BBB", "CCC")]
+    harness = Staged(world, {"AAA": CLIPPY_ERROR, "BBB": CLIPPY_ERROR, "CCC": CLIPPY_ERROR}, patches)
+
+    proposal = harness.dispatch()
+
+    assert proposal == {SRC: patches[2]}
+    assert len(harness.calls) == 3
+    failure = harness.evo.precheck({**seed_candidate(), **proposal})
+    assert failure is not None and failure[0] == "just check"
+
+
+def test_no_repair_makes_no_lint_repair_either(world) -> None:  # noqa: F811
+    first = marked_patch(world, "AAA")
+    harness = Staged(world, {"AAA": CLIPPY_ERROR}, [first], "--no-repair")
+
+    assert harness.dispatch() == {SRC: first}
+    assert len(harness.calls) == 1
+
+
+def test_lint_only_reads_every_error_block() -> None:
+    clippy_twice = CLIPPY_ERROR + "\n" + CLIPPY_ERROR.replace("map-or", "other")
+
+    assert engine.lint_only(cargo_output())
+    assert engine.lint_only(cargo_output(clippy_twice))
+    assert engine.lint_only(FMT_DIFF)
+    assert engine.lint_only(cargo_output(CLIPPY_ERROR + FMT_DIFF))
+    assert not engine.lint_only("")
+    assert not engine.lint_only("error: Recipe `check` failed on line 3 with exit code 1\n")
+    assert not engine.lint_only(TEST_FAILURE)
+    assert not engine.lint_only(cargo_output(COMPILE_ERROR))
+    assert not engine.lint_only(cargo_output(CLIPPY_ERROR + COMPILE_ERROR))
+    assert not engine.lint_only(cargo_output("error: unused variable: `x`\n  |\n  = note: `-D unused-variables` implied by `-D warnings`\n"))
+
+
+def test_lint_only_counts_the_same_lint_twice() -> None:
+    second = CLIPPY_ERROR.replace("    = note: `-D clippy::unnecessary-map-or` implied by `-D warnings`\n", "")
+
+    assert "-D clippy" not in second
+    assert engine.lint_only(cargo_output(CLIPPY_ERROR + "\n" + second))
+
+
+def test_lint_only_ignores_a_note_written_in_source_text() -> None:
+    fake = ("error: unused variable: `x`\n   --> src/a.rs:3:9\n    |\n"
+            '3   |     let s = "= note: `-D clippy::fake`";\n    |\n')
+
+    assert not engine.lint_only(cargo_output(fake))

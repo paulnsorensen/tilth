@@ -12,10 +12,20 @@ _INCLUDE_NAME = re.compile(r"\binclude(?:_str|_bytes)?\b")
 _BARE_MACRO = re.compile(r"\b(?:include(?:_str|_bytes)?(?!\w)(?!\s*!)|cfg(?!\w)(?!\s*[!(]))")
 _CFG_MACRO = re.compile(r"\bcfg\s*!\s*([(\[{])")
 _PATH_ATTR = re.compile(r"#\s*!?\s*\[\s*path\s*=")
-_MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
+_CFG_ATTR_ANY = re.compile(r"#\s*!?\s*\[\s*cfg_attr\s*\(")
+_PATH_KEY = re.compile(r"\bpath\s*=")
+_OUTER_ATTR = re.compile(r"\s*#\s*\[")
+_CFG_NAME = re.compile(r"cfg(?:_attr)?\(")
+# An item at statement position: after `{`, `;`, or `}`, with attributes and modifiers allowed.
+_BODY_ITEM = re.compile(
+    r"(?:^|[;{}])\s*(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)*"
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:unsafe|async|default)\s+)*"
+    r"(impl|trait|mod|use|struct|enum|fn|static|const|type|union|extern)\b|macro_rules\s*!")
+_MODULE_DECL = re.compile(r"\bmod\s+(?:r#)?(\w+)\s*$")
+_MOD_AT_END = re.compile(r"\bmod\s+(?:r#)?(\w+)$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
-_FN = re.compile(r"\bfn\s+(\w+)")
-_MOD_BLOCK = re.compile(r"\bmod\s+(\w+)\s*\{")
+_FN = re.compile(r"\bfn\s+(?:r#)?(\w+)")
+_MOD_BLOCK = re.compile(r"\bmod\s+(?:r#)?(\w+)\s*\{")
 _MODIFIERS = re.compile(r"(?:\b(?:pub(?:\s*\([^)]*\))?|async|const|unsafe)\s+)*$")
 _ATTRIBUTES = re.compile(r"(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+$")
 _TEST_ATTR = re.compile(r"\btest\b")
@@ -23,7 +33,11 @@ _FAILED_NAME = re.compile(r"\s{4}(\S+)")
 _ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
 _TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
 _GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
-_ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!|\?")
+_ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!")
+_TRY = re.compile(r"[\w)\]}]\s*\?")
+_IGNORE = re.compile(r"\bignore\b")
+_MACRO_DEF = re.compile(r"\bmacro_rules\s*!\s*(\w+)")
+_MACRO_CALL = re.compile(r"\b(\w+)\s*!(?!=)")
 _RAW = re.compile(r'r(#*)"')
 _STRING = r'("(?:[^"\\]|\\.)*")'
 _COUNT = re.compile(r"SERVER_INSTRUCTIONS\.len\(\),\s*(\d+)")
@@ -100,33 +114,104 @@ def _line(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
-def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
-    """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``
-    or ``debug_assertions``.
+def _cfg_test_ranges(text: str) -> list[tuple[int, int, str, bool]]:
+    """``(start, end, key, inner)``: the character range ``[start, end)`` of each item under a ``cfg`` or
+    ``cfg_attr`` attribute naming ``test`` or ``debug_assertions``.
 
     That covers ``cfg(test)``, ``cfg(any(.., test))``, ``cfg(all(test, ..))``, ``cfg(not(test))``, and
-    ``cfg_attr(test, ..)``; the span starts at the attribute, so the attribute itself is part of the item.
-    ``head`` is the item's code before ``{`` or ``;``. An inner ``#![cfg(..test..)]`` spans the whole file.
+    ``cfg_attr(test, ..)``; the range starts at the attribute, so the attribute itself is part of the item.
+    ``key`` is the item's code before ``{`` or ``;``, attribute included, with whitespace folded.
+    An inner ``#![cfg(..test..)]`` ranges to the end of the file; its key is ``#!``.
     """
     mask = _code_mask(text)
-    items = []
+    ranges = []
     for match in _CFG_ATTR.finditer(mask):
         close = _match_brace(mask, mask.index("[", match.start()), "[]")
         if not _TEST_TOKEN.search(mask, match.end(), close):
             continue
         if match[1]:
-            items.append((_line(text, match.start()), _line(text, max(len(text) - 1, 0)), ""))
+            ranges.append((match.start(), len(text), "#!", True))
             continue
         terminator = re.compile(r"[{;]").search(mask, close + 1)
         if terminator is None:
             continue
         end = terminator.start() if terminator[0] == ";" else _match_brace(mask, terminator.start())
-        items.append((_line(text, match.start()), _line(text, end), mask[close + 1:terminator.start()].strip()))
-    return items
+        key = " ".join(mask[match.start():terminator.start()].split())
+        ranges.append((match.start(), end + 1, key, False))
+    return ranges
+
+
+def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
+    """``(first_line, last_line, key)`` of each item ``_cfg_test_ranges`` finds."""
+    return [(_line(text, start), _line(text, max(end - 1, 0)), key) for start, end, key, _inner in _cfg_test_ranges(text)]
 
 
 def cfg_test_spans(text: str) -> list[tuple[int, int]]:
-    return [(first, last) for first, last, _head in _cfg_test_items(text)]
+    return [(first, last) for first, last, _key in _cfg_test_items(text)]
+
+def guarded_spans(text: str) -> list[tuple[int, int]]:
+    """Line spans of cfg items that are not plain ``#[cfg(test)]``: ``cfg(not(test))``, ``cfg(debug_assertions)``,
+    ``cfg(any(.., test))``, ``cfg_attr`` and the like. Production builds and test builds differ in these items,
+    so the integrity stage cannot swap them for the seed's."""
+    return [(first, last) for first, last, key in _cfg_test_items(text) if key != "#!" and not key.startswith("#[cfg(test)]")]
+
+
+
+def _attribute_run_start(mask: str, start: int) -> int:
+    """The start of the contiguous run of outer attributes that sits directly above ``start``."""
+    while True:
+        head = mask[:start].rstrip()
+        if not head.endswith("]"):
+            return start
+        depth, index = 0, len(head) - 1
+        while index >= 0:
+            depth += {"]": 1, "[": -1}.get(head[index], 0)
+            if depth == 0:
+                break
+            index -= 1
+        before = head[:index].rstrip()
+        if index < 0 or not before.endswith("#"):
+            return start
+        start = len(before) - 1
+
+
+def cfg_test_regions(text: str) -> list[tuple[int, int, str, bool]]:
+    """The outermost ``_cfg_test_ranges`` of ``text``, in file order; a range inside another one is left out.
+
+    An outer region starts at the first attribute of the run stacked directly above its ``cfg``, and its key holds
+    those attributes. A candidate cannot then keep an attribute (``#[cfg(any())]``, ``#[cfg_attr(.., path = ..)]``)
+    on the seed's item: the key differs, so the candidate's item is not swapped but dropped.
+    """
+    mask = _code_mask(text)
+    regions: list[tuple[int, int, str, bool]] = []
+    reached = 0
+    for start, end, key, inner in sorted(_cfg_test_ranges(text)):
+        if start < reached:
+            continue
+        if not inner and (run := _attribute_run_start(mask, start)) < start:
+            key = " ".join(mask[run:start].split()) + " " + key
+            start = run
+        regions.append((start, end, key, inner))
+        reached = end
+    return regions
+
+
+def test_region_cfg_lines(text: str) -> list[int]:
+    """Lines of each ``cfg`` or ``cfg_attr`` attribute in the run that heads a test region, bar plain ``cfg(test)``.
+
+    Such an attribute can compile the region out or point it at another file.
+    """
+    mask = _code_mask(text)
+    found = []
+    for start, _end, _key, inner in cfg_test_regions(text):
+        index = start
+        while not inner and (opened := _OUTER_ATTR.match(mask, index)):
+            close = _match_brace(mask, opened.end() - 1, "[]")
+            body = re.sub(r"\s+", "", mask[opened.end():close])
+            if _CFG_NAME.match(body) and body != "cfg(test)":
+                found.append(_line(text, opened.end()))
+            index = close + 1
+    return found
 
 
 def test_module_files(path: str, text: str) -> set[str]:
@@ -175,6 +260,24 @@ def test_functions(path: str, text: str) -> list[tuple[str, int, int]]:
     return found
 
 
+def test_region_modules(path: str, text: str) -> list[tuple[int, str]]:
+    """``(index of the opening brace, cargo path of the module)`` of each outermost test ``cfg`` region of ``text``
+    that is an inline ``mod name {``. The path joins the file's module path, the inline ``mod`` blocks around the
+    region, and the region's own module name.
+    """
+    mask = _code_mask(text)
+    mods = [(match[1], match.start(), _match_brace(mask, match.end() - 1)) for match in _MOD_BLOCK.finditer(mask)]
+    found = []
+    for start, end, key, inner in cfg_test_regions(text):
+        named = None if inner else _MOD_AT_END.search(key)
+        brace = mask.find("{", start, end)
+        if named is None or brace < 0:
+            continue
+        outer = [name for name, opened, close in mods if opened < start < close]
+        found.append((brace, "::".join([*module_path(path), *outer, named[1]])))
+    return found
+
+
 def failing_tests(output: str) -> list[str]:
     """The test names in cargo's ``failures:`` lists, in order and without repeats.
 
@@ -205,20 +308,10 @@ def test_weakening(old: str, new: str) -> str | None:
     has an ``assert!``, ``assert_eq!``, ``assert_ne!``, ``panic!``, or ``?``, so must ``new``'s. The body check is
     deliberately coarse: it catches a gutted body, not one that moves its asserts into a helper.
     """
-    def parts(text: str) -> tuple[list[str], str] | None:
-        mask = _code_mask(text)
-        found = _FN.search(mask)
-        terminator = mask.find("{", found.end()) if found else -1
-        if found is None or terminator < 0:
-            return None
-        head = mask[:found.start()]
-        head = head[:_MODIFIERS.search(head).start()]
-        return [re.sub(r"\s+", "", match[1]) for match in _ATTRIBUTE.finditer(head)], mask[terminator:]
-
-    before, after = parts(old), parts(new)
+    before, after = _fn_parts(old), _fn_parts(new)
     if after is None:
         return "the test fn cannot be read"
-    attributes, body = after
+    attributes, signature, body, _raw = after
     if sum(bool(_TEST_ATTRIBUTE.fullmatch(attribute)) for attribute in attributes) != 1:
         return "it must carry exactly one test attribute"
     kept = list(before[0]) if before else []
@@ -227,9 +320,84 @@ def test_weakening(old: str, new: str) -> str | None:
             kept.remove(attribute)
         elif _GUARD_ATTRIBUTE.match(attribute):
             return f"it adds #[{attribute}], which can disable or invert the test"
-    if before and _ASSERTION.search(before[1]) and not _ASSERTION.search(body):
+    if before and _asserts(before[1], before[2]) and not _asserts(signature, body):
         return "its body no longer asserts anything"
+    if item := body_items(new):
+        return f"its body defines an item ({item.strip()}), which can change how other tests resolve"
     return None
+
+
+def body_items(text: str) -> str | None:
+    """The keyword of the first item defined at statement position in the body of the fn ``text``, or None.
+
+    An ``impl``, ``trait``, ``macro_rules!``, ``mod``, ``use``, ``struct``, ``enum``, ``fn``, ``static``, ``const``,
+    ``type``, ``union``, or ``extern`` in a fn body is crate-wide or shadows names, so it can change what another
+    test checks. Closures and ``let`` bindings are not items.
+    """
+    parts = _fn_parts(text)
+    found = _BODY_ITEM.search(parts[2]) if parts else None
+    return (found[1] or "macro_rules!") if found else None
+
+
+def _fn_parts(text: str) -> tuple[list[str], str, str, str] | None:
+    """``(attributes, signature, body, raw body)`` of the fn in ``text``; the first two and the body are code-masked."""
+    mask = _code_mask(text)
+    found = _FN.search(mask)
+    terminator = mask.find("{", found.end()) if found else -1
+    if found is None or terminator < 0:
+        return None
+    head = mask[:found.start()]
+    head = head[:_MODIFIERS.search(head).start()]
+    attributes = [re.sub(r"\s+", "", match[1]) for match in _ATTRIBUTE.finditer(head)]
+    return attributes, mask[found.start():terminator], mask[terminator:], text[terminator:]
+
+
+def _asserts(signature: str, body: str) -> bool:
+    """True when ``body`` holds an assert macro, or a postfix ``?`` in a fn that returns ``Result``."""
+    return bool(_ASSERTION.search(body) or ("Result" in signature and _TRY.search(body)))
+
+
+def has_test_attribute(text: str) -> bool:
+    """True when the fn in ``text`` carries a test attribute: ``#[test]``, ``#[tokio::test(..)]``, ``#[<path>::test]``."""
+    parts = _fn_parts(text)
+    return parts is not None and any(_TEST_ATTRIBUTE.fullmatch(attribute) for attribute in parts[0])
+
+
+def new_test_problem(new: str) -> str | None:
+    """Why the added fn ``new`` is not a real test, or None. The text runs from the first attribute to the
+    closing brace.
+
+    It needs a test attribute (``#[test]``, ``#[tokio::test(..)]``, ``#[<path>::test]``) and no ``ignore`` in any
+    attribute. The integrity stage judges the rest: it runs the seed's tests, not the added ones.
+    """
+    parts = _fn_parts(new)
+    if parts is None or not any(_TEST_ATTRIBUTE.fullmatch(attribute) for attribute in parts[0]):
+        return "it carries no test attribute"
+    if any(_IGNORE.search(attribute) for attribute in parts[0]):
+        return "it is ignored"
+    return None
+
+
+def is_standalone_fn(text: str) -> bool:
+    """True when ``text`` is one fn with its attributes and no other code, so no item shares its first or last line."""
+    mask = _code_mask(text).strip()
+    found = _FN.search(mask)
+    terminator = mask.find("{", found.end()) if found else -1
+    if terminator < 0 or _match_brace(mask, terminator) != len(mask) - 1:
+        return False
+    head = mask[:found.start()]
+    head = head[:_MODIFIERS.search(head).start()]
+    return bool(_ATTRIBUTES.fullmatch(head))
+
+
+def macro_names(text: str) -> set[str]:
+    """The names ``text`` defines with ``macro_rules!``."""
+    return set(_MACRO_DEF.findall(_code_mask(text)))
+
+
+def invoked_macros(text: str) -> set[str]:
+    """The names ``text`` invokes as ``name!``."""
+    return set(_MACRO_CALL.findall(_code_mask(text)))
 
 
 def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
@@ -279,9 +447,14 @@ def cfg_test_macros(text: str) -> list[tuple[int, int]]:
 
 
 def path_attributes(text: str) -> list[int]:
-    """The first line of each ``#[path = ..]`` or ``#![path = ..]`` attribute, which can point a module outside the tree."""
+    """The first line of each ``#[path = ..]``, ``#![path = ..]``, or ``cfg_attr(.., path = ..)`` attribute, which
+    can point a module outside the tree."""
     mask = _code_mask(text)
-    return [_line(text, match.start()) for match in _PATH_ATTR.finditer(mask)]
+    lines = [_line(text, match.start()) for match in _PATH_ATTR.finditer(mask)]
+    for match in _CFG_ATTR_ANY.finditer(mask):
+        if _PATH_KEY.search(mask, match.end(), _match_brace(mask, mask.index("[", match.start()), "[]")):
+            lines.append(_line(text, match.start()))
+    return sorted(lines)
 
 
 def string_literal(source: str) -> str | None:
@@ -292,15 +465,6 @@ def string_literal(source: str) -> str | None:
         return re.sub(r"\\(.)", lambda escape: {"n": "\n", "t": "\t", "r": "\r"}.get(escape[1], escape[1]),
                       plain[1])
     return None
-
-
-def declaring_files(path: str) -> list[str]:
-    """Files that could declare ``path`` as a module."""
-    source = PurePosixPath(path)
-    module_dir = source.parent.parent if source.name == "mod.rs" else source.parent
-    if str(module_dir) == "src" or module_dir == PurePosixPath("."):
-        return ["src/lib.rs", "src/main.rs"]
-    return [str(module_dir / "mod.rs"), f"{module_dir}.rs"]
 
 
 def _byte_lock_matches(text: str) -> list[re.Match]:

@@ -79,8 +79,12 @@ The proposer has no Bash, so it cannot compile. When a `src_patch` proposal's ch
 `repair` record: `stage`, `error` (the failure tail), and the instruction to fix only that failure. The repaired
 patch replaces the first one, so the content id names the final patch and GEPA never sees the broken child. The
 check is the cascade's own memoized apply and `just check` stage, so a passing child is not checked twice. A
-repair that also fails is a failed candidate; the log shows both attempts. The directive is claimed once and the
-hypothesis stays on the final child. The second call is billed as `proposer` spend. Text components are never
+repair that also fails is a failed candidate, with one exception: when the repair's own `just check` failure is
+lint-only or fmt-only (every error block is a clippy lint with its `-D clippy::...` note or a rustfmt `Diff in`,
+with no test failure and no `error[E...]`), the dispatcher makes one more repair with the new tail. That is at most
+three proposer calls per proposal, and the log shows each attempt. The extra repair keeps the test grants of the
+repair before it. `--no-repair` turns off both. The directive is claimed once and the
+hypothesis stays on the final child. Each repair call is billed as `proposer` spend. Text components are never
 repaired. `--no-repair` turns the repair off.
 
 A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
@@ -88,7 +92,73 @@ A long failure tail keeps the compiler, clippy, test, or fmt error blocks that c
 
 ### Pinned-test updates in repair
 
-A proposer cannot touch `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
+Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
+module or in a `#[cfg(test)] mod x;` module file. The materializer checks only cheap rules on an added fn: it needs
+a test attribute and no `ignore`. Existing test fns change only under a repair grant (below). Added and changed tests
+count as `tests_changed`, appear in the log, and appear under "Test changes for review" in the draft PR. A new
+`#[test]` fn outside `#[cfg(test)]` code is listed there too. The materializer also refuses a candidate that edits
+a `#[cfg(not(test))]`, `#[cfg(any(..test..))]`, `cfg_attr` or `#[cfg(debug_assertions)]` item, or that adds
+an inner `#![cfg(..test..)]` attribute.
+
+### Integrity stage
+
+The test text is not the safe thing to check. A candidate can add a `macro_rules! assert_eq` on a test attribute line,
+or put `#[cfg(any())]` above the test module. Then `just check` is green while the seed's tests no longer run as the
+seed wrote them. So the cascade has a behavioral stage, `integrity`, after `just check` passes and before `build`.
+The rule: the seed's tests must keep running and passing against the candidate's production code, exactly as the seed
+wrote them. The one exception is a test with a repair grant, which may assert new behavior.
+
+The stage applies to every `src_patch` candidate whose patch differs from the seed. It builds the tree in the
+candidate worktree: the candidate's production code stays, and each outermost `#[cfg(test)]` item is replaced by the
+seed's item with the same header. The header includes the run of attributes stacked above the item, so a candidate
+that adds `#[cfg(any())]` or `#[cfg_attr(.., path = ..)]` there gets no seed twin, and its item is dropped. Granted
+test fns keep the SEED's version in this tree, and the run skips them (`-- --skip <name> --exact`). The candidate's
+granted version is already checked by `just check`, and here it cannot change how the other tests resolve. A granted
+fn whose body defines an item (`impl`, `trait`, `macro_rules!`, `mod`, `use`, `struct`, `enum`, `fn`, `static`,
+`const`, `type`, `union`, `extern`) is still refused, as defence in depth. A candidate `#[test]` fn outside any test
+`cfg` item with the name of a seed test is refused. Seed `#[cfg(test)] mod x;` files are restored byte for byte,
+and test modules or files the candidate added are dropped.
+
+Each restored seed test region also holds a canary, `#[test] fn __tilth_canary_<nonce>() {}`: right after the opening
+brace of an inline test `mod`, or at the end of a test file. The nonce is random per run and no proposer sees it. The
+stage lists the tests of each cargo target apart (`cargo test --lib -- --list`, and `cargo test --bin <name> --
+--list` per bin) and requires every seed test name in the list of the same target as in the seed, and every canary
+under the exact module path of its region. A region that the candidate compiled out, wrapped in a fn, swallowed with a
+macro, or moved lists no canary, so the stage fails with "Unsound or missing seed region <path>". A listed name under
+a seed test's module that the source does not define as often as it is listed (a macro made it) fails too. The seed
+names are listed once per run in a scratch worktree. Last, the stage runs `cargo test --lib --bins`, and all tests
+must pass. A granted test whose seed version no longer compiles against the new production code fails the stage;
+the repair has to keep the old signature.
+
+A failure is a cascade failure at stage `integrity`, and it is repairable like `just check`. The tail names the
+missing or failing seed tests. A repair after an integrity failure never gets test scope. Where a replacement cannot
+be made sound (a production macro that shadows a seed macro, an inner test `cfg` in a production file, a granted fn
+that is gone or defines an item), the candidate fails at this stage with the reason. It is never
+accepted.
+
+A cargo timeout, or a cargo failure that is not a compile error, is an infrastructure fault. The stage then reports
+that cause in its headline instead of blaming the candidate's tests, and the result is not memoized.
+
+The materializer backs the stage with these refusals: an added or changed `cfg` or `cfg_attr` attribute stacked on a
+test item; a `cfg_attr(.., path = ..)`; a test name defined twice in one file; and added code that names
+`current_exe`, `/deps/`, `RUST_TEST_`, or `--test-threads`. The last is a heuristic. Production code can still tell a
+test run from a real run in a way it does not catch, so the winner PR note asks the reviewer to read the production
+diff for that.
+
+Cost per candidate: one incremental test build per listed target and one test run in the shared candidate target dir,
+and one extra seed list build per run. Cargo trusts file mtimes and the trees share a target dir, so the stage touches
+the sources before each cargo call; `just check` gets the same touch.
+
+The stage is on whenever cargo is wired: `build(..., cargo=...)` sets it, and a custom `just_check` without `cargo` turns
+it off with a warning on stderr. The stage is skipped for the seed, for an unchanged patch, and for a text-only child
+(the result is memoized by patch and grant).
+
+Limits: a granted fn that needs a test helper the candidate added fails integrity (repairable). Edits to non-test lines
+in plain `#[cfg(test)]` code pass the materializer, because this stage restores the seed's version.
+
+### Repair grants for existing tests
+
+A proposer cannot change existing `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
 old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record
 also carries `failing_tests` and `may_update_tests: true`. The repaired child may then change exactly those `#[test]`
 fns (matched by module path), plus any test its parent already changed. The grant is keyed by the candidate's
@@ -97,7 +167,7 @@ byte-equal to the parent's. A text-only child keeps the grant. The prompt allows
 makes a pinned test obsolete; the test must assert the new behavior. The materializer refuses any other cfg(test)
 change, a deleted or reverted granted test, and any file outside `src/` and `prompts/`. It also refuses a weakened
 granted test: it needs exactly one test attribute, no added `ignore`, `should_panic`, `cfg` or `cfg_attr`, and an
-assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or `?`) when the old body had one. A candidate that changes
+assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or a postfix `?` in a `Result` fn) when the old body had one. A candidate that changes
 tests is `tests_changed`, and the log names the tests. If it wins, the draft PR body lists each changed test with its
 diff under "Test changes for review". Nothing merges automatically.
 
