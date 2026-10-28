@@ -232,6 +232,19 @@ def test_weakening(old: str, new: str) -> str | None:
     return None
 
 
+_ASSERTING_STUB = "#[test]\nfn stub() {\n    assert!(true);\n}"
+
+
+def new_test_problem(new: str) -> str | None:
+    """Why the new test fn ``new`` is not a real test, or None. The text runs from the first attribute to the
+    closing brace.
+
+    It holds the same checks as ``test_weakening`` against a plain asserting test: exactly one test attribute, no
+    ``ignore``, ``should_panic``, ``cfg``, or ``cfg_attr``, and a body that asserts something.
+    """
+    return test_weakening(_ASSERTING_STUB, new)
+
+
 def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
     """``(first_line, last_line, macro, argument)`` of each ``include!``, ``include_str!``, or ``include_bytes!``.
 

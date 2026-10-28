@@ -79,8 +79,12 @@ The proposer has no Bash, so it cannot compile. When a `src_patch` proposal's ch
 `repair` record: `stage`, `error` (the failure tail), and the instruction to fix only that failure. The repaired
 patch replaces the first one, so the content id names the final patch and GEPA never sees the broken child. The
 check is the cascade's own memoized apply and `just check` stage, so a passing child is not checked twice. A
-repair that also fails is a failed candidate; the log shows both attempts. The directive is claimed once and the
-hypothesis stays on the final child. The second call is billed as `proposer` spend. Text components are never
+repair that also fails is a failed candidate, with one exception: when the repair's own `just check` failure is
+lint-only or fmt-only (every error block is a clippy lint with its `-D clippy::...` note or a rustfmt `Diff in`,
+with no test failure and no `error[E...]`), the dispatcher makes one more repair with the new tail. That is at most
+three proposer calls per proposal, and the log shows each attempt. The extra repair keeps the test grants of the
+repair before it. `--no-repair` turns off both. The directive is claimed once and the
+hypothesis stays on the final child. Each repair call is billed as `proposer` spend. Text components are never
 repaired. `--no-repair` turns the repair off.
 
 A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
@@ -88,7 +92,14 @@ A long failure tail keeps the compiler, clippy, test, or fmt error blocks that c
 
 ### Pinned-test updates in repair
 
-A proposer cannot touch `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
+Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
+module or in a `#[cfg(test)] mod x;` module file, plus the `use` lines they need at the top of that module. Each
+new fn needs exactly one test attribute (`#[test]`, `#[tokio::test]`, any `#[<path>::test]`), no `ignore`,
+`should_panic`, `cfg` or `cfg_attr`, and an assertion. Every existing test fn and every other `#[cfg(test)]` line
+must stay byte-identical. Added tests count as changed tests (`tests_changed`, the log, and "Test changes for
+review" in the draft PR). Changing or removing an existing test is allowed only in a repair grant.
+
+A proposer cannot change existing `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
 old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record
 also carries `failing_tests` and `may_update_tests: true`. The repaired child may then change exactly those `#[test]`
 fns (matched by module path), plus any test its parent already changed. The grant is keyed by the candidate's

@@ -13,8 +13,9 @@ from .materialize import PHRASE_PIN_EXEMPT_ENV
 REPIN_NOTE = (f"Phrase pins were exempt during the search: each candidate's `just check` set {PHRASE_PIN_EXEMPT_ENV}=1, "
               "so the Rust tests skipped their exact-phrase asserts on prompts/ text. CI does not set it. "
               "Re-pin those asserts to this PR's prompt text before it lands.")
-TEST_REVIEW_NOTE = ("A repair updated pinned Rust tests whose old asserts the intended behavior change made obsolete. "
-                    "Check that each test below asserts the new behavior and is not deleted or weakened.")
+TEST_REVIEW_NOTE = ("The tests below are new, or a repair updated them because the intended behavior change made "
+                    "their old asserts obsolete. Check that each new test checks the new behavior and that no test "
+                    "is deleted or weakened.")
 ALLOWED_WINNER_PREFIXES = ("src/", "prompts/")
 ALLOWED_WINNER_FILES = ("AGENTS.md",)
 _GITHUB_URL = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?")

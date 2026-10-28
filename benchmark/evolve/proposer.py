@@ -37,7 +37,9 @@ PROPOSER_HEADER = (
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    "touch #[cfg(test)] code, except as the repair record allows. "
+    "change or remove existing #[cfg(test)] code, except as the repair record allows. You may add new #[test] "
+    "fns that test your new behavior, each with an assertion, and the `use` lines they need at the top of the "
+    "test module. "
     f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 

@@ -93,6 +93,63 @@ def _cfg_test_code(path: str, text: str, module_file: bool) -> tuple[list[tuple[
     return spans, tests
 
 
+_USE_LINE = re.compile(r"\s*use\s")
+_MOD_HEAD = re.compile(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{\s*$")
+
+
+def _use_header_lines(lines: list[str], spans: list[tuple[int, int]], module_file: bool) -> set[int]:
+    """The 1-based lines of the ``use`` statements at the top of each test module in ``lines``."""
+    found: set[int] = set()
+    for first, last in spans:
+        start = first
+        if not module_file:
+            while start <= last and lines[start - 1].lstrip().startswith("#["):
+                start += 1
+            if start > last or not _MOD_HEAD.match(lines[start - 1]):
+                continue
+            start += 1
+        in_use = False
+        for number in range(start, min(last, len(lines)) + 1):
+            text = lines[number - 1]
+            if in_use or _USE_LINE.match(text):
+                found.add(number)
+                in_use = not text.rstrip().endswith(";")
+            elif text.strip():
+                break
+    return found
+
+
+_TEST_ATTRIBUTE = re.compile(r"^\s*#\[\s*(?:\w+\s*::\s*)*test\s*\]", re.MULTILINE)
+
+
+def _without_added_tests(path: str, old_text: str, new_text: str, module_file: bool,
+                         old_tests: dict[str, tuple[int, int]], new_tests: dict[str, tuple[int, int]],
+                         granted: frozenset[str]):
+    """None when ``new_text`` adds no whole ``#[test]`` fn. Otherwise ``(removed, added, spans, tests)``: the
+    line changes and test-code spans of ``new_text`` with the added fns cut out, so only the rest is left to judge.
+
+    Each added fn must be a real test (``rust.new_test_problem``). Of the other added lines only blank lines and
+    the ``use`` lines at the top of a test module stay out of ``added``; every other one is still refused.
+    """
+    lines = new_text.split("\n")
+    fresh = sorted(
+        (span, name) for name, span in new_tests.items()
+        if name not in old_tests and name not in granted
+        and _TEST_ATTRIBUTE.search("\n".join(lines[span[0] - 1:span[1]]))
+    )
+    if not fresh:
+        return None
+    for (first, last), name in fresh:
+        if problem := rust.new_test_problem("\n".join(lines[first - 1:last])):
+            raise ApplyRejected(f"{path} adds the test {name}, which is not a real test: {problem}")
+    cut = {number for (first, last), _name in fresh for number in range(first, last + 1)}
+    rest = [line for number, line in enumerate(lines, 1) if number not in cut]
+    removed, added = _line_changes(old_text, "\n".join(rest))
+    spans, tests = _cfg_test_code(path, "\n".join(rest), module_file)
+    header = _use_header_lines(rest, spans, module_file)
+    return removed, {n for n in added if rest[n - 1].strip() and n not in header}, spans, tests
+
+
 def _refuse_oversize(candidate: Mapping[str, str]) -> None:
     """Refuse a text over its byte cap before a worktree or ``just check`` is spent on it."""
     for name, limit in MAX_BYTES.items():
@@ -306,6 +363,9 @@ class Materializer:
                          keep: tuple[str, frozenset[str]] | None = None) -> tuple[dict[str, str], dict[str, str]]:
         """Refuse any changed line inside a ``#[cfg(test)]`` item or in a ``#[cfg(test)]`` module file.
 
+        One change needs no grant: a whole new ``#[test]`` fn, with the blank lines around it and the ``use``
+        lines at the top of its test module. See ``_without_added_tests``.
+
         The three byte-lock literals are exempt, and nothing else on their lines: the applier rewrites them itself.
         ``scope`` holds the names of failing tests, as cargo prints them. Lines inside those ``#[test]`` fns may
         change, and deleting one is refused. An edited one must stay a test: ``rust.test_weakening`` refuses a
@@ -332,8 +392,6 @@ class Materializer:
                 texts = [self._seed_text(declarer) or "",
                          _read(declared_new) if declared_new.is_file() else ""]
                 if any(path in rust.test_module_files(declarer, text) for text in texts):
-                    if not granted:
-                        raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
                     module_file = True
             if path == BYTE_LOCK_FILE:
                 # Only the three literals the applier rewrites may differ; the rest of their lines may not.
@@ -341,9 +399,14 @@ class Materializer:
                 removed, added = _line_changes(old_text, new_text)
             old_spans, old_tests = _cfg_test_code(path, old_text, module_file)
             new_spans, new_tests = _cfg_test_code(path, new_text, module_file)
+            checked = _without_added_tests(path, old_text, new_text, module_file, old_tests, new_tests, granted)
+            if module_file and not granted and checked is None:
+                raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
+            check_removed, check_added, check_spans, check_tests = checked or (removed, added, new_spans, new_tests)
             if gone := sorted((old_tests.keys() - new_tests.keys()) & granted):
                 raise ApplyRejected(f"{path} deletes the failing test {gone[0]}; update it to the new behavior instead")
-            for lines, spans, tests in ((removed, old_spans, old_tests), (added, new_spans, new_tests)):
+            for lines, spans, tests in ((check_removed, old_spans, old_tests),
+                                        (check_added, check_spans, check_tests)):
                 allowed = [span for name, span in tests.items() if name in granted]
                 for first, last in spans:
                     touched = sorted(line for line in lines if first <= line <= last
