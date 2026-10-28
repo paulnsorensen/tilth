@@ -41,11 +41,8 @@ from spend import SpendLedger  # noqa: E402
 JUST_CHECK_TIMEOUT_S = 1800
 
 
-def default_just_check(worktree: Path) -> tuple[bool, str]:
-    """Run ``just check`` in an allowlisted env, with ``<worktree>/target`` linked to the shared candidate target dir.
-
-    The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
-    reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
+def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeout_s: int) -> tuple[bool, str]:
+    """Run ``command`` in ``worktree`` with ``<worktree>/target`` linked to the shared candidate target dir.
 
     A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
     ``/target`` matches a symlink.
@@ -56,16 +53,31 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
         shared.mkdir(parents=True, exist_ok=True)
         target.symlink_to(shared, target_is_directory=True)
     # A new session lets a timeout kill cargo and the test binaries too, not only ``just``.
-    process = subprocess.Popen(["just", "check"], cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env={**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
-                               start_new_session=True)
+    process = subprocess.Popen(command, cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=env, start_new_session=True)
     try:
-        stdout, stderr = process.communicate(timeout=JUST_CHECK_TIMEOUT_S)
+        stdout, stderr = process.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
-        return False, f"just check timed out after {JUST_CHECK_TIMEOUT_S} s"
+        return False, f"{' '.join(command[:2])} timed out after {timeout_s} s"
     return process.returncode == 0, stdout + stderr
+
+
+def default_just_check(worktree: Path) -> tuple[bool, str]:
+    """Run ``just check`` in an allowlisted env.
+
+    The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
+    reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
+    """
+    return _run_in_tree(["just", "check"], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
+                        JUST_CHECK_TIMEOUT_S)
+
+
+def default_cargo(worktree: Path, args: list[str]) -> tuple[bool, str]:
+    """Run ``cargo <args>`` for the integrity stage, in the same env and target dir as ``default_just_check``."""
+    return _run_in_tree(["cargo", *args], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
+                        JUST_CHECK_TIMEOUT_S)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -212,7 +224,8 @@ def build(argv: list[str] | None = None, *,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
-                     spawn=spawn or subprocess.run, deep_runner=deep_runner)
+                     spawn=spawn or subprocess.run, deep_runner=deep_runner,
+                     cargo=default_cargo if just_check is None else None)
 
 
 def main(argv: list[str] | None = None, **deps) -> int:

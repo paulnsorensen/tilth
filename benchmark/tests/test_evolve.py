@@ -530,10 +530,12 @@ def test_rejects_cfg_test_edit(tilth_clone, tmp_path: Path) -> None:
                            '"SERVER_INSTRUCTIONS may not introduce triple newlines"')
     integration_edit = integration.replace("\n", "\n// candidate edit\n", 1)
 
-    for name, text in (("src/mcp/mod.rs", assertion), ("src/edit/integration_tests.rs", integration_edit)):
-        with pytest.raises(Exception, match=r"cfg\(test\)"):
-            materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {name: text})})
+    with pytest.raises(Exception, match=r"cfg\(test\)"):
+        materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {"src/mcp/mod.rs": assertion})})
     assert git("for-each-ref", "refs/evolve/cfgtest", cwd=repo).strip() == ""
+    # A comment outside every test fn passes here; the integrity stage restores the seed's module file.
+    assert materializer.materialize(
+        {**base, "src_patch": _clone_patch(repo, seed, {"src/edit/integration_tests.rs": integration_edit})})
 
 
 def test_rejects_a_candidate_that_flips_the_phrase_pin_exemption(tilth_clone, tmp_path: Path) -> None:
@@ -2355,7 +2357,7 @@ def test_rejects_cfg_test_attribute_with_whitespace_or_comment(world, attribute:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\npub fn gated() {}\n"})
 
-    with pytest.raises(ApplyRejected, match=r"#\[cfg\(test\)\]"):
+    with pytest.raises(ApplyRejected, match=r"#\[cfg\(test\)\]|adds the test gated"):
         materializer.materialize({**seed_candidate(), "src_patch": patch})
     assert refs(world) == []
 

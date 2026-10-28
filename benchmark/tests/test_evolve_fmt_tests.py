@@ -276,9 +276,9 @@ def test_a_granted_test_may_keep_a_test_attribute_of_any_path(two_tests, head: s
     assert mat.materialize(child)
 
 
-def test_a_new_test_beside_the_granted_one_is_refused(two_tests) -> None:
+def test_an_ignored_test_beside_the_granted_one_is_refused(two_tests) -> None:
     mat = materializer(two_tests, fmt=lambda root: True)
-    added = NEW_BEHAVIOR + "\n#[test]\nfn extra() {}\n"
+    added = NEW_BEHAVIOR + "\n#[test]\n#[ignore]\nfn extra() {\n    assert_ne!(1, 2);\n}\n"
     child = granted(mat, {**seed_candidate(), SRC: patch_for(two_tests, {TESTS: added})}, EDITS_APPLY)
 
     with pytest.raises(ApplyRejected, match="not a real test"):
@@ -581,9 +581,7 @@ def test_an_added_test_that_also_edits_an_existing_test_is_refused(inline_tests)
 
 @pytest.mark.parametrize("fn", [
     "\n    #[test]\n    #[ignore]\n    fn thing_is_not_two() {\n        assert_ne!(thing(), 2);\n    }\n",
-    "\n    #[test]\n    #[should_panic]\n    fn thing_is_not_two() {\n        assert_ne!(thing(), 2);\n    }\n",
-    "\n    #[test]\n    fn thing_is_not_two() {}\n",
-    "\n    fn thing_is_not_two() {\n        assert_ne!(thing(), 2);\n    }\n\n    #[test]\n    #[test]\n    fn doubled() {\n        assert!(true);\n    }\n",
+    "\n    #[test]\n    #[ignore = \"later\"]\n    fn thing_is_not_two() {\n        assert_ne!(thing(), 2);\n    }\n",
 ])
 def test_an_added_test_that_is_ignored_or_empty_is_refused(inline_tests, fn: str) -> None:
     mat = materializer(inline_tests, fmt=lambda root: True)
@@ -593,30 +591,12 @@ def test_an_added_test_that_is_ignored_or_empty_is_refused(inline_tests, fn: str
     assert refs(inline_tests) == []
 
 
-def test_a_new_helper_fn_in_the_test_module_is_refused(inline_tests) -> None:
+def test_an_added_test_must_not_have_a_second_test_attribute_that_is_ignored(inline_tests) -> None:
     mat = materializer(inline_tests, fmt=lambda root: True)
-    helper = "\n    fn helper() -> u8 {\n        2\n    }\n"
+    fn = "\n    #[test]\n    #[cfg_attr(not(debug_assertions), ignore)]\n    fn thing_is_not_two() {\n        assert_ne!(thing(), 2);\n    }\n"
 
-    with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
-        mat.materialize(inline_child(inline_tests, with_added(helper + ADDED_FN)))
-    with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
-        mat.materialize(inline_child(inline_tests, with_added(helper)))
-
-
-def test_a_use_line_below_the_top_of_the_test_module_is_refused(inline_tests) -> None:
-    mat = materializer(inline_tests, fmt=lambda root: True)
-    late = with_added().replace("    #[test]\n    fn thing_is_not_two", "    use std::fmt;\n\n    #[test]\n    fn thing_is_not_two")
-
-    with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
-        mat.materialize(inline_child(inline_tests, late))
-
-
-def test_a_use_line_alone_is_refused(inline_tests) -> None:
-    mat = materializer(inline_tests, fmt=lambda root: True)
-    text = INLINE_TEXT.replace("    use super::*;\n", "    use super::*;\n    use std::fmt;\n")
-
-    with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
-        mat.materialize(inline_child(inline_tests, text))
+    with pytest.raises(ApplyRejected):
+        mat.materialize(inline_child(inline_tests, with_added(fn)))
 
 
 def test_an_added_test_in_a_module_file_is_accepted(two_tests) -> None:
@@ -686,74 +666,30 @@ def test_the_test_grant_survives_the_second_repair(two_tests) -> None:
     assert list(run.evo.materializer.test_diffs[candidates.content_id(final)]) == [EDITS_APPLY]
 
 
-# --- shadowing holes: an addition may only tighten ---
+# --- cheap rules: an added test needs a test attribute and no ignore; the rest is the integrity stage's job ---
 
 
-@pytest.mark.parametrize("use", [
-    "    use crate::lenient as assert_eq;\n",
-    "    use super::thing as other_thing;\n",
+@pytest.mark.parametrize("extra", [
     "    use std::fmt;\n",
-    "    use std::fmt; // note\n",
-    "    use std::fmt; // note\n    fn thing() {}\n",
+    "    use crate::lenient as assert_eq;\n",
+    "    fn helper() -> u8 {\n        2\n    }\n",
+    "    macro_rules! assert_eq { ($a:expr, $b:expr) => {}; }\n",
 ])
-def test_an_added_test_may_not_bring_a_use_line(inline_tests, use: str) -> None:
+def test_helpers_beside_an_added_test_pass_here_and_meet_the_integrity_stage(inline_tests, extra: str) -> None:
     mat = materializer(inline_tests, fmt=lambda root: True)
+    child = inline_child(inline_tests, with_added(ADDED_FN + "\n" + extra))
 
-    with pytest.raises(ApplyRejected, match=r"cfg\(test\)"):
-        mat.materialize(inline_child(inline_tests, with_added(use=use)))
-    assert refs(inline_tests) == []
+    mat.materialize(child)
+
+    assert list(mat.test_diffs[candidates.content_id(child)]) == [ADDED_NAME]
 
 
-@pytest.mark.parametrize("name", ["thing", "lib_marker"])
-def test_an_added_test_may_not_take_a_name_the_seed_already_uses(inline_tests, name: str) -> None:
+@pytest.mark.parametrize("body", ["assert!(true);", ""])
+def test_an_added_test_is_not_judged_by_what_it_asserts(inline_tests, body: str) -> None:
     mat = materializer(inline_tests, fmt=lambda root: True)
-    fn = ADDED_FN.replace("thing_is_not_two", name)
+    fn = f"\n    #[test]\n    fn thing_is_not_two() {{\n        {body}\n    }}\n"
 
-    with pytest.raises(ApplyRejected, match="already uses"):
-        mat.materialize(inline_child(inline_tests, with_added(fn)))
-
-
-@pytest.mark.parametrize("item", [
-    "impl Marker for u8 {}",
-    "macro_rules! lenient { () => {}; }",
-    "fn helper() {}",
-    "struct Local;",
-    "use std::fmt::Debug as assert_eq;",
-    "static LOCAL: u8 = 1;",
-])
-def test_an_added_test_may_not_declare_an_item(inline_tests, item: str) -> None:
-    mat = materializer(inline_tests, fmt=lambda root: True)
-    fn = f"\n    #[test]\n    fn thing_is_not_two() {{\n        {item}\n        assert_ne!(thing(), 2);\n    }}\n"
-
-    with pytest.raises(ApplyRejected, match="declares an item"):
-        mat.materialize(inline_child(inline_tests, with_added(fn)))
-
-
-@pytest.mark.parametrize("body", [
-    "let _unused: Option<Box<dyn std::fmt::Debug + ?Sized>> = None;",
-    "assert!(true);",
-    "assert_eq!(thing(), thing());",
-    "assert!(1 == 1);",
-    "assert_eq!(2, 2);\n        assert!(!false);",
-])
-def test_an_added_test_must_assert_something_real(inline_tests, body: str) -> None:
-    mat = materializer(inline_tests, fmt=lambda root: True)
-    fn = f"\n    #[test]\n    fn sized_only<T: ?Sized>() {{\n        {body}\n    }}\n"
-
-    with pytest.raises(ApplyRejected, match="not a real test"):
-        mat.materialize(inline_child(inline_tests, with_added(fn)))
-
-
-def test_a_question_mark_asserts_only_in_a_fn_that_returns_result(inline_tests) -> None:
-    mat = materializer(inline_tests, fmt=lambda root: True)
-    ok = ('\n    #[test]\n    fn parses_one() -> Result<(), String> {\n'
-          '        let _v: u8 = "1".parse().map_err(|_| String::new())?;\n        Ok(())\n    }\n')
-    plain = ok.replace(" -> Result<(), String>", "").replace("        Ok(())\n", "")
-
-    mat.materialize(inline_child(inline_tests, with_added(ok)))
-    with pytest.raises(ApplyRejected, match="not a real test"):
-        mat.materialize(inline_child(inline_tests, with_added(plain)))
-
+    assert mat.materialize(inline_child(inline_tests, with_added(fn)))
 
 @pytest.mark.parametrize("head", [
     "    /// Checks that the answer is not two.\n    #[test]\n",

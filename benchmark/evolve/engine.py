@@ -31,6 +31,8 @@ REFLECTION_HEADER = (
 )
 # The paid-tier side_info fields that make up the score; reflection sees them once per candidate.
 REPAIR_INSTRUCTION = "Fix only this failure; keep the intended change."
+INTEGRITY_INSTRUCTION = ("The seed's existing tests ran against your production code, exactly as the seed wrote "
+                         "them, and failed or went missing. Fix the production code. Do not edit those tests.")
 # One repair for any failure, and a second only when the first repair failed on clippy lints or rustfmt diffs alone.
 MAX_REPAIRS = 2
 _ERROR_HEAD = re.compile(r"error(?:\[\w+\])?:|Diff in ")
@@ -233,7 +235,7 @@ class Dispatcher:
         return proposal
 
     def _repaired(self, candidate: Mapping[str, str], proposal: Mapping[str, str], records: list[dict]) -> str:
-        """The proposed ``src_patch``, or its repair when its child fails apply or ``just check``.
+        """The proposed ``src_patch``, or its repair when its child fails apply, ``just check``, or integrity.
 
         The repair is the proposer's second call: it sees the failed patch applied and the real error.
         Whatever it returns is the child; the cascade then checks that child (the check is memoized) and fails
@@ -261,7 +263,8 @@ class Dispatcher:
             if attempt > 1 and (stage != "just check" or failing or not lint_only(error)):
                 self.log("repair: the repair did not fail on lint or fmt alone; no second repair")
                 return patch
-            repair = {"stage": stage, "error": error, "instruction": REPAIR_INSTRUCTION}
+            repair = {"stage": stage, "error": error,
+                      "instruction": INTEGRITY_INSTRUCTION if stage == "integrity" else REPAIR_INSTRUCTION}
             if failing:
                 repair["failing_tests"] = failing
                 repair["may_update_tests"] = True

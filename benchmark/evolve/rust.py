@@ -24,12 +24,10 @@ _ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
 _TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
 _GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
 _ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!")
-_ASSERT_CALL = re.compile(r"\b(assert|assert_eq|assert_ne)\s*!\s*([(\[{])")
 _TRY = re.compile(r"[\w)\]}]\s*\?")
-_LITERAL_ONLY = re.compile(r'"(?:[^"\\]|\\.)*"|\b\d[\w.]*|\btrue\b|\bfalse\b|[=!<>&|()\s-]')
-_NESTED_ITEM = re.compile(r"\bfn\s+(?=[A-Za-z_])|\b(?:struct|enum|impl|trait|mod|use|macro_rules|const|type)\b"
-                         r"|(?<!')\bstatic\b|#\s*\[\s*macro_export")
-_WORD = re.compile(r"[A-Za-z_]\w*")
+_IGNORE = re.compile(r"\bignore\b")
+_MACRO_DEF = re.compile(r"\bmacro_rules\s*!\s*(\w+)")
+_MACRO_CALL = re.compile(r"\b(\w+)\s*!(?!=)")
 _RAW = re.compile(r'r(#*)"')
 _STRING = r'("(?:[^"\\]|\\.)*")'
 _COUNT = re.compile(r"SERVER_INSTRUCTIONS\.len\(\),\s*(\d+)")
@@ -106,33 +104,58 @@ def _line(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
-def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
-    """``(first_line, last_line, head)`` of each item under a ``cfg`` or ``cfg_attr`` attribute naming ``test``
-    or ``debug_assertions``.
+def _cfg_test_ranges(text: str) -> list[tuple[int, int, str, bool]]:
+    """``(start, end, key, inner)``: the character range ``[start, end)`` of each item under a ``cfg`` or
+    ``cfg_attr`` attribute naming ``test`` or ``debug_assertions``.
 
     That covers ``cfg(test)``, ``cfg(any(.., test))``, ``cfg(all(test, ..))``, ``cfg(not(test))``, and
-    ``cfg_attr(test, ..)``; the span starts at the attribute, so the attribute itself is part of the item.
-    ``head`` is the item's code before ``{`` or ``;``. An inner ``#![cfg(..test..)]`` spans the whole file.
+    ``cfg_attr(test, ..)``; the range starts at the attribute, so the attribute itself is part of the item.
+    ``key`` is the item's code before ``{`` or ``;``, attribute included, with whitespace folded.
+    An inner ``#![cfg(..test..)]`` ranges to the end of the file; its key is ``#!``.
     """
     mask = _code_mask(text)
-    items = []
+    ranges = []
     for match in _CFG_ATTR.finditer(mask):
         close = _match_brace(mask, mask.index("[", match.start()), "[]")
         if not _TEST_TOKEN.search(mask, match.end(), close):
             continue
         if match[1]:
-            items.append((_line(text, match.start()), _line(text, max(len(text) - 1, 0)), ""))
+            ranges.append((match.start(), len(text), "#!", True))
             continue
         terminator = re.compile(r"[{;]").search(mask, close + 1)
         if terminator is None:
             continue
         end = terminator.start() if terminator[0] == ";" else _match_brace(mask, terminator.start())
-        items.append((_line(text, match.start()), _line(text, end), mask[close + 1:terminator.start()].strip()))
-    return items
+        key = " ".join(mask[match.start():terminator.start()].split())
+        ranges.append((match.start(), end + 1, key, False))
+    return ranges
+
+
+def _cfg_test_items(text: str) -> list[tuple[int, int, str]]:
+    """``(first_line, last_line, key)`` of each item ``_cfg_test_ranges`` finds."""
+    return [(_line(text, start), _line(text, max(end - 1, 0)), key) for start, end, key, _inner in _cfg_test_ranges(text)]
 
 
 def cfg_test_spans(text: str) -> list[tuple[int, int]]:
-    return [(first, last) for first, last, _head in _cfg_test_items(text)]
+    return [(first, last) for first, last, _key in _cfg_test_items(text)]
+
+def guarded_spans(text: str) -> list[tuple[int, int]]:
+    """Line spans of cfg items that are not plain ``#[cfg(test)]``: ``cfg(not(test))``, ``cfg(debug_assertions)``,
+    ``cfg(any(.., test))``, ``cfg_attr`` and the like. Production builds and test builds differ in these items,
+    so the integrity stage cannot swap them for the seed's."""
+    return [(first, last) for first, last, key in _cfg_test_items(text) if key != "#!" and not key.startswith("#[cfg(test)]")]
+
+
+
+def cfg_test_regions(text: str) -> list[tuple[int, int, str, bool]]:
+    """The outermost ``_cfg_test_ranges`` of ``text``, in file order; a range inside another one is left out."""
+    regions: list[tuple[int, int, str, bool]] = []
+    reached = 0
+    for region in sorted(_cfg_test_ranges(text)):
+        if region[0] >= reached:
+            regions.append(region)
+            reached = region[1]
+    return regions
 
 
 def test_module_files(path: str, text: str) -> set[str]:
@@ -252,63 +275,41 @@ def has_test_attribute(text: str) -> bool:
     return parts is not None and any(_TEST_ATTRIBUTE.fullmatch(attribute) for attribute in parts[0])
 
 
-def identifiers(text: str) -> set[str]:
-    """Every identifier in the code of ``text``, comments and strings left out."""
-    return set(_WORD.findall(_code_mask(text)))
-
-
-def _call_arguments(raw: str, mask: str, open_index: int) -> list[str]:
-    close = _match_brace(mask, open_index, {"(": "()", "[": "[]", "{": "{}"}[mask[open_index]])
-    arguments, depth, start = [], 0, open_index + 1
-    for index in range(open_index + 1, close):
-        if mask[index] in "([{":
-            depth += 1
-        elif mask[index] in ")]}":
-            depth -= 1
-        elif mask[index] == "," and depth == 0:
-            arguments.append(raw[start:index])
-            start = index + 1
-    arguments.append(raw[start:close])
-    return [argument.strip() for argument in arguments if argument.strip()]
-
-
-def _trivial_assert(name: str, arguments: list[str]) -> bool:
-    def constant(argument: str) -> bool:
-        return not _LITERAL_ONLY.sub("", argument)
-
-    if name == "assert":
-        return not arguments or constant(arguments[0])
-    if len(arguments) < 2:
-        return True
-    same = re.sub(r"\s+", "", arguments[0]) == re.sub(r"\s+", "", arguments[1])
-    return same or (constant(arguments[0]) and constant(arguments[1]))
-
-
-_ASSERTING_STUB = "#[test]\nfn stub() {\n    assert!(true);\n}"
-
-
 def new_test_problem(new: str) -> str | None:
-    """Why the new test fn ``new`` is not a real test, or None. The text runs from the first attribute to the
+    """Why the added fn ``new`` is not a real test, or None. The text runs from the first attribute to the
     closing brace.
 
-    It holds the same checks as ``test_weakening`` against a plain asserting test: exactly one test attribute, no
-    ``ignore``, ``should_panic``, ``cfg``, or ``cfg_attr``, and a body that asserts something. A postfix ``?``
-    counts only in a fn that returns ``Result``. A body whose assert macros compare only literals, or two identical
-    arguments, asserts nothing. The body may not declare an item (``fn``, ``struct``, ``enum``, ``impl``, ``trait``,
-    ``mod``, ``use``, ``macro_rules!``, ``static``, ``const``, ``type``, ``#[macro_export]``): its names could leak
-    into the module and change what the existing tests resolve to.
+    It needs a test attribute (``#[test]``, ``#[tokio::test(..)]``, ``#[<path>::test]``) and no ``ignore`` in any
+    attribute. The integrity stage judges the rest: it runs the seed's tests, not the added ones.
     """
-    if problem := test_weakening(_ASSERTING_STUB, new):
-        return problem
-    _attributes, signature, body, raw = _fn_parts(new)
-    if nested := _NESTED_ITEM.search(body, 1):
-        item = " ".join(nested[0].split())
-        return f"its body declares an item ({item}), which can shadow a name"
-    calls = [(match[1], _call_arguments(raw, body, match.end() - 1)) for match in _ASSERT_CALL.finditer(body)]
-    if calls and all(_trivial_assert(name, arguments) for name, arguments in calls) \
-            and not re.search(r"\bpanic\s*!", body) and not ("Result" in signature and _TRY.search(body)):
-        return "its asserts compare only literals or identical values"
+    parts = _fn_parts(new)
+    if parts is None or not any(_TEST_ATTRIBUTE.fullmatch(attribute) for attribute in parts[0]):
+        return "it carries no test attribute"
+    if any(_IGNORE.search(attribute) for attribute in parts[0]):
+        return "it is ignored"
     return None
+
+
+def is_standalone_fn(text: str) -> bool:
+    """True when ``text`` is one fn with its attributes and no other code, so no item shares its first or last line."""
+    mask = _code_mask(text).strip()
+    found = _FN.search(mask)
+    terminator = mask.find("{", found.end()) if found else -1
+    if terminator < 0 or _match_brace(mask, terminator) != len(mask) - 1:
+        return False
+    head = mask[:found.start()]
+    head = head[:_MODIFIERS.search(head).start()]
+    return bool(_ATTRIBUTES.fullmatch(head))
+
+
+def macro_names(text: str) -> set[str]:
+    """The names ``text`` defines with ``macro_rules!``."""
+    return set(_MACRO_DEF.findall(_code_mask(text)))
+
+
+def invoked_macros(text: str) -> set[str]:
+    """The names ``text`` invokes as ``name!``."""
+    return set(_MACRO_CALL.findall(_code_mask(text)))
 
 
 def include_invocations(text: str) -> list[tuple[int, int, str, str]]:
@@ -371,15 +372,6 @@ def string_literal(source: str) -> str | None:
         return re.sub(r"\\(.)", lambda escape: {"n": "\n", "t": "\t", "r": "\r"}.get(escape[1], escape[1]),
                       plain[1])
     return None
-
-
-def declaring_files(path: str) -> list[str]:
-    """Files that could declare ``path`` as a module."""
-    source = PurePosixPath(path)
-    module_dir = source.parent.parent if source.name == "mod.rs" else source.parent
-    if str(module_dir) == "src" or module_dir == PurePosixPath("."):
-        return ["src/lib.rs", "src/main.rs"]
-    return [str(module_dir / "mod.rs"), f"{module_dir}.rs"]
 
 
 def _byte_lock_matches(text: str) -> list[re.Match]:

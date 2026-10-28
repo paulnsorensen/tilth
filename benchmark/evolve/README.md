@@ -93,17 +93,42 @@ A long failure tail keeps the compiler, clippy, test, or fmt error blocks that c
 ### Pinned-test updates in repair
 
 Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
-module or in a `#[cfg(test)] mod x;` module file. An addition may only tighten: it may never change what an
-existing test resolves to or checks. So an added test may not add a `use` line (it uses full paths), may not declare a
-nested item (`fn`, `struct`, `enum`, `impl`, `trait`, `mod`, `use`, `macro_rules!`, `static`, `const`, `type`,
-`#[macro_export]`), and may not take a name that any seed `src/**/*.rs` file already uses as an identifier, because
-the test module glob-imports that code. Each new fn needs exactly one test attribute (`#[test]`, `#[tokio::test(..)]`,
-any `#[<path>::test]`; a leading `///` doc comment is fine), no `ignore`, `should_panic`, `cfg` or `cfg_attr`, and a
-real assertion: an `assert!`, `assert_eq!`, `assert_ne!` or `panic!`, or a postfix `?` in a fn that returns `Result`.
-A body whose asserts compare only literals or two identical arguments (`assert!(true)`, `assert_eq!(x, x)`,
-`assert!(1 == 1)`) is refused. Every existing test fn and every other `#[cfg(test)]` line must stay byte-identical.
-Added tests count as changed tests (`tests_changed`, the log, and "Test changes for review" in the draft PR). A new
-`#[test]` fn outside `#[cfg(test)]` code is listed there too. Changing or removing an existing test is allowed only in a repair grant.
+module or in a `#[cfg(test)] mod x;` module file. The materializer checks only cheap rules on an added fn: it needs
+a test attribute and no `ignore`. Existing test fns change only under a repair grant (below). Added and changed tests
+count as `tests_changed`, appear in the log, and appear under "Test changes for review" in the draft PR. A new
+`#[test]` fn outside `#[cfg(test)]` code is listed there too. The materializer also refuses a candidate that edits
+a `#[cfg(not(test))]`, `#[cfg(any(..test..))]`, `cfg_attr` or `#[cfg(debug_assertions)]` item, or that adds
+an inner `#![cfg(..test..)]` attribute.
+
+### Integrity stage
+
+The test text is not the safe thing to check. A candidate can add a `macro_rules! assert_eq` on a test attribute line,
+or put `#[cfg(any())]` above the test module. Then `just check` is green while the seed's tests no longer run as the
+seed wrote them. So the cascade has a behavioral stage, `integrity`, after `just check` passes and before `build`.
+The rule: the seed's tests must keep running and passing against the candidate's production code, exactly as the seed
+wrote them. The one exception is a test with a repair grant, which may assert new behavior.
+
+The stage applies to every `src_patch` candidate whose patch differs from the seed. It builds the tree in the
+candidate worktree: the candidate's production code stays, and each outermost `#[cfg(test)]` item is replaced by the
+seed's item with the same header. Granted test fns take the candidate's version. Seed `#[cfg(test)] mod x;` files are
+restored byte for byte (granted fns excepted), and test modules or files the candidate added are dropped. It then runs
+`cargo test --lib --bins -- --list`. Every seed test name must be in the list; the seed names are listed once per run
+in a scratch worktree. Last, it runs `cargo test --lib --bins`, and all tests must pass.
+
+A failure is a cascade failure at stage `integrity`, and it is repairable like `just check`. The tail names the
+missing or failing seed tests. A repair after an integrity failure never gets test scope. Where a replacement cannot
+be made sound (a production macro that shadows a seed macro, an inner test `cfg` in a production file, a granted fn
+that shares lines with other code), the candidate fails at this stage with the reason. It is never accepted.
+
+Cost per candidate: one incremental test build for the list and one test run in the shared candidate target dir, and
+one extra seed list build per run. Cargo trusts file mtimes and the trees share a target dir, so the stage touches the
+sources before each cargo call. The stage is skipped for the seed, for an unchanged patch, and for a text-only child
+(the result is memoized by patch and grant).
+
+Limits: a granted fn that needs a test helper the candidate added fails integrity (repairable). Edits to non-test lines
+in plain `#[cfg(test)]` code pass the materializer, because this stage restores the seed's version.
+
+### Repair grants for existing tests
 
 A proposer cannot change existing `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
 old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record

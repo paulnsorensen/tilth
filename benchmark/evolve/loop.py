@@ -35,6 +35,7 @@ from . import deepdiag, diagnosis, directives, engine, hookgate, replay, rust
 from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
+from .integrity import Integrity
 from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
@@ -149,7 +150,7 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check", "build", "hook gate"}:
+        if self.stage in {"apply", "just check", "integrity", "build", "hook gate"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -294,7 +295,8 @@ def _paired_score_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Map
 class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
-                 spawn: Callable, deep_runner: deepdiag.Runner | None = None) -> None:
+                 spawn: Callable, deep_runner: deepdiag.Runner | None = None,
+                 cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> None:
         self.settings = settings
         self.panel = panel
         self.ledger = ledger
@@ -333,6 +335,10 @@ class Evolution:
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms())
+        # Without a cargo runner the integrity stage is off; the stub gates of the offline tests run no cargo.
+        self.integrity = (Integrity(settings.repo, settings.seed_sha, self.run_dir / "worktrees", cargo)
+                          if cargo is not None else None)
+        self._integrity_memo: dict[tuple[str, frozenset[str]], tuple[bool, str]] = {}
         self.dispatcher.test_scope = self.materializer.test_scope
         self.dispatcher.test_keep = self.materializer.test_keep
         self.results: dict[str, Cascade] = {}
@@ -608,14 +614,34 @@ class Evolution:
                 result.tests_changed = True
                 self.log(f"candidate {result.cid[:12]}: changes tests for review: {', '.join(sorted(changed))}")
         if result.just_check_ok is None:
-            ok, output = self.just_check(self.materializer.worktree(result.sha))
+            worktree = self.materializer.worktree(result.sha)
+            ok, output = self.just_check(worktree)
             result.just_check_ok = ok
+            if ok:
+                sound, output = self._integrity(result, worktree)
             self.materializer.release(result.sha)
             if not ok:
                 # The full output, before `tail` cuts it, holds cargo's whole `failures:` list.
                 result.failing_tests = rust.failing_tests(output)
                 return self._fail(result, "just check", tail(output))
+            if not sound:
+                return self._fail(result, "integrity", tail(output))
         return None
+
+    def _integrity(self, result: Cascade, worktree: Path) -> tuple[bool, str]:
+        """Run the seed's tests against the candidate's production code; see ``integrity.py``.
+
+        It runs once per ``src_patch`` and grant: a child that only changes a text component, or the seed,
+        has nothing new to check.
+        """
+        patch = result.candidate[SRC_PATCH]
+        if self.integrity is None or not patch.strip():
+            return True, ""
+        keep = self.materializer.test_keep.get(patch)
+        granted = self.materializer.test_scope.get(patch, frozenset()) | (keep[1] if keep else frozenset())
+        if (patch, granted) not in self._integrity_memo:
+            self._integrity_memo[(patch, granted)] = self.integrity.check(worktree, granted)
+        return self._integrity_memo[(patch, granted)]
 
     def _failing_tests_of(self, candidate: Mapping[str, str]) -> list[str]:
         """The Rust tests that ``candidate`` failed in `just check`; empty when it failed for another reason."""
@@ -623,14 +649,15 @@ class Evolution:
         return list(result.failing_tests) if result is not None and result.stage == "just check" else []
 
     def precheck(self, candidate: Mapping[str, str]) -> tuple[str, str] | None:
-        """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply or ``just check``, else None.
+        """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply, ``just check``, or
+        integrity, else None.
 
         It runs the cascade's own memoized stages, so a child that passes is not checked again when GEPA evaluates it.
         """
         result = self.new_cascade(candidate)
         if not result.done and not self.stop.is_set:
             self._static_checks(result)
-        if result.stage in {"apply", "just check"}:
+        if result.stage in {"apply", "just check", "integrity"}:
             return result.stage, self._redact(result.tail or "")
         return None
 
