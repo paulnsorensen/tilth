@@ -24,6 +24,8 @@ import baselines
 import panels
 import run
 from config import REPO_ROOT, ModeConfig
+from evolve import materialize as evolve_materialize
+from evolve import proposer as evolve_proposer
 from judge import core as judge_core
 from judge import config as judge_config
 from judge.store import Agreement
@@ -314,6 +316,9 @@ def make_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str,
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-fixture-token")
+    # The fixture seed is not rustfmt-clean, so the default formatter would rewrite files the tests do not own.
+    monkeypatch.setattr(evolve_materialize, "format_tree", lambda root: True)
+    monkeypatch.setattr(evolve_proposer, "format_tree", lambda root: True)
     monkeypatch.setattr(run, "RESULTS_DIR", results)
     monkeypatch.setattr(run, "cli_version", lambda _runner, **_kwargs: CLI_VERSION)
     monkeypatch.setattr(run, "env_fingerprint", lambda _task: world.env)

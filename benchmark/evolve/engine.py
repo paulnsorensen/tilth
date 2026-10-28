@@ -140,7 +140,15 @@ class Dispatcher:
                  extra_records: Callable[[Mapping[str, str]], list[dict]] | None = None,
                  directives=None,
                  check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
+                 failing_tests: Callable[[Mapping[str, str]], list[str]] | None = None,
+                 test_scope: dict[str, frozenset[str]] | None = None,
+                 test_keep: dict[str, tuple[str, frozenset[str]]] | None = None,
                  log: Callable[[str], None] | None = None) -> None:
+        self.failing_tests = failing_tests
+        # ``src_patch`` text -> tests that patch may change; the materializer reads the same dicts. ``test_keep``
+        # maps a patch to (parent patch, tests it inherits and must leave as the parent had them).
+        self.test_scope = test_scope if test_scope is not None else {}
+        self.test_keep = test_keep if test_keep is not None else {}
         self.directives = directives
         self.check = check
         self.log = log or (lambda _line: None)
@@ -179,6 +187,8 @@ class Dispatcher:
             if directive is not None and directive.component == name and directive.hypothesis \
                     and self.hypotheses is not None:
                 self.hypotheses.default(name, directive.hypothesis)
+        if SRC_PATCH in proposal and not self.stop.is_set:
+            self._inherit_tests(candidate, proposal)
         if SRC_PATCH in proposal and self.check is not None and not self.stop.is_set:
             proposal[SRC_PATCH] = self._repaired(candidate, proposal, patch_records)
         if self.stop.is_set:
@@ -193,7 +203,12 @@ class Dispatcher:
         The repair is the proposer's only second call: it sees the failed patch applied and the real error.
         Whatever it returns is the child; the cascade then checks that child (the check is memoized) and fails
         it for good if it still fails. The same directive and hypothesis stay on the final child.
+
+        When ``just check`` failed on Rust tests, the repair record names them and sets ``may_update_tests``.
+        The final child may then change exactly those tests. It may also change the tests its parent's grant
+        covers: a repair that names failing tests is the one call that may. Any other child keeps them as they are.
         """
+        inherited = self._granted(candidate)
         if proposal[SRC_PATCH] == candidate[SRC_PATCH]:
             return proposal[SRC_PATCH]  # no change: the parent was checked when it was evaluated
         child = {**candidate, **proposal}
@@ -202,6 +217,10 @@ class Dispatcher:
             return proposal[SRC_PATCH]
         stage, error = failure
         repair = {"stage": stage, "error": error, "instruction": REPAIR_INSTRUCTION}
+        failing = self.failing_tests(child) if stage == "just check" and self.failing_tests is not None else []
+        if failing:
+            repair["failing_tests"] = failing
+            repair["may_update_tests"] = True
         if stage == "apply":
             # The failed patch cannot be applied to an export, so the proposer gets it as text.
             repair["failed_diff"] = proposal[SRC_PATCH]
@@ -209,11 +228,32 @@ class Dispatcher:
         else:
             base = child
         try:
-            return self.propose(base, [*records, {"repair": repair}])
+            patch = self.propose(base, [*records, {"repair": repair}])
         except (OSError, RuntimeError, ValueError) as error:
             # A failed repair leaves the failed child; stop and auth signals are not caught here.
             self.log(f"repair: proposer failed ({type(error).__name__}: {error}); keeping the failed patch")
             return proposal[SRC_PATCH]
+        if failing:
+            self.test_scope[patch] = self.test_scope.get(patch, frozenset()) | inherited | frozenset(failing)
+            if patch != candidate[SRC_PATCH]:
+                self.test_keep.pop(patch, None)
+        else:
+            self._inherit_tests(candidate, {SRC_PATCH: patch})
+        return patch
+
+    def _granted(self, candidate: Mapping[str, str]) -> frozenset[str]:
+        """The tests the candidate's patch may change or inherited from its parent."""
+        patch = candidate[SRC_PATCH]
+        return self.test_scope.get(patch, frozenset()) | self.test_keep.get(patch, ("", frozenset()))[1]
+
+    def _inherit_tests(self, candidate: Mapping[str, str], proposal: Mapping[str, str]) -> None:
+        """A child's cumulative patch carries its parent's test edits. The child keeps them read-only: a repair,
+        not a plain proposal, may change them. A child with the parent's patch needs no entry; it has the grant."""
+        parent, patch = candidate[SRC_PATCH], proposal[SRC_PATCH]
+        if patch == parent or not (granted := self._granted(candidate)):
+            return
+        before = self.test_keep.get(patch)
+        self.test_keep[patch] = (parent, granted | before[1] if before and before[0] == parent else granted)
 
 
 def optimize(seed: dict[str, str], *, evaluator: Callable, dataset: Sequence[str], max_metric_calls: int,

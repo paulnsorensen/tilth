@@ -17,6 +17,7 @@ from .calls import PaidCalls
 from .candidate import OBJECTIVE, SRC_PATCH, TEXT_COMPONENTS
 from .diagnosis import DIAGNOSIS_NOTE, DIRECTIVE_NOTE, PROPOSER_HYPOTHESIS, HypothesisBook
 from .gitops import GitError, git, git_bytes
+from .rustfmt import format_tree
 
 EXPORT_PATHS = ("src", "prompts", "Cargo.toml", "Cargo.lock")
 TOOLS = "Read,Edit,Write,Glob,Grep"
@@ -25,14 +26,19 @@ PATH_KEYS = ("file_path", "path", "notebook_path")
 REPAIR_NOTE = ("A record with a `repair` key means your earlier change failed. When its `stage` is `just check`, "
                "that change is already applied here and `error` holds the compiler or lint output. When its `stage` "
                "is `apply`, the tree is the parent's and `failed_diff` holds the change that did not apply. Fix only "
-               "that failure and keep the intended change.")
+               "that failure and keep the intended change. When the repair record has `may_update_tests`, the "
+               "`just check` failure includes the unit tests in `failing_tests`, and you may change only those test "
+               "fns, and only when your intended behavior change makes a pinned test obsolete. Update each such test "
+               "to assert the NEW intended behavior. Never delete a test, and never weaken it so that it passes "
+               "trivially; a person reviews every test change. If a test fails for another reason, fix the code.")
 PROPOSER_HEADER = (
     "You are improving tilth, a Rust MCP server for code intelligence whose source is in the current "
     "directory. Below are reflective records of AI agents' rollouts with tilth on benchmark tasks: each holds "
     "the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
-    f"touch #[cfg(test)] code. {DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
+    "touch #[cfg(test)] code, except as the repair record allows. "
+    f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 
 
@@ -60,7 +66,9 @@ class Proposer:
     """
 
     def __init__(self, repo: Path, seed_sha: str, paid: PaidCalls, model: str, *, forbidden: list[str],
-                 log: Callable[[str], None], hypotheses: HypothesisBook | None = None) -> None:
+                 log: Callable[[str], None], hypotheses: HypothesisBook | None = None,
+                 fmt: Callable[[Path], object] | None = None) -> None:
+        self.fmt = fmt or format_tree
         self.hypotheses = hypotheses
         self.repo = Path(repo)
         self.seed_sha = seed_sha
@@ -140,7 +148,14 @@ class Proposer:
         return None
 
     def cumulative_diff(self, root: Path) -> str:
-        """The export's ``src/**`` against the seed's, as a unified diff ``git apply`` accepts at the seed."""
+        """The export's ``src/**`` against the seed's, as a unified diff ``git apply`` accepts at the seed.
+
+        The export is rustfmt-formatted first, so the diff, its content id, and the next proposal's base are all
+        formatted code.
+        """
+        if self.fmt(root) is False:
+            # `cargo fmt` exits non-zero on a parse error; the patch then stays unformatted and `just check` says why.
+            self.log("proposer: cargo fmt failed on the export; the diff stays unformatted")
         common = Path(git("rev-parse", "--git-common-dir", cwd=self.repo).strip())
         git_dir = common if common.is_absolute() else self.repo / common
         with tempfile.TemporaryDirectory(prefix="tilth-evolve-index-") as index_dir:

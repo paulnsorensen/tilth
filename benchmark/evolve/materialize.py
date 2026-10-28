@@ -5,12 +5,13 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 from . import rust
 from .candidate import MAX_BYTES, SRC_PATCH, TEXT_COMPONENTS, content_id, read_seed, ref_name
 from .gitops import GitError, git
+from .rustfmt import format_tree
 
 ALLOWED_PREFIXES = ("src/", "prompts/")
 # The candidate `just check` sets this to 1, and the Rust tests then skip their prompt phrase pins.
@@ -83,6 +84,15 @@ def _line_changes(old: str, new: str) -> tuple[set[int], set[int]]:
     return removed, added
 
 
+def _cfg_test_code(path: str, text: str, module_file: bool) -> tuple[list[tuple[int, int]], dict[str, tuple[int, int]]]:
+    """The test-code line spans of ``text`` (all of it for a ``#[cfg(test)]`` module file) and, by name, the
+    ``#[test]`` fn spans inside them."""
+    spans = [(1, text.count("\n") + 1)] if module_file else rust.cfg_test_spans(text)
+    tests = {name: (first, last) for name, first, last in rust.test_functions(path, text)
+             if any(low <= first and last <= high for low, high in spans)}
+    return spans, tests
+
+
 def _refuse_oversize(candidate: Mapping[str, str]) -> None:
     """Refuse a text over its byte cap before a worktree or ``just check`` is spent on it."""
     for name, limit in MAX_BYTES.items():
@@ -97,16 +107,31 @@ class Materializer:
     The first call for a content id takes these steps:
 
     1. Refuse a text over its ``MAX_BYTES`` cap. Then write the text components into a worktree at the seed.
-    2. Apply the cumulative ``src_patch``.
-    3. Refuse changes outside ``src/**`` and ``prompts/**``, and changes inside ``#[cfg(test)]`` code.
+    2. Apply the cumulative ``src_patch``, then run ``cargo fmt`` on the tree so the commit holds formatted code.
+    3. Refuse changes outside ``src/**`` and ``prompts/**``, and changes inside ``#[cfg(test)]`` code. The one
+       exception is a patch in ``test_scope``: a repaired child may change the ``#[test]`` fns it names, but may
+       not disable or gut them. A patch in ``test_keep`` must leave its parent's granted tests byte-equal.
     4. Refuse reach for the harness: a harness name, an ``include*!`` outside ``src/`` and ``prompts/``,
        an alias of an include macro, or ``cfg!(test)``.
-    5. Regenerate ``AGENTS.md`` and rewrite the byte-lock literals.
+    5. Regenerate ``AGENTS.md`` and rewrite the byte-lock literals, then format again when the rewrite changed
+       ``src/mcp/mod.rs``, since a long last prompt line pushes its assert past rustfmt's width.
     6. Commit with the seed as parent, and point ``evolve/<run-id>/<content-id>`` at the commit.
     """
 
     def __init__(self, repo: Path, seed_sha: str, run_id: str, work_dir: Path, *,
-                 forbidden: Iterable[str] = ()) -> None:
+                 forbidden: Iterable[str] = (), fmt: Callable[[Path], object] | None = None) -> None:
+        self.fmt = fmt or format_tree
+        # ``src_patch`` text -> names of the failing tests (as cargo prints them) that patch may change. The
+        # key is the patch, not the content id, so a child that only changes a text component keeps the grant.
+        # The dispatcher fills it before the candidate is materialized.
+        self.test_scope: dict[str, frozenset[str]] = {}
+        # ``src_patch`` text -> (parent patch, test names) for a patch that extends a granted parent without a
+        # repair. Those tests carry the parent's edits and must stay byte-equal to the parent's.
+        self.test_keep: dict[str, tuple[str, frozenset[str]]] = {}
+        # ``src_patch`` text -> {granted test name: its text as committed}, read to enforce ``test_keep``.
+        self.test_texts: dict[str, dict[str, str]] = {}
+        # Content id -> {test name: diff against the seed} for each committed candidate that changes tests.
+        self.test_diffs: dict[str, dict[str, str]] = {}
         self.repo = Path(repo)
         self.forbidden = [term for term in dict.fromkeys((*HARNESS_TERMS, *forbidden)) if term]
         self.seed_sha = seed_sha
@@ -185,6 +210,8 @@ class Materializer:
                 git("apply", "--whitespace=nowarn", "-", cwd=worktree, input=patch)
             except GitError as error:
                 raise ApplyRejected("the cumulative src_patch does not apply onto the seed", error.output) from error
+            # Before the checks, so they judge the code that gets committed. A parse error leaves the tree as is.
+            self.fmt(worktree)
         git("add", "-A", cwd=worktree)
         raw = git("diff", "--cached", "--raw", "-z", "--no-renames", self.seed_sha, cwd=worktree).split("\0")
         changed = raw[1::2]
@@ -198,18 +225,26 @@ class Materializer:
         diff = git("diff", "--cached", "-U0", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
                    self.seed_sha, "--", "src", cwd=worktree)
         self._refuse_harness_reach(worktree, diff)
-        self._refuse_cfg_test(worktree, diff)
+        changes, texts = self._refuse_cfg_test(worktree, diff, self.test_scope.get(patch, frozenset()),
+                                               self.test_keep.get(patch))
         regen = subprocess.run(["bash", "scripts/regen-agents-md.sh"], cwd=worktree, capture_output=True, text=True)
         if regen.returncode != 0:
             raise ApplyRejected("scripts/regen-agents-md.sh failed", regen.stdout + regen.stderr)
         mod = worktree / BYTE_LOCK_FILE
         if mod.is_file():
+            before = mod.read_text(encoding="utf-8")
             try:
-                mod.write_text(rust.rewrite_byte_lock(mod.read_text(encoding="utf-8"), candidate["prompts/mcp.md"]),
-                               encoding="utf-8")
+                after = rust.rewrite_byte_lock(before, candidate["prompts/mcp.md"])
             except ValueError as error:
                 raise ApplyRejected(f"{BYTE_LOCK_FILE}: {error}") from error
+            mod.write_text(after, encoding="utf-8")
+            if after != before:
+                self.fmt(worktree)
         git("add", "-A", cwd=worktree)
+        if changes:
+            self.test_diffs[cid] = changes
+        if texts:
+            self.test_texts[patch] = texts
         stamp = f"@{git('log', '-1', '--format=%ct', self.seed_sha, cwd=worktree).strip()} +0000"
         git("commit", "-q", "--allow-empty", "--no-verify", "-m", f"evolve: candidate {cid[:12]}", cwd=worktree,
             env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
@@ -267,29 +302,75 @@ class Materializer:
                 if not any(target.is_relative_to(prefix) for prefix in allowed):
                     raise ApplyRejected(f"{where} reaches {value}, outside src/** and prompts/**")
 
-    def _refuse_cfg_test(self, worktree: Path, diff: str) -> None:
+    def _refuse_cfg_test(self, worktree: Path, diff: str, scope: frozenset[str] = frozenset(),
+                         keep: tuple[str, frozenset[str]] | None = None) -> tuple[dict[str, str], dict[str, str]]:
         """Refuse any changed line inside a ``#[cfg(test)]`` item or in a ``#[cfg(test)]`` module file.
 
         The three byte-lock literals are exempt, and nothing else on their lines: the applier rewrites them itself.
+        ``scope`` holds the names of failing tests, as cargo prints them. Lines inside those ``#[test]`` fns may
+        change, and deleting one is refused. An edited one must stay a test: ``rust.test_weakening`` refuses a
+        disabled or gutted one. ``keep`` is ``(parent patch, names)``: those tests carry the parent's edits, so
+        their text must equal the parent's. Returns each changed test fn's name with its diff against the seed,
+        and the text of every granted test.
         """
+        changes: dict[str, str] = {}
+        granted_texts: dict[str, str] = {}
+        kept = keep[1] - scope if keep else frozenset()
+        granted = scope | kept
+        parent_texts = self.test_texts.get(keep[0]) if keep else None
+        if keep and parent_texts is None:
+            raise ApplyRejected("the parent candidate's granted tests are unknown; materialize the parent first")
         for path, (removed, added) in changed_lines(diff).items():
             if not path.endswith(".rs"):
                 continue
             new_file = worktree / path
             old_text = self._seed_text(path) or ""
             new_text = _read(new_file) if new_file.is_file() else ""
+            module_file = False
             for declarer in rust.declaring_files(path):
                 declared_new = worktree / declarer
                 texts = [self._seed_text(declarer) or "",
                          _read(declared_new) if declared_new.is_file() else ""]
                 if any(path in rust.test_module_files(declarer, text) for text in texts):
-                    raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
+                    if not granted:
+                        raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
+                    module_file = True
             if path == BYTE_LOCK_FILE:
                 # Only the three literals the applier rewrites may differ; the rest of their lines may not.
                 old_text, new_text = rust.blank_byte_lock(old_text), rust.blank_byte_lock(new_text)
                 removed, added = _line_changes(old_text, new_text)
-            for lines, text in ((removed, old_text), (added, new_text)):
-                for first, last in rust.cfg_test_spans(text):
-                    touched = sorted(line for line in lines if first <= line <= last)
+            old_spans, old_tests = _cfg_test_code(path, old_text, module_file)
+            new_spans, new_tests = _cfg_test_code(path, new_text, module_file)
+            if gone := sorted((old_tests.keys() - new_tests.keys()) & granted):
+                raise ApplyRejected(f"{path} deletes the failing test {gone[0]}; update it to the new behavior instead")
+            for lines, spans, tests in ((removed, old_spans, old_tests), (added, new_spans, new_tests)):
+                allowed = [span for name, span in tests.items() if name in granted]
+                for first, last in spans:
+                    touched = sorted(line for line in lines if first <= line <= last
+                                     and not any(low <= line <= high for low, high in allowed))
                     if touched:
                         raise ApplyRejected(f"{path}:{touched[0]} is inside a #[cfg(test)] or #[cfg(debug_assertions)] item (lines {first}-{last})")
+            old_lines, new_lines = old_text.split("\n"), new_text.split("\n")
+            for name in sorted(new_tests.keys() & granted):
+                new_fn = "\n".join(new_lines[new_tests[name][0] - 1:new_tests[name][1]])
+                granted_texts[name] = new_fn
+                if name in kept:
+                    if new_fn != parent_texts.get(name):
+                        raise ApplyRejected(f"{path} changes the inherited test {name}; only a repair may change a "
+                                            "test its parent changed")
+                elif name in old_tests:
+                    old_fn = "\n".join(old_lines[old_tests[name][0] - 1:old_tests[name][1]])
+                    if new_fn != old_fn and (problem := rust.test_weakening(old_fn, new_fn)):
+                        raise ApplyRejected(f"{path} weakens the test {name}: {problem}")
+            for name in sorted(old_tests.keys() | new_tests.keys()):
+                before, after = old_tests.get(name), new_tests.get(name)
+                if (before and any(before[0] <= line <= before[1] for line in removed)) \
+                        or (after and any(after[0] <= line <= after[1] for line in added)):
+                    old_body = old_lines[before[0] - 1:before[1]] if before else []
+                    new_body = new_lines[after[0] - 1:after[1]] if after else []
+                    changes[name] = "\n".join(difflib.unified_diff(old_body, new_body, f"a/{path}", f"b/{path}",
+                                                                  lineterm=""))
+        if reverted := sorted(name for name in kept if name in parent_texts and name not in granted_texts):
+            raise ApplyRejected(f"the inherited test {reverted[0]} no longer carries its parent's change; only a repair "
+                                "may change it")
+        return changes, granted_texts
