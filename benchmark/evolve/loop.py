@@ -150,7 +150,7 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check", "integrity", "build", "hook gate"}:
+        if self.stage in {"apply", "just check", "integrity", "integrity infra", "build", "hook gate"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -627,6 +627,10 @@ class Evolution:
                 result.failing_tests = rust.failing_tests(output)
                 return self._fail(result, "just check", tail(output))
             if not sound:
+                if output.startswith(INFRASTRUCTURE_HEADLINE):
+                    # No verdict: fail this evaluation, but keep nothing, so the same patch is checked again.
+                    self.results.pop(result.cid, None)
+                    return self._fail(result, "integrity infra", tail(output))
                 return self._fail(result, "integrity", tail(output))
         return None
 

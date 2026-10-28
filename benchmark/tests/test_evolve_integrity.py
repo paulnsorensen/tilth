@@ -352,7 +352,7 @@ def test_the_stage_is_skipped_for_the_seed_and_runs_once_per_patch(two_tests) ->
     assert run.evo.precheck(child) is None
     calls = len(cargo.calls)
     assert [args for _name, args in cargo.calls] == [METADATA_ARGS, LIST_LIB, LIST_LIB, TEST_ARGS]
-    assert run.evo.precheck({**child, "mcp_instructions": "x"}) is None or True
+    assert run.evo.precheck({**child, "mcp_instructions": "x"}) is None
     assert run.evo.precheck(child) is None
     assert len(cargo.calls) == calls
 

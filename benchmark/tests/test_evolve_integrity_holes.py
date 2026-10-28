@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from evolve import rust
+from evolve.candidate import content_id
 from evolve.integrity import Integrity, _swap_regions
 from evolve.materialize import HARNESS_TERMS, ApplyRejected, Materializer
 from evolve_support import build, cargo_available, git, seed_candidate
@@ -74,7 +75,7 @@ def verdict(tmp: Path, target: Path, seed: dict[str, str], candidate: dict[str, 
 def test_a_stacked_cfg_and_a_fake_test_module_fail_integrity(tmp_path: Path, target: Path, stacked: str) -> None:
     candidate = TWO_FN + FAKE_TESTS + f"\n{stacked}\n" + TEST_MOD
 
-    plain_ok, plain, ok, output = verdict(tmp_path, target, {"src/lib.rs": SEED_LIB}, {"src/lib.rs": candidate})
+    plain_ok, plain, ok, _output = verdict(tmp_path, target, {"src/lib.rs": SEED_LIB}, {"src/lib.rs": candidate})
 
     assert plain_ok, plain
     assert not ok, "the fake module satisfied the seed's test name while value() changed"
@@ -406,6 +407,24 @@ def test_an_infrastructure_fault_is_worded_by_cause_and_is_not_memoized(two_test
     assert second == (True, "") and len(calls) == 2
 
 
+def test_an_infrastructure_fault_is_not_repairable_and_leaves_no_memo(two_tests) -> None:
+    from evolve.integrity import InfrastructureFailure
+
+    child = {**seed_candidate(), SRC: patch_for(two_tests, {"src/lib.rs": FORMATTED.replace("    2\n", "    3\n")})}
+    run = Repair(two_tests, [child, child])
+    run.evo.just_check = lambda worktree: (True, "just check: ok")
+
+    def check(worktree, granted=frozenset()):
+        raise InfrastructureFailure("cargo timed out")
+
+    run.evo.integrity = SimpleNamespace(check=check)
+
+    assert run.evo.precheck(child) is None
+    assert run.evo.results.get(content_id(child)) is None
+    assert not run.evo._integrity_memo
+    assert run.calls == []
+
+
 # --- finding 7 ---
 
 
@@ -489,7 +508,7 @@ RAW_FAKE = "mod r#tests {\n    #[test]\n    fn r#value_is_one() {\n        asser
 ])
 def test_a_hidden_seed_region_with_a_same_named_fake_passes_cargo_and_fails_integrity(
         tmp_path: Path, target: Path, name: str, candidate: str) -> None:
-    plain_ok, plain, ok, output = verdict(tmp_path, target, {"src/lib.rs": SEED_LIB}, {"src/lib.rs": candidate})
+    plain_ok, plain, ok, _output = verdict(tmp_path, target, {"src/lib.rs": SEED_LIB}, {"src/lib.rs": candidate})
 
     assert plain_ok, plain
     assert not ok, f"{name}: the hidden region slipped through"

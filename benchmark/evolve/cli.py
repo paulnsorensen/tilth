@@ -61,12 +61,12 @@ def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeou
                                text=True, env=env, start_new_session=True)
     try:
         stdout, stderr = process.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         message = f"{' '.join(command[:2])} timed out after {timeout_s} s"
         if timeout_raises:
-            raise InfrastructureFailure(message)
+            raise InfrastructureFailure(message) from error
         return False, message
     return process.returncode == 0, stdout + stderr
 
