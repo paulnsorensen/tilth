@@ -110,19 +110,37 @@ wrote them. The one exception is a test with a repair grant, which may assert ne
 
 The stage applies to every `src_patch` candidate whose patch differs from the seed. It builds the tree in the
 candidate worktree: the candidate's production code stays, and each outermost `#[cfg(test)]` item is replaced by the
-seed's item with the same header. Granted test fns take the candidate's version. Seed `#[cfg(test)] mod x;` files are
-restored byte for byte (granted fns excepted), and test modules or files the candidate added are dropped. It then runs
-`cargo test --lib --bins -- --list`. Every seed test name must be in the list; the seed names are listed once per run
-in a scratch worktree. Last, it runs `cargo test --lib --bins`, and all tests must pass.
+seed's item with the same header. The header includes the run of attributes stacked above the item, so a candidate
+that adds `#[cfg(any())]` or `#[cfg_attr(.., path = ..)]` there gets no seed twin, and its item is dropped. Granted
+test fns take the candidate's version. A granted fn whose body defines an item (`impl`, `trait`, `macro_rules!`, `mod`,
+`use`, `struct`, `enum`, `fn`, `static`, `const`, `type`, `union`, `extern`) is refused, since such an item can change
+how other tests resolve. A candidate `#[test]` fn outside any test `cfg` item with the name of a seed test is refused. Seed `#[cfg(test)] mod x;` files are
+restored byte for byte (granted fns excepted), and test modules or files the candidate added are dropped. It then
+lists the tests of each cargo target apart (`cargo test --lib -- --list`, and `cargo test --bin <name> -- --list` per
+bin). Every seed test name must be in the list of the same target as in the seed; the seed names are listed once per
+run in a scratch worktree. Last, it runs `cargo test --lib --bins`, and all tests must pass.
 
 A failure is a cascade failure at stage `integrity`, and it is repairable like `just check`. The tail names the
 missing or failing seed tests. A repair after an integrity failure never gets test scope. Where a replacement cannot
 be made sound (a production macro that shadows a seed macro, an inner test `cfg` in a production file, a granted fn
-that shares lines with other code), the candidate fails at this stage with the reason. It is never accepted.
+that shares lines with other code or defines an item), the candidate fails at this stage with the reason. It is never
+accepted.
 
-Cost per candidate: one incremental test build for the list and one test run in the shared candidate target dir, and
-one extra seed list build per run. Cargo trusts file mtimes and the trees share a target dir, so the stage touches the
-sources before each cargo call. The stage is skipped for the seed, for an unchanged patch, and for a text-only child
+A cargo timeout, or a cargo failure that is not a compile error, is an infrastructure fault. The stage then reports
+that cause in its headline instead of blaming the candidate's tests, and the result is not memoized.
+
+The materializer backs the stage with these refusals: an added or changed `cfg` or `cfg_attr` attribute stacked on a
+test item; a `cfg_attr(.., path = ..)`; a test name defined twice in one file; and added code that names
+`current_exe`, `/deps/`, `RUST_TEST_`, or `--test-threads`. The last is a heuristic. Production code can still tell a
+test run from a real run in a way it does not catch, so the winner PR note asks the reviewer to read the production
+diff for that.
+
+Cost per candidate: one incremental test build per listed target and one test run in the shared candidate target dir,
+and one extra seed list build per run. Cargo trusts file mtimes and the trees share a target dir, so the stage touches
+the sources before each cargo call; `just check` gets the same touch.
+
+The stage is on whenever cargo is wired: `build(..., cargo=...)` sets it, and a custom `just_check` without `cargo` turns
+it off with a warning on stderr. The stage is skipped for the seed, for an unchanged patch, and for a text-only child
 (the result is memoized by patch and grant).
 
 Limits: a granted fn that needs a test helper the candidate added fails integrity (repairable). Edits to non-test lines

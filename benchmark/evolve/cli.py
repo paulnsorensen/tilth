@@ -33,6 +33,7 @@ from evolve import deepdiag, directives  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
+from evolve.integrity import InfrastructureFailure, touch_sources  # noqa: E402
 from evolve.loop import Evolution, EvolveError, Settings, forbidden_terms  # noqa: E402
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV  # noqa: E402
 from judge import core as judge  # noqa: E402
@@ -41,8 +42,11 @@ from spend import SpendLedger  # noqa: E402
 JUST_CHECK_TIMEOUT_S = 1800
 
 
-def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeout_s: int) -> tuple[bool, str]:
+def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeout_s: int, *,
+                 timeout_raises: bool = False) -> tuple[bool, str]:
     """Run ``command`` in ``worktree`` with ``<worktree>/target`` linked to the shared candidate target dir.
+
+    A timeout returns ``(False, message)``, or raises ``InfrastructureFailure`` when ``timeout_raises``.
 
     A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
     ``/target`` matches a symlink.
@@ -60,7 +64,10 @@ def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeou
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
-        return False, f"{' '.join(command[:2])} timed out after {timeout_s} s"
+        message = f"{' '.join(command[:2])} timed out after {timeout_s} s"
+        if timeout_raises:
+            raise InfrastructureFailure(message)
+        return False, message
     return process.returncode == 0, stdout + stderr
 
 
@@ -70,6 +77,7 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
     The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
     reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
     """
+    touch_sources(worktree)
     return _run_in_tree(["just", "check"], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
                         JUST_CHECK_TIMEOUT_S)
 
@@ -77,7 +85,7 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
 def default_cargo(worktree: Path, args: list[str]) -> tuple[bool, str]:
     """Run ``cargo <args>`` for the integrity stage, in the same env and target dir as ``default_just_check``."""
     return _run_in_tree(["cargo", *args], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
-                        JUST_CHECK_TIMEOUT_S)
+                        JUST_CHECK_TIMEOUT_S, timeout_raises=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -156,7 +164,8 @@ def build(argv: list[str] | None = None, *,
           judge_factory: Callable[[SpendLedger, float], judge.Judge] | None = None,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
           spawn: Callable | None = None, auth_spawn: Callable | None = None,
-          deep_runner: deepdiag.Runner | None = None) -> Evolution | int:
+          deep_runner: deepdiag.Runner | None = None,
+          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -212,6 +221,8 @@ def build(argv: list[str] | None = None, *,
     except (auth.ClaudeAuthError, ValueError) as error:
         return _error(str(error))
     factory = judge_factory or (lambda shared, floor: judge.Judge(shared, cell_estimate_usd=floor))
+    # A custom just_check no longer turns the integrity stage off by itself: pass `cargo` to run it.
+    cargo = cargo or (default_cargo if just_check is None else None)
     settings = Settings(
         run_id=args.run_id, repo=repo, seed_sha=seed_sha, base_branch=args.base_branch, model=args.model,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
@@ -225,13 +236,19 @@ def build(argv: list[str] | None = None, *,
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
                      spawn=spawn or subprocess.run, deep_runner=deep_runner,
-                     cargo=default_cargo if just_check is None else None)
+                     cargo=cargo)
+
+
+INTEGRITY_OFF = ("WARNING: the integrity stage is OFF: a custom just_check was injected without a cargo runner, so the "
+                 "seed's tests are not re-run against candidate code.")
 
 
 def main(argv: list[str] | None = None, **deps) -> int:
     evolution = build(argv, **deps)
     if isinstance(evolution, int):
         return evolution
+    if evolution.integrity is None:
+        print(INTEGRITY_OFF, file=sys.stderr)
     try:
         return evolution.run()
     except (EvolveError, auth.ClaudeAuthError) as error:

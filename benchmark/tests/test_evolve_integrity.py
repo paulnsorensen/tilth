@@ -18,7 +18,7 @@ from evolve import candidate as candidates
 from evolve import rust
 from evolve.engine import INTEGRITY_INSTRUCTION
 from evolve.finish import changed_tests_section
-from evolve.integrity import HEADLINE, LIST_ARGS, TEST_ARGS, Integrity, _swap_regions
+from evolve.integrity import HEADLINE, METADATA_ARGS, TEST_ARGS, Integrity, _swap_regions, list_args
 from evolve.materialize import Materializer
 from evolve_support import cargo_available, git, seed_candidate
 from test_evolve import patch_for, world  # noqa: F401  (world is a fixture)
@@ -34,6 +34,8 @@ SEED_LIB = ("pub fn value() -> u8 {\n    1\n}\n\n"
             "#[cfg(test)]\nmod tests {\n    use super::*;\n\n"
             "    #[test]\n    fn value_is_one() {\n        assert_eq!(value(), 1);\n    }\n}\n")
 TWO = SEED_LIB.replace("    1\n}", "    2\n}")
+LIB_ONLY = '{"packages":[{"targets":[{"kind":["lib"],"name":"fixture","test":true}]}]}'
+LIST_LIB = list_args(["--lib"])
 SHADOW = "    macro_rules! assert_eq { ($a:expr, $b:expr) => {}; } #[test]\n    fn added() {\n        assert!(value() > 0);\n    }\n\n"
 
 
@@ -47,7 +49,9 @@ class Stub:
 
     def __call__(self, tree: Path, args: list[str]) -> tuple[bool, str]:
         self.calls.append((tree.name, args))
-        if args == LIST_ARGS:
+        if args == METADATA_ARGS:
+            return True, LIB_ONLY
+        if args == LIST_LIB:
             names = self.names if tree.name == "integrity-seed" or self.tree_names is None else self.tree_names
             return True, "".join(f"{name}: test\n" for name in names)
         self.trees.append({path.relative_to(tree).as_posix(): path.read_text() for path in sorted(tree.rglob("*.rs"))})
@@ -136,10 +140,10 @@ def test_swapping_regions_keeps_production_code_and_takes_the_seed_test_module(t
     assert "    2\n}" in text and "fn value_is_one" in text and "fn edited" not in text
 
 
-def test_a_cfg_attribute_stacked_above_the_test_module_stays_on_the_seeds_module() -> None:
+def test_a_cfg_attribute_stacked_above_the_test_module_is_dropped_for_the_seeds_module() -> None:
     text = _swap_regions(SEED_LIB.replace("#[cfg(test)]\nmod", "#[cfg(any())]\n#[cfg(test)]\nmod"), SEED_LIB)
 
-    assert "#[cfg(any())]\n#[cfg(test)]\nmod tests" in text
+    assert "cfg(any())" not in text and text.count("mod tests") == 1 and "fn value_is_one" in text
 
 
 def test_a_seed_test_module_the_candidate_removed_comes_back() -> None:
@@ -171,7 +175,7 @@ def test_the_seed_is_listed_once_per_stage(tmp_path: Path) -> None:
     for name in ("one", "two"):
         assert stage.check(make_tree(tmp_path, name, {"src/lib.rs": TWO}))[0]
 
-    assert [name for name, args in stage.cargo.calls if args == LIST_ARGS].count("integrity-seed") == 1
+    assert [name for name, args in stage.cargo.calls if args == LIST_LIB].count("integrity-seed") == 1
 
 
 def test_a_missing_seed_test_fails_and_is_named(tmp_path: Path) -> None:
@@ -260,7 +264,7 @@ def test_a_macro_on_the_attribute_line_passes_just_check_and_fails_integrity(car
 
 
 @real_cargo_needed
-def test_a_cfg_any_above_the_test_module_passes_just_check_and_fails_integrity(cargo_stage) -> None:
+def test_a_cfg_any_above_the_test_module_is_dropped_and_the_seed_tests_run(cargo_stage) -> None:
     tmp, stage, cargo = cargo_stage
     hidden = SEED_LIB.replace("#[cfg(test)]\nmod", "#[cfg(any())]\n#[cfg(test)]\nmod")
     tree = make_tree(tmp, "hidden", {"src/lib.rs": hidden})
@@ -269,7 +273,8 @@ def test_a_cfg_any_above_the_test_module_passes_just_check_and_fails_integrity(c
     ok, output = stage.check(tree)
 
     assert plain_ok and "0 passed" in plain
-    assert not ok and VALUE_IS_ONE in output and "missing" in output
+    assert ok, output
+    assert "cfg(any())" not in (tree / "src" / "lib.rs").read_text()
 
 
 @real_cargo_needed
@@ -311,7 +316,9 @@ class CascadeStub:
 
     def __call__(self, tree: Path, args: list[str]) -> tuple[bool, str]:
         self.calls.append((tree.name, args))
-        if args == LIST_ARGS:
+        if args == METADATA_ARGS:
+            return True, LIB_ONLY
+        if args == LIST_LIB:
             return True, listing()
         return "    2" not in (tree / "src" / "lib.rs").read_text(), FAILURE
 
@@ -333,7 +340,7 @@ def test_the_stage_is_skipped_for_the_seed_and_runs_once_per_patch(two_tests) ->
     assert cargo.calls == []
     assert run.evo.precheck(child) is None
     calls = len(cargo.calls)
-    assert [args for _name, args in cargo.calls] == [LIST_ARGS, LIST_ARGS, TEST_ARGS]
+    assert [args for _name, args in cargo.calls] == [METADATA_ARGS, LIST_LIB, LIST_LIB, TEST_ARGS]
     assert run.evo.precheck({**child, "mcp_instructions": "x"}) is None or True
     assert run.evo.precheck(child) is None
     assert len(cargo.calls) == calls

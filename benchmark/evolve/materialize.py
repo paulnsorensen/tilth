@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
@@ -19,6 +20,9 @@ PHRASE_PIN_EXEMPT_ENV = "TILTH_EVOLVE_CANDIDATE"
 # Names that point a candidate's code at the harness; the loop adds the panel file and the data directory.
 # The exemption variable is one: candidate code that names it could keep the exemption on outside the search.
 HARNESS_TERMS = ("benchmark", ".cheese", "tilth_bench", "tilth-bench", "TILTH_BENCH_DATA", PHRASE_PIN_EXEMPT_ENV)
+# Added production code that names one of these can tell a test run from a real run. A heuristic: it cannot stop
+# every probe, so the winner PR note asks the reviewer to read the production diff for one.
+RUNTIME_PROBE_TERMS = ("current_exe", "/deps/", "RUST_TEST_", "--test-threads")
 BYTE_LOCK_FILE = "src/mcp/mod.rs"
 REGULAR_MODES = {"000000", "100644", "100755"}
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -264,6 +268,9 @@ class Materializer:
                 if any(term.lower() in line for term in self.forbidden):
                     # The tail reaches the proposer, so it does not repeat the harness name.
                     raise ApplyRejected(f"{path}:{number} names the benchmark harness")
+                raw = lines[number - 1] if number <= len(lines) else ""
+                if probe := next((term for term in RUNTIME_PROBE_TERMS if term in raw), None):
+                    raise ApplyRejected(f"{path}:{number} names {probe}, which can tell a test run from a real run")
             # Every file under src/ is lexed, not only .rs: an include! can pull in any extension.
             for first, last in rust.include_aliases(text):
                 if any(first <= number <= last for number in added):
@@ -327,10 +334,14 @@ class Materializer:
             old_lines, new_lines = old_text.split("\n"), new_text.split("\n")
             spans_of = {id(text): [(first, last) for name, first, last in rust.test_functions(path, text)
                                    if name in granted] for text in (old_text, new_text)}
-            old_tests = {name: "\n".join(old_text.split("\n")[first - 1:last])
-                         for name, first, last in rust.test_functions(path, old_text)}
-            new_tests = {name: "\n".join(new_text.split("\n")[first - 1:last])
-                         for name, first, last in rust.test_functions(path, new_text)}
+            old_found, new_found = rust.test_functions(path, old_text), rust.test_functions(path, new_text)
+            old_counts = Counter(name for name, _first, _last in old_found)
+            for name, count in Counter(name for name, _first, _last in new_found).items():
+                if count > max(1, old_counts[name]):
+                    raise ApplyRejected(f"{path} defines the test {name} {count} times; a copy can stand in for the "
+                                        "existing test")
+            old_tests = {name: "\n".join(old_lines[first - 1:last]) for name, first, last in old_found}
+            new_tests = {name: "\n".join(new_lines[first - 1:last]) for name, first, last in new_found}
             if sum(region[3] for region in rust.cfg_test_regions(new_text)) \
                     > sum(region[3] for region in rust.cfg_test_regions(old_text)):
                 raise ApplyRejected(f"{path} adds an inner #![cfg(test)] attribute; candidates may not change "
@@ -368,6 +379,10 @@ class Materializer:
                     changes[name] = "\n".join(difflib.unified_diff(
                         old_fn.split("\n") if old_fn else [], new_fn.split("\n") if new_fn else [],
                         f"a/{path}", f"b/{path}", lineterm=""))
+            for number in rust.test_region_cfg_lines(new_text):
+                if number in new_changed:
+                    raise ApplyRejected(f"{path}:{number} adds or changes a cfg or cfg_attr attribute on a test "
+                                        "item, which can compile the item out or point it at another file")
         if reverted := sorted(name for name in kept if name in parent_texts and name not in granted_texts):
             raise ApplyRejected(f"the inherited test {reverted[0]} no longer carries its parent's change; only a repair "
                                 "may change it")

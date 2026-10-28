@@ -35,7 +35,7 @@ from . import deepdiag, diagnosis, directives, engine, hookgate, replay, rust
 from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
-from .integrity import Integrity
+from .integrity import INFRASTRUCTURE_HEADLINE, InfrastructureFailure, Integrity
 from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
@@ -615,11 +615,13 @@ class Evolution:
                 self.log(f"candidate {result.cid[:12]}: changes tests for review: {', '.join(sorted(changed))}")
         if result.just_check_ok is None:
             worktree = self.materializer.worktree(result.sha)
-            ok, output = self.just_check(worktree)
-            result.just_check_ok = ok
-            if ok:
-                sound, output = self._integrity(result, worktree)
-            self.materializer.release(result.sha)
+            try:
+                ok, output = self.just_check(worktree)
+                result.just_check_ok = ok
+                if ok:
+                    sound, output = self._integrity(result, worktree)
+            finally:
+                self.materializer.release(result.sha)
             if not ok:
                 # The full output, before `tail` cuts it, holds cargo's whole `failures:` list.
                 result.failing_tests = rust.failing_tests(output)
@@ -640,7 +642,12 @@ class Evolution:
         keep = self.materializer.test_keep.get(patch)
         granted = self.materializer.test_scope.get(patch, frozenset()) | (keep[1] if keep else frozenset())
         if (patch, granted) not in self._integrity_memo:
-            self._integrity_memo[(patch, granted)] = self.integrity.check(worktree, granted)
+            try:
+                self._integrity_memo[(patch, granted)] = self.integrity.check(worktree, granted)
+            except InfrastructureFailure as fault:
+                # No verdict, so nothing is memoized: the next candidate with this patch runs the stage again.
+                self.log(f"integrity stage gave no verdict: {fault}")
+                return False, f"{INFRASTRUCTURE_HEADLINE}\n{fault}"
         return self._integrity_memo[(patch, granted)]
 
     def _failing_tests_of(self, candidate: Mapping[str, str]) -> list[str]:
