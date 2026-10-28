@@ -38,8 +38,8 @@ PROPOSER_HEADER = (
     f"applicability label and a critique. {OBJECTIVE} Edit files under src/ so agents solve tasks like these "
     "at lower cost without losing correctness. Edit nothing outside src/, keep the crate building, and do not "
     "change or remove existing #[cfg(test)] code, except as the repair record allows. You may add new #[test] "
-    "fns that test your new behavior, each with an assertion, and the `use` lines they need at the top of the "
-    "test module. "
+    "fns that test your new behavior, each with a real assertion. An added test may not add a `use` line or a "
+    "nested item (`fn`, `struct`, `impl`, `macro_rules!`), and its name must be new to the crate; use full paths. "
     f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 

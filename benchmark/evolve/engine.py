@@ -35,7 +35,11 @@ REPAIR_INSTRUCTION = "Fix only this failure; keep the intended change."
 MAX_REPAIRS = 2
 _ERROR_HEAD = re.compile(r"error(?:\[\w+\])?:|Diff in ")
 _ERROR_SUMMARY = re.compile(r"error: (?:could not compile|aborting due to|Recipe )")
-_CLIPPY_NOTE = re.compile(r"=\s*note: `-D clippy::[\w-]+`")
+# Anchored to the line start, so source text inside an `N |` snippet cannot fake either line. Clippy prints the
+# note once per lint, but the help link with each block.
+_CLIPPY_NOTE = re.compile(r"^\s*= note: `-D clippy::[\w-]+`", re.M)
+_CLIPPY_HELP = re.compile(r"^\s*= help: for further information visit https://rust-lang\.github\.io/rust-clippy/\S*"
+                         r"index\.html#[\w-]+", re.M)
 _TEST_FAILURE = re.compile(r"^(?:failures:|---- .* ----|thread '.*' panicked)", re.M)
 SCORE_FIELDS = ("task_scores", "pass_rate", "mean_cost", "baseline_cost")
 SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
@@ -114,7 +118,8 @@ class ReflectionClient:
 def lint_only(error: str) -> bool:
     """True when every error block of a ``just check`` tail is a clippy lint or a rustfmt ``Diff in``.
 
-    A clippy block is one with its ``= note: `-D clippy::...``` line. A test failure, a compile error
+    A clippy block is one with its ``= note: `-D clippy::...``` line or its clippy ``= help:`` link line; clippy
+    prints the note once per lint, so a second block of the same lint has only the link. A test failure, a compile error
     (``error[E...]``), or any other error block makes it false, and so does a tail with no error block.
     """
     if _TEST_FAILURE.search(error):
@@ -130,7 +135,8 @@ def lint_only(error: str) -> bool:
     blocks = [block for block in blocks if block]
     return bool(blocks) and all(
         block[0].startswith("Diff in ")
-        or (re.match(r"error: ", block[0]) and _CLIPPY_NOTE.search("\n".join(block)))
+        or (re.match(r"error: ", block[0])
+            and (_CLIPPY_NOTE.search("\n".join(block)) or _CLIPPY_HELP.search("\n".join(block))))
         for block in blocks)
 
 

@@ -426,3 +426,17 @@ def test_lint_only_reads_every_error_block() -> None:
     assert not engine.lint_only(cargo_output(COMPILE_ERROR))
     assert not engine.lint_only(cargo_output(CLIPPY_ERROR + COMPILE_ERROR))
     assert not engine.lint_only(cargo_output("error: unused variable: `x`\n  |\n  = note: `-D unused-variables` implied by `-D warnings`\n"))
+
+
+def test_lint_only_counts_the_same_lint_twice() -> None:
+    second = CLIPPY_ERROR.replace("    = note: `-D clippy::unnecessary-map-or` implied by `-D warnings`\n", "")
+
+    assert "-D clippy" not in second
+    assert engine.lint_only(cargo_output(CLIPPY_ERROR + "\n" + second))
+
+
+def test_lint_only_ignores_a_note_written_in_source_text() -> None:
+    fake = ("error: unused variable: `x`\n   --> src/a.rs:3:9\n    |\n"
+            '3   |     let s = "= note: `-D clippy::fake`";\n    |\n')
+
+    assert not engine.lint_only(cargo_output(fake))

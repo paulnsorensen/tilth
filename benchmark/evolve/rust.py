@@ -23,7 +23,13 @@ _FAILED_NAME = re.compile(r"\s{4}(\S+)")
 _ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
 _TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
 _GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
-_ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!|\?")
+_ASSERTION = re.compile(r"\b(?:assert|assert_eq|assert_ne|panic)\s*!")
+_ASSERT_CALL = re.compile(r"\b(assert|assert_eq|assert_ne)\s*!\s*([(\[{])")
+_TRY = re.compile(r"[\w)\]}]\s*\?")
+_LITERAL_ONLY = re.compile(r'"(?:[^"\\]|\\.)*"|\b\d[\w.]*|\btrue\b|\bfalse\b|[=!<>&|()\s-]')
+_NESTED_ITEM = re.compile(r"\bfn\s+(?=[A-Za-z_])|\b(?:struct|enum|impl|trait|mod|use|macro_rules|const|type)\b"
+                         r"|(?<!')\bstatic\b|#\s*\[\s*macro_export")
+_WORD = re.compile(r"[A-Za-z_]\w*")
 _RAW = re.compile(r'r(#*)"')
 _STRING = r'("(?:[^"\\]|\\.)*")'
 _COUNT = re.compile(r"SERVER_INSTRUCTIONS\.len\(\),\s*(\d+)")
@@ -205,20 +211,10 @@ def test_weakening(old: str, new: str) -> str | None:
     has an ``assert!``, ``assert_eq!``, ``assert_ne!``, ``panic!``, or ``?``, so must ``new``'s. The body check is
     deliberately coarse: it catches a gutted body, not one that moves its asserts into a helper.
     """
-    def parts(text: str) -> tuple[list[str], str] | None:
-        mask = _code_mask(text)
-        found = _FN.search(mask)
-        terminator = mask.find("{", found.end()) if found else -1
-        if found is None or terminator < 0:
-            return None
-        head = mask[:found.start()]
-        head = head[:_MODIFIERS.search(head).start()]
-        return [re.sub(r"\s+", "", match[1]) for match in _ATTRIBUTE.finditer(head)], mask[terminator:]
-
-    before, after = parts(old), parts(new)
+    before, after = _fn_parts(old), _fn_parts(new)
     if after is None:
         return "the test fn cannot be read"
-    attributes, body = after
+    attributes, signature, body, _raw = after
     if sum(bool(_TEST_ATTRIBUTE.fullmatch(attribute)) for attribute in attributes) != 1:
         return "it must carry exactly one test attribute"
     kept = list(before[0]) if before else []
@@ -227,9 +223,65 @@ def test_weakening(old: str, new: str) -> str | None:
             kept.remove(attribute)
         elif _GUARD_ATTRIBUTE.match(attribute):
             return f"it adds #[{attribute}], which can disable or invert the test"
-    if before and _ASSERTION.search(before[1]) and not _ASSERTION.search(body):
+    if before and _asserts(before[1], before[2]) and not _asserts(signature, body):
         return "its body no longer asserts anything"
     return None
+
+
+def _fn_parts(text: str) -> tuple[list[str], str, str, str] | None:
+    """``(attributes, signature, body, raw body)`` of the fn in ``text``; the first two and the body are code-masked."""
+    mask = _code_mask(text)
+    found = _FN.search(mask)
+    terminator = mask.find("{", found.end()) if found else -1
+    if found is None or terminator < 0:
+        return None
+    head = mask[:found.start()]
+    head = head[:_MODIFIERS.search(head).start()]
+    attributes = [re.sub(r"\s+", "", match[1]) for match in _ATTRIBUTE.finditer(head)]
+    return attributes, mask[found.start():terminator], mask[terminator:], text[terminator:]
+
+
+def _asserts(signature: str, body: str) -> bool:
+    """True when ``body`` holds an assert macro, or a postfix ``?`` in a fn that returns ``Result``."""
+    return bool(_ASSERTION.search(body) or ("Result" in signature and _TRY.search(body)))
+
+
+def has_test_attribute(text: str) -> bool:
+    """True when the fn in ``text`` carries a test attribute: ``#[test]``, ``#[tokio::test(..)]``, ``#[<path>::test]``."""
+    parts = _fn_parts(text)
+    return parts is not None and any(_TEST_ATTRIBUTE.fullmatch(attribute) for attribute in parts[0])
+
+
+def identifiers(text: str) -> set[str]:
+    """Every identifier in the code of ``text``, comments and strings left out."""
+    return set(_WORD.findall(_code_mask(text)))
+
+
+def _call_arguments(raw: str, mask: str, open_index: int) -> list[str]:
+    close = _match_brace(mask, open_index, {"(": "()", "[": "[]", "{": "{}"}[mask[open_index]])
+    arguments, depth, start = [], 0, open_index + 1
+    for index in range(open_index + 1, close):
+        if mask[index] in "([{":
+            depth += 1
+        elif mask[index] in ")]}":
+            depth -= 1
+        elif mask[index] == "," and depth == 0:
+            arguments.append(raw[start:index])
+            start = index + 1
+    arguments.append(raw[start:close])
+    return [argument.strip() for argument in arguments if argument.strip()]
+
+
+def _trivial_assert(name: str, arguments: list[str]) -> bool:
+    def constant(argument: str) -> bool:
+        return not _LITERAL_ONLY.sub("", argument)
+
+    if name == "assert":
+        return not arguments or constant(arguments[0])
+    if len(arguments) < 2:
+        return True
+    same = re.sub(r"\s+", "", arguments[0]) == re.sub(r"\s+", "", arguments[1])
+    return same or (constant(arguments[0]) and constant(arguments[1]))
 
 
 _ASSERTING_STUB = "#[test]\nfn stub() {\n    assert!(true);\n}"
@@ -240,9 +292,23 @@ def new_test_problem(new: str) -> str | None:
     closing brace.
 
     It holds the same checks as ``test_weakening`` against a plain asserting test: exactly one test attribute, no
-    ``ignore``, ``should_panic``, ``cfg``, or ``cfg_attr``, and a body that asserts something.
+    ``ignore``, ``should_panic``, ``cfg``, or ``cfg_attr``, and a body that asserts something. A postfix ``?``
+    counts only in a fn that returns ``Result``. A body whose assert macros compare only literals, or two identical
+    arguments, asserts nothing. The body may not declare an item (``fn``, ``struct``, ``enum``, ``impl``, ``trait``,
+    ``mod``, ``use``, ``macro_rules!``, ``static``, ``const``, ``type``, ``#[macro_export]``): its names could leak
+    into the module and change what the existing tests resolve to.
     """
-    return test_weakening(_ASSERTING_STUB, new)
+    if problem := test_weakening(_ASSERTING_STUB, new):
+        return problem
+    _attributes, signature, body, raw = _fn_parts(new)
+    if nested := _NESTED_ITEM.search(body, 1):
+        item = " ".join(nested[0].split())
+        return f"its body declares an item ({item}), which can shadow a name"
+    calls = [(match[1], _call_arguments(raw, body, match.end() - 1)) for match in _ASSERT_CALL.finditer(body)]
+    if calls and all(_trivial_assert(name, arguments) for name, arguments in calls) \
+            and not re.search(r"\bpanic\s*!", body) and not ("Result" in signature and _TRY.search(body)):
+        return "its asserts compare only literals or identical values"
+    return None
 
 
 def include_invocations(text: str) -> list[tuple[int, int, str, str]]:

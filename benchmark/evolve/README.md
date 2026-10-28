@@ -93,11 +93,17 @@ A long failure tail keeps the compiler, clippy, test, or fmt error blocks that c
 ### Pinned-test updates in repair
 
 Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
-module or in a `#[cfg(test)] mod x;` module file, plus the `use` lines they need at the top of that module. Each
-new fn needs exactly one test attribute (`#[test]`, `#[tokio::test]`, any `#[<path>::test]`), no `ignore`,
-`should_panic`, `cfg` or `cfg_attr`, and an assertion. Every existing test fn and every other `#[cfg(test)]` line
-must stay byte-identical. Added tests count as changed tests (`tests_changed`, the log, and "Test changes for
-review" in the draft PR). Changing or removing an existing test is allowed only in a repair grant.
+module or in a `#[cfg(test)] mod x;` module file. An addition may only tighten: it may never change what an
+existing test resolves to or checks. So an added test may not add a `use` line (it uses full paths), may not declare a
+nested item (`fn`, `struct`, `enum`, `impl`, `trait`, `mod`, `use`, `macro_rules!`, `static`, `const`, `type`,
+`#[macro_export]`), and may not take a name that any seed `src/**/*.rs` file already uses as an identifier, because
+the test module glob-imports that code. Each new fn needs exactly one test attribute (`#[test]`, `#[tokio::test(..)]`,
+any `#[<path>::test]`; a leading `///` doc comment is fine), no `ignore`, `should_panic`, `cfg` or `cfg_attr`, and a
+real assertion: an `assert!`, `assert_eq!`, `assert_ne!` or `panic!`, or a postfix `?` in a fn that returns `Result`.
+A body whose asserts compare only literals or two identical arguments (`assert!(true)`, `assert_eq!(x, x)`,
+`assert!(1 == 1)`) is refused. Every existing test fn and every other `#[cfg(test)]` line must stay byte-identical.
+Added tests count as changed tests (`tests_changed`, the log, and "Test changes for review" in the draft PR). A new
+`#[test]` fn outside `#[cfg(test)]` code is listed there too. Changing or removing an existing test is allowed only in a repair grant.
 
 A proposer cannot change existing `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
 old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record
@@ -108,7 +114,7 @@ byte-equal to the parent's. A text-only child keeps the grant. The prompt allows
 makes a pinned test obsolete; the test must assert the new behavior. The materializer refuses any other cfg(test)
 change, a deleted or reverted granted test, and any file outside `src/` and `prompts/`. It also refuses a weakened
 granted test: it needs exactly one test attribute, no added `ignore`, `should_panic`, `cfg` or `cfg_attr`, and an
-assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or `?`) when the old body had one. A candidate that changes
+assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or a postfix `?` in a `Result` fn) when the old body had one. A candidate that changes
 tests is `tests_changed`, and the log names the tests. If it wins, the draft PR body lists each changed test with its
 diff under "Test changes for review". Nothing merges automatically.
 

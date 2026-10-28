@@ -93,61 +93,38 @@ def _cfg_test_code(path: str, text: str, module_file: bool) -> tuple[list[tuple[
     return spans, tests
 
 
-_USE_LINE = re.compile(r"\s*use\s")
-_MOD_HEAD = re.compile(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{\s*$")
-
-
-def _use_header_lines(lines: list[str], spans: list[tuple[int, int]], module_file: bool) -> set[int]:
-    """The 1-based lines of the ``use`` statements at the top of each test module in ``lines``."""
-    found: set[int] = set()
-    for first, last in spans:
-        start = first
-        if not module_file:
-            while start <= last and lines[start - 1].lstrip().startswith("#["):
-                start += 1
-            if start > last or not _MOD_HEAD.match(lines[start - 1]):
-                continue
-            start += 1
-        in_use = False
-        for number in range(start, min(last, len(lines)) + 1):
-            text = lines[number - 1]
-            if in_use or _USE_LINE.match(text):
-                found.add(number)
-                in_use = not text.rstrip().endswith(";")
-            elif text.strip():
-                break
-    return found
-
-
-_TEST_ATTRIBUTE = re.compile(r"^\s*#\[\s*(?:\w+\s*::\s*)*test\s*\]", re.MULTILINE)
-
-
 def _without_added_tests(path: str, old_text: str, new_text: str, module_file: bool,
                          old_tests: dict[str, tuple[int, int]], new_tests: dict[str, tuple[int, int]],
-                         granted: frozenset[str]):
+                         granted: frozenset[str], taken: Callable[[], set[str]]):
     """None when ``new_text`` adds no whole ``#[test]`` fn. Otherwise ``(removed, added, spans, tests)``: the
     line changes and test-code spans of ``new_text`` with the added fns cut out, so only the rest is left to judge.
 
-    Each added fn must be a real test (``rust.new_test_problem``). Of the other added lines only blank lines and
-    the ``use`` lines at the top of a test module stay out of ``added``; every other one is still refused.
+    Each added fn must be a real test (``rust.new_test_problem``) and must not take a name that the seed's code
+    already uses (``taken()``), since a test module reaches that code by a glob import. The cut covers the fn's
+    doc comment. Every other added line, a ``use`` line included, is still refused.
     """
     lines = new_text.split("\n")
     fresh = sorted(
         (span, name) for name, span in new_tests.items()
         if name not in old_tests and name not in granted
-        and _TEST_ATTRIBUTE.search("\n".join(lines[span[0] - 1:span[1]]))
+        and rust.has_test_attribute("\n".join(lines[span[0] - 1:span[1]]))
     )
     if not fresh:
         return None
+    cut: set[int] = set()
     for (first, last), name in fresh:
         if problem := rust.new_test_problem("\n".join(lines[first - 1:last])):
             raise ApplyRejected(f"{path} adds the test {name}, which is not a real test: {problem}")
-    cut = {number for (first, last), _name in fresh for number in range(first, last + 1)}
+        if name.rsplit("::", 1)[-1] in taken():
+            raise ApplyRejected(f"{path} adds the test {name}, whose name the seed's code already uses; "
+                                "pick a fresh name")
+        while first > 1 and lines[first - 2].strip().startswith("///"):
+            first -= 1
+        cut.update(range(first, last + 1))
     rest = [line for number, line in enumerate(lines, 1) if number not in cut]
     removed, added = _line_changes(old_text, "\n".join(rest))
     spans, tests = _cfg_test_code(path, "\n".join(rest), module_file)
-    header = _use_header_lines(rest, spans, module_file)
-    return removed, {n for n in added if rest[n - 1].strip() and n not in header}, spans, tests
+    return removed, {n for n in added if rest[n - 1].strip()}, spans, tests
 
 
 def _refuse_oversize(candidate: Mapping[str, str]) -> None:
@@ -198,6 +175,7 @@ class Materializer:
         self._seed_id = content_id(self.seed)
         self._memo: dict[str, str | ApplyRejected] = {}
         self._worktrees: dict[str, Path] = {}
+        self._identifiers: set[str] | None = None
 
     def materialize(self, candidate: Mapping[str, str]) -> str:
         cid = content_id(candidate)
@@ -307,6 +285,14 @@ class Materializer:
             env={"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp})
         return git("rev-parse", "HEAD", cwd=worktree).strip()
 
+    def _seed_identifiers(self) -> set[str]:
+        """Every identifier in the code of the seed's ``src/**/*.rs`` files, cached."""
+        if self._identifiers is None:
+            names = git("ls-tree", "-r", "--name-only", self.seed_sha, "--", "src", cwd=self.repo).split("\n")
+            self._identifiers = set().union(*(rust.identifiers(self._seed_text(name) or "")
+                                              for name in names if name.endswith(".rs")))
+        return self._identifiers
+
     def _seed_text(self, path: str) -> str | None:
         try:
             return git("show", f"{self.seed_sha}:{path}", cwd=self.repo)
@@ -399,7 +385,8 @@ class Materializer:
                 removed, added = _line_changes(old_text, new_text)
             old_spans, old_tests = _cfg_test_code(path, old_text, module_file)
             new_spans, new_tests = _cfg_test_code(path, new_text, module_file)
-            checked = _without_added_tests(path, old_text, new_text, module_file, old_tests, new_tests, granted)
+            checked = _without_added_tests(path, old_text, new_text, module_file, old_tests, new_tests, granted,
+                                           self._seed_identifiers)
             if module_file and not granted and checked is None:
                 raise ApplyRejected(f"{path} is a #[cfg(test)] module file; candidates may not change it")
             check_removed, check_added, check_spans, check_tests = checked or (removed, added, new_spans, new_tests)
@@ -433,6 +420,12 @@ class Materializer:
                     new_body = new_lines[after[0] - 1:after[1]] if after else []
                     changes[name] = "\n".join(difflib.unified_diff(old_body, new_body, f"a/{path}", f"b/{path}",
                                                                   lineterm=""))
+            # A #[test] fn added outside #[cfg(test)] code runs in the gate too, so a person reviews it as well.
+            old_names = {name for name, _first, _last in rust.test_functions(path, old_text)}
+            for name, first, last in rust.test_functions(path, new_text):
+                if name not in old_names and name not in new_tests:
+                    changes[name] = "\n".join(difflib.unified_diff([], new_lines[first - 1:last], f"a/{path}",
+                                                                  f"b/{path}", lineterm=""))
         if reverted := sorted(name for name in kept if name in parent_texts and name not in granted_texts):
             raise ApplyRejected(f"the inherited test {reverted[0]} no longer carries its parent's change; only a repair "
                                 "may change it")
