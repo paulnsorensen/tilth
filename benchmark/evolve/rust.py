@@ -21,10 +21,11 @@ _BODY_ITEM = re.compile(
     r"(?:^|[;{}])\s*(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)*"
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:unsafe|async|default)\s+)*"
     r"(impl|trait|mod|use|struct|enum|fn|static|const|type|union|extern)\b|macro_rules\s*!")
-_MODULE_DECL = re.compile(r"\bmod\s+(\w+)\s*$")
+_MODULE_DECL = re.compile(r"\bmod\s+(?:r#)?(\w+)\s*$")
+_MOD_AT_END = re.compile(r"\bmod\s+(?:r#)?(\w+)$")
 _IDENT = re.compile(r"[A-Za-z0-9_]")
-_FN = re.compile(r"\bfn\s+(\w+)")
-_MOD_BLOCK = re.compile(r"\bmod\s+(\w+)\s*\{")
+_FN = re.compile(r"\bfn\s+(?:r#)?(\w+)")
+_MOD_BLOCK = re.compile(r"\bmod\s+(?:r#)?(\w+)\s*\{")
 _MODIFIERS = re.compile(r"(?:\b(?:pub(?:\s*\([^)]*\))?|async|const|unsafe)\s+)*$")
 _ATTRIBUTES = re.compile(r"(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+$")
 _TEST_ATTR = re.compile(r"\btest\b")
@@ -256,6 +257,24 @@ def test_functions(path: str, text: str) -> list[tuple[str, int, int]]:
         inline = [name for name, start, close in mods if start < match.start() < close]
         name = "::".join([*module_path(path), *inline, match[1]])
         found.append((name, _line(text, attributes.start()), _line(text, end)))
+    return found
+
+
+def test_region_modules(path: str, text: str) -> list[tuple[int, str]]:
+    """``(index of the opening brace, cargo path of the module)`` of each outermost test ``cfg`` region of ``text``
+    that is an inline ``mod name {``. The path joins the file's module path, the inline ``mod`` blocks around the
+    region, and the region's own module name.
+    """
+    mask = _code_mask(text)
+    mods = [(match[1], match.start(), _match_brace(mask, match.end() - 1)) for match in _MOD_BLOCK.finditer(mask)]
+    found = []
+    for start, end, key, inner in cfg_test_regions(text):
+        named = None if inner else _MOD_AT_END.search(key)
+        brace = mask.find("{", start, end)
+        if named is None or brace < 0:
+            continue
+        outer = [name for name, opened, close in mods if opened < start < close]
+        found.append((brace, "::".join([*module_path(path), *outer, named[1]])))
     return found
 
 

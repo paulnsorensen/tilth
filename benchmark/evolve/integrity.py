@@ -12,8 +12,10 @@ Tree construction, per ``src/**/*.rs`` file:
   for the seed item with the same header. The header holds the run of attributes stacked above the item, so a
   candidate that adds one (``#[cfg(any())]``) gets no seed twin: its item is dropped. A seed item without a
   candidate twin is appended at the end of the file.
-* A test fn named in ``granted`` takes the candidate's version inside the seed's item. The candidate's version
-  must stand alone on its lines, so nothing can ride along on them.
+* A test fn named in ``granted`` keeps the SEED's version in the tree, and the run skips it by exact name. The
+  candidate's version is already checked by ``just check``; here it cannot change how the other tests resolve.
+* Every restored seed test region holds a canary ``#[test] fn __tilth_canary_<nonce>() {}`` (one random nonce per
+  run). A region that the candidate compiled out, wrapped in a fn, swallowed with a macro, or moved lists no canary.
 * The byte-lock literals follow the candidate's prompt, as the applier rewrites them.
 
 The tree is refused when the candidate's production code defines a ``macro_rules!`` whose name the seed already
@@ -23,18 +25,21 @@ The tree is refused when a candidate ``#[test]`` fn outside any test ``cfg`` ite
 sits inside one.
 
 Then every seed test name must be listed, in the same cargo target (the lib, or one bin) as in the seed and as many
-times as the seed lists it, and every test must pass.
+times as the seed lists it, every canary must be listed under its region's module path, no listed name under a
+seed test's module may be one that the source does not define, and every test must pass.
 
 A timeout, or a cargo failure that is not a compile error, raises ``InfrastructureFailure``: it gives no verdict.
 """
 
 import json
 import re
+import secrets
 import shutil
 import subprocess
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from . import rust
 from .gitops import git
@@ -43,6 +48,7 @@ from .materialize import BYTE_LOCK_FILE
 Cargo = Callable[[Path, list[str]], tuple[bool, str]]
 TEST_ARGS = ["test", "--lib", "--bins"]
 METADATA_ARGS = ["metadata", "--no-deps", "--format-version", "1"]
+CANARY = "__tilth_canary_"
 COMPILE_FAILURE = "could not compile"
 LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 HEADLINE = "Existing seed tests failed against the new production code, which ran them exactly as the seed wrote them."
@@ -102,33 +108,52 @@ def _test_files(texts: dict[str, str]) -> set[str]:
     return files
 
 
-def _granted_seed(seed: dict[str, str], candidate: dict[str, str], granted: frozenset[str]) -> dict[str, str]:
-    """``seed`` with each granted test fn replaced by the candidate's version of it."""
-    wanted: dict[str, str] = {}
+class Built(NamedTuple):
+    canaries: list[tuple[str, str]]  # (file, cargo name) of each canary the tree holds
+    defined: Counter[str]  # test names that the tree's source text defines
+
+
+def test_args(granted: frozenset[str]) -> list[str]:
+    """The cargo arguments that run the tree's tests; a granted test is skipped by exact name."""
+    if not granted:
+        return TEST_ARGS
+    return [*TEST_ARGS, "--", *(arg for name in sorted(granted) for arg in ("--skip", name)), "--exact"]
+
+
+def _check_granted(seed: dict[str, str], candidate: dict[str, str], granted: frozenset[str]) -> None:
+    """Defence in depth. The tree runs the seed's version of a granted test, so the candidate's body is never run
+    here; refuse one that is gone, or that defines an item that could change how other tests resolve."""
+    found: dict[str, str] = {}
     for path, text in candidate.items():
         lines = text.split("\n")
         for name, first, last in rust.test_functions(path, text):
-            if name in granted and name not in wanted:
-                fn = "\n".join(lines[first - 1:last])
-                if not rust.is_standalone_fn(fn):
-                    raise Unsound(f"the granted test {name} shares its lines with other code")
-                wanted[name] = fn
+            if name in granted:
+                found.setdefault(name, "\n".join(lines[first - 1:last]))
     original = {name: "\n".join(text.split("\n")[first - 1:last]) for path, text in seed.items()
                 for name, first, last in rust.test_functions(path, text) if name in granted}
-    for name, fn in wanted.items():
-        if fn != original.get(name) and (item := rust.body_items(fn)):
+    for name in sorted(original):
+        if name not in found:
+            raise Unsound(f"the granted test {name} is missing from the candidate")
+        if found[name] != original[name] and (item := rust.body_items(found[name])):
             raise Unsound(f"the granted test {name} defines an item ({item.strip()}) in its body, which can change "
                           "how other tests resolve")
-    result = dict(seed)
+
+
+def _with_canaries(seed: dict[str, str], seed_files: set[str], canary: str) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """``seed`` with a canary test in each test region, and the ``(file, cargo name)`` of every canary.
+
+    A test file gets it at the end. An inline test ``mod`` gets it right after its opening brace.
+    """
+    result, sites = dict(seed), []
     for path, text in seed.items():
-        lines = text.split("\n")
-        for name, first, last in sorted(rust.test_functions(path, text), key=lambda found: -found[1]):
-            if name in granted:
-                if name not in wanted:
-                    raise Unsound(f"the granted test {name} is missing from the candidate")
-                lines[first - 1:last] = wanted[name].split("\n")
-        result[path] = "\n".join(lines)
-    return result
+        if path in seed_files:
+            result[path] = text.rstrip("\n") + f"\n\n#[test]\nfn {canary}() {{}}\n"
+            sites.append((path, "::".join([*rust.module_path(path), canary])))
+            continue
+        for brace, module in sorted(rust.test_region_modules(path, text), reverse=True):
+            result[path] = result[path][:brace + 1] + f"\n    #[test]\n    fn {canary}() {{}}\n" + result[path][brace + 1:]
+            sites.append((path, f"{module}::{canary}"))
+    return result, sites
 
 
 def _region_test_names(seed: dict[str, str], seed_files: set[str]) -> set[str]:
@@ -220,8 +245,9 @@ class Integrity:
     def check(self, worktree: Path, granted: frozenset[str] = frozenset()) -> tuple[bool, str]:
         """Build the integrity tree in ``worktree``, which the caller releases afterward, and run it."""
         worktree = Path(worktree)
+        canary = CANARY + secrets.token_hex(8)
         try:
-            self._build(worktree, granted)
+            built = self._build(worktree, granted, canary)
         except Unsound as unsound:
             return False, f"{HEADLINE}\nThe candidate's test code cannot be replaced soundly: {unsound}"
         expected = self.seed_names()
@@ -236,7 +262,21 @@ class Integrity:
         if missing:
             return False, (f"{HEADLINE}\n{len(missing)} seed tests are missing from their cargo target "
                            f"(compiled out, removed, or moved): {_shown(missing)}")
-        ok, output = self._run(worktree, TEST_ARGS)
+        for path, name in built.canaries:
+            prefix = name.rpartition("::")[0]
+            labels = [label for label, names in expected.items()
+                      if any(not prefix or seed_name.startswith(prefix + "::") for seed_name in names)]
+            if labels and not any(have[label][name] for label in labels):
+                return False, (f"{HEADLINE}\nUnsound or missing seed region {path}: its canary test is not listed "
+                               f"under {prefix or 'the crate root'} (the region is compiled out, wrapped in a fn, "
+                               "swallowed by a macro, or moved).")
+        parents = {name.rpartition("::")[0] for names in expected.values() for name in names}
+        for label, names in have.items():
+            for name, count in names.items():
+                if name.rpartition("::")[0] in parents and count > (built.defined[name] or expected[label][name]):
+                    return False, (f"{HEADLINE}\nThe test {name} ({label}) is listed {count} times, which the source "
+                                   "does not account for: a macro generates it.")
+        ok, output = self._run(worktree, test_args(granted))
         if not ok:
             return False, f"{output}\n{HEADLINE} Failed: {_shown(rust.failing_tests(output))}"
         return True, ""
@@ -273,12 +313,13 @@ class Integrity:
                            for name in names if name.endswith(".rs")}
         return self._texts
 
-    def _build(self, worktree: Path, granted: frozenset[str]) -> None:
+    def _build(self, worktree: Path, granted: frozenset[str], canary: str) -> Built:
         seed = self._seed_texts()
         candidate = {path.relative_to(worktree).as_posix(): _read(path)
                      for path in sorted((worktree / "src").rglob("*.rs"))}
-        seed_tests = _granted_seed(seed, candidate, granted)
+        _check_granted(seed, candidate, granted)
         seed_files = _test_files(seed)
+        seed_tests, canaries = _with_canaries(seed, seed_files, canary)
         added_files = _test_files(candidate) - seed_files - seed.keys()
         final: dict[str, str | None] = {}
         for path in candidate.keys() | seed.keys():
@@ -313,3 +354,6 @@ class Integrity:
             elif not target.is_file() or _read(target) != text:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(text.encode("utf-8"))
+        sources = Counter(name for path, text in final.items() if text
+                          for name, _first, _last in rust.test_functions(path, text))
+        return Built(canaries, sources)

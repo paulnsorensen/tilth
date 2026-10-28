@@ -23,7 +23,7 @@ from evolve.materialize import HARNESS_TERMS, ApplyRejected, Materializer
 from evolve_support import build, cargo_available, git, seed_candidate
 from test_evolve import patch_for, world  # noqa: F401  (world is a fixture)
 from test_evolve_fmt_tests import FORMATTED, SRC, Repair, two_tests  # noqa: F401  (two_tests is a fixture)
-from test_evolve_integrity import SEED_LIB, TWO, VALUE_IS_ONE, integrity, make_seed, make_tree, real_cargo
+from test_evolve_integrity import SEED_LIB, TWO, VALUE_IS_ONE, canaries, integrity, make_seed, make_tree, real_cargo
 
 real_cargo_needed = pytest.mark.skipif(not cargo_available(), reason="cargo is not on PATH")
 
@@ -293,7 +293,8 @@ class TargetStub:
             return True, ""
         names = self.seed if tree.name == "integrity-seed" else self.candidate
         listed = names["lib"] + names["bin"] if "--bins" in args else names["lib"] if "--lib" in args else names["bin"]
-        return True, "".join(f"{name}: test\n" for name in listed)
+        found = "" if tree.name == "integrity-seed" or "--bin" in args else canaries(tree)
+        return True, "".join(f"{name}: test\n" for name in listed) + found
 
 
 def test_a_seed_lib_test_is_not_satisfied_by_a_bin_test_of_the_same_name(tmp_path: Path) -> None:
@@ -466,3 +467,107 @@ def test_default_just_check_touches_the_sources_before_it_runs(monkeypatch: pyte
     assert cli.default_just_check(worktree) == (True, "ok")
 
     assert source.stat().st_mtime > 1000
+
+
+# --- a canary in each seed test region, and the seed's version of a granted test ---
+
+
+HIDE = ("macro_rules! hide {\n    ($m:ident, $n:ident, $i:tt) => {\n        mod $m {\n            #[test]\n            fn $n() {\n"
+        "                assert_eq!(super::value(), 2);\n            }\n        }\n    };\n}\n\n")
+HIDE_ITEM = HIDE.replace("$i:tt", "$i:item")
+WRAP = "#[rustfmt::skip]\n#[allow(dead_code, unnameable_test_items)]\nfn hidden() {\n" + TEST_MOD + "}\n"
+VALID_IMPL = ("#[allow(unused_macros)]\nmacro_rules! valid_impl {\n    ($t:ty, $e:expr) => {\n        #[allow(non_local_definitions)]\n"
+              "        impl $t {\n            pub fn is_valid(&self) -> bool {\n                $e\n            }\n        }\n    };\n}\n\n")
+RAW_FAKE = "mod r#tests {\n    #[test]\n    fn r#value_is_one() {\n        assert_eq!(super::value(), 2);\n    }\n}\n\n"
+
+
+@real_cargo_needed
+@pytest.mark.parametrize("name, candidate", [
+    ("fn_wrap_raw_identifiers", TWO_FN + RAW_FAKE + WRAP),
+    ("macro_swallows_the_region", TWO_FN + HIDE_ITEM + "hide! {\n    tests,\n    value_is_one,\n" + TEST_MOD + "}\n"),
+    ("fn_wrap_and_macro_fake", TWO_FN + HIDE + "hide!(tests, value_is_one, x);\n\n" + WRAP),
+])
+def test_a_hidden_seed_region_with_a_same_named_fake_passes_cargo_and_fails_integrity(
+        tmp_path: Path, target: Path, name: str, candidate: str) -> None:
+    plain_ok, plain, ok, output = verdict(tmp_path, target, {"src/lib.rs": SEED_LIB}, {"src/lib.rs": candidate})
+
+    assert plain_ok, plain
+    assert not ok, f"{name}: the hidden region slipped through"
+
+
+@real_cargo_needed
+def test_a_granted_body_that_calls_a_macro_emitting_an_impl_fails_integrity(tmp_path: Path, target: Path) -> None:
+    body = "    fn other_is_one() {\n        valid_impl!(Foo, true);\n        assert_eq!(other(), 2);\n    }"
+    candidate = nested("2", body).replace("pub fn other()", VALID_IMPL + "pub fn other()")
+
+    plain_ok, plain, ok, output = verdict(tmp_path, target, {"src/lib.rs": NESTED_SEED}, {"src/lib.rs": candidate},
+                                          frozenset({OTHER_IS_ONE}))
+
+    assert plain_ok, plain
+    assert not ok and "value_is_valid" in output
+
+
+@real_cargo_needed
+def test_a_legitimate_granted_repair_passes_with_its_seed_version_skipped(tmp_path: Path, target: Path) -> None:
+    seed = SEED_LIB.replace("    }\n}\n", "    }\n\n    #[test]\n    fn value_is_positive() {\n        assert!(value() > 0);\n    }\n}\n")
+    candidate = seed.replace("    1\n}", "    2\n}", 1).replace("assert_eq!(value(), 1)", "assert_eq!(value(), 2)")
+
+    plain_ok, plain, ok, output = verdict(tmp_path, target, {"src/lib.rs": seed}, {"src/lib.rs": candidate},
+                                          frozenset({VALUE_IS_ONE}))
+
+    assert plain_ok, plain
+    assert ok, output
+
+
+def test_a_canary_goes_in_each_inline_test_mod_and_each_test_file() -> None:
+    from evolve.integrity import _with_canaries
+
+    seed = {"src/lib.rs": "mod a {\n    #[cfg(test)]\n    mod tests {\n        #[test]\n        fn x() {}\n    }\n}\n",
+            "src/pins.rs": "#[test]\nfn pin() {}\n"}
+
+    result, sites = _with_canaries(seed, {"src/pins.rs"}, "__tilth_canary_n")
+
+    assert sites == [("src/lib.rs", "a::tests::__tilth_canary_n"), ("src/pins.rs", "pins::__tilth_canary_n")]
+    assert result["src/lib.rs"].index("mod tests {") < result["src/lib.rs"].index("__tilth_canary_n") < result["src/lib.rs"].index("fn x")
+    assert result["src/pins.rs"].endswith("fn __tilth_canary_n() {}\n")
+
+
+def test_a_missing_canary_fails_the_stage_and_names_the_file(tmp_path: Path) -> None:
+    class NoCanary(TargetStub):
+        def __call__(self, tree: Path, args: list[str]) -> tuple[bool, str]:
+            ok, output = super().__call__(tree, args)
+            return ok, "".join(line + "\n" for line in output.splitlines() if "__tilth_canary_" not in line)
+
+    stub = NoCanary({"lib": [VALUE_IS_ONE], "bin": []}, {"lib": [VALUE_IS_ONE], "bin": []})
+    stage = integrity(tmp_path, {"src/lib.rs": SEED_LIB}, stub)
+
+    ok, output = stage.check(make_tree(tmp_path, "cand", {"src/lib.rs": TWO}))
+
+    assert not ok and "Unsound or missing seed region src/lib.rs" in output
+
+
+def test_a_listed_test_name_that_the_source_does_not_define_twice_fails_the_stage(tmp_path: Path) -> None:
+    class Doubled(TargetStub):
+        def __call__(self, tree: Path, args: list[str]) -> tuple[bool, str]:
+            ok, output = super().__call__(tree, args)
+            return ok, output + (f"{VALUE_IS_ONE}: test\n" if tree.name != "integrity-seed" and "--list" in args else "")
+
+    stub = Doubled({"lib": [VALUE_IS_ONE], "bin": []}, {"lib": [VALUE_IS_ONE], "bin": []})
+    stage = integrity(tmp_path, {"src/lib.rs": SEED_LIB}, stub)
+
+    ok, output = stage.check(make_tree(tmp_path, "cand", {"src/lib.rs": TWO}))
+
+    assert not ok and "a macro generates it" in output
+
+
+def test_raw_identifiers_are_read_as_their_plain_names() -> None:
+    text = "mod r#tests {\n    #[test]\n    fn r#value_is_one() {}\n}\n"
+
+    assert [name for name, _first, _last in rust.test_functions("src/lib.rs", text)] == [VALUE_IS_ONE]
+
+
+def test_the_granted_names_are_skipped_exactly_and_no_grant_adds_no_filter() -> None:
+    from evolve.integrity import TEST_ARGS, test_args
+
+    assert test_args(frozenset()) == TEST_ARGS
+    assert test_args(frozenset({"b::y", "a::x"})) == [*TEST_ARGS, "--", "--skip", "a::x", "--skip", "b::y", "--exact"]

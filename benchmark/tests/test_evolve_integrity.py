@@ -39,6 +39,16 @@ LIST_LIB = list_args(["--lib"])
 SHADOW = "    macro_rules! assert_eq { ($a:expr, $b:expr) => {}; } #[test]\n    fn added() {\n        assert!(value() > 0);\n    }\n\n"
 
 
+def canaries(tree: Path) -> str:
+    """The listing lines of the canary tests that the tree's sources define, as real cargo would list them."""
+    found = []
+    for path in sorted((tree / "src").rglob("*.rs")):
+        relative = path.relative_to(tree).as_posix()
+        found += [name for name, _first, _last in rust.test_functions(relative, path.read_text())
+                  if "__tilth_canary_" in name]
+    return "".join(f"{name}: test\n" for name in found)
+
+
 class Stub:
     """A cargo stub: lists ``names`` for the seed and the candidate tree, and records every call and tree."""
 
@@ -53,7 +63,7 @@ class Stub:
             return True, LIB_ONLY
         if args == LIST_LIB:
             names = self.names if tree.name == "integrity-seed" or self.tree_names is None else self.tree_names
-            return True, "".join(f"{name}: test\n" for name in names)
+            return True, "".join(f"{name}: test\n" for name in names) + ("" if tree.name == "integrity-seed" else canaries(tree))
         self.trees.append({path.relative_to(tree).as_posix(): path.read_text() for path in sorted(tree.rglob("*.rs"))})
         return self.passes, self.output
 
@@ -164,7 +174,7 @@ def test_the_tree_holds_the_seed_module_file_and_drops_an_added_one(tmp_path: Pa
     ok, output = stage.check(tree)
 
     assert ok, output
-    assert stub.trees[-1]["src/pins.rs"] == pins
+    assert stub.trees[-1]["src/pins.rs"].startswith(pins) and "__tilth_canary_" in stub.trees[-1]["src/pins.rs"]
     assert "src/extra.rs" not in stub.trees[-1]
     assert "mod extra;" not in stub.trees[-1]["src/lib.rs"]
 
@@ -215,16 +225,17 @@ def test_an_inner_test_cfg_in_a_production_file_is_refused(tmp_path: Path) -> No
     assert not ok and "inner" in output
 
 
-def test_a_granted_test_takes_the_candidates_version_and_must_stand_alone(tmp_path: Path) -> None:
+def test_a_granted_test_keeps_the_seeds_version_and_is_skipped_by_exact_name(tmp_path: Path) -> None:
     stage = integrity(tmp_path, {"src/lib.rs": SEED_LIB}, Stub())
     updated = TWO.replace("assert_eq!(value(), 1)", "assert_eq!(value(), 2)")
-    ok, output = stage.check(make_tree(tmp_path, "cand", {"src/lib.rs": updated}), frozenset({VALUE_IS_ONE}))
-    assert ok, output
-    assert "assert_eq!(value(), 2)" in stage.cargo.trees[-1]["src/lib.rs"]
 
-    shared = updated.replace("    #[test]\n    fn value_is_one() {", "    fn helper() {} #[test]\n    fn value_is_one() {")
-    ok, output = stage.check(make_tree(tmp_path, "shared", {"src/lib.rs": shared}), frozenset({VALUE_IS_ONE}))
-    assert not ok and "shares its lines" in output
+    ok, output = stage.check(make_tree(tmp_path, "cand", {"src/lib.rs": updated}), frozenset({VALUE_IS_ONE}))
+
+    assert ok, output
+    assert "assert_eq!(value(), 1)" in stage.cargo.trees[-1]["src/lib.rs"]
+    assert "assert_eq!(value(), 2)" not in stage.cargo.trees[-1]["src/lib.rs"]
+    assert ("cand", [*TEST_ARGS, "--", "--skip", VALUE_IS_ONE, "--exact"]) in stage.cargo.calls
+    assert ("cand", TEST_ARGS) not in stage.cargo.calls
 
 
 def test_a_granted_test_the_candidate_deleted_is_refused(tmp_path: Path) -> None:
@@ -319,7 +330,7 @@ class CascadeStub:
         if args == METADATA_ARGS:
             return True, LIB_ONLY
         if args == LIST_LIB:
-            return True, listing()
+            return True, listing() + ("" if tree.name == "integrity-seed" else canaries(tree))
         return "    2" not in (tree / "src" / "lib.rs").read_text(), FAILURE
 
 

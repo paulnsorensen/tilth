@@ -112,18 +112,28 @@ The stage applies to every `src_patch` candidate whose patch differs from the se
 candidate worktree: the candidate's production code stays, and each outermost `#[cfg(test)]` item is replaced by the
 seed's item with the same header. The header includes the run of attributes stacked above the item, so a candidate
 that adds `#[cfg(any())]` or `#[cfg_attr(.., path = ..)]` there gets no seed twin, and its item is dropped. Granted
-test fns take the candidate's version. A granted fn whose body defines an item (`impl`, `trait`, `macro_rules!`, `mod`,
-`use`, `struct`, `enum`, `fn`, `static`, `const`, `type`, `union`, `extern`) is refused, since such an item can change
-how other tests resolve. A candidate `#[test]` fn outside any test `cfg` item with the name of a seed test is refused. Seed `#[cfg(test)] mod x;` files are
-restored byte for byte (granted fns excepted), and test modules or files the candidate added are dropped. It then
-lists the tests of each cargo target apart (`cargo test --lib -- --list`, and `cargo test --bin <name> -- --list` per
-bin). Every seed test name must be in the list of the same target as in the seed; the seed names are listed once per
-run in a scratch worktree. Last, it runs `cargo test --lib --bins`, and all tests must pass.
+test fns keep the SEED's version in this tree, and the run skips them (`-- --skip <name> --exact`). The candidate's
+granted version is already checked by `just check`, and here it cannot change how the other tests resolve. A granted
+fn whose body defines an item (`impl`, `trait`, `macro_rules!`, `mod`, `use`, `struct`, `enum`, `fn`, `static`,
+`const`, `type`, `union`, `extern`) is still refused, as defence in depth. A candidate `#[test]` fn outside any test
+`cfg` item with the name of a seed test is refused. Seed `#[cfg(test)] mod x;` files are restored byte for byte,
+and test modules or files the candidate added are dropped.
+
+Each restored seed test region also holds a canary, `#[test] fn __tilth_canary_<nonce>() {}`: right after the opening
+brace of an inline test `mod`, or at the end of a test file. The nonce is random per run and no proposer sees it. The
+stage lists the tests of each cargo target apart (`cargo test --lib -- --list`, and `cargo test --bin <name> --
+--list` per bin) and requires every seed test name in the list of the same target as in the seed, and every canary
+under the exact module path of its region. A region that the candidate compiled out, wrapped in a fn, swallowed with a
+macro, or moved lists no canary, so the stage fails with "Unsound or missing seed region <path>". A listed name under
+a seed test's module that the source does not define as often as it is listed (a macro made it) fails too. The seed
+names are listed once per run in a scratch worktree. Last, the stage runs `cargo test --lib --bins`, and all tests
+must pass. A granted test whose seed version no longer compiles against the new production code fails the stage;
+the repair has to keep the old signature.
 
 A failure is a cascade failure at stage `integrity`, and it is repairable like `just check`. The tail names the
 missing or failing seed tests. A repair after an integrity failure never gets test scope. Where a replacement cannot
 be made sound (a production macro that shadows a seed macro, an inner test `cfg` in a production file, a granted fn
-that shares lines with other code or defines an item), the candidate fails at this stage with the reason. It is never
+that is gone or defines an item), the candidate fails at this stage with the reason. It is never
 accepted.
 
 A cargo timeout, or a cargo failure that is not a compile error, is an infrastructure fault. The stage then reports
