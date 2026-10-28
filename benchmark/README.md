@@ -85,6 +85,13 @@ The estimate is the mean stored cost for that task, arm, and model, else this ru
 A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
 The run key of a Claude cell includes a per-cell budget placeholder, so rows stored before this change need `--refreeze-baselines` to be reused.
 Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning.
+
+The Claude CLI version is pinned in `benchmark/claude-cli.version`, because the version is part of every cell's run key.
+The runner binary is, in order: `$TILTH_BENCH_CLAUDE`; the mise install `~/.local/share/mise/installs/aqua-anthropics-claude-code/v<pin>/claude` when it exists; `claude` on PATH.
+Before it plans any cell, `run.py` and `evolve/cli.py` probe that binary with `--version` (no model call) and refuse to start when the version is not the pin. The message names the version found and the fix.
+`--allow-cli-drift` runs anyway; the run keys then differ from the stored cells, so those cells are bought again.
+To bump the pin on purpose: install the new version (`mise install aqua:anthropics/claude-code@<new>`), write it into `benchmark/claude-cli.version`, and commit.
+A bump invalidates every stored cell's run key, so every stored cell, baselines included, is bought again (`--refreeze-baselines` for stock arms).
 A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks `CLAUDE_CODE_OAUTH_TOKEN`.
 It also refuses when a settings file that a cell loads sets one of these keys under `env` or sets `apiKeyHelper`; no runner receives any `ANTHROPIC_*` variable.
 Before the first paid cell, a Claude run also needs `CLAUDE_CODE_OAUTH_TOKEN` and a passing `claude auth status` preflight that reports `oauth_token` for each distinct cell environment.
