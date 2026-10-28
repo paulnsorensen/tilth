@@ -58,6 +58,24 @@ def test_env_override_beats_the_mise_install(pin: Path, monkeypatch: pytest.Monk
     assert run.resolve_claude_binary() == "/opt/claude"
 
 
+def test_an_unprefixed_mise_version_dir_is_found(pin: Path) -> None:
+    unprefixed = pin.parent.parent / "2.1.310" / "claude"
+    unprefixed.parent.mkdir()
+    unprefixed.write_text("")
+    pin.unlink()
+    assert run.resolve_claude_binary() == str(unprefixed)
+
+
+def test_a_relative_override_is_made_absolute(pin: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(run.CLAUDE_BINARY_ENV, "./bin/claude")
+    assert run.resolve_claude_binary() == str(tmp_path / "bin" / "claude")
+
+
+def test_a_bare_command_override_stays_a_command(pin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(run.CLAUDE_BINARY_ENV, "claude-beta")
+    assert run.resolve_claude_binary() == "claude-beta"
+
 def test_cli_version_probes_the_resolved_binary(pin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     probed = probe_reporting(monkeypatch, {str(pin): "2.1.310 (Claude Code)"})
     assert run.cli_version("claude") == "2.1.310 (Claude Code)"

@@ -882,12 +882,20 @@ def claude_cli_pin() -> str:
 
 
 def resolve_claude_binary() -> str:
-    """The Claude CLI a run spawns: $TILTH_BENCH_CLAUDE, else the pinned mise install, else ``claude`` on PATH."""
+    """The Claude CLI a run spawns: $TILTH_BENCH_CLAUDE, else the pinned mise install, else ``claude`` on PATH.
+
+    A path-form override is made absolute, because a cell runs from a disposable workspace. mise names version
+    directories with or without a ``v`` prefix, so both are tried.
+    """
     override = os.environ.get(CLAUDE_BINARY_ENV)
     if override:
-        return override
-    pinned = MISE_CLAUDE_ROOT / f"v{claude_cli_pin()}" / "claude"
-    return str(pinned) if pinned.is_file() else "claude"
+        return str(Path(override).resolve()) if os.sep in override else override
+    pin = claude_cli_pin()
+    for name in (f"v{pin}", pin):
+        pinned = MISE_CLAUDE_ROOT / name / "claude"
+        if pinned.is_file():
+            return str(pinned)
+    return "claude"
 
 
 def require_pinned_cli(*, allow_drift: bool = False) -> str:
