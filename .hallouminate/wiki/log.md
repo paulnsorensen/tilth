@@ -117,3 +117,6 @@
 - 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-invariants.md · proposer repair, directives, deep diagnosis, auto-fmt, test grants, integrity stage, CLI pin, chain digest scope
 - 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-gotchas.md · gepa-v3 rounds: CLI auto-update drift, hook-hint drift, split lock rename, wrapper pid, stale cargo binaries, finish reserve, text-rule test guards
 
+
+- 2026-10-29 · pr-413-fixups · merged · benchmark-gepa-invariants.md; benchmark-gepa-v3-evolve.md; index.md · Fix 8 review comments on #413: deep-diagnosis cap, --no-repair, repair test grant, per-target integrity commands, index entry, r2 note, tool-call labels. Add sources/gepa-v3-call-gap.md.
+

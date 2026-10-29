@@ -24,19 +24,21 @@ The evolve score `p * base / c` is stricter: its parity line is the baseline pas
 | Run | Seed | Dev cost per correct vs baseline | Test cost per correct vs baseline |
 |---|---|---|---|
 | r1 | `202027d` (old seed) | +9% | not run |
+| r2 | not accepted | no score | no score |
 | r3 | `eab2279` + #409 candidate | +8% | -2% |
 | r4 | `25e48dd` | +2% | not run |
 | r5 | `58d4a75` | +4% | not run |
 | r6 | `b2f4412` | +11% | -6% (22 of 24 cells) |
 
+r2 has no score: its seed was not accepted, because a fastapi cell timed out before the venv fix.
 The same tilth code (content id `4c56a06`) scored dev means of 0.952, 0.945 and 0.876 in r4, r5 and r6.
 So the dev split moves about 8 points between runs of identical code; trust the test split and paired intervals, not single dev means.
 
 ## Why tilth cost more: trajectory diagnosis
 
 The cost gap is driven by extra dependent turns, not by more tool calls.
-A turn-by-turn diagnosis by Codex `gpt-6-astra` over the seed's trajectories counted 308 API calls for tilth against 196 for baseline, on 334 against 356 tool calls.
-The report is at `/tmp/tilth-verify/gepa-v3-call-gap.md`, copied from `.cheese/research/gepa-v3-call-gap.md` in the run worktree.
+A turn-by-turn diagnosis by Codex `gpt-6-astra` over the seed's trajectories counted 308 API calls for tilth against 196 for baseline. Tilth made 334 tool calls and baseline made 356.
+The report is in the corpus at [Seed API-call gap: tilth versus built-in tools](sources/gepa-v3-call-gap.md).
 
 - Go receiver-signature searches missed, and unique hits stopped at 60 lines, so caddy-6288 took 27 calls against baseline's 8. Fixed by #404.
 - The 10-hit search cap and untagged test hits forced narrowing and re-reads before edits. Fixed by #404.
@@ -77,4 +79,4 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412 · Updated: 2026-10-29_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy) · Updated: 2026-10-29_
