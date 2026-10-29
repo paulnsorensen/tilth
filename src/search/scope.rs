@@ -115,6 +115,44 @@ pub fn enclosing_definition_at(
     })
 }
 
+/// The line span of the largest syntax node around `line` that spans at most
+/// `max_lines` lines, below the file root: the complete statement, block, or
+/// small definition a hit sits in. `None` when `source` does not parse or no
+/// such node is larger than the line itself.
+pub(crate) fn bounded_construct_span(
+    path: &Path,
+    source: &str,
+    line: u32,
+    max_lines: u32,
+    cache: &OutlineCache,
+) -> Option<(u32, u32)> {
+    let row = line.checked_sub(1)? as usize;
+    let text = source.lines().nth(row)?;
+    let parsed = cache.parse_source(path, source)?;
+    let root = parsed.tree().root_node();
+    let column = text.len() - text.trim_start().len();
+    let point = tree_sitter::Point { row, column };
+    let node = root.descendant_for_point_range(point, point)?;
+    let mut best = None;
+    for candidate in std::iter::successors(Some(node), tree_sitter::Node::parent) {
+        if candidate.parent().is_none() {
+            break;
+        }
+        let start = candidate.start_position().row as u32 + 1;
+        let end_position = candidate.end_position();
+        let mut end = end_position.row as u32 + 1;
+        // A node that ends at column 0 owns only the newline of the row before.
+        if end_position.column == 0 && end > start {
+            end -= 1;
+        }
+        if end - start + 1 > max_lines {
+            break;
+        }
+        best = Some((start, end));
+    }
+    best.filter(|&(start, end)| end > start)
+}
+
 /// Map a tree-sitter definition node to a short user-facing label. Every kind
 /// we handle is enumerated here, so adding a new language grammar is "add the
 /// node kind to this match" with no string heuristics elsewhere.
@@ -157,6 +195,51 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn bounded_span_completes_a_multi_line_call() {
+        let source = "def host():\n    call(\n        a,\n    )\n    other()\n";
+        let cache = OutlineCache::new();
+        let span = bounded_construct_span(Path::new("a.py"), source, 2, 12, &cache);
+        assert_eq!(span, Some((1, 5)), "the whole small function fits");
+        let span = bounded_construct_span(Path::new("a.py"), source, 2, 3, &cache);
+        assert_eq!(
+            span,
+            Some((2, 4)),
+            "the statement fits, its function does not"
+        );
+    }
+
+    #[test]
+    fn bounded_span_includes_the_enclosing_small_block() {
+        let source = "if (!module.parent) {\n  app.listen(3000);\n  log('started');\n}\n";
+        let cache = OutlineCache::new();
+        let span = bounded_construct_span(Path::new("a.js"), source, 2, 12, &cache);
+        assert_eq!(span, Some((1, 4)));
+    }
+
+    #[test]
+    fn bounded_span_is_none_for_a_single_line_or_an_oversized_construct() {
+        let cache = OutlineCache::new();
+        let one = "x = 1\ny = 2\n";
+        assert_eq!(
+            bounded_construct_span(Path::new("a.py"), one, 1, 12, &cache),
+            None
+        );
+        let wide = format!("call(\n{}\n)\n", "    a,\n".repeat(30));
+        assert_eq!(
+            bounded_construct_span(Path::new("a.py"), &wide, 1, 12, &cache),
+            None
+        );
+        assert_eq!(
+            bounded_construct_span(Path::new("a.md"), "# a\n\ntext\n", 3, 12, &cache),
+            None
+        );
+        assert_eq!(
+            bounded_construct_span(Path::new("a.py"), one, 0, 12, &cache),
+            None
+        );
     }
 
     #[test]
