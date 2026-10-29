@@ -63,13 +63,17 @@ The finish reserve is about $40 whenever the seed commit changes, because `git_s
 
 ## Ideas to push cost per correct lower
 
-These ideas are untested; the first two attack the remaining measured causes.
+These ideas cut dependent turns, the measured cause of tilth's extra cost.
+They are untested; the call savings are the deep-diagnosis estimates for the main seed (`4c56a06`), and the ranges overlap, so do not add them.
+The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-split measurement, rather than more evolve rounds.
 
-- Edit from search: let `tilth_write` edit lines a search hit displayed, now that #404 tags test hits, to skip a read turn.
-- Explicit search modes (literal, regex, symbol) so auto-resolution stops narrowing intent; the diagnosis rated this the largest remaining cause (about 0.45 calls per cell).
-- Structural or exact-text edits instead of line-range edits, to cut repair loops (about 0.35 calls per cell).
-- Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
-- Smaller tool schemas and instructions, since they ride every API call.
+1. Explicit search modes (literal, regex, symbol), so auto-resolution stops narrowing or changing the agent's intent. This is the largest remaining cause, about 0.45 calls per cell.
+2. Edit from search: let `tilth_write` edit lines that a search hit displayed, now that #404 tags test hits, to skip a read turn.
+3. Structural or exact-text edits instead of line-range edits, to cut repair loops such as a leftover brace after a partial replace (about 0.35 calls per cell).
+4. Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
+5. Prevent malformed `tilth_write` JSON: the seed had 5 rejected write calls against none for baseline. Smaller structural payloads or a schema-first example would help (about 0.17 calls per cell).
+6. Batch independent discovery: baseline searches two entry points in its first turn, while tilth spends two turns (about 0.13 calls per cell).
+7. Smaller tool schemas and instructions, since they ride every API call; [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, is where cost went. This is unmeasured on this panel.
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
