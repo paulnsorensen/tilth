@@ -183,11 +183,13 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(dir)?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+    // Group write is allowed: with umask 002 (Debian and Ubuntu), a dir is 0775 and its group
+    // is the user's private group.
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o002 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} must be a directory that you own and that only you can write",
+                "{} must be a directory that you own and that other users cannot write",
                 dir.display()
             ),
         ));

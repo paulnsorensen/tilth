@@ -441,9 +441,10 @@ fn launch_cache_dir_is_private() {
 
     for (mode, ok) in [
         (0o755, true),
-        (0o775, false),
+        (0o775, true),
         (0o757, false),
         (0o777, false),
+        (0o703, false),
     ] {
         fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
         let _ = fs::remove_file(&sb.log);
