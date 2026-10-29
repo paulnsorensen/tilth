@@ -59,10 +59,16 @@ impl Sandbox {
             .env("XDG_CACHE_HOME", &self.xdg)
     }
 
-    fn cmd(&self, harness: &str, args: &[&str]) -> Command {
+    fn tilth(&self, argv: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tilth"));
-        cmd.arg(harness).args(args);
+        cmd.args(argv);
         self.env(&mut cmd);
+        cmd
+    }
+
+    fn cmd(&self, harness: &str, args: &[&str]) -> Command {
+        let mut cmd = self.tilth(&[harness]);
+        cmd.args(args);
         cmd
     }
 
@@ -89,12 +95,12 @@ impl Sandbox {
     }
 }
 
+/// True for `preamble-<16 hex digits>.md`.
 fn is_preamble_name(p: &Path) -> bool {
     let name = p.file_name().and_then(OsStr::to_str).unwrap_or("");
-    name.starts_with("preamble-")
-        && Path::new(name)
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+    name.strip_prefix("preamble-")
+        .and_then(|n| n.strip_suffix(".md"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The argv a harness must see: the preamble flag for `harness`, then `args` unchanged.
@@ -110,6 +116,21 @@ fn launch_expected(harness: &str, file: &Path, args: &[&str]) -> Vec<String> {
     };
     want.extend(args.iter().map(|s| (*s).to_owned()));
     want
+}
+
+/// Run `tilth <harness> <args>` against a stub harness and check the argv it received.
+fn assert_prepends(harness: &str, args: &[&str]) {
+    let sb = Sandbox::new();
+    sb.fake(harness, 0);
+    let out = sb.cmd(harness, args).output().unwrap();
+    assert!(out.status.success(), "{harness} {args:?}: {out:?}");
+    let file = Sandbox::preamble_file(&sb.xdg.join("tilth"));
+    assert!(is_preamble_name(&file), "{}", file.display());
+    assert_eq!(
+        sb.argv(),
+        launch_expected(harness, &file, args),
+        "{harness} {args:?}"
+    );
 }
 
 fn launch_assert_clean_failure(out: &Output, sb: &Sandbox) {
@@ -150,18 +171,13 @@ fn launch_prepends_preamble() {
                 "it's \"quoted\"",
             ],
         ),
+        ("claude", &["--help"]),
+        ("codex", &["-h"]),
+        ("claude", &["--", "--system-prompt", "x"]),
+        ("codex", &["exec", "--", "-c", "model_instructions_file=/f"]),
     ];
     for (harness, args) in cases {
-        let sb = Sandbox::new();
-        sb.fake(harness, 0);
-        let out = sb.cmd(harness, args).output().unwrap();
-        assert!(out.status.success(), "{harness} {args:?}: {out:?}");
-        let file = Sandbox::preamble_file(&sb.xdg.join("tilth"));
-        assert_eq!(
-            sb.argv(),
-            launch_expected(harness, &file, args),
-            "{harness} {args:?}"
-        );
+        assert_prepends(harness, args);
     }
 }
 
@@ -179,34 +195,36 @@ fn launch_dashdash_placements_pass_through_unchanged() {
     ];
     for harness in ["claude", "codex"] {
         for args in cases {
-            let sb = Sandbox::new();
-            sb.fake(harness, 0);
-            let out = sb.cmd(harness, args).output().unwrap();
-            assert!(out.status.success(), "{harness} {args:?}: {out:?}");
-            let file = Sandbox::preamble_file(&sb.xdg.join("tilth"));
-            assert_eq!(
-                sb.argv(),
-                launch_expected(harness, &file, args),
-                "{harness} {args:?}"
-            );
+            assert_prepends(harness, args);
         }
     }
 }
 
 #[test]
-fn launch_top_level_flags_before_a_harness_are_a_usage_error() {
-    let cases: &[(&str, &[&str])] = &[
-        ("claude", &["--json", "claude", "-p", "hi"]),
-        ("codex", &["--mcp", "codex", "exec", "hi"]),
+fn launch_harness_not_first_is_a_usage_error() {
+    let cases: &[&[&str]] = &[
+        &["--json", "claude", "-p", "hi"],
+        &["--mcp", "codex", "exec", "hi"],
+        &["--json", "claude", "--help"],
+        &["foo", "claude"],
+        &["--json", "codex"],
     ];
-    for (harness, argv) in cases {
+    for argv in cases {
         let sb = Sandbox::new();
-        sb.fake(harness, 0);
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tilth"));
-        cmd.args(*argv);
-        let out = sb.env(&mut cmd).output().unwrap();
+        sb.fake("claude", 0);
+        sb.fake("codex", 0);
+        let out = sb.tilth(argv).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{argv:?}: {out:?}");
         assert!(!sb.log.exists(), "{argv:?}: the harness must not run");
+    }
+    for argv in [&["foo", "claude"][..], &["--json", "codex"]] {
+        let sb = Sandbox::new();
+        let out = sb.tilth(argv).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("must be the first argument to tilth"),
+            "{argv:?}: {stderr}"
+        );
     }
 }
 
@@ -226,9 +244,7 @@ fn launch_dashdash_query_still_searches_the_word() {
         &["--scope", scope, "--", "codex"][..],
         &["--scope", scope, "launch_marker"][..],
     ] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tilth"));
-        cmd.args(argv);
-        let out = sb.env(&mut cmd).output().unwrap();
+        let out = sb.tilth(argv).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(out.status.code(), Some(0), "{argv:?}: {out:?}");
         assert!(stdout.contains("# Search"), "{argv:?}: {stdout}");
@@ -255,7 +271,10 @@ fn launch_caller_wins() {
         assert!(out.status.success(), "{harness} {args:?}: {out:?}");
         assert_eq!(sb.argv(), *args);
         assert!(!sb.xdg.exists(), "no cache dir for {args:?}");
-        assert!(!sb.home.join(".cache").exists());
+        assert!(
+            !sb.home.join(".cache").exists(),
+            "no cache dir for {args:?}"
+        );
     }
 }
 
@@ -319,7 +338,7 @@ fn launch_missing_binary_names_it() {
     for harness in ["claude", "codex"] {
         let sb = Sandbox::new();
         let out = sb.cmd(harness, &["x"]).output().unwrap();
-        assert_eq!(out.status.code(), Some(127));
+        assert_eq!(out.status.code(), Some(127), "{harness}: {out:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(harness), "{stderr}");
     }
@@ -369,7 +388,10 @@ fn launch_unwritable_cache_fails_cleanly() {
         fs::set_permissions(&sb.xdg, fs::Permissions::from_mode(0o555)).unwrap();
         if fs::write(sb.xdg.join("probe"), b"x").is_ok() {
             fs::set_permissions(&sb.xdg, fs::Permissions::from_mode(0o755)).unwrap();
-            continue; // running as root: permission bits do not bind
+            eprintln!(
+                "skip launch_unwritable_cache_fails_cleanly: permission bits do not bind (root)"
+            );
+            return;
         }
         let out = sb.cmd(harness, &["-p"]).output().unwrap();
         fs::set_permissions(&sb.xdg, fs::Permissions::from_mode(0o755)).unwrap();
@@ -394,10 +416,9 @@ fn launch_cache_file_path_blocked_by_directory_is_clean() {
 fn launch_cache_name_is_stable_and_content_addressed_shape() {
     let sb = Sandbox::new();
     sb.fake("claude", 0);
+    sb.fake("codex", 0);
     assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
     let first = Sandbox::preamble_file(&sb.xdg.join("tilth"));
-    assert!(sb.cmd("codex", &["exec"]).output().is_ok());
-    sb.fake("codex", 0);
     assert!(sb
         .cmd("codex", &["exec"])
         .output()
@@ -406,21 +427,105 @@ fn launch_cache_name_is_stable_and_content_addressed_shape() {
         .success());
     let second = Sandbox::preamble_file(&sb.xdg.join("tilth"));
     assert_eq!(first, second, "same bytes must give the same file name");
-    let name = first.file_name().unwrap().to_str().unwrap();
-    let hex = name
-        .strip_prefix("preamble-")
-        .and_then(|n| n.strip_suffix(".md"))
-        .unwrap_or("");
-    assert_eq!(hex.len(), 16, "{name}");
-    assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+    assert!(is_preamble_name(&first), "{first:?}");
+}
+
+#[test]
+fn launch_cache_dir_is_private() {
+    let sb = Sandbox::new();
+    sb.fake("claude", 0);
+    assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
+    let dir = sb.xdg.join("tilth");
+    let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "new cache dir mode {mode:o}");
+
+    for (mode, ok) in [
+        (0o755, true),
+        (0o775, false),
+        (0o757, false),
+        (0o777, false),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        let _ = fs::remove_file(&sb.log);
+        let out = sb.cmd("claude", &["-p"]).output().unwrap();
+        if ok {
+            assert!(out.status.success(), "{mode:o}: {out:?}");
+        } else {
+            launch_assert_clean_failure(&out, &sb);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains(dir.to_str().unwrap()), "{mode:o}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn launch_cache_dir_symlink_is_refused() {
+    let sb = Sandbox::new();
+    sb.fake("claude", 0);
+    let target = sb.home.join("elsewhere");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&sb.xdg).unwrap();
+    std::os::unix::fs::symlink(&target, sb.xdg.join("tilth")).unwrap();
+    let out = sb.cmd("claude", &["-p"]).output().unwrap();
+    launch_assert_clean_failure(&out, &sb);
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+}
+
+#[test]
+fn launch_removes_only_stale_cache_files_of_other_revisions() {
+    use std::time::{Duration, SystemTime};
+    let sb = Sandbox::new();
+    sb.fake("claude", 0);
+    let dir = sb.xdg.join("tilth");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let day = Duration::from_hours(24);
+    let old = SystemTime::now() - 40 * day;
+    let recent = SystemTime::now() - 2 * day;
+    let seeds = [
+        ("preamble-0000000000000000.md", old, false),
+        ("preamble-1111111111111111.md", recent, true),
+        ("notes.md", old, true),
+    ];
+    for (name, mtime, _) in seeds {
+        let f = fs::File::create(dir.join(name)).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+    assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
+    for (name, _, kept) in seeds {
+        assert_eq!(dir.join(name).exists(), kept, "{name}");
+    }
+
+    // A launch that finds its file in place marks it as in use.
+    let ours: PathBuf = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| is_preamble_name(p) && fs::read(p).unwrap() == PREAMBLE)
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&ours)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
+    let age = fs::metadata(&ours)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .elapsed()
+        .unwrap();
+    assert!(age < day, "mtime not refreshed: {age:?}");
 }
 
 #[test]
 fn launch_concurrent_launches_never_see_a_partial_preamble() {
     let sb = Sandbox::new();
-    sb.script("claude", "/usr/bin/cat \"$2\" > \"$OUT_DIR/$$\"");
+    let path = format!("{}:/bin:/usr/bin", sb.bin.display());
+    sb.script("claude", "cat \"$2\" > \"$OUT_DIR/$$\"");
     let first = sb
         .cmd("claude", &["-p"])
+        .env("PATH", &path)
         .env("OUT_DIR", &sb.home)
         .output()
         .unwrap();
@@ -435,6 +540,7 @@ fn launch_concurrent_launches_never_see_a_partial_preamble() {
                 .map(|_| {
                     s.spawn(|| {
                         sb.cmd("claude", &["-p"])
+                            .env("PATH", &path)
                             .env("OUT_DIR", &out_dir)
                             .output()
                             .unwrap()
@@ -495,12 +601,10 @@ fn launch_stdin_stdout_stderr_pass_through() {
     use std::io::Write;
     use std::process::Stdio;
     let sb = Sandbox::new();
-    sb.script(
-        "claude",
-        "/usr/bin/cat\necho \"argc=$#\"\necho err-line >&2",
-    );
+    sb.script("claude", "cat\necho \"argc=$#\"\necho err-line >&2");
     let mut child = sb
         .cmd("claude", &[])
+        .env("PATH", format!("{}:/bin:/usr/bin", sb.bin.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

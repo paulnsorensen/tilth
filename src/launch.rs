@@ -1,11 +1,16 @@
 //! `tilth claude` and `tilth codex`: start the harness with the bundled tilth preamble.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const PREAMBLE: &str = include_str!("../prompts/preamble.md");
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A cache file of another preamble revision that no launch used for this long is removed.
+const STALE_AFTER: Duration = Duration::from_hours(30 * 24);
+
+#[derive(Clone, Copy, Debug)]
 pub enum Harness {
     Claude,
     Codex,
@@ -20,7 +25,9 @@ impl Harness {
     }
 }
 
-/// Start the harness with the preamble prepended. Returns an exit code only on failure.
+/// Start the harness with the bundled preamble as its system prompt.
+/// On Unix, it replaces the process and returns only when exec fails.
+/// Elsewhere, it returns the harness exit code.
 #[must_use]
 pub fn run(harness: Harness, args: Vec<OsString>) -> i32 {
     let mut argv: Vec<OsString> = Vec::new();
@@ -38,12 +45,15 @@ pub fn run(harness: Harness, args: Vec<OsString>) -> i32 {
                 argv.push(file.into_os_string());
             }
             Harness::Codex => {
-                if let Err(e) = utf8_path(&file) {
-                    eprintln!("tilth: {e}");
-                    return 1;
-                }
+                let path = match utf8_path(&file) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("tilth: {e}");
+                        return 1;
+                    }
+                };
                 argv.push("-c".into());
-                argv.push(codex_override(&file));
+                argv.push(codex_override(path));
             }
         }
     }
@@ -52,7 +62,12 @@ pub fn run(harness: Harness, args: Vec<OsString>) -> i32 {
 }
 
 /// True when the caller already sets the system prompt, so the caller wins.
+/// Arguments after the first `--` are positional text, so the scan stops there.
 fn caller_overrides(harness: Harness, args: &[OsString]) -> bool {
+    let args = args
+        .iter()
+        .position(|a| a == "--")
+        .map_or(args, |end| &args[..end]);
     match harness {
         Harness::Claude => args.iter().any(|a| {
             let a = a.to_string_lossy();
@@ -64,19 +79,15 @@ fn caller_overrides(harness: Harness, args: &[OsString]) -> bool {
             const KEY: &str = "model_instructions_file=";
             for (i, a) in args.iter().enumerate() {
                 let a = a.to_string_lossy();
-                if let Some(rest) = a.strip_prefix("--config=") {
-                    if rest.starts_with(KEY) {
-                        return true;
-                    }
-                } else if matches!(a.as_ref(), "-c" | "--config") {
-                    let next = args.get(i + 1).map(|n| n.to_string_lossy());
-                    if next.is_some_and(|n| n.starts_with(KEY)) {
-                        return true;
-                    }
-                } else if let Some(rest) = a.strip_prefix("-c") {
-                    if rest.starts_with(KEY) {
-                        return true;
-                    }
+                let next;
+                let value = if matches!(a.as_ref(), "-c" | "--config") {
+                    next = args.get(i + 1).map(|n| n.to_string_lossy());
+                    next.as_deref()
+                } else {
+                    a.strip_prefix("--config=").or_else(|| a.strip_prefix("-c"))
+                };
+                if value.is_some_and(|v| v.starts_with(KEY)) {
+                    return true;
                 }
             }
             false
@@ -85,13 +96,8 @@ fn caller_overrides(harness: Harness, args: &[OsString]) -> bool {
 }
 
 /// One argv element: `model_instructions_file=<path>` with the path as a TOML string.
-/// The caller checks the path with `utf8_path` first; TOML cannot hold other bytes.
-fn codex_override(file: &Path) -> OsString {
-    format!(
-        "model_instructions_file={}",
-        toml_edit::Value::from(file.to_string_lossy().as_ref())
-    )
-    .into()
+fn codex_override(path: &str) -> OsString {
+    format!("model_instructions_file={}", toml_edit::Value::from(path)).into()
 }
 
 /// The path as UTF-8, or an error message that names it.
@@ -117,16 +123,81 @@ fn preamble_name() -> String {
     format!("preamble-{hash:016x}.md")
 }
 
-fn ensure_preamble_file() -> std::io::Result<PathBuf> {
-    let dir = cache_dir(std::env::var_os("XDG_CACHE_HOME"), home::home_dir()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory found")
-    })?;
-    std::fs::create_dir_all(&dir)?;
-    let file = dir.join(preamble_name());
-    if std::fs::read(&file).ok().as_deref() != Some(PREAMBLE.as_bytes()) {
+fn ensure_preamble_file() -> io::Result<PathBuf> {
+    let dir = cache_dir(std::env::var_os("XDG_CACHE_HOME"), home::home_dir())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no cache directory found"))?;
+    create_private_dir(&dir)?;
+    let name = preamble_name();
+    let file = dir.join(&name);
+    if std::fs::read(&file).ok().as_deref() == Some(PREAMBLE.as_bytes()) {
+        // Mark the file as in use, so another tilth version does not remove it.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(SystemTime::now()));
+    } else {
         crate::util::atomic_write_bytes(&file, PREAMBLE.as_bytes())?;
+        remove_stale_preambles(&dir, &name);
     }
     Ok(file)
+}
+
+/// Remove cache files of other preamble revisions that no launch used for `STALE_AFTER`.
+fn remove_stale_preambles(dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let ours = name
+            .strip_prefix("preamble-")
+            .is_some_and(|n| n.strip_suffix(".md").is_some());
+        if name == keep || !ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Create the cache dir and refuse one that another user can change.
+/// Another user who can write the dir can swap the preamble before the harness reads it.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be a directory that you own and that only you can write",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 #[cfg(unix)]
@@ -145,8 +216,8 @@ fn exec(binary: &str, argv: &[OsString]) -> i32 {
     }
 }
 
-fn report_spawn_error(binary: &str, err: &std::io::Error) -> i32 {
-    if err.kind() == std::io::ErrorKind::NotFound {
+fn report_spawn_error(binary: &str, err: &io::Error) -> i32 {
+    if err.kind() == io::ErrorKind::NotFound {
         eprintln!("tilth: cannot find `{binary}` on PATH: {err}");
         127
     } else {
@@ -170,6 +241,7 @@ mod tests {
             &["--system-prompt=x"],
             &["-p", "--system-prompt-file", "f"],
             &["--system-prompt-file=f"],
+            &["--system-prompt", "x", "--", "y"],
         ] {
             assert!(caller_overrides(Harness::Claude, &os(form)), "{form:?}");
         }
@@ -185,6 +257,8 @@ mod tests {
             &["--SYSTEM-PROMPT", "x"],
             &["-p", "explain --system-prompt please"],
             &["-p", "hi"],
+            &["--", "--system-prompt"],
+            &["-p", "--", "--system-prompt-file=f"],
             &[],
         ] {
             assert!(!caller_overrides(Harness::Claude, &os(form)), "{form:?}");
@@ -199,6 +273,7 @@ mod tests {
             &["--config=model_instructions_file=/a"],
             &["-cmodel_instructions_file=/a"],
             &["exec", "hi", "-c", "model_instructions_file=/f"],
+            &["-c", "model=o3", "-c", "model_instructions_file=/f"],
         ] {
             assert!(caller_overrides(Harness::Codex, &os(form)), "{form:?}");
         }
@@ -209,11 +284,17 @@ mod tests {
         for form in [
             &["-c", "model=o3"][..],
             &["-c"],
+            &["--config"],
             &["exec", "model_instructions_file=/a"],
             &["-cmodel=o3"],
             &["exec", "-c", " model_instructions_file=/f"],
             &["exec", "-c", "MODEL_INSTRUCTIONS_FILE=/f"],
             &["-c", "model_instructions_files=/f"],
+            &["-c", "profiles.x.model_instructions_file=/f"],
+            &["--config=profiles.x.model_instructions_file=/f"],
+            &["-c", "x=model_instructions_file=/f"],
+            &["exec", "--", "-c", "model_instructions_file=/f"],
+            &["-c", "--", "model_instructions_file=/f"],
         ] {
             assert!(!caller_overrides(Harness::Codex, &os(form)), "{form:?}");
         }
@@ -236,38 +317,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn launch_toml_override_keeps_non_utf8_path_bytes() {
+    fn launch_utf8_path_rejects_non_utf8() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(OsStr::from_bytes(b"/cache/x\xffy/p.md"));
         let err = utf8_path(path).expect_err("a non-UTF-8 path cannot be a TOML string");
         assert!(err.contains("/cache/x"), "error must name the path: {err}");
-        assert!(!codex_override(Path::new("/cache/ok/p.md"))
-            .to_string_lossy()
-            .contains('\u{fffd}'));
     }
 
     #[test]
-    fn launch_preamble_name_is_hash_of_bundled_bytes() {
-        let want = format!(
-            "preamble-{:016x}.md",
-            twox_hash::XxHash3_64::oneshot(PREAMBLE.as_bytes())
-        );
-        assert_eq!(preamble_name(), want);
-        let other = twox_hash::XxHash3_64::oneshot(b"other bytes");
-        assert_ne!(preamble_name(), format!("preamble-{other:016x}.md"));
-    }
-
-    #[test]
-    fn launch_scan_codex_ignores_dotted_key_and_attached_other_key() {
-        for form in [
-            &["-c", "profiles.x.model_instructions_file=/f"][..],
-            &["--config=profiles.x.model_instructions_file=/f"],
-            &["-c", "x=model_instructions_file=/f"],
-            &["--config"],
-        ] {
-            assert!(!caller_overrides(Harness::Codex, &os(form)), "{form:?}");
-        }
+    fn launch_utf8_path_accepts_utf8_paths() {
+        assert_eq!(utf8_path(Path::new("/a/\u{2713}")), Ok("/a/\u{2713}"));
     }
 
     #[test]
@@ -292,7 +352,7 @@ mod tests {
         );
         let mut failures = Vec::new();
         for p in &inputs {
-            let el = codex_override(Path::new(p));
+            let el = codex_override(p);
             let text = el.to_str().unwrap().to_owned();
             match text.parse::<toml_edit::DocumentMut>() {
                 Ok(doc) => {
@@ -305,9 +365,5 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
-    }
-    #[test]
-    fn launch_utf8_path_accepts_utf8_paths() {
-        assert_eq!(utf8_path(Path::new("/a/\u{2713}")), Ok("/a/\u{2713}"));
     }
 }

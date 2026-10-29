@@ -1,6 +1,6 @@
 # ADR: tilth harness preamble launcher
 
-Status: implemented (2026-10-29) on branch `t3/confirm-preamble-editor`. Spec: `~/.local/share/cheese/mold/specs/tilth-harness-preamble-launcher.md`. Research: `~/.local/share/cheese/briesearch/research/harness-preamble-injection-claude-codex/`.
+Status: implemented (2026-10-29) on branch `t3/confirm-preamble-editor` (PR #417). Review follow-ups on `t3/preamble-launcher-lows`. Spec: `~/.local/share/cheese/mold/specs/tilth-harness-preamble-launcher.md`. Research: `~/.local/share/cheese/briesearch/research/harness-preamble-injection-claude-codex/`.
 
 tilth takes over the preamble role of the dotfiles `ap` tool for Claude Code and Codex. It adds two launcher subcommands, `tilth claude` and `tilth codex`. Each one execs the harness with a bundled preamble that replaces the built-in system prompt.
 
@@ -23,12 +23,13 @@ tilth takes over the preamble role of the dotfiles `ap` tool for Claude Code and
 
 - Claude Code has no `settings.json` key that sets or appends to the system prompt. A plain `claude` launch never sees the preamble.
 - The Codex `model_instructions_file` key must be a TOML root key, written before any table (dotfiles bug #262). The launcher avoids this because it uses `-c`.
-- A replaced prompt drops vendor safety and tool guidance, so `prompts/preamble.md` must restate it.
+- A replaced prompt drops vendor safety and tool guidance, so `prompts/preamble.md` must restate it, including the defensive-security and no-guessed-URL lines.
 - Management subcommands (`claude mcp …`) through the launcher are a non-goal. The prepended flag can break them.
 - The benchmark does not use `ap`. It builds its own argv (`benchmark/run.py:1324-1490`). A preamble arm is a follow-up.
-
-- Clap drops a leading `--` in a `trailing_var_arg` positional. The launcher therefore takes the harness args verbatim from `std::env::args_os()[2..]`, and a tilth flag before `claude`/`codex` is a usage error (exit 2). `args_conflicts_with_subcommands` does not work here: clap then reads `claude` as the positional query and runs a search.
+- Clap drops a leading `--` in a `trailing_var_arg` positional. `src/main.rs` `launch_from_argv` therefore dispatches before clap parses argv when argv[1] is `claude` or `codex`, and passes argv[2..] unchanged. The clap `Claude`/`Codex` variants are unit variants for `--help` only. Clap reaches them only when another argument comes first, and that is a usage error (exit 2). `args_conflicts_with_subcommands` does not work here: clap then reads `claude` as the positional query and runs a search.
 - `tilth -- claude` still searches for the word `claude`; a bare `tilth claude` starts the launcher.
+- The caller-override scan (`caller_overrides`) stops at the first `--`. Text after it, such as `tilth claude -- --system-prompt`, is a prompt, not a flag.
+- On Unix the cache dir `<cache>/tilth` is created with mode 0700. The launcher refuses it when it is a symlink, another user owns it, or group or others can write it. With a shared `XDG_CACHE_HOME`, another user could otherwise swap the preamble before the harness reads it.
+- Each preamble revision has its own cache file. A launch that finds its file refreshes the file mtime. A launch that writes a new file removes other `preamble-*.md` files older than 30 days, so a running session of another tilth version keeps its file.
 - Codex's session record (`~/.codex/sessions/.../rollout-*.jsonl`, `session_meta.payload.base_instructions`) shows which base instructions a launch used. Use it to verify delivery; a model asked to "quote your instructions" may quote `~/.codex/AGENTS.md` instead.
 - On Windows the launcher needs a native `claude.exe`/`codex.exe`; Rust `Command` does not run npm `.cmd` shims.
-

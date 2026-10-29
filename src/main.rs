@@ -105,21 +105,15 @@ enum Command {
         hint: String,
     },
     /// Start Claude Code with the tilth preamble as its system prompt.
-    /// All arguments pass to `claude` unchanged, including `--help`.
+    /// `claude` must be the first argument. Every later argument passes to `claude` unchanged.
     /// A system-prompt flag from the caller replaces the preamble.
-    #[command(disable_help_flag = true)]
-    Claude {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<std::ffi::OsString>,
-    },
+    #[command(disable_help_flag = true, override_usage = "tilth claude [ARGS]...")]
+    Claude,
     /// Start Codex with the tilth preamble as its model instructions.
-    /// All arguments pass to `codex` unchanged, including `--help`.
+    /// `codex` must be the first argument. Every later argument passes to `codex` unchanged.
     /// A `model_instructions_file` override from the caller replaces the preamble.
-    #[command(disable_help_flag = true)]
-    Codex {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<std::ffi::OsString>,
-    },
+    #[command(disable_help_flag = true, override_usage = "tilth codex [ARGS]...")]
+    Codex,
 }
 
 /// Accepted `tilth hook --host` values: the four event families, plus the install host
@@ -144,22 +138,22 @@ impl HookHost {
     }
 }
 
-/// Harness arguments, verbatim from argv: clap would drop a leading `--`.
-/// A tilth flag before `claude` / `codex` is a usage error: the launcher would ignore it.
-fn harness_args() -> Vec<std::ffi::OsString> {
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if !argv.get(1).is_some_and(|a| a == "claude" || a == "codex") {
-        Cli::command()
-            .error(
-                clap::error::ErrorKind::ArgumentConflict,
-                "tilth flags cannot go before `claude` or `codex`; put harness flags after it",
-            )
-            .exit();
-    }
-    argv.into_iter().skip(2).collect()
+/// `tilth claude ...` and `tilth codex ...` dispatch before clap parses argv.
+/// Clap would drop a leading `--`, and every argument must reach the harness unchanged.
+fn launch_from_argv() -> Option<i32> {
+    let mut argv = std::env::args_os().skip(1);
+    let harness = match argv.next()?.to_str()? {
+        "claude" => tilth::launch::Harness::Claude,
+        "codex" => tilth::launch::Harness::Codex,
+        _ => return None,
+    };
+    Some(tilth::launch::run(harness, argv.collect()))
 }
 
 fn main() {
+    if let Some(code) = launch_from_argv() {
+        process::exit(code);
+    }
     configure_thread_pools();
     let cli = Cli::parse();
 
@@ -186,17 +180,15 @@ fn main() {
             Command::Hook { host, ref hint } => {
                 process::exit(tilth::hook::run_cli(host.family(), hint));
             }
-            Command::Claude { .. } => {
-                process::exit(tilth::launch::run(
-                    tilth::launch::Harness::Claude,
-                    harness_args(),
-                ));
-            }
-            Command::Codex { .. } => {
-                process::exit(tilth::launch::run(
-                    tilth::launch::Harness::Codex,
-                    harness_args(),
-                ));
+            // `launch_from_argv` handles `claude` / `codex` as argv[1], so clap reaches
+            // these only when another argument comes first.
+            Command::Claude | Command::Codex => {
+                Cli::command()
+                    .error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "`claude` or `codex` must be the first argument to tilth. Put harness arguments after it.",
+                    )
+                    .exit();
             }
         }
         return;
