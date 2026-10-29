@@ -104,6 +104,22 @@ enum Command {
         #[arg(long, default_value = "tilth")]
         hint: String,
     },
+    /// Start Claude Code with the tilth preamble as its system prompt.
+    /// All arguments pass to `claude` unchanged, including `--help`.
+    /// A system-prompt flag from the caller replaces the preamble.
+    #[command(disable_help_flag = true)]
+    Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<std::ffi::OsString>,
+    },
+    /// Start Codex with the tilth preamble as its model instructions.
+    /// All arguments pass to `codex` unchanged, including `--help`.
+    /// A `model_instructions_file` override from the caller replaces the preamble.
+    #[command(disable_help_flag = true)]
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<std::ffi::OsString>,
+    },
 }
 
 /// Accepted `tilth hook --host` values: the four event families, plus the install host
@@ -126,6 +142,21 @@ impl HookHost {
             Self::Windsurf => "windsurf",
         }
     }
+}
+
+/// Harness arguments, verbatim from argv: clap would drop a leading `--`.
+/// A tilth flag before `claude` / `codex` is a usage error: the launcher would ignore it.
+fn harness_args() -> Vec<std::ffi::OsString> {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if !argv.get(1).is_some_and(|a| a == "claude" || a == "codex") {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "tilth flags cannot go before `claude` or `codex`; put harness flags after it",
+            )
+            .exit();
+    }
+    argv.into_iter().skip(2).collect()
 }
 
 fn main() {
@@ -154,6 +185,18 @@ fn main() {
             }
             Command::Hook { host, ref hint } => {
                 process::exit(tilth::hook::run_cli(host.family(), hint));
+            }
+            Command::Claude { .. } => {
+                process::exit(tilth::launch::run(
+                    tilth::launch::Harness::Claude,
+                    harness_args(),
+                ));
+            }
+            Command::Codex { .. } => {
+                process::exit(tilth::launch::run(
+                    tilth::launch::Harness::Codex,
+                    harness_args(),
+                ));
             }
         }
         return;
