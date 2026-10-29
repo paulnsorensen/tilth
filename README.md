@@ -250,6 +250,19 @@ tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_inst
 - `claude` or `codex` must be the first argument to tilth. `tilth --json claude` is a usage error (exit 2).
 - On Windows, the launcher needs a native `claude.exe` or `codex.exe` on `PATH`. It does not run `.cmd` shims, such as the ones npm creates.
 
+### Use the tilth preamble in another harness
+
+`tilth preamble` prints the tilth preamble. `tilth preamble --path` writes it to the cache file and prints the path of that file.
+
+```bash
+tilth preamble >> AGENTS.md                               # add it to project instructions
+claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in Claude Code prompt
+<harness> --system-prompt-file "$(tilth preamble --path)" # give the file to a harness that takes one
+```
+
+- The text is the same text that `tilth claude` and `tilth codex` use.
+- `--path` uses the same cache file and the same directory checks as the launcher.
+
 ### Smaller models
 
 Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Grep. To force tilth adoption, disable the overlapping built-in tools:

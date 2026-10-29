@@ -6,7 +6,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ```
 src/
-  main.rs              CLI entry (clap). Dispatches to install, the `hook` shell guard, the `claude`/`codex` launchers, MCP, or single-query mode.
+  main.rs              CLI entry (clap). Dispatches to install, the `hook` shell guard, the `claude`/`codex` launchers (before clap parses argv), `preamble`, MCP, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS via include_str! from prompts/mcp.md. Always serves the edit surface.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
@@ -50,7 +50,7 @@ src/
     recovery.rs        3-way-merge recovery when the live file drifted since the tagged read.
     snapshots.rs       Per-session file snapshots keyed by tag for edit verification.
     mismatch.rs        Tag-mismatch classification (drift vs fabricated).
-  launch.rs            `tilth claude` / `tilth codex`: write the bundled preamble to the cache dir and exec the harness with it. Embeds prompts/preamble.md via include_str!.
+  launch.rs            `tilth claude` / `tilth codex`: write the bundled preamble to the cache dir and exec the harness with it. `tilth preamble`: print the preamble or its cache path. Embeds prompts/preamble.md via include_str!.
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
@@ -163,7 +163,7 @@ Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed
 
 ## Launcher preamble
 
-`tilth claude` and `tilth codex` hand the harness a bundled system prompt. It lives in `prompts/preamble.md` and `src/launch.rs` embeds it with `include_str!`. `tests/launch_preamble.rs` guards its headings and bans personal-policy terms. `scripts/regen-agents-md.sh` does not read it, so `AGENTS.md` does not carry it.
+`tilth claude` and `tilth codex` hand the harness a bundled system prompt. `tilth preamble` prints the same text, and `tilth preamble --path` prints its cache file, so other harnesses can use it. It lives in `prompts/preamble.md` and `src/launch.rs` embeds it with `include_str!`. `tests/launch_preamble.rs` guards its headings and bans personal-policy terms. `scripts/regen-agents-md.sh` does not read it, so `AGENTS.md` does not carry it.
 
 ## MCP instructions
 

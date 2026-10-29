@@ -114,6 +114,13 @@ enum Command {
     /// A `model_instructions_file` override from the caller replaces the preamble.
     #[command(disable_help_flag = true, override_usage = "tilth codex [ARGS]...")]
     Codex,
+    /// Print the tilth preamble, so that you can give it to another harness.
+    /// With `--path`, write it to the cache file and print the path of that file.
+    Preamble {
+        /// Print the path of the cache file, not the text.
+        #[arg(long)]
+        path: bool,
+    },
 }
 
 /// Accepted `tilth hook --host` values: the four event families, plus the install host
@@ -179,6 +186,9 @@ fn main() {
             }
             Command::Hook { host, ref hint } => {
                 process::exit(tilth::hook::run_cli(host.family(), hint));
+            }
+            Command::Preamble { path } => {
+                process::exit(tilth::launch::print_preamble(path));
             }
             // `launch_from_argv` handles `claude` / `codex` as argv[1], so clap reaches
             // these only when another argument comes first.
