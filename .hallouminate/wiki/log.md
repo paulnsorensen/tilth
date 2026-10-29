@@ -112,3 +112,8 @@
 2026-10-15 · mmc-t-2-rebase · merged+new-page · benchmark-task-inventory.md; benchmark-selection-and-rigor.md; benchmark-gin-render-context.md; featurebench-integration.md; benchmark-cost-planning.md; sources/benchmark-research.md; sources/featurebench.md; sources/sonnet-5-5.md; sources/index.md; benchmark-harness-gotchas.md; mcp-cost-model-sonnet5.md; index.md · Rebase the benchmark research pages onto main after the GEPA overhaul. Re-derive task counts, retire the Phase 4 gate, and describe the native FeatureBench runner.
 
 2026-10-16 · small-followups-kind-hints · merged · adr/tilth-search-v2-roadmap-002.md; specs/fuzzy-suggest-only.md; specs/tilth-search-revival.md; specs/tilth-api-adoption.md · Point footnote 4 at PR #309 instead of an untracked spec. Record the removed kind hints and the fuzzy_path doc fix. Record #175 as closed.
+
+- 2026-10-29 · 739cdeebd9b488f0 · new-page · benchmark-gepa-v3-evolve.md · gepa-v3 evolve campaign state: panel, cost per correct at parity, trajectory diagnosis, spend, ideas
+- 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-invariants.md · proposer repair, directives, deep diagnosis, auto-fmt, test grants, integrity stage, CLI pin, chain digest scope
+- 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-gotchas.md · gepa-v3 rounds: CLI auto-update drift, hook-hint drift, split lock rename, wrapper pid, stale cargo binaries, finish reserve, text-rule test guards
+

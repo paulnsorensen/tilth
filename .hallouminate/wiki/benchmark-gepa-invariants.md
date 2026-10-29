@@ -154,6 +154,19 @@ Candidate refs live at `refs/evolve/<run-id>/<content-id[:12]>`. Builds are cach
 The seven stop reasons are `ceiling`, `quota`, `plateau`, `cli-version`, `mcp-unavailable`, `invalid-cell`, and `auth` (`benchmark/evolve/calls.py:17`). `auth` is a no-spend reason, so finish runs in store-only mode.
 Finish pushes with an empty-ref lease, so an existing winner branch is a logged refusal. It then opens `gh pr create --draft` with no merge.
 
+## Proposer repair and test integrity (gepa-v3)
+
+The gepa-v3 rounds added these guards so a `src_patch` candidate can change behavior without weakening existing tests (PRs #406, #408, #410, #412).
+
+- `--directives PATH` queues seeded proposals; while one remains, the selector picks its component and the proposer gets a `directive` record (`benchmark/evolve/directives.py`). `--deep-diagnosis` runs Codex `gpt-6-astra` read-only once per parent on neutrally named dev-split trajectory copies in a temp dir outside the repo, and scrubs its causes of forbidden terms (`benchmark/evolve/deepdiag.py`).
+- A `src_patch` child that fails apply, `just check`, or integrity gets one repair call with a `repair` record that holds the real error; a lint-only or fmt-only repair failure gets one more (`MAX_REPAIRS = 2`, `benchmark/evolve/engine.py`). The failure tail keeps every `error:` block, not only the last lines (`tail`, `benchmark/evolve/loop.py`).
+- `cargo fmt` runs on the proposer export and again in the materializer before commit, so content ids name formatted code (`benchmark/evolve/rustfmt.py`).
+- A repair may change only the `#[test]` fns that its `just check` failure named; the grant is keyed by `src_patch`, and an inherited grant is read-only. A patch may add new `#[test]` fns with a test attribute and no `ignore`. Every added or changed test is listed under "Test changes for review" in the winner draft PR (`benchmark/evolve/finish.py`).
+- The integrity stage runs after `just check` (`benchmark/evolve/integrity.py`). It builds the candidate's production code with the seed's test modules: the seed's attribute runs are restored, candidate-added test modules are dropped, and granted tests keep their seed version and are skipped by exact name. A canary `#[test] fn __tilth_canary_<nonce>()` with a fresh `secrets.token_hex` nonce goes into each restored seed region. Every seed test and every canary must appear per target in `cargo test --lib --bins -- --list` under its seed module path, and the tree must pass. This catches compiled-out modules, macro or fn-body wrapping, and impls emitted by macros, which text rules missed in three review rounds.
+- An infrastructure fault in integrity (timeout, non-cargo error) fails at stage `integrity infra`, which is neither memoized nor repairable.
+- `benchmark/claude-cli.version` pins the Claude CLI (2.1.310). `run.py` and `evolve.cli.build` refuse a mismatched binary unless `--allow-cli-drift` is set, and cells spawn the resolved binary (`resolve_claude_binary`, `require_pinned_cli`, `benchmark/run.py`).
+- A chain's task digest skips `chains.py` and keys on member digests plus `chains.CHAIN_PROTOCOL`; bump the protocol when chain driving or grading changes (`_task_source_files`, `benchmark/run.py`).
+
 ## Before the first paid run
 
 The archive left this checklist open on 2026-10-08.
@@ -175,4 +188,4 @@ These risks remained open at the end of the PR #312 session, the provenance of t
 - Issue [#325](https://github.com/paulnsorensen/tilth/issues/325) (spend across resumes, failed-cell pricing, settings-level auth) closed with PR #334. Open edges: a shared-budget overshoot of one in-flight cell per run, and a token revoked mid-run is not re-probed.
 - Reflection prompt size is unbounded, and the result store is local-only.
 
-_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319 after the PR #318 cure; spec lines at `9e84659` via `refs/pull/312/head` ; spend and auth sections from PR #334 and the 2026-10-16 live smoke run · Updated: 2026-10-16_
+_Source: PR #312 session archive (phase outcomes, hardening cure, wheypoint), verified against the layer 6 head of PR #319 after the PR #318 cure; spec lines at `9e84659` via `refs/pull/312/head` ; spend and auth sections from PR #334 and the 2026-10-16 live smoke run; proposer repair and test integrity from PRs #406-#412 · Updated: 2026-10-29_
