@@ -1,0 +1,76 @@
+# gepa-v3 evolve campaign state
+
+The gepa-v3 evolve campaign (October 2026) brought tilth to cost-per-correct parity with the built-in-tools baseline, on a long-session panel.
+Main at `b2f4412` is within noise of baseline on the dev split, and 2-6% cheaper per correct answer on the held-out test split.
+The evolve loop is now hardened end to end, but its dev split is too noisy to rank single candidates that differ by a few percent.
+Guards added during the campaign are on [Benchmark GEPA loop invariants and guards](benchmark-gepa-invariants.md); failures it hit are on [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md).
+
+## Panel: gepa-v3-long-2
+
+The gepa-v3 panel exists because real coding sessions run about 93 API calls, while the old gepa-v2 tasks ran 5-6, so carry cost never showed.
+`benchmark/panels/gepa-v3-long-2.json` holds 18 members, 10 dev and 8 test, scored with sonnet at 3 reps.
+
+- **Long single tasks:** metaflow (FeatureBench), caddy-6288, axum-1119, vuejs-11739, and the four local edit tasks (gin, express, fastapi, ripgrep).
+- **Chains:** `chain:gin-edit-5`, `chain:fastapi-edit-5`, `chain:rg-edit-7` and `chain:express-edit-6` run several tasks in one resumed `claude -p` session (`benchmark/chains.py`). A chain is correct only when every sub-task is correct.
+- **Short controls:** tokio-4867, ripgrep-2209, caddy-6350, terraform-35611, axios-5085 and coreutils-6682, so evolve cannot win long tasks while losing short ones.
+- **Dropped:** bat-1892, because bat's pty integration test hangs the agent's full `cargo test`, and the `gin_context_next` and `grok_context_next` chain sub-tasks, because chain answers omit their literal `HandlersChain` grading string.
+- The panel loader refuses any task that reaches both dev and test, directly or as a chain sub-task (`_check_no_shared_task`, `benchmark/panels.py`).
+
+## Cost per correct: where tilth stands
+
+Cost per correct is total spend divided by correct cells; below 1.0 means tilth is cheaper than baseline.
+The evolve score `p * base / c` is stricter: its parity line is the baseline pass rate, so on the test split (baseline 21/24) parity sits near 0.875, not 1.0.
+
+| Run | Seed | Dev cost per correct vs baseline | Test cost per correct vs baseline |
+|---|---|---|---|
+| r1 | `202027d` (old seed) | +9% | not run |
+| r3 | `eab2279` + #409 candidate | +8% | -2% |
+| r4 | `25e48dd` | +2% | not run |
+| r5 | `58d4a75` | +4% | not run |
+| r6 | `b2f4412` | +11% | -6% (22 of 24 cells) |
+
+The same tilth code (content id `4c56a06`) scored dev means of 0.952, 0.945 and 0.876 in r4, r5 and r6.
+So the dev split moves about 8 points between runs of identical code; trust the test split and paired intervals, not single dev means.
+
+## Why tilth cost more: trajectory diagnosis
+
+The cost gap is driven by extra dependent turns, not by more tool calls.
+A turn-by-turn diagnosis by Codex `gpt-6-astra` over the seed's trajectories counted 308 API calls for tilth against 196 for baseline, on 334 against 356 tool calls.
+The report is at `/tmp/tilth-verify/gepa-v3-call-gap.md`, copied from `.cheese/research/gepa-v3-call-gap.md` in the run worktree.
+
+- Go receiver-signature searches missed, and unique hits stopped at 60 lines, so caddy-6288 took 27 calls against baseline's 8. Fixed by #404.
+- The 10-hit search cap and untagged test hits forced narrowing and re-reads before edits. Fixed by #404.
+- Strict Bash hook denials cost turns (38 for tilth against 20 for baseline). Fixed by #403 with an operation map in `prompts/mcp.md` and the denial hints.
+- A read error or a host-clipped read marked unseen lines as seen, so later reads got false "unchanged" stubs. Fixed by #405 (displayed-lines-only records and a 40 KB response cap).
+- `create_file` on existing files. Fixed by #403 in `prompts/tools/write.md`.
+- Harness artifacts: a fastapi phrase-check false negative (#402), a fastapi agent without pytest or argon2 that timed out (#407), and shared fixed `/tmp` scratch paths (not fixed).
+
+After the fixes, tilth makes fewer calls than baseline on 7 of 10 dev tasks; for example, the fastapi chain fell from 44 to 31 calls.
+
+## What evolve found
+
+Across r1-r6, evolve's best winner was a prompt edit, not a source patch.
+
+- r3 found a two-call multi-file edit pattern for `prompts/mcp.md` (dev 0.977 against 0.932, test 0.958 against 0.833). Its paired test interval included 0, so it shipped by hand as #409.
+- Source-patch directives mostly failed on clippy, rustfmt, or pinned tests until #408, #410 and #412 gave the proposer repair, auto-format, and test-update paths.
+- The r6 `budget.rs` numbered-line cut led the dev split (0.973) but cost 14% more per correct than baseline on test, so it was noise.
+- A hypothesis that a change cuts one tool's calls was often met while the score fell, so per-tool metrics do not predict cost per correct.
+
+## Spend
+
+Evolve spend totals about $487: r1 $99, baseline buy $32, r2 $45, r3 $161, r4 $12, r5 $48, r6 $89.
+The finish reserve is about $40 whenever the seed commit changes, because `git_sha` is in every tilth cell's run key.
+
+## Ideas to push cost per correct lower
+
+These ideas are untested; the first two attack the remaining measured causes.
+
+- Edit from search: let `tilth_write` edit lines a search hit displayed, now that #404 tags test hits, to skip a read turn.
+- Explicit search modes (literal, regex, symbol) so auto-resolution stops narrowing intent; the diagnosis rated this the largest remaining cause (about 0.45 calls per cell).
+- Structural or exact-text edits instead of line-range edits, to cut repair loops (about 0.35 calls per cell).
+- Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
+- Smaller tool schemas and instructions, since they ride every API call.
+- A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
+- Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
+
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412 · Updated: 2026-10-29_
