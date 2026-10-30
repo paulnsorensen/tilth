@@ -1,7 +1,8 @@
 # Read coalescing and construct completion
 
 `tilth_read` plans its `paths` before it renders them, so one call returns whole, unfragmented code.
-The planner is `src/mcp/tools/read/plan.rs`; `plan_paths` and `construct_boundary` in `src/mcp/tools/read.rs` wire it in.
+The planner is `src/mcp/tools/read/plan.rs`; `tool_read_paths` and `construct_boundary` in `src/mcp/tools/read.rs` wire it in.
+`ReadCall::parse` checks the arguments and parses each path once into a `Request` (path plus `PathSuffix`). The planner takes and returns `Request` values, and the renderer reads them without a second parse. `suffix_span` is the one resolver from a suffix to a line span, for the planner and for `read_single_with_suffix`.
 The construct lookup is `cut_construct` in `src/lang/outline.rs`. It uses `innermost_entry`, the same innermost-entry walk that resolves a line anchor in `src/edit/block.rs`, and `deep_outline_for_path`, which needs no `OutlineCache`.
 It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.md).
 
@@ -27,7 +28,8 @@ The next cluster, at 8-20 lines, was deliberate picks: single lines 10 or 20 apa
 - Python's root `module` node parses into the deep outline as a whole-file `Module` entry. `cut_construct` therefore never counts a `Module`; without that, every Python range grew to end of file.
 - A container (class, struct, impl, interface, enum) with child definitions is a clean stop between its members. A container without children, such as a struct with fields only, is a construct to complete.
 - `mcp::tests::documents_direct_reads_do_not_parse` pins that a direct range read does not parse. The planner parses lazily, and only when a range ends before the file's last line.
-- `plan_paths` returns `None` for a malformed request (missing `cwd`, more than 20 paths, a non-string path). The renderer then reports the error unchanged.
+- `ReadCall::parse` reports a malformed request (missing `cwd`, more than 20 paths, a non-string path, an unknown `mode`) before the planner runs. Its checks keep the order the renderer used, so a call with several faults reports the same error.
+- A rewritten request is `Request::with_range`: its `raw` is `shown#start-end`, and its suffix is the `LineRange` that string parses to.
 - Coalescing rewrites the request list, and `CutCtx.requests` must be the rewritten list, because `Part.request` indexes into it.
 
 ## Measured baseline (before the change)

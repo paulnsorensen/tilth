@@ -7,6 +7,7 @@
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
+use super::Request;
 use crate::cache::OutlineCache;
 use crate::lang::outline;
 use crate::mcp::path_suffix::PathSuffix;
@@ -23,20 +24,10 @@ pub(super) const COALESCE_GAP: u32 = 3;
 /// section can use.
 const SECTION_FRAME_BYTES: usize = 160;
 
-/// One request of a batch, already resolved by the caller.
-pub(super) struct Request {
-    /// The request as the caller wrote it.
-    pub raw: String,
-    /// The path part of `raw`, used to spell a rewritten request.
-    pub shown: String,
-    pub path: PathBuf,
-    pub suffix: PathSuffix,
-}
-
 /// A planned request and the continuation its section ends with, if any.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct Planned {
-    pub request: String,
+    pub request: Request,
     pub next: Option<Continuation>,
 }
 
@@ -140,23 +131,14 @@ impl FileView {
     }
 }
 
-/// The line span a request shows when the file reads cleanly.
+/// The line span a request shows when the file reads cleanly. A line range
+/// stops at the last line, and only its end can cut a construct.
 fn request_span(request: &Request, total: u32, cache: &OutlineCache) -> Option<(u32, u32, bool)> {
-    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    let (start, end, open_end) = match &request.suffix {
-        PathSuffix::LineRange(start, end) => (cast(*start), cast(*end).min(total), true),
-        PathSuffix::FromLine(start) => (cast(*start), total, false),
-        PathSuffix::Symbol(name) => match super::resolve_symbol(&request.path, name, cache) {
-            super::SymbolLookup::Found(start, end) => (cast(start), cast(end), false),
-            super::SymbolLookup::Missing | super::SymbolLookup::PreconditionFailed => {
-                return None;
-            }
-        },
-        PathSuffix::Heading(heading) => {
-            let (start, end) = crate::read::resolve_heading_span(&request.path, heading)?;
-            (start, end, false)
-        }
-        PathSuffix::None => return None,
+    let (start, end) = super::suffix_span(&request.path, &request.suffix, || Some(total), cache)?;
+    let (end, open_end) = match request.suffix {
+        PathSuffix::LineRange(..) => (end.min(total), true),
+        PathSuffix::FromLine(_) => (end.min(total), false),
+        PathSuffix::Symbol(_) | PathSuffix::Heading(_) | PathSuffix::None => (end, false),
     };
     (start >= 1 && start <= end).then_some((start, end, open_end))
 }
@@ -323,7 +305,7 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
     let mut planned: Vec<Option<Planned>> = Vec::with_capacity(requests.len());
     for request in requests {
         planned.push(Some(Planned {
-            request: request.raw.clone(),
+            request: request.clone(),
             next: None,
         }));
     }
@@ -337,9 +319,9 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
             && spans[cluster.lead]
                 .is_some_and(|(start, end, ..)| (start, end) == (cluster.start, cluster.end));
         let request = if unchanged {
-            lead.raw.clone()
+            lead.clone()
         } else {
-            format!("{}#{}-{}", lead.shown, cluster.start, cluster.end)
+            lead.with_range(cluster.start, cluster.end)
         };
         planned[cluster.lead] = Some(Planned {
             request,
@@ -376,22 +358,22 @@ fn tail() {}
 
     fn requests(dir: &Path, raws: &[&str]) -> Vec<Request> {
         raws.iter()
-            .map(|raw| {
-                let (shown, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(raw);
-                Request {
-                    raw: (*raw).to_string(),
-                    shown: shown.to_string_lossy().into_owned(),
-                    path: dir.join(&shown),
-                    suffix,
-                }
-            })
+            .map(|raw| Request::parse(raw, dir).unwrap())
             .collect()
     }
 
     fn planned(dir: &Path, raws: &[&str], limit: usize) -> Vec<String> {
+        sections(dir, raws, limit)
+            .into_iter()
+            .map(|(request, _)| request)
+            .collect()
+    }
+
+    /// Each planned request as written, with its continuation.
+    fn sections(dir: &Path, raws: &[&str], limit: usize) -> Vec<(String, Option<Continuation>)> {
         plan(&requests(dir, raws), &OutlineCache::new(), limit)
             .into_iter()
-            .map(|item| item.request)
+            .map(|item| (item.request.raw, item.next))
             .collect()
     }
 
@@ -457,20 +439,17 @@ fn tail() {}
     #[test]
     fn over_limit_growth_stops_before_the_construct() {
         let dir = fixture(RUST, "p.rs");
-        let requests = requests(dir.path(), &["p.rs#1-12"]);
-        let frame = SECTION_FRAME_BYTES;
         let view = FileView::load(&dir.path().join("p.rs")).unwrap();
-        let limit = frame + view.size(1, 12);
-        let plan = plan(&requests, &OutlineCache::new(), limit);
+        let limit = SECTION_FRAME_BYTES + view.size(1, 12);
         assert_eq!(
-            plan,
-            [Planned {
-                request: "p.rs#1-10".into(),
-                next: Some(Continuation {
+            sections(dir.path(), &["p.rs#1-12"], limit),
+            [(
+                "p.rs#1-10".to_string(),
+                Some(Continuation {
                     request: "p.rs#11-13".into(),
                     stopped_before: true,
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -479,17 +458,9 @@ fn tail() {}
         let dir = fixture(RUST, "p.rs");
         let view = FileView::load(&dir.path().join("p.rs")).unwrap();
         let limit = SECTION_FRAME_BYTES + view.size(1, 10) - 1;
-        let plan = plan(
-            &requests(dir.path(), &["p.rs#1-12"]),
-            &OutlineCache::new(),
-            limit,
-        );
         assert_eq!(
-            plan,
-            [Planned {
-                request: "p.rs#1-12".into(),
-                next: None,
-            }]
+            sections(dir.path(), &["p.rs#1-12"], limit),
+            [("p.rs#1-12".to_string(), None)]
         );
     }
 
@@ -499,29 +470,18 @@ fn tail() {}
         let view = FileView::load(&dir.path().join("p.rs")).unwrap();
         let fits = SECTION_FRAME_BYTES + view.size(8, 8);
         assert_eq!(
-            plan(
-                &requests(dir.path(), &["p.rs#8-8"]),
-                &OutlineCache::new(),
-                fits
-            ),
-            [Planned {
-                request: "p.rs#8-8".into(),
-                next: Some(Continuation {
+            sections(dir.path(), &["p.rs#8-8"], fits),
+            [(
+                "p.rs#8-8".to_string(),
+                Some(Continuation {
                     request: "p.rs#9-9".into(),
                     stopped_before: false,
-                }),
-            }]
+                })
+            )]
         );
         assert_eq!(
-            plan(
-                &requests(dir.path(), &["p.rs#8-8"]),
-                &OutlineCache::new(),
-                fits - 1
-            ),
-            [Planned {
-                request: "p.rs#8-8".into(),
-                next: None,
-            }]
+            sections(dir.path(), &["p.rs#8-8"], fits - 1),
+            [("p.rs#8-8".to_string(), None)]
         );
     }
 
@@ -530,20 +490,15 @@ fn tail() {}
         let dir = fixture(RUST, "p.rs");
         let view = FileView::load(&dir.path().join("p.rs")).unwrap();
         let limit = 2 * SECTION_FRAME_BYTES + view.size(1, 12);
-        let plan = plan(
-            &requests(dir.path(), &["p.rs#1-9", "p.rs#11-12"]),
-            &OutlineCache::new(),
-            limit,
-        );
         assert_eq!(
-            plan,
-            [Planned {
-                request: "p.rs#1-12".into(),
-                next: Some(Continuation {
+            sections(dir.path(), &["p.rs#1-9", "p.rs#11-12"], limit),
+            [(
+                "p.rs#1-12".to_string(),
+                Some(Continuation {
                     request: "p.rs#13-13".into(),
                     stopped_before: false,
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -557,6 +512,25 @@ fn tail() {}
     }
 
     #[test]
+    fn a_rewritten_request_parses_back_to_itself() {
+        let dir = fixture(RUST, "p.rs");
+        let plan = plan(
+            &requests(dir.path(), &["p.rs:1-7", "p.rs#a"]),
+            &OutlineCache::new(),
+            40_000,
+        );
+        let [item] = plan.as_slice() else {
+            panic!("the two sections merge into one");
+        };
+        let parsed = Request::parse(&item.request.raw, dir.path()).unwrap();
+        assert_eq!(item.request.raw, "p.rs#1-9");
+        assert_eq!(parsed.shown, item.request.shown);
+        assert_eq!(parsed.path, item.request.path);
+        assert!(matches!(item.request.suffix, PathSuffix::LineRange(1, 9)));
+        assert!(matches!(parsed.suffix, PathSuffix::LineRange(1, 9)));
+    }
+
+    #[test]
     fn files_too_large_to_cache_are_not_parsed_for_constructs() {
         let mut text = String::from("def big():\n");
         while text.len() as u64 <= crate::cache::MAX_PARSED_FILE_BYTES {
@@ -565,15 +539,8 @@ fn tail() {}
         text.push_str("    return value\n");
         let dir = fixture(&text, "big.py");
         assert_eq!(
-            plan(
-                &requests(dir.path(), &["big.py#1-2"]),
-                &OutlineCache::new(),
-                40_000
-            ),
-            [Planned {
-                request: "big.py#1-2".into(),
-                next: None,
-            }]
+            sections(dir.path(), &["big.py#1-2"], 40_000),
+            [("big.py#1-2".to_string(), None)]
         );
     }
 
@@ -585,18 +552,14 @@ fn tail() {}
         let limit = SECTION_FRAME_BYTES + view.size(1, 2);
         assert!(view.size(3, 5) > view.size(1, 2), "the rest must not fit");
         assert_eq!(
-            plan(
-                &requests(dir.path(), &["q.rs#1-2"]),
-                &OutlineCache::new(),
-                limit
-            ),
-            [Planned {
-                request: "q.rs#1-2".into(),
-                next: Some(Continuation {
+            sections(dir.path(), &["q.rs#1-2"], limit),
+            [(
+                "q.rs#1-2".to_string(),
+                Some(Continuation {
                     request: "q.rs#3-3".into(),
                     stopped_before: false,
-                }),
-            }]
+                })
+            )]
         );
     }
 
