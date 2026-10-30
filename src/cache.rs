@@ -20,7 +20,7 @@ const MAX_OUTLINE_ENTRIES: usize = 2000;
 const MAX_PARSED_ENTRIES: usize = 500;
 
 /// Largest file the parsed-file cache accepts.
-const MAX_PARSED_FILE_BYTES: u64 = 500_000;
+pub(crate) const MAX_PARSED_FILE_BYTES: u64 = 500_000;
 
 /// Reservation attempts before `get_or_parse` parses once without caching.
 const MAX_LOAD_ATTEMPTS: usize = 3;

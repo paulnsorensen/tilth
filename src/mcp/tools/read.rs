@@ -12,6 +12,8 @@ use crate::cache::OutlineCache;
 use crate::mcp::path_suffix::PathSuffix;
 use crate::session::Session;
 
+mod plan;
+
 const PATHS_SHAPE_EXAMPLE: &str = "paths: [\"a.rs\", \"b.rs\"]";
 
 /// Header token pad reserved for truncation metadata (`truncated`,
@@ -72,11 +74,16 @@ pub(in crate::mcp) fn tool_read(
     }
 }
 
+/// Render the read of `args`. `batch` is set when the caller asked for more
+/// than one path, so a batch the planner merged to one section keeps the
+/// batch response shape.
 fn render_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     note_tokens: u64,
+    nexts: &[Option<plan::Continuation>],
+    batch: bool,
 ) -> Result<Rendered, String> {
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
     // `apply_budget` used by the other tools — an uncapped `mode=full` or
@@ -97,9 +104,9 @@ fn render_read(
     if paths_arr.is_empty() {
         return Err("paths must contain at least one file".into());
     }
-    if paths_arr.len() > 20 {
+    if paths_arr.len() > MAX_READ_PATHS {
         return Err(format!(
-            "batch read limited to 20 files (got {})",
+            "batch read limited to {MAX_READ_PATHS} files (got {})",
             paths_arr.len()
         ));
     }
@@ -155,7 +162,7 @@ fn render_read(
 
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
-    if paths.len() > 1 {
+    if batch {
         use rayon::prelude::*;
 
         // Per-path outcome. Workers are pure (read file, parse outline, format)
@@ -169,7 +176,8 @@ fn render_read(
 
         let outcomes: Vec<PerPath> = parsed
             .par_iter()
-            .map(|(path, suffix)| {
+            .enumerate()
+            .map(|(index, (path, suffix))| {
                 let _display_base = crate::format::set_display_base(Path::new(cwd));
                 // Label used for the `── omitted (raise budget) ──` footer when
                 // this part's rendered body does not fit the batch budget.
@@ -233,6 +241,7 @@ fn render_read(
                 ) {
                     return PerPath::Content(label, stub, None);
                 }
+                let body = with_continuation(body, &spec, nexts.get(index));
                 // Name the file; the wrapper records the lines this part's own
                 // span of the final response shows, so a follow-up tilth_write
                 // can verify the tag.
@@ -464,17 +473,24 @@ fn render_read(
                 budget,
             )));
         }
+        let next = nexts.first().and_then(Option::as_ref);
+        let mut meta = serde_json::Map::new();
+        if let Some(next) = next.filter(|_| shows_lines(&spec)) {
+            meta.insert("next_view".into(), Value::String(next.request.clone()));
+        }
+        let body = with_continuation(body, &spec, nexts.first());
         let parts =
             if should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full) {
                 vec![whole_part(&path, &spec, body.len())]
             } else {
                 Vec::new()
             };
-        // Suffix-driven reads carry no view-meta — the LLM declared the slice.
+        // Suffix-driven reads carry no view-meta — the LLM declared the slice —
+        // except the exact `next_view` of a section cut at a construct.
         // Cache token still rides along when if_modified_since was supplied.
         return Ok(finalize_parts(
             since.map(|_| now),
-            serde_json::Map::new(),
+            meta,
             &body,
             budget,
             parts,
@@ -617,6 +633,13 @@ const CUT_NOTE_RESERVE: usize = 600;
 /// Bytes the JSON header line and the file headers of a response can use.
 const HEADER_RESERVE: usize = 400;
 
+/// Bytes kept free beside a construct that a host cut moves back to, so the
+/// construct still fits one later response with its own section frame.
+const CONSTRUCT_FIT_RESERVE: usize = 300;
+
+/// Most paths one `tilth_read` call accepts.
+const MAX_READ_PATHS: usize = 20;
+
 /// Escaped bytes of the `Next:` path list in a cut note. Longer lists end in
 /// `(+K more)` so the note stays inside [`CUT_NOTE_RESERVE`].
 const NEXT_LIST_BUDGET: usize = 200;
@@ -727,6 +750,56 @@ fn truncated_prefix_len(original: &str, result: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether a view of `spec` shows any numbered line.
+fn shows_lines(spec: &crate::read::SeenSpec) -> bool {
+    !matches!(spec, crate::read::SeenSpec::Ranges(ranges) if ranges.is_empty())
+}
+
+/// `body` followed by the continuation note of its planned section, if any.
+/// An error body shows no line, so it gets no note.
+fn with_continuation(
+    body: String,
+    spec: &crate::read::SeenSpec,
+    next: Option<&Option<plan::Continuation>>,
+) -> String {
+    match next.and_then(Option::as_ref) {
+        Some(next) if shows_lines(spec) => format!("{body}\n\n{}", next.note()),
+        _ => body,
+    }
+}
+
+/// Plan the `paths` of `args`: merge close sections of one file and complete
+/// ranges that end inside a construct. `None` leaves a malformed request to
+/// the renderer, which reports it.
+fn plan_paths(args: &Value, cache: &OutlineCache) -> Option<Vec<plan::Planned>> {
+    let cwd = super::require_cwd(args).ok()?;
+    let paths = args.get("paths")?.as_array()?;
+    if paths.is_empty() || paths.len() > MAX_READ_PATHS {
+        return None;
+    }
+    let mut requests = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let raw = raw.as_str()?;
+        let (shown, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(raw);
+        let path = super::resolve_anchored(&shown, cwd).ok()?;
+        requests.push(plan::Request {
+            raw: raw.to_string(),
+            shown: shown.to_string_lossy().into_owned(),
+            path,
+            suffix,
+        });
+    }
+    let budget = args
+        .get("budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let budget_bytes = usize::try_from(budget.saturating_mul(4)).unwrap_or(usize::MAX);
+    let limit = budget_bytes
+        .min(HOST_VISIBLE_MAX - HOST_CAP_RESERVE)
+        .saturating_sub(CUT_NOTE_RESERVE + HEADER_RESERVE);
+    Some(plan::plan(&requests, cache, limit))
+}
+
 /// Render the read, cut it to the host limit, then record as seen exactly the
 /// numbered lines each file's own span of the final text shows. An error, an
 /// outline, a stub, or a cut-off tail shows no line, so it marks no line seen.
@@ -736,7 +809,27 @@ fn tool_read_paths(
     session: &Session,
     note_tokens: u64,
 ) -> Result<String, String> {
-    let rendered = render_read(args, cache, session, note_tokens)?;
+    let batch = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| paths.len() > 1);
+    let patched;
+    let mut nexts = Vec::new();
+    let args = match plan_paths(args, cache) {
+        Some(planned) => {
+            let mut clone = args.clone();
+            let mut paths = Vec::with_capacity(planned.len());
+            for item in planned {
+                paths.push(Value::String(item.request));
+                nexts.push(item.next);
+            }
+            clone["paths"] = Value::Array(paths);
+            patched = clone;
+            &patched
+        }
+        None => args,
+    };
+    let rendered = render_read(args, cache, session, note_tokens, &nexts, batch)?;
     let cwd = super::require_cwd(args)?;
     let _display_base = crate::format::set_display_base(Path::new(cwd));
     let requests: Vec<String> = args
@@ -753,6 +846,7 @@ fn tool_read_paths(
     let ctx = CutCtx {
         requests: &requests,
         mode,
+        cache,
     };
     let shown = cap_rendered(rendered, &ctx, HOST_VISIBLE_MAX - HOST_CAP_RESERVE);
     record_shown(session, &shown);
@@ -783,9 +877,25 @@ fn record_shown(session: &Session, shown: &Rendered) {
     }
 }
 
-/// Length of `text` once JSON-escaped, without the surrounding quotes.
+/// Length of `text` once JSON-escaped, without the surrounding quotes. It
+/// counts the escapes `serde_json` writes: two bytes for `"`, `\\`, and the
+/// short control escapes, six bytes for any other control byte.
 fn escaped_len(text: &str) -> usize {
-    serde_json::to_string(text).map_or(text.len(), |s| s.len().saturating_sub(2))
+    let mut len = 0;
+    for byte in text.bytes() {
+        len += match byte {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+    }
+    len
+}
+
+/// The `Next:` call that continues a response. `paths` is a JSON array and
+/// `extra` holds any further arguments, each led by `, `.
+fn next_call(paths: &str, extra: &str) -> String {
+    format!("Next: tilth_read(paths: {paths}{extra})")
 }
 
 /// The line number of an `N:content` row, or `None` for any other line.
@@ -812,15 +922,67 @@ fn numbered_ranges(text: &str) -> Vec<(u32, u32)> {
     ranges
 }
 
+/// `kept_end`, or the start of the line where the construct it cuts begins.
+/// The cut stays when the construct began before the part's first shown line,
+/// or when the construct alone would not fit a response either.
+fn construct_boundary(
+    text: &str,
+    kept_end: usize,
+    parts: &[Part],
+    ctx: &CutCtx,
+    limit: usize,
+) -> usize {
+    let Some(part) = parts
+        .iter()
+        .find(|part| part.start < kept_end && kept_end < part.end)
+    else {
+        return kept_end;
+    };
+    let (Some((path, _)), Some(seen)) = (&part.record, text.get(part.start..kept_end)) else {
+        return kept_end;
+    };
+    let shown = numbered_ranges(seen);
+    let (Some(&(first, _)), Some(&(_, last))) = (shown.first(), shown.last()) else {
+        return kept_end;
+    };
+    let hidden = text.get(kept_end..part.end).unwrap_or("");
+    if hidden.lines().find_map(numbered_line) != last.checked_add(1) {
+        return kept_end;
+    }
+    let Some(view) = plan::FileView::load(path) else {
+        return kept_end;
+    };
+    let Some((start, end)) = view.cut_at(last, ctx.cache) else {
+        return kept_end;
+    };
+    if start <= first {
+        return kept_end;
+    }
+    if view.size(start, end) > limit.saturating_sub(HEADER_RESERVE + CONSTRUCT_FIT_RESERVE) {
+        return kept_end;
+    }
+    let mut offset = part.start;
+    for line in seen.split_inclusive('\n') {
+        if numbered_line(line) == Some(start) {
+            return offset;
+        }
+        offset += line.len();
+    }
+    kept_end
+}
+
 /// The request that produced a response, for the continuation note.
 struct CutCtx<'a> {
     requests: &'a [String],
     mode: &'a str,
+    cache: &'a OutlineCache,
 }
 
 /// Cut `rendered` at a line boundary so its JSON-escaped size stays within
-/// `ceiling`. A cut response ends with the exact `tilth_read` call that
-/// continues it. The returned spans stop at the cut.
+/// `ceiling`. A cut inside a construct moves back to the line before the
+/// construct when the construct fits a response alone. A cut response ends
+/// with the exact `tilth_read` call that continues it. The returned spans
+/// stop at the cut.
 fn cap_rendered(rendered: Rendered, ctx: &CutCtx, ceiling: usize) -> Rendered {
     let Rendered { text, parts } = rendered;
     if escaped_len(&text) <= ceiling {
@@ -837,6 +999,7 @@ fn cap_rendered(rendered: Rendered, ctx: &CutCtx, ceiling: usize) -> Rendered {
         used += cost;
         kept_end += line.len();
     }
+    let kept_end = construct_boundary(&text, kept_end, &parts, ctx, limit);
     let note = cut_note(&text, kept_end, &parts, ctx, limit);
     let mut out = text[..kept_end].to_string();
     if !out.is_empty() && !out.ends_with('\n') {
@@ -956,7 +1119,7 @@ fn cut_note(text: &str, kept_end: usize, parts: &[Part], ctx: &CutCtx, limit: us
         } else {
             format!(", mode: \"{}\"", ctx.mode)
         };
-        let _ = write!(note, " Next: tilth_read(paths: {list}{mode})");
+        let _ = write!(note, " {}", next_call(&list, &mode));
         if more > 0 {
             let _ = write!(note, " (+{more} more)");
         }
