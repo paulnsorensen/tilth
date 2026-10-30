@@ -1484,14 +1484,32 @@ def test_judge_non_oauth_status_refuses_before_any_client_call(capsys: pytest.Ca
     assert client.prompts == [] and "oauth_token" in capsys.readouterr().err
 
 
-def test_judge_missing_oauth_token_is_refused(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_judge_without_token_refuses_a_token_status(monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
     statuses: list[dict] = []
     client = StubClient(answer="strong")
 
     assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses)) != 0
 
-    assert client.prompts == [] and statuses == [] and "CLAUDE_CODE_OAUTH_TOKEN" in capsys.readouterr().err
+    assert client.prompts == [] and statuses and "claude.ai" in capsys.readouterr().err
+
+
+def test_judge_login_session_uses_the_host_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    statuses: list[dict] = []
+    client = StubClient(answer="strong")
+
+    assert cli.main(_LABEL_ARGS, client=client, auth_spawn=_status_spawn(statuses, method="claude.ai")) == 0
+
+    assert len(client.prompts) == 1
+    assert [call["env"]["CLAUDE_CONFIG_DIR"] for call in statuses] == [os.environ["CLAUDE_CONFIG_DIR"]]
+    Path(os.environ["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
+    recorder = Recorder(claude_stream("strong", 0.01))
+    make_judge(core.ClaudeJudgeClient(spawn=recorder)).applicability(TASKS["gin_servehttp_flow"])
+    (call,) = recorder.calls
+    assert call["env"]["CLAUDE_CONFIG_DIR"] == os.environ["CLAUDE_CONFIG_DIR"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in call["env"]
 
 
 @pytest.fixture

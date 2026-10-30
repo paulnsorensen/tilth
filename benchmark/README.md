@@ -92,9 +92,10 @@ Before it plans any cell, `run.py` and `evolve/cli.py` probe that binary with `-
 `--allow-cli-drift` runs anyway; the run keys then differ from the stored cells, so those cells are bought again.
 To bump the pin on purpose: install the new version (`mise install aqua:anthropics/claude-code@<new>`), write it into `benchmark/claude-cli.version`, and commit.
 A bump invalidates every stored cell's run key, so every stored cell, baselines included, is bought again (`--refreeze-baselines` for stock arms).
-A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks `CLAUDE_CODE_OAUTH_TOKEN`.
+A Claude run bills the Claude subscription: through `CLAUDE_CODE_OAUTH_TOKEN` when it is set, else through the host's `claude /login` session.
+A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks subscription auth.
 It also refuses when a settings file that a cell loads sets one of these keys under `env` or sets `apiKeyHelper`; no runner receives any `ANTHROPIC_*` variable.
-Before the first paid cell, a Claude run also needs `CLAUDE_CODE_OAUTH_TOKEN` and a passing `claude auth status` preflight that reports `oauth_token` for each distinct cell environment.
+Before the first paid cell, a Claude run also needs a passing `claude auth status` preflight for each distinct cell environment: it must report the `firstParty` provider and `oauth_token` with the token, or `claude.ai` without it.
 A live Claude call can report an init `apiKeySource` other than `none`, report no `apiKeySource`, or send an assistant event before its init event.
 The run then records the cell as `infra: auth` and stops.
 Every paid run charges a persistent budget file at `$TILTH_BENCH_DATA/budgets/<budget_id>.jsonl`.
@@ -198,7 +199,7 @@ Judge calls share the `--max-usd` ceiling and pass its remaining headroom as `--
 The first usage-limit rejection stops every later judge call.
 The flags accept finite positive numbers only.
 `--budget-id NAME` keeps the judge spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`; without it, no budget file is written.
-Before the first uncached call, the judge runs one `claude auth status` check and refuses unless `CLAUDE_CODE_OAUTH_TOKEN` is set and the method is `oauth_token`.
+Before the first uncached call, the judge runs one `claude auth status` check and refuses unless it reports subscription auth (`oauth_token` with `CLAUDE_CODE_OAUTH_TOKEN`, else `claude.ai`).
 A judge call whose init event reports an API key raises an error, keeps its cost on the ledger, and discards its output.
 The maintainer hand-labels `benchmark/judge/calibration.json`.
 Its shape is `{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, with verdict `apt`, `missed`, or `misapplied`.
@@ -254,7 +255,8 @@ A stronger model, such as `sonnet`, costs more per token, so give it a larger bu
 `--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
 Evolve runs strict by default (`--no-strict-file-tools` opts out); see [evolve/README.md](evolve/README.md) for the seed-hook preflight and the hook gate.
 A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, passed `--strict-file-tools` with its hook commit equal to the evolve `--seed-sha`, and did not pass `--reasoning-effort`.
-The evolve run refuses before any paid call unless `CLAUDE_CODE_OAUTH_TOKEN` is set and `claude auth status` reports `oauth_token`.
+The evolve run refuses before any paid call unless `claude auth status` reports subscription auth (`oauth_token` with `CLAUDE_CODE_OAUTH_TOKEN`, else `claude.ai`).
+With the token, evolve and judge calls use an empty temp `CLAUDE_CONFIG_DIR`; with a `/login` session they keep the host config dir, which holds its credentials, and `--setting-sources ""` with `--strict-mcp-config` keeps its settings and MCP servers out.
 A call whose init event shows an API key stops the run with the `auth` reason, and its cost stays on the ledger.
 The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
 A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
@@ -546,7 +548,7 @@ python benchmark/run.py \
   --models sonnet --reps 1 --modes baseline,tilth --max-usd 5
 
 # Local three-way Sonnet 5 comparison: one Gin renderer task, five matched repetitions.
-# Set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
+# Log in with claude /login or set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
 # only its wozcode/auth.json is copied into each temporary Woz cell.
 TILTH_BIN=/absolute/path/to/target/release/tilth \
 CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \

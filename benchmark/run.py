@@ -211,7 +211,7 @@ _RUNTIME_ENV_KEYS = frozenset(
     }
 )
 # No runner bills Anthropic through the API or needs an ANTHROPIC_* setting:
-# Claude cells use CLAUDE_CODE_OAUTH_TOKEN, and a variable such as
+# Claude cells use the subscription (CLAUDE_CODE_OAUTH_TOKEN or /login), and a variable such as
 # ANTHROPIC_BASE_URL or ANTHROPIC_MODEL would redirect a cell outside its run key.
 _PROVIDER_AUTH_PREFIXES = ("OPENAI_", "OPENROUTER_")
 _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
@@ -252,10 +252,28 @@ def _isolated_config_dir() -> str:
     return path
 
 
+@contextmanager
+def isolated_claude_config(env: dict[str, str], prefix: str):
+    """Point ``env`` at an empty temp CLAUDE_CONFIG_DIR for one evolve or judge call when it uses the token.
+
+    A ``/login`` session keeps its credentials in the host config dir, so without the token the call keeps
+    the host dir. ``--setting-sources ""`` and ``--strict-mcp-config`` still keep its settings and MCP
+    servers out.
+    """
+    if not env.get(auth.OAUTH_TOKEN_KEY):
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix=prefix) as config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+        yield
+
+
 def isolated_call_target() -> auth.AuthTarget:
-    """The auth target of an evolve or judge call: temp cwd, temp CLAUDE_CONFIG_DIR, no settings sources."""
+    """The auth target of an evolve or judge call: temp cwd, no settings sources, and a temp
+    CLAUDE_CONFIG_DIR under the token (see ``isolated_claude_config``)."""
     env = dict(build_runner_env("claude", tilth_bin=None))
-    env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
+    if env.get(auth.OAUTH_TOKEN_KEY):
+        env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
     return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
 
 

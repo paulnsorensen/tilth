@@ -345,8 +345,7 @@ class ClaudeJudgeClient:
     def __call__(self, prompt: str) -> JudgeReply:
         env = run.build_runner_env("claude", tilth_bin=None)
         with (tempfile.TemporaryDirectory(prefix="tilth-judge-cwd-") as cwd,
-              tempfile.TemporaryDirectory(prefix="tilth-judge-config-") as config_dir):
-            env["CLAUDE_CONFIG_DIR"] = config_dir
+              run.isolated_claude_config(env, "tilth-judge-config-")):
             try:
                 completed = self.spawn(self.argv(self._headroom()), input=prompt, capture_output=True, text=True,
                                        cwd=cwd, env=env, timeout=self.timeout_s)
