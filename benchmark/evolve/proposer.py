@@ -98,7 +98,8 @@ class Proposer:
             with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
                 tar.extractall(root, filter="data")
             for name in TEXT_COMPONENTS:
-                (root / name).write_bytes(candidate[name].encode("utf-8"))
+                if name in candidate:
+                    (root / name).write_bytes(candidate[name].encode("utf-8"))
             if candidate[SRC_PATCH].strip():
                 git("apply", "--whitespace=nowarn", "-", cwd=root, input=candidate[SRC_PATCH])
             yield root

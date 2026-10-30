@@ -20,6 +20,8 @@ from typing import Iterable, Mapping
 
 from parse import extract_trajectory, output_chars
 
+from .candidate import PREAMBLE
+
 VERSION = 1
 ARMS = ("candidate", "baseline")
 BASE_EDIT = ("Edit", "Write", "MultiEdit")
@@ -40,6 +42,8 @@ HINTS = {
     "tilth_read_batched_4plus": "prompts/tools/read.md", "search_output": "src_patch",
     "write_errors": "prompts/tools/write.md", "read_breadth": "prompts/mcp.md",
 }
+# In a --preamble run the preamble asks the agent to read callers and helpers before an edit, so it steers breadth.
+PREAMBLE_HINTS = {**HINTS, "read_breadth": PREAMBLE}
 _SECTION_ERROR = re.compile(r"^error:", re.M)
 _BENCH_ROOT = re.compile(r"^/tmp/tilth-benchmark-[^/]+/repo/")
 
@@ -188,7 +192,7 @@ def _gather(rows: Iterable[Mapping], tasks: set[str]) -> tuple[dict[str, list[tu
     return cells, missing
 
 
-def _dominant(cand: dict, base: dict) -> list[dict]:
+def _dominant(cand: dict, base: dict, hints: Mapping[str, str]) -> list[dict]:
     g = lambda stats, *key: stats.get(key, 0.0)  # noqa: E731
     base_write = sum(g(base, "chars", t) - g(base, "errchars", t) for t in BASE_EDIT)
     base_write_err = sum(g(base, "errchars", t) for t in BASE_EDIT)
@@ -215,11 +219,13 @@ def _dominant(cand: dict, base: dict) -> list[dict]:
                       f"{shape} is {g(cand, 'shape_calls', 'tilth_read', shape) / (g(cand, 'calls', 'tilth_read') or 1):.0%}"
                       f" of reads and {share:.0%} of read chars"))
     ranked = sorted((f for f in found if f[1] > 0), key=lambda f: -f[1])[:MAX_DOMINANT]
-    return [{"cause": c, "excess_chars_per_cell": round(x, 1), "evidence": e, "component_hint": HINTS[c]}
+    return [{"cause": c, "excess_chars_per_cell": round(x, 1), "evidence": e, "component_hint": hints[c]}
             for c, x, e in ranked]
 
 
-def summarize(candidate_rows: Iterable[Mapping], baseline_rows: Iterable[Mapping], tasks: Iterable[str]) -> dict:
+def summarize(candidate_rows: Iterable[Mapping], baseline_rows: Iterable[Mapping], tasks: Iterable[str], *,
+              hints: Mapping[str, str] = HINTS) -> dict:
+    """The attribution of ``tasks``; ``hints`` maps each dominant cause to the component it names."""
     wanted = set(tasks)
     gathered = {arm: _gather(rows, wanted) for arm, rows in zip(ARMS, (candidate_rows, baseline_rows))}
     matched = sorted(set(gathered["candidate"][0]) & set(gathered["baseline"][0]))
@@ -264,5 +270,5 @@ def summarize(candidate_rows: Iterable[Mapping], baseline_rows: Iterable[Mapping
                           "edits_on_unread_files_per_cell": stats[arm].get(("unread_edits",), 0.0)} for arm in ARMS},
         "exposure": {arm: {"result_chars_times_remaining_api_turns_per_cell": exposure[arm]}
                      for arm in ARMS},
-        "dominant": _dominant(stats["candidate"], stats["baseline"]),
+        "dominant": _dominant(stats["candidate"], stats["baseline"], hints),
     }

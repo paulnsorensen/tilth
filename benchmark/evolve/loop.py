@@ -93,6 +93,8 @@ class Settings:
     deep_diagnosis_timeout: float = deepdiag.DEFAULT_TIMEOUT_S
     # One repair call for a src_patch proposal whose child fails apply or `just check`.
     repair: bool = True
+    # The candidate arm runs with prompts/preamble.md as its system prompt, and the preamble is a text component.
+    preamble: bool = False
 
 
 def forbidden_terms(panel_path: Path) -> list[str]:
@@ -334,7 +336,7 @@ class Evolution:
                                             failing_tests=self._failing_tests_of, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
-                                         forbidden=self._forbidden_terms())
+                                         forbidden=self._forbidden_terms(), preamble=settings.preamble)
         # Without a cargo runner the integrity stage is off; the stub gates of the offline tests run no cargo.
         self.integrity = (Integrity(settings.repo, settings.seed_sha, self.run_dir / "worktrees", cargo)
                           if cargo is not None else None)
@@ -392,7 +394,8 @@ class Evolution:
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
                                     cell_estimate_usd=self.settings.cell_estimate_usd,
                                     max_budget_usd=self.settings.cell_budget_usd, store_only=store_only,
-                                    repo=self.settings.repo, **self._strict_plan_kwargs())
+                                    repo=self.settings.repo, preamble=self.settings.preamble,
+                                    **self._strict_plan_kwargs())
         except run.PlanStopped as stopped:
             self.log(f"cells: stopped ({stopped})")
             self.stop.set(stopped.reason)
@@ -901,8 +904,9 @@ class Evolution:
         """Attribute a candidate's paid dev rows once per content id; replay its src change when asked."""
         if result.attribution is None:
             try:
+                hints = {"hints": cost_attribution.PREAMBLE_HINTS} if self.settings.preamble else {}
                 result.attribution = cost_attribution.summarize(result.rows, self.dev_baseline_rows or [],
-                                                                self.panel.dev)
+                                                                self.panel.dev, **hints)
             except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
                 self.log(f"attribution {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
             else:

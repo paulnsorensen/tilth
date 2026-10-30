@@ -14,14 +14,14 @@ from collections.abc import Callable, Mapping, Sequence
 from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig, optimize_anything
 
 from .calls import PaidCalls, StopState
-from .candidate import MAX_BYTES, OBJECTIVE, SRC_PATCH, content_id
+from .candidate import MAX_BYTES, OBJECTIVE, PREAMBLE, SRC_PATCH, content_id
 from .diagnosis import DIAGNOSIS_NOTE, DIRECTIVE_NOTE, REFLECTION_HYPOTHESIS, HypothesisBook
 from .source_map import entries_for
 
 __all__ = ["Dispatcher", "ReflectionClient", "StopState", "Stopper", "optimize", "reflection_prompt"]
 
 REFLECTION_HEADER = (
-    "You are revising one instruction file that the tilth MCP server sends to AI coding agents. "
+    "You are revising one instruction file that tilth gives to AI coding agents. "
     "Below are its current text and reflective records of agents' rollouts on benchmark tasks: each record "
     "holds the task prompt, the rollout's row fields, and its full tool-call trajectory, and may carry an "
     f"applicability label and a critique. {OBJECTIVE} Rewrite the file so agents solve tasks like these at "
@@ -44,19 +44,31 @@ _CLIPPY_HELP = re.compile(r"^\s*= help: for further information visit https://ru
                          r"index\.html#[\w-]+", re.M)
 _TEST_FAILURE = re.compile(r"^(?:failures:|---- .* ----|thread '.*' panicked)", re.M)
 SCORE_FIELDS = ("task_scores", "pass_rate", "mean_cost", "baseline_cost")
-SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, the size of "
-             "the MCP field it fills, so remove at least as much text as you add; a longer file is refused "
+SIZE_NOTE = ("The current file is {size} bytes. The new file must be at most {max_bytes} UTF-8 bytes, its size "
+             "cap, so remove at least as much text as you add; a longer file is refused "
              "and never scored.")
-SHORTEN_PROMPT = ("Your rewrite of one instruction file for the tilth MCP server is {size} UTF-8 bytes. Its MCP "
-                  "field holds at most {max_bytes} bytes. Shorten the file to at most {max_bytes} bytes "
+SHORTEN_PROMPT = ("Your rewrite of one instruction file for tilth is {size} UTF-8 bytes. Its size "
+                  "cap is {max_bytes} bytes. Shorten the file to at most {max_bytes} bytes "
                   "and keep its most important guidance. Reply with the complete new file text between <new_text> "
                   "and </new_text>, and nothing else.")
 
 
-def reflection_prompt(text: str, records: list[dict], *, max_bytes: int | None = None) -> str:
-    """The reflection prompt: a fixed header (with the byte cap when the file has one), the text, and the records."""
-    note = None if max_bytes is None else SIZE_NOTE.format(size=len(text.encode("utf-8")), max_bytes=max_bytes)
-    header = REFLECTION_HEADER if note is None else f"{REFLECTION_HEADER} {note}"
+# The preamble is not an MCP field. tests/launch_preamble.rs pins these headings, and `just check` runs it.
+PREAMBLE_NOTE = ("This file is the agent's whole system prompt: it replaces the host's own system prompt, and the "
+                 "tilth MCP server sends its own instructions beside it. Keep exactly one `# ` heading, and keep "
+                 "the word tilth in it. Keep the `## Tools`, `## Safety`, and `## Verification` heading lines. "
+                 "A test refuses a file without them.")
+
+
+def reflection_prompt(text: str, records: list[dict], *, max_bytes: int | None = None, name: str | None = None) -> str:
+    """The reflection prompt: a fixed header (with the byte cap when the file has one, and the preamble note for
+    the preamble), the text, and the records."""
+    notes = [REFLECTION_HEADER]
+    if name == PREAMBLE:
+        notes.append(PREAMBLE_NOTE)
+    if max_bytes is not None:
+        notes.append(SIZE_NOTE.format(size=len(text.encode("utf-8")), max_bytes=max_bytes))
+    header = " ".join(notes)
     rendered = json.dumps(records, indent=2, sort_keys=True)
     return f"{header}\n\n<current>\n{text}\n</current>\n\n<records>\n{rendered}\n</records>\n"
 
@@ -87,7 +99,7 @@ class ReflectionClient:
 
     def __call__(self, name: str, text: str, records: list[dict]) -> str:
         limit = MAX_BYTES.get(name)
-        new = self._ask(name, reflection_prompt(text, records, max_bytes=limit), offer=True)
+        new = self._ask(name, reflection_prompt(text, records, max_bytes=limit, name=name), offer=True)
         if new is None:
             return text
         size = len(new.encode("utf-8"))

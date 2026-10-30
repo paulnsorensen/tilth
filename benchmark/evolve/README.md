@@ -24,6 +24,28 @@ The dispatcher sends reflection and the `src/` proposer one `scores` record per 
 rates, mean costs, baseline costs) and one `cost_pairs` record per task. Both prompts state the score
 (`candidate.OBJECTIVE`) and ask for lower cost without lost correctness.
 
+## Preamble mode
+
+`--preamble` (default off) runs the candidate arm with the launcher preamble, `prompts/preamble.md`, as its whole
+system prompt. This is the prompt that `tilth claude` gives the agent. The baseline arm keeps the harness prompt.
+`run.run_plan(preamble=True)` reads the preamble at the commit of each candidate, so each cell sees the text of its
+own candidate. The preamble text is part of the run key.
+
+In this mode the preamble is a sixth text component. The seed reads it at `--seed-sha`; a seed without the file
+refuses the run (exit 2). The selector, reflection, the proposer export, and the materializer handle it like the
+four MCP texts. Its cap is 4096 bytes (`candidate.MAX_BYTES`); the seed file is about 3 KB. Reflection on the
+preamble gets `engine.PREAMBLE_NOTE`: the file is the system prompt, and it must keep one `# ` heading that names
+tilth and the `## Tools`, `## Safety`, and `## Verification` headings. Attribution maps the `read_breadth` cause to
+the preamble (`attribution.PREAMBLE_HINTS`), because the preamble tells the agent which code to read before an
+edit. The other causes keep their hints.
+
+The preamble has no byte lock and no phrase pin. `tests/launch_preamble.rs` guards its headings and refuses
+personal-policy terms. `just check` runs that test through `cargo test`, so a candidate that breaks the guard
+fails at stage `just check`. A candidate cannot edit the test, because `tests/` is outside the allowlist.
+
+Without `--preamble`, the seed and every candidate hold only the four MCP texts. The materializer refuses a
+candidate that carries the preamble then, and a candidate that drops a seed component in either mode (stage
+`apply`). A key that names no component is not written, as before.
 ## Diagnosis records
 
 After a candidate's paid dev tier, `attribution.summarize` runs once per content id on the candidate's dev
