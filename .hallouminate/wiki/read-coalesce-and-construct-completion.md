@@ -10,12 +10,23 @@ It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.
 
 - **Coalesce.** Sections of one file that overlap or lie at most `COALESCE_GAP` (3) lines apart merge into one `path#a-b` section with one `[path#TAG]` header. The merged section takes the slot of its first request, so output order stays deterministic.
 - **Complete.** An explicit `#n-m` range whose end cuts a construct grows to the construct's end when the whole response stays within the limit. The limit is the smaller of `budget` and the host cap, less the cut-note and header reserves and 160 bytes of framing per request.
-- **Fall back.** When the growth does not fit, the range stops on the line before the construct and ends with `... Next: tilth_read(paths: ["path#start-end"])`. A single-path read also gets `next_view: "path#start-end"` in its JSON header. The range keeps its end, and the continuation covers the rest of the construct, in three cases: the construct alone would not fit, the construct began before the range, or a request of the section starts inside the construct.
+- **Fall back.** When the growth does not fit, the range stops on the line before the construct and ends with `... Next: tilth_read(paths: ["path#start-end"])`. The JSON header names the same request in `next_view`: a string for a single-path read, and for a batch an array of the shortened sections' requests in section order (see [Batch `next_view`](#batch-next_view)). The range keeps its end, and the continuation covers the rest of the construct, in three cases: the construct alone would not fit, the construct began before the range, or a request of the section starts inside the construct.
 - **Overflow.** When the section does not fit even after it stops, the planner keeps the request as written and adds no continuation. The host cut then names the rest of the requested range, so no requested line falls out of the `Next:` chain.
 - **Host cut.** A response cut at `HOST_VISIBLE_MAX` inside a construct moves its cut back to the line before the construct, under the same "fits alone" rule. The existing cut note then names the construct's start.
 - **Large files.** A file larger than `MAX_PARSED_FILE_BYTES` (500 KB) gets no construct lookup, because the parsed-file cache does not keep it and every call would parse it again. Its ranges never grow, and a host cut inside one of its constructs stays where it falls.
 
 Seen-line provenance needs no new code: `record_shown` still records the numbered lines that each part's span of the final text shows.
+
+## Batch `next_view`
+
+A batch header lists a continuation only when the body shows its `Next:` note. `render_read` keeps each section's request in `Slot.next`, and `batch_meta` builds the array from the final layout:
+
+- `shown_next` gives a section a continuation only when its view shows lines. A stub, an error, or an outline adds no note and no entry, the same as the single-path filter.
+- A section that the batch budget clips loses its note, so it adds no entry. A section moved to `── omitted (raise budget) ──` and a batch that collapses to counts add none.
+- The key is absent when no entry remains. The single-path shape (`next_view` as a string) and the note text do not change.
+- The body budget uses the header with every planned entry. The final header names the same entries or fewer, so it never makes the response larger than the budget.
+
+Both notes, the planner's `Continuation::note` and the host `cut_note`, format the call through the one `next_call` helper, so the two `Next:` spellings match.
 
 ## Why the gap is 3
 
@@ -42,4 +53,4 @@ Across 769 tilth-arm sessions and 2,656 `tilth_read` calls in gepa-v3 r1-r6, the
 
 The measurement script and its definitions are in the body of PR #415.
 
-_Source: PR #415 (branch t3/coalesce-complete-read-ranges) · Updated: 2026-10-30_
+_Source: PR #415 (branch t3/coalesce-complete-read-ranges); batch `next_view` from branch t3/batch-next-view-header · Updated: 2026-10-30_
