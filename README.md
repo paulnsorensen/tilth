@@ -263,6 +263,7 @@ claude --append-system-prompt "$(tilth preamble)"         # add it after the bui
 
 - The text is the same text that `tilth claude` and `tilth codex` use.
 - `--path` uses the same cache file and the same directory checks as the launcher.
+- The preamble tells the agent to use the tilth tools, so register the tilth MCP server in that harness too (see [MCP server](#mcp-server)).
 
 ### Smaller models
 
