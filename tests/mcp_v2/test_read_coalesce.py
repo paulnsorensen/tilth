@@ -187,6 +187,45 @@ class ReadCoalesce(unittest.TestCase):
         self.assertEqual(shown(text), list(range(201, 451)), text[-400:])
         self.assertNotIn("Next:", text)
 
+    # A batch names each shortened section's continuation in its header too.
+    def test_batch_header_names_the_shortened_section(self):
+        self.write_file("h.py", self.over_budget_source())
+        self.write_file("g.py", flat(3))
+        result = self.run_session(self.read(2, ["g.py#1-3", "h.py#1-210"]))
+        text = harness.tool_result_text(result.response_by_id(2))
+        spec = "h.py#201-450"
+        self.assertIn(f'Next: tilth_read(paths: ["{spec}"])', text)
+        self.assertEqual(header(text).get("next_view"), [spec], text[:200])
+
+    def test_batch_header_drops_next_view_when_nothing_is_shortened(self):
+        self.write_file("h.py", self.over_budget_source())
+        self.write_file("f.py", flat(120))
+        self.write_file("g.py", flat(3))
+        result = self.run_session(
+            self.read(2, ["g.py#1-3", "h.py#1-210"]),
+            self.read(3, ["f.py#10-20", "g.py#1-3"]))
+        shortened = harness.tool_result_text(result.response_by_id(2))
+        self.assertEqual(header(shortened).get("next_view"), ["h.py#201-450"],
+                         shortened[:200])
+        text = harness.tool_result_text(result.response_by_id(3))
+        self.assertNotIn("Next:", text)
+        meta = header(text)
+        self.assertIn("if_modified_since", meta, text[:200])
+        self.assertNotIn("next_view", meta, text[:200])
+
+    # A shortened section that shows no line (here an unchanged-reread stub)
+    # adds no entry, the same as it gets no `Next:` note.
+    def test_batch_header_skips_a_shortened_section_that_shows_no_line(self):
+        self.write_file("h.py", self.over_budget_source())
+        self.write_file("g.py", flat(3))
+        result = self.run_session(
+            self.read(2, ["h.py#1-210"]),
+            self.read(3, ["g.py#1-3", "h.py#1-210"]))
+        text = harness.tool_result_text(result.response_by_id(3))
+        self.assertIn("unchanged since your last read", text)
+        self.assertNotIn("Next: tilth_read", text)
+        self.assertNotIn("next_view", header(text), text[:200])
+
     # A range larger than one response keeps its request. The host cut then
     # continues it up to the requested end, past the construct it cuts.
     def oversize_source(self):
