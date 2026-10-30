@@ -14,10 +14,11 @@ from auth import AuthTarget, ClaudeAuthError, InitGate, check_captured, prefligh
 
 SECRET = "sk-ant-SECRETVALUE-9f3a"
 GOOD_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-fixture"}
+TOKEN_STATUS = '{"authMethod": "oauth_token", "apiProvider": "firstParty"}'
 
 
 class Spawn:
-    def __init__(self, stdout: str = '{"authMethod": "oauth_token"}', returncode: int = 0) -> None:
+    def __init__(self, stdout: str = TOKEN_STATUS, returncode: int = 0) -> None:
         self.stdout, self.returncode, self.calls = stdout, returncode, []
 
     def __call__(self, argv, **kwargs):
@@ -62,11 +63,13 @@ def test_without_token_only_a_login_session_passes(tmp_path: Path, method: str |
 
 
 @pytest.mark.parametrize("env", [{}, GOOD_ENV], ids=["login", "token"])
-@pytest.mark.parametrize("provider", ["bedrock", "vertex", None])
+@pytest.mark.parametrize("provider", ["bedrock", "vertex", None, "omitted"])
 def test_non_first_party_provider_refused(tmp_path: Path, env: dict, provider: str | None) -> None:
-    method = "oauth_token" if env else "claude.ai"
+    status = {"authMethod": "oauth_token" if env else "claude.ai"}
+    if provider != "omitted":
+        status["apiProvider"] = provider
     with pytest.raises(ClaudeAuthError, match="apiProvider"):
-        run(tmp_path, target(tmp_path, env), Spawn(json.dumps({"authMethod": method, "apiProvider": provider})))
+        run(tmp_path, target(tmp_path, env), Spawn(json.dumps(status)))
 
 
 @pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
@@ -151,7 +154,7 @@ def test_wrong_auth_method_refused_naming_cwd_and_method(tmp_path: Path, method:
 
 def test_nonzero_exit_refused_even_with_oauth_method(tmp_path: Path) -> None:
     with pytest.raises(ClaudeAuthError, match="exit 1"):
-        run(tmp_path, target(tmp_path), Spawn('{"authMethod": "oauth_token"}', returncode=1))
+        run(tmp_path, target(tmp_path), Spawn(TOKEN_STATUS, returncode=1))
 
 
 @pytest.mark.parametrize("stdout", ["not json", "", "[1]", "{}"])

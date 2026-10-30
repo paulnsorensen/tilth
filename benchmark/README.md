@@ -176,7 +176,7 @@ The first completed stored row for a panel name locks its split: a later split c
 
 `benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability.
 It also critiques stripped rollouts for reflection.
-It uses the claude CLI alias `opus` (`--model opus`) through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN`.
+It uses the claude CLI alias `opus` (`--model opus`) through an isolated, tool-less `claude -p` on the Claude subscription: `CLAUDE_CODE_OAUTH_TOKEN` when it is set, else the host `/login` session.
 The alias follows the newest opus release, and cache keys and calibration records store only `opus`.
 Evolve reflection and the proposer use the claude CLI alias `sonnet`.
 The call has no tools, MCP servers, settings, or hooks, and the prompt goes on stdin.

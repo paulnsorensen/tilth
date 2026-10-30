@@ -122,7 +122,7 @@ The label cache key is `sha256(subject, model, prompt_hash)`, where the subject 
 ### Judge call isolation
 
 - Every judge call runs `claude -p --output-format stream-json --verbose --model JUDGE_MODEL --tools "" --strict-mcp-config --setting-sources "" --no-session-persistence --disable-slash-commands` (`benchmark/judge/core.py:324-333`). It never passes `--bare`, which refuses OAuth, or `--mcp-config`.
-- The call runs in a fresh empty temporary cwd with a fresh empty `CLAUDE_CONFIG_DIR`. So no settings, hooks, MCP servers, or files load (`benchmark/judge/core.py:339-342`).
+- The call runs in a fresh empty temporary cwd. With `CLAUDE_CODE_OAUTH_TOKEN` set it also gets a fresh empty `CLAUDE_CONFIG_DIR`; a `/login` session keeps the host `CLAUDE_CONFIG_DIR`, which holds its credentials. In both modes `--setting-sources ""` and `--strict-mcp-config` keep settings, hooks, and MCP servers out (`benchmark/judge/core.py`, `isolated_claude_config` in `benchmark/run.py`).
 - `stripped_record` is the one grader-free view of a rollout: the task prompt, allowlisted row fields, integer `f2p_`/`p2p_` counts, and the verbatim sidecar (`benchmark/judge/core.py:131`). It raises `UnresolvableTask` when the task does not resolve. Evolve builds its reflective records with it (`_records`, `benchmark/evolve/loop.py:394-417`).
 - The default resolver loads a cached external task without admission (`default_resolve_task`, `benchmark/judge/core.py:112-119`). The judge must read rollouts of tasks that admission may since refuse.
 - `critique` withholds a row as `contaminated` (when `contaminated` is not exactly false), `no-trajectory`, or `uncalibrated` before any call (`benchmark/judge/core.py:397-405`).

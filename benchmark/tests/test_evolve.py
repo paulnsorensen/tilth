@@ -2423,7 +2423,7 @@ def _budget_records(name: str) -> list[dict]:
 def _status_spawn(calls: list[dict], method: str = "oauth_token"):
     def spawn(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method, "apiProvider": "firstParty"}), "")
     return spawn
 
 

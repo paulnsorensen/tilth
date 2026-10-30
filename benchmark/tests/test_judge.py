@@ -1397,7 +1397,7 @@ _LABEL_ARGS = ["label", "--tasks", "rg_search_dispatch", "--max-usd", "5", "--ce
 def _status_spawn(calls: list[dict], method: str = "oauth_token") -> Callable:
     def spawn(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         calls.append({"argv": list(argv), **kwargs})
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method, "apiProvider": "firstParty"}), "")
     return spawn
 
 

@@ -129,7 +129,7 @@ def _require_subscription_status(target: AuthTarget, spawn: Callable[..., subpro
     try:
         payload = json.loads(completed.stdout or "")
         if isinstance(payload, dict):
-            method, provider = payload.get("authMethod"), payload.get("apiProvider", FIRST_PARTY)
+            method, provider = payload.get("authMethod"), payload.get("apiProvider")
     except json.JSONDecodeError:
         pass
     expected = expected_method(target.env)
