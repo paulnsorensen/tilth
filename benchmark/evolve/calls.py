@@ -2,7 +2,6 @@
 
 import os
 import subprocess
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,8 +109,7 @@ class PaidCalls:
             # The CLI itself stops a call before it spends past what the run has left.
             argv = [*argv, "--max-budget-usd", f"{headroom:.4f}"]
         env = run.build_runner_env("claude", tilth_bin=None)
-        with tempfile.TemporaryDirectory(prefix=f"tilth-{kind}-config-") as config_dir:
-            env["CLAUDE_CONFIG_DIR"] = config_dir
+        with run.isolated_claude_config(env, f"tilth-{kind}-config-"):
             try:
                 completed = self.spawn(argv, input=prompt, capture_output=True, text=True, cwd=str(cwd), env=env,
                                        timeout=self.timeout_s)

@@ -68,11 +68,11 @@ A paid call never spends into the finish reserve.
 
 ## Claude auth guard
 
-No `claude -p` call may authenticate with anything other than `CLAUDE_CODE_OAUTH_TOKEN` (`benchmark/auth.py`, PR #334).
+No `claude -p` call may authenticate with anything other than the Claude subscription (`benchmark/auth.py`, PR #334). Subscription auth is `CLAUDE_CODE_OAUTH_TOKEN` when it is set, else the host `claude /login` session (`authMethod` `claude.ai`, added 2026-10-30).
 
 - `refuse_env` refuses `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, the three `CLAUDE_CODE_USE_*` provider flags, and both federation variables, because each outranks the OAuth token (`REFUSED_ENV_KEYS`, `benchmark/auth.py:29`). Refusals name the key, never the value.
-- `preflight_claude_auth` runs before any paid call, once per distinct cell target. It requires the token, scans the managed settings and, when the cell loads them, the user, project, and local settings for a refused `env` key or `apiKeyHelper`, and requires `claude auth status` to report `oauth_token` (`benchmark/auth.py:87,141`). A passed status is cached per process.
-- A target is the seed repo and seed config dir that each cell copies, so the check is conservative (`claude_auth_targets`, `benchmark/run.py:220`). Evolve and judge calls use one temp-cwd, temp-config target with no settings sources.
+- `preflight_claude_auth` runs before any paid call, once per distinct cell target. It scans the managed settings and, when the cell loads them, the user, project, and local settings for a refused `env` key or `apiKeyHelper`. It requires `claude auth status` to report the `firstParty` provider and `expected_method`: `oauth_token` with the token, `claude.ai` without it (`benchmark/auth.py`). A passed status is cached per process.
+- A target is the seed repo and seed config dir that each cell copies, so the check is conservative (`claude_auth_targets`, `benchmark/run.py:220`). Evolve and judge calls use one temp-cwd target with no settings sources. Under the token it also gets a temp config dir; a `/login` session keeps the host config dir, because its credentials live there (`isolated_claude_config`, `benchmark/run.py`). A live probe on 2026-10-30 (claude 2.1.310) showed `apiKeySource` `none` under `/login` and no user `CLAUDE.md` with `--setting-sources ""`.
 - `InitGate` stops a live cell whose init `apiKeySource` is not `none`, has no `apiKeySource`, or sends an assistant event before init. The cell is charged and stored as `infra: auth`, and the run stops (`benchmark/auth.py:176`, `benchmark/run.py:1252`). Evolve and judge replay captured stdout through `check_captured` (`benchmark/auth.py:197`).
 - The allowlist `{"none"}` comes from a live probe on 2026-10-16 with claude 2.1.301 and only the token set: `authMethod` was `oauth_token` and init `apiKeySource` was `none` (`ALLOWED_API_KEY_SOURCES`, `benchmark/auth.py:43`). `none` alone does not prove the token; the status check gives the positive proof.
 
@@ -122,7 +122,7 @@ The label cache key is `sha256(subject, model, prompt_hash)`, where the subject 
 ### Judge call isolation
 
 - Every judge call runs `claude -p --output-format stream-json --verbose --model JUDGE_MODEL --tools "" --strict-mcp-config --setting-sources "" --no-session-persistence --disable-slash-commands` (`benchmark/judge/core.py:324-333`). It never passes `--bare`, which refuses OAuth, or `--mcp-config`.
-- The call runs in a fresh empty temporary cwd with a fresh empty `CLAUDE_CONFIG_DIR`. So no settings, hooks, MCP servers, or files load (`benchmark/judge/core.py:339-342`).
+- The call runs in a fresh empty temporary cwd. With `CLAUDE_CODE_OAUTH_TOKEN` set it also gets a fresh empty `CLAUDE_CONFIG_DIR`; a `/login` session keeps the host `CLAUDE_CONFIG_DIR`, which holds its credentials. In both modes `--setting-sources ""` and `--strict-mcp-config` keep settings, hooks, and MCP servers out (`benchmark/judge/core.py`, `isolated_claude_config` in `benchmark/run.py`).
 - `stripped_record` is the one grader-free view of a rollout: the task prompt, allowlisted row fields, integer `f2p_`/`p2p_` counts, and the verbatim sidecar (`benchmark/judge/core.py:131`). It raises `UnresolvableTask` when the task does not resolve. Evolve builds its reflective records with it (`_records`, `benchmark/evolve/loop.py:394-417`).
 - The default resolver loads a cached external task without admission (`default_resolve_task`, `benchmark/judge/core.py:112-119`). The judge must read rollouts of tasks that admission may since refuse.
 - `critique` withholds a row as `contaminated` (when `contaminated` is not exactly false), `no-trajectory`, or `uncalibrated` before any call (`benchmark/judge/core.py:397-405`).

@@ -140,7 +140,8 @@ def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.setattr(auth, "_PASSED_STATUS", set())
     monkeypatch.setattr(
         auth, "_run_status",
-        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"authMethod": "oauth_token"}', ""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, '{"authMethod": "oauth_token", "apiProvider": "firstParty"}', ""),
     )
 
 

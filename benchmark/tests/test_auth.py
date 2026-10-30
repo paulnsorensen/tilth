@@ -14,10 +14,11 @@ from auth import AuthTarget, ClaudeAuthError, InitGate, check_captured, prefligh
 
 SECRET = "sk-ant-SECRETVALUE-9f3a"
 GOOD_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-fixture"}
+TOKEN_STATUS = '{"authMethod": "oauth_token", "apiProvider": "firstParty"}'
 
 
 class Spawn:
-    def __init__(self, stdout: str = '{"authMethod": "oauth_token"}', returncode: int = 0) -> None:
+    def __init__(self, stdout: str = TOKEN_STATUS, returncode: int = 0) -> None:
         self.stdout, self.returncode, self.calls = stdout, returncode, []
 
     def __call__(self, argv, **kwargs):
@@ -43,17 +44,47 @@ def write(path: Path, data) -> Path:
     return path
 
 
+LOGIN = json.dumps({"authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"})
+
+
 # AC-15
-def test_missing_oauth_token_refused_and_spawn_never_called(tmp_path: Path) -> None:
-    spawn = Spawn()
-    with pytest.raises(ClaudeAuthError, match="CLAUDE_CODE_OAUTH_TOKEN"):
-        run(tmp_path, target(tmp_path, {}), spawn)
+@pytest.mark.parametrize("env", [{}, {"CLAUDE_CODE_OAUTH_TOKEN": ""}], ids=["unset", "empty"])
+def test_login_session_passes_without_token(tmp_path: Path, env: dict) -> None:
+    spawn = run(tmp_path, target(tmp_path, env), Spawn(LOGIN))
+    assert [argv for argv, _ in spawn.calls] == [["claude", "auth", "status"]]
+
+
+@pytest.mark.parametrize("method", ["oauth_token", "api_key", None])
+def test_without_token_only_a_login_session_passes(tmp_path: Path, method: str | None) -> None:
+    tgt = target(tmp_path, {})
+    with pytest.raises(ClaudeAuthError, match="expected 'claude.ai' from a claude /login") as caught:
+        run(tmp_path, tgt, Spawn(json.dumps({"authMethod": method})))
+    assert str(tgt.cwd) in str(caught.value)
+
+
+@pytest.mark.parametrize("env", [{}, GOOD_ENV], ids=["login", "token"])
+@pytest.mark.parametrize("provider", ["bedrock", "vertex", None, "omitted"])
+def test_non_first_party_provider_refused(tmp_path: Path, env: dict, provider: str | None) -> None:
+    status = {"authMethod": "oauth_token" if env else "claude.ai"}
+    if provider != "omitted":
+        status["apiProvider"] = provider
+    with pytest.raises(ClaudeAuthError, match="apiProvider"):
+        run(tmp_path, target(tmp_path, env), Spawn(json.dumps(status)))
+
+
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_login_mode_still_refuses_api_keys_before_spawn(tmp_path: Path, key: str) -> None:
+    spawn = Spawn(LOGIN)
+    with pytest.raises(ClaudeAuthError, match=key):
+        run(tmp_path, target(tmp_path, {key: SECRET}), spawn)
     assert spawn.calls == []
 
 
-def test_empty_oauth_token_refused(tmp_path: Path) -> None:
-    with pytest.raises(ClaudeAuthError, match="CLAUDE_CODE_OAUTH_TOKEN"):
-        run(tmp_path, target(tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": ""}))
+def test_login_mode_still_refuses_api_key_helper(tmp_path: Path) -> None:
+    tgt = target(tmp_path, {})
+    write(tgt.cwd / ".claude" / "settings.json", {"apiKeyHelper": "x"})
+    with pytest.raises(ClaudeAuthError, match="apiKeyHelper"):
+        run(tmp_path, tgt, Spawn(LOGIN))
 
 
 # AC-16
@@ -111,7 +142,7 @@ def test_failed_status_probe_is_not_cached(tmp_path: Path, monkeypatch: pytest.M
     assert len(bad.calls) == 1 and len(good.calls) == 1
 
 
-# AC-17
+# AC-17: with the token set, a login session means the token is ignored, so it is refused too.
 @pytest.mark.parametrize("method", ["api_key", "claude.ai"])
 def test_wrong_auth_method_refused_naming_cwd_and_method(tmp_path: Path, method: str) -> None:
     tgt = target(tmp_path)
@@ -123,7 +154,7 @@ def test_wrong_auth_method_refused_naming_cwd_and_method(tmp_path: Path, method:
 
 def test_nonzero_exit_refused_even_with_oauth_method(tmp_path: Path) -> None:
     with pytest.raises(ClaudeAuthError, match="exit 1"):
-        run(tmp_path, target(tmp_path), Spawn('{"authMethod": "oauth_token"}', returncode=1))
+        run(tmp_path, target(tmp_path), Spawn(TOKEN_STATUS, returncode=1))
 
 
 @pytest.mark.parametrize("stdout", ["not json", "", "[1]", "{}"])

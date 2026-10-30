@@ -1,11 +1,12 @@
 """Subscription-only auth guard for every ``claude -p`` subprocess the benchmark starts.
 
-A run must bill the subscription through ``CLAUDE_CODE_OAUTH_TOKEN``, never an API key. Three layers
-enforce it, because under ``claude -p`` an API key from any source outranks the token:
+A run must bill the Claude subscription, never an API key. It authenticates through
+``CLAUDE_CODE_OAUTH_TOKEN`` when that is set, else through the host's ``claude /login`` session. Three
+layers enforce it, because under ``claude -p`` an API key from any source outranks both:
 
-1. ``preflight_claude_auth`` refuses before any paid call: a missing token, a refused environment
-   variable, a refused key in a settings file the call loads, or a ``claude auth status`` method other
-   than ``oauth_token`` (the positive proof).
+1. ``preflight_claude_auth`` refuses before any paid call: a refused environment variable, a refused key
+   in a settings file the call loads, or a ``claude auth status`` method other than the expected one
+   (the positive proof): ``oauth_token`` with the token, ``claude.ai`` without it.
 2. ``InitGate`` checks the ``apiKeySource`` of a live subprocess's init event, and that no assistant
    event arrives before it.
 3. ``check_captured`` replays a captured stream through one gate for calls that do not stream live.
@@ -22,6 +23,10 @@ from pathlib import Path
 from jsonl import tolerant_jsonl
 
 OAUTH_TOKEN_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
+TOKEN_METHOD = "oauth_token"
+# ``claude auth status`` for a subscription ``/login`` session (claude 2.1.310, 2026-10-30).
+LOGIN_METHOD = "claude.ai"
+FIRST_PARTY = "firstParty"
 
 # Credentials that outrank ``CLAUDE_CODE_OAUTH_TOKEN``, or select a non-subscription provider
 # (https://code.claude.com/docs/en/authentication, "Authentication precedence" and
@@ -37,9 +42,9 @@ REFUSED_ENV_KEYS = (
     "ANTHROPIC_ORGANIZATION_ID",
 )
 
-# The init event's ``apiKeySource`` under ``CLAUDE_CODE_OAUTH_TOKEN`` alone. A live probe on 2026-10-16
-# with claude 2.1.301 pinned it: ``claude auth status`` reported authMethod ``oauth_token`` and the init
-# event reported apiKeySource ``none``. ``none`` only proves that no API key is in use.
+# The init event's ``apiKeySource`` under subscription auth. A live probe on 2026-10-16 with claude 2.1.301
+# pinned it for ``CLAUDE_CODE_OAUTH_TOKEN``: ``claude auth status`` reported authMethod ``oauth_token`` and
+# the init event reported apiKeySource ``none``. ``none`` only proves that no API key is in use.
 ALLOWED_API_KEY_SOURCES = frozenset({"none"})
 
 AUTH_STATUS_TIMEOUT_S = 60
@@ -109,23 +114,34 @@ def _scan_settings(path: Path) -> None:
         raise ClaudeAuthError(f"{path}: settings set apiKeyHelper, which outranks CLAUDE_CODE_OAUTH_TOKEN")
 
 
-def _require_oauth_status(target: AuthTarget, spawn: Callable[..., subprocess.CompletedProcess]) -> None:
+def expected_method(env: Mapping[str, str]) -> str:
+    """The ``claude auth status`` method a subscription call must report under ``env``."""
+    return TOKEN_METHOD if env.get(OAUTH_TOKEN_KEY) else LOGIN_METHOD
+
+
+def _require_subscription_status(target: AuthTarget, spawn: Callable[..., subprocess.CompletedProcess]) -> None:
     try:
         completed = spawn(["claude", "auth", "status"], capture_output=True, text=True, cwd=str(target.cwd),
                           env=dict(target.env), timeout=AUTH_STATUS_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as error:
         raise ClaudeAuthError(f"claude auth status could not run in {target.cwd}: {error}") from error
-    method = None
+    method = provider = None
     try:
         payload = json.loads(completed.stdout or "")
         if isinstance(payload, dict):
-            method = payload.get("authMethod")
+            method, provider = payload.get("authMethod"), payload.get("apiProvider")
     except json.JSONDecodeError:
         pass
-    if completed.returncode != 0 or method != "oauth_token":
+    expected = expected_method(target.env)
+    source = OAUTH_TOKEN_KEY if expected == TOKEN_METHOD else "a claude /login subscription session"
+    if completed.returncode != 0 or method != expected:
         raise ClaudeAuthError(
             f"claude auth status in {target.cwd} reports authMethod {method!r} (exit {completed.returncode}); "
-            "expected 'oauth_token' from CLAUDE_CODE_OAUTH_TOKEN."
+            f"expected {expected!r} from {source}."
+        )
+    if provider != FIRST_PARTY:
+        raise ClaudeAuthError(
+            f"claude auth status in {target.cwd} reports apiProvider {provider!r}; expected {FIRST_PARTY!r}."
         )
 
 
@@ -143,11 +159,12 @@ def preflight_claude_auth(
     spawn: Callable[..., subprocess.CompletedProcess] | None = None,
     managed_root: Path | None = None,
 ) -> None:
-    """Refuse before any paid call unless every distinct target authenticates by ``CLAUDE_CODE_OAUTH_TOKEN``.
+    """Refuse before any paid call unless every distinct target authenticates by the Claude subscription.
 
-    Per target: the OAuth token is set, no refused variable is set, no settings file the call loads sets a
-    refused key or ``apiKeyHelper``, and ``claude auth status`` reports ``oauth_token``. ``claude auth
-    status`` makes no model call. ``managed_root`` is the filesystem root that holds the managed settings.
+    Per target: no refused variable is set, no settings file the call loads sets a refused key or
+    ``apiKeyHelper``, and ``claude auth status`` reports the first-party ``expected_method``: ``oauth_token``
+    when ``CLAUDE_CODE_OAUTH_TOKEN`` is set, else ``claude.ai`` from ``/login``. ``claude auth status`` makes
+    no model call. ``managed_root`` is the filesystem root that holds the managed settings.
     The default status probe runs once per distinct target per process; the other checks run on every call.
     """
     use_default_probe = spawn is None
@@ -160,15 +177,11 @@ def preflight_claude_auth(
             continue
         seen.add(key)
         refuse_env(target.env)
-        if not target.env.get(OAUTH_TOKEN_KEY):
-            raise ClaudeAuthError(
-                f"{OAUTH_TOKEN_KEY} is not set; the benchmark bills the subscription through it only."
-            )
         for path in _settings_files(target, managed_root):
             _scan_settings(path)
         if use_default_probe and key in _PASSED_STATUS:
             continue
-        _require_oauth_status(target, spawn)
+        _require_subscription_status(target, spawn)
         if use_default_probe:
             _PASSED_STATUS.add(key)
 

@@ -2423,7 +2423,7 @@ def _budget_records(name: str) -> list[dict]:
 def _status_spawn(calls: list[dict], method: str = "oauth_token"):
     def spawn(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method, "apiProvider": "firstParty"}), "")
     return spawn
 
 
@@ -2511,13 +2511,32 @@ def test_non_oauth_status_refuses_before_any_paid_call(world) -> None:
     assert statuses and world.spawned == [] and world.calls == [] and world.builds == []
 
 
-def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_without_token_a_token_status_is_refused_before_any_paid_call(world, monkeypatch: pytest.MonkeyPatch) -> None:
     statuses: list[dict] = []
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
 
     assert main(world, auth_spawn=_status_spawn(statuses)) == 2
 
-    assert statuses == [] and world.spawned == [] and world.calls == []
+    assert statuses and world.spawned == [] and world.calls == []
+
+
+def test_login_session_runs_paid_calls_in_the_host_config(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    statuses: list[dict] = []
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    host_config = os.environ["CLAUDE_CONFIG_DIR"]
+    seen: list[dict] = []
+
+    def spawn(argv, **kwargs):
+        seen.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, tool_stream([]), "")
+
+    evo = build(world, auth_spawn=_status_spawn(statuses, method="claude.ai"), spawn=spawn)
+
+    assert not isinstance(evo, int)
+    assert {call["env"]["CLAUDE_CONFIG_DIR"] for call in statuses} == {host_config}
+    assert evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp) is not None
+    [env] = seen
+    assert env["CLAUDE_CONFIG_DIR"] == host_config and "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
 # --- a definitively rejected candidate's kept build is cleared ---
