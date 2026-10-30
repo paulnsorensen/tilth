@@ -74,89 +74,142 @@ pub(in crate::mcp) fn tool_read(
     }
 }
 
-/// Render the read of `args`. `batch` is set when the caller asked for more
-/// than one path, so a batch the planner merged to one section keeps the
-/// batch response shape.
+/// One `paths` entry of a read, parsed once. The planner and the renderer
+/// both take it.
+#[derive(Debug, Clone)]
+struct Request {
+    /// The request as the caller wrote it.
+    raw: String,
+    /// The path part of `raw`, used to spell a rewritten request.
+    shown: String,
+    path: PathBuf,
+    suffix: PathSuffix,
+}
+
+impl Request {
+    /// Split `raw` into its path and suffix, and anchor a relative path under
+    /// `cwd`. Absolute paths pass through (trust-absolute).
+    fn parse(raw: &str, cwd: &Path) -> Result<Self, String> {
+        let (shown, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(raw);
+        Ok(Self {
+            raw: raw.to_string(),
+            path: super::resolve_anchored(&shown, cwd)?,
+            shown: shown.to_string_lossy().into_owned(),
+            suffix,
+        })
+    }
+
+    /// This request narrowed to lines `start..=end`.
+    fn with_range(&self, start: u32, end: u32) -> Self {
+        Self {
+            raw: format!("{}#{start}-{end}", self.shown),
+            shown: self.shown.clone(),
+            path: self.path.clone(),
+            suffix: PathSuffix::LineRange(start as usize, end as usize),
+        }
+    }
+}
+
+/// The arguments of one `tilth_read` call, checked once.
+struct ReadCall<'a> {
+    budget: u64,
+    mode: &'a str,
+    since: Option<SystemTime>,
+    cwd: &'a Path,
+    requests: Vec<Request>,
+}
+
+impl<'a> ReadCall<'a> {
+    /// Check `args` and parse each path. The checks run in a fixed order, so
+    /// a call with several faults always reports the same one.
+    fn parse(args: &'a Value) -> Result<Self, String> {
+        // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
+        // `apply_budget` used by the other tools — an uncapped `mode=full` or
+        // multi-file batch read would otherwise exceed the host response limit.
+        let budget = args
+            .get("budget")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET);
+
+        let paths_arr = match args.get("paths") {
+            Some(v) => v.as_array().ok_or(
+                "paths must be an array of file paths (use single-element array for one file)",
+            )?,
+            None => return Err("missing required parameter: paths (array of file paths)".into()),
+        };
+
+        if paths_arr.is_empty() {
+            return Err("paths must contain at least one file".into());
+        }
+        if paths_arr.len() > MAX_READ_PATHS {
+            return Err(format!(
+                "batch read limited to {MAX_READ_PATHS} files (got {})",
+                paths_arr.len()
+            ));
+        }
+
+        let raw_paths: Vec<&str> = paths_arr
+            .iter()
+            .map(|p| {
+                p.as_str().ok_or_else(|| {
+                    format!("paths must be an array of strings, e.g. {PATHS_SHAPE_EXAMPLE}")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // `mode: auto|full|signature|stripped` overrides the implicit smart-view.
+        let mode = args.get("mode").and_then(Value::as_str).unwrap_or("auto");
+        if !matches!(mode, "auto" | "full" | "signature" | "stripped") {
+            return Err(format!(
+                "unknown read mode: {mode}. Valid modes: auto, full, signature, stripped. \
+                \"edit\" is not a mode — mode only controls the view; every tilth_read is already \
+                tagged and editable."
+            ));
+        }
+
+        // if_modified_since: skip files whose mtime is <= ts (return stub).
+        let since = args
+            .get("if_modified_since")
+            .and_then(Value::as_str)
+            .and_then(crate::mcp::iso::parse_iso_utc);
+
+        // The absolute checkout directory anchors every relative path.
+        let cwd = super::require_cwd(args)?;
+        let requests = raw_paths
+            .into_iter()
+            .map(|raw| Request::parse(raw, cwd))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            budget,
+            mode,
+            since,
+            cwd,
+            requests,
+        })
+    }
+}
+
+/// Render `call`. `batch` is set when the caller asked for more than one
+/// path, so a batch the planner merged to one section keeps the batch
+/// response shape.
 fn render_read(
-    args: &Value,
+    call: &ReadCall,
     cache: &OutlineCache,
     session: &Session,
     note_tokens: u64,
     nexts: &[Option<plan::Continuation>],
     batch: bool,
 ) -> Result<Rendered, String> {
-    // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
-    // `apply_budget` used by the other tools — an uncapped `mode=full` or
-    // multi-file batch read would otherwise exceed the host response limit.
-    let budget_val = args
-        .get("budget")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let budget_val = call.budget;
     let budget = Some(budget_val);
-
-    let paths_arr = match args.get("paths") {
-        Some(v) => v.as_array().ok_or(
-            "paths must be an array of file paths (use single-element array for one file)",
-        )?,
-        None => return Err("missing required parameter: paths (array of file paths)".into()),
-    };
-
-    if paths_arr.is_empty() {
-        return Err("paths must contain at least one file".into());
-    }
-    if paths_arr.len() > MAX_READ_PATHS {
-        return Err(format!(
-            "batch read limited to {MAX_READ_PATHS} files (got {})",
-            paths_arr.len()
-        ));
-    }
-
-    let raw_paths: Vec<String> = paths_arr
-        .iter()
-        .map(|p| {
-            p.as_str()
-                .ok_or_else(|| {
-                    format!("paths must be an array of strings, e.g. {PATHS_SHAPE_EXAMPLE}")
-                })
-                .map(String::from)
-        })
-        .collect::<Result<_, _>>()?;
-
-    // `mode: auto|full|signature|stripped` overrides the implicit smart-view.
-    let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
-    if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
-        return Err(format!(
-            "unknown read mode: {mode_str}. Valid modes: auto, full, signature, stripped. \
-            \"edit\" is not a mode — mode only controls the view; every tilth_read is already \
-            tagged and editable."
-        ));
-    }
+    let mode_str = call.mode;
     let force_full = mode_str == "full";
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
-
-    // if_modified_since: skip files whose mtime is <= ts (return stub).
-    let since = args
-        .get("if_modified_since")
-        .and_then(|v| v.as_str())
-        .and_then(crate::mcp::iso::parse_iso_utc);
-
-    // The absolute checkout directory anchors every relative path.
-    let cwd = super::require_cwd(args)?;
+    let since = call.since;
+    let cwd = call.cwd;
     // Path labels print relative to cwd; file content is never rewritten.
-    let _display_base = crate::format::set_display_base(Path::new(cwd));
-
-    // Resolve suffix grammar on each path spec into (PathBuf, Suffix). Relative
-    // paths anchor under `cwd`; absolute paths pass through (trust-absolute).
-    let parsed: Vec<(PathBuf, PathSuffix)> = raw_paths
-        .iter()
-        .map(|s| {
-            let (p, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(s);
-            Ok((super::resolve_anchored(&p, cwd)?, suffix))
-        })
-        .collect::<Result<_, String>>()?;
-    let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
-    let suffixes: Vec<&PathSuffix> = parsed.iter().map(|(_, s)| s).collect();
+    let _display_base = crate::format::set_display_base(cwd);
 
     let now = std::time::SystemTime::now();
 
@@ -174,11 +227,12 @@ fn render_read(
             NotFound(String),
         }
 
-        let outcomes: Vec<PerPath> = parsed
+        let outcomes: Vec<PerPath> = call
+            .requests
             .par_iter()
             .enumerate()
-            .map(|(index, (path, suffix))| {
-                let _display_base = crate::format::set_display_base(Path::new(cwd));
+            .map(|(index, Request { path, suffix, .. })| {
+                let _display_base = crate::format::set_display_base(cwd);
                 // Label used for the `── omitted (raise budget) ──` footer when
                 // this part's rendered body does not fit the batch budget.
                 let label = match suffix {
@@ -257,9 +311,9 @@ fn render_read(
             })
             .collect();
 
-        let mut parts: Vec<String> = Vec::with_capacity(parsed.len());
-        let mut labels: Vec<String> = Vec::with_capacity(parsed.len());
-        let mut slots: Vec<Slot> = Vec::with_capacity(parsed.len());
+        let mut parts: Vec<String> = Vec::with_capacity(call.requests.len());
+        let mut labels: Vec<String> = Vec::with_capacity(call.requests.len());
+        let mut slots: Vec<Slot> = Vec::with_capacity(call.requests.len());
         let mut not_found: Vec<String> = Vec::new();
         for (request, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
@@ -422,12 +476,8 @@ fn render_read(
         ));
     }
 
-    let path = paths.into_iter().next().expect("paths non-empty");
-    let suffix = suffixes
-        .into_iter()
-        .next()
-        .cloned()
-        .unwrap_or(PathSuffix::None);
+    let Request { path, suffix, .. } = &call.requests[0];
+    let (path, suffix) = (path.clone(), suffix.clone());
 
     // A repo's .tilthignore hard-denies an explicit read of this path.
     if crate::read::tilthignore_denies(&path) {
@@ -768,84 +818,37 @@ fn with_continuation(
     }
 }
 
-/// Plan the `paths` of `args`: merge close sections of one file and complete
-/// ranges that end inside a construct. `None` leaves a malformed request to
-/// the renderer, which reports it.
-fn plan_paths(args: &Value, cache: &OutlineCache) -> Option<Vec<plan::Planned>> {
-    let cwd = super::require_cwd(args).ok()?;
-    let paths = args.get("paths")?.as_array()?;
-    if paths.is_empty() || paths.len() > MAX_READ_PATHS {
-        return None;
-    }
-    let mut requests = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let raw = raw.as_str()?;
-        let (shown, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(raw);
-        let path = super::resolve_anchored(&shown, cwd).ok()?;
-        requests.push(plan::Request {
-            raw: raw.to_string(),
-            shown: shown.to_string_lossy().into_owned(),
-            path,
-            suffix,
-        });
-    }
-    let budget = args
-        .get("budget")
-        .and_then(Value::as_u64)
-        .unwrap_or(crate::budget::DEFAULT_BUDGET);
-    let budget_bytes = usize::try_from(budget.saturating_mul(4)).unwrap_or(usize::MAX);
-    let limit = budget_bytes
-        .min(HOST_VISIBLE_MAX - HOST_CAP_RESERVE)
-        .saturating_sub(CUT_NOTE_RESERVE + HEADER_RESERVE);
-    Some(plan::plan(&requests, cache, limit))
-}
-
 /// Render the read, cut it to the host limit, then record as seen exactly the
 /// numbered lines each file's own span of the final text shows. An error, an
 /// outline, a stub, or a cut-off tail shows no line, so it marks no line seen.
+/// Before it renders, the planner merges close sections of one file and
+/// completes ranges that end inside a construct.
 fn tool_read_paths(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     note_tokens: u64,
 ) -> Result<String, String> {
-    let batch = args
-        .get("paths")
-        .and_then(Value::as_array)
-        .is_some_and(|paths| paths.len() > 1);
-    let patched;
-    let mut nexts = Vec::new();
-    let args = match plan_paths(args, cache) {
-        Some(planned) => {
-            let mut clone = args.clone();
-            let mut paths = Vec::with_capacity(planned.len());
-            for item in planned {
-                paths.push(Value::String(item.request));
-                nexts.push(item.next);
-            }
-            clone["paths"] = Value::Array(paths);
-            patched = clone;
-            &patched
-        }
-        None => args,
-    };
-    let rendered = render_read(args, cache, session, note_tokens, &nexts, batch)?;
-    let cwd = super::require_cwd(args)?;
-    let _display_base = crate::format::set_display_base(Path::new(cwd));
-    let requests: Vec<String> = args
-        .get("paths")
-        .and_then(Value::as_array)
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(|p| p.as_str().map(String::from))
-                .collect()
+    let mut call = ReadCall::parse(args)?;
+    let batch = call.requests.len() > 1;
+    let budget_bytes = usize::try_from(call.budget.saturating_mul(4)).unwrap_or(usize::MAX);
+    let limit = budget_bytes
+        .min(HOST_VISIBLE_MAX - HOST_CAP_RESERVE)
+        .saturating_sub(CUT_NOTE_RESERVE + HEADER_RESERVE);
+    let planned = plan::plan(&call.requests, cache, limit);
+    let mut nexts = Vec::with_capacity(planned.len());
+    call.requests = planned
+        .into_iter()
+        .map(|item| {
+            nexts.push(item.next);
+            item.request
         })
-        .unwrap_or_default();
-    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("auto");
+        .collect();
+    let rendered = render_read(&call, cache, session, note_tokens, &nexts, batch)?;
+    let _display_base = crate::format::set_display_base(call.cwd);
     let ctx = CutCtx {
-        requests: &requests,
-        mode,
+        requests: &call.requests,
+        mode: call.mode,
         cache,
     };
     let shown = cap_rendered(rendered, &ctx, HOST_VISIBLE_MAX - HOST_CAP_RESERVE);
@@ -973,7 +976,7 @@ fn construct_boundary(
 
 /// The request that produced a response, for the continuation note.
 struct CutCtx<'a> {
-    requests: &'a [String],
+    requests: &'a [Request],
     mode: &'a str,
     cache: &'a OutlineCache,
 }
@@ -1057,7 +1060,10 @@ fn cut_note(text: &str, kept_end: usize, parts: &[Part], ctx: &CutCtx, limit: us
         let split = kept_end.clamp(part.start, part.end);
         let seen = text.get(part.start..split).unwrap_or("");
         let hidden = text.get(split..part.end).unwrap_or("");
-        let request = ctx.requests.get(part.request).map_or("", String::as_str);
+        let request = ctx
+            .requests
+            .get(part.request)
+            .map_or("", |request| request.raw.as_str());
         let last_seen = numbered_ranges(seen).last().map(|&(_, end)| end);
         let mut first_hidden: Option<(u32, usize)> = None;
         for line in hidden.split_inclusive('\n') {
@@ -1177,54 +1183,35 @@ pub(crate) fn read_single_with_suffix(
     cache: &OutlineCache,
 ) -> (String, crate::read::SeenSpec) {
     use crate::read::SeenSpec;
-    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let render_err = |e: crate::error::TilthError| {
         format!("# {}\nerror: {}", crate::format::display_path(path), e)
     };
     // An error shows no line, so its spec is an empty range list: it never
     // stubs and never marks a line seen.
-    let read_span = |s: u32, e: u32| {
+    if let Some((s, e)) = suffix_span(path, suffix, || count_lines(path), cache) {
         let range = format!("{s}-{e}");
-        match crate::read::read_ranges(path, &[range.as_str()], true) {
+        return match crate::read::read_ranges(path, &[range.as_str()], true) {
             Ok(body) => (body, SeenSpec::Ranges(vec![(s, e)])),
             Err(err) => (render_err(err), SeenSpec::Ranges(Vec::new())),
-        }
-    };
+        };
+    }
     match suffix {
-        PathSuffix::LineRange(s, e) => read_span(cast(*s), cast(*e)),
-        PathSuffix::FromLine(n) => {
-            // Resolve total lines via metadata + count; cheap & avoids full read.
-            let total = count_lines(path).map_or(*n, |t| t as usize);
-            read_span(cast(*n), cast(total.max(*n)))
-        }
         PathSuffix::Heading(h) => {
-            // Resolve the heading span once (like the symbol path) so the read
-            // and the seen-lines spec share a single resolution. An absent
-            // heading reads the raw anchor to surface the error.
-            if let Some((s, e)) = crate::read::resolve_heading_span(path, h) {
-                read_span(s, e)
-            } else {
-                let body =
-                    crate::read::read_ranges(path, &[h.as_str()], true).unwrap_or_else(render_err);
-                (body, SeenSpec::Ranges(Vec::new()))
-            }
+            // An absent heading reads the raw anchor to surface the error.
+            let body =
+                crate::read::read_ranges(path, &[h.as_str()], true).unwrap_or_else(render_err);
+            (body, SeenSpec::Ranges(Vec::new()))
         }
-        PathSuffix::Symbol(name) => {
-            // Resolve symbol via outline -> range once, reused for read + spec.
-            if let Some((s, e)) = resolve_symbol_range(path, name, cache) {
-                read_span(cast(s), cast(e))
-            } else {
-                (
-                    format!(
-                        "# {}\nerror: symbol '{}' not found in outline",
-                        crate::format::display_path(path),
-                        name
-                    ),
-                    SeenSpec::Ranges(Vec::new()),
-                )
-            }
-        }
-        PathSuffix::None => {
+        PathSuffix::Symbol(name) => (
+            format!(
+                "# {}\nerror: symbol '{}' not found in outline",
+                crate::format::display_path(path),
+                name
+            ),
+            SeenSpec::Ranges(Vec::new()),
+        ),
+        // A line suffix always names a span, so only a whole-file read is left.
+        PathSuffix::None | PathSuffix::LineRange(..) | PathSuffix::FromLine(_) => {
             debug_assert!(
                 !(signature && stripped),
                 "signature and stripped are mutually exclusive view modes"
@@ -1311,12 +1298,29 @@ fn resolve_symbol(path: &Path, name: &str, cache: &OutlineCache) -> SymbolLookup
     }
 }
 
-/// Back-compat shim for `read_single_with_suffix`, which collapses all
-/// non-Found outcomes into a single inline error message.
-fn resolve_symbol_range(path: &Path, name: &str, cache: &OutlineCache) -> Option<(usize, usize)> {
-    match resolve_symbol(path, name, cache) {
-        SymbolLookup::Found(s, e) => Some((s, e)),
-        SymbolLookup::Missing | SymbolLookup::PreconditionFailed => None,
+/// The 1-based line span that `suffix` names in `path`: the one resolver for
+/// the planner and the renderer. `None` for a whole-file read and for a
+/// heading or symbol that does not resolve. Only `#n` calls `total`, the line
+/// count of `path`.
+fn suffix_span(
+    path: &Path,
+    suffix: &PathSuffix,
+    total: impl FnOnce() -> Option<u32>,
+    cache: &OutlineCache,
+) -> Option<(u32, u32)> {
+    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match suffix {
+        PathSuffix::LineRange(start, end) => Some((cast(*start), cast(*end))),
+        PathSuffix::FromLine(start) => {
+            let start = cast(*start);
+            Some((start, total().map_or(start, |total| total.max(start))))
+        }
+        PathSuffix::Heading(heading) => crate::read::resolve_heading_span(path, heading),
+        PathSuffix::Symbol(name) => match resolve_symbol(path, name, cache) {
+            SymbolLookup::Found(start, end) => Some((cast(start), cast(end))),
+            SymbolLookup::Missing | SymbolLookup::PreconditionFailed => None,
+        },
+        PathSuffix::None => None,
     }
 }
 
@@ -1678,7 +1682,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_symbol_range(&path, "target", &OutlineCache::new()),
+            suffix_span(
+                &path,
+                &PathSuffix::Symbol("target".into()),
+                || None,
+                &OutlineCache::new()
+            ),
             Some((3, 5)),
             "symbol lookup must reach definitions below the shallow display outline"
         );
