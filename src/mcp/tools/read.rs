@@ -223,7 +223,9 @@ fn render_read(
         // `cache` access (Mutex-guarded LRU). Partitioned after the join to preserve
         // input order — `par_iter().collect()` is index-stable.
         enum PerPath {
-            Content(String, String, Option<Record>),
+            /// Label, body, the file it shows lines of, and the continuation
+            /// request whose note ends the body.
+            Content(String, String, Option<Record>, Option<String>),
             NotFound(String),
         }
 
@@ -245,7 +247,7 @@ fn render_read(
                     return PerPath::NotFound(crate::format::display_path(path));
                 }
                 if crate::read::tilthignore_denies(path) {
-                    return PerPath::Content(label, crate::read::blocked_notice(path), None);
+                    return PerPath::Content(label, crate::read::blocked_notice(path), None, None);
                 }
                 // A `#symbol` suffix that resolves cleanly to "symbol absent
                 // from outline" is the symbol-equivalent of a missing file:
@@ -268,6 +270,7 @@ fn render_read(
                         return PerPath::Content(
                             label,
                             crate::mcp::iso::unchanged_stub(path, s_ts),
+                            None,
                             None,
                         );
                     }
@@ -293,9 +296,10 @@ fn render_read(
                     (signature, force_stripped, force_full),
                     &spec,
                 ) {
-                    return PerPath::Content(label, stub, None);
+                    return PerPath::Content(label, stub, None, None);
                 }
-                let body = with_continuation(body, &spec, nexts.get(index));
+                let next = shown_next(&spec, nexts.get(index));
+                let body = with_continuation(body, next);
                 // Name the file; the wrapper records the lines this part's own
                 // span of the final response shows, so a follow-up tilth_write
                 // can verify the tag.
@@ -307,7 +311,7 @@ fn render_read(
                     force_full,
                 )
                 .then(|| (path.clone(), spec_tail(&spec)));
-                PerPath::Content(label, body, record)
+                PerPath::Content(label, body, record, next.map(|next| next.request.clone()))
             })
             .collect();
 
@@ -317,10 +321,14 @@ fn render_read(
         let mut not_found: Vec<String> = Vec::new();
         for (request, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
-                PerPath::Content(label, s, record) => {
+                PerPath::Content(label, s, record, next) => {
                     labels.push(label);
                     parts.push(s);
-                    slots.push(Slot { request, record });
+                    slots.push(Slot {
+                        request,
+                        record,
+                        next,
+                    });
                 }
                 PerPath::NotFound(s) => not_found.push(s),
             }
@@ -343,22 +351,24 @@ fn render_read(
             combined
         };
         let mut combined = join(&parts);
-        let complete =
-            crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &combined);
+        let whole = lay_out(
+            slots
+                .iter()
+                .zip(&parts)
+                .map(|(slot, part)| (slot, part.as_str(), part.len())),
+        );
+        let whole_meta = batch_meta(&slots, &parts, &whole);
+        let complete = crate::mcp::iso::with_meta_header(Some(now), whole_meta.clone(), &combined);
         if crate::types::estimate_tokens(complete.len() as u64) <= budget_val {
             let shift = complete.len() - combined.len();
-            let layout = lay_out(
-                slots
-                    .iter()
-                    .zip(&parts)
-                    .map(|(slot, part)| (slot, part.as_str(), part.len())),
-            );
             return Ok(Rendered {
-                parts: shift_parts(layout, shift, usize::MAX),
+                parts: shift_parts(whole, shift, usize::MAX),
                 text: complete,
             });
         }
-        let body_budget = response_body_budget(Some(now), &serde_json::Map::new(), budget_val);
+        // The header of the response names at most what `whole_meta` names,
+        // so its size bounds the body budget.
+        let body_budget = response_body_budget(Some(now), &whole_meta, budget_val);
         let mut layout: Vec<Part> = Vec::new();
         if !parts.is_empty() {
             let framing_bytes = join(&vec![String::new(); parts.len()]).len();
@@ -466,14 +476,8 @@ fn render_read(
             combined = batch_count_summary(parts.len(), not_found.len());
             layout.clear();
         }
-        // Multi-file responses don't carry per-file view-meta.
-        return Ok(finalize_parts(
-            Some(now),
-            serde_json::Map::new(),
-            &combined,
-            budget,
-            layout,
-        ));
+        let meta = batch_meta(&slots, &parts, &layout);
+        return Ok(finalize_parts(Some(now), meta, &combined, budget, layout));
     }
 
     let Request { path, suffix, .. } = &call.requests[0];
@@ -523,12 +527,12 @@ fn render_read(
                 budget,
             )));
         }
-        let next = nexts.first().and_then(Option::as_ref);
+        let next = shown_next(&spec, nexts.first());
         let mut meta = serde_json::Map::new();
-        if let Some(next) = next.filter(|_| shows_lines(&spec)) {
+        if let Some(next) = next {
             meta.insert("next_view".into(), Value::String(next.request.clone()));
         }
-        let body = with_continuation(body, &spec, nexts.first());
+        let body = with_continuation(body, next);
         let parts =
             if should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full) {
                 vec![whole_part(&path, &spec, body.len())]
@@ -698,9 +702,11 @@ const NEXT_LIST_BUDGET: usize = 200;
 type Record = (PathBuf, Option<u32>);
 
 /// What one request of a batch contributes, before layout in the response.
+/// `next` is the continuation request whose note ends the request's text.
 struct Slot {
     request: usize,
     record: Option<Record>,
+    next: Option<String>,
 }
 
 /// The byte span `start..end` of a response that one request produced.
@@ -805,17 +811,42 @@ fn shows_lines(spec: &crate::read::SeenSpec) -> bool {
     !matches!(spec, crate::read::SeenSpec::Ranges(ranges) if ranges.is_empty())
 }
 
-/// `body` followed by the continuation note of its planned section, if any.
-/// An error body shows no line, so it gets no note.
-fn with_continuation(
-    body: String,
+/// The continuation of a planned section whose view of `spec` shows lines.
+/// An error, a stub, or an outline shows no line, so it gets none.
+fn shown_next<'a>(
     spec: &crate::read::SeenSpec,
-    next: Option<&Option<plan::Continuation>>,
-) -> String {
-    match next.and_then(Option::as_ref) {
-        Some(next) if shows_lines(spec) => format!("{body}\n\n{}", next.note()),
-        _ => body,
+    next: Option<&'a Option<plan::Continuation>>,
+) -> Option<&'a plan::Continuation> {
+    next.and_then(Option::as_ref).filter(|_| shows_lines(spec))
+}
+
+/// `body` followed by the note of its continuation, if any.
+fn with_continuation(body: String, next: Option<&plan::Continuation>) -> String {
+    match next {
+        Some(next) => format!("{body}\n\n{}", next.note()),
+        None => body,
     }
+}
+
+/// The header fields of a batch. `next_view` lists, in section order, the
+/// continuation of each section whose whole text, note included, `layout`
+/// shows. A clipped or omitted section adds no entry.
+fn batch_meta(slots: &[Slot], parts: &[String], layout: &[Part]) -> serde_json::Map<String, Value> {
+    let requests: Vec<Value> = slots
+        .iter()
+        .zip(parts)
+        .filter(|(slot, part)| {
+            layout
+                .iter()
+                .any(|shown| shown.request == slot.request && shown.end - shown.start == part.len())
+        })
+        .filter_map(|(slot, _)| slot.next.clone().map(Value::String))
+        .collect();
+    let mut meta = serde_json::Map::new();
+    if !requests.is_empty() {
+        meta.insert("next_view".into(), Value::Array(requests));
+    }
+    meta
 }
 
 /// Render the read, cut it to the host limit, then record as seen exactly the
@@ -1715,6 +1746,46 @@ mod tests {
         // Unsorted input: caps track each part's original index, not input order.
         let reversed: Vec<String> = parts.iter().rev().cloned().collect();
         assert_eq!(batch_part_caps(&reversed, 64), [20, 20, 20, 4]);
+    }
+
+    #[test]
+    fn batch_meta_lists_continuations_only_of_wholly_shown_sections() {
+        let slot = |request: usize, next: Option<&str>| Slot {
+            request,
+            record: None,
+            next: next.map(str::to_owned),
+        };
+        // Request 1 is missing, so slot indices and request indices differ.
+        let slots = [
+            slot(0, Some("a.rs#5-9")),
+            slot(2, None),
+            slot(3, Some("c.rs#7-8")),
+            slot(4, Some("d.rs#2-3")),
+        ];
+        let parts: Vec<String> = ["aaaa", "bb", "cccccc", "dd"].map(String::from).to_vec();
+        let whole = lay_out(
+            slots
+                .iter()
+                .zip(&parts)
+                .map(|(s, p)| (s, p.as_str(), p.len())),
+        );
+        let names = |layout: &[Part]| batch_meta(&slots, &parts, layout).get("next_view").cloned();
+        assert_eq!(
+            names(&whole),
+            Some(serde_json::json!(["a.rs#5-9", "c.rs#7-8", "d.rs#2-3"]))
+        );
+        // A clipped section loses its note, so it loses its entry; an
+        // omitted one has no span at all.
+        let partial = lay_out(
+            [
+                (&slots[0], "aa", 2),
+                (&slots[1], "bb", 2),
+                (&slots[2], "cccccc", 6),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(names(&partial), Some(serde_json::json!(["c.rs#7-8"])));
+        assert_eq!(names(&[]), None);
     }
 
     #[test]

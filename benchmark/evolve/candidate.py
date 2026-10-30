@@ -1,9 +1,10 @@
 """Candidate components and content identity.
 
-A candidate is five components: the four prompt texts that ``src/`` embeds
-with ``include_str!`` and ``src_patch``, the cumulative unified diff of the
-candidate's ``src/**`` against the seed commit. Its identity is a hash of its
-content, never a GEPA pool index.
+A candidate is the prompt texts that ``src/`` embeds with ``include_str!`` and
+``src_patch``, the cumulative unified diff of the candidate's ``src/**`` against
+the seed commit. The four MCP texts are always components. The launcher preamble
+is a component only in a ``--preamble`` run, where it is the candidate arm's
+system prompt. Its identity is a hash of its content, never a GEPA pool index.
 """
 
 import hashlib
@@ -13,12 +14,17 @@ from pathlib import Path
 
 from .gitops import GitError, git_bytes
 
-TEXT_COMPONENTS = ("prompts/mcp.md", "prompts/tools/read.md", "prompts/tools/search.md", "prompts/tools/write.md")
+MCP_TEXT_COMPONENTS = ("prompts/mcp.md", "prompts/tools/read.md", "prompts/tools/search.md", "prompts/tools/write.md")
+PREAMBLE = "prompts/preamble.md"
+# Every text component a candidate may carry; a candidate carries exactly the seed's set.
+TEXT_COMPONENTS = (*MCP_TEXT_COMPONENTS, PREAMBLE)
 SRC_PATCH = "src_patch"
 COMPONENTS = (*TEXT_COMPONENTS, SRC_PATCH)
 # The MCP host truncates the instructions field and each tool description past 2048 bytes; the src/mcp tests
 # (server_instructions_fit_character_cap, tool_descriptions_fit_2kb) reject a longer prompt file.
-MAX_BYTES = {name: 2048 for name in TEXT_COMPONENTS}
+# The preamble fills no MCP field. Its cap keeps the system prompt short and leaves about a third of room above
+# the seed file.
+MAX_BYTES = {**{name: 2048 for name in MCP_TEXT_COMPONENTS}, PREAMBLE: 4096}
 # What reflection and the src proposer optimize: the evolve score (``loop.task_score``), stated in both prompts.
 OBJECTIVE = (
     "Each rollout uses only tilth's tools and is scored against the same task run with the host's built-in "
@@ -49,10 +55,13 @@ def ref_name(run_id: str, candidate: Mapping[str, str]) -> str:
     return f"refs/evolve/{run_id}/{short_id(candidate)}"
 
 
-def read_seed(repo: Path, seed_sha: str) -> dict[str, str]:
-    """The seed candidate: the four prompt files' bytes at ``seed_sha`` and an empty ``src_patch``."""
+def read_seed(repo: Path, seed_sha: str, *, preamble: bool = False) -> dict[str, str]:
+    """The seed candidate: the prompt files' bytes at ``seed_sha`` and an empty ``src_patch``.
+
+    The four MCP texts are always read; ``preamble`` adds ``prompts/preamble.md``.
+    """
     texts, missing = {}, []
-    for name in TEXT_COMPONENTS:
+    for name in TEXT_COMPONENTS if preamble else MCP_TEXT_COMPONENTS:
         try:
             texts[name] = git_bytes("show", f"{seed_sha}:{name}", cwd=repo).decode("utf-8")
         except GitError:

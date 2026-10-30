@@ -523,7 +523,7 @@ class SkillUnavailableError(ArmUnavailableError):
 
 def _uses_claude_session_features(mode: ModeConfig) -> bool:
     """Skill arms and appended-prompt arms need Claude's session init, which other runners lack."""
-    return _is_skill_arm(mode) or mode.prompt_mode != "replace"
+    return _is_skill_arm(mode) or mode.prompt_mode == "append"
 
 
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
@@ -1056,6 +1056,8 @@ def _cell_task_digest(task: object) -> str:
 _REPO_PLACEHOLDER = Path("<repo>")
 _TILTH_BIN_PLACEHOLDER = "<tilth-bin>"
 _BUDGET_PLACEHOLDER = "<max-budget>"
+_PREAMBLE_KEY = "model_instructions_file="
+_PREAMBLE_PLACEHOLDER = _PREAMBLE_KEY + "<preamble-file>"
 
 
 def _command_template(
@@ -1091,7 +1093,10 @@ def _command_template(
         # The cell fails when it runs; key it by the reason it cannot be built.
         return [f"unbuildable: {error}"]
     # The digest records max_budget_usd on its own; the budget format must not change the key.
-    return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd" else part for i, part in enumerate(cmd)]
+    # The system prompt keys the preamble text, so its content-addressed file path does not.
+    return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd"
+            else _PREAMBLE_PLACEHOLDER if part.startswith(_PREAMBLE_KEY)
+            else part for i, part in enumerate(cmd)]
 
 
 def cell_identity(
@@ -1124,7 +1129,7 @@ def cell_identity(
         tools = list(mode.tools)
     identity = {
         "harness_digest": baselines.harness_digest(
-            system_prompt=SYSTEM_PROMPT + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
+            system_prompt=_base_prompt(mode) + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
             tools=tools,
             strict_file_tools=strict_file_tools,
             bare=bare,
@@ -1142,6 +1147,8 @@ def cell_identity(
         "timeout_s": _task_timeout(task),
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
         **({"plugin_sha256": mode.plugin_sha256} if mode.plugin_dir else {}),
+        **({"preamble_sha256": hashlib.sha256(_base_prompt(mode).encode("utf-8")).hexdigest()}
+           if mode.prompt_mode == "preamble" else {}),
     }
     key_inputs = {
         **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
@@ -1347,7 +1354,13 @@ def _codex_command(
         f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
     )
     cmd += ["-c", f"skills.config=[{skills_config}]"]
-    instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
+    if mode.prompt_mode == "preamble":
+        # As `tilth codex` does: the preamble replaces Codex's model instructions, not the developer message.
+        cmd += ["-c", f"{_PREAMBLE_KEY}{json.dumps(str(_preamble_file(_base_prompt(mode))))}"]
+        lead = ""
+    else:
+        lead = f"{SYSTEM_PROMPT}\n"
+    instructions = f"{lead}Your current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
     if mode.mcp_config_path:
         instructions += _CODEX_TILTH_GUIDANCE
     cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
@@ -1455,7 +1468,8 @@ def _claude_command(
         # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
         cmd += ["--append-system-prompt", cwd_prompt]
     else:
-        cmd += ["--system-prompt", SYSTEM_PROMPT + "\n" + cwd_prompt]
+        # A preamble arm replaces the system prompt with the preamble, as `tilth claude` does.
+        cmd += ["--system-prompt", _base_prompt(mode) + "\n" + cwd_prompt]
 
     # --setting-sources "" loads no user/project/local settings (hooks, env,
     # user MCP servers) while retaining OAuth/keychain auth and honoring
@@ -2126,6 +2140,48 @@ def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
                    binary_sha256=build.binary_sha256)
 
 
+PREAMBLE_FILE = "prompts/preamble.md"
+
+
+def read_preamble(sha: str | None = None, *, repo: Path | None = None) -> str:
+    """The launcher preamble of the tree under test: ``prompts/preamble.md`` at the commit ``sha`` of ``repo``,
+    or in the ``repo`` checkout when ``sha`` is None (default repo: this checkout).
+
+    Raises ``OSError`` or ``subprocess.CalledProcessError`` when the file is absent.
+    """
+    repo = Path(repo or REPO_ROOT)
+    if sha is None:
+        return (repo / PREAMBLE_FILE).read_text(encoding="utf-8")
+    return subprocess.run(["git", "show", f"{sha}:{PREAMBLE_FILE}"], cwd=repo, check=True,
+                          capture_output=True).stdout.decode("utf-8")
+
+
+def preamble_mode(mode: ModeConfig, text: str) -> ModeConfig:
+    """``mode`` with ``text`` as its whole system prompt, in place of ``SYSTEM_PROMPT``."""
+    return replace(mode, prompt_mode="preamble", preamble=text)
+
+
+def _base_prompt(mode: ModeConfig) -> str:
+    """The system prompt text of an arm: its preamble for a preamble arm, else ``SYSTEM_PROMPT``."""
+    if mode.prompt_mode != "preamble":
+        return SYSTEM_PROMPT
+    if mode.preamble is None:
+        raise ValueError(f"mode '{mode.name}' is a preamble arm with no preamble text")
+    return mode.preamble
+
+
+def _preamble_file(text: str) -> Path:
+    """A content-addressed copy of ``text`` under the results dir, for Codex's ``model_instructions_file``."""
+    data = text.encode("utf-8")
+    path = RESULTS_DIR / "configs" / "preambles" / f"preamble-{hashlib.sha256(data).hexdigest()}.md"
+    if not path.is_file() or path.read_bytes() != data:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        partial.write_bytes(data)
+        partial.replace(path)
+    return path
+
+
 def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
                      strict_file_tools: bool = False, hook_sha: str | None = None,
                      hook_repo: Path | None = None) -> dict:
@@ -2191,6 +2247,7 @@ def run_plan(
     repo: Path | None = None,
     strict_file_tools: bool = False,
     hook_sha: str | None = None,
+    preamble: bool = False,
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
@@ -2203,9 +2260,11 @@ def run_plan(
     Every row returned is also appended to ``output``.
     ``strict_file_tools`` runs every cell with Bash guarded by the hook: a tilth arm runs its own binary's hook,
     the baseline runs the hook built at ``hook_sha`` (a commit of ``repo``), and that hook replays every Bash call.
+    ``preamble`` gives every tilth arm ``prompts/preamble.md`` as its system prompt, read at ``candidate_sha``
+    (or from the ``repo`` checkout when ``candidate_sha`` is None).
 
-    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, or ``hook_sha`` has no
-    ``src/hook``; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
+    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, ``hook_sha`` has no
+    ``src/hook``, or ``preamble`` finds no preamble file; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
     Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell or a Claude CLI older than the
     minimum for exec-form hooks.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
@@ -2228,14 +2287,25 @@ def run_plan(
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CandidateBuildFailed(build_failure_detail(error)) from error
     saved: dict[str, ModeConfig] = {}
+    build = None
     if candidate_sha is not None:
         try:
             build = build_candidate(candidate_sha, repo=repo)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CandidateBuildFailed(build_failure_detail(error)) from error
+    text = None
+    if preamble:
+        try:
+            text = read_preamble(build.git_sha if build else None, repo=repo)
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+            raise CandidateBuildFailed(f"cannot read {PREAMBLE_FILE}: {error}") from error
+    if build is not None or text is not None:
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
-            MODES[name] = candidate_mode(MODES[name], build)
+            if build is not None:
+                MODES[name] = candidate_mode(MODES[name], build)
+            if text is not None:
+                MODES[name] = preamble_mode(MODES[name], text)
     try:
         if strict_file_tools and not store_only:
             probe_strict_hooks({cell.mode for cell in cells}, hook_binary)
@@ -2534,6 +2604,22 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
     return modes, experiment
 
 
+def _apply_preamble(modes: list[str], models: list[str], experiment: object, candidate_sha: str | None) -> None:
+    """Make every selected tilth arm a preamble arm, with the preamble at ``candidate_sha`` or in this checkout."""
+    if experiment is not None:
+        raise ValueError("a pinned experiment manifest owns its arms; it cannot be combined with --preamble")
+    if any(RUNNERS[model] not in ("claude", "codex") for model in models):
+        raise ValueError("the preamble arm runs on Claude and Codex models only")
+    tilth_modes = [name for name in modes if _is_tilth_arm(MODES[name])]
+    if not tilth_modes:
+        raise ValueError("no selected arm serves tilth")
+    if appended := [name for name in tilth_modes if MODES[name].prompt_mode != "replace"]:
+        raise ValueError(f"arm(s) {appended} already set prompt_mode")
+    text = read_preamble(candidate_sha)
+    for name in tilth_modes:
+        MODES[name] = preamble_mode(MODES[name], text)
+
+
 def _verify_mcp_servers(modes: list[str], runner: Optional[str]) -> None:
     """Verify the exact MCP command that each selected runner will launch."""
     for mode_name in modes:
@@ -2722,6 +2808,12 @@ Examples:
         "--candidate-sha",
         help="Serve tilth arms from a binary built with cargo build --release --locked at this local commit",
     )
+    parser.add_argument(
+        "--preamble",
+        action="store_true",
+        help="Give every tilth arm prompts/preamble.md as its whole system prompt, as `tilth claude` and "
+             "`tilth codex` do; read at --candidate-sha, else from this checkout. Claude and Codex models only",
+    )
     arm_group = parser.add_mutually_exclusive_group()
     arm_group.add_argument(
         "--modes",
@@ -2819,6 +2911,11 @@ Examples:
         for mode_name in modes:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
+    if args.preamble:
+        try:
+            _apply_preamble(modes, models, experiment, args.candidate_sha)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            parser.error(f"--preamble: {error}")
 
     if any(RUNNERS[name] == "claude" for name in models):
         try:

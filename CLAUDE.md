@@ -132,6 +132,8 @@ python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_tr
 
 # Models: sonnet, opus, haiku (claude CLI aliases), sonnet46, sonnet5, opus5, haiku45 (pinned IDs), gpt5, luna56, o3, gpt5mini
 # Modes: baseline (built-in tools), tilth (built-in + tilth MCP), tilth_forced (tilth MCP only)
+# --preamble: tilth arms run with prompts/preamble.md as their system prompt (Claude and Codex models only);
+#   evolve's --preamble also evolves that file as a text component
 # Tasks: all, or comma-separated names from benchmark/tasks/*.py
 # --max-usd is required whenever any cell is not already in the result store; matching completed cells are reused, not re-run
 ```
