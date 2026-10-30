@@ -6,6 +6,7 @@
 - [semantic-declaration-spans](./semantic-declaration-spans.md) — ADR: Semantic declaration spans
 - [tilth-diff-scope-ergonomics](./tilth-diff-scope-ergonomics.md) — ADRs — tilth_diff scope ergonomics (slug: tilth-diff-scope-ergonomics)
 - [tilth-grok-ergonomics](./tilth-grok-ergonomics.md) — ADR: tilth-grok-ergonomics — curd 2 inclusion and shape
+- [tilth-harness-preamble-launcher](./tilth-harness-preamble-launcher.md) — ADR: tilth harness preamble launcher
 - [tilth-hook-strict-evolve](./tilth-hook-strict-evolve.md) — ADR: tilth hook and strict-by-default evolve
 - [tilth-read-input-ergonomics](./tilth-read-input-ergonomics.md) — ADRs — tilth_read input ergonomics (slug: tilth-read-input-ergonomics)
 - [tilth-search-resilience](./tilth-search-resilience.md) — ADRs — tilth_search resilience (slug: tilth-search-resilience)

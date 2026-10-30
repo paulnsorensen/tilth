@@ -8,6 +8,7 @@ description: Use the `tilth` CLI for code reading, outlining, search, callers, a
 Tree-sitter + ripgrep + smart file reading in one binary. Replaces `grep`, `cat`, `find`, `ls` with AST-aware equivalents across 14 languages (Rust, TS/TSX, JS, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Elixir).
 
 Run via Bash: `tilth <args>`. Search before reading — `tilth <symbol> --scope .` returns definitions, usages, and callee footers in one call.
+`claude`, `codex`, `preamble`, `install`, and `hook` are subcommands. To search for one of these words, run `tilth -- <word>`.
 
 DO NOT use `grep`, `rg`, `cat`, `head`, `tail`, `find`, `ls` — use `tilth` instead.
 DO NOT re-read files whose content is already shown in expanded search results.

@@ -6,7 +6,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ```
 src/
-  main.rs              CLI entry (clap). Dispatches to install, the `hook` shell guard, MCP, or single-query mode.
+  main.rs              CLI entry (clap). Dispatches to install, the `hook` shell guard, the `claude`/`codex` launchers (before clap parses argv), `preamble`, MCP, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS via include_str! from prompts/mcp.md. Always serves the edit surface.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
@@ -50,6 +50,7 @@ src/
     recovery.rs        3-way-merge recovery when the live file drifted since the tagged read.
     snapshots.rs       Per-session file snapshots keyed by tag for edit verification.
     mismatch.rs        Tag-mismatch classification (drift vs fabricated).
+  launch.rs            `tilth claude` / `tilth codex`: write the bundled preamble to the cache dir and exec the harness with it. `tilth preamble`: print the preamble or its cache path. Embeds prompts/preamble.md via include_str!.
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
@@ -57,7 +58,7 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-prompts/               MCP server instruction source (mcp.md) and tool descriptions (tools/*.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
+prompts/               MCP server instruction source (mcp.md), tool descriptions (tools/*.md), and the launcher preamble (preamble.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
 AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/mcp.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
@@ -159,6 +160,10 @@ Do not register an MCP tool, alias, or dispatch arm only to redirect callers.
 Agents do not remember removed or renamed tools, so a retirement shim or "did you mean" hint adds code without value.
 When you remove or rename a tool, delete it fully. An unregistered name gets the plain `unknown tool: <name>` error.
 Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed tool does not return by accident.
+
+## Launcher preamble
+
+`tilth claude` and `tilth codex` hand the harness a bundled system prompt. `tilth preamble` prints the same text, and `tilth preamble --path` prints its cache file, so other harnesses can use it. It lives in `prompts/preamble.md` and `src/launch.rs` embeds it with `include_str!`. `tests/launch_preamble.rs` guards its headings and bans personal-policy terms. `scripts/regen-agents-md.sh` does not read it, so `AGENTS.md` does not carry it.
 
 ## MCP instructions
 

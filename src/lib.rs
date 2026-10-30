@@ -13,6 +13,7 @@ pub mod hook;
 pub mod index;
 pub mod install;
 pub(crate) mod lang;
+pub mod launch;
 pub mod mcp;
 pub(crate) mod read;
 pub(crate) mod search;
