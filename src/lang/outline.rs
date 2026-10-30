@@ -1370,6 +1370,139 @@ pub fn find_entry_by_start_line(
     None
 }
 
+/// Deep outline tree of `content` in the language of `path`, or `None` when
+/// `path` has no code grammar. A `tree` already parsed from `content` skips
+/// the parse.
+pub(crate) fn deep_outline_for_path(
+    path: &std::path::Path,
+    content: &str,
+    tree: Option<&tree_sitter::Tree>,
+) -> Option<Vec<OutlineEntry>> {
+    let crate::types::FileType::Code(lang) = super::detect_file_type(path) else {
+        return None;
+    };
+    Some(match tree {
+        Some(tree) => deep_outline_tree_from_tree(content, lang, tree),
+        None => get_deep_outline_tree(content, lang),
+    })
+}
+
+/// The innermost path-line entry whose span holds every line of
+/// `first..=last`. The walk descends only into entries that hold the lines.
+/// The deepest entry wins, and the first in source order wins a tie.
+pub(crate) fn innermost_entry(
+    entries: &[OutlineEntry],
+    first: u32,
+    last: u32,
+) -> Option<&OutlineEntry> {
+    let mut pending: Vec<(&OutlineEntry, usize)> =
+        entries.iter().rev().map(|entry| (entry, 0)).collect();
+    let mut best: Option<(usize, &OutlineEntry)> = None;
+    while let Some((entry, depth)) = pending.pop() {
+        if !is_path_line_entry_kind(entry.kind) {
+            continue;
+        }
+        if entry.span_start_line <= first && last <= entry.end_line {
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, entry));
+            }
+            pending.extend(entry.children.iter().rev().map(|child| (child, depth + 1)));
+        }
+    }
+    best.map(|(_, entry)| entry)
+}
+
+/// Kinds whose body holds other definitions, so a line between two members
+/// is a clean place to stop.
+fn is_container(kind: OutlineKind) -> bool {
+    matches!(
+        kind,
+        OutlineKind::Class
+            | OutlineKind::Struct
+            | OutlineKind::Interface
+            | OutlineKind::Enum
+            | OutlineKind::Module
+            | OutlineKind::TestSuite
+    )
+}
+
+/// The span of the construct that a stop after `line` cuts in two, or `None`
+/// when `line` and `line + 1` do not lie inside one construct. A stop between
+/// two members of a class or impl does not cut it. A module never counts:
+/// Python's whole-file root parses as one, and a module body is a member list.
+pub(crate) fn cut_construct(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
+    let entry = innermost_entry(entries, line, line.checked_add(1)?)?;
+    if entry.kind == OutlineKind::Module || (is_container(entry.kind) && !entry.children.is_empty())
+    {
+        return None;
+    }
+    Some((entry.span_start_line, entry.end_line))
+}
+
+#[cfg(test)]
+mod construct_tests {
+    use std::path::Path;
+
+    use super::{cut_construct, deep_outline_for_path, innermost_entry};
+
+    const RUST: &str = "\
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Point {
+    fn a(&self) -> i32 {
+        self.x
+    }
+
+    fn b(&self) -> i32 {
+        self.y
+    }
+}
+
+fn tail() {}
+";
+
+    fn rust_outline() -> Vec<crate::types::OutlineEntry> {
+        deep_outline_for_path(Path::new("p.rs"), RUST, None).expect("rust has a grammar")
+    }
+
+    #[test]
+    fn innermost_entry_holds_every_line_of_the_span() {
+        let entries = rust_outline();
+        let name = |first, last| innermost_entry(&entries, first, last).map(|e| e.name.as_str());
+        assert_eq!(name(8, 8), Some("a"), "a line inside a method");
+        assert_eq!(name(7, 9), Some("a"), "the whole method");
+        assert_eq!(name(9, 11), Some("impl Point"), "a span across two methods");
+        assert_eq!(name(4, 6), None, "a span across two top-level items");
+        assert_eq!(name(16, 16), Some("tail"));
+        assert_eq!(name(5, 5), None, "a blank line between items");
+    }
+
+    #[test]
+    fn files_without_a_grammar_have_no_outline() {
+        assert!(deep_outline_for_path(Path::new("notes.txt"), RUST, None).is_none());
+    }
+
+    #[test]
+    fn cut_construct_names_the_innermost_cut_definition() {
+        let entries = rust_outline();
+        assert_eq!(cut_construct(&entries, 2), Some((1, 4)), "struct body");
+        assert_eq!(cut_construct(&entries, 7), Some((7, 9)), "method body");
+        assert_eq!(cut_construct(&entries, 10), None, "between methods");
+        assert_eq!(cut_construct(&entries, 4), None, "after the struct");
+        assert_eq!(cut_construct(&entries, 15), None, "last line");
+    }
+
+    #[test]
+    fn python_root_module_is_not_a_construct() {
+        let source = "a = 1\nb = 2\nc = 3\n";
+        let entries = deep_outline_for_path(Path::new("m.py"), source, None).unwrap();
+        assert_eq!(cut_construct(&entries, 1), None);
+    }
+}
+
 #[cfg(test)]
 mod markdown_helper_tests {
     use super::{heading_level, heading_text, parse_markdown};

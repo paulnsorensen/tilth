@@ -2,6 +2,7 @@
 
 `tilth_read` plans its `paths` before it renders them, so one call returns whole, unfragmented code.
 The planner is `src/mcp/tools/read/plan.rs`; `plan_paths` and `construct_boundary` in `src/mcp/tools/read.rs` wire it in.
+The construct lookup is `cut_construct` in `src/lang/outline.rs`. It uses `innermost_entry`, the same innermost-entry walk that resolves a line anchor in `src/edit/block.rs`, and `deep_outline_for_path`, which needs no `OutlineCache`.
 It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.md).
 
 ## What the planner does
