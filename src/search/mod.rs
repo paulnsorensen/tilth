@@ -88,6 +88,14 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// agent can edit any line of it without a separate read.
 const WHOLE_FILE_MAX_LINES: u32 = 60;
 
+/// A usage hit prints the largest syntax node around it of at most this many
+/// lines (the whole statement, block, or small definition), so the agent can
+/// edit that construct from the search tag without a separate read. An offline
+/// replay of gepa-v3 trajectories put the knee here: 4 lines made 12% of
+/// search-read-write sequences read-free for 7% more search output; 12 lines
+/// gained 2 more points for 32% more output.
+const CONSTRUCT_CONTEXT_MAX_LINES: u32 = 4;
+
 pub(crate) const SECRET_REDACTION_NOTICE: &str =
     "\n-> contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
 
@@ -830,7 +838,7 @@ fn format_matches(
         } else {
             // Multiple usages collapsed into one entry
             let start = out.len();
-            format_grouped_usages(group, scope, cache, session, out, seen);
+            format_grouped_usages(group, scope, cache, session, out, seen, budget_tokens);
             let value = group
                 .iter()
                 .map(|m| i64::from(m.def_weight))
@@ -934,8 +942,57 @@ fn lines_as_ranges(lines: &[u32]) -> Vec<(u32, u32)> {
     lines.iter().map(|&n| (n, n)).collect()
 }
 
+/// The numbered lines of the bounded construct around each of `lines`, with
+/// the spans they cover. The `mark` line prints as `-> N:text`, so a widened
+/// hit still shows which line matched. `None` when the constructs add no line
+/// to `lines`, or the block would take more than half the response budget on
+/// top of `out_len`.
+fn construct_context(
+    path: &Path,
+    lines: &[u32],
+    mark: Option<u32>,
+    source: &str,
+    cache: &OutlineCache,
+    out_len: usize,
+    budget_tokens: u64,
+) -> Option<(String, Vec<(u32, u32)>)> {
+    let found =
+        scope::bounded_construct_spans(path, source, lines, CONSTRUCT_CONTEXT_MAX_LINES, cache);
+    let mut spans: Vec<(u32, u32)> = lines
+        .iter()
+        .zip(found)
+        .map(|(&n, span)| span.unwrap_or((n, n)))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let printed: u32 = merged.iter().map(|&(start, end)| end - start + 1).sum();
+    if printed as usize <= lines.len() {
+        return None;
+    }
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut block = String::new();
+    for &(start, end) in &merged {
+        for n in start..=end {
+            let text = source_lines.get((n as usize).checked_sub(1)?)?;
+            let marker = if mark == Some(n) { "-> " } else { "" };
+            let _ = write!(block, "\n{marker}{n}:{text}");
+        }
+    }
+    if estimate_tokens((out_len + block.len()) as u64) > budget_tokens / 2 {
+        return None;
+    }
+    Some((block, merged))
+}
+
 /// Format a group of usages collapsed into a single entry. Each matched line
-/// prints as `N:text` under a tagged header, and only those lines are recorded.
+/// prints as `N:text` under a tagged header, widened to its bounded construct
+/// when that fits; only the printed lines are recorded.
 fn format_grouped_usages(
     group: &[&Match],
     scope: &Path,
@@ -943,6 +1000,7 @@ fn format_grouped_usages(
     session: Option<&Session>,
     out: &mut String,
     seen: &mut Vec<(usize, SeenEntry)>,
+    budget_tokens: u64,
 ) {
     let first = group[0];
     let path_str = rel(&first.path, scope);
@@ -968,24 +1026,34 @@ fn format_grouped_usages(
         return;
     }
 
-    for m in group {
-        let _ = write!(out, "\n{}:{}", m.line, m.text);
-    }
     let content = fs::read_to_string(&first.path).ok();
     let source = content.as_deref().filter(|source| {
+        let source_lines: Vec<&str> = source.lines().collect();
         group
             .iter()
-            .all(|m| source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str()))
+            .all(|m| source_lines.get(m.line.saturating_sub(1) as usize) == Some(&m.text.as_str()))
     });
-    insert_tag(
-        out,
-        tag_at,
-        session,
-        seen,
-        &first.path,
-        &lines_as_ranges(&lines),
-        source,
-    );
+    let context = source.and_then(|source| {
+        construct_context(
+            &first.path,
+            &lines,
+            None,
+            source,
+            cache,
+            out.len(),
+            budget_tokens,
+        )
+    });
+    let shown = if let Some((block, spans)) = context {
+        out.push_str(&block);
+        spans
+    } else {
+        for m in group {
+            let _ = write!(out, "\n{}:{}", m.line, m.text);
+        }
+        lines_as_ranges(&lines)
+    };
+    insert_tag(out, tag_at, session, seen, &first.path, &shown, source);
 }
 
 /// Format a comma-separated line list, collapsing consecutive runs.
@@ -1064,6 +1132,41 @@ fn insert_entry_tag(
         ));
     }
 }
+
+/// Print a hit's one-line preview, or its bounded construct as numbered lines
+/// when that fits, and log the printed lines under the file's tag.
+#[allow(clippy::too_many_arguments)]
+fn push_hit_preview(
+    out: &mut String,
+    tag_at: usize,
+    session: Option<&Session>,
+    seen: &mut Vec<(usize, SeenEntry)>,
+    m: &Match,
+    source: Option<&str>,
+    cache: &OutlineCache,
+    budget_tokens: u64,
+) {
+    let context = source.and_then(|source| {
+        construct_context(
+            &m.path,
+            &[m.line],
+            Some(m.line),
+            source,
+            cache,
+            out.len(),
+            budget_tokens,
+        )
+    });
+    if let Some((block, spans)) = context {
+        out.push_str(&block);
+        insert_tag(out, tag_at, session, seen, &m.path, &spans, source);
+    } else {
+        let line = [(m.line, m.line)];
+        insert_tag(out, tag_at, session, seen, &m.path, &line, source);
+        let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
+    }
+}
+
 /// The symbol to feed query-aware truncation when expanding a match's body.
 ///
 /// For `impl`/`implements` matches the user searched for the trait or interface,
@@ -1240,42 +1343,42 @@ fn format_single_match(
     } else if m.file_lines < 50 {
         // Skip outline for small files — the expanded code speaks for itself
         if !fence_will_follow {
-            insert_tag(
+            push_hit_preview(
                 out,
                 tag_at,
                 session,
                 seen,
-                &m.path,
-                &[(m.line, m.line)],
+                m,
                 preview_content.as_deref(),
+                cache,
+                budget_tokens,
             );
-            let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
         if !fence_will_follow {
-            insert_tag(
+            push_hit_preview(
                 out,
                 tag_at,
                 session,
                 seen,
-                &m.path,
-                &[(m.line, m.line)],
+                m,
                 preview_content.as_deref(),
+                cache,
+                budget_tokens,
             );
-            let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if !fence_will_follow {
-        insert_tag(
+        push_hit_preview(
             out,
             tag_at,
             session,
             seen,
-            &m.path,
-            &[(m.line, m.line)],
+            m,
             preview_content.as_deref(),
+            cache,
+            budget_tokens,
         );
-        let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
     if *expand_remaining > 0 {
@@ -1827,7 +1930,15 @@ fn format_search_result_seen(
             }
             for (_, _, group) in &test_files {
                 let start = out.len();
-                format_grouped_usages(group, &result.scope, cache, session, &mut out, &mut seen);
+                format_grouped_usages(
+                    group,
+                    &result.scope,
+                    cache,
+                    session,
+                    &mut out,
+                    &mut seen,
+                    budget_tokens,
+                );
                 let value = group
                     .iter()
                     .map(|m| i64::from(m.def_weight))
@@ -3860,7 +3971,15 @@ mod tests {
         let group: Vec<&Match> = vec![&m1, &m2, &m3];
         let cache = OutlineCache::new();
         let mut out = String::new();
-        format_grouped_usages(&group, tmp.path(), &cache, None, &mut out, &mut Vec::new());
+        format_grouped_usages(
+            &group,
+            tmp.path(),
+            &cache,
+            None,
+            &mut out,
+            &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
+        );
 
         assert!(
             out.starts_with("\n\n### "),
@@ -3901,7 +4020,15 @@ mod tests {
         let group: Vec<&Match> = vec![&m1, &m2];
         let cache = OutlineCache::new();
         let mut out = String::new();
-        format_grouped_usages(&group, tmp.path(), &cache, None, &mut out, &mut Vec::new());
+        format_grouped_usages(
+            &group,
+            tmp.path(),
+            &cache,
+            None,
+            &mut out,
+            &mut Vec::new(),
+            crate::budget::DEFAULT_BUDGET,
+        );
 
         assert!(
             out.contains("credentials.json"),
@@ -3916,6 +4043,56 @@ mod tests {
             !out.contains("TOPSECRET_value_999"),
             "secret value must never appear: {out:?}"
         );
+    }
+
+    /// A usage hit on line 2 of a small Python function, previewed under `budget_tokens`.
+    fn hit_preview(budget_tokens: u64) -> String {
+        use crate::types::Match;
+
+        let source = "def host():\n    marker_call(\n        first,\n    )\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.py");
+        std::fs::write(&p, source).unwrap();
+        let m = Match {
+            path: p,
+            line: 2,
+            text: "    marker_call(".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 4,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_byte_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let mut out = String::new();
+        push_hit_preview(
+            &mut out,
+            0,
+            None,
+            &mut Vec::new(),
+            &m,
+            Some(source),
+            &cache,
+            budget_tokens,
+        );
+        out
+    }
+
+    #[test]
+    fn widened_hit_marks_its_matched_line() {
+        assert_eq!(
+            hit_preview(crate::budget::DEFAULT_BUDGET),
+            "\n1:def host():\n-> 2:    marker_call(\n3:        first,\n4:    )"
+        );
+    }
+
+    #[test]
+    fn hit_over_half_the_budget_prints_only_its_matched_line() {
+        assert_eq!(hit_preview(4), "\n-> [2]       marker_call(");
     }
 
     // Verify that format_matches records segment byte ranges correctly.

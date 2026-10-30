@@ -2509,12 +2509,13 @@ mod tests {
         let h = Harness::new();
         let found = h.search(dir.path(), json!({"query": "marker_call"}));
         let preview = found["results"][0]["preview"].as_str().unwrap();
-        // host() starts at line 2401; its two marker_call lines are 2402-2403.
+        // host() spans 2401-2404 and fits the construct bound, so the hits print it whole.
         let tag = u16::from_str_radix(&header_tag(preview, "big.rs"), 16).unwrap();
-        assert!(preview.contains("marker_call();"), "{preview}");
+        assert!(preview.contains("\n2404:}"), "{preview}");
         let snapshot = h.session.snapshots().by_tag(&path, tag).expect("snapshot");
-        assert_eq!(snapshot.first_unseen_anchor([2402, 2403]), None);
-        assert_eq!(snapshot.first_unseen_anchor([2404]), Some(2404));
+        assert_eq!(snapshot.first_unseen_anchor([2401, 2402, 2403, 2404]), None);
+        assert_eq!(snapshot.first_unseen_anchor([2400]), Some(2400));
+        assert_eq!(snapshot.first_unseen_anchor([2405]), Some(2405));
     }
 
     #[test]

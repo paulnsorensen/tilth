@@ -191,7 +191,7 @@ class TestFacetEditable(SearchFixture):
         (self.root / "tests").mkdir()
         for name in ("alpha", "beta", "gamma", "delta"):
             (self.root / "tests" / f"test_{name}.py").write_text(
-                "def test_it():\n    tagged_marker(1)\n    return unrelated_tail\n")
+                "def test_it():\n    tagged_marker(1)\n\n\ndef test_other():\n    return unrelated_tail\n")
         for name in ("one", "two", "three"):
             (self.root / f"src_{name}.py").write_text(f"def run_{name}():\n    tagged_marker(2)\n")
 

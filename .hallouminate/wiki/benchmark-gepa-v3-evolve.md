@@ -71,6 +71,9 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 
 1. Explicit search modes (literal, regex, symbol), so auto-resolution stops narrowing or changing the agent's intent. This is the largest remaining cause, about 0.45 calls per cell.
 2. Edit from search: let `tilth_write` edit lines that a search hit displayed, now that #404 tags test hits, to skip a read turn.
+   Measured on the gepa-v3 streams: after #404, 85% of search-read-write sequences read because the write touched lines the search did not display (imports, the rest of a multi-line statement, other hunks); only 8% re-read lines the search had shown.
+   A usage hit now prints its enclosing syntax node of at most 4 lines (`CONSTRUCT_CONTEXT_MAX_LINES`, `src/search/mod.rs`). An offline replay made 12% of sequences read-free for 7% more search output; 12 lines gave 14% for 32% more.
+   Import edits remain the largest unserved group.
 3. Structural or exact-text edits instead of line-range edits, to cut repair loops such as a leftover brace after a partial replace (about 0.35 calls per cell).
 4. Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
 5. Prevent malformed `tilth_write` JSON: the seed had 5 rejected write calls against none for baseline. Smaller structural payloads or a schema-first example would help (about 0.17 calls per cell).
