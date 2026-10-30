@@ -1,4 +1,5 @@
 //! `tilth claude` and `tilth codex`: start the harness with the bundled tilth preamble.
+//! `tilth preamble`: print the preamble, or the path of its cache file, for other harnesses.
 
 use std::ffi::OsString;
 use std::io;
@@ -21,6 +22,36 @@ impl Harness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+        }
+    }
+}
+
+/// Print the bundled preamble. With `path`, write the cache file and print its path.
+#[must_use]
+pub fn print_preamble(path: bool) -> i32 {
+    let out = if path {
+        match ensure_preamble_file() {
+            Ok(f) => {
+                let mut bytes = f.into_os_string().into_encoded_bytes();
+                bytes.push(b'\n');
+                bytes
+            }
+            Err(e) => {
+                eprintln!("tilth: cannot write the preamble file: {e}");
+                return 1;
+            }
+        }
+    } else {
+        PREAMBLE.as_bytes().to_vec()
+    };
+    let mut stdout = io::stdout().lock();
+    match io::Write::write_all(&mut stdout, &out).and_then(|()| io::Write::flush(&mut stdout)) {
+        Ok(()) => 0,
+        // A reader such as `head` closed the pipe early. That is not an error.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 0,
+        Err(e) => {
+            eprintln!("tilth: cannot write the preamble: {e}");
+            1
         }
     }
 }

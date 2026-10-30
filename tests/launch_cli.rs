@@ -665,3 +665,49 @@ fn launch_non_utf8_codex_cache_path_exits_1_before_exec() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
 }
+
+#[test]
+fn launch_preamble_command_prints_the_bundled_bytes() {
+    let sb = Sandbox::new();
+    let out = sb.tilth(&["preamble"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.stdout, PREAMBLE);
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert!(
+        !sb.xdg.exists(),
+        "printing the text must not write the cache"
+    );
+}
+
+#[test]
+fn launch_preamble_path_prints_the_cache_file() {
+    let sb = Sandbox::new();
+    for _ in 0..2 {
+        let out = sb.tilth(&["preamble", "--path"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let line = stdout
+            .strip_suffix('\n')
+            .expect("one line ending in a newline");
+        assert!(!line.contains('\n'), "{stdout:?}");
+        let file = Path::new(line);
+        assert_eq!(file, Sandbox::preamble_file(&sb.xdg.join("tilth")));
+        assert!(is_preamble_name(file), "{}", file.display());
+        assert_eq!(fs::read(file).unwrap(), PREAMBLE);
+    }
+
+    // `--path` gives the same file that the launcher passes to the harness.
+    sb.fake("claude", 0);
+    assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
+    let file = Sandbox::preamble_file(&sb.xdg.join("tilth"));
+    assert_eq!(sb.argv()[1], file.to_str().unwrap());
+}
+
+#[test]
+fn launch_preamble_path_fails_cleanly_on_a_bad_cache_dir() {
+    let sb = Sandbox::new();
+    fs::write(&sb.xdg, b"i am a file").unwrap();
+    let out = sb.tilth(&["preamble", "--path"]).output().unwrap();
+    launch_assert_clean_failure(&out, &sb);
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
