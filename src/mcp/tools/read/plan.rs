@@ -51,13 +51,13 @@ pub(super) struct Continuation {
 impl Continuation {
     /// The line a section ends with to name the continuation.
     pub(super) fn note(&self) -> String {
-        let request = serde_json::Value::String(self.request.clone());
+        let paths = serde_json::json!([self.request]).to_string();
         let why = if self.stopped_before {
             "stopped before a construct that does not fit this response."
         } else {
             "the construct continues past this section and does not fit this response."
         };
-        format!("... {why} Next: tilth_read(paths: [{request}])")
+        format!("... {why} {}", super::next_call(&paths, ""))
     }
 }
 
@@ -88,8 +88,10 @@ impl FileView {
         let content = std::fs::read_to_string(path).ok()?;
         let mut sizes = vec![0];
         for (index, line) in content.lines().enumerate() {
-            let numbered = format!("{}:{line}\n", index + 1);
-            sizes.push(sizes[sizes.len() - 1] + super::escaped_len(&numbered));
+            let digits = (index + 1).ilog10() as usize + 1;
+            // `N:`, the line, and the escaped `\n` that ends it.
+            let numbered = digits + 1 + super::escaped_len(line) + 2;
+            sizes.push(sizes[sizes.len() - 1] + numbered);
         }
         Some(Self {
             path: path.to_path_buf(),
@@ -108,6 +110,16 @@ impl FileView {
         let end = (end as usize).min(self.sizes.len() - 1);
         let start = (start as usize).clamp(1, end.max(1));
         self.sizes[end] - self.sizes[start - 1]
+    }
+
+    /// The last line of `start..=end` that keeps the lines from `start` within
+    /// `limit` bytes. The result is never less than `start`.
+    fn fit_end(&self, start: u32, end: u32, limit: usize) -> u32 {
+        let mut last = start;
+        while last < end && self.size(start, last + 1) <= limit {
+            last += 1;
+        }
+        last
     }
 
     /// The construct a section ending at `line` cuts, if any. A file larger
@@ -196,14 +208,21 @@ fn request_span(request: &Request, total: u32, cache: &OutlineCache) -> Option<(
     };
     (start >= 1 && start <= end).then_some((start, end, open_end))
 }
+/// Whether a section that starts at `start` lies within [`COALESCE_GAP`]
+/// lines after a section that ends at `end`.
+fn within_gap(end: u32, start: u32) -> bool {
+    start <= end.saturating_add(COALESCE_GAP + 1)
+}
 
 /// Plan `requests` so the response fits `limit` escaped bytes. Requests that
 /// show no line span (whole files, errors, ignored paths) pass through.
 pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> Vec<Planned> {
     let frame = SECTION_FRAME_BYTES * requests.len();
     let limit = limit.saturating_sub(frame);
-    let mut files: Vec<(PathBuf, Option<FileView>)> = Vec::new();
-    let mut spans: Vec<Option<(u32, u32, bool)>> = Vec::with_capacity(requests.len());
+    // Files are keyed by their normalized path, so `a/../f.py` and `f.py`
+    // are one file.
+    let mut files: Vec<(String, Option<FileView>)> = Vec::new();
+    let mut spans: Vec<Option<(u32, u32, bool, usize)>> = Vec::with_capacity(requests.len());
     let mut used = 0usize;
     for request in requests {
         let mut span = None;
@@ -211,12 +230,15 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
             && request.path.is_file()
             && !crate::read::tilthignore_denies(&request.path)
         {
-            if !files.iter().any(|(path, _)| *path == request.path) {
-                files.push((request.path.clone(), FileView::load(&request.path)));
-            }
-            let view = files.iter().find(|(path, _)| *path == request.path);
-            if let Some((_, Some(view))) = view {
-                span = request_span(request, view.total(), cache);
+            let key = crate::edit::normalize_path_key(&request.path);
+            let file = files.iter().position(|(known, _)| *known == key);
+            let file = file.unwrap_or_else(|| {
+                files.push((key, FileView::load(&request.path)));
+                files.len() - 1
+            });
+            if let Some(view) = &files[file].1 {
+                span = request_span(request, view.total(), cache)
+                    .map(|(start, end, open)| (start, end, open, file));
             }
         } else if matches!(request.suffix, PathSuffix::None)
             && !crate::read::would_outline(&request.path)
@@ -227,25 +249,22 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
     }
 
     let mut clusters: Vec<(usize, Cluster)> = Vec::new();
-    for (file, (path, view)) in files.iter().enumerate() {
+    for (file, (_, view)) in files.iter().enumerate() {
         if view.is_none() {
             continue;
         }
-        let mut members: Vec<(u32, u32, bool, usize)> = requests
-            .iter()
-            .zip(&spans)
-            .enumerate()
-            .filter_map(|(index, (request, span))| {
-                let (start, end, open) = (*span)?;
-                (request.path == *path).then_some((start, end, open, index))
-            })
-            .collect();
+        let mut members: Vec<(u32, u32, bool, usize)> = Vec::new();
+        for (index, span) in spans.iter().enumerate() {
+            if let Some((start, end, open, owner)) = *span {
+                if owner == file {
+                    members.push((start, end, open, index));
+                }
+            }
+        }
         members.sort_unstable_by_key(|&(start, end, _, index)| (start, end, index));
         for (start, end, open, index) in members {
             match clusters.last_mut() {
-                Some((owner, cluster))
-                    if *owner == file && start <= cluster.end.saturating_add(COALESCE_GAP + 1) =>
-                {
+                Some((owner, cluster)) if *owner == file && within_gap(cluster.end, start) => {
                     cluster.lead = cluster.lead.min(index);
                     cluster.members.push(index);
                     if end > cluster.end {
@@ -300,7 +319,7 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
         let asked = cluster
             .members
             .iter()
-            .any(|&member| spans[member].is_some_and(|(first, _, _)| first >= start));
+            .any(|&member| spans[member].is_some_and(|(first, ..)| first >= start));
         let stop = start > cluster.start && !asked && view.size(start, end) <= limit;
         let kept = if stop {
             used - view.size(start, cluster.end)
@@ -321,8 +340,11 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
                 stopped_before: true,
             });
         } else {
+            // Name only as many lines as one response at this limit shows.
+            let first = cluster.end + 1;
+            let last = view.fit_end(first, end, limit);
             cluster.next = Some(Continuation {
-                request: format!("{shown}#{}-{end}", cluster.end + 1),
+                request: format!("{shown}#{first}-{last}"),
                 stopped_before: false,
             });
         }
@@ -333,9 +355,7 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
     for (file, cluster) in clusters {
         match merged.last_mut() {
             Some((owner, last))
-                if *owner == file
-                    && last.next.is_none()
-                    && cluster.start <= last.end.saturating_add(COALESCE_GAP + 1) =>
+                if *owner == file && last.next.is_none() && within_gap(last.end, cluster.start) =>
             {
                 last.lead = last.lead.min(cluster.lead);
                 last.members.extend(cluster.members);
@@ -348,15 +368,13 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
         }
     }
 
-    let mut planned: Vec<Option<Planned>> = requests
-        .iter()
-        .map(|request| {
-            Some(Planned {
-                request: request.raw.clone(),
-                next: None,
-            })
-        })
-        .collect();
+    let mut planned: Vec<Option<Planned>> = Vec::with_capacity(requests.len());
+    for request in requests {
+        planned.push(Some(Planned {
+            request: request.raw.clone(),
+            next: None,
+        }));
+    }
     for (_, cluster) in merged {
         for &member in &cluster.members {
             planned[member] = None;
@@ -365,7 +383,7 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
         let unchanged = cluster.members.len() == 1
             && cluster.next.is_none()
             && spans[cluster.lead]
-                .is_some_and(|(start, end, _)| (start, end) == (cluster.start, cluster.end));
+                .is_some_and(|(start, end, ..)| (start, end) == (cluster.start, cluster.end));
         let request = if unchanged {
             lead.raw.clone()
         } else {
@@ -623,5 +641,52 @@ fn tail() {}
                 next: None,
             }]
         );
+    }
+
+    #[test]
+    fn a_continuation_names_only_lines_that_fit_the_limit() {
+        let source = "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n";
+        let dir = fixture(source, "q.rs");
+        let view = FileView::load(&dir.path().join("q.rs")).unwrap();
+        let limit = SECTION_FRAME_BYTES + view.size(1, 2);
+        assert!(view.size(3, 5) > view.size(1, 2), "the rest must not fit");
+        assert_eq!(
+            plan(
+                &requests(dir.path(), &["q.rs#1-2"]),
+                &OutlineCache::new(),
+                limit
+            ),
+            [Planned {
+                request: "q.rs#1-2".into(),
+                next: Some(Continuation {
+                    request: "q.rs#3-3".into(),
+                    stopped_before: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn spellings_of_one_file_merge() {
+        let dir = fixture(&assignments(), "f.py");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let dotted = format!("{}/sub/../f.py#12-20", dir.path().display());
+        assert_eq!(
+            planned(dir.path(), &["f.py#5-10", &dotted], 40_000),
+            ["f.py#5-20"]
+        );
+    }
+
+    #[test]
+    fn file_view_sizes_match_the_escaped_numbered_lines() {
+        let source = "a \"q\" \\ b\n\tc\u{1}\u{8}\u{c}\r\u{1f}\u{7f} é ☃\n\nlast";
+        let dir = fixture(source, "s.txt");
+        let view = FileView::load(&dir.path().join("s.txt")).unwrap();
+        let mut expected = 0;
+        for (index, line) in source.lines().enumerate() {
+            let numbered = format!("{}:{line}\n", index + 1);
+            expected += serde_json::to_string(&numbered).unwrap().len() - 2;
+        }
+        assert_eq!(view.size(1, 4), expected);
     }
 }

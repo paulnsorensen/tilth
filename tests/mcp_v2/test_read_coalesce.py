@@ -122,6 +122,13 @@ class ReadCoalesce(unittest.TestCase):
         self.assertIn("unchanged since your last read", text)
         self.assertEqual(shown(text), [], text)
 
+    def test_batch_merged_to_one_section_keeps_the_batch_header(self):
+        self.write_file("f.py", flat(120))
+        result = self.run_session(self.read(2, ["f.py#10-40", "f.py#35-80"]))
+        text = harness.tool_result_text(result.response_by_id(2))
+        self.assertEqual(text.count("[f.py#"), 1, text)
+        self.assertIn("if_modified_since", header(text), text[:200])
+
     # (b) a range that ends inside a function grows to the function's end.
     def test_range_ending_mid_function_extends_to_its_end(self):
         source = flat(4) + "\n" + function("beta", 20) + "\n" + function("gamma", 5)

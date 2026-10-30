@@ -74,12 +74,16 @@ pub(in crate::mcp) fn tool_read(
     }
 }
 
+/// Render the read of `args`. `batch` is set when the caller asked for more
+/// than one path, so a batch the planner merged to one section keeps the
+/// batch response shape.
 fn render_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     note_tokens: u64,
     nexts: &[Option<plan::Continuation>],
+    batch: bool,
 ) -> Result<Rendered, String> {
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
     // `apply_budget` used by the other tools — an uncapped `mode=full` or
@@ -158,7 +162,7 @@ fn render_read(
 
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
-    if paths.len() > 1 {
+    if batch {
         use rayon::prelude::*;
 
         // Per-path outcome. Workers are pure (read file, parse outline, format)
@@ -805,6 +809,10 @@ fn tool_read_paths(
     session: &Session,
     note_tokens: u64,
 ) -> Result<String, String> {
+    let batch = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| paths.len() > 1);
     let patched;
     let mut nexts = Vec::new();
     let args = match plan_paths(args, cache) {
@@ -821,7 +829,7 @@ fn tool_read_paths(
         }
         None => args,
     };
-    let rendered = render_read(args, cache, session, note_tokens, &nexts)?;
+    let rendered = render_read(args, cache, session, note_tokens, &nexts, batch)?;
     let cwd = super::require_cwd(args)?;
     let _display_base = crate::format::set_display_base(Path::new(cwd));
     let requests: Vec<String> = args
@@ -869,9 +877,25 @@ fn record_shown(session: &Session, shown: &Rendered) {
     }
 }
 
-/// Length of `text` once JSON-escaped, without the surrounding quotes.
+/// Length of `text` once JSON-escaped, without the surrounding quotes. It
+/// counts the escapes `serde_json` writes: two bytes for `"`, `\\`, and the
+/// short control escapes, six bytes for any other control byte.
 fn escaped_len(text: &str) -> usize {
-    serde_json::to_string(text).map_or(text.len(), |s| s.len().saturating_sub(2))
+    let mut len = 0;
+    for byte in text.bytes() {
+        len += match byte {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+    }
+    len
+}
+
+/// The `Next:` call that continues a response. `paths` is a JSON array and
+/// `extra` holds any further arguments, each led by `, `.
+fn next_call(paths: &str, extra: &str) -> String {
+    format!("Next: tilth_read(paths: {paths}{extra})")
 }
 
 /// The line number of an `N:content` row, or `None` for any other line.
@@ -1095,7 +1119,7 @@ fn cut_note(text: &str, kept_end: usize, parts: &[Part], ctx: &CutCtx, limit: us
         } else {
             format!(", mode: \"{}\"", ctx.mode)
         };
-        let _ = write!(note, " Next: tilth_read(paths: {list}{mode})");
+        let _ = write!(note, " {}", next_call(&list, &mode));
         if more > 0 {
             let _ = write!(note, " (+{more} more)");
         }
