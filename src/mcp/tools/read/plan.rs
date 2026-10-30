@@ -8,8 +8,9 @@ use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use crate::cache::OutlineCache;
+use crate::lang::outline;
 use crate::mcp::path_suffix::PathSuffix;
-use crate::types::{OutlineEntry, OutlineKind};
+use crate::types::OutlineEntry;
 
 /// Sections of one file merge when at most this many lines lie between them.
 /// A section costs about 25 tokens of framing (stats line, `[path#TAG]`,
@@ -130,62 +131,13 @@ impl FileView {
         if line >= self.total() || too_large {
             return None;
         }
-        let entries = self
-            .entries
-            .get_or_init(|| outline(&self.path, &self.content, cache));
-        cut_construct(entries, line)
+        let entries = self.entries.get_or_init(|| {
+            let parsed = cache.parse_source(&self.path, &self.content);
+            let tree = parsed.as_ref().map(|parsed| parsed.tree());
+            outline::deep_outline_for_path(&self.path, &self.content, tree).unwrap_or_default()
+        });
+        outline::cut_construct(entries, line)
     }
-}
-
-/// Deep outline of `content`, or nothing for a file without a grammar.
-fn outline(path: &Path, content: &str, cache: &OutlineCache) -> Vec<OutlineEntry> {
-    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
-        return Vec::new();
-    };
-    match cache.parse_source(path, content) {
-        Some(parsed) => {
-            crate::lang::outline::deep_outline_tree_from_tree(content, lang, parsed.tree())
-        }
-        None => crate::lang::outline::get_deep_outline_tree(content, lang),
-    }
-}
-
-/// Kinds whose body holds other definitions, so a line between two members
-/// is a clean place to stop.
-fn is_container(kind: OutlineKind) -> bool {
-    matches!(
-        kind,
-        OutlineKind::Class
-            | OutlineKind::Struct
-            | OutlineKind::Interface
-            | OutlineKind::Enum
-            | OutlineKind::Module
-            | OutlineKind::TestSuite
-    )
-}
-
-/// The span of the construct that a stop after `line` cuts in two, or `None`
-/// when `line` and `line + 1` do not lie inside one construct. A stop between
-/// two members of a class or impl does not cut it. A module never counts:
-/// Python's whole-file root parses as one, and a module body is a member list.
-fn cut_construct(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
-    let next = line.checked_add(1)?;
-    let mut level = entries;
-    let mut found: Option<&OutlineEntry> = None;
-    while let Some(entry) = level.iter().find(|entry| {
-        crate::lang::outline::is_path_line_entry_kind(entry.kind)
-            && entry.span_start_line <= line
-            && next <= entry.end_line
-    }) {
-        found = Some(entry);
-        level = &entry.children;
-    }
-    let entry = found?;
-    if entry.kind == OutlineKind::Module || (is_container(entry.kind) && !entry.children.is_empty())
-    {
-        return None;
-    }
-    Some((entry.span_start_line, entry.end_line))
 }
 
 /// The line span a request shows when the file reads cleanly.
@@ -447,24 +399,6 @@ fn tail() {}
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(name), text).unwrap();
         dir
-    }
-
-    #[test]
-    fn cut_construct_names_the_innermost_cut_definition() {
-        let path = Path::new("p.rs");
-        let entries = outline(path, RUST, &OutlineCache::new());
-        assert_eq!(cut_construct(&entries, 2), Some((1, 4)), "struct body");
-        assert_eq!(cut_construct(&entries, 7), Some((7, 9)), "method body");
-        assert_eq!(cut_construct(&entries, 10), None, "between methods");
-        assert_eq!(cut_construct(&entries, 4), None, "after the struct");
-        assert_eq!(cut_construct(&entries, 15), None, "last line");
-    }
-
-    #[test]
-    fn python_root_module_is_not_a_construct() {
-        let source = "a = 1\nb = 2\nc = 3\n";
-        let entries = outline(Path::new("m.py"), source, &OutlineCache::new());
-        assert_eq!(cut_construct(&entries, 1), None);
     }
 
     /// Sixty plain assignments, a file with no construct to cut.

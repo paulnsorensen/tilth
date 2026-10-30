@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::parser::BlockAnchor;
-use crate::types::{FileType, OutlineEntry};
+use crate::types::OutlineEntry;
 
 /// A resolved 1-based inclusive line span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +30,7 @@ pub fn resolve_block(path: &Path, text: &str, anchor: &BlockAnchor) -> Option<Bl
 /// callers resolving several anchors should compute this once and reuse it via
 /// [`resolve_block_in`].
 pub fn outline_for(path: &Path, text: &str) -> Option<Vec<OutlineEntry>> {
-    let FileType::Code(lang) = crate::lang::detect_file_type(path) else {
-        return None;
-    };
-    Some(crate::lang::outline::get_deep_outline_tree(text, lang))
+    crate::lang::outline::deep_outline_for_path(path, text, None)
 }
 
 /// Resolve `anchor` against pre-computed outline `entries`.
@@ -70,7 +67,8 @@ fn resolve_line(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
     if let Some(hit) = begins_on(entries, line) {
         return Some(hit);
     }
-    innermost_containing(entries, line)
+    crate::lang::outline::innermost_entry(entries, line, line)
+        .map(|entry| (entry.span_start_line, entry.end_line))
 }
 
 fn begins_on(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
@@ -88,24 +86,6 @@ fn begins_on(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
         pending.extend(entry.children.iter().rev());
     }
     best
-}
-
-fn innermost_containing(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
-    let mut pending: Vec<(&OutlineEntry, usize)> =
-        entries.iter().rev().map(|entry| (entry, 0)).collect();
-    let mut best = None;
-    while let Some((entry, depth)) = pending.pop() {
-        if !crate::lang::outline::is_path_line_entry_kind(entry.kind) {
-            continue;
-        }
-        if line >= entry.span_start_line && line <= entry.end_line {
-            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
-                best = Some((depth, (entry.span_start_line, entry.end_line)));
-            }
-            pending.extend(entry.children.iter().rev().map(|child| (child, depth + 1)));
-        }
-    }
-    best.map(|(_, span)| span)
 }
 
 #[cfg(test)]
