@@ -115,21 +115,37 @@ pub fn enclosing_definition_at(
     })
 }
 
-/// The line span of the largest syntax node around `line` that spans at most
-/// `max_lines` lines, below the file root: the complete statement, block, or
-/// small definition a hit sits in. `None` when `source` does not parse or no
-/// such node is larger than the line itself.
-pub(crate) fn bounded_construct_span(
+/// For each of `lines`, the line span of the largest syntax node around it that
+/// spans at most `max_lines` lines, below the file root: the complete statement,
+/// block, or small definition a hit sits in. An entry is `None` when `source`
+/// does not parse or no such node is larger than the line itself. The file
+/// parses and splits into lines once for all of `lines`.
+pub(crate) fn bounded_construct_spans(
     path: &Path,
     source: &str,
-    line: u32,
+    lines: &[u32],
     max_lines: u32,
     cache: &OutlineCache,
+) -> Vec<Option<(u32, u32)>> {
+    let Some(parsed) = cache.parse_source(path, source) else {
+        return vec![None; lines.len()];
+    };
+    let root = parsed.tree().root_node();
+    let source_lines: Vec<&str> = source.lines().collect();
+    lines
+        .iter()
+        .map(|&line| span_at(root, &source_lines, line, max_lines))
+        .collect()
+}
+
+fn span_at(
+    root: tree_sitter::Node,
+    source_lines: &[&str],
+    line: u32,
+    max_lines: u32,
 ) -> Option<(u32, u32)> {
     let row = line.checked_sub(1)? as usize;
-    let text = source.lines().nth(row)?;
-    let parsed = cache.parse_source(path, source)?;
-    let root = parsed.tree().root_node();
+    let text = source_lines.get(row)?;
     // Anchor on the line's last character: the node there belongs to the
     // construct that continues past the line, not to a block the line closes.
     let trimmed = text.trim_end();
@@ -198,6 +214,24 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, content).unwrap();
         p
+    }
+
+    fn bounded_construct_span(
+        path: &Path,
+        source: &str,
+        line: u32,
+        max_lines: u32,
+        cache: &OutlineCache,
+    ) -> Option<(u32, u32)> {
+        bounded_construct_spans(path, source, &[line], max_lines, cache)[0]
+    }
+
+    #[test]
+    fn bounded_spans_resolve_every_line_from_one_parse() {
+        let source = "def host():\n    call(\n        a,\n    )\n    other(\n        b,\n    )\n";
+        let cache = OutlineCache::new();
+        let spans = bounded_construct_spans(Path::new("a.py"), source, &[2, 5, 9], 3, &cache);
+        assert_eq!(spans, vec![Some((2, 4)), Some((5, 7)), None]);
     }
 
     #[test]

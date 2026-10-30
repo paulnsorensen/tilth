@@ -943,22 +943,25 @@ fn lines_as_ranges(lines: &[u32]) -> Vec<(u32, u32)> {
 }
 
 /// The numbered lines of the bounded construct around each of `lines`, with
-/// the spans they cover. `None` when the constructs add no line to `lines`, or
-/// the block would take more than half the response budget on top of `out_len`.
+/// the spans they cover. The `mark` line prints as `-> N:text`, so a widened
+/// hit still shows which line matched. `None` when the constructs add no line
+/// to `lines`, or the block would take more than half the response budget on
+/// top of `out_len`.
 fn construct_context(
     path: &Path,
     lines: &[u32],
+    mark: Option<u32>,
     source: &str,
     cache: &OutlineCache,
     out_len: usize,
     budget_tokens: u64,
 ) -> Option<(String, Vec<(u32, u32)>)> {
+    let found =
+        scope::bounded_construct_spans(path, source, lines, CONSTRUCT_CONTEXT_MAX_LINES, cache);
     let mut spans: Vec<(u32, u32)> = lines
         .iter()
-        .map(|&n| {
-            scope::bounded_construct_span(path, source, n, CONSTRUCT_CONTEXT_MAX_LINES, cache)
-                .unwrap_or((n, n))
-        })
+        .zip(found)
+        .map(|(&n, span)| span.unwrap_or((n, n)))
         .collect();
     spans.sort_unstable();
     let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
@@ -977,7 +980,8 @@ fn construct_context(
     for &(start, end) in &merged {
         for n in start..=end {
             let text = source_lines.get((n as usize).checked_sub(1)?)?;
-            let _ = write!(block, "\n{n}:{text}");
+            let marker = if mark == Some(n) { "-> " } else { "" };
+            let _ = write!(block, "\n{marker}{n}:{text}");
         }
     }
     if estimate_tokens((out_len + block.len()) as u64) > budget_tokens / 2 {
@@ -1024,12 +1028,21 @@ fn format_grouped_usages(
 
     let content = fs::read_to_string(&first.path).ok();
     let source = content.as_deref().filter(|source| {
+        let source_lines: Vec<&str> = source.lines().collect();
         group
             .iter()
-            .all(|m| source.lines().nth(m.line.saturating_sub(1) as usize) == Some(m.text.as_str()))
+            .all(|m| source_lines.get(m.line.saturating_sub(1) as usize) == Some(&m.text.as_str()))
     });
     let context = source.and_then(|source| {
-        construct_context(&first.path, &lines, source, cache, out.len(), budget_tokens)
+        construct_context(
+            &first.path,
+            &lines,
+            None,
+            source,
+            cache,
+            out.len(),
+            budget_tokens,
+        )
     });
     let shown = if let Some((block, spans)) = context {
         out.push_str(&block);
@@ -1134,7 +1147,15 @@ fn push_hit_preview(
     budget_tokens: u64,
 ) {
     let context = source.and_then(|source| {
-        construct_context(&m.path, &[m.line], source, cache, out.len(), budget_tokens)
+        construct_context(
+            &m.path,
+            &[m.line],
+            Some(m.line),
+            source,
+            cache,
+            out.len(),
+            budget_tokens,
+        )
     });
     if let Some((block, spans)) = context {
         out.push_str(&block);
@@ -4022,6 +4043,56 @@ mod tests {
             !out.contains("TOPSECRET_value_999"),
             "secret value must never appear: {out:?}"
         );
+    }
+
+    /// A usage hit on line 2 of a small Python function, previewed under `budget_tokens`.
+    fn hit_preview(budget_tokens: u64) -> String {
+        use crate::types::Match;
+
+        let source = "def host():\n    marker_call(\n        first,\n    )\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.py");
+        std::fs::write(&p, source).unwrap();
+        let m = Match {
+            path: p,
+            line: 2,
+            text: "    marker_call(".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 4,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_byte_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let mut out = String::new();
+        push_hit_preview(
+            &mut out,
+            0,
+            None,
+            &mut Vec::new(),
+            &m,
+            Some(source),
+            &cache,
+            budget_tokens,
+        );
+        out
+    }
+
+    #[test]
+    fn widened_hit_marks_its_matched_line() {
+        assert_eq!(
+            hit_preview(crate::budget::DEFAULT_BUDGET),
+            "\n1:def host():\n-> 2:    marker_call(\n3:        first,\n4:    )"
+        );
+    }
+
+    #[test]
+    fn hit_over_half_the_budget_prints_only_its_matched_line() {
+        assert_eq!(hit_preview(4), "\n-> [2]       marker_call(");
     }
 
     // Verify that format_matches records segment byte ranges correctly.
