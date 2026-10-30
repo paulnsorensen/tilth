@@ -4,6 +4,7 @@
 The planner is `src/mcp/tools/read/plan.rs`; `tool_read_paths` and `construct_boundary` in `src/mcp/tools/read.rs` wire it in.
 `ReadCall::parse` checks the arguments and parses each path once into a `Request` (path plus `PathSuffix`). The planner takes and returns `Request` values, and the renderer reads them without a second parse. `suffix_span` is the one resolver from a suffix to a line span, for the planner and for `read_single_with_suffix`.
 The construct lookup is `cut_construct` in `src/lang/outline.rs`. It uses `innermost_entry`, the same innermost-entry walk that resolves a line anchor in `src/edit/block.rs`, and `deep_outline_for_path`, which needs no `OutlineCache`.
+The grow-or-stop decision is `FileView::complete` in `src/read/complete.rs`. `FileView<C>` measures numbered lines with a `LineCost`: `plan::Escaped` counts the JSON-escaped `N:line` that `tilth_read` sends, and `Plain` counts the padded `N  line` that the CLI prints. `plan::FileView` is the alias `complete::FileView<Escaped>`.
 It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.md).
 
 ## What the planner does
@@ -16,6 +17,15 @@ It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.
 - **Large files.** A file larger than `MAX_PARSED_FILE_BYTES` (500 KB) gets no construct lookup, because the parsed-file cache does not keep it and every call would parse it again. Its ranges never grow, and a host cut inside one of its constructs stays where it falls.
 
 Seen-line provenance needs no new code: `record_shown` still records the numbered lines that each part's span of the final text shows.
+
+## CLI `--section`
+
+`tilth <file> --section N-M` completes a construct in the same way. `cli_section` in `src/read/complete.rs` calls `FileView::complete`, and `run_inner` in `src/lib.rs` reads the range it returns.
+
+- The limit is `--budget` tokens times 4 bytes, less 200 bytes and two copies of the path for the header and the note. Without `--budget`, the CLI has no limit, so the range always grows to the end of the construct.
+- When the growth does not fit, the read ends with `... Next: tilth <path> --section A-B`. The path is the absolute path that the header shows, so the call works from any directory.
+- Only an `N-M` range completes. A heading section reads as before.
+- `tests/section_cli.rs` runs the built binary: a range grows, a small budget stops before the function, and a Python range never grows to the root module.
 
 ## Batch `next_view`
 
