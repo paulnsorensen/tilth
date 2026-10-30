@@ -130,7 +130,10 @@ pub(crate) fn bounded_construct_span(
     let text = source.lines().nth(row)?;
     let parsed = cache.parse_source(path, source)?;
     let root = parsed.tree().root_node();
-    let column = text.len() - text.trim_start().len();
+    // Anchor on the line's last character: the node there belongs to the
+    // construct that continues past the line, not to a block the line closes.
+    let trimmed = text.trim_end();
+    let column = trimmed.len() - trimmed.chars().next_back()?.len_utf8();
     let point = tree_sitter::Point { row, column };
     let node = root.descendant_for_point_range(point, point)?;
     let mut best = None;
@@ -217,6 +220,23 @@ mod tests {
         let cache = OutlineCache::new();
         let span = bounded_construct_span(Path::new("a.js"), source, 2, 12, &cache);
         assert_eq!(span, Some((1, 4)));
+    }
+
+    #[test]
+    fn bounded_span_completes_a_call_that_continues_past_the_hit_line() {
+        let cache = OutlineCache::new();
+        let js = "function host(x) {\n  if (x) {\n    other();\n  } else if (marker_call(a,\n      b)) {\n    done();\n  }\n}\n";
+        assert_eq!(
+            bounded_construct_span(Path::new("a.js"), js, 4, 4, &cache),
+            Some((4, 7)),
+            "a leading `}}` must not anchor the span to the block before the hit"
+        );
+        let py = "def host():\n    x = prep(); marker_call(\n        a,\n    )\n    y = 1\n    z = 2\n    w = 3\n";
+        assert_eq!(
+            bounded_construct_span(Path::new("a.py"), py, 2, 4, &cache),
+            Some((2, 4)),
+            "a second statement on the hit line must be completed"
+        );
     }
 
     #[test]

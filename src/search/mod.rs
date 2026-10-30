@@ -1119,6 +1119,7 @@ fn insert_entry_tag(
         ));
     }
 }
+
 /// Print a hit's one-line preview, or its bounded construct as numbered lines
 /// when that fits, and log the printed lines under the file's tag.
 #[allow(clippy::too_many_arguments)]
