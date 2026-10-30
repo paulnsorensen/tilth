@@ -19,7 +19,7 @@ $ tilth src/auth.ts
   [132-180] fn authorize(user, resource)
 ```
 
-Small files come back whole. Large files get an outline. Drill in with `--section`:
+Small files come back whole. Large files get an outline. Drill in with `--section`. A line range that ends inside a function grows to the function's end. If that does not fit `--budget`, the range stops before the function and names the next `tilth` call:
 
 ```bash
 tilth src/auth.ts --section 44-89
@@ -353,7 +353,7 @@ Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-pro
 
 ```bash
 tilth <path>                      # read file (outline if large)
-tilth <path> --section 45-89      # exact line range
+tilth <path> --section 45-89      # line range, grown to the end of a cut function
 tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages

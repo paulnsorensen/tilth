@@ -1,3 +1,4 @@
+pub(crate) mod complete;
 pub mod fuzzy_path;
 pub mod imports;
 pub mod outline;

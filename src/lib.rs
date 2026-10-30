@@ -222,7 +222,15 @@ fn run_inner(
             if read::tilthignore_denies(&path) {
                 return Err(TilthError::IgnoreDenied { path });
             }
-            let mut out = read::read_file_resolving(&path, section, full, cache, false, scope)?;
+            let completed =
+                section.and_then(|s| read::complete::cli_section(&path, s, budget_tokens, cache));
+            let range = completed.as_ref().map(|c| c.range.as_str());
+            let mut out =
+                read::read_file_resolving(&path, range.or(section), full, cache, false, scope)?;
+            if let Some(note) = completed.and_then(|c| c.note) {
+                out.push('\n');
+                out.push_str(&note);
+            }
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = read::imports::resolve_related_files(&path);
                 if !related.is_empty() {
