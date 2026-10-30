@@ -240,6 +240,7 @@ tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_inst
 ```
 
 - The tilth preamble replaces the built-in system prompt of the harness.
+- The launcher does not register the tilth MCP server. The preamble sends file reads and edits to the tilth tools, so run `tilth install claude-code` or `tilth install codex` first (see [MCP server](#mcp-server)).
 - `<F>` is `$XDG_CACHE_HOME/tilth/preamble-<hash>.md`, or `~/.cache/tilth/` when `XDG_CACHE_HOME` is unset. The launcher writes only in this directory. It writes no host config (`~/.claude.json`, `~/.claude/settings.json`, `~/.codex/config.toml`).
 - On Unix, the launcher refuses a `tilth` cache directory that is a symlink, that another user owns, or that all users can write.
 - Your own `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), wins. The launcher then adds nothing. Arguments after `--` are text, so they do not count.
