@@ -213,10 +213,13 @@ An external instance needs only a cached dataset row: the judge does not run adm
 
 `benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits.
 A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
+With `--preamble`, a candidate also holds `prompts/preamble.md`, and the `tilth_forced` arm runs with that file as its system prompt (see [Preamble arm](#preamble-arm)).
+Each cell reads the preamble from the commit of its candidate, so reflection can change it and the next cell sees the change.
 Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
 The commit passes `just check`, then the hook gate (strict runs), then a cheap tier, then the panel's dev split.
 That `just check` sets `TILTH_EVOLVE_CANDIDATE=1`, so the Rust tests skip their phrase pins on `prompts/` text; CI does not set it, so the winner PR must re-pin them before it lands.
-The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. Reflection is told this cap and the current size, and a candidate prompt file over it is refused before its worktree and `just check`.
+The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. The preamble fills no MCP field; its cap is 4096 bytes. Reflection is told the cap of the file and its current size, and a candidate prompt file over its cap is refused before its worktree and `just check`.
+A candidate that carries the preamble outside a `--preamble` run, or that drops a component of the seed, is refused at the apply stage.
 The run log names the stage at which each candidate failed (apply, `just check`, build, hook gate, or cheap tier), with the output tail.
 Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
 A task's score is `p * base / c`: pass rate times the frozen baseline mean cost over the candidate's mean rollout cost; contaminated rollouts count as incorrect.
@@ -555,9 +558,30 @@ python benchmark/run.py \
 
 # Diagnostic only: remove built-in search tools and force the local tilth MCP
 python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced --max-usd 20
+
+# Preamble arm: the tilth arms run with prompts/preamble.md as their system prompt
+python benchmark/run.py --tasks rg_search_dispatch --models haiku --reps 1 --modes baseline,tilth \
+  --preamble --max-usd 5
 ```
 
 `--strict-file-tools` gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms guard Bash with `tilth hook` (exec form, `onFailure: block`, so a missing binary denies). A tilth arm runs its own binary with `hook --hint tilth`; the baseline runs the binary built at the hook commit with `hook --hint native`. The hook commit is the checkout's `HEAD` (the seed hook), even with `--candidate-sha`; `run_plan(strict_file_tools=True, hook_sha=...)` takes it explicitly. A strict run needs Claude CLI >= 2.1.295 (exec-form hooks and `onFailure: block`) and refuses an older one. The hook denies shell file reads, searches, and writes; see `src/hook`. Before any paid strict cell, the run probes every distinct hook binary (each tilth arm's binary with `--hint tilth`, the hook-commit build with `--hint native`) with one allow event (`go test ./...`, exit 0) and one deny event (`cat src/lib.rs`, exit 2, with the matching hint text). A binary that fails the probe, such as one built before `tilth hook` existed, refuses the run before any spend (`parser.error` in `run.py`, `HookProbeFailed` from `run_plan`). The wozcode arm has no native file tools, but its denials use `--hint native` and name them; read its denial text with that in mind. After each cell, the audit replays every Bash call through the hook binary built at the hook commit. A call that ran and that hook denies fails the cell as `hook_loosened`, whichever arm made it, so the seed hook is the floor for a candidate hook. This controls tool use, not code run by tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools`, `hook_source_key`, and the count of Bash calls that the hook-commit hook denies (a call that only a candidate hook denied is not counted).
+
+#### Preamble arm
+
+`--preamble` runs every selected tilth arm with the launcher preamble (`prompts/preamble.md`) as its whole system prompt.
+This is the prompt that `tilth claude` and `tilth codex` give the agent.
+The stock arms keep the harness system prompt.
+The run reads the preamble at `--candidate-sha`, or from this checkout when that flag is absent.
+A Claude cell passes the preamble and the working-directory line with `--system-prompt`, in place of the harness prompt.
+A Codex cell passes the preamble as `-c model_instructions_file=<file>`, as `tilth codex` does.
+The file is a content-addressed copy under the gitignored `benchmark/results/configs/preambles/`.
+The Codex developer message keeps the working-directory line and the Codex guidance, without the harness prompt.
+The preamble text is part of the run key, so a changed preamble buys new cells.
+Result rows record `preamble_sha256`.
+The flag needs a tilth arm and Claude or Codex models.
+It refuses `--experiment`, an OpenCode model, and a `--modes-json` tilth arm with `prompt_mode: "append"`.
+A `--modes-json` arm cannot set `prompt_mode: "preamble"` or `preamble` itself.
+`run_plan(preamble=True)` is the same switch for library callers such as evolve.
 
 **Analyze:**
 

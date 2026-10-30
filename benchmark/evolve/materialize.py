@@ -91,9 +91,9 @@ def _changed_line_numbers(old: str, new: str) -> tuple[set[int], set[int]]:
 def _refuse_oversize(candidate: Mapping[str, str]) -> None:
     """Refuse a text over its byte cap before a worktree or ``just check`` is spent on it."""
     for name, limit in MAX_BYTES.items():
-        size = len(candidate[name].encode("utf-8"))
+        size = len(candidate[name].encode("utf-8")) if name in candidate else 0
         if size > limit:
-            raise ApplyRejected(f"{name} is {size} bytes; its MCP field holds at most {limit} bytes")
+            raise ApplyRejected(f"{name} is {size} bytes; it may hold at most {limit} bytes")
 
 
 class Materializer:
@@ -101,7 +101,8 @@ class Materializer:
 
     The first call for a content id takes these steps:
 
-    1. Refuse a text over its ``MAX_BYTES`` cap. Then write the text components into a worktree at the seed.
+    1. Refuse a candidate that lacks a seed component or carries a text component the seed lacks, and a text
+       over its ``MAX_BYTES`` cap. Then write the text components into a worktree at the seed.
     2. Apply the cumulative ``src_patch``, then run ``cargo fmt`` on the tree so the commit holds formatted code.
     3. Refuse changes outside ``src/**`` and ``prompts/**``, a changed or deleted seed ``#[test]`` fn, and an added
        test that is not a real test. The one exception is a patch in ``test_scope``: a repaired child may change
@@ -115,7 +116,8 @@ class Materializer:
     """
 
     def __init__(self, repo: Path, seed_sha: str, run_id: str, work_dir: Path, *,
-                 forbidden: Iterable[str] = (), fmt: Callable[[Path], object] | None = None) -> None:
+                 forbidden: Iterable[str] = (), fmt: Callable[[Path], object] | None = None,
+                 preamble: bool = False) -> None:
         self.fmt = fmt or format_tree
         # ``src_patch`` text -> names of the failing tests (as cargo prints them) that patch may change. The
         # key is the patch, not the content id, so a child that only changes a text component keeps the grant.
@@ -133,7 +135,7 @@ class Materializer:
         self.seed_sha = seed_sha
         self.run_id = run_id
         self.work_dir = Path(work_dir)
-        self.seed = read_seed(self.repo, seed_sha)
+        self.seed = read_seed(self.repo, seed_sha, preamble=preamble)
         self._seed_id = content_id(self.seed)
         self._memo: dict[str, str | ApplyRejected] = {}
         self._worktrees: dict[str, Path] = {}
@@ -149,6 +151,13 @@ class Materializer:
             if cid == self._seed_id:
                 sha = self.seed_sha
             else:
+                # A text component that the seed lacks (the preamble outside a --preamble run) is outside this
+                # run's component set; a key that names no component is never written, as before.
+                extra = sorted(set(candidate) & set(TEXT_COMPONENTS) - set(self.seed))
+                absent = sorted(set(self.seed) - set(candidate))
+                if extra or absent:
+                    raise ApplyRejected(f"the candidate's components differ from the seed's: extra {extra}, "
+                                        f"missing {absent}")
                 _refuse_oversize(candidate)
                 sha = self._commit(candidate, cid)
         except ApplyRejected as rejected:
@@ -199,7 +208,8 @@ class Materializer:
 
     def _build_commit(self, worktree: Path, candidate: Mapping[str, str], cid: str) -> str:
         for name in TEXT_COMPONENTS:
-            (worktree / name).write_bytes(candidate[name].encode("utf-8"))
+            if name in candidate:
+                (worktree / name).write_bytes(candidate[name].encode("utf-8"))
         patch = candidate[SRC_PATCH]
         if patch.strip():
             try:
