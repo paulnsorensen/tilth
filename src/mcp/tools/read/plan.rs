@@ -1,8 +1,8 @@
-//! Request planning for `tilth_read`. Before any file is rendered, sections of
-//! one file that overlap or sit close together merge into one section, and a
-//! line range that ends inside a construct grows to the construct's end when
-//! the response stays within budget. Otherwise the range stops before that
-//! construct and carries an exact continuation.
+//! Request planning for `tilth_read`. The planner runs before any file
+//! renders. It merges sections of one file that overlap or sit close together.
+//! It grows a line range that ends inside a construct to the construct's end
+//! when the response stays within budget. Otherwise the range stops before
+//! that construct and carries an exact continuation.
 
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ struct Cluster {
 
 /// The text of one file, loaded once per plan. The outline parses only when a
 /// range ends before the last line, since only then can it cut a construct.
-struct FileView {
+pub(super) struct FileView {
     path: PathBuf,
     content: String,
     /// `sizes[n]` is the JSON-escaped size of numbered lines `1..=n`.
@@ -84,7 +84,7 @@ struct FileView {
 }
 
 impl FileView {
-    fn load(path: &Path) -> Option<Self> {
+    pub(super) fn load(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
         let mut sizes = vec![0];
         for (index, line) in content.lines().enumerate() {
@@ -104,15 +104,18 @@ impl FileView {
     }
 
     /// Escaped bytes of numbered lines `start..=end`.
-    fn size(&self, start: u32, end: u32) -> usize {
+    pub(super) fn size(&self, start: u32, end: u32) -> usize {
         let end = (end as usize).min(self.sizes.len() - 1);
         let start = (start as usize).clamp(1, end.max(1));
         self.sizes[end] - self.sizes[start - 1]
     }
 
-    /// The construct a section ending at `line` cuts, if any.
-    fn cut_at(&self, line: u32, cache: &OutlineCache) -> Option<(u32, u32)> {
-        if line >= self.total() {
+    /// The construct a section ending at `line` cuts, if any. A file larger
+    /// than the parsed-file cache keeps would parse again on every call, so it
+    /// gets no construct lookup.
+    pub(super) fn cut_at(&self, line: u32, cache: &OutlineCache) -> Option<(u32, u32)> {
+        let too_large = self.content.len() as u64 > crate::cache::MAX_PARSED_FILE_BYTES;
+        if line >= self.total() || too_large {
             return None;
         }
         let entries = self
@@ -123,7 +126,7 @@ impl FileView {
 }
 
 /// Deep outline of `content`, or nothing for a file without a grammar.
-pub(super) fn outline(path: &Path, content: &str, cache: &OutlineCache) -> Vec<OutlineEntry> {
+fn outline(path: &Path, content: &str, cache: &OutlineCache) -> Vec<OutlineEntry> {
     let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
         return Vec::new();
     };
@@ -153,7 +156,7 @@ fn is_container(kind: OutlineKind) -> bool {
 /// when `line` and `line + 1` do not lie inside one construct. A stop between
 /// two members of a class or impl does not cut it. A module never counts:
 /// Python's whole-file root parses as one, and a module body is a member list.
-pub(super) fn cut_construct(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
+fn cut_construct(entries: &[OutlineEntry], line: u32) -> Option<(u32, u32)> {
     let next = line.checked_add(1)?;
     let mut level = entries;
     let mut found: Option<&OutlineEntry> = None;
@@ -181,7 +184,9 @@ fn request_span(request: &Request, total: u32, cache: &OutlineCache) -> Option<(
         PathSuffix::FromLine(start) => (cast(*start), total, false),
         PathSuffix::Symbol(name) => match super::resolve_symbol(&request.path, name, cache) {
             super::SymbolLookup::Found(start, end) => (cast(start), cast(end), false),
-            _ => return None,
+            super::SymbolLookup::Missing | super::SymbolLookup::PreconditionFailed => {
+                return None;
+            }
         },
         PathSuffix::Heading(heading) => {
             let (start, end) = crate::read::resolve_heading_span(&request.path, heading)?;
@@ -290,9 +295,26 @@ pub(super) fn plan(requests: &[Request], cache: &OutlineCache, limit: usize) -> 
             cluster.end = end;
             continue;
         }
+        // A member that starts inside the construct asked for its lines, so
+        // the section does not stop before the construct.
+        let asked = cluster
+            .members
+            .iter()
+            .any(|&member| spans[member].is_some_and(|(first, _, _)| first >= start));
+        let stop = start > cluster.start && !asked && view.size(start, end) <= limit;
+        let kept = if stop {
+            used - view.size(start, cluster.end)
+        } else {
+            used
+        };
+        // A section that still overflows keeps its request. The host cut then
+        // continues it up to the requested end.
+        if kept > limit {
+            continue;
+        }
+        used = kept;
         let shown = &requests[cluster.lead].shown;
-        if start > cluster.start && view.size(start, end) <= limit {
-            used -= view.size(start, cluster.end);
+        if stop {
             cluster.end = start - 1;
             cluster.next = Some(Continuation {
                 request: format!("{shown}#{start}-{end}"),
@@ -439,16 +461,13 @@ fn tail() {}
     #[test]
     fn sections_merge_up_to_the_gap_and_no_further() {
         let dir = fixture(&assignments(), "f.py");
-        let gap = COALESCE_GAP;
-        let close = format!("f.py#{}-{}", 10 + gap + 1, 30);
-        let far = format!("f.py#{}-{}", 10 + gap + 2, 30);
         assert_eq!(
-            planned(dir.path(), &["f.py#5-10", &close], 40_000),
+            planned(dir.path(), &["f.py#5-10", "f.py#14-30"], 40_000),
             ["f.py#5-30"]
         );
         assert_eq!(
-            planned(dir.path(), &["f.py#5-10", &far], 40_000),
-            ["f.py#5-10".to_string(), far]
+            planned(dir.path(), &["f.py#5-10", "f.py#15-30"], 40_000),
+            ["f.py#5-10", "f.py#15-30"]
         );
     }
 
@@ -499,6 +518,109 @@ fn tail() {}
                     request: "p.rs#11-13".into(),
                     stopped_before: true,
                 }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_section_that_overflows_after_the_stop_keeps_its_request() {
+        let dir = fixture(RUST, "p.rs");
+        let view = FileView::load(&dir.path().join("p.rs")).unwrap();
+        let limit = SECTION_FRAME_BYTES + view.size(1, 10) - 1;
+        let plan = plan(
+            &requests(dir.path(), &["p.rs#1-12"]),
+            &OutlineCache::new(),
+            limit,
+        );
+        assert_eq!(
+            plan,
+            [Planned {
+                request: "p.rs#1-12".into(),
+                next: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn mid_construct_range_names_the_rest_only_when_it_fits() {
+        let dir = fixture(RUST, "p.rs");
+        let view = FileView::load(&dir.path().join("p.rs")).unwrap();
+        let fits = SECTION_FRAME_BYTES + view.size(8, 8);
+        assert_eq!(
+            plan(
+                &requests(dir.path(), &["p.rs#8-8"]),
+                &OutlineCache::new(),
+                fits
+            ),
+            [Planned {
+                request: "p.rs#8-8".into(),
+                next: Some(Continuation {
+                    request: "p.rs#9-9".into(),
+                    stopped_before: false,
+                }),
+            }]
+        );
+        assert_eq!(
+            plan(
+                &requests(dir.path(), &["p.rs#8-8"]),
+                &OutlineCache::new(),
+                fits - 1
+            ),
+            [Planned {
+                request: "p.rs#8-8".into(),
+                next: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_member_that_starts_inside_the_construct_is_not_dropped() {
+        let dir = fixture(RUST, "p.rs");
+        let view = FileView::load(&dir.path().join("p.rs")).unwrap();
+        let limit = 2 * SECTION_FRAME_BYTES + view.size(1, 12);
+        let plan = plan(
+            &requests(dir.path(), &["p.rs#1-9", "p.rs#11-12"]),
+            &OutlineCache::new(),
+            limit,
+        );
+        assert_eq!(
+            plan,
+            [Planned {
+                request: "p.rs#1-12".into(),
+                next: Some(Continuation {
+                    request: "p.rs#13-13".into(),
+                    stopped_before: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_grown_end_merges_with_the_next_section() {
+        let dir = fixture(RUST, "p.rs");
+        assert_eq!(
+            planned(dir.path(), &["p.rs#1-7", "p.rs#12-16"], 40_000),
+            ["p.rs#1-16"]
+        );
+    }
+
+    #[test]
+    fn files_too_large_to_cache_are_not_parsed_for_constructs() {
+        let mut text = String::from("def big():\n");
+        while text.len() as u64 <= crate::cache::MAX_PARSED_FILE_BYTES {
+            text.push_str("    value = 1\n");
+        }
+        text.push_str("    return value\n");
+        let dir = fixture(&text, "big.py");
+        assert_eq!(
+            plan(
+                &requests(dir.path(), &["big.py#1-2"]),
+                &OutlineCache::new(),
+                40_000
+            ),
+            [Planned {
+                request: "big.py#1-2".into(),
+                next: None,
             }]
         );
     }

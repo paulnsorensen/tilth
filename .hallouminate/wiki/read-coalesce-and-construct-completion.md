@@ -8,8 +8,10 @@ It came from idea 4 on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.
 
 - **Coalesce.** Sections of one file that overlap or lie at most `COALESCE_GAP` (3) lines apart merge into one `path#a-b` section with one `[path#TAG]` header. The merged section takes the slot of its first request, so output order stays deterministic.
 - **Complete.** An explicit `#n-m` range whose end cuts a construct grows to the construct's end when the whole response stays within the limit. The limit is the smaller of `budget` and the host cap, less the cut-note and header reserves and 160 bytes of framing per request.
-- **Fall back.** When the growth does not fit, the range stops on the line before the construct and ends with `... Next: tilth_read(paths: ["path#start-end"])`. A single-path read also gets `next_view: "path#start-end"` in its JSON header. When the construct alone would not fit either, or it began before the range, the range keeps its end and the continuation covers the rest of the construct.
+- **Fall back.** When the growth does not fit, the range stops on the line before the construct and ends with `... Next: tilth_read(paths: ["path#start-end"])`. A single-path read also gets `next_view: "path#start-end"` in its JSON header. The range keeps its end, and the continuation covers the rest of the construct, in three cases: the construct alone would not fit, the construct began before the range, or a request of the section starts inside the construct.
+- **Overflow.** When the section does not fit even after it stops, the planner keeps the request as written and adds no continuation. The host cut then names the rest of the requested range, so no requested line falls out of the `Next:` chain.
 - **Host cut.** A response cut at `HOST_VISIBLE_MAX` inside a construct moves its cut back to the line before the construct, under the same "fits alone" rule. The existing cut note then names the construct's start.
+- **Large files.** A file larger than `MAX_PARSED_FILE_BYTES` (500 KB) gets no construct lookup, because the parsed-file cache does not keep it and every call would parse it again. Its ranges never grow, and a host cut inside one of its constructs stays where it falls.
 
 Seen-line provenance needs no new code: `record_shown` still records the numbered lines that each part's span of the final text shows.
 
@@ -35,6 +37,6 @@ Across 769 tilth-arm sessions and 2,656 `tilth_read` calls in gepa-v3 r1-r6, the
 - 504 consecutive reads that extend a same-file span by overlap or a gap of at most 3 lines;
 - 10 batch calls with same-file sections that overlap (7) or lie at most 3 lines apart (3).
 
-The measurement script and its definitions are in the PR body.
+The measurement script and its definitions are in the body of PR #415.
 
-_Source: branch t3/coalesce-complete-read-ranges · Updated: 2026-10-29_
+_Source: PR #415 (branch t3/coalesce-complete-read-ranges) · Updated: 2026-10-30_

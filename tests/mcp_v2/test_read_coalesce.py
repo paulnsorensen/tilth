@@ -102,6 +102,7 @@ class ReadCoalesce(unittest.TestCase):
                 self.replace(3, "f.py", tag, [line]))
             write = result.response_by_id(3)
             self.assertTrue(harness.tool_is_error(write), harness.tool_result_text(write))
+            self.assertIn("never displayed", harness.tool_result_text(write))
         self.assertEqual((Path(self.cwd) / "f.py").read_text(), flat(120))
 
     def test_adjacent_ranges_within_the_gap_merge_and_far_ones_do_not(self):
@@ -140,9 +141,14 @@ class ReadCoalesce(unittest.TestCase):
                                   self.replace(3, "g.py", tag, [20]))
         write = result.response_by_id(3)
         self.assertFalse(harness.tool_is_error(write), harness.tool_result_text(write))
+        # Restore the file so the refused write carries a valid tag and only
+        # the seen-lines gate can refuse it.
+        self.write_file("g.py", source)
         refused = self.run_session(self.read(2, ["g.py#1-12"]),
                                    self.replace(3, "g.py", tag, [28]))
-        self.assertTrue(harness.tool_is_error(refused.response_by_id(3)))
+        write = refused.response_by_id(3)
+        self.assertTrue(harness.tool_is_error(write))
+        self.assertIn("never displayed", harness.tool_result_text(write))
 
     # (c) an extension over budget stops at a construct boundary.
     def over_budget_source(self):
@@ -165,12 +171,40 @@ class ReadCoalesce(unittest.TestCase):
         tag = self.tag(harness.tool_result_text(first.response_by_id(2)), "h.py")
         refused = self.run_session(self.read(2, ["h.py#1-210"]),
                                    self.replace(3, "h.py", tag, [205]))
-        self.assertTrue(harness.tool_is_error(refused.response_by_id(3)))
+        write = refused.response_by_id(3)
+        self.assertTrue(harness.tool_is_error(write))
+        self.assertIn("never displayed", harness.tool_result_text(write))
         result = self.run_session(self.read(2, ["h.py#1-210"]),
                                   self.read(3, ["h.py#201-450"]))
         text = harness.tool_result_text(result.response_by_id(3))
         self.assertEqual(shown(text), list(range(201, 451)), text[-400:])
         self.assertNotIn("Next:", text)
+
+    # A range larger than one response keeps its request. The host cut then
+    # continues it up to the requested end, past the construct it cuts.
+    def oversize_source(self):
+        filler = "".join(f'filler_{i} = "{PAD}"\n' for i in range(1, 1990))
+        return filler + function("mid", 19) + flat(1000)
+
+    def test_oversize_batch_range_continues_to_its_requested_end(self):
+        self.write_file("big.py", self.oversize_source())
+        self.write_file("g.py", flat(3))
+        result = self.run_session(
+            self.read(2, ["big.py#1-2000", "g.py#1-3"], budget=200000))
+        text = harness.tool_result_text(result.response_by_id(2))
+        resume = shown(text)[-1] + 1
+        self.assertLess(resume, 1990, text[-400:])
+        self.assertIn(
+            f'Next: tilth_read(paths: ["big.py#{resume}-2000","g.py#1-3"])', text)
+
+    def test_oversize_single_range_points_next_view_at_the_cut(self):
+        self.write_file("big.py", self.oversize_source())
+        result = self.run_session(self.read(2, ["big.py#1-2000"], budget=200000))
+        text = harness.tool_result_text(result.response_by_id(2))
+        resume = shown(text)[-1] + 1
+        self.assertLess(resume, 1990, text[-400:])
+        self.assertIn(f'Next: tilth_read(paths: ["big.py#{resume}-2000"', text)
+        self.assertNotIn("big.py#1990-2010", text, text[-400:])
 
     # A host-limit cut inside a function moves back to the function's start.
     def test_host_cut_moves_back_to_a_construct_start(self):

@@ -100,9 +100,9 @@ fn render_read(
     if paths_arr.is_empty() {
         return Err("paths must contain at least one file".into());
     }
-    if paths_arr.len() > 20 {
+    if paths_arr.len() > MAX_READ_PATHS {
         return Err(format!(
-            "batch read limited to 20 files (got {})",
+            "batch read limited to {MAX_READ_PATHS} files (got {})",
             paths_arr.len()
         ));
     }
@@ -629,6 +629,13 @@ const CUT_NOTE_RESERVE: usize = 600;
 /// Bytes the JSON header line and the file headers of a response can use.
 const HEADER_RESERVE: usize = 400;
 
+/// Bytes kept free beside a construct that a host cut moves back to, so the
+/// construct still fits one later response with its own section frame.
+const CONSTRUCT_FIT_RESERVE: usize = 300;
+
+/// Most paths one `tilth_read` call accepts.
+const MAX_READ_PATHS: usize = 20;
+
 /// Escaped bytes of the `Next:` path list in a cut note. Longer lists end in
 /// `(+K more)` so the note stays inside [`CUT_NOTE_RESERVE`].
 const NEXT_LIST_BUDGET: usize = 200;
@@ -763,7 +770,7 @@ fn with_continuation(
 fn plan_paths(args: &Value, cache: &OutlineCache) -> Option<Vec<plan::Planned>> {
     let cwd = super::require_cwd(args).ok()?;
     let paths = args.get("paths")?.as_array()?;
-    if paths.is_empty() || paths.len() > 20 {
+    if paths.is_empty() || paths.len() > MAX_READ_PATHS {
         return None;
     }
     let mut requests = Vec::with_capacity(paths.len());
@@ -918,24 +925,16 @@ fn construct_boundary(
     if hidden.lines().find_map(numbered_line) != last.checked_add(1) {
         return kept_end;
     }
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Some(view) = plan::FileView::load(path) else {
         return kept_end;
     };
-    let entries = plan::outline(path, &content, ctx.cache);
-    let Some((start, end)) = plan::cut_construct(&entries, last) else {
+    let Some((start, end)) = view.cut_at(last, ctx.cache) else {
         return kept_end;
     };
     if start <= first {
         return kept_end;
     }
-    let construct: usize = content
-        .lines()
-        .zip(1u32..)
-        .skip_while(|&(_, n)| n < start)
-        .take_while(|&(_, n)| n <= end)
-        .map(|(line, n)| escaped_len(&format!("{n}:{line}\n")))
-        .sum();
-    if construct > limit.saturating_sub(HEADER_RESERVE + 300) {
+    if view.size(start, end) > limit.saturating_sub(HEADER_RESERVE + CONSTRUCT_FIT_RESERVE) {
         return kept_end;
     }
     let mut offset = part.start;
