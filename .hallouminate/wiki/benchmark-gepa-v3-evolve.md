@@ -100,9 +100,25 @@ Across r1-r6, evolve's best winner was a prompt edit, not a source patch.
 - The r6 `budget.rs` numbered-line cut led the dev split (0.973) but cost 14% more per correct than baseline on test, so it was noise.
 - A hypothesis that a change cuts one tool's calls was often met while the score fell, so per-tool metrics do not predict cost per correct.
 
+## Preamble rounds (`--preamble`)
+
+Both rounds ran the tilth arm with `prompts/preamble.md` as its whole system prompt (#422, #425 for `/login` auth). Neither found a change that beats the seed on the test split.
+
+| Run | Panel, cell budget | Seed dev mean | Candidates | Verdict | Spend |
+|---|---|---|---|---|---|
+| preamble-r1 | long-2, `$1` | 0.860 | `read.md` `next_view` directive (dev 0.862), 2 src_patch (failed `just check`), `write.md` (unscored) | finish incomplete: one budget-capped cell voided it | $128 of $200 |
+| preamble-r2 | long-3, `$3` | 0.858 | preamble `preamble-tilth-not-bash` (dev 0.893), preamble + `preamble-script-files` (0.840), src_patch repair (dev accuracy -0.05), `write.md` (cut at ceiling) | no improvement: paired test delta +0.005, 95% CI [-0.064, 0.062], 8 tasks; test pass rate -3.1% | $178 of $200 |
+
+- preamble-r1 never proposed the preamble: the selector weighted it about 10% per pick, and the $128 reserve left 4 proposals. #427 gives the preamble a slot by proposal 3 and cuts the reserve to the cells finish buys ($75.63 in r2).
+- preamble-r1's `$1` budget re-bought every baseline and capped one long cell. #428 counts a budget-capped cell as a completed failure and retries incomplete cells (r2 retried one `chain:gin-edit-5` cell).
+- The preamble directives met their tool hypotheses (error rate 0.119 to 0.100 to 0.083) while dev accuracy fell; this repeats the per-tool-metric lesson above.
+- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logs `cargo fmt failed on the export` on every src_patch proposal.
+- Stored baselines from another checkout do not transfer: harness digest, CLI version, and env fingerprint are part of the key, so a run there needs `--refreeze-baselines` (about $45 on long-3).
+
 ## Spend
 
 Evolve spend totals about $487: r1 $99, baseline buy $32, r2 $45, r3 $161, r4 $12, r5 $48, r6 $89.
+The preamble rounds add $306: preamble-r1 $128 and preamble-r2 $178.
 The finish reserve is about $40 whenever the seed commit changes, because `git_sha` is in every tilth cell's run key.
 
 ## Ideas to push cost per correct lower
@@ -124,4 +140,4 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py` · Updated: 2026-10-31_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`) · Updated: 2026-10-31_
