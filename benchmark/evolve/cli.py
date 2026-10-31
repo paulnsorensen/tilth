@@ -30,7 +30,7 @@ import baselines  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
-from evolve import deepdiag, directives  # noqa: E402
+from evolve import deepdiag, diagnosis, directives  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
@@ -150,6 +150,16 @@ def _parser() -> argparse.ArgumentParser:
                         help="run with a Claude CLI that is not the version in benchmark/claude-cli.version; "
                              "every stored cell's run key then drifts and is bought again")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
+    parser.add_argument("--finish-reserve-usd", type=float, metavar="USD",
+                        help="hold this finish reserve instead of the computed one; refused below the winner's "
+                             "test-split cost, which finish buys in any case (default: computed from the test "
+                             "cells that no stored row answers)")
+    parser.add_argument("--max-unselected", type=int, default=diagnosis.MAX_UNSELECTED, metavar="N",
+                        help="no component waits more than N proposals in a row; at least the component count "
+                             f"minus 1 (default {diagnosis.MAX_UNSELECTED})")
+    parser.add_argument("--src-patch-by", type=int, default=diagnosis.SRC_PATCH_BY_PROPOSAL, metavar="N",
+                        help="the selector picks src_patch within the first N proposals "
+                             f"(default {diagnosis.SRC_PATCH_BY_PROPOSAL})")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
@@ -218,6 +228,14 @@ def build(argv: list[str] | None = None, *,
         panel.register(run.TASKS)
     except panels.PanelError as error:
         return _error(str(error))
+    if args.finish_reserve_usd is not None and (not math.isfinite(args.finish_reserve_usd)
+                                                or args.finish_reserve_usd < 0):
+        return _error("--finish-reserve-usd must be a finite number of at least 0")
+    if args.max_unselected < len(seed) - 1:
+        return _error(f"--max-unselected must be at least {len(seed) - 1}, one less than the {len(seed)} "
+                      "components, or a component can wait past its bound")
+    if not 1 <= args.src_patch_by <= args.max_unselected + 1:
+        return _error("--src-patch-by must be between 1 and --max-unselected + 1")
     queue: list[directives.Directive] = []
     if args.directives is not None:
         try:
@@ -245,6 +263,8 @@ def build(argv: list[str] | None = None, *,
         deep_diagnosis=args.deep_diagnosis,
         deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,
         deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
+        finish_reserve_usd=args.finish_reserve_usd, max_unselected=args.max_unselected,
+        src_patch_by=args.src_patch_by,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "preamble-tilth-not-bash",
+    "component": "prompts/preamble.md",
+    "brief": "The Bash hook refuses about one shell call per rollout, the largest error class of the tilth arm, and a third of rollouts hit it twice or more. Most refused calls are compound orientation commands in which one segment reads or searches files: `git status && ls dir && grep -rn X .`, `wc -l file`, `git grep X`, `cat a.py | head`, `find ... | grep`, or `python -c ...`. The hook refuses the whole command, so the agent loses the turn and then repeats the work with tilth. Change the `## Tools` section of prompts/preamble.md so the agent uses tilth_search for every text search (in place of grep, rg, git grep, find piped to grep) and tilth_read for every file read and line count (in place of cat, head, tail, sed, awk, wc). Say that the hook refuses a whole compound command when any segment reads or searches files, so shell commands stay single-purpose: git status, git log, ls, tests, and builds. Keep the `# ` heading that names tilth and the `## Tools`, `## Safety`, and `## Verification` headings. Keep the file under 4096 bytes; remove words elsewhere in `## Tools` to pay for the new text.",
+    "hypothesis": {"metric": "error_rate", "scope": "Bash", "direction": "decrease", "tolerance": 0.25, "invariants": ["accuracy does not drop", "preamble headings unchanged"]}
+  },
+  {
+    "id": "preamble-script-files",
+    "component": "prompts/preamble.md",
+    "brief": "The Bash hook refuses inline interpreters (`python -c`, `node -e`) and heredocs, and rollouts lose a turn each time the agent tries one to run a quick check. Add one rule to the `## Tools` section of prompts/preamble.md: to run a short script, create it with tilth_write in a new `mktemp -d` directory, then run that file with shell. Keep it to one or two lines, keep the `# ` heading that names tilth and the `## Tools`, `## Safety`, and `## Verification` headings, and keep the file under 4096 bytes.",
+    "hypothesis": {"metric": "calls_per_cell", "scope": "Bash", "direction": "decrease", "tolerance": 0.1, "invariants": ["accuracy does not drop", "preamble headings unchanged"]}
+  }
+]

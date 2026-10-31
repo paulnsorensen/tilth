@@ -1664,16 +1664,17 @@ def test_insufficient_reserve_refuses_at_start(world, capsys: pytest.CaptureFixt
     assert main(world, max_usd="0.15") != 0
     assert world.calls == [] and world.judge.labelled == [] and world.spawned == []
     error = capsys.readouterr().err
-    assert "$0.15" in error and "$0.80" in error and "$0.40" in error
+    # test_a x 2 reps at $0.10: winner $0.20 + unstored seed $0.20 + unstored baseline $0.20.
+    assert "$0.15" in error and "$0.60" in error and "winner $0.20" in error
 
 
 def test_max_usd_equal_to_the_reserve_is_refused(world, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(world, max_usd="0.8") == 2
+    assert main(world, max_usd="0.6") == 2
     error = capsys.readouterr().err
-    assert "$0.80" in error and "$0.40" in error
+    assert "$0.60" in error and "winner $0.20" in error
     assert world.calls == [] and world.judge.labelled == []
 
-    assert build(world, max_usd="0.85").preflight() is None
+    assert build(world, max_usd="0.65").preflight() is None
 
 
 def test_stop_state_neutralizes_calls(world) -> None:
@@ -1714,7 +1715,8 @@ def _ceiling_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn):
     """max 1.2, a 0.2 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
     world = weak_world(monkeypatch, tmp_path)
     world.costs.update(dev_a=1e-6, dev_b=1e-6, cheap_a=1e-6, test_a=0.1)
-    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="2000", spawn=spawn)
+    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", "--finish-reserve-usd", "0.2", max_usd="1.2",
+                calls="2000", spawn=spawn)
     monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
     assert evo.preflight() is None
     assert evo.ledger.reserve == pytest.approx(0.2)

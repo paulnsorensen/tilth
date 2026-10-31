@@ -95,6 +95,11 @@ class Settings:
     repair: bool = True
     # The candidate arm runs with prompts/preamble.md as its system prompt, and the preamble is a text component.
     preamble: bool = False
+    # The finish reserve in USD; None computes it from the test cells finish buys (`Evolution.finish_reserve`).
+    finish_reserve_usd: float | None = None
+    # Selector bounds: no component waits more than `max_unselected` proposals; src_patch comes by `src_patch_by`.
+    max_unselected: int = diagnosis.MAX_UNSELECTED
+    src_patch_by: int = diagnosis.SRC_PATCH_BY_PROPOSAL
     # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
     cell_retries: int = 2
 
@@ -347,7 +352,10 @@ class Evolution:
         self.proposer = Proposer(settings.repo, settings.seed_sha, self.paid, settings.helper_model, log=self.log,
                                  forbidden=self._forbidden_terms(), hypotheses=self.hypotheses)
         self.directives = directives.DirectiveQueue(settings.directives, self.log)
-        self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log, directives=self.directives)
+        self.selector = diagnosis.WeightedSelector(
+            self._dominant_of, self.log, directives=self.directives,
+            stages=lambda: [cascade.stage for cascade in self.results.values()],
+            max_unselected=settings.max_unselected, src_patch_by=settings.src_patch_by)
         # The scratch dir lives outside the repo so Codex's -C path never names benchmark/ or the run dir.
         deep_root = Path(tempfile.gettempdir()) / f"tilth-deepdiag-{settings.run_id}"
         self.deep = (deepdiag.DeepDiagnosis(deep_root, dev_tasks=panel.dev,
@@ -473,7 +481,11 @@ class Evolution:
     # --- preflight ---
 
     def finalist_test_cost(self) -> float:
-        """The estimate for one finalist: its test-split cells plus the test-split baseline cells not yet stored."""
+        """The old estimate for one finalist: its test-split cells plus the test-split baseline cells not yet stored.
+
+        ``FINISH_CELL_SETS`` times this counts the seed's stored cells and the baseline cells twice; the reserve
+        now comes from ``finish_reserve``, and the log shows this figure beside it.
+        """
         history = baselines.load_rows(run.RESULTS_DIR / baselines.STORE_FILENAME)
         stored = baselines.completed_by_key(history)
         model = run.MODELS[self.settings.model]
@@ -487,6 +499,59 @@ class Evolution:
                 cost += run.estimate_cell_cost(history, task=cell.task, mode=BASELINE_MODE, model=model,
                                                run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         return cost
+
+    def _seed_test_keys(self, cells: list[run.CellSpec]) -> list[str] | None:
+        """The run keys finish plans for the seed's candidate-arm ``cells``; None when the seed cannot be keyed.
+
+        ``run.run_plan`` keys a tilth cell on the candidate binary and, in a --preamble run, on the preamble at
+        the candidate commit. This swaps the same mode in, keys the cells, and restores the mode.
+        """
+        try:
+            build = run.build_candidate(self.settings.seed_sha, repo=self.settings.repo)
+            text = run.read_preamble(build.git_sha, repo=self.settings.repo) if self.settings.preamble else None
+        except (RuntimeError, OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+            self.log(f"reserve: the seed's test cells count in full; they cannot be keyed: {tail(str(error))}")
+            return None
+        base = run.MODES[CANDIDATE_MODE]
+        mode = run.candidate_mode(base, build)
+        run.MODES[CANDIDATE_MODE] = mode if text is None else run.preamble_mode(mode, text)
+        try:
+            return [run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd,
+                                         **self._strict_identity_kwargs())["run_key"] for cell in cells]
+        finally:
+            run.MODES[CANDIDATE_MODE] = base
+
+    def finish_reserve(self) -> dict[str, float]:
+        """The finish reserve, by part: only the test-split cells finish buys that no stored row answers.
+
+        ``winner`` is every candidate-arm test cell of the dev winner, a new candidate with no stored row.
+        ``seed`` is each seed candidate-arm test cell with no completed row under the key finish plans.
+        ``baseline`` is each baseline test cell with no completed row; finish plans them once for both finalists.
+        ``total`` is their sum. ``winner`` is also the floor for ``--finish-reserve-usd``, because finish buys
+        those cells in every case. ``old`` is the estimate before: ``FINISH_CELL_SETS * finalist_test_cost()``.
+        """
+        history = baselines.load_rows(run.RESULTS_DIR / baselines.STORE_FILENAME)
+        stored = baselines.completed_by_key(history)
+        model = run.MODELS[self.settings.model]
+
+        # The fallback is not scaled by chain size: on the preamble-r1 panel a size-scaled fallback held $76 per
+        # finalist against a stored mean of $28.
+        def estimate(cell: run.CellSpec) -> float:
+            return run.estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=model, run_max_cost=None,
+                                          fallback=self.settings.cell_estimate_usd)
+
+        candidate_cells = self._cells(self.panel.test, CANDIDATE_MODE, self._reps())
+        seed_keys = self._seed_test_keys(candidate_cells)
+        baseline_cells = self._cells(self.panel.test, BASELINE_MODE, self._reps())
+        baseline_keys = [run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd,
+                                              **self._strict_identity_kwargs())["run_key"] for cell in baseline_cells]
+        parts = {
+            "winner": sum(estimate(cell) for cell in candidate_cells),
+            "seed": sum(estimate(cell) for index, cell in enumerate(candidate_cells)
+                        if seed_keys is None or seed_keys[index] not in stored),
+            "baseline": sum(estimate(cell) for cell, key in zip(baseline_cells, baseline_keys) if key not in stored),
+        }
+        return {**parts, "total": sum(parts.values()), "old": FINISH_CELL_SETS * self.finalist_test_cost()}
 
     def refuse(self, message: str) -> int:
         self.log(f"refused: {message}")
@@ -534,15 +599,21 @@ class Evolution:
                                          **self._strict_identity_kwargs())
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
-        # The estimate counts every unstored baseline test cell, so the reserve over-counts them; that error is kept
-        # because holding too much is safe and holding too little would starve finish.
-        per_finalist = self.finalist_test_cost()
-        reserve = FINISH_CELL_SETS * per_finalist
+        computed = self.finish_reserve()
+        override = self.settings.finish_reserve_usd
+        if override is not None and override < computed["winner"]:
+            return self.refuse(f"--finish-reserve-usd ${override:.2f} is below the safe floor ${computed['winner']:.2f}: "
+                               "finish buys every test-split cell of the winner in any case")
+        reserve = computed["total"] if override is None else override
         if self.settings.max_usd <= reserve:
             return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} must exceed the finish reserve ${reserve:.2f} "
-                               f"({FINISH_CELL_SETS} x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
+                               f"(winner ${computed['winner']:.2f} + unstored seed ${computed['seed']:.2f} + unstored "
+                               f"baseline ${computed['baseline']:.2f}); the search would have no budget")
         self.ledger.reserve = reserve
-        self.log(f"reserve: ${reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
+        source = (f"winner ${computed['winner']:.4f} + seed ${computed['seed']:.4f} + baseline "
+                  f"${computed['baseline']:.4f}" if override is None
+                  else f"--finish-reserve-usd; computed ${computed['total']:.4f}")
+        self.log(f"reserve: ${reserve:.4f} held for finish ({source}; old estimate ${computed['old']:.4f})")
 
         unlabeled = []
         for name in self.panel.select("all"):

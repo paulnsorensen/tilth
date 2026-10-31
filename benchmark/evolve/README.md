@@ -17,6 +17,31 @@ Finish opens a PR only if both hold: the lower bound of the paired test-split bo
 per-task score delta (winner minus seed) is above 0, and the winner's aggregate test pass rate is at least
 the seed's.
 
+## Finish reserve
+
+Preflight holds a finish reserve that no search call may spend. `Evolution.finish_reserve` counts only the
+test-split cells that finish buys and that no stored row answers. It looks each cell up by the run key that finish
+plans, in the result store.
+
+- `winner`: every candidate-arm test cell of the dev winner. The winner is a new candidate, so no row answers it.
+- `seed`: each seed candidate-arm test cell with no completed row. The key uses the seed binary and, in a
+  `--preamble` run, the seed preamble, as `run.run_plan` does. When the seed cannot be built, these cells count in
+  full.
+- `baseline`: each baseline test cell with no completed row, counted once. Finish plans the baseline once for both
+  finalists.
+
+Each cell costs the stored mean of its task and arm, else `--cell-estimate-usd`. The log line shows the parts and
+the old estimate, `FINISH_CELL_SETS * finalist_test_cost()`. The old estimate counted the seed's stored cells and
+the baseline cells twice. For the preamble-r1 run the old estimate held $128, and the new count is $96 (winner $32,
+seed $32, baseline $32).
+
+`--finish-reserve-usd USD` holds USD instead. Preflight refuses a value below the `winner` part (exit 2), because
+finish buys those cells in any case. A negative or non-finite value is a usage error.
+
+The baseline part still holds money that `buy_baselines` spends right after preflight, before any candidate cell.
+Only a baseline rep that fails there reaches finish. A refresh of the reserve after `buy_baselines` would release
+that part; it is not done yet.
+
 ## Incomplete cells
 
 A cell that ends with `error_max_budget_usd` spent its own `--cell-budget-usd` cap. Its row gets `budget_capped:
@@ -56,9 +81,17 @@ In this mode the preamble is a sixth text component. The seed reads it at `--see
 refuses the run (exit 2). The selector, reflection, the proposer export, and the materializer handle it like the
 four MCP texts. Its cap is 4096 bytes (`candidate.MAX_BYTES`); the seed file is about 3 KB. Reflection on the
 preamble gets `engine.PREAMBLE_NOTE`: the file is the system prompt, and it must keep one `# ` heading that names
-tilth and the `## Tools`, `## Safety`, and `## Verification` headings. Attribution maps the `read_breadth` cause to
-the preamble (`attribution.PREAMBLE_HINTS`), because the preamble tells the agent which code to read before an
-edit. The other causes keep their hints.
+tilth and the `## Tools`, `## Safety`, and `## Verification` headings. Attribution maps two causes to the preamble
+(`attribution.PREAMBLE_HINTS`): `read_breadth`, because the preamble tells the agent which code to read before an
+edit, and `hook_denials`, because it tells the agent that shell is not a content reader. `hook_denials` prices each
+strict-hook denial (`PreToolUse:<tool> hook error`) above the baseline's rate per cell at the candidate's mean
+denial size. A run without `--preamble` has no `hook_denials` cause; the other causes keep their hints. The error
+class of a denial is `hook_denied` in both modes.
+
+The selector proposes the preamble within the first 3 proposals (`diagnosis.PREAMBLE_BY_PROPOSAL`), after the
+`src_patch` slot. A directive that names the preamble replaces this slot. Without the slot, the preamble had no
+dominant cause in preamble-r1 and got about one pick in ten. `directives/preamble-r2.json` holds two preamble
+directives that aim at the strict-hook denials.
 
 The preamble has no byte lock and no phrase pin. `tests/launch_preamble.rs` guards its headings and refuses
 personal-policy terms. `just check` runs that test through `cargo test`, so a candidate that breaks the guard
@@ -76,10 +109,17 @@ skipped. The side info for the candidate carries a compact `attribution` view un
 The dispatcher sends it, with a `source_map` record for the leading causes, to reflection and the proposer.
 
 `diagnosis.WeightedSelector` is the gepa `module_selector`. It weights each component by the parent's
-`dominant` hints (the hinted component takes about 44% of the picks, against 20% for a uniform choice), picks
-`src_patch` within the first 2 proposals, and leaves no component out for more than 10 proposals in a row. The
-bound is `MAX_UNSELECTED`. Each pick goes to `log.txt` with its evidence and reason. A reflection or proposer call
-receives a `replay` record only from its own candidate, never from another one.
+`dominant` hints (with five components the hinted component takes about 31% of the picks, against 20% for a
+uniform choice), picks `src_patch` within the first 2 proposals (`--src-patch-by N`), and leaves no component out
+for more than 6 proposals in a row (`--max-unselected N`, at least the component count minus 1). The bound was 10:
+preamble-r1 made 4 proposals, so a component waited past the run. A component whose last 2 proposals each left a
+child that failed `apply`, `just check`, or `integrity` rests for 3 proposals, and its deadline moves past the rest.
+In preamble-r1 both `src_patch` proposals failed `just check` and cost $7.45 of proposer spend. A directive still
+picks a resting component. Each pick and each rest goes to `log.txt` with its evidence and reason. A reflection or
+proposer call receives a `replay` record only from its own candidate, never from another one.
+
+The cheap tier (`panel.cheap`) is the cheap dev subsample before the paid dev tier. The preamble-r1 panel has no
+cheap members, so every candidate there went straight to the full dev split.
 
 Reflection and the proposer end a reply with one `<hypothesis>` block (`metric`, `scope`, `direction`,
 `tolerance`, `invariants`). `hypotheses.jsonl` in the run directory holds it, keyed by parent and child content

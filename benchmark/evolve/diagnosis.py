@@ -4,7 +4,8 @@ Three parts. None of them scores or rejects a candidate.
 
 - ``compact`` cuts an ``attribution.summarize`` result to a size that a prompt record can carry.
 - ``WeightedSelector`` is gepa's ``ReflectionComponentSelector``. It favours the components that the parent's
-  attribution names. It also guarantees that ``src_patch`` and every other component gets a turn.
+  attribution names. It also guarantees that ``src_patch``, the preamble, and every other component gets a turn,
+  and it rests a component whose proposals keep failing the build gate.
 - ``HypothesisBook`` stores the soft predictions that reflection and the proposer attach to a change. It keys
   them by parent and child content id outside the candidate, and settles them against attribution.
 """
@@ -15,15 +16,22 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-from .candidate import SRC_PATCH, short_id
+from .candidate import PREAMBLE, SRC_PATCH, short_id
 
 ATTRIBUTION_CAP = 4000
 DOMINANT_SHOWN = 3
 EVIDENCE_CAP = 120
 FEEDBACK_SHOWN = 5
 SRC_PATCH_BY_PROPOSAL = 2
-MAX_UNSELECTED = 10
+# In a --preamble run the preamble is the agent's whole system prompt; no attribution cause dominates it often.
+PREAMBLE_BY_PROPOSAL = 3
+# Six components in a --preamble run: each one gets a turn within seven proposals.
+MAX_UNSELECTED = 6
 HINT_WEIGHT = 4.0
+# A component whose last proposals all failed the build gate rests for COOLDOWN_PROPOSALS proposals.
+COOLDOWN_AFTER_FAILURES = 2
+COOLDOWN_PROPOSALS = 3
+CHECK_STAGES = frozenset({"apply", "just check", "integrity"})
 DIRECTIONS = ("decrease", "increase")
 TOOL_METRICS = ("result_chars_per_cell", "calls_per_cell", "error_rate")
 METRICS = (*TOOL_METRICS, "excess_chars_per_cell", "exposure")
@@ -227,19 +235,33 @@ class HypothesisBook:
 class WeightedSelector:
     """gepa component selector: one component per proposal, weighted by the parent's attribution hints.
 
-    Two bounds hold whatever the weights say. ``src_patch`` is picked within the first
-    ``SRC_PATCH_BY_PROPOSAL`` proposals, and no component waits more than ``MAX_UNSELECTED`` proposals in a row.
-    Each pick keeps every component's deadline reachable, so the bounds hold even when several components wait.
+    Three bounds hold whatever the weights say. ``src_patch`` is picked within the first ``src_patch_by``
+    proposals, the preamble (when the candidate carries it and no directive names it) within the first
+    ``preamble_by``, and no component waits more than ``max_unselected`` proposals in a row. Each pick keeps
+    every component's deadline reachable, so the bounds hold even when several components wait.
+
+    ``stages`` returns the cascade stage of every candidate so far, oldest first. When the last
+    ``COOLDOWN_AFTER_FAILURES`` proposals of a component each left a child that failed a ``CHECK_STAGES``
+    stage, the component rests for ``COOLDOWN_PROPOSALS`` proposals, and its deadline moves past the rest.
+    A directive still picks a resting component.
     """
 
     def __init__(self, dominant_of: Callable[[dict], list[dict] | None], log: Callable[[str], None],
-                 rng: random.Random | None = None, directives=None):
+                 rng: random.Random | None = None, directives=None, *,
+                 stages: Callable[[], list[str | None]] | None = None, max_unselected: int = MAX_UNSELECTED,
+                 src_patch_by: int = SRC_PATCH_BY_PROPOSAL, preamble_by: int = PREAMBLE_BY_PROPOSAL):
         self.dominant_of = dominant_of
         self.log = log
         self.directives = directives
         self.rng = rng or random.Random(0)
+        self.stages = stages
+        self.max_unselected = max_unselected
+        self.early = {SRC_PATCH: src_patch_by, PREAMBLE: preamble_by}
         self.count = 0
         self.deadline: dict[str, int] = {}
+        self.failures: dict[str, int] = {}
+        self.resting: dict[str, int] = {}
+        self.last: tuple[str, int] | None = None
 
     def _weights(self, names: list[str], dominant: list[dict]) -> dict[str, float]:
         total = sum(d["excess_chars_per_cell"] for d in dominant) or 1.0
@@ -254,38 +276,73 @@ class WeightedSelector:
         slots = sorted(deadlines.values())
         return all(self.count + 1 + index <= due for index, due in enumerate(slots))
 
+    def _set_early_deadlines(self, names: list[str]) -> None:
+        targeted = {d.component for d in self.directives.pending} if self.directives is not None else set()
+        for name, due in self.early.items():
+            if name == PREAMBLE and name in targeted:
+                continue
+            if name in names and self.deadline[name] > due:
+                self.deadline[name] = due
+
+    def _settle_last(self) -> None:
+        """Record whether the previous pick's child failed the build gate; start a rest after repeated failures."""
+        if self.last is None or self.stages is None:
+            return
+        name, seen = self.last
+        self.last = None
+        new = self.stages()[seen:]
+        if not new:
+            return
+        if new[-1] not in CHECK_STAGES:
+            self.failures[name] = 0
+            return
+        self.failures[name] = self.failures.get(name, 0) + 1
+        if self.failures[name] >= COOLDOWN_AFTER_FAILURES:
+            self.failures[name] = 0
+            self.resting[name] = self.count + COOLDOWN_PROPOSALS - 1
+            self.deadline[name] = max(self.deadline.get(name, 0),
+                                      self.resting[name] + self.max_unselected + 1)
+            self.log(f"selector: {name} rests for proposals {self.count}-{self.resting[name]}: its last "
+                     f"{COOLDOWN_AFTER_FAILURES} proposals failed {new[-1]}")
+
+    def _picked(self, name: str) -> None:
+        self.deadline[name] = self.count + self.max_unselected + 1
+        self.last = (name, len(self.stages())) if self.stages is not None else None
+
     def __call__(self, state, trajectories, subsample_scores, candidate_idx, candidate) -> list[str]:
         names = list(candidate)
         self.count += 1
         for name in names:
-            self.deadline.setdefault(name, MAX_UNSELECTED + 1)
-        if SRC_PATCH in names and self.deadline[SRC_PATCH] > SRC_PATCH_BY_PROPOSAL and self.count == 1:
-            self.deadline[SRC_PATCH] = SRC_PATCH_BY_PROPOSAL
+            self.deadline.setdefault(name, self.max_unselected + 1)
+        if self.count == 1:
+            self._set_early_deadlines(names)
+        self._settle_last()
         if self.directives is not None and self.directives.pending:
             directive = self.directives.take(self.count)
             if directive.component in names:
-                self.deadline[directive.component] = self.count + MAX_UNSELECTED + 1
+                self._picked(directive.component)
                 self.log(f"selector: proposal {self.count} parent {short_id(candidate)} -> {directive.component}: "
                          f"directive override {directive.id}")
                 return [directive.component]
             self.log(f"selector: directive {directive.id} dropped: the candidate has no {directive.component}")
+        awake = [name for name in names if self.resting.get(name, 0) < self.count] or names
         feasible = []
-        for name in names:
-            after = {**self.deadline, name: self.count + MAX_UNSELECTED + 1}
+        for name in awake:
+            after = {**self.deadline, name: self.count + self.max_unselected + 1}
             if self._reachable({k: after[k] for k in names}):
                 feasible.append(name)
         dominant = self.dominant_of(candidate) or []
-        weights = self._weights(feasible or names, dominant)
+        weights = self._weights(feasible or awake, dominant)
         if not feasible:
-            pick = min(names, key=lambda n: (self.deadline[n], names.index(n)))
+            pick = min(awake, key=lambda n: (self.deadline[n], names.index(n)))
             reason = "deadline"
-        elif len(feasible) < len(names):
+        elif len(feasible) < len(awake):
             pick = self.rng.choices(feasible, [weights[n] for n in feasible])[0]
             reason = "deadline-bounded weighted choice"
         else:
             pick = self.rng.choices(feasible, [weights[n] for n in feasible])[0]
             reason = "weighted choice" if dominant else "uniform choice, no attribution"
-        self.deadline[pick] = self.count + MAX_UNSELECTED + 1
+        self._picked(pick)
         hints = "; ".join(f"{d['cause']} -> {d['component_hint']} ({d['excess_chars_per_cell']} chars/cell)"
                           for d in dominant) or "none"
         self.log(f"selector: proposal {self.count} parent {short_id(candidate)} -> {pick}: {reason}; "
