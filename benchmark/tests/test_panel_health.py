@@ -81,6 +81,31 @@ def test_a_chain_is_timed_by_its_slowest_turn() -> None:
     assert health.wall_s == [50.0]
 
 
+def test_each_cell_is_compared_with_its_own_timeout() -> None:
+    """A 420 s cell under a 900 s limit is not slow just because another stored row had a 600 s limit."""
+    old = row("t", "baseline", 0, True, wall_duration_ms=200_000, timeout_s=600)
+    new = row("t", "baseline", 1, True, wall_duration_ms=420_000, timeout_s=900)
+
+    health = panel_health.summarize([old, new])["t"]
+
+    assert "slow" not in health.flags()
+    assert max(health.wall_ratio) == pytest.approx(420 / 900)
+    assert "| 0.47 |" in panel_health.render({"t": health})
+
+
+def test_a_chain_turn_uses_its_own_timeout_and_wall_time() -> None:
+    """A chain turn is measured by wall time against that turn's limit, not the chain row's limit."""
+    subs = [{"task": "read_a", "correct": True, "duration_ms": 100_000, "wall_duration_ms": 350_000, "timeout_s": 600},
+            {"task": "edit", "correct": True, "duration_ms": 50_000, "timeout_s": 900}]
+    rows = [row("chain:c-2", "baseline", 0, True, sub_tasks=subs, chain_size=2, timeout_s=900)]
+
+    health = panel_health.summarize(rows)["chain:c-2"]
+
+    assert health.wall_s == [350.0]
+    assert health.wall_ratio == [pytest.approx(350 / 600)]
+    assert "slow" in health.flags()
+
+
 def test_load_rows_skips_reused_shared_and_torn_rows(tmp_path: Path) -> None:
     paid = row("t", "baseline", 0, True)
     first = write_rows(tmp_path / "a.jsonl", [paid, {**row("t", "baseline", 1, True), "reused": True}])

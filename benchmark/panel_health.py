@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Per-task health table for a benchmark panel, built from stored result rows.
 
-A chain row is timed by its slowest turn (the API ``duration_ms`` of its sub-task), and its budget is the
-member budget times the chain size.
+Each cell is compared with its own timeout: ``max/timeout`` is the largest per-cell ratio, so rows stored
+under different limits never mix. A chain is timed per turn, because the timeout applies to each turn: each
+sub-task's wall time (``wall_duration_ms``, else ``duration_ms``) against that turn's ``timeout_s``. Its budget
+is the member budget times the chain size.
 
 The table shows, for each task, the pass rate per arm, the failure-reason classes,
 the wall-time percentiles against the cell timeout, the cost against the cell
@@ -50,6 +52,8 @@ class TaskHealth:
     split: str | None = None
     arms: dict[str, ArmStats] = field(default_factory=lambda: defaultdict(ArmStats))
     wall_s: list[float] = field(default_factory=list)
+    # Each timed cell's wall time over its own timeout (a chain's slowest turn over that turn's timeout).
+    wall_ratio: list[float] = field(default_factory=list)
     timeouts_s: set[int] = field(default_factory=set)
     cost_ratio: list[float] = field(default_factory=list)
     costs: list[float] = field(default_factory=list)
@@ -63,7 +67,7 @@ class TaskHealth:
             flags.append(f"both-arms: {shared}")
         if self.timed_out:
             flags.append("timeout")
-        if self.wall_s and self.timeouts_s and max(self.wall_s) > HEADROOM_LIMIT * min(self.timeouts_s):
+        if self.wall_ratio and max(self.wall_ratio) > HEADROOM_LIMIT:
             flags.append("slow")
         if self.budget_caps:
             flags.append("budget-cap")
@@ -141,16 +145,36 @@ def _cost(row: Mapping) -> float | None:
     return None
 
 
-def _wall_s(row: Mapping) -> float | None:
-    """Seconds the cell ran; for a chain, its slowest turn, because the timeout applies to each turn."""
-    if row.get("sub_tasks"):
-        turns = [sub.get("duration_ms") or 0 for sub in row["sub_tasks"]]
-        return max(turns) / 1000 if max(turns) > 0 else None
+def _seconds(record: Mapping) -> float | None:
+    """Measured wall time when stored, else the API duration, in seconds."""
     for name in ("wall_duration_ms", "duration_ms"):
-        value = row.get(name)
+        value = record.get(name)
         if isinstance(value, (int, float)) and value > 0:
             return value / 1000
     return None
+
+
+def _timeout(record: Mapping) -> int | None:
+    value = record.get("timeout_s")
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _timing(row: Mapping) -> tuple[float | None, float | None]:
+    """The cell's wall seconds and its wall-to-own-timeout ratio; for a chain, its slowest turn of each.
+
+    A stored chain sub-task without its own ``timeout_s`` falls back to the chain row's.
+    """
+    if not row.get("sub_tasks"):
+        wall, timeout = _seconds(row), _timeout(row)
+        return wall, (wall / timeout if wall is not None and timeout else None)
+    walls, ratios = [], []
+    for sub in row["sub_tasks"]:
+        if (wall := _seconds(sub)) is None:
+            continue
+        walls.append(wall)
+        if timeout := _timeout(sub) or _timeout(row):
+            ratios.append(wall / timeout)
+    return (max(walls) if walls else None), (max(ratios) if ratios else None)
 
 
 def summarize(rows: Iterable[Mapping], splits: Mapping[str, str] | None = None) -> dict[str, TaskHealth]:
@@ -179,8 +203,11 @@ def summarize(rows: Iterable[Mapping], splits: Mapping[str, str] | None = None) 
             health.costs.append(cost)
             if budget is not None:
                 health.cost_ratio.append(cost / budget)
-        if (wall := _wall_s(row)) is not None:
+        wall, ratio = _timing(row)
+        if wall is not None:
             health.wall_s.append(wall)
+        if ratio is not None:
+            health.wall_ratio.append(ratio)
     return tasks
 
 
@@ -224,12 +251,11 @@ def render(tasks: Mapping[str, TaskHealth], order: Sequence[str] | None = None) 
     for name in names:
         health = tasks[name]
         wall = health.wall_s
-        timeout = min(health.timeouts_s) if health.timeouts_s else None
         cells = [
             name, health.split or "-", *(_arm_cell(health.arms.get(mode)) for mode in modes), _failures(health.arms),
             f"{percentile(wall, 50):.0f}/{percentile(wall, 90):.0f}/{max(wall):.0f}" if wall else "-",
             "/".join(str(value) for value in sorted(health.timeouts_s)) or "-",
-            f"{max(wall) / timeout:.2f}" if wall and timeout else "-",
+            f"{max(health.wall_ratio):.2f}" if health.wall_ratio else "-",
             str(suggested_timeout(health) or "-"),
             f"{percentile(health.costs, 90):.2f}/{max(health.costs):.2f}" if health.costs else "-",
             "/".join(f"{value:g}" for value in sorted(health.budgets)) or "-",

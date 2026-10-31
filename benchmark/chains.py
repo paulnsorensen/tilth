@@ -244,6 +244,8 @@ def chain_row(task: ChainTask, rows: Sequence[dict], *, identity: dict, chain_bu
             "api_calls": len(r["per_turn_context_tokens"]),
             "num_turns": r["num_turns"],
             "duration_ms": r["duration_ms"],
+            "wall_duration_ms": r.get("wall_duration_ms"),
+            "timeout_s": r.get("timeout_s"),
         }
         for r in rows
     ]
