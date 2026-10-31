@@ -172,6 +172,14 @@ The first completed stored row for a panel name locks its split: a later split c
 `analyze.py` counts a `contaminated` panel row as incorrect, keeps it in its denominators, and tallies it per task and arm.
 `benchmark/tests/fixtures/panels/gepa-v1-rows/` holds redacted rows (`instance_id`, `repo`, `base_commit`) for the committed panel's language check; full rows stay in `$TILTH_BENCH_DATA`.
 
+`panel_health.py` prints one markdown row per task from stored result rows: pass rate per arm, failure classes (a chain names each wrong sub-task), wall time against the cell timeout, cost against the cell budget, and budget-cap and timeout hits.
+It flags a failure class that hits at least 25% of the cells in every arm, a cell over half its timeout, and a budget cap.
+It skips `reused` rows, counts a row shared by two files once, and times a chain by its slowest turn, because the timeout applies to each turn.
+
+```bash
+python3 benchmark/panel_health.py benchmark/results/evolve/*/rows.jsonl --panel benchmark/panels/gepa-v3-long-3.json
+```
+
 ## Applicability judge
 
 `benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability.
@@ -665,4 +673,4 @@ Preview a plan without any model call or `--max-usd`:
 python3 benchmark/run.py --tasks chain:gin-edit-5 --modes baseline --models sonnet --reps 1 --dry-run
 ```
 
-The committed chains are `gin-edit-5`, `fastapi-edit-5`, `rg-edit-7`, and `express-edit-6`. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.
+The committed chains are `gin-edit-5`, `fastapi-edit-5`, `rg-edit-7`, `express-edit-6`, `rg-edit-6`, and `fastapi-edit-4`. `rg-edit-6` and `fastapi-edit-4` drop `grok_rg_matcher` and `fastapi_request_validation`, whose required strings a chain answer often omits; `gepa-v3-long-3` uses them. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.
