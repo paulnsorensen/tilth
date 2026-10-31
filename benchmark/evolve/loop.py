@@ -95,6 +95,8 @@ class Settings:
     repair: bool = True
     # The candidate arm runs with prompts/preamble.md as its system prompt, and the preamble is a text component.
     preamble: bool = False
+    # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
+    cell_retries: int = 2
 
 
 def forbidden_terms(panel_path: Path) -> list[str]:
@@ -294,6 +296,32 @@ def _paired_score_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Map
     return deltas
 
 
+def _incomplete_cells(arms: Mapping[str, list[dict]], tasks: Iterable[str],
+                      reps: Iterable[int]) -> dict[str, list[str]]:
+    """Each task with a cell that has no completed row in some arm, mapped to those cells as ``arm/repN``."""
+    reps = list(reps)
+    missing: dict[str, list[str]] = {}
+    for task in tasks:
+        for label, rows in arms.items():
+            done = {row["repetition"] for row in rows if row["task"] == task and baselines.is_completed(row)}
+            missing.setdefault(task, []).extend(f"{label}/rep{rep}" for rep in reps if rep not in done)
+        if not missing[task]:
+            del missing[task]
+    return missing
+
+
+def _means_line(finalists: Iterable[Cascade], test_rows: Mapping[str, list[dict]]) -> str:
+    """Each finalist's test pass rate over ``test_rows``, as ``cid=mean`` pairs."""
+    means = {member.cid: mean(correct(row) for row in test_rows[member.cid]) if test_rows[member.cid] else 0.0
+             for member in finalists}
+    return ", ".join(f"{cid[:12]}={value:.3f}" for cid, value in means.items())
+
+
+def _cell_of(row: Mapping) -> tuple[str, str, int]:
+    """The (task, mode, repetition) cell a row answers; one plan has one model."""
+    return row["task"], row["mode"], row["repetition"]
+
+
 class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
@@ -388,6 +416,28 @@ class Evolution:
         return [run.CellSpec(task, mode, self.settings.model, rep) for task in tasks for rep in reps]
 
     def _plan(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
+        """Run ``cells`` once, then re-run each cell that did not complete up to ``cell_retries`` more times.
+
+        The newest attempt's row replaces the cell's earlier row. A stop during a retry keeps the rows so far.
+        A store-only plan never retries.
+        """
+        rows = self._plan_once(cells, sha, store_only=store_only)
+        retries = 0 if store_only else self.settings.cell_retries
+        for attempt in range(1, retries + 1):
+            failed = {_cell_of(row) for row in rows if not baselines.is_completed(row)}
+            if not failed:
+                break
+            retry = [cell for cell in cells if (cell.task, cell.mode, cell.repetition) in failed]
+            self.log(f"cells: retry {attempt}/{self.settings.cell_retries} of {len(retry)} incomplete cell(s): "
+                     + ", ".join(f"{cell.task}/{cell.mode}/rep{cell.repetition}" for cell in retry))
+            try:
+                again = {_cell_of(row): row for row in self._plan_once(retry, sha)}
+            except _Stopped:
+                break
+            rows = [again.get(_cell_of(row), row) if not baselines.is_completed(row) else row for row in rows]
+        return rows
+
+    def _plan_once(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
         try:
             with self._spending("cells"):
                 rows = run.run_plan(cells, panel=self.panel, ledger=self.ledger, candidate_sha=sha,
@@ -1000,28 +1050,39 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete (baseline drift: {error})")
         except run.CandidateBuildFailed as error:
             return self._finish_failed(f"finish: incomplete (build failed)\n{tail(str(error))}")
-        test_means = {cid: mean(correct(row) for row in rows) if rows else 0.0 for cid, rows in test_rows.items()}
-        scores = ", ".join(f"{member.cid[:12]}={test_means[member.cid]:.3f}" for member in finalists)
         expected = len(self.panel.test) * len(reps)
         if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
-            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
-        unfinished = [member.cid[:12] for member in finalists
-                      if not all(baselines.is_completed(row) for row in test_rows[member.cid])]
-        if not all(baselines.is_completed(row) for row in baseline_rows):
-            unfinished.append("baseline")
-        if unfinished:
+            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: "
+                                       f"{_means_line(finalists, test_rows)}")
+        arms = {"baseline": baseline_rows, **{member.cid[:12]: test_rows[member.cid] for member in finalists}}
+        dropped = _incomplete_cells(arms, self.panel.test, reps)
+        kept = [task for task in self.panel.test if task not in dropped]
+        if dropped:
+            self.log(f"finish: dropped test task(s) {', '.join(dropped)}: cells did not complete after "
+                     f"{self.settings.cell_retries} retries: "
+                     + ", ".join(f"{task}/{cell}" for task, cells in dropped.items() for cell in cells))
+        if not kept:
+            unfinished = sorted({cell.split("/")[0] for cells in dropped.values() for cell in cells})
             return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
-                                       f"{', '.join(unfinished)}); test-split means not compared: {scores}")
+                                       f"{', '.join(unfinished)}); no test task has complete paired rows; "
+                                       f"test-split means not compared: {_means_line(finalists, test_rows)}")
+        # Paired: every finalist and the baseline are scored on the same test tasks, each with all its reps.
+        test_rows = {cid: [row for row in rows if row["task"] in kept] for cid, rows in test_rows.items()}
+        baseline_rows = [row for row in baseline_rows if row["task"] in kept]
+        test_means = {cid: mean(correct(row) for row in rows) for cid, rows in test_rows.items()}
+        scores = _means_line(finalists, test_rows)
         self.log(f"finish: test-split means {scores}")
-        test_base = _baseline_costs(baseline_rows, self.panel.test)
-        deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], self.panel.test, test_base)
+        test_base = _baseline_costs(baseline_rows, kept)
+        deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], kept, test_base)
         if not deltas:
             self.log("finish: no improvement (no test task has paired winner and seed rows)")
             return None
         point = sum(deltas) / len(deltas)
         low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
         pass_delta = test_means[winner.cid] - test_means[seed.cid]
-        paired_line = f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)"
+        dropped_note = f"; dropped incomplete: {', '.join(dropped)}" if dropped else ""
+        paired_line = (f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks"
+                       f"{dropped_note})")
         pass_line = f"test pass rate delta {pass_delta:+.3f}"
         self.log(f"finish: {paired_line}; {pass_line}")
         if not low > 0:

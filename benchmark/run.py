@@ -65,6 +65,7 @@ from config import (
     ModeConfig,
 )
 from fixtures.reset import ensure_repo_clean, reset_repo
+from jsonl import tolerant_jsonl
 from parse import (
     detect_quota_rejection,
     extract_stream_error,
@@ -275,6 +276,15 @@ def isolated_call_target() -> auth.AuthTarget:
     if env.get(auth.OAUTH_TOKEN_KEY):
         env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
     return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
+
+
+def budget_capped(stream: str) -> bool:
+    """True when a claude stream's last result event is ``error_max_budget_usd``: the agent spent its own cap.
+
+    Such a cell is a completed, incorrect attempt (``baselines.is_completed``), not an infra fault.
+    """
+    results = [event for event in tolerant_jsonl(stream) if event.get("type") == "result"]
+    return bool(results) and results[-1].get("subtype") == "error_max_budget_usd"
 
 
 def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | None) -> tuple[float, str]:
@@ -2466,8 +2476,11 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             if quota:
                 fail({"infra": "quota", "error": f"infra:quota: {quota}", "correctness_reason": f"Usage limit: {quota}"})
                 raise PlanStopped("quota", quota, rows) from error
-            fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
-            if cell_cap < max_budget_usd and "error_max_budget_usd" in str(error):
+            capped = runner == "claude" and budget_capped(_read_stream(stream_log_path))
+            # Only a cap at the run key's budget is the agent's own; a cap shrunk to the headroom is the ledger's.
+            fail({"error": str(error), "correctness_reason": f"Exception: {error}",
+                  **({"budget_capped": True} if capped and cell_cap >= max_budget_usd else {})})
+            if cell_cap < max_budget_usd and (capped or "error_max_budget_usd" in str(error)):
                 raise PlanStopped("ceiling", f"{cell_id} hit its ${cell_cap:.4f} cap at the unreserved headroom",
                                   rows) from error
         else:
@@ -3382,6 +3395,8 @@ Examples:
                     "error": str(error),
                     "correct": False,
                     "correctness_reason": f"Exception: {error}",
+                    **({"budget_capped": True}
+                       if runner == "claude" and budget_capped(_read_stream(stream_log_path)) else {}),
                 }, stream_log_path, runner, estimate)
 
             else:

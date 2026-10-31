@@ -932,7 +932,9 @@ def test_first_rollout_that_did_not_complete_is_not_rerun(monkeypatch: pytest.Mo
     evo.evaluate(candidate, "dev_a")
     result = evo.results[candidates.content_id(candidate)]
 
-    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 0), ("dev_b", 0)]
+    # The errored cell runs once and twice more as --cell-retries (default 2) before the rollout counts as incomplete.
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
+        ("dev_a", 0), ("dev_a", 0), ("dev_a", 0), ("dev_b", 0)]
     assert not result.accepted and result not in evo.frontier
     assert "a first rollout did not complete; not re-run" in log_text(world)
 
@@ -946,7 +948,7 @@ def test_rerun_that_did_not_complete_is_not_accepted(monkeypatch: pytest.MonkeyP
     result = evo.results[candidates.content_id(candidate)]
 
     assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
-        ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
+        ("dev_a", 0), ("dev_a", 1), ("dev_a", 1), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
     assert not result.accepted and result not in evo.frontier
     assert "a re-run did not complete; not accepted" in log_text(world)
 

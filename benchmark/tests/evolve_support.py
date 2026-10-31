@@ -3,7 +3,9 @@
 Candidate outcomes are written into the candidate itself: a ``score:`` line in
 ``prompts/mcp.md`` such as ``score: dev_a=10 cheap_a=1`` gives each task one
 character per repetition (``1`` correct, ``0`` incorrect, ``C`` correct but
-contaminated, ``E`` an errored cell; the last character repeats). The stub
+contaminated, ``E`` an errored cell, ``B`` a cell that spent its Claude budget cap,
+``F`` a cell that crashes while ``World.flaky`` is above 0 and is correct after;
+the last character repeats). The stub
 runner reads the line from the commit the cell is served from, so no test
 reaches a model, a network, or cargo.
 """
@@ -154,10 +156,11 @@ class EvolveTask:
         return True, "expected answer"
 
 
-def fixture_panel(name: str = "evolve-fixture", dev: tuple[str, ...] = DEV) -> panels.Panel:
+def fixture_panel(name: str = "evolve-fixture", dev: tuple[str, ...] = DEV,
+                  test: tuple[str, ...] = TEST) -> panels.Panel:
     members = tuple(panels.Member(id=task, family="local", language="rust", split=split)
-                    for split, tasks in (("cheap", CHEAP), ("dev", dev), ("test", TEST)) for task in tasks)
-    return panels.Panel(name=name, cheap=CHEAP, dev=dev, test=TEST,
+                    for split, tasks in (("cheap", CHEAP), ("dev", dev), ("test", test)) for task in tasks)
+    return panels.Panel(name=name, cheap=CHEAP, dev=dev, test=test,
                         split_digest=panels.split_digest(members), members=members)
 
 
@@ -228,6 +231,8 @@ class World:
     sha_scale: dict[str, float] = field(default_factory=dict)
     env: str = "env-fingerprint-a"
     spawned: list[dict] = field(default_factory=list)
+    # How many more ``F`` cells crash before an ``F`` cell completes; each crash takes one.
+    flaky: int = 0
 
     @property
     def store_path(self) -> Path:
@@ -260,13 +265,21 @@ class World:
         stream = kwargs["stream_log_path"]
         stream.parent.mkdir(parents=True, exist_ok=True)
         stream.write_text("{}\n")
-        if mark == "E":
+        if mark == "E" or (mark == "F" and self.flaky > 0):
+            if mark == "F":
+                self.flaky -= 1
             raise RuntimeError(f"cell {task_name} rep {repetition} failed")
+        if mark == "B":
+            # As claude -p prints it: exit 1, and the last result event names the per-cell budget cap.
+            stream.write_text(json.dumps({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                          "errors": ["Reached maximum budget ($1)"], "num_turns": 57,
+                                          "total_cost_usd": self.costs.get(task_name, self.cost)}) + "\n")
+            raise RuntimeError("claude -p failed with code 1\nstderr: \nstdout tail: error_max_budget_usd")
         sidecar = stream.with_name(f"{stream.stem}.trajectory.jsonl")
         call = {"tool_use_id": "toolu_1", "name": "Grep", "input": {"pattern": "dispatch AGENT_GT"},
                 "output": LONG_OUTPUT + f"[{task_name}:{repetition}]", "is_error": False}
         sidecar.write_text(json.dumps(call) + "\n")
-        correct = mark in {"1", "C"}
+        correct = mark in {"1", "C", "F"}
         row = {
             "task": task_name, "mode": mode_name, "model": run.MODELS[model_name], "model_alias": model_name,
             "repetition": repetition, "correct": correct,

@@ -390,7 +390,8 @@ def test_finish_with_a_test_task_present_on_only_the_winner_side_compares_the_pa
     evo.finish()
     text = log_text(world)
     assert "finish: incomplete" not in text
-    assert "2 tasks)" in text
+    # The unpaired task is dropped by name, not skipped silently.
+    assert "2 tasks; dropped incomplete: test_c)" in text
 
 
 def test_finish_with_no_paired_test_tasks_opens_no_pr(monkeypatch, tmp_path) -> None:
