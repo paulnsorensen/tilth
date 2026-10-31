@@ -89,6 +89,10 @@ def default_cargo(worktree: Path, args: list[str]) -> tuple[bool, str]:
                         JUST_CHECK_TIMEOUT_S, timeout_raises=True)
 
 
+# A hard bound on --cell-retries: a cell that fails this often is not flaky, and each attempt can cost a full cell.
+MAX_CELL_RETRIES = 5
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--panel", type=Path, required=True, help="pre-registered panel file")
@@ -103,6 +107,9 @@ def _parser() -> argparse.ArgumentParser:
     claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
     parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
+    parser.add_argument("--cell-retries", type=int, default=2, metavar="N",
+                        help="re-run a cell that did not complete (crash, infra, timeout) up to N more times per "
+                             "plan; each attempt is charged (default 2; a budget-capped cell is a completed failure)")
     parser.add_argument("--plateau", type=int, default=5,
                         help="stop after P paid-tier candidates leave the best dev mean unimproved (default 5)")
     parser.add_argument("--cell-budget-usd", type=float, default=run.DEFAULT_MAX_BUDGET_USD,
@@ -190,9 +197,10 @@ def build(argv: list[str] | None = None, *,
                         ("--cell-estimate-usd", args.cell_estimate_usd)):
         if not math.isfinite(value) or value <= 0:
             return _error(f"{flag} must be a positive finite number")
-    if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1 or args.replay_diagnostic < 0:
+    if (args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1 or args.replay_diagnostic < 0
+            or not 0 <= args.cell_retries <= MAX_CELL_RETRIES):
         return _error("--max-metric-calls and --plateau must be at least 1, --reruns and --replay-diagnostic "
-                      "at least 0")
+                      f"at least 0, --cell-retries from 0 to {MAX_CELL_RETRIES}")
     try:
         auth.refuse_env(os.environ)
     except auth.ClaudeAuthError as error:
@@ -251,7 +259,8 @@ def build(argv: list[str] | None = None, *,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
         strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
-        directives=tuple(queue), repair=args.repair, preamble=args.preamble, deep_diagnosis=args.deep_diagnosis,
+        directives=tuple(queue), repair=args.repair, preamble=args.preamble, cell_retries=args.cell_retries,
+        deep_diagnosis=args.deep_diagnosis,
         deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,
         deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
         finish_reserve_usd=args.finish_reserve_usd, max_unselected=args.max_unselected,

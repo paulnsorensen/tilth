@@ -42,6 +42,27 @@ The baseline part still holds money that `buy_baselines` spends right after pref
 Only a baseline rep that fails there reaches finish. A refresh of the reserve after `buy_baselines` would release
 that part; it is not done yet.
 
+## Incomplete cells
+
+A cell that ends with `error_max_budget_usd` spent its own `--cell-budget-usd` cap. Its row gets `budget_capped:
+true` and is a completed, incorrect row in search scoring, delta reports, and finish. Its cost counts toward the
+score. A cap that the ledger shrank to the unreserved headroom is not the agent's own: that row stays incomplete,
+and the plan stops with `ceiling`.
+
+A cell that did not complete (a crash with no budget subtype, an infra failure, or a timeout) is run again up to
+`--cell-retries N` more times in the same plan (default 2, at most 5). This applies to every plan: baselines, the
+cheap and dev tiers, admission re-runs, and finish. Each attempt is charged to the ledger and stored, and `log.txt`
+names each retry. The ledger ceiling still applies, and a stop during a retry keeps the rows so far. `--reruns` is a
+different setting: it counts the extra repetitions that admission and finish run, not retries.
+
+If cells are still incomplete after the retries, finish drops each test task with an incomplete cell for the winner,
+the seed, or the baseline. It compares the finalists on the remaining tasks, paired. The log names the dropped cells,
+and the verdict line and the PR body end with `dropped incomplete: <tasks>`. The dev mean still picks the winner, and
+the seed still wins ties. Finish fails only when no test task is left.
+
+A resume with the same `--run-id` reuses every completed row, budget-capped rows included, and runs only the
+incomplete cells again.
+
 Paid-tier side info for reflection carries `cost_pairs` for the task: the candidate's rows and the frozen
 baseline rows, each cut to cost, turns, tokens, tool calls, tool sequence, and batch sizes. Reflection can
 so see why a candidate costs more than stock Claude. The pairs carry no trajectory and no grader output.
