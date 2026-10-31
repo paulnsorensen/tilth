@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "name": "gepa-v3-long-3",
+  "split_seed": 20261025,
+  "members": [
+    {"id": "Netflix__metaflow.b390a8d4.test_stub_generator.7bf08c98.lv1", "family": "featurebench", "language": "python", "split": "dev"},
+    {"id": "caddyserver__caddy-6288", "family": "swebench_ml", "language": "go", "split": "dev"},
+    {"id": "express_edit_example_start", "family": "local", "language": "javascript", "split": "test"},
+    {"id": "fastapi_edit_security_raise_on_missing", "family": "local", "language": "python", "split": "dev"},
+    {"id": "gin_edit_render_context", "family": "local", "language": "go", "split": "dev"},
+    {"id": "rg_edit_flow_migration", "family": "local", "language": "rust", "split": "test"},
+    {"id": "tokio-rs__axum-1119", "family": "swebench_ml", "language": "rust", "split": "dev"},
+    {"id": "vuejs__core-11739", "family": "swebench_ml", "language": "javascript", "split": "test"},
+    {"id": "tokio-rs__tokio-4867", "family": "swebench_ml", "language": "rust", "split": "dev"},
+    {"id": "burntsushi__ripgrep-2209", "family": "swebench_ml", "language": "rust", "split": "test"},
+    {"id": "caddyserver__caddy-6350", "family": "swebench_ml", "language": "go", "split": "test"},
+    {"id": "hashicorp__terraform-35611", "family": "swebench_ml", "language": "go", "split": "dev"},
+    {"id": "axios__axios-5085", "family": "swebench_ml", "language": "javascript", "split": "dev"},
+    {"id": "uutils__coreutils-6682", "family": "swebench_ml", "language": "rust", "split": "test"},
+    {"id": "chain:gin-edit-5", "family": "chain", "language": "go", "split": "dev"},
+    {"id": "chain:fastapi-edit-4", "family": "chain", "language": "python", "split": "dev"},
+    {"id": "chain:rg-edit-6", "family": "chain", "language": "rust", "split": "test"},
+    {"id": "chain:express-edit-6", "family": "chain", "language": "javascript", "split": "test"}
+  ]
+}
