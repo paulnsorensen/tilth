@@ -135,8 +135,8 @@ def test_selector_picks_src_patch_within_two_proposals_whatever_the_hints(hint: 
         assert SRC in picks[:diagnosis.SRC_PATCH_BY_PROPOSAL], (seed, picks)
 
 
-def test_selector_never_leaves_a_component_out_for_more_than_ten_proposals() -> None:
-    assert diagnosis.MAX_UNSELECTED == 10
+def test_selector_never_leaves_a_component_out_for_more_than_max_unselected_proposals() -> None:
+    assert diagnosis.MAX_UNSELECTED == 6
     names = list(seed_candidate())
     for seed in range(20):
         picks, _logs = run_selector(seed, READ_MD, 80)
@@ -148,14 +148,14 @@ def test_selector_never_leaves_a_component_out_for_more_than_ten_proposals() -> 
 
 
 def test_selector_favours_the_hinted_component() -> None:
-    # Measured over seeds 0-19 with 300 proposals each: the hinted component takes 44% of the turns,
-    # the same component unhinted takes 14%, and a uniform choice among five would give 20%.
+    # Measured over seeds 0-19 with 300 proposals each at MAX_UNSELECTED 6: the hinted component takes 31% of the
+    # turns, the same component unhinted takes 17%, and a uniform choice among five would give 20%.
     def share(hint: str) -> float:
         picks = [pick for seed in range(20) for pick in run_selector(seed, hint, 300)[0]]
         return picks.count(READ_MD) / len(picks)
 
-    assert share(READ_MD) >= 0.40
-    assert share("prompts/mcp.md") <= 0.16
+    assert share(READ_MD) >= 0.29
+    assert share("prompts/mcp.md") <= 0.18
 
 
 def test_selector_without_attribution_still_returns_one_component() -> None:

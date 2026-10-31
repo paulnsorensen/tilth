@@ -8,7 +8,11 @@ Two figures are proxies. ``exposure`` is result characters times the API turns t
 cell, a context-cost proxy (cache reads re-pay a result every later turn). A sidecar without ``api_turn`` is
 re-derived from the raw stream beside its sidecar; when that is missing too the cell's exposure is None and
 the cell is left out of the exposure mean (``coverage.exposure_cells`` counts the cells that have one). ``read_breadth`` excess prices each extra
-distinct file at the candidate's mean read-result size.
+distinct file at the candidate's mean read-result size. ``hook_denials`` excess prices each extra strict-hook
+denial at the candidate's mean denial-result size.
+
+A cause that the ``hints`` map does not name is left out of ``dominant``. Only ``PREAMBLE_HINTS`` names
+``hook_denials``, so a run without ``--preamble`` keeps its causes and hints.
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ MAX_DOMINANT = 5
 
 # Checked in order; the first match wins.
 ERROR_CLASSES = (
+    ("hook_denied", re.compile(r"^PreToolUse:\w+ hook error")),
     ("never_displayed", re.compile(r"never displayed|was not displayed")),
     ("create_file_exists", re.compile(r"create_file (?:target already exists|requires a tagless)")),
     ("text_not_found", re.compile(r"text to replace was not found|String to replace not found")),
@@ -42,8 +47,10 @@ HINTS = {
     "tilth_read_batched_4plus": "prompts/tools/read.md", "search_output": "src_patch",
     "write_errors": "prompts/tools/write.md", "read_breadth": "prompts/mcp.md",
 }
-# In a --preamble run the preamble asks the agent to read callers and helpers before an edit, so it steers breadth.
-PREAMBLE_HINTS = {**HINTS, "read_breadth": PREAMBLE}
+# In a --preamble run the preamble is the agent's system prompt. It asks the agent to read callers and helpers
+# before an edit, so it steers breadth, and it tells the agent that shell is not a content reader, so it steers
+# how often the strict hook denies a Bash call.
+PREAMBLE_HINTS = {**HINTS, "read_breadth": PREAMBLE, "hook_denials": PREAMBLE}
 _SECTION_ERROR = re.compile(r"^error:", re.M)
 _BENCH_ROOT = re.compile(r"^/tmp/tilth-benchmark-[^/]+/repo/")
 
@@ -157,6 +164,9 @@ def _cell_stats(cell: tuple[list[dict], bool], arm: str, examples: dict) -> Coun
             out[("errchars", tool)] += chars
             out[("cls", tool, kind)] += 1
             examples.setdefault((arm, tool, kind), text.strip()[:EXAMPLE_CHARS])
+            if kind == "hook_denied":
+                out[("hook_denials",)] += 1
+                out[("hook_denial_chars",)] += chars
         for shape in _shapes(tool, args):
             out[("shape_calls", tool, shape)] += 1
             out[("shape_chars", tool, shape)] += chars
@@ -199,6 +209,7 @@ def _dominant(cand: dict, base: dict, hints: Mapping[str, str]) -> list[dict]:
     read_total = g(cand, "chars", "tilth_read")
     base_read = g(base, "chars", "Read")
     read_mean = read_total / g(cand, "calls", "tilth_read") if g(cand, "calls", "tilth_read") else 0.0
+    denial_mean = g(cand, "hook_denial_chars") / g(cand, "hook_denials") if g(cand, "hook_denials") else 0.0
     found = [
         ("tilth_write_receipt", g(cand, "chars", "tilth_write") - g(cand, "errchars", "tilth_write") - base_write,
          f"tilth_write ok results {g(cand, 'calls', 'tilth_write'):.1f} calls/cell vs built-in edits "
@@ -210,6 +221,9 @@ def _dominant(cand: dict, base: dict, hints: Mapping[str, str]) -> list[dict]:
          f"{sum(g(base, 'calls', t) for t in BASE_SEARCH):.1f}"),
         ("read_breadth", (g(cand, "files") - g(base, "files")) * read_mean,
          f"{g(cand, 'files'):.1f} vs {g(base, 'files'):.1f} distinct files read per cell at {read_mean:.0f} chars/read"),
+        ("hook_denials", (g(cand, "hook_denials") - g(base, "hook_denials")) * denial_mean,
+         f"strict-hook denials {g(cand, 'hook_denials'):.2f} per cell vs baseline {g(base, 'hook_denials'):.2f} "
+         f"at {denial_mean:.0f} chars/denial"),
     ]
     for shape in ("requested_mode_full", "batched_4plus"):
         shape_chars = g(cand, "shape_chars", "tilth_read", shape)
@@ -218,7 +232,7 @@ def _dominant(cand: dict, base: dict, hints: Mapping[str, str]) -> list[dict]:
         found.append((cause, shape_chars - base_read * share,
                       f"{shape} is {g(cand, 'shape_calls', 'tilth_read', shape) / (g(cand, 'calls', 'tilth_read') or 1):.0%}"
                       f" of reads and {share:.0%} of read chars"))
-    ranked = sorted((f for f in found if f[1] > 0), key=lambda f: -f[1])[:MAX_DOMINANT]
+    ranked = sorted((f for f in found if f[1] > 0 and f[0] in hints), key=lambda f: -f[1])[:MAX_DOMINANT]
     return [{"cause": c, "excess_chars_per_cell": round(x, 1), "evidence": e, "component_hint": hints[c]}
             for c, x, e in ranked]
 
