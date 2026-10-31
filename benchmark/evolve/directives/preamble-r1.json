@@ -1,0 +1,8 @@
+[
+  {
+    "id": "read-batch-next-view",
+    "component": "prompts/tools/read.md",
+    "brief": "Since PR #423, a batch tilth_read response names each section that the planner shortened in its JSON header as `next_view`, a list of `path#n-m` continuation requests in section order. A single-path read still gives `next_view` as one string. prompts/tools/read.md describes only the single-path form. Append this sentence to the end of line 3, after \"not `mode=full`.\": \"In a batch, `next_view` is a list; read each `path#n-m` in it with one batched call.\" Do not change other text, and keep the file within its byte cap.",
+    "hypothesis": {"metric": "calls_per_cell", "scope": "tilth_read", "direction": "decrease", "tolerance": 0.1, "invariants": ["accuracy does not drop"]}
+  }
+]
