@@ -29,6 +29,7 @@ from panel_support import (
 
 GEPA_V2_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v2.json"
 GEPA_V3_LONG_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long-2.json"
+GEPA_V3_LONG_3_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long-3.json"
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 REDACTED_KEYS = {"instance_id", "repo", "base_commit", "language"}
 GRADER_KEYS = {"patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS", "problem_statement"}
@@ -725,6 +726,32 @@ def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> 
     assert members[-1].capability == "fix"
     assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
 
+
+def test_gepa_v3_long_3_swaps_only_the_two_false_negative_chains(store: Path) -> None:
+    old, new = read(GEPA_V3_LONG_PANEL), read(GEPA_V3_LONG_3_PANEL)
+    languages = {entry["id"]: entry["language"] for entry in new["members"]}
+
+    panel = load(GEPA_V3_LONG_3_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
+
+    swapped = {"chain:rg-edit-7": "chain:rg-edit-6", "chain:fastapi-edit-5": "chain:fastapi-edit-4"}
+    expected = [{**entry, "id": swapped.get(entry["id"], entry["id"])} for entry in old["members"]]
+    assert new["members"] == expected
+    assert new["split_seed"] == old["split_seed"]
+    assert (len(panel.dev), len(panel.test)) == (10, 8)
+    reached = {name for member in panel.members if member.family == "chain"
+               for name in chains.CHAINS[member.id.removeprefix(chains.PREFIX)].members}
+    assert not {"grok_rg_matcher", "fastapi_request_validation"} & reached
+    assert chains.CHAINS["rg-edit-6"].members == tuple(
+        name for name in chains.CHAINS["rg-edit-7"].members if name != "grok_rg_matcher")
+    assert chains.CHAINS["fastapi-edit-4"].members == tuple(
+        name for name in chains.CHAINS["fastapi-edit-5"].members if name != "fastapi_request_validation")
+
+
+@pytest.mark.parametrize("task_name", ["rg_edit_flow_migration", "fastapi_edit_security_raise_on_missing"])
+def test_long_edit_tasks_get_a_loaded_host_timeout(task_name: str) -> None:
+    task = tasks.TASKS[task_name]
+
+    assert run._task_timeout(task) == 900 > run.CELL_TIMEOUT_S
 
 def test_a_task_in_a_dev_chain_and_in_test_is_refused() -> None:
     leaking = [

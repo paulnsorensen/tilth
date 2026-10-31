@@ -83,6 +83,24 @@ CHAINS: dict[str, Chain] = {
             ),
             "Five express read tasks, then the example-start migration edit. Estimated 45-55 API calls.",
         ),
+        Chain(
+            "rg-edit-6",
+            (
+                "rg_trait_implementors", "rg_flag_definition", "rg_search_dispatch", "rg_walker_parallel",
+                "rg_lineiter_usage", "rg_edit_flow_migration",
+            ),
+            "rg-edit-7 without grok_rg_matcher: in a chain the agent names the `Matcher` impl without the required "
+            "`impl Matcher for RegexMatcher` string (19 of 33 stored rg-edit-7 cells, both arms).",
+        ),
+        Chain(
+            "fastapi-edit-4",
+            (
+                "fastapi_dependency_resolution", "fastapi_depends_internals", "grok_depends",
+                "fastapi_edit_security_raise_on_missing",
+            ),
+            "fastapi-edit-5 without fastapi_request_validation: in a chain the agent calls the handler an async "
+            "closure `app(request)` without a required `async def app` form (8 of 87 stored cells, both arms).",
+        ),
     )
 }
 

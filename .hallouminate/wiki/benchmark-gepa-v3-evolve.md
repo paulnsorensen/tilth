@@ -5,7 +5,7 @@ Main at `b2f4412` is within noise of baseline on the dev split, and 2-6% cheaper
 The evolve loop is now hardened end to end, but its dev split is too noisy to rank single candidates that differ by a few percent.
 Guards added during the campaign are on [Benchmark GEPA loop invariants and guards](benchmark-gepa-invariants.md); failures it hit are on [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md).
 
-## Panel: gepa-v3-long-2
+## Panel: gepa-v3-long-2, superseded by gepa-v3-long-3
 
 The gepa-v3 panel exists because real coding sessions run about 93 API calls, while the old gepa-v2 tasks ran 5-6, so carry cost never showed.
 `benchmark/panels/gepa-v3-long-2.json` holds 18 members, 10 dev and 8 test, scored with sonnet at 3 reps.
@@ -15,6 +15,48 @@ The gepa-v3 panel exists because real coding sessions run about 93 API calls, wh
 - **Short controls:** tokio-4867, ripgrep-2209, caddy-6350, terraform-35611, axios-5085 and coreutils-6682, so evolve cannot win long tasks while losing short ones.
 - **Dropped:** bat-1892, because bat's pty integration test hangs the agent's full `cargo test`, and the `gin_context_next` and `grok_context_next` chain sub-tasks, because chain answers omit their literal `HandlersChain` grading string.
 - The panel loader refuses any task that reaches both dev and test, directly or as a chain sub-task (`_check_no_shared_task`, `benchmark/panels.py`).
+
+`benchmark/panels/gepa-v3-long-3.json` is long-2 with two chains swapped. It keeps the seed, the split (10 dev, 8 test), and all six short controls.
+`chain:rg-edit-7` becomes `chain:rg-edit-6` (no `grok_rg_matcher`), and `chain:fastapi-edit-5` becomes `chain:fastapi-edit-4` (no `fastapi_request_validation`).
+Do not edit long-2: stored runs carry its name and split digest. Use long-3 for new runs.
+
+## Panel health (October 2026)
+
+`benchmark/panel_health.py` builds the per-task table from result rows; re-run it after each run.
+The numbers below count every paid row of gepa-v3-r1 to r6, gepa-v3-baselines and preamble-r1 (sonnet, CLI 2.1.310), skipping reused rows.
+
+| Task | Split | Baseline | Tilth | Failure class | Max wall / timeout | Verdict |
+|---|---|---|---|---|---|---|
+| `chain:rg-edit-7` | test | 5/13 | 9/20 | `grok_rg_matcher` sub-task in all 19 failures | 400 s turn / 600 | Replaced by `rg-edit-6` |
+| `chain:fastapi-edit-5` | dev | 14/16 | 65/71 | `fastapi_request_validation` sub-task in all 8 failures | 348 s turn / 600 | Replaced by `fastapi-edit-4` |
+| tokio-4867 | dev | 11/11 | 60/77 | F2P, tilth arm only | 74 s / 1800 | Kept |
+| ripgrep-2209 | test | 6/8 | 17/20 | F2P `regression::r2208`, both arms | 78 s / 1800 | Kept, watch |
+| `rg_edit_flow_migration` | test | 10/10 | 19/20 | One `$1` budget cap | 307 s / 600 | Kept, timeout 900 s |
+| `fastapi_edit_security_raise_on_missing` | dev | 16/16 | 77/78 | One timeout, before the #407 venv fix | 241 s / 600 | Kept, timeout 900 s |
+| vuejs-11739 | test | 10/10 | 18/20 | F2P | 824 s / 1200 | Kept |
+| metaflow | dev | 13/13 | 77/78 | One contaminated row | 732 s / 1200 | Kept |
+
+The other ten members pass at least 92% of cells in both arms and use at most 40% of their timeout.
+
+- **Grading false negatives.** `grok_rg_matcher` requires the literal `impl Matcher for RegexMatcher`; chain answers write "`Matcher` impl (line 409)". `fastapi_request_validation` requires an `async def app` form; chain answers write "an async closure, `app(request)`".
+- Without these sub-tasks, rg-edit-7 passes 13/13 and 20/20, and fastapi-edit-5 passes 15/16 and 71/71.
+- The fix drops the sub-tasks from new chains, as for `gin_context_next`. A grader edit would change the task digests and move the stored long-2 chain keys.
+- **tokio-4867** fails only in the tilth arm. The failures are quick (8 turns) alternative fixes in `recv_ref` that the hidden test rejects; the sampled passing runs fix `new_receiver`. The grade builds in 9 s, so it is not flaky.
+- **ripgrep-2209** fails in both arms (25% and 15%). The grade compiles in 6 s, then `r2208` fails on a different `replace_all` fix, so the failures are real wrong answers. It stays as a short control, but it adds noise to the test split.
+- **Background-task wake-ups.** When an agent backgrounds a test run, each notification starts a new one-turn result in the same stream, and the row keeps only the last. Seven slow rows report 1-3 turns for 15-37 real turns.
+- vuejs rep 0 of preamble-r1 is one of them: 37 turns for $0.43, then 3 wake-ups, for 824 s of wall time. Cost stays correct because the last result event is cumulative; `num_turns` and `duration_ms` do not.
+
+## Cell timeouts and budget
+
+- `timeout_s` and the per-cell `--max-budget-usd` are both run-key inputs (`cell_identity`, `benchmark/run.py`). `_task_source_files` also hashes the source file of each task.
+- `rg_edit_flow_migration` and `fastapi_edit_security_raise_on_missing` now set `timeout_s = 900`. That keeps 2x headroom over the slowest stored turn (400 s and 348 s) for a loaded host.
+- Only metaflow (732 s) and vuejs (824 s, a wake-up row) used more than 40% of a timeout among the other tasks, both against 1200 s. Their timeouts are per language in `benchmark/external/task.py`; a change would move every Python or JavaScript external key, so they stay.
+- Re-buy for a long-3 run: the baselines of the two edit tasks and of the two new chains. Stored baseline means at `$3` are $1.04 (rg edit), $0.48 (fastapi edit), about $2.63 (rg-edit-6) and about $1.10 (fastapi-edit-4).
+- That is about $5.25 per repetition, or $15.75 at 3 reps; the timeout changes are $1.52 of each repetition. The other 14 members keep their keys.
+- Long-2 also loses the stored keys of those two tasks and of its `chain:rg-edit-7` and `chain:fastapi-edit-5` cells.
+- The budget cannot vary per task: `--cell-budget-usd` sets one budget for every cell, and a chain gets that budget times its size.
+- At `$1`, `rg_edit_flow_migration` sits at the cap in both arms (baseline mean $0.94, max $0.99; one tilth cell capped after 57 turns). At `$3`, r1-r6 never hit a cap; the costliest single cell was $1.09 and the costliest chain $4.09 of $21.
+- Run long-3 with `--cell-budget-usd 3`. That matches r1-r6, so their stored `$3` baselines (the `long-pool-screen` result store) answer the 14 unchanged members.
 
 ## Cost per correct: where tilth stands
 
@@ -82,4 +124,4 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy) · Updated: 2026-10-29_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py` · Updated: 2026-10-31_
