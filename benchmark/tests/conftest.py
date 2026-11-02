@@ -20,6 +20,7 @@ import external.data
 import external.proc
 import external_support
 import run
+import tmp_aging
 from config import DEFAULT_MAX_BUDGET_USD, ModeConfig
 from tasks.base import GroundTruth, Task, TaskSource
 
@@ -143,6 +144,12 @@ def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
         lambda argv, **kwargs: subprocess.CompletedProcess(
             argv, 0, '{"authMethod": "oauth_token", "apiProvider": "firstParty"}', ""),
     )
+
+
+@pytest.fixture(autouse=True)
+def hermetic_tmpfiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model a host without systemd-tmpfiles, so the guard skips on every host; guard tests replace it."""
+    monkeypatch.setattr(tmp_aging, "_cat_config", lambda: None)
 
 
 @pytest.fixture

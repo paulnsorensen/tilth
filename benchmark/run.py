@@ -38,12 +38,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import auth
 import baselines
 import chains
+import config
 import erosion
 import external
 import external.contamination
 import external.proc
 import external.preflight
 import panels
+import tmp_aging
 from spend import BudgetBusyError, SpendLedger, hold_run_lock, plan_budget_id, settle_failed
 from config import (
     BENCHMARK_DIR,
@@ -3068,6 +3070,11 @@ Examples:
             auth.preflight_claude_auth(claude_auth_targets(
                 [(cell.task_name, cell.mode_name, cell.model_name) for cell in pending], bare=bare))
         except auth.ClaudeAuthError as error:
+            parser.error(str(error))
+        # Host check only: it reads tmpfiles.d and feeds no run key.
+        try:
+            tmp_aging.require_exclusion(config.REPOS_DIR.parent)
+        except tmp_aging.TmpAgingError as error:
             parser.error(str(error))
         drift = {}
         for cell in pending:
