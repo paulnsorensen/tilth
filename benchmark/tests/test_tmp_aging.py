@@ -117,3 +117,13 @@ def test_dry_run_skips_the_host_check(bench, monkeypatch: pytest.MonkeyPatch, ca
     code = bench.main("--tasks", "cell_a", "--models", "sonnet5", "--modes", "plain", "--reps", "1", "--dry-run")
 
     assert code == 0 and "1 would call a model" in capsys.readouterr().out
+
+
+def test_evolve_refuses_before_any_spend(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from evolve import cli as evolve_cli
+
+    monkeypatch.setattr(tmp_aging, "_cat_config", lambda: STOCK)
+    argv = ["--panel", "p.json", "--max-usd", "1", "--max-metric-calls", "1", "--seed-sha", "HEAD"]
+
+    assert evolve_cli.build(argv) == 2
+    assert FIX in capsys.readouterr().err
