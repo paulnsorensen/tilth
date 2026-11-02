@@ -381,7 +381,8 @@ def test_a_timeout_in_the_default_cargo_is_an_infrastructure_failure(monkeypatch
 
     with pytest.raises(InfrastructureFailure, match="timed out"):
         cli.default_cargo(worktree, ["test"])
-    assert cli.default_just_check(worktree)[0] is False
+    with pytest.raises(InfrastructureFailure, match="timed out"):
+        cli.default_just_check(worktree)
 
 
 def test_an_infrastructure_fault_is_worded_by_cause_and_is_not_memoized(two_tests) -> None:

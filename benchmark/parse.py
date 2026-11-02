@@ -171,6 +171,7 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
     turns_by_message_id: dict[str, Turn] = {}
     result_text_parts: list[str] = []
     final_summary = {}
+    result_events: list[dict] = []
     available_tools: list[str] = []
     mcp_servers: list[dict] = []
     skills: list[str] = []
@@ -247,29 +248,41 @@ def parse_stream_json(raw_output: str, model: str | None = None) -> RunResult:
 
         elif event_type == "result":
             final_summary = event
+            result_events.append(event)
+
+    # A backgrounded command adds a result event per wake-up. Cost, modelUsage
+    # and duration_api_ms are cumulative (last event wins); turns, duration_ms
+    # and usage are per-segment and sum.
+    def _segments_total(read) -> int:
+        return sum(read(event) or 0 for event in result_events)
 
     native_cost = _native_cost(final_summary)
     resolved_model = stream_model or message_model
     return RunResult(
         session_id=session_id,
         turns=turns,
-        num_turns=final_summary.get("num_turns", len(turns)),
+        num_turns=(
+            _segments_total(lambda e: e.get("num_turns"))
+            if any("num_turns" in event for event in result_events) else len(turns)
+        ),
         total_cost_usd=(
             native_cost if native_cost is not None
             else _priced_stream_cost(turns, resolved_model or model)
         ),
         cost_source="native" if native_cost is not None else "pricing",
-        duration_ms=final_summary.get("duration_ms", 0),
-        duration_api_ms=final_summary.get("duration_api_ms", 0),
-        total_input_tokens=final_summary.get("usage", {}).get("input_tokens", 0),
-        total_output_tokens=final_summary.get("usage", {}).get("output_tokens", 0),
-        total_cache_creation_tokens=final_summary.get("usage", {}).get(
-            "cache_creation_input_tokens",
-            0,
+        duration_ms=_segments_total(lambda e: e.get("duration_ms")),
+        duration_api_ms=final_summary.get("duration_api_ms") or 0,
+        total_input_tokens=_segments_total(
+            lambda e: (e.get("usage") or {}).get("input_tokens"),
         ),
-        total_cache_read_tokens=final_summary.get("usage", {}).get(
-            "cache_read_input_tokens",
-            0,
+        total_output_tokens=_segments_total(
+            lambda e: (e.get("usage") or {}).get("output_tokens"),
+        ),
+        total_cache_creation_tokens=_segments_total(
+            lambda e: (e.get("usage") or {}).get("cache_creation_input_tokens"),
+        ),
+        total_cache_read_tokens=_segments_total(
+            lambda e: (e.get("usage") or {}).get("cache_read_input_tokens"),
         ),
         result_text="\n".join(result_text_parts),
         available_tools=available_tools,

@@ -163,3 +163,131 @@ def test_the_cli_flag_reads_the_checkout_and_patches_only_tilth_arms(monkeypatch
 def test_the_cli_flag_refuses_unsupported_runs(modes, models, message) -> None:
     with pytest.raises(ValueError, match=message):
         run._apply_preamble(modes, models, None, None)
+
+
+def _stock_tilth(**fields) -> run.ModeConfig:
+    return replace(run.MODES["tilth_forced"], name="tilth_stock", prompt_mode="append", **fields)
+
+
+def test_preamble_mode_places_the_text_by_the_arm_prompt_mode() -> None:
+    replaced = run.preamble_mode(run.MODES["tilth_forced"], PREAMBLE_A)
+    appended = run.preamble_mode(_stock_tilth(), PREAMBLE_A)
+
+    assert (replaced.prompt_mode, replaced.preamble) == ("preamble", PREAMBLE_A)
+    assert (appended.prompt_mode, appended.preamble) == ("append_preamble", PREAMBLE_A)
+    with pytest.raises(ValueError, match="prompt_mode"):
+        run.preamble_mode(replaced, PREAMBLE_B)
+
+
+def test_claude_append_preamble_arm_keeps_the_stock_prompt_and_appends_the_preamble() -> None:
+    mode = run.preamble_mode(_stock_tilth(), PREAMBLE_A)
+    cmd = _argv(mode, "sonnet5")
+
+    assert "--system-prompt" not in cmd
+    assert cmd.count("--append-system-prompt") == 1
+    assert _flag(cmd, "--append-system-prompt") == PREAMBLE_A + "\nYour current working directory is: /work/repo"
+    assert run.SYSTEM_PROMPT not in _flag(cmd, "--append-system-prompt")
+    assert json.loads(_flag(cmd, "--settings")) == {"autoMemoryEnabled": False}
+
+
+def test_a_strict_append_preamble_arm_merges_memory_off_into_the_hook_settings() -> None:
+    mode = run.preamble_mode(_stock_tilth(), PREAMBLE_A)
+    cmd = run._claude_command(TASK, mode, "claude-x", Path("/work/repo"), bare=True, reasoning_effort=None,
+                              max_budget_usd=1.0, strict_file_tools=True, strict_hook_binary="/bin/hook")
+
+    settings = json.loads(_flag(cmd, "--settings"))
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["hooks"] == json.loads(run._strict_bash_settings(*run._strict_hook_spec(mode, "/bin/hook")))["hooks"]
+    assert cmd.count("--settings") == 1
+    assert _flag(cmd, "--append-system-prompt").endswith(run._STRICT_SYSTEM_GUIDANCE)
+
+
+def test_codex_refuses_an_append_preamble_arm() -> None:
+    mode = run.preamble_mode(_stock_tilth(), PREAMBLE_A)
+
+    with pytest.raises(ValueError, match="append_preamble"):
+        _argv(mode, "luna56")
+
+
+def test_the_append_preamble_text_keys_the_cell(monkeypatch: pytest.MonkeyPatch) -> None:
+    def identity(mode: run.ModeConfig) -> dict:
+        monkeypatch.setitem(run.MODES, "tilth_stock", mode)
+        return run.cell_identity("preamble_task", "tilth_stock", "sonnet5", 0, bare=True, reasoning_effort=None,
+                                 max_budget_usd=1.0, strict_file_tools=False)
+
+    plain = identity(_stock_tilth())
+    first = identity(run.preamble_mode(_stock_tilth(), PREAMBLE_A))
+    second = identity(run.preamble_mode(_stock_tilth(), PREAMBLE_B))
+    replaced = identity(run.preamble_mode(run.MODES["tilth_forced"], PREAMBLE_A))
+
+    assert len({plain["run_key"], first["run_key"], second["run_key"], replaced["run_key"]}) == 4
+    assert "preamble_sha256" not in plain
+    assert first["preamble_sha256"] != second["preamble_sha256"]
+    assert first["preamble_sha256"] == replaced["preamble_sha256"]
+
+
+def test_the_cli_flag_appends_the_preamble_to_a_stock_arm(monkeypatch: pytest.MonkeyPatch, tree) -> None:
+    repo, _first, _second = tree
+    monkeypatch.setattr(run, "REPO_ROOT", repo)
+    monkeypatch.setitem(run.MODES, "tilth_stock", _stock_tilth())
+    monkeypatch.setitem(run.MODES, "tilth_forced", run.MODES["tilth_forced"])
+
+    run._apply_preamble(["tilth_stock", "tilth_forced"], ["sonnet5"], None, None)
+
+    assert run.MODES["tilth_stock"].prompt_mode == "append_preamble"
+    assert run.MODES["tilth_stock"].preamble == PREAMBLE_B
+    assert run.MODES["tilth_forced"].prompt_mode == "preamble"
+
+
+def test_the_cli_flag_refuses_an_arm_that_already_carries_a_preamble(monkeypatch: pytest.MonkeyPatch, tree) -> None:
+    repo, _first, _second = tree
+    monkeypatch.setattr(run, "REPO_ROOT", repo)
+    monkeypatch.setitem(run.MODES, "tilth_stock", run.preamble_mode(_stock_tilth(), PREAMBLE_A))
+
+    with pytest.raises(ValueError, match="already set prompt_mode"):
+        run._apply_preamble(["tilth_stock"], ["sonnet5"], None, None)
+
+
+def _modes_file(tmp_path: Path, *entries: dict) -> Path:
+    path = tmp_path / "modes.json"
+    path.write_text(json.dumps(list(entries)))
+    return path
+
+
+def _tilth_entry(name: str, prompt_mode: str) -> dict:
+    return {"name": name, "tools": ["Bash"], "description": name, "prompt_mode": prompt_mode,
+            "mcp_config_path": run.MODES["tilth"].mcp_config_path}
+
+
+def test_a_modes_file_places_a_preamble_per_arm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tree) -> None:
+    repo, first, _second = tree
+    monkeypatch.setattr(run, "REPO_ROOT", repo)
+    monkeypatch.setattr(run, "MODES", dict(run.MODES))
+    path = _modes_file(tmp_path, _tilth_entry("t_stock", "append"), _tilth_entry("t_steer", "append_preamble"),
+                       _tilth_entry("t_pre", "preamble"))
+
+    assert run.load_modes_json(path, preamble_sha=first) == ["t_stock", "t_steer", "t_pre"]
+
+    assert (run.MODES["t_stock"].prompt_mode, run.MODES["t_stock"].preamble) == ("append", None)
+    assert (run.MODES["t_steer"].prompt_mode, run.MODES["t_steer"].preamble) == ("append_preamble", PREAMBLE_A)
+    assert (run.MODES["t_pre"].prompt_mode, run.MODES["t_pre"].preamble) == ("preamble", PREAMBLE_A)
+
+
+def test_a_modes_file_reads_the_checkout_preamble_without_a_sha(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                 tree) -> None:
+    repo, _first, _second = tree
+    monkeypatch.setattr(run, "REPO_ROOT", repo)
+    monkeypatch.setattr(run, "MODES", dict(run.MODES))
+
+    run.load_modes_json(_modes_file(tmp_path, _tilth_entry("t_pre", "preamble")))
+
+    assert run.MODES["t_pre"].preamble == PREAMBLE_B
+
+
+def test_a_modes_file_refuses_a_preamble_on_an_arm_without_tilth(monkeypatch: pytest.MonkeyPatch,
+                                                                tmp_path: Path) -> None:
+    monkeypatch.setattr(run, "MODES", dict(run.MODES))
+    entry = {"name": "b_pre", "tools": ["Read"], "description": "b", "prompt_mode": "append_preamble"}
+
+    with pytest.raises(ValueError, match="only a tilth arm"):
+        run.load_modes_json(_modes_file(tmp_path, entry))

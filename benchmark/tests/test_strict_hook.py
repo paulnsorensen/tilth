@@ -4,6 +4,7 @@ The replay audit runs a real subprocess: a fake hook script (exit 2 on a file re
 built binary in every test, and a real ``tilth`` build joins when one exists in this checkout.
 """
 
+import hashlib
 import json
 import stat
 import subprocess
@@ -895,3 +896,30 @@ def test_a_full_sha_hook_key_spawns_no_rev_parse(hook_history: dict, monkeypatch
 
     assert run._hook_source_key(full, hook_history["repo"]) == first
     assert calls == []
+
+
+# Computed by the code before the append-family arms existed (strict, bare, sonnet5, budget 1.0, hook_sha abc).
+_PINNED_STRICT_ARMS = {
+    "baseline": ("9a7baa1bd13f4ed39dcb3d4255aa2937b5eb40e77102364ce282c85290ce75eb",
+                 "2c6493b045b6ce5ce1e6db87dbc343ed6a911951c22c94fc01e88d3176b183a4"),
+    "tilth_forced": ("47e49e30ac80b6509ac64f71e11f301dc061a2c9f4bc4f91f7125eeb5cb53bb3",
+                     "5c7d6f1e944807bfe947f4c5423e52951015223739bdcc061c68cd88944d23fb"),
+}
+
+
+@pytest.mark.parametrize("mode_name", sorted(_PINNED_STRICT_ARMS))
+def test_a_strict_replace_arm_keeps_its_command_and_key_inputs(monkeypatch: pytest.MonkeyPatch, mode_name: str) -> None:
+    monkeypatch.setitem(run.TASKS, "pin_task", StoreTask())
+    monkeypatch.setattr(run, "cli_version", lambda *_a, **_k: "2.1.295 (Claude Code)")
+    monkeypatch.setattr(run, "_hook_source_key", lambda *_a, **_k: "tree:lock")
+    template = run._command_template(run.TASKS["pin_task"], run.MODES[mode_name], mode_name, "sonnet5", bare=True,
+                                     reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=True)
+    identity = run.cell_identity("pin_task", mode_name, "sonnet5", 0, bare=True, reasoning_effort=None,
+                                 max_budget_usd=1.0, strict_file_tools=True, hook_sha="abc")
+
+    template_sha, harness_digest = _PINNED_STRICT_ARMS[mode_name]
+    assert hashlib.sha256(repr(template).encode()).hexdigest() == template_sha
+    assert identity["harness_digest"] == harness_digest
+    settings = template[template.index("--settings") + 1]
+    assert list(json.loads(settings)) == ["hooks"]
+    assert settings == json.dumps(json.loads(settings))

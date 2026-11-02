@@ -41,10 +41,10 @@ The other ten members pass at least 92% of cells in both arms and use at most 40
 - **Grading false negatives.** `grok_rg_matcher` requires the literal `impl Matcher for RegexMatcher`; chain answers write "`Matcher` impl (line 409)". `fastapi_request_validation` requires an `async def app` form; chain answers write "an async closure, `app(request)`".
 - Without these sub-tasks, rg-edit-7 passes 13/13 and 20/20, and fastapi-edit-5 passes 15/16 and 71/71.
 - The fix drops the sub-tasks from new chains, as for `gin_context_next`. A grader edit would change the task digests and move the stored long-2 chain keys.
-- **tokio-4867** fails only in the tilth arm. The failures are quick (8 turns) alternative fixes in `recv_ref` that the hidden test rejects; the sampled passing runs fix `new_receiver`. The grade builds in 9 s, so it is not flaky.
-- **ripgrep-2209** fails in both arms (25% and 15%). The grade compiles in 6 s, then `r2208` fails on a different `replace_all` fix, so the failures are real wrong answers. It stays as a short control, but it adds noise to the test split.
-- **Background-task wake-ups.** When an agent backgrounds a test run, each notification starts a new one-turn result in the same stream, and the row keeps only the last. Seven slow rows report 1-3 turns for 15-37 real turns.
-- vuejs rep 0 of preamble-r1 is one of them: 37 turns for $0.43, then 3 wake-ups, for 824 s of wall time. Cost stays correct because the last result event is cumulative; `num_turns` and `duration_ms` do not.
+- **tokio-4867** fails only in the tilth arm: 24 of 97 tilth cells fail against 0 of 17 baseline cells (Fisher p = 0.013). Every failure is a quick `recv_ref` edit that the hidden test rejects. Tilth picks `recv_ref` in 43 of 97 cells against 2 of 17; why is not proven (the grouped `[3 usages in function recv_ref]` search output is a suspect). The grade builds in 9 s, so it is not flaky.
+- **ripgrep-2209** fails 3 of 14 baseline and 3 of 28 tilth cells (no arm effect, p = 0.31). All 6 failures make the same naive `replace_all` edit, so they are real wrong answers. It stays as a short control, but it adds noise to the test split.
+- **Background-task wake-ups.** When an agent backgrounds a test run, each notification starts a new result event in the same stream. Before the November audit the row kept only the last one, so `num_turns`, `duration_ms` and the usage token fields described the last segment only (9 unique streams; rows said 1-3 turns for 10-38 real turns).
+- `total_cost_usd`, `duration_api_ms` and `modelUsage` are cumulative across result events; `num_turns`, `duration_ms` and `usage` are per segment. `parse_stream_json` now sums the per-segment fields and keeps the cumulative ones from the last event. Grading was never affected: `result_text` joins every assistant message.
 
 ## Cell timeouts and budget
 
@@ -112,8 +112,30 @@ Both rounds ran the tilth arm with `prompts/preamble.md` as its whole system pro
 - preamble-r1 never proposed the preamble: the selector weighted it about 10% per pick, and the $128 reserve left 4 proposals. #427 gives the preamble a slot by proposal 3 and cuts the reserve to the cells finish buys ($75.63 in r2).
 - preamble-r1's `$1` budget re-bought every baseline and capped one long cell. #428 counts a budget-capped cell as a completed failure and retries incomplete cells (r2 retried one `chain:gin-edit-5` cell).
 - The preamble directives met their tool hypotheses (error rate 0.119 to 0.100 to 0.083) while dev accuracy fell; this repeats the per-tool-metric lesson above.
-- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logs `cargo fmt failed on the export` on every src_patch proposal.
+- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logged `cargo fmt failed on the export` on every src_patch proposal. Cause: the export holds only src, prompts, Cargo.toml and Cargo.lock, and Cargo.toml declares the `[[test]]` target `tests/bdd/main.rs`, so `cargo fmt` exited 1. The export now runs `rustfmt --edition` on its files; failed patches are remembered and shown to later proposals, and `--avoid-failures-from <run dir>` carries them into the next round.
+- The finish reserve kept the baseline share after `buy_baselines` bought those cells ($24.60 locked in preamble-r2, enough for about one more proposal). The loop now refreshes the reserve after the baselines.
 - Stored baselines from another checkout do not transfer: harness digest, CLI version, and env fingerprint are part of the key, so a run there needs `--refreeze-baselines` (about $45 on long-3).
+
+## November 2026 audit: what the arms receive
+
+A logging proxy (`ANTHROPIC_BASE_URL` at a local server that saves each request body and refuses it) captured the exact requests of live cells, with no model spend.
+
+- Both arms use `prompt_mode` `replace`: `--system-prompt` holds `SYSTEM_PROMPT` plus the cwd line and the strict guidance. Neither arm sees Claude Code's stock system prompt or its `gitStatus` context block. The baseline is not "stock Claude".
+- `--preamble` swaps only the tilth arm's text for `prompts/preamble.md`. That equals `tilth claude` (`--system-prompt-file`) except the cwd and strict lines, so the preamble is applied correctly.
+- Tool rules reach the tilth arm three ways: the preamble, the MCP server instructions (`prompts/mcp.md`, in the environment block), and the tool descriptions. The preamble's `## Tools` repeats six rules of `prompts/mcp.md`; seeded as directive `preamble-drop-duplicate-tool-rules` in `benchmark/evolve/directives/audit-r1.json`.
+- Claude Code's stock `-p` prompt (CLI 2.1.316, about 6.1k characters) has a `# Memory` section that points the agent at the host's `~/.claude/projects/<cwd>/memory` directory, because `/login` cells keep the host config dir. `--settings '{"autoMemoryEnabled": false}'` removes it, also with `--setting-sources ""`.
+- Stock arms now exist: a `--modes-json` arm with `prompt_mode: append` keeps the stock prompt (memory off), and `append_preamble` appends the preamble to it. A modes file can mix `append`, `append_preamble` and `preamble` arms in one run.
+- Every cell also carries two host-account reminders (user email and commit attribution) in its first user message; they are equal across arms.
+
+## November 2026 audit: noise causes
+
+- **Dev split spread is sampling noise.** The r4, r5 and r6 seed cells use the same binary and the same 30 reused baseline cells. A bootstrap over the 9 seed cells per task gives a 3-rep dev-mean SD of 0.042; P(range of three means >= 0.075) = 0.40. Pass flips on metaflow, tokio-4867 and terraform carry 56% of the variance, caddy-6288 cost 23%.
+- The ratio score turns one failed cell on a cheap task into -0.03 of the dev mean; chains add about 1% each.
+- **Power.** At 8 test tasks and 3 reps, a paired test detects about a 20% cost-per-correct effect, not 5% (power 0.12 for 5%). Adding tasks is cheaper than adding reps: about 15 reps at 24 tasks reach 80% power for 5%.
+- The 27 rows at CLI 2.1.311 in r5 came from an aborted first attempt; no score used them.
+- **Strict-hook denials.** About 73% of tilth-arm denials are compound commands with one read or search segment (`git status && grep ...`); the rest are single reads or writes. No pipe-filter false positives. The hook source is identical across runs, so the preamble seed's higher rate (1.30 against 0.90 per cell) is behavior. Seeded as directive `hook-compound-nothing-ran`.
+- **Preamble side effects.** No preamble-r2 tilth cell ended by asking a question, and no chain read sub-task ran a test or lint gate.
+- Cost swings on express and vuejs track call count and test runs; tilth responses on express average 69K characters against 37K for baseline.
 
 ## Spend
 

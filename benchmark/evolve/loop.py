@@ -36,6 +36,7 @@ from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
 from .integrity import INFRASTRUCTURE_HEADLINE, InfrastructureFailure, Integrity
+from .failures import FailedPatches, header
 from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
@@ -50,6 +51,8 @@ ERROR_BLOCK_LINES = 14  # one error block: its message, ``-->`` location, source
 ERROR_START = re.compile(r"^(error(\[\w+\])?:|---- .* ----$|Diff in |thread '.*' panicked|failures:$)")
 NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell", "auth"})
 FINISH_CELL_SETS = 2  # finish scores two candidates on the test split: the dev winner and the seed
+# run._build_candidate's message for a nonzero `cargo build` exit; a CandidateBuildFailed from run_plan starts with it.
+COMPILE_FAILURE = "cargo build --release --locked failed at "
 
 
 class EvolveError(RuntimeError):
@@ -58,6 +61,14 @@ class EvolveError(RuntimeError):
 
 class _Stopped(Exception):
     """A paid step did not start because the stop state is set."""
+
+
+def build_stage(error: BaseException, sha: str | None) -> str:
+    """``build`` when cargo failed to compile ``sha``; ``build infra`` for any other build error.
+
+    A timeout, a full disk, a worktree or cache fault, or the seed's hook build says nothing about the candidate.
+    """
+    return "build" if sha and str(error).startswith(COMPILE_FAILURE + sha) else "build infra"
 
 
 @dataclass(frozen=True)
@@ -100,6 +111,8 @@ class Settings:
     # Selector bounds: no component waits more than `max_unselected` proposals; src_patch comes by `src_patch_by`.
     max_unselected: int = diagnosis.MAX_UNSELECTED
     src_patch_by: int = diagnosis.SRC_PATCH_BY_PROPOSAL
+    # Run dirs whose ``log.txt`` seeds the failed-patch ledger (`--avoid-failures-from`).
+    avoid_failures_from: tuple[Path, ...] = ()
     # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
     cell_retries: int = 2
 
@@ -159,7 +172,8 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check", "integrity", "integrity infra", "build", "hook gate"}:
+        if self.stage in {"apply", "just check", "just check infra", "integrity", "integrity infra", "build",
+                          "build infra", "hook gate"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -343,6 +357,10 @@ class Evolution:
         self.run_dir = run.RESULTS_DIR / "evolve" / settings.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.run_dir / "log.txt"
+        # Gate failures from prior runs and from this run's own log (a resume) are known before the first proposal.
+        self.failed = FailedPatches()
+        for prior in (*settings.avoid_failures_from, self.run_dir):
+            self.failed.seed_from(prior / "log.txt")
         self.rows_path = self.run_dir / "rows.jsonl"
         self.stop = StopState()
         self.stop.listeners.append(self._on_stop)
@@ -369,7 +387,9 @@ class Evolution:
                                             hypotheses=self.hypotheses, extra_records=self._extra_records,
                                             directives=self.directives,
                                             check=self.precheck if settings.repair else None,
-                                            failing_tests=self._failing_tests_of, log=self.log)
+                                            failing_tests=self._failing_tests_of,
+                                            patch_records=self._failed_patch_records,
+                                            skip_repair=self._failed_before, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
                                          forbidden=self._forbidden_terms(), preamble=settings.preamble)
@@ -553,6 +573,22 @@ class Evolution:
         }
         return {**parts, "total": sum(parts.values()), "old": FINISH_CELL_SETS * self.finalist_test_cost()}
 
+    def _refresh_reserve(self) -> None:
+        """Recompute the finish reserve once the baseline cells are stored, so it drops the baseline share.
+
+        Preflight holds the baseline share because the baselines are not bought yet. Once ``buy_baselines``
+        stores them, finish buys none, so the search must not keep that share. An explicit
+        ``--finish-reserve-usd`` stays as set.
+        """
+        if self.settings.finish_reserve_usd is not None:
+            return
+        computed = self.finish_reserve()
+        if computed["total"] >= self.ledger.reserve:
+            return
+        self.log(f"reserve: ${self.ledger.reserve:.4f} -> ${computed['total']:.4f} after the baselines (winner "
+                 f"${computed['winner']:.4f} + seed ${computed['seed']:.4f} + baseline ${computed['baseline']:.4f})")
+        self.ledger.reserve = computed["total"]
+
     def refuse(self, message: str) -> int:
         self.log(f"refused: {message}")
         print(f"error: {message}", file=sys.stderr)
@@ -672,6 +708,7 @@ class Evolution:
             self.base_cost = _baseline_costs(rows, tasks)
             self.base_rows = {task: [cost_summary(row) for row in rows
                                      if row["task"] == task and baselines.is_completed(row)] for task in tasks}
+            self._refresh_reserve()
         except run.BaselineDrift as error:
             return self.refuse(str(error))
         except run.CandidateBuildFailed as error:
@@ -712,6 +749,8 @@ class Evolution:
         result = self.new_cascade(candidate)
         if result.done:
             return result
+        if (known := self._known_failure(result)) is not None:
+            return result.fail(*known)
         if result.cid != self.seed_id and not self.cascade(self.seed).accepted:
             raise EvolveError("the seed is not on the accepted frontier (its dev run failed or did not complete); "
                               "refusing to buy candidate rollouts")
@@ -725,7 +764,14 @@ class Evolution:
         except run.HookProbeFailed as failed:
             return self._fail(result, "hook gate", tail(str(failed)))
         except run.CandidateBuildFailed as failed:
-            return self._fail(result, "build", tail(str(failed)))
+            return self._build_failed(result, failed, str(failed))
+
+    def _build_failed(self, result: Cascade, error: BaseException, detail: str) -> Cascade:
+        """Fail ``result`` at ``build`` or ``build infra``; ``build infra`` keeps nothing, so the patch is built again."""
+        stage = build_stage(error, result.sha)
+        if stage == "build infra":
+            self.results.pop(result.cid, None)
+        return self._fail(result, stage, tail(detail))
 
     def _static_checks(self, result: Cascade) -> Cascade | None:
         """Materialize and run ``just check``, each once per content id; the failed cascade, or None when both pass."""
@@ -744,6 +790,10 @@ class Evolution:
                 result.just_check_ok = ok
                 if ok:
                     sound, output = self._integrity(result, worktree)
+            except InfrastructureFailure as fault:
+                # A `just check` timeout has no verdict: keep nothing, so the same patch is checked again.
+                self.results.pop(result.cid, None)
+                return self._fail(result, "just check infra", tail(str(fault)))
             finally:
                 self.materializer.release(result.sha)
             if not ok:
@@ -783,6 +833,26 @@ class Evolution:
         result = self.results.get(content_id(candidate))
         return list(result.failing_tests) if result is not None and result.stage == "just check" else []
 
+    def _failed_patch_records(self) -> list[dict]:
+        """The record that lists earlier failed patches for a ``src_patch`` proposal; empty when none failed."""
+        summary = self.failed.summary()
+        return [{"failed_patches": summary}] if summary else []
+
+    def _failed_before(self, candidate: Mapping[str, str]) -> bool:
+        """True when ``candidate`` already failed a gate (this run or a seeded one); the Dispatcher then skips its repair."""
+        return self._prior_failure(content_id(candidate)) is not None
+
+    def _prior_failure(self, cid: str) -> tuple[str, str] | None:
+        """``(stage, error)`` of an earlier gate failure for ``cid``; the seed never counts."""
+        return None if cid == self.seed_id else self.failed.get(cid)
+
+    def _known_failure(self, result: Cascade) -> tuple[str, str] | None:
+        """``(stage, error)`` when this candidate already failed a gate; the seed never counts."""
+        known = self._prior_failure(result.cid)
+        if known is not None:
+            self.log(f"candidate {result.cid[:12]}: skipped, it already failed at {known[0]} ({known[1]})")
+        return known
+
     def precheck(self, candidate: Mapping[str, str]) -> tuple[str, str] | None:
         """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply, ``just check``, or
         integrity, else None.
@@ -790,7 +860,9 @@ class Evolution:
         It runs the cascade's own memoized stages, so a child that passes is not checked again when GEPA evaluates it.
         """
         result = self.new_cascade(candidate)
-        if not result.done and not self.stop.is_set:
+        if not result.done and (known := self._known_failure(result)) is not None:
+            result.fail(*known)
+        elif not result.done and not self.stop.is_set:
             self._static_checks(result)
         if result.stage in {"apply", "just check", "integrity"}:
             return result.stage, self._redact(result.tail or "")
@@ -810,7 +882,8 @@ class Evolution:
         try:
             binary = run.build_candidate(result.sha, repo=self.settings.repo).binary_path
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
-            return self._fail(result, "build", tail(run.build_failure_detail(error)))
+            # Only a compile failure is a verdict; any other build error fails at `build infra`, which nothing skips.
+            return self._build_failed(result, error, run.build_failure_detail(error))
         failures = hookgate.corpus_failures(binary)
         if failures:
             shown = failures[:TAIL_LINES - 2]
@@ -823,9 +896,10 @@ class Evolution:
 
     def _fail(self, result: Cascade, stage: str, output: str = "") -> Cascade:
         """Mark ``result`` failed at ``stage`` and log the stage with its failure tail."""
-        self.log(f"candidate {result.cid[:12]}: failed at {stage}")
+        self.log(header(result.cid, stage))
         for line in output.splitlines():
             self.log(f"  {line}")
+        self.failed.add(result.cid, stage, output)
         self._discard_build(result)
         return result.fail(stage, output)
 

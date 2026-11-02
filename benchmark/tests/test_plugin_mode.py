@@ -231,6 +231,16 @@ def test_prompt_mode_append_uses_append_system_prompt_only(monkeypatch, tmp_path
     assert "--system-prompt" not in cmd
     assert cmd.count("--append-system-prompt") == 1
     assert _flag_value(cmd, "--append-system-prompt").startswith("Your current working directory is: ")
+    assert json.loads(_flag_value(cmd, "--settings")) == {"autoMemoryEnabled": False}
+
+
+def test_a_replace_arm_passes_no_settings_unless_strict() -> None:
+    mode = ModeConfig(name="replace_mode", tools=["Read"], mcp_config_path=None, description="replace")
+
+    cmd = run._claude_command(_PluginTask(), mode, "claude-x", Path("/w"), bare=True, reasoning_effort=None,
+                              max_budget_usd=1.0, strict_file_tools=False, strict_hook_binary=None)
+
+    assert "--settings" not in cmd
 
 
 # --- the skill-load check (probe fixtures) ---

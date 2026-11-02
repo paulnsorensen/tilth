@@ -334,3 +334,30 @@ def test_the_main_directive_hypothesis_is_measurable_from_attribution(tmp_path: 
     status, observed = diagnosis.judge(main_directive.hypothesis, parent, child)
 
     assert status == "met" and observed["parent"] == 1.0 > observed["child"]
+
+
+# --- the reserve drops the baseline share once the baselines are bought ---
+
+
+def test_the_reserve_drops_the_baseline_share_after_the_baselines_are_bought(world) -> None:  # noqa: F811
+    evo = build(world)
+    assert evo.preflight() is None
+    held = evo.ledger.reserve
+    assert held == pytest.approx(evo.finish_reserve()["total"]) and evo.finish_reserve()["baseline"] > 0
+
+    assert evo.buy_baselines() is None
+
+    parts = evo.finish_reserve()
+    assert parts["baseline"] == 0.0
+    assert evo.ledger.reserve == pytest.approx(parts["winner"] + parts["seed"]) and evo.ledger.reserve < held
+    assert f"reserve: ${held:.4f} -> ${evo.ledger.reserve:.4f} after the baselines" in log_text(world)
+
+
+def test_an_explicit_finish_reserve_is_not_refreshed_after_the_baselines(world) -> None:  # noqa: F811
+    evo = build(world, "--finish-reserve-usd", "5.0")
+    assert evo.preflight() is None
+
+    assert evo.buy_baselines() is None
+
+    assert evo.ledger.reserve == pytest.approx(5.0)
+    assert "after the baselines" not in log_text(world)

@@ -2054,11 +2054,15 @@ def test_default_just_check_timeout_kills_the_whole_process_group(monkeypatch: p
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
+    from evolve.integrity import InfrastructureFailure
+
     started = time.monotonic()
-    ok, output = cli.default_just_check(worktree)
+    # A timeout is no verdict on the candidate, so it raises instead of failing `just check`.
+    with pytest.raises(InfrastructureFailure, match="timed out"):
+        cli.default_just_check(worktree)
 
     # A surviving child holds the output pipes open, so a partial kill waits for the 60 s sleep.
-    assert ok is False and "timed out" in output and time.monotonic() - started < 30
+    assert time.monotonic() - started < 30
     child = int((worktree / "child.pid").read_text())
     assert _exits_within(child, 30)
 

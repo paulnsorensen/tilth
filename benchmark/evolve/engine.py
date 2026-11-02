@@ -190,10 +190,16 @@ class Dispatcher:
                  directives=None,
                  check: Callable[[Mapping[str, str]], tuple[str, str] | None] | None = None,
                  failing_tests: Callable[[Mapping[str, str]], list[str]] | None = None,
+                 patch_records: Callable[[], list[dict]] | None = None,
+                 skip_repair: Callable[[Mapping[str, str]], bool] | None = None,
                  test_scope: dict[str, frozenset[str]] | None = None,
                  test_keep: dict[str, tuple[str, frozenset[str]]] | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.failing_tests = failing_tests
+        # Records only a ``src_patch`` proposal sees, such as the patches that already failed a gate.
+        self.patch_records = patch_records
+        # True for a child that already failed a gate: its repair is not paid for again.
+        self.skip_repair = skip_repair
         # ``src_patch`` text -> tests that patch may change; the materializer reads the same dicts. ``test_keep``
         # maps a patch to (parent patch, tests it inherits and must leave as the parent had them).
         self.test_scope = test_scope if test_scope is not None else {}
@@ -229,7 +235,8 @@ class Dispatcher:
             if self.stop.is_set:
                 break
             if name == SRC_PATCH:
-                patch_records = records
+                patch_records = [*records, *(self.patch_records() if self.patch_records is not None else [])]
+                records = patch_records
                 proposal[name] = self.propose(candidate, records)
             else:
                 proposal[name] = self.reflect(name, candidate[name], records)
@@ -266,6 +273,9 @@ class Dispatcher:
         patch = proposal[SRC_PATCH]
         child = {**candidate, **proposal}
         parent: Mapping[str, str] = candidate
+        if self.skip_repair is not None and self.skip_repair(child):
+            self.log("repair: the child already failed a gate; no repair")
+            return patch
         failure = self.check(child)
         for attempt in range(1, MAX_REPAIRS + 1):
             if failure is None:

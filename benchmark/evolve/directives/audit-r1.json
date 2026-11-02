@@ -1,0 +1,14 @@
+[
+  {
+    "id": "hook-compound-nothing-ran",
+    "component": "src_patch",
+    "brief": "In strict cells, about 73% of the Bash hook's refusals in the tilth arm are compound commands in which one segment reads or searches a file, for example `git status && ls dir && grep -rn X .` or `cd x; ls; wc -l f`. The hook refuses the whole command at the first refused segment (src/hook/walk.rs), and the refusal text from src/hook/hints.rs names the tilth alternative but never says that no segment ran. After a refusal, about a quarter of next calls are another shell call. Change the refusal hint for a compound command so it says that no part of the command ran, and that the agent runs the allowed segments (git, ls, tests, builds) as their own shell call and does the read or search with tilth. Keep the existing alternative line and the filter line. Update the hook tests that pin the text.",
+    "hypothesis": {"metric": "error_rate", "scope": "Bash", "direction": "decrease", "tolerance": 0.25, "invariants": ["accuracy does not drop", "single-command refusals keep their text"]}
+  },
+  {
+    "id": "preamble-drop-duplicate-tool-rules",
+    "component": "prompts/preamble.md",
+    "brief": "The tilth MCP server instructions already reach every API call and state these rules: set cwd on every call, batch queries and paths, read the section you change, do not re-read content a search expanded, do not read files with cat, head, tail, sed, grep, or rg, and do not write files with redirects, heredocs, or inline interpreters. The `## Tools` section of prompts/preamble.md repeats each of them, so every call carries both copies. Remove the repeated rules from `## Tools`. Keep only what the server instructions do not say: the role of each tilth tool, edit only after a tagged read or search, apply one coherent change as several sections in one tilth_write call, read callers and helpers before an edit, and match the codebase conventions. Keep the `# ` heading that names tilth and the `## Tools`, `## Safety`, and `## Verification` headings.",
+    "hypothesis": {"metric": "excess_chars_per_cell", "scope": "preamble", "direction": "decrease", "tolerance": 0.1, "invariants": ["accuracy does not drop", "preamble headings unchanged"]}
+  }
+]
