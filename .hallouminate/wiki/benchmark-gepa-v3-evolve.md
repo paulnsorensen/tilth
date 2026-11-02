@@ -148,12 +148,12 @@ The arms are in `benchmark/results/stock-ab/modes.json`:
 - `tilth_steer`: `tilth_stock` with the preamble appended (`append_preamble`).
 - `tilth_pre`: the preamble replaces the system prompt (`preamble`), as in `tilth claude`.
 
-| arm | correct | $/correct | turns/cell | tool calls/cell | context tokens/cell |
-|---|---|---|---|---|---|
-| baseline_stock | 54/54 | 0.547 | 58.3 | 56.3 | 791,654 |
-| tilth_stock | 52/54 | 0.628 | 23.5 | 21.6 | 994,020 |
-| tilth_steer | 53/54 | 0.633 | 23.9 | 21.9 | 1,044,164 |
-| tilth_pre | 53/54 | 0.611 | 24.6 | 22.6 | 1,042,344 |
+| arm | correct | $/cell | $/correct | turns/cell | tool calls/cell | context tokens/cell |
+|---|---|---|---|---|---|---|
+| baseline_stock | 54/54 | 0.547 | 0.547 | 58.3 | 56.3 | 791,654 |
+| tilth_stock | 52/54 | 0.605 | 0.628 | 23.5 | 21.6 | 994,020 |
+| tilth_steer | 53/54 | 0.621 | 0.633 | 23.9 | 21.9 | 1,044,164 |
+| tilth_pre | 53/54 | 0.599 | 0.611 | 24.6 | 22.6 | 1,042,344 |
 
 The paired deltas come from `benchmark/paired.py`. The task is the sampling unit (18 tasks), with a 95% task bootstrap CI.
 
@@ -164,9 +164,11 @@ The paired deltas come from `benchmark/paired.py`. The task is the sampling unit
 | tilth_pre vs baseline_stock | +11.6% [+3.6, +24.1] | −1.9pp [−5.6, +0.0] |
 | tilth_steer vs tilth_stock | +0.8% [−1.6, +15.0] | +1.9pp [−3.7, +7.4] |
 | tilth_pre vs tilth_stock | −2.8% [−10.1, +15.0] | +1.9pp [−3.7, +7.4] |
+| tilth_steer vs tilth_pre | +3.6% [−0.4, +19.0] | +0.0pp [−5.6, +5.6] |
 
 - Against the stock prompt, every tilth arm costs more per correct answer. All three cost CIs exclude 0. All accuracy CIs include 0.
 - The preamble has no detectable effect inside the tilth arms, as an appended text or as the replacement prompt.
+- Power: 18 tasks × 3 reps give paired cost CIs 17–25 points wide. A difference below about 10% between tilth arms stays inside these CIs, so this A/B cannot rank the preamble placements.
 - The tilth arms make about 60% fewer turns and tool calls, but they carry 26–32% more context tokens per cell. Nearly all of the extra context is cache reads.
   This A/B does not split that context between the fixed MCP prefix ([MCP cost model](mcp-cost-model-sonnet5.md)) and larger tool results.
 - The largest per-task gaps are `chain:rg-edit-6` (+22–30% per cell) and `chain:express-edit-6` (+13–23%).
