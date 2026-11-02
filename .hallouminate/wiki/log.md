@@ -120,3 +120,5 @@
 
 - 2026-10-29 · pr-413-fixups · merged · benchmark-gepa-invariants.md; benchmark-gepa-v3-evolve.md; index.md · Fix 8 review comments on #413: deep-diagnosis cap, --no-repair, repair test grant, per-target integrity commands, index entry, r2 note, tool-call labels. Add sources/gepa-v3-call-gap.md.
 
+- 2026-11-02 · stock-ab-2026-11-02 · merged · benchmark-gepa-v3-evolve.md · Stock-prompt A/B results (4 arms, 18 tasks, 3 reps), spend, and a conflict note on the dependent-turn cost claim. Written directly; the hallouminate server was unavailable, so no ground probes ran.
+- 2026-11-02 · stock-ab-2026-11-02 · merged · benchmark-harness-gotchas.md · `mise prune` deletes an ad-hoc pinned Claude CLI; `/tmp` aging corrupts the rg-flow grader cache. Written directly; no ground probes ran.

@@ -226,4 +226,33 @@ These breaks from the first check are fixed: `--output` exists, and result rows 
 The mined task shape, the `skills` and `error` row fields, and `model_alias` match.
 The live Haiku cell with the real cook plugin stays open. No spend is approved for it.
 
-_Source: PR #277 at 411e183 · Updated: 2026-10-15 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+## `mise prune` deletes an ad-hoc pinned Claude CLI mid-run (2026-11-02)
+
+`resolve_claude_binary` (`benchmark/run.py:912`) uses `$TILTH_BENCH_CLAUDE`, then the mise install of the `benchmark/claude-cli.version` pin, then `claude` on PATH.
+A plain `mise install aqua:anthropics/claude-code@<pin>` is untracked, because no mise config names it.
+The dotfiles `bin-doctor clean --sync` (and `dots sync`) runs `mise prune -y`, which deletes untracked versions.
+
+On 2026-11-02 a dotfiles session ran `bin-doctor clean --sync` at 06:07 UTC. The stock-prompt A/B lost its 2.1.310 install, and the next cell resolved PATH `claude` 2.1.316.
+The per-cell probe (`run.py:3287`) stopped the run with "agent CLI version changed mid-run". No cell mixed versions, and a rerun reused all stored rows.
+
+For a long run, copy the pinned binary outside mise and point `TILTH_BENCH_CLAUDE` at it.
+The cell identity stores only the `--version` string, not the path, so stored rows stay reusable.
+
+## `/tmp` aging corrupts the rg-flow grader cache (2026-11-02)
+
+Ubuntu ships the tmpfiles rule `Q /tmp 1777 root root 10d`. `systemd-tmpfiles-clean` deletes `/tmp` files older than 10 days, but it keeps their directories.
+The rg-flow grader reuses one cargo target dir, `/tmp/tilth_bench/cargo-target-ripgrep-flow` (`benchmark/tasks/rg_flow_migration_tasks.py:32`).
+
+On 2026-11-02 the clean ran at 05:56 UTC. It emptied all 12 build-script `out/` dirs, which dated from 10-22, and left cargo's fingerprints in place.
+Cargo then treated `serde_core` as fresh. The grader's `cargo test --no-run` failed with `couldn't find file .../serde_core-*/out/private.rs`.
+All 12 `chain:rg-edit-6` cells of the stock-prompt A/B failed sub-task 6 this way. The harness stored them as completed wrong answers, so a rerun would reuse them.
+
+The recovery deleted the cache and rebuilt it from a clean copy of the ripgrep fixture. It also set `infra: "grade"` on the 12 store rows, so `is_completed` rejects them and the next run re-runs them.
+The standalone `rg_edit_flow_migration` cells ran at 01:43–02:25, before the clean, so they stay valid.
+
+Do not move the `/tmp/tilth_bench` literals. Four task modules hold them, and `_task_source_files` hashes those modules into `task_digest`.
+A move re-keys 8 `gepa-v3-long-3` tasks and discards about $100 of stored rows per 4-arm, 3-rep pass.
+Instead, exclude the tree from aging once per host: `echo 'x /tmp/tilth_bench' | sudo tee /etc/tmpfiles.d/tilth-bench.conf`.
+A grader build failure that is not the agent's fault still reads as a wrong answer. Check `sub_tasks[].reason` before you trust a uniform failure across all arms.
+
+_Source: PR #277 at 411e183; stock-prompt A/B run log and `systemd-tmpfiles-clean` journal (2026-11-02) · Updated: 2026-11-02 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

@@ -137,10 +137,47 @@ A logging proxy (`ANTHROPIC_BASE_URL` at a local server that saves each request 
 - **Preamble side effects.** No preamble-r2 tilth cell ended by asking a question, and no chain read sub-task ran a test or lint gate.
 - Cost swings on express and vuejs track call count and test runs; tilth responses on express average 69K characters against 37K for baseline.
 
+## November 2026 stock-prompt A/B
+
+The stock-prompt A/B measured tilth against Claude Code's stock system prompt on 2026-11-02.
+It ran the 18 `gepa-v3-long-3` tasks with `claude-sonnet-5-5`, CLI 2.1.310, 3 reps, `--strict-file-tools --bare --max-budget-usd 3`, and candidate `aec0efd4`.
+The arms are in `benchmark/results/stock-ab/modes.json`:
+
+- `baseline_stock`: built-in tools and the stock prompt (`prompt_mode` `append`, memory off).
+- `tilth_stock`: tilth MCP plus Bash, and the stock prompt.
+- `tilth_steer`: `tilth_stock` with the preamble appended (`append_preamble`).
+- `tilth_pre`: the preamble replaces the system prompt (`preamble`), as in `tilth claude`.
+
+| arm | correct | $/correct | turns/cell | tool calls/cell | context tokens/cell |
+|---|---|---|---|---|---|
+| baseline_stock | 54/54 | 0.547 | 58.3 | 56.3 | 791,654 |
+| tilth_stock | 52/54 | 0.628 | 23.5 | 21.6 | 994,020 |
+| tilth_steer | 53/54 | 0.633 | 23.9 | 21.9 | 1,044,164 |
+| tilth_pre | 53/54 | 0.611 | 24.6 | 22.6 | 1,042,344 |
+
+The paired deltas come from `benchmark/paired.py`. The task is the sampling unit (18 tasks), with a 95% task bootstrap CI.
+
+| comparison | cost/correct Δ | accuracy Δ |
+|---|---|---|
+| tilth_stock vs baseline_stock | +14.7% [+2.1, +33.8] | −3.7pp [−9.3, +0.0] |
+| tilth_steer vs baseline_stock | +15.6% [+8.9, +34.7] | −1.9pp [−5.6, +0.0] |
+| tilth_pre vs baseline_stock | +11.6% [+3.6, +24.1] | −1.9pp [−5.6, +0.0] |
+| tilth_steer vs tilth_stock | +0.8% [−1.6, +15.0] | +1.9pp [−3.7, +7.4] |
+| tilth_pre vs tilth_stock | −2.8% [−10.1, +15.0] | +1.9pp [−3.7, +7.4] |
+
+- Against the stock prompt, every tilth arm costs more per correct answer. All three cost CIs exclude 0. All accuracy CIs include 0.
+- The preamble has no detectable effect inside the tilth arms, as an appended text or as the replacement prompt.
+- The tilth arms make about 60% fewer turns and tool calls, but they carry 26–32% more context tokens per cell. Nearly all of the extra context is cache reads.
+  This A/B does not split that context between the fixed MCP prefix ([MCP cost model](mcp-cost-model-sonnet5.md)) and larger tool results.
+- The largest per-task gaps are `chain:rg-edit-6` (+22–30% per cell) and `chain:express-edit-6` (+13–23%).
+- `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over `rows.jsonl` and from `paired.py`.
+- The run resumed after four stops: a CLI version change, a full disk, the first $130 cap, and 12 `chain:rg-edit-6` cells that a corrupt grader cache failed. See [Benchmark harness gotchas](benchmark-harness-gotchas.md).
+
 ## Spend
 
 Evolve spend totals about $487: r1 $99, baseline buy $32, r2 $45, r3 $161, r4 $12, r5 $48, r6 $89.
 The preamble rounds add $306: preamble-r1 $128 and preamble-r2 $178.
+The stock-prompt A/B adds $168.39 of its $170 cap (budget `stock-ab-1`). That includes about $35 for the 12 `chain:rg-edit-6` cells that the corrupt grader cache failed, and about $35 to re-run them.
 The finish reserve is about $40 whenever the seed commit changes, because `git_sha` is in every tilth cell's run key.
 
 ## Ideas to push cost per correct lower
@@ -148,6 +185,8 @@ The finish reserve is about $40 whenever the seed commit changes, because `git_s
 These ideas cut dependent turns, the measured cause of tilth's extra cost.
 They are untested; the call savings are the deep-diagnosis estimates for the main seed (`4c56a06`), and the ranges overlap, so do not add them.
 The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-split measurement, rather than more evolve rounds.
+
+> ⚠️ Conflicts with the [stock-prompt A/B](#november-2026-stock-prompt-ab): there the tilth arms made about 60% fewer turns than baseline and still cost 12–16% more per correct answer, with 26–32% more context tokens per cell. The dependent-turn cause was measured on the `replace` arms. Needs human resolution.
 
 1. Explicit search modes (literal, regex, symbol), so auto-resolution stops narrowing or changing the agent's intent. This is the largest remaining cause, about 0.45 calls per cell.
 2. Edit from search: let `tilth_write` edit lines that a search hit displayed, now that #404 tags test hits, to skip a read turn.
@@ -162,4 +201,4 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`) · Updated: 2026-10-31_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows (`benchmark/results/stock-ab/rows.jsonl`, budget `stock-ab-1`) · Updated: 2026-11-02 · Supersedes: none; the Ideas section keeps its dependent-turn claim with a conflict note_
