@@ -41,6 +41,7 @@ impl Session {
             .arg("--mcp")
             .current_dir(&workspace)
             .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)

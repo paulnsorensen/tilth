@@ -18,6 +18,7 @@ use std::path::Path;
 
 use clru::{CLruCache, CLruCacheConfig, WeightScale};
 
+use super::seen_store::{content_digest, SeenRecord};
 use super::tag::compute_file_hash;
 
 pub const DEFAULT_MAX_PATHS: usize = 30;
@@ -91,6 +92,9 @@ pub struct SnapshotStore {
     /// Per path key: the `recorded_at` of the head a write committed. Any later
     /// record bumps `recorded_at`, so a read supersedes it without bookkeeping.
     write_marks: HashMap<String, u64>,
+    /// `(path key, tag)` of versions whose seen lines changed since the last
+    /// `take_unsaved_seen`.
+    unsaved: HashSet<(String, u16)>,
 }
 
 impl Default for SnapshotStore {
@@ -124,6 +128,7 @@ impl SnapshotStore {
             per_file_cap,
             seq: 0,
             write_marks: HashMap::new(),
+            unsaved: HashSet::new(),
         }
     }
 
@@ -194,6 +199,7 @@ impl SnapshotStore {
         // Best-effort store; if the single history exceeds the byte ceiling
         // (cannot happen under the per-file/version caps) the tag is still
         // returned but the snapshot is not retained.
+        self.unsaved.insert((key.clone(), tag));
         let _ = self.versions.put_with_weight(key, history);
         self.enforce_path_cap();
         Some(tag)
@@ -212,8 +218,35 @@ impl SnapshotStore {
         };
         if let Some(v) = history.iter_mut().find(|s| s.tag == tag) {
             v.seen_lines.extend(lines);
+            self.unsaved.insert((key.clone(), tag));
         }
         let _ = self.versions.put_with_weight(key, history);
+    }
+
+    /// Drain the versions whose seen lines changed since the last call, as
+    /// records for the on-disk seen store. Evicted versions and versions with
+    /// no seen lines give no record.
+    pub(crate) fn take_unsaved_seen(&mut self) -> Vec<SeenRecord> {
+        let mut out = Vec::new();
+        for (key, tag) in std::mem::take(&mut self.unsaved) {
+            let Some(snap) = self
+                .versions
+                .peek(&key)
+                .and_then(|h| h.iter().find(|s| s.tag == tag))
+            else {
+                continue;
+            };
+            if snap.seen_lines.is_empty() {
+                continue;
+            }
+            out.push(SeenRecord {
+                digest: content_digest(&snap.text),
+                ranges: snap.seen_ranges(),
+                key,
+                tag,
+            });
+        }
+        out
     }
 
     /// Most-recently recorded version for `path`.
@@ -506,6 +539,31 @@ mod tests {
         store.record_seen_lines("a.rs", tag, [2, 3]);
         let snap = store.by_tag("a.rs", tag).unwrap();
         assert_eq!(snap.seen_lines, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn take_unsaved_seen_drains_changed_versions_once() {
+        let mut store = SnapshotStore::new();
+        // A search records with no seen lines, then marks the displayed lines.
+        let tag = store.record(Path::new("a.rs"), "l1\nl2\nl3\n", []).unwrap();
+        assert_eq!(store.take_unsaved_seen(), [], "no seen lines yet");
+        store.record_seen_lines("a.rs", tag, [2, 3]);
+        let records = store.take_unsaved_seen();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tag, tag);
+        assert_eq!(records[0].ranges, vec![(2, 3)]);
+        assert_eq!(records[0].digest, content_digest("l1\nl2\nl3\n"));
+        assert_eq!(store.take_unsaved_seen(), [], "drained");
+
+        store
+            .record(Path::new("a.rs"), "l1\nl2\nl3\n", [1])
+            .unwrap();
+        let records = store.take_unsaved_seen();
+        assert_eq!(records[0].ranges, vec![(1, 3)], "merged seen lines");
+
+        store.record(Path::new("b.rs"), "b\n", [1]).unwrap();
+        store.invalidate(Path::new("b.rs"));
+        assert_eq!(store.take_unsaved_seen(), [], "evicted versions drop");
     }
 
     #[test]

@@ -343,6 +343,16 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_write" => tool_write(args, services.session(), services.bloom(), services.cache()),
         _ => Err(format!("unknown tool: {tool}")),
     };
+    // Save the seen lines this call recorded, so a resumed agent session (a
+    // new tilth process) can still edit them.
+    if let Some(cwd) = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .filter(|cwd| cwd.is_absolute())
+    {
+        services.session().persist_seen(cwd);
+    }
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
     // `tilth_search` is exempt: its response is pure JSON and drops any tip,
