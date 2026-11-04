@@ -98,24 +98,30 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 
 ## Litmus re-run after the fixes (2026-11-04)
 
-#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. A paid re-run of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` cut the cell cost by 18%. The gap to `baseline_stock` fell from +30% to +7%.
+#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. A paid re-run of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` cut the cell cost by 18%. The gap to `baseline_stock` fell from +30% to +7%. **The re-run omitted `--bare`, and the November 2 rows used it, so the comparison is confounded.** See the second bullet.
 
 | Per cell, 3 reps | baseline_stock (Nov 2) | tilth_stock before | tilth_stock after |
 |---|---|---|---|
+| `--bare` | yes | yes | no |
 | Correct | 3/3 | 3/3 | 3/3 |
 | Cost (range) | $2.46 ($2.16–2.80) | $3.19 ($2.82–3.54) | $2.62 ($2.53–2.76) |
 | Context tokens | 4.47M | 6.28M | 5.95M |
+| First API call context | 7.4k | 9.3k | 11.5k |
 | API calls | 51.7 | 56.7 | 60.7 |
+| Actions per tool-using API call | 3.87 | 4.61 | 4.23 |
+| Bash calls | 6.0 | 7.7 | 13.3 |
 | `tilth_write` errors | n/a | 3.00 | 0.33 |
 | Seen-line rejections | n/a | 2.67 | 0.33 |
 | `mode=full` reads | n/a | 7.67 | 0 |
 | Batches killed by a bad pattern | n/a | 2 (total) | 0 |
 | Read result chars | 190k | 209k | 157k |
+| Search result chars | 46k (`Grep`) | 98k | 87k |
 
-- **Remaining gap: batching.** Session analytics (`model_turns.tool_calls`) shows about 1.1 tool calls per API call for tilth and about 3.6 for baseline, which sends parallel `Read`/`Edit` calls. Tilth needs more API calls although each result is smaller.
+- **Batching is not the gap.** Count actions, not tool calls. An action is one read path, search query, edit op, or built-in tool call. Tilth batches inside one call: 2.05 paths per read, 3.07 queries per search and 8.85 ops per write. Baseline sends parallel calls instead. Session analytics `model_turns.tool_calls` counts calls, so its 1.1 against 3.6 hides this.
+- **The re-run used the user's harness.** Without `--bare`, `run.py` does not pass `--setting-sources ""`. The arm then ran the user's SessionStart hooks and loaded `~/.claude/CLAUDE.md`. The tilth prompts grew by 10 bytes, but the first API call grew by 2.2k tokens. Of 40 Bash calls, 28 use `eatmydata`, a rule from that file; the November 2 runs have none. Most of the extra Bash calls run `cargo check` or `cargo test`. They give most of the 9 extra API calls against baseline. Re-run `tilth_stock` with `--bare` for a clean comparison.
+- **Other gap sources.** Tilth search results are about twice the size of `Grep` results. With `--bare`, the tilth tool schemas add about 1.9k tokens to each API call.
 - **Cause 1 is smaller, not gone.** Ambiguous search results fell from 3.67 to 3.00 per cell.
-- **Bash grew from 7.7 to 13.3 calls per cell**, almost all `eatmydata cargo test`. No repo or task file names `eatmydata`, so the arms very likely load the user's `~/.claude/CLAUDE.md`. Run paid A/Bs with `--bare` to remove it.
-- **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`.
+- **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`. Pass `--bare` to match the stock A/B rows.
 - **Limits.** n=3. The baseline rows come from November 2, not from the same day. The run started before #432, so the `/tmp` aging guard did not apply. Spend: $7.87, budget `litmus-rg-edit-6`.
 
-_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 litmus streams and session-analytics `model_turns` · Updated: 2026-11-04 · Supersedes: none_
+_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 litmus streams and rows (`bare`, `git_sha`), and session-analytics `model_turns` · Updated: 2026-11-04 · Supersedes: none_
