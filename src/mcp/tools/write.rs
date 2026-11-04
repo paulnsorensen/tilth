@@ -180,7 +180,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
 
     let section = fill_live_tag(section, path, session, &live);
     let section: &Section = &section;
-    let (new_text, file_op, normalized, written) = resolve_edit(section, path, session, &live)?;
+    let (new_text, file_op, normalized, written) =
+        resolve_edit(section, path, session, &live, ctx.cwd)?;
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
@@ -207,7 +208,9 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     session.record_read(path);
 
     let (summary, mut seen_lines) = summarize_changes(&live, &new_text, written.as_ref());
-    seen_lines.extend(carried_seen_lines(section, path, session, &live, &new_text));
+    seen_lines.extend(carried_seen_lines(
+        section, path, session, &live, &new_text, ctx.cwd,
+    ));
     let new_tag = session.record_write_snapshot(path, &new_text, seen_lines);
 
     // Decision 5: when the exact `old` failed and the whitespace-normalized
@@ -311,12 +314,15 @@ fn fill_live_tag<'a>(
 /// drifted (or tag-collided) tag, [`recover_edit`] runs; a tagless section
 /// seeds/edits against live with synthetic empty provenance. A tagless text
 /// edit reaches this point only when [`fill_live_tag`] found no snapshot of
-/// the live content, so it is rejected.
+/// the live content, so it is rejected. On a matched tag, lines that an
+/// earlier tilth process in the checkout of `cwd` displayed for the exact live
+/// content also pass the gate.
 fn resolve_edit(
     section: &Section,
     path: &Path,
     session: &Session,
     live: &str,
+    cwd: &Path,
 ) -> Result<Resolved, TilthError> {
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
@@ -345,17 +351,22 @@ fn resolve_edit(
         // it through recovery instead.
         Some(tag) if tag == live_tag => {
             let store = session.snapshots();
-            if let Some(snap) = store.by_tag(&key, tag) {
+            if let Some(mut snap) = store.by_tag(&key, tag) {
                 if snap.text == live {
+                    // A resumed agent session runs in a new tilth process.
+                    snap.seen_lines
+                        .extend(session.persisted_seen(cwd, &key, tag, live));
                     let r = gated_apply(&snap, path, &section.ops)
                         .map_err(|e| map_edit_error(e, path, tag))?;
                     return Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)));
                 }
                 return recover_edit(&store, section, path, &key, tag, live);
             }
-            // The read's snapshot was evicted: preserve the tag and source text,
-            // but do not authorize hidden source lines.
-            let snap = synthetic_snapshot(&key, live, tag);
+            // The read's snapshot was evicted, or another tilth process made
+            // it: preserve the tag and source text, and authorize only the
+            // lines that the seen store saved for this exact content.
+            let mut snap = synthetic_snapshot(&key, live, tag);
+            snap.seen_lines = session.persisted_seen(cwd, &key, tag, live);
             let r =
                 gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
             Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
@@ -562,26 +573,31 @@ fn commit_file_op(
 /// Lines of `new_text` the agent already saw in the version this edit applied
 /// against and the edit left untouched, at their new line numbers.
 ///
-/// Carries only when the section's tag names a recorded snapshot whose text is
-/// exactly `live` (no drift). A 3-way-merge recovery, a tagless section, or an
-/// evicted snapshot carries nothing: the agent did not see the merge base, so
-/// the safe answer is to require a re-read.
+/// Carries the seen lines of the section's tag only when they belong to
+/// exactly `live` (no drift): a recorded snapshot whose text is `live`, and the
+/// lines that the seen store saved for `live` in the checkout of `cwd`. A
+/// 3-way-merge recovery or a tagless section carries nothing: the agent did
+/// not see the merge base, so the safe answer is to require a re-read.
 fn carried_seen_lines(
     section: &Section,
     path: &Path,
     session: &Session,
     live: &str,
     new_text: &str,
+    cwd: &Path,
 ) -> Vec<u32> {
     let Some(tag) = section.tag else {
         return Vec::new();
     };
     let key = crate::edit::normalize_path_key(path);
     let base = session.snapshots().by_tag(&key, tag);
-    match base {
-        Some(snap) if snap.text == live => carry_forward(live, new_text, &snap.seen_lines),
-        _ => Vec::new(),
-    }
+    let mut seen = match base {
+        Some(snap) if snap.text == live => snap.seen_lines,
+        Some(_) => return Vec::new(),
+        None => HashSet::new(),
+    };
+    seen.extend(session.persisted_seen(cwd, &key, tag, live));
+    carry_forward(live, new_text, &seen)
 }
 
 /// Remap `seen` line numbers of `before` onto `after` through a diffy patch:
@@ -2033,7 +2049,7 @@ mod tests {
                 new: "replacement".into(),
             }],
         };
-        let err = resolve_edit(&section, &p, &session, original).unwrap_err();
+        let err = resolve_edit(&section, &p, &session, original, root).unwrap_err();
         match err {
             // The rejection must name the cheap route to a tag; stating only
             // the requirement drove agents into a full re-read of a large file
@@ -2063,6 +2079,49 @@ mod tests {
             other => panic!("expected EditRejected, got {other:?}"),
         }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    /// A resumed agent session runs in a new tilth process: a new `Session`
+    /// over the same seen store keeps the lines the first one displayed, and
+    /// only those, for the same content.
+    #[test]
+    fn a_new_session_in_the_checkout_keeps_saved_seen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let state = dir.path().join("state");
+        let p = root.join("a.rs");
+        let original = "l1\nl2\nl3\nl4\n";
+        std::fs::write(&p, original).unwrap();
+        let first = Session::with_seen_dir(state.clone());
+        let tag = first.record_snapshot(&p, original, [2, 3]).unwrap();
+        first.save_seen(&root, first.take_unsaved_seen());
+
+        let second = Session::with_seen_dir(state);
+        let swap = |line: u32| Section {
+            path: p.to_string_lossy().into_owned(),
+            tag: Some(tag),
+            ops: vec![Op::Swap {
+                start: line,
+                end: line,
+                payload: vec!["edited".into()],
+            }],
+        };
+        let applied = resolve_edit(&swap(3), &p, &second, original, &root).unwrap();
+        assert_eq!(applied.0, "l1\nl2\nedited\nl4\n");
+        // Line 2 was displayed too, so it carries to the edited version.
+        let carried = carried_seen_lines(&swap(3), &p, &second, original, &applied.0, &root);
+        assert!(carried.contains(&2), "{carried:?}");
+        assert!(
+            resolve_edit(&swap(4), &p, &second, original, &root).is_err(),
+            "line 4 was never displayed"
+        );
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(
+            resolve_edit(&swap(3), &p, &second, original, &elsewhere).is_err(),
+            "another checkout does not share the record"
+        );
     }
 
     #[test]

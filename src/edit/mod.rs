@@ -9,6 +9,7 @@ pub mod mismatch;
 pub mod parser;
 pub mod recovery;
 mod rewrite;
+pub(crate) mod seen_store;
 pub mod snapshots;
 pub mod tag;
 
